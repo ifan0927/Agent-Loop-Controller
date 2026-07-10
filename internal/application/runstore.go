@@ -27,6 +27,8 @@ type Run struct {
 	CandidateHead         string       `json:"candidate_head"`
 	ImplementationSession string       `json:"implementation_session_id"`
 	LastError             string       `json:"last_durable_error"`
+	LeaseOwner            string       `json:"-"`
+	LeaseExpiresAt        time.Time    `json:"-"`
 	CreatedAt             time.Time    `json:"created_at"`
 	UpdatedAt             time.Time    `json:"updated_at"`
 }
@@ -57,6 +59,10 @@ type Attempt struct {
 	ExitCode      int       `json:"exit_code"`
 	StdoutPath    string    `json:"stdout_path"`
 	StderrPath    string    `json:"stderr_path"`
+	StdoutHash    string    `json:"stdout_hash"`
+	StderrHash    string    `json:"stderr_hash"`
+	StdoutSize    int64     `json:"stdout_size"`
+	StderrSize    int64     `json:"stderr_size"`
 	OutcomePath   string    `json:"outcome_path"`
 	OutcomeHash   string    `json:"outcome_hash"`
 	ArtifactDir   string    `json:"artifact_directory"`
@@ -73,6 +79,10 @@ type VerificationRecord struct {
 	ExitCode     int       `json:"exit_code"`
 	StdoutPath   string    `json:"stdout_path"`
 	StderrPath   string    `json:"stderr_path"`
+	StdoutHash   string    `json:"stdout_hash"`
+	StderrHash   string    `json:"stderr_hash"`
+	StdoutSize   int64     `json:"stdout_size"`
+	StderrSize   int64     `json:"stderr_size"`
 	EvidencePath string    `json:"evidence_path"`
 	EvidenceHash string    `json:"evidence_hash"`
 	CreatedAt    time.Time `json:"timestamp"`
@@ -117,6 +127,9 @@ type RunStore interface {
 	SetImplementationSession(context.Context, string, string) error
 	SetCandidateHead(context.Context, string, string) error
 	SetLastError(context.Context, string, string) error
+	AcquireLease(context.Context, string, string, time.Time) (bool, error)
+	RenewLease(context.Context, string, string, time.Time) (bool, error)
+	ReleaseLease(context.Context, string, string) error
 	BeginAttempt(context.Context, string, string, string) (Attempt, error)
 	FinishAttempt(context.Context, Attempt) error
 	SaveVerification(context.Context, VerificationRecord) error

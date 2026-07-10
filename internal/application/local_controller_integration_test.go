@@ -119,7 +119,11 @@ func (p *durableFakeProcess) Run(_ context.Context, s processadapter.Spec) (proc
 			mustWriteFile(filepath.Join(s.WorkingDir, "mathutil", "clamp.go"), "package mathutil\n\nfunc Clamp(value, min, max int) int { if value < min { return min }; if value > max { return max }; return value }\n")
 			mustWriteFile(filepath.Join(s.WorkingDir, "mathutil", "clamp_test.go"), "package mathutil\n\nimport \"testing\"\n\nfunc TestClamp(t *testing.T) { tests := []struct{ v, min, max, want int }{{-1,0,5,0},{3,0,5,3},{9,0,5,5}}; for _, tt := range tests { if got := Clamp(tt.v,tt.min,tt.max); got != tt.want { t.Fatalf(\"got %d want %d\",got,tt.want) } } }\n")
 			writeLastMessage(s.Args, completedOutcome)
-			stdout = "{\"type\":\"thread.started\",\"thread_id\":\"implementation-session\"}\n"
+			sessionID := "implementation-session"
+			if slices.Contains(s.Args, "recovered-session") {
+				sessionID = "recovered-session"
+			}
+			stdout = fmt.Sprintf("{\"type\":\"thread.started\",\"thread_id\":%q}\n", sessionID)
 		} else if argument(s.Args, "--sandbox") == "read-only" {
 			p.reviewCalls++
 			head := gitHead(s.WorkingDir)
@@ -272,6 +276,87 @@ type failingTransitionStore struct {
 	remaining int
 }
 
+type failAfterTransitionStore struct {
+	application.RunStore
+	from, to  domain.State
+	remaining int
+}
+
+func (s *failAfterTransitionStore) Transition(ctx context.Context, id string, from, to domain.State, reason, evidence, head string) error {
+	err := s.RunStore.Transition(ctx, id, from, to, reason, evidence, head)
+	if err == nil && from == s.from && to == s.to && s.remaining > 0 {
+		s.remaining--
+		return errors.New("simulated crash after durable transition")
+	}
+	return err
+}
+
+func TestRestartRecoversStartedAttemptSessionAndResumesExplicitly(t *testing.T) {
+	lab := newLocalLab(t)
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	process := &durableFakeProcess{}
+	wrapper := &failAfterTransitionStore{RunStore: store, from: domain.StateProvisioning, to: domain.StateExecuting, remaining: 1}
+	run, err := newController(t, wrapper, lab, process, gitadapter.Workspace{}).Start(context.Background(), startInput(lab))
+	if err == nil || run.State != domain.StateExecuting {
+		t.Fatalf("run=%+v err=%v", run, err)
+	}
+	directory := filepath.Join(run.ArtifactRoot, "attempts", "interrupted")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.BeginAttempt(context.Background(), run.ID, "implementation", directory); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(directory, "implementation.stdout.jsonl"), "{\"type\":\"thread.started\",\"thread_id\":\"recovered-session\"}\n")
+	mustWrite(t, filepath.Join(directory, "implementation.stderr.txt"), "")
+	run, err = newController(t, store, lab, process, gitadapter.Workspace{}).Continue(context.Background(), run.ID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.State != domain.StateApprovalReady || run.ImplementationSession != "recovered-session" {
+		t.Fatalf("run=%+v", run)
+	}
+	if process.resumeCalls != 1 || !slices.Contains(process.resumeArgs, "recovered-session") || slices.Contains(process.resumeArgs, "--last") {
+		t.Fatalf("resume args=%v", process.resumeArgs)
+	}
+	inspection, _ := store.Inspect(context.Background(), run.ID)
+	found := false
+	for _, attempt := range inspection.Attempts {
+		if attempt.ErrorCategory == "controller_restart_session_recovered" && attempt.SessionID == "recovered-session" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("recovered interrupted attempt evidence missing")
+	}
+}
+
+func TestControllerRefusesCompetingActiveLease(t *testing.T) {
+	lab := newLocalLab(t)
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	input := startInput(lab)
+	repositoryJSON, _ := json.Marshal(input.Repository)
+	_, _, err = store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: input.Task.RunID, IssueID: input.Task.IssueID, IdempotencyKey: input.IdempotencyKey, SourceRevision: input.Task.SourceRevision, RawIssueJSON: string(input.RawIssueJSON), RawIssueHash: input.RawIssueHash, NormalizedTaskJSON: string(input.NormalizedJSON), TaskHash: input.TaskHash, Repository: input.Task.Repository, RepositoryConfigJSON: string(repositoryJSON), BaseBranch: input.Task.BaseBranch, WorkingBranch: input.Task.WorkingBranch, WorktreePath: filepath.Join(lab.worktrees, input.Task.RunID), ArtifactRoot: filepath.Join(lab.runs, input.Task.RunID)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := store.AcquireLease(context.Background(), input.Task.RunID, "other-controller", time.Now().Add(time.Minute)); err != nil || !ok {
+		t.Fatalf("lease=%v err=%v", ok, err)
+	}
+	_, err = newController(t, store, lab, &durableFakeProcess{}, gitadapter.Workspace{}).Continue(context.Background(), input.Task.RunID, nil)
+	if err == nil || !strings.Contains(err.Error(), "actively leased") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
 func (s *failingTransitionStore) Transition(ctx context.Context, id string, from, to domain.State, reason, evidence, head string) error {
 	if from == s.from && to == s.to && s.remaining > 0 {
 		s.remaining--
@@ -391,8 +476,33 @@ func TestApprovalInvalidatesOnWorkspaceAndEvidenceMutation(t *testing.T) {
 			}
 			t.Fatal("missing verification")
 		}},
+		{"verification stdout", func(t *testing.T, r application.Run) {
+			store, err := storeadapter.Open(filepath.Join(filepath.Dir(filepath.Dir(r.ArtifactRoot)), "controller.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			inspection, err := store.Inspect(context.Background(), r.ID)
+			store.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, v := range inspection.Verifications {
+				if v.Phase == "candidate" {
+					mustWrite(t, v.StdoutPath, "tampered")
+					return
+				}
+			}
+			t.Fatal("missing verification stdout")
+		}},
 		{"review evidence", func(t *testing.T, r application.Run) {
 			paths, err := filepath.Glob(filepath.Join(r.ArtifactRoot, "attempts", "review-*", "review-outcome.json"))
+			if err != nil || len(paths) != 1 {
+				t.Fatalf("review paths=%v err=%v", paths, err)
+			}
+			mustWrite(t, paths[0], "tampered")
+		}},
+		{"review stdout", func(t *testing.T, r application.Run) {
+			paths, err := filepath.Glob(filepath.Join(r.ArtifactRoot, "attempts", "review-*", "review.stdout.jsonl"))
 			if err != nil || len(paths) != 1 {
 				t.Fatalf("review paths=%v err=%v", paths, err)
 			}

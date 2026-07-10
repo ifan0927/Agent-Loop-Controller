@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -15,17 +17,22 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 type Store struct{ db *sql.DB }
 
 func Open(path string) (*Store, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	path = absolute
 	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
 		return nil, errors.New("SQLite database path must not be a symlink")
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", sqliteDSN(path))
 	if err != nil {
 		return nil, err
 	}
@@ -40,6 +47,10 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	return store, nil
+}
+
+func sqliteDSN(path string) string {
+	return (&url.URL{Scheme: "file", Path: path}).String() + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -77,6 +88,8 @@ func (s *Store) migrate(ctx context.Context) error {
 		switch version {
 		case 1:
 			statements = migrationV1
+		case 2:
+			statements = migrationV2
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -135,6 +148,19 @@ var migrationV1 = []string{
 			UNIQUE(resource_kind, resource_name))`,
 }
 
+var migrationV2 = []string{
+	`ALTER TABLE runs ADD COLUMN lease_owner TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE runs ADD COLUMN lease_expires_unix INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE attempts ADD COLUMN stdout_hash TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE attempts ADD COLUMN stderr_hash TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE attempts ADD COLUMN stdout_size INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE attempts ADD COLUMN stderr_size INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE verifications ADD COLUMN stdout_hash TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE verifications ADD COLUMN stderr_hash TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE verifications ADD COLUMN stdout_size INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE verifications ADD COLUMN stderr_size INTEGER NOT NULL DEFAULT 0`,
+}
+
 func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput) (application.Run, bool, error) {
 	run := input.Run
 	now := time.Now().UTC()
@@ -180,22 +206,26 @@ func (s *Store) getByIdempotency(ctx context.Context, key string) (application.R
 
 const runSelect = `SELECT run_id,issue_id,idempotency_key,source_revision,raw_issue_json,raw_issue_hash,
 	normalized_task_json,task_hash,repository,repository_config_json,base_branch,working_branch,base_sha,worktree_path,artifact_root,
-	current_state,candidate_head,implementation_session_id,last_error,created_at,updated_at FROM runs`
+	current_state,candidate_head,implementation_session_id,last_error,lease_owner,lease_expires_unix,created_at,updated_at FROM runs`
 
 type rowScanner interface{ Scan(...any) error }
 
 func scanRun(row rowScanner) (application.Run, error) {
 	var run application.Run
 	var state, created, updated string
+	var leaseExpires int64
 	err := row.Scan(&run.ID, &run.IssueID, &run.IdempotencyKey, &run.SourceRevision, &run.RawIssueJSON, &run.RawIssueHash,
 		&run.NormalizedTaskJSON, &run.TaskHash, &run.Repository, &run.RepositoryConfigJSON, &run.BaseBranch, &run.WorkingBranch, &run.BaseSHA, &run.WorktreePath,
-		&run.ArtifactRoot, &state, &run.CandidateHead, &run.ImplementationSession, &run.LastError, &created, &updated)
+		&run.ArtifactRoot, &state, &run.CandidateHead, &run.ImplementationSession, &run.LastError, &run.LeaseOwner, &leaseExpires, &created, &updated)
 	if err != nil {
 		return run, err
 	}
 	run.State = domain.State(state)
 	run.CreatedAt = parseTime(created)
 	run.UpdatedAt = parseTime(updated)
+	if leaseExpires > 0 {
+		run.LeaseExpiresAt = time.Unix(0, leaseExpires).UTC()
+	}
 	return run, nil
 }
 
@@ -249,6 +279,38 @@ func (s *Store) SetLastError(ctx context.Context, id, message string) error {
 	return execOne(ctx, s.db, `UPDATE runs SET last_error=?,updated_at=? WHERE run_id=?`, message, nowText(), id)
 }
 
+func (s *Store) AcquireLease(ctx context.Context, id, owner string, expires time.Time) (bool, error) {
+	if strings.TrimSpace(owner) == "" {
+		return false, errors.New("lease owner must not be blank")
+	}
+	now := time.Now().UTC().UnixNano()
+	result, err := s.db.ExecContext(ctx, `UPDATE runs SET lease_owner=?,lease_expires_unix=?,updated_at=? WHERE run_id=? AND (lease_owner='' OR lease_expires_unix<=? OR lease_owner=?)`, owner, expires.UTC().UnixNano(), nowText(), id, now, owner)
+	if err != nil {
+		return false, err
+	}
+	count, _ := result.RowsAffected()
+	return count == 1, nil
+}
+func (s *Store) RenewLease(ctx context.Context, id, owner string, expires time.Time) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE runs SET lease_expires_unix=?,updated_at=? WHERE run_id=? AND lease_owner=? AND lease_expires_unix>?`, expires.UTC().UnixNano(), nowText(), id, owner, time.Now().UTC().UnixNano())
+	if err != nil {
+		return false, err
+	}
+	count, _ := result.RowsAffected()
+	return count == 1, nil
+}
+func (s *Store) ReleaseLease(ctx context.Context, id, owner string) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE runs SET lease_owner='',lease_expires_unix=0,updated_at=? WHERE run_id=? AND lease_owner=?`, nowText(), id, owner)
+	if err != nil {
+		return err
+	}
+	count, _ := result.RowsAffected()
+	if count == 0 {
+		return errors.New("lease release owner mismatch")
+	}
+	return nil
+}
+
 func (s *Store) BeginAttempt(ctx context.Context, runID, kind, artifactDir string) (application.Attempt, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -272,13 +334,13 @@ func (s *Store) BeginAttempt(ctx context.Context, runID, kind, artifactDir strin
 }
 
 func (s *Store) FinishAttempt(ctx context.Context, attempt application.Attempt) error {
-	return execOne(ctx, s.db, `UPDATE attempts SET status=?,codex_session_id=?,finished_at=?,exit_code=?,stdout_path=?,stderr_path=?,outcome_path=?,outcome_hash=?,error_category=? WHERE attempt_id=?`,
-		attempt.Status, attempt.SessionID, formatTime(attempt.FinishedAt), attempt.ExitCode, attempt.StdoutPath, attempt.StderrPath, attempt.OutcomePath, attempt.OutcomeHash, attempt.ErrorCategory, attempt.ID)
+	return execOne(ctx, s.db, `UPDATE attempts SET status=?,codex_session_id=?,finished_at=?,exit_code=?,stdout_path=?,stderr_path=?,stdout_hash=?,stderr_hash=?,stdout_size=?,stderr_size=?,outcome_path=?,outcome_hash=?,error_category=? WHERE attempt_id=?`,
+		attempt.Status, attempt.SessionID, formatTime(attempt.FinishedAt), attempt.ExitCode, attempt.StdoutPath, attempt.StderrPath, attempt.StdoutHash, attempt.StderrHash, attempt.StdoutSize, attempt.StderrSize, attempt.OutcomePath, attempt.OutcomeHash, attempt.ErrorCategory, attempt.ID)
 }
 
 func (s *Store) SaveVerification(ctx context.Context, record application.VerificationRecord) error {
-	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO verifications(run_id,attempt_id,verifier_id,phase,verified_head,exit_code,stdout_path,stderr_path,evidence_path,evidence_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-		record.RunID, record.AttemptID, record.VerifierID, record.Phase, record.VerifiedHead, record.ExitCode, record.StdoutPath, record.StderrPath, record.EvidencePath, record.EvidenceHash, nowText())
+	_, err := s.db.ExecContext(ctx, `INSERT INTO verifications(run_id,attempt_id,verifier_id,phase,verified_head,exit_code,stdout_path,stderr_path,stdout_hash,stderr_hash,stdout_size,stderr_size,evidence_path,evidence_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		record.RunID, record.AttemptID, record.VerifierID, record.Phase, record.VerifiedHead, record.ExitCode, record.StdoutPath, record.StderrPath, record.StdoutHash, record.StderrHash, record.StdoutSize, record.StderrSize, record.EvidencePath, record.EvidenceHash, nowText())
 	return err
 }
 func (s *Store) SaveReview(ctx context.Context, record application.ReviewRecord) error {
@@ -326,14 +388,14 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 		inspection.Timeline = append(inspection.Timeline, v)
 	}
 	rows.Close()
-	rows, err = s.db.QueryContext(ctx, `SELECT attempt_id,run_id,number,kind,status,codex_session_id,started_at,finished_at,exit_code,stdout_path,stderr_path,outcome_path,outcome_hash,artifact_dir,error_category FROM attempts WHERE run_id=? ORDER BY number`, id)
+	rows, err = s.db.QueryContext(ctx, `SELECT attempt_id,run_id,number,kind,status,codex_session_id,started_at,finished_at,exit_code,stdout_path,stderr_path,stdout_hash,stderr_hash,stdout_size,stderr_size,outcome_path,outcome_hash,artifact_dir,error_category FROM attempts WHERE run_id=? ORDER BY number`, id)
 	if err != nil {
 		return inspection, err
 	}
 	for rows.Next() {
 		var v application.Attempt
 		var started, finished string
-		if err := rows.Scan(&v.ID, &v.RunID, &v.Number, &v.Kind, &v.Status, &v.SessionID, &started, &finished, &v.ExitCode, &v.StdoutPath, &v.StderrPath, &v.OutcomePath, &v.OutcomeHash, &v.ArtifactDir, &v.ErrorCategory); err != nil {
+		if err := rows.Scan(&v.ID, &v.RunID, &v.Number, &v.Kind, &v.Status, &v.SessionID, &started, &finished, &v.ExitCode, &v.StdoutPath, &v.StderrPath, &v.StdoutHash, &v.StderrHash, &v.StdoutSize, &v.StderrSize, &v.OutcomePath, &v.OutcomeHash, &v.ArtifactDir, &v.ErrorCategory); err != nil {
 			rows.Close()
 			return inspection, err
 		}
@@ -342,14 +404,14 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 		inspection.Attempts = append(inspection.Attempts, v)
 	}
 	rows.Close()
-	rows, err = s.db.QueryContext(ctx, `SELECT verification_id,run_id,attempt_id,verifier_id,phase,verified_head,exit_code,stdout_path,stderr_path,evidence_path,evidence_hash,created_at FROM verifications WHERE run_id=? ORDER BY verification_id`, id)
+	rows, err = s.db.QueryContext(ctx, `SELECT verification_id,run_id,attempt_id,verifier_id,phase,verified_head,exit_code,stdout_path,stderr_path,stdout_hash,stderr_hash,stdout_size,stderr_size,evidence_path,evidence_hash,created_at FROM verifications WHERE run_id=? ORDER BY verification_id`, id)
 	if err != nil {
 		return inspection, err
 	}
 	for rows.Next() {
 		var v application.VerificationRecord
 		var created string
-		if err := rows.Scan(&v.ID, &v.RunID, &v.AttemptID, &v.VerifierID, &v.Phase, &v.VerifiedHead, &v.ExitCode, &v.StdoutPath, &v.StderrPath, &v.EvidencePath, &v.EvidenceHash, &created); err != nil {
+		if err := rows.Scan(&v.ID, &v.RunID, &v.AttemptID, &v.VerifierID, &v.Phase, &v.VerifiedHead, &v.ExitCode, &v.StdoutPath, &v.StderrPath, &v.StdoutHash, &v.StderrHash, &v.StdoutSize, &v.StderrSize, &v.EvidencePath, &v.EvidenceHash, &created); err != nil {
 			rows.Close()
 			return inspection, err
 		}

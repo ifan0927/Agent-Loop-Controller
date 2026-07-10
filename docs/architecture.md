@@ -143,11 +143,20 @@ not write Linear or GitHub state during implementation.
 ## Persistence direction
 
 Phase 1B uses SQLite as the authoritative source of local run state. The schema
-has an explicit migration version and persists runs, ordered transitions, Codex
+has explicit ordered migrations and persists runs, ordered transitions, Codex
 attempts, head-bound verifications, reviews, and controller-owned resources.
 Filesystem artifacts retain full JSONL, stderr, structured outcomes, and verifier
 output; SQLite retains paths, hashes, session IDs, exact SHAs, verdicts, and
 summaries needed to reject incomplete or mutated evidence.
+
+SQLite schema version 2 adds a compare-and-swap run lease with owner and expiry,
+plus digest and size bindings for Codex and verifier stdout/stderr. A local
+controller renews its lease while an external process is active and cancels the
+operation if ownership is lost. A crashed owner becomes reclaimable after the
+bounded lease expiry, preventing concurrent controllers from mutating one owned
+worktree. SQLite foreign keys and busy timeout are configured in the driver DSN
+so they apply to every physical connection, including connections recreated by
+`database/sql`.
 
 Run creation is idempotent by immutable issue/source-revision content and only
 one active run may own an issue. State transitions use a transaction with an
@@ -157,6 +166,12 @@ row and unique empty artifact directory before process execution. Candidate
 commit recovery accepts only the controller's fixed commit identity as the sole
 child of the persisted exact base; any other Git/SQLite disagreement fails
 closed.
+
+If a controller restarts with a `started` Codex attempt, it does not silently
+open a new implementation session. It recovers the explicit session ID from the
+attempt JSONL, records the interrupted attempt and session in SQLite, and uses a
+new isolated resume attempt. Missing or malformed session evidence stops for
+manual handling.
 
 The SQLite adapter uses `modernc.org/sqlite`. Its pure-Go implementation avoids a
 CGO compiler/runtime dependency and keeps local and race-test execution

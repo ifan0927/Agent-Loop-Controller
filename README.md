@@ -49,8 +49,10 @@ simulated Linear issue JSON, freezes the normalized task and local repository
 registry snapshots, provisions a controller-owned dedicated worktree, and uses
 SQLite as the authoritative run and transition state. Implementation, explicit
 session resume, verification, candidate commit, and fresh review evidence survive
-controller restarts. A successful trial stops at `approval_ready` without push or
-pull request creation.
+controller restarts. A renewable SQLite lease prevents competing local controller
+processes from operating one run concurrently, and artifact digests protect
+reused verification/review evidence. A successful trial stops at
+`approval_ready` without push or pull request creation.
 
 ## Try the contract planner
 

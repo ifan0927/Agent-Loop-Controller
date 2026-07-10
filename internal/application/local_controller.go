@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,6 +21,7 @@ import (
 )
 
 const candidateCommitSubject = "Controller-owned local candidate"
+const localLeaseTTL = 45 * time.Second
 
 type LocalRepository struct {
 	Label       string   `json:"label"`
@@ -127,6 +129,52 @@ func (c *LocalController) Start(ctx context.Context, input LocalStartInput) (Run
 }
 
 func (c *LocalController) Continue(ctx context.Context, runID string, decision *Decision) (Run, error) {
+	owner, err := randomIdentifier("controller-")
+	if err != nil {
+		return Run{}, err
+	}
+	acquired, err := c.store.AcquireLease(ctx, runID, owner, time.Now().UTC().Add(localLeaseTTL))
+	if err != nil {
+		return Run{}, fmt.Errorf("acquire run lease: %w", err)
+	}
+	if !acquired {
+		return Run{}, errors.New("run is actively leased by another controller process")
+	}
+	leaseCtx, cancelLease := context.WithCancelCause(ctx)
+	stopLease := make(chan struct{})
+	leaseDone := make(chan struct{})
+	go func() {
+		defer close(leaseDone)
+		ticker := time.NewTicker(localLeaseTTL / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopLease:
+				return
+			case <-leaseCtx.Done():
+				return
+			case <-ticker.C:
+				ok, renewErr := c.store.RenewLease(context.Background(), runID, owner, time.Now().UTC().Add(localLeaseTTL))
+				if renewErr != nil {
+					cancelLease(fmt.Errorf("renew run lease: %w", renewErr))
+					return
+				}
+				if !ok {
+					cancelLease(errors.New("run lease ownership was lost"))
+					return
+				}
+			}
+		}
+	}()
+	defer func() {
+		close(stopLease)
+		cancelLease(nil)
+		<-leaseDone
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = c.store.ReleaseLease(releaseCtx, runID, owner)
+	}()
+	ctx = leaseCtx
 	for steps := 0; steps < 20; steps++ {
 		run, err := c.store.GetRun(ctx, runID)
 		if err != nil {
@@ -298,18 +346,52 @@ func (c *LocalController) execute(ctx context.Context, run Run, decision *Decisi
 			decision = &persisted
 		}
 	}
+	recoveryResume := false
+	for _, attempt := range inspection.Attempts {
+		if attempt.ErrorCategory == "controller_restart_session_recovered" {
+			recoveryResume = true
+		}
+	}
 	for i := len(inspection.Attempts) - 1; i >= 0; i-- {
 		attempt := inspection.Attempts[i]
 		if attempt.Kind != "implementation" && attempt.Kind != "resume" {
 			continue
 		}
 		if attempt.Status == "started" {
+			stdoutPath := filepath.Join(attempt.ArtifactDir, "implementation.stdout.jsonl")
+			stderrPath := filepath.Join(attempt.ArtifactDir, "implementation.stderr.txt")
+			sessionID, recoverErr := codex.ExtractSessionIDFile(stdoutPath)
+			if recoverErr != nil {
+				attempt.Status = "failed"
+				attempt.FinishedAt = time.Now().UTC()
+				attempt.ExitCode = -1
+				attempt.ErrorCategory = "controller_restart_missing_session"
+				attempt.StdoutPath = stdoutPath
+				attempt.StderrPath = stderrPath
+				_ = c.populateAttemptCaptureDigests(&attempt)
+				if finishErr := c.store.FinishAttempt(ctx, attempt); finishErr != nil {
+					return errors.Join(recoverErr, finishErr)
+				}
+				return fmt.Errorf("interrupted attempt has no recoverable explicit session ID: %w", recoverErr)
+			}
+			if err := c.store.SetImplementationSession(ctx, run.ID, sessionID); err != nil {
+				return err
+			}
 			attempt.Status = "failed"
 			attempt.FinishedAt = time.Now().UTC()
-			attempt.ErrorCategory = "controller_restart"
+			attempt.ExitCode = -1
+			attempt.SessionID = sessionID
+			attempt.StdoutPath = stdoutPath
+			attempt.StderrPath = stderrPath
+			attempt.ErrorCategory = "controller_restart_session_recovered"
+			if err := c.populateAttemptCaptureDigests(&attempt); err != nil {
+				return err
+			}
 			if err := c.store.FinishAttempt(ctx, attempt); err != nil {
 				return err
 			}
+			run.ImplementationSession = sessionID
+			recoveryResume = true
 			break
 		}
 		if attempt.Status == "succeeded" && decision == nil {
@@ -328,7 +410,7 @@ func (c *LocalController) execute(ctx context.Context, run Run, decision *Decisi
 	kind := "implementation"
 	if run.ImplementationSession != "" {
 		kind = "resume"
-		if decision == nil {
+		if decision == nil && !recoveryResume {
 			return errors.New("explicit resume requires persisted decision evidence")
 		}
 	}
@@ -340,6 +422,8 @@ func (c *LocalController) execute(ctx context.Context, run Run, decision *Decisi
 	if err != nil {
 		return err
 	}
+	attempt.StdoutPath = filepath.Join(directory, "implementation.stdout.jsonl")
+	attempt.StderrPath = filepath.Join(directory, "implementation.stderr.txt")
 	if err := os.Mkdir(directory, 0o700); err != nil {
 		return c.failAttempt(ctx, attempt, "artifact_creation", err)
 	}
@@ -357,7 +441,10 @@ func (c *LocalController) execute(ctx context.Context, run Run, decision *Decisi
 	if kind == "implementation" {
 		result, err = c.codex.Implementation(ctx, c.commands.Implementation(task, run.WorktreePath, directory), directory)
 	} else {
-		instructions := fmt.Sprintf("Human decision: %s\n\n%s", decision.ChoiceID, decision.Instructions)
+		instructions := "Controller restarted after an interrupted attempt. Inspect the current owned worktree, continue the same task safely, and return a new structured outcome."
+		if decision != nil {
+			instructions = fmt.Sprintf("Human decision: %s\n\n%s", decision.ChoiceID, decision.Instructions)
+		}
 		spec, specErr := c.commands.Resume(run.ImplementationSession, run.WorktreePath, directory, instructions)
 		if specErr != nil {
 			return c.failAttempt(ctx, attempt, "resume_command", specErr)
@@ -379,6 +466,9 @@ func (c *LocalController) execute(ctx context.Context, run Run, decision *Decisi
 	attempt.ExitCode = result.Process.ExitCode
 	attempt.StdoutPath = result.Process.StdoutPath
 	attempt.StderrPath = result.Process.StderrPath
+	if err := c.populateAttemptCaptureDigests(&attempt); err != nil {
+		return c.failAttempt(ctx, attempt, "capture_digest", err)
+	}
 	attempt.OutcomePath = filepath.Join(directory, "implementation-outcome.json")
 	attempt.OutcomeHash, err = fileHash(attempt.OutcomePath)
 	if err != nil {
@@ -543,7 +633,12 @@ func (c *LocalController) runVerification(ctx context.Context, run Run, phase st
 		return evidence, errors.Join(runErr, hashErr)
 	}
 	for _, check := range evidence.Checks {
-		if err := c.store.SaveVerification(ctx, VerificationRecord{RunID: run.ID, VerifierID: check.VerifierID, Phase: phase, VerifiedHead: evidence.VerifiedHeadSHA, ExitCode: check.ExitCode, StdoutPath: check.StdoutPath, StderrPath: check.StderrPath, EvidencePath: path, EvidenceHash: hash}); err != nil {
+		stdoutHash, stdoutSize, stdoutErr := fileDigest(check.StdoutPath)
+		stderrHash, stderrSize, stderrErr := fileDigest(check.StderrPath)
+		if stdoutErr != nil || stderrErr != nil {
+			return evidence, errors.Join(runErr, stdoutErr, stderrErr)
+		}
+		if err := c.store.SaveVerification(ctx, VerificationRecord{RunID: run.ID, VerifierID: check.VerifierID, Phase: phase, VerifiedHead: evidence.VerifiedHeadSHA, ExitCode: check.ExitCode, StdoutPath: check.StdoutPath, StderrPath: check.StderrPath, StdoutHash: stdoutHash, StderrHash: stderrHash, StdoutSize: stdoutSize, StderrSize: stderrSize, EvidencePath: path, EvidenceHash: hash}); err != nil {
 			return evidence, errors.Join(runErr, err)
 		}
 	}
@@ -579,6 +674,8 @@ func (c *LocalController) freshReview(ctx context.Context, run Run) error {
 	if err != nil {
 		return err
 	}
+	attempt.StdoutPath = filepath.Join(directory, "review.stdout.jsonl")
+	attempt.StderrPath = filepath.Join(directory, "review.stderr.txt")
 	if err := os.Mkdir(directory, 0o700); err != nil {
 		return c.failAttempt(ctx, attempt, "artifact_creation", err)
 	}
@@ -604,6 +701,9 @@ func (c *LocalController) freshReview(ctx context.Context, run Run) error {
 	attempt.ExitCode = result.Process.ExitCode
 	attempt.StdoutPath = result.Process.StdoutPath
 	attempt.StderrPath = result.Process.StderrPath
+	if err := c.populateAttemptCaptureDigests(&attempt); err != nil {
+		return c.failAttempt(ctx, attempt, "capture_digest", err)
+	}
 	attempt.OutcomePath = filepath.Join(directory, "review-outcome.json")
 	attempt.OutcomeHash, err = fileHash(attempt.OutcomePath)
 	if err != nil {
@@ -632,6 +732,24 @@ func (c *LocalController) authorizeReview(ctx context.Context, run Run, outcome 
 		if record.Phase == "candidate" && record.VerifiedHead == run.CandidateHead && record.ExitCode == 0 {
 			verificationHead = record.VerifiedHead
 		}
+	}
+	if !hasCompleteVerification(inspection.Verifications, run.CandidateHead, taskVerifierIDs(run.NormalizedTaskJSON)) {
+		return errors.New("candidate verification evidence is incomplete")
+	}
+	if err := validateVerificationFiles(inspection.Verifications, run.CandidateHead); err != nil {
+		return err
+	}
+	reviewValidated := false
+	for _, record := range inspection.Reviews {
+		if record.ReviewedHead == run.CandidateHead && record.OutcomePath == evidence {
+			if err := validateReviewAttempt(inspection.Attempts, record); err != nil {
+				return err
+			}
+			reviewValidated = true
+		}
+	}
+	if !reviewValidated {
+		return errors.New("review attempt evidence is missing")
 	}
 	head, err := c.git.Head(ctx, run.WorktreePath)
 	if err != nil {
@@ -685,14 +803,13 @@ func validateReviewAttempt(attempts []Attempt, review ReviewRecord) error {
 		if attempt.Kind != "review" || attempt.Status != "succeeded" || attempt.SessionID != review.SessionID || attempt.OutcomePath != review.OutcomePath {
 			return errors.New("review attempt evidence does not match review record")
 		}
-		for _, path := range []string{attempt.StdoutPath, attempt.StderrPath} {
-			info, err := os.Lstat(path)
-			if err != nil {
-				return fmt.Errorf("review artifact missing: %w", err)
-			}
-			if !info.Mode().IsRegular() {
-				return errors.New("review artifact must be a regular file")
-			}
+		stdoutHash, stdoutSize, stdoutErr := fileDigest(attempt.StdoutPath)
+		stderrHash, stderrSize, stderrErr := fileDigest(attempt.StderrPath)
+		if stdoutErr != nil || stderrErr != nil {
+			return errors.Join(stdoutErr, stderrErr)
+		}
+		if stdoutHash != attempt.StdoutHash || stderrHash != attempt.StderrHash || stdoutSize != attempt.StdoutSize || stderrSize != attempt.StderrSize {
+			return errors.New("review output digest or size mismatch")
 		}
 		return nil
 	}
@@ -742,8 +859,21 @@ func (c *LocalController) failAttempt(ctx context.Context, attempt Attempt, cate
 	attempt.FinishedAt = time.Now().UTC()
 	attempt.ExitCode = -1
 	attempt.ErrorCategory = category
+	if attempt.StdoutPath != "" && attempt.StderrPath != "" {
+		_ = c.populateAttemptCaptureDigests(&attempt)
+	}
 	_ = c.store.FinishAttempt(ctx, attempt)
 	return cause
+}
+
+func (c *LocalController) populateAttemptCaptureDigests(attempt *Attempt) error {
+	var err error
+	attempt.StdoutHash, attempt.StdoutSize, err = fileDigest(attempt.StdoutPath)
+	if err != nil {
+		return err
+	}
+	attempt.StderrHash, attempt.StderrSize, err = fileDigest(attempt.StderrPath)
+	return err
 }
 
 func decodeTaskSnapshot(value string) (domain.CodingTask, error) {
@@ -759,11 +889,19 @@ func decodeTaskSnapshot(value string) (domain.CodingTask, error) {
 	return task, nil
 }
 func newArtifactDirectoryPath(root, kind string) (string, error) {
-	var value [8]byte
+	value, err := randomIdentifier(kind + "-")
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "attempts", value), nil
+}
+
+func randomIdentifier(prefix string) (string, error) {
+	var value [16]byte
 	if _, err := rand.Read(value[:]); err != nil {
 		return "", err
 	}
-	return filepath.Join(root, "attempts", kind+"-"+hex.EncodeToString(value[:])), nil
+	return prefix + hex.EncodeToString(value[:]), nil
 }
 func newArtifactDirectory(root, kind string) (string, error) {
 	path, err := newArtifactDirectoryPath(root, kind)
@@ -779,12 +917,29 @@ func newArtifactDirectory(root, kind string) (string, error) {
 	return path, nil
 }
 func fileHash(path string) (string, error) {
-	data, err := os.ReadFile(path)
+	hash, _, err := fileDigest(path)
+	return hash, err
+}
+
+func fileDigest(path string) (string, int64, error) {
+	info, err := os.Lstat(path)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:]), nil
+	if !info.Mode().IsRegular() {
+		return "", 0, errors.New("artifact must be a regular file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer file.Close()
+	digest := sha256.New()
+	size, err := io.Copy(digest, file)
+	if err != nil {
+		return "", 0, err
+	}
+	return hex.EncodeToString(digest.Sum(nil)), size, nil
 }
 
 func bytesHash(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeToString(sum[:]) }
@@ -882,14 +1037,13 @@ func validateVerificationFiles(records []VerificationRecord, head string) error 
 		if hash != record.EvidenceHash || record.ExitCode != 0 {
 			return errors.New("malformed candidate verification evidence")
 		}
-		for _, path := range []string{record.StdoutPath, record.StderrPath} {
-			info, err := os.Lstat(path)
-			if err != nil {
-				return fmt.Errorf("verification artifact missing: %w", err)
-			}
-			if !info.Mode().IsRegular() {
-				return errors.New("verification artifact must be a regular file")
-			}
+		stdoutHash, stdoutSize, stdoutErr := fileDigest(record.StdoutPath)
+		stderrHash, stderrSize, stderrErr := fileDigest(record.StderrPath)
+		if stdoutErr != nil || stderrErr != nil {
+			return errors.Join(stdoutErr, stderrErr)
+		}
+		if stdoutHash != record.StdoutHash || stderrHash != record.StderrHash || stdoutSize != record.StdoutSize || stderrSize != record.StderrSize {
+			return errors.New("verification output digest or size mismatch")
 		}
 	}
 	return nil

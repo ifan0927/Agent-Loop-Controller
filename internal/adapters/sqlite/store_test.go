@@ -2,10 +2,12 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
@@ -59,6 +61,89 @@ func TestDatabaseIsPrivateAndMigrationIsIdempotent(t *testing.T) {
 	version, err := store.SchemaVersion(context.Background())
 	if err != nil || version != schemaVersion {
 		t.Fatalf("version=%d err=%v", version, err)
+	}
+}
+
+func TestMigratesVersionOneDatabaseToVersionTwo(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "controller.db")
+	db, err := sql.Open("sqlite", sqliteDSN(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range migrationV1 {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO schema_migrations(version,applied_at) VALUES(1,'v1')`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	version, err := store.SchemaVersion(context.Background())
+	if err != nil || version != 2 {
+		t.Fatalf("version=%d err=%v", version, err)
+	}
+	var count int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name IN ('lease_owner','lease_expires_unix')`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatal("v2 run lease columns are missing")
+	}
+}
+
+func TestForeignKeysRemainEnabledAfterConnectionRecreation(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.db.SetMaxIdleConns(0)
+	if err := store.db.PingContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.db.Exec(`INSERT INTO attempts(run_id,number,kind,status,started_at,artifact_dir) VALUES('missing',1,'implementation','started','now','/tmp/missing')`)
+	if err == nil {
+		t.Fatal("foreign key constraint must survive a recreated connection")
+	}
+}
+
+func TestRunLeaseUsesOwnerCASAndExpiry(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	input := application.CreateRunInput{Run: application.Run{ID: "run-1", IssueID: "ISSUE-1", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "repo:test-project", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "ifan/test", ArtifactRoot: "/tmp/run"}}
+	if _, _, err := store.CreateRun(context.Background(), input); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(time.Minute)
+	if ok, err := store.AcquireLease(context.Background(), "run-1", "owner-1", future); err != nil || !ok {
+		t.Fatalf("acquire=%v err=%v", ok, err)
+	}
+	if ok, err := store.AcquireLease(context.Background(), "run-1", "owner-2", future); err != nil || ok {
+		t.Fatalf("competing acquire=%v err=%v", ok, err)
+	}
+	if ok, err := store.RenewLease(context.Background(), "run-1", "owner-1", future.Add(time.Minute)); err != nil || !ok {
+		t.Fatalf("renew=%v err=%v", ok, err)
+	}
+	if err := store.ReleaseLease(context.Background(), "run-1", "owner-2"); err == nil {
+		t.Fatal("wrong owner released lease")
+	}
+	if err := store.ReleaseLease(context.Background(), "run-1", "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := store.AcquireLease(context.Background(), "run-1", "owner-2", time.Now().Add(time.Minute)); err != nil || !ok {
+		t.Fatalf("reacquire=%v err=%v", ok, err)
 	}
 }
 

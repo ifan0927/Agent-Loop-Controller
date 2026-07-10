@@ -154,6 +154,15 @@ func extractSessionID(jsonl io.Reader) (string, error) {
 	return sessionID, nil
 }
 
+func ExtractSessionIDFile(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	return extractSessionID(file)
+}
+
 func structuredPaths(command CommandSpec) (outputPath, schemaPath string, err error) {
 	for index := 0; index < len(command.Args)-1; index++ {
 		switch command.Args[index] {
