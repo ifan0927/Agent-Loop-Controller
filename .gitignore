@@ -1,0 +1,5 @@
+/bin/
+/dist/
+/runs/
+*.log
+.DS_Store

@@ -1,0 +1,30 @@
+{
+  "run_id": "run-example-001",
+  "issue_id": "IFAN-123",
+  "issue_url": "https://linear.app/example/issue/IFAN-123/example-task",
+  "title": "Example coding-ready task",
+  "description": "Demonstrates the immutable controller-to-executor contract.",
+  "repository": "ifan0927/STDS_backend_go",
+  "base_branch": "dev",
+  "working_branch": "ifan/ifan-123-example-task",
+  "goal": "Implement the scoped example behavior without expanding the issue.",
+  "acceptance_criteria": [
+    "The requested behavior is implemented.",
+    "Relevant tests pass."
+  ],
+  "out_of_scope": [
+    "Deployment and production changes."
+  ],
+  "verifier_ids": [
+    "go-test-all"
+  ],
+  "policy": {
+    "human_approval_required": true,
+    "merge_method": "squash",
+    "max_repair_attempts": 3,
+    "allow_scope_expansion": false,
+    "create_derived_issues": true
+  },
+  "source_revision": "linear-updated-at-or-content-hash",
+  "created_at": "2026-07-10T00:00:00Z"
+}

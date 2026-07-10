@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ReviewOutcome",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "reviewed_head_sha", "findings"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["pass", "findings", "failed"] },
+    "summary": { "type": "string" },
+    "reviewed_head_sha": { "type": "string" },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "severity", "title", "body", "file", "line"],
+        "properties": {
+          "id": { "type": "string" },
+          "severity": { "type": "string", "enum": ["critical", "high", "medium", "low"] },
+          "title": { "type": "string" },
+          "body": { "type": "string" },
+          "file": { "type": ["string", "null"] },
+          "line": { "type": ["integer", "null"], "minimum": 1 }
+        }
+      }
+    }
+  }
+}

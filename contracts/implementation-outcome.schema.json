@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ImplementationOutcome",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "summary",
+    "decision_request",
+    "discovered_issues",
+    "suggested_checks",
+    "implementation_sha"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["completed", "needs_human_decision", "blocked", "failed"]
+    },
+    "summary": { "type": "string" },
+    "decision_request": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["question", "context", "options", "recommendation", "blocking_reason"],
+      "properties": {
+        "question": { "type": "string" },
+        "context": { "type": "string" },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "description"],
+            "properties": {
+              "id": { "type": "string" },
+              "description": { "type": "string" }
+            }
+          }
+        },
+        "recommendation": {
+          "type": "string",
+          "description": "The exact ID of one option, not free-form prose."
+        },
+        "blocking_reason": { "type": "string" }
+      }
+    },
+    "discovered_issues": { "type": "array", "items": { "type": "string" } },
+    "suggested_checks": { "type": "array", "items": { "type": "string" } },
+    "implementation_sha": { "type": ["string", "null"] }
+  }
+}
