@@ -13,6 +13,18 @@ type Workspace struct {
 	Binary string
 }
 
+func (w Workspace) CommitMetadata(ctx context.Context, directory, head string) (parent, subject string, err error) {
+	parentOutput, err := w.run(ctx, directory, "rev-parse", head+"^")
+	if err != nil {
+		return "", "", err
+	}
+	subjectOutput, err := w.run(ctx, directory, "show", "-s", "--format=%s", head)
+	if err != nil {
+		return "", "", err
+	}
+	return strings.TrimSpace(parentOutput), strings.TrimSpace(subjectOutput), nil
+}
+
 func (w Workspace) Head(ctx context.Context, directory string) (string, error) {
 	output, err := w.run(ctx, directory, "rev-parse", "HEAD")
 	if err != nil {

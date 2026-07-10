@@ -22,10 +22,20 @@ var requiredExecFlags = []string{
 	"--ephemeral",
 }
 
+var requiredResumeFlags = []string{
+	"--ignore-user-config",
+	"--config",
+	"--json",
+	"--output-schema",
+	"--output-last-message",
+}
+
 type PreflightEvidence struct {
-	Version       string   `json:"version"`
-	RequiredFlags []string `json:"required_flags"`
-	MissingFlags  []string `json:"missing_flags"`
+	Version               string   `json:"version"`
+	RequiredFlags         []string `json:"required_flags"`
+	MissingFlags          []string `json:"missing_flags"`
+	ResumeFlags           []string `json:"required_resume_flags"`
+	ExplicitResumeSession bool     `json:"explicit_resume_session"`
 }
 
 type Preflighter struct {
@@ -74,14 +84,41 @@ func (p Preflighter) Run(ctx context.Context, artifacts string) (PreflightEviden
 			missing = append(missing, flag)
 		}
 	}
+	resumeHelp, err := p.process.Run(ctx, processadapter.Spec{
+		Program: p.binary, Args: []string{"exec", "resume", "--help"},
+		StdoutPath: filepath.Join(artifacts, "codex-exec-resume-help.stdout.txt"),
+		StderrPath: filepath.Join(artifacts, "codex-exec-resume-help.stderr.txt"),
+	})
+	if err != nil {
+		return PreflightEvidence{}, fmt.Errorf("codex exec resume help: %w", err)
+	}
+	if resumeHelp.ExitCode != 0 {
+		return PreflightEvidence{}, fmt.Errorf("codex exec resume --help exited with code %d", resumeHelp.ExitCode)
+	}
+	resumeOutput, err := boundedStdout(resumeHelp, 1<<20)
+	if err != nil {
+		return PreflightEvidence{}, fmt.Errorf("read codex exec resume help: %w", err)
+	}
+	resumeFlags := declaredLongOptions(string(resumeOutput))
+	for _, flag := range requiredResumeFlags {
+		if _, ok := resumeFlags[flag]; !ok {
+			missing = append(missing, "resume:"+flag)
+		}
+	}
+	explicitResume := strings.Contains(string(resumeOutput), "[SESSION_ID]")
+	if !explicitResume {
+		missing = append(missing, "resume:[SESSION_ID]")
+	}
 	versionOutput, err := boundedStdout(version, 4096)
 	if err != nil {
 		return PreflightEvidence{}, fmt.Errorf("read codex version: %w", err)
 	}
 	evidence := PreflightEvidence{
-		Version:       strings.TrimSpace(string(versionOutput)),
-		RequiredFlags: append([]string(nil), requiredExecFlags...),
-		MissingFlags:  missing,
+		Version:               strings.TrimSpace(string(versionOutput)),
+		RequiredFlags:         append([]string(nil), requiredExecFlags...),
+		MissingFlags:          missing,
+		ResumeFlags:           append([]string(nil), requiredResumeFlags...),
+		ExplicitResumeSession: explicitResume,
 	}
 	if evidence.Version == "" {
 		return PreflightEvidence{}, fmt.Errorf("codex --version returned an empty version")

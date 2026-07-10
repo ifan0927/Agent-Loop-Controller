@@ -14,6 +14,15 @@ func TestPROpenIsNotAGenericStateTransition(t *testing.T) {
 	}
 }
 
+func TestFreshReviewCanReachApprovalReadyButNotPROpen(t *testing.T) {
+	if !CanTransition(StateFreshReview, StateApprovalReady) {
+		t.Fatal("passing guarded review must be able to reach approval_ready")
+	}
+	if CanTransition(StateApprovalReady, StatePROpen) {
+		t.Fatal("local approval_ready must not imply PR creation")
+	}
+}
+
 func TestCodeRabbitChangeReturnsToRepair(t *testing.T) {
 	if !CanTransition(StateCodeRabbitReview, StateRepairing) {
 		t.Fatal("CodeRabbit findings must return the run to repair")

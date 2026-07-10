@@ -17,11 +17,17 @@ func (p preflightProcess) Run(_ context.Context, spec processadapter.Spec) (proc
 	if len(spec.Args) == 1 && spec.Args[0] == "--version" {
 		return processadapter.Result{Stdout: []byte("codex-cli test\n")}, nil
 	}
-	lines := make([]string, 0, len(requiredExecFlags))
-	for _, flag := range requiredExecFlags {
+	flags := requiredExecFlags
+	prefix := ""
+	if len(spec.Args) >= 2 && spec.Args[1] == "resume" {
+		flags = requiredResumeFlags
+		prefix = "Usage: codex exec resume [OPTIONS] [SESSION_ID]\n"
+	}
+	lines := make([]string, 0, len(flags))
+	for _, flag := range flags {
 		lines = append(lines, "      "+flag)
 	}
-	help := strings.Join(lines, "\n")
+	help := prefix + strings.Join(lines, "\n")
 	help = strings.ReplaceAll(help, p.missing, "")
 	help += "\n" + p.extraHelp
 	return processadapter.Result{Stdout: []byte(help)}, nil

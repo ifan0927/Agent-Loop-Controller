@@ -45,6 +45,10 @@ func (e Executor) Implementation(ctx context.Context, spec CommandSpec, artifact
 	return e.runner.Implementation(ctx, spec, artifacts)
 }
 
+func (e Executor) Resume(ctx context.Context, spec CommandSpec, artifacts string) (StructuredResult[domain.AgentOutcome], error) {
+	return e.runner.Implementation(ctx, spec, artifacts)
+}
+
 func (e Executor) Review(ctx context.Context, spec CommandSpec, artifacts string) (StructuredResult[domain.ReviewOutcome], error) {
 	return e.runner.Review(ctx, spec, artifacts)
 }

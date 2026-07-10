@@ -6,6 +6,9 @@ Prove one reliable vertical slice from an explicitly triggered, coding-ready
 Linear issue to a human-approved squash-merged PR, using Mac Codex CLI as the
 executor.
 
+Phase 1B proves the durable local subset with simulated issue input and stops at
+`approval_ready`; it does not claim PR or external-system completion.
+
 ## In scope
 
 - Manual `start IFAN-xxx` admission signal.

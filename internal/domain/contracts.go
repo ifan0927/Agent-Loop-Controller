@@ -119,6 +119,15 @@ func validVerifierID(value string) bool {
 	return true
 }
 
+// ValidateVerifierID validates an untrusted verifier identifier without
+// accepting executable command text.
+func ValidateVerifierID(value string) error {
+	if !validVerifierID(value) {
+		return fmt.Errorf("invalid verifier ID: %q", value)
+	}
+	return nil
+}
+
 func validGitBranch(value string) bool {
 	if value == "" || strings.HasPrefix(value, "-") || strings.HasPrefix(value, "/") ||
 		strings.HasSuffix(value, "/") || strings.HasSuffix(value, ".") ||
@@ -137,6 +146,15 @@ func validGitBranch(value string) bool {
 		}
 	}
 	return true
+}
+
+// ValidateGitBranch validates an untrusted branch name before it is passed to
+// Git as a positional argument.
+func ValidateGitBranch(value string) error {
+	if !validGitBranch(value) {
+		return errors.New("unsafe Git branch name")
+	}
+	return nil
 }
 
 func blankItem(values []string) bool {

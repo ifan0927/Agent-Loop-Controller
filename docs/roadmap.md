@@ -19,15 +19,24 @@
   and approval-ready simulation.
 - No Linear, durable state, push, pull request, or external approval workflow.
 
+### Phase 1B: Local durable controller trial
+
+- Simulated Linear issue admission and immutable task/source snapshots.
+- Controller-owned local repository/verifier registry and dedicated worktree.
+- Versioned SQLite run, transition, attempt, verification, review, and resource
+  ownership state.
+- Restart reconciliation, idempotent start/continue, and explicit-session Codex
+  resume using isolated attempt artifacts.
+- Exact-HEAD candidate verification, fresh structured review, and guarded local
+  `approval_ready` state.
+- Disposable fake-process integration plus opt-in real happy-path and resume
+  smoke scripts.
+- No real Linear adapter, push, pull request, CodeRabbit, merge, or cleanup.
+
 ### Later Phase 1 slices
 
-- SQLite run store and transition journal.
 - Linear read adapter and IFAN admission policy.
-- Repository registry and worktree manager.
-- Codex subprocess runner with CLI capability preflight, version recording,
-  JSONL/session capture, and cancellation.
-- Repository verification runner.
-- Fresh review and repair loop.
+- Review-finding repair and re-review loop.
 - GitHub PR publisher and human-gated finalizer.
 - Crash recovery and reconciliation CLI.
 

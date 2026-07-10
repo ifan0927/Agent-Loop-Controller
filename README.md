@@ -44,6 +44,14 @@ executes controller-owned verification, creates a local candidate commit, and
 stops at an approval-ready simulation. It does not call Linear, push a branch,
 open a pull request, or write durable run state.
 
+Phase 1B adds an experimental local durable controller trial. It admits a
+simulated Linear issue JSON, freezes the normalized task and local repository
+registry snapshots, provisions a controller-owned dedicated worktree, and uses
+SQLite as the authoritative run and transition state. Implementation, explicit
+session resume, verification, candidate commit, and fresh review evidence survive
+controller restarts. A successful trial stops at `approval_ready` without push or
+pull request creation.
+
 ## Try the contract planner
 
 ```sh
@@ -83,6 +91,42 @@ local repositories:
 ```sh
 ./scripts/live-spike.sh
 ```
+
+## Run the local durable trial
+
+Create an isolated local lab containing a bare origin, source checkout,
+worktree/run roots, registry, and simulated issue:
+
+```sh
+lab="$(./scripts/create-local-lab.sh)"
+go run ./cmd/ifan-loop local start \
+  --issue "$lab/simulated-issue.json" \
+  --registry "$lab/repository-registry.json" \
+  --db "$lab/controller.db" \
+  --run-root "$lab/runs" \
+  --worktree-root "$lab/worktrees"
+```
+
+Inspect or continue the persisted run after restarting the process:
+
+```sh
+go run ./cmd/ifan-loop local status <run-id> --db "$lab/controller.db"
+go run ./cmd/ifan-loop local inspect <run-id> --db "$lab/controller.db"
+go run ./cmd/ifan-loop local continue <run-id> \
+  --db "$lab/controller.db" \
+  --decision "$lab/decision.json"
+```
+
+The two real-model Phase 1B smoke paths are opt-in and retain their disposable
+labs for inspection:
+
+```sh
+./scripts/live-local-durable.sh
+./scripts/live-local-resume.sh
+```
+
+The local repository registry contains paths and allowed verifier IDs only.
+Executable verifier commands remain compiled controller policy.
 
 ## Documentation
 

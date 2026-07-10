@@ -3,16 +3,22 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"time"
 
 	codexadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/codex"
 	gitadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/git"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/localissue"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/localregistry"
 	processadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/process"
+	sqlitestore "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/verifier"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
@@ -34,6 +40,8 @@ func main() {
 		err = plan(os.Args[2:])
 	case "spike":
 		err = spike(os.Args[2:])
+	case "local":
+		err = local(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -42,6 +50,206 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+func local(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: ifan-loop local <start|continue|status|inspect>")
+	}
+	switch args[0] {
+	case "start":
+		return localStart(args[1:])
+	case "continue":
+		return localContinue(args[1:])
+	case "status", "inspect":
+		return localInspect(args[0], args[1:])
+	default:
+		return fmt.Errorf("unknown experimental local command: %s", args[0])
+	}
+}
+
+func localStart(args []string) error {
+	flags := flag.NewFlagSet("local start", flag.ContinueOnError)
+	issuePath := flags.String("issue", "", "simulated Linear issue JSON")
+	registryPath := flags.String("registry", "", "controller-owned local repository registry JSON")
+	dbPath := flags.String("db", "", "SQLite controller database")
+	runRoot := flags.String("run-root", "", "absolute run artifact root")
+	worktreeRoot := flags.String("worktree-root", "", "absolute dedicated worktree root")
+	codexBinary := flags.String("codex-binary", "codex", "Codex CLI binary")
+	timeout := flags.Duration("timeout", 30*time.Minute, "local run timeout")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *issuePath == "" || *registryPath == "" || *dbPath == "" || *runRoot == "" || *worktreeRoot == "" {
+		return fmt.Errorf("--issue, --registry, --db, --run-root, and --worktree-root are required")
+	}
+	registry, err := localregistry.Load(*registryPath)
+	if err != nil {
+		return fmt.Errorf("load registry: %w", err)
+	}
+	file, err := os.Open(*issuePath)
+	if err != nil {
+		return err
+	}
+	issue, raw, decodeErr := localissue.Decode(file)
+	file.Close()
+	if decodeErr != nil {
+		return decodeErr
+	}
+	snapshot, err := localissue.Admit(issue, raw, registry)
+	if err != nil {
+		return fmt.Errorf("simulated admission: %w", err)
+	}
+	repo, err := registry.Resolve(snapshot.Task.Repository)
+	if err != nil {
+		return err
+	}
+	store, err := sqlitestore.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	controller := newLocalController(store, *codexBinary, *worktreeRoot)
+	ctx, cancel := localContext(*timeout)
+	defer cancel()
+	run, err := controller.Start(ctx, application.LocalStartInput{Task: snapshot.Task, RawIssueJSON: snapshot.RawJSON, RawIssueHash: snapshot.RawHash,
+		NormalizedJSON: snapshot.NormalizedJSON, TaskHash: snapshot.TaskHash, IdempotencyKey: snapshot.IdempotencyKey,
+		Repository: application.LocalRepository{Label: repo.Label, OriginPath: repo.OriginPath, SourcePath: repo.SourcePath, BaseBranch: repo.BaseBranch, VerifierIDs: repo.VerifierIDs},
+		RunRoot:    *runRoot, WorktreeRoot: *worktreeRoot})
+	if err != nil {
+		return err
+	}
+	return printJSON(run)
+}
+
+func localContinue(args []string) error {
+	flags := flag.NewFlagSet("local continue", flag.ContinueOnError)
+	dbPath := flags.String("db", "", "SQLite controller database")
+	decisionPath := flags.String("decision", "", "optional simulated human decision JSON")
+	codexBinary := flags.String("codex-binary", "codex", "Codex CLI binary")
+	timeout := flags.Duration("timeout", 30*time.Minute, "local run timeout")
+	runID, flagArgs := splitLeadingRunID(args)
+	if err := flags.Parse(flagArgs); err != nil {
+		return err
+	}
+	if runID == "" && flags.NArg() == 1 {
+		runID = flags.Arg(0)
+	}
+	if runID == "" || *dbPath == "" {
+		return fmt.Errorf("usage: ifan-loop local continue <run-id> --db <controller.db> [--decision <decision.json>]")
+	}
+	store, err := sqlitestore.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	existing, err := store.GetRun(context.Background(), runID)
+	if err != nil {
+		return err
+	}
+	var decision *application.Decision
+	if *decisionPath != "" {
+		file, err := os.Open(*decisionPath)
+		if err != nil {
+			return err
+		}
+		value, decodeErr := decodeDecision(file)
+		file.Close()
+		if decodeErr != nil {
+			return decodeErr
+		}
+		decision = &value
+	}
+	controller := newLocalController(store, *codexBinary, filepath.Dir(existing.WorktreePath))
+	ctx, cancel := localContext(*timeout)
+	defer cancel()
+	run, err := controller.Continue(ctx, runID, decision)
+	if err != nil {
+		return err
+	}
+	return printJSON(run)
+}
+
+func decodeDecision(reader io.Reader) (application.Decision, error) {
+	var value application.Decision
+	decoder := json.NewDecoder(reader)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&value); err != nil {
+		return value, err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return value, errors.New("decision input must contain exactly one JSON value")
+		}
+		return value, fmt.Errorf("unexpected decision trailing data: %w", err)
+	}
+	return value, nil
+}
+
+func localInspect(command string, args []string) error {
+	flags := flag.NewFlagSet("local "+command, flag.ContinueOnError)
+	dbPath := flags.String("db", "", "SQLite controller database")
+	runID, flagArgs := splitLeadingRunID(args)
+	if err := flags.Parse(flagArgs); err != nil {
+		return err
+	}
+	if runID == "" && flags.NArg() == 1 {
+		runID = flags.Arg(0)
+	}
+	if runID == "" || *dbPath == "" {
+		return fmt.Errorf("usage: ifan-loop local %s <run-id> --db <controller.db>", command)
+	}
+	store, err := sqlitestore.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	inspection, err := store.Inspect(context.Background(), runID)
+	if err != nil {
+		return err
+	}
+	return printJSON(inspection)
+}
+
+func splitLeadingRunID(args []string) (string, []string) {
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		return args[0], args[1:]
+	}
+	return "", args
+}
+
+type commandWorktrees struct{ manager gitadapter.WorktreeManager }
+
+func (w commandWorktrees) Provision(ctx context.Context, spec application.WorktreeSpec) (application.WorktreeRecord, error) {
+	e, err := w.manager.Provision(ctx, gitadapter.WorktreeRequest{SourcePath: spec.SourcePath, OriginPath: spec.OriginPath, BaseBranch: spec.BaseBranch, Branch: spec.Branch, Path: spec.Path})
+	if err != nil {
+		return application.WorktreeRecord{}, err
+	}
+	return application.WorktreeRecord{SourcePath: e.SourcePath, OriginPath: e.OriginPath, Path: e.Path, Branch: e.Branch, BaseBranch: e.BaseBranch, BaseSHA: e.BaseSHA}, nil
+}
+func (w commandWorktrees) ValidateOwned(ctx context.Context, r application.WorktreeRecord) error {
+	return w.manager.ValidateOwned(ctx, gitadapter.WorktreeEvidence{SourcePath: r.SourcePath, OriginPath: r.OriginPath, Path: r.Path, Branch: r.Branch, BaseBranch: r.BaseBranch, BaseSHA: r.BaseSHA})
+}
+
+func newLocalController(store application.RunStore, codexBinary, worktreeRoot string) *application.LocalController {
+	process := processadapter.OSRunner{}
+	git := gitadapter.Workspace{}
+	registry := verifier.NewRegistry(localregistry.BuiltinVerifierCommands(), process, git)
+	executor := codexadapter.NewExecutor(process, codexBinary)
+	return application.NewLocalController(store, commandWorktrees{gitadapter.WorktreeManager{}}, executor, registry, git, codexBinary, worktreeRoot)
+}
+func localContext(timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	timed, cancel := context.WithTimeout(ctx, timeout)
+	return timed, func() { cancel(); stop() }
+}
+func printJSON(value any) error {
+	output, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(output))
+	return nil
 }
 
 func spike(args []string) error {
@@ -142,5 +350,5 @@ func decodeTask(reader io.Reader) (domain.CodingTask, error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: ifan-loop <version|plan|spike> [options]")
+	fmt.Fprintln(os.Stderr, "usage: ifan-loop <version|plan|spike|local> [options]")
 }

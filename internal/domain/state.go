@@ -13,6 +13,7 @@ const (
 	StateAwaitingHumanDecision State = "awaiting_human_decision"
 	StateVerifying             State = "verifying"
 	StateFreshReview           State = "fresh_review"
+	StateApprovalReady         State = "approval_ready"
 	StateRepairing             State = "repairing"
 	StatePROpen                State = "pr_open"
 	StateCodeRabbitReview      State = "coderabbit_review"
@@ -30,7 +31,8 @@ var allowedTransitions = map[State]map[State]struct{}{
 	StateExecuting:             set(StateAwaitingHumanDecision, StateVerifying, StateFailed),
 	StateAwaitingHumanDecision: set(StateExecuting, StateFailed),
 	StateVerifying:             set(StateFreshReview, StateRepairing, StateFailed),
-	StateFreshReview:           set(StateRepairing, StateFailed),
+	StateFreshReview:           set(StateApprovalReady, StateRepairing, StateFailed),
+	StateApprovalReady:         set(StateFailed),
 	StateRepairing:             set(StateExecuting, StateFailed),
 	StatePROpen:                set(StateCodeRabbitReview, StateFailed),
 	StateCodeRabbitReview:      set(StateAwaitingHumanApproval, StateRepairing, StateFailed),

@@ -142,7 +142,28 @@ not write Linear or GitHub state during implementation.
 
 ## Persistence direction
 
-The MVP should add SQLite as the durable source of run state. External events are
-at-least-once and must be deduplicated by request/event ID. Every transition must
-record its reason and evidence. A periodic reconciler will eventually repair
-missed or reordered Linear and GitHub events.
+Phase 1B uses SQLite as the authoritative source of local run state. The schema
+has an explicit migration version and persists runs, ordered transitions, Codex
+attempts, head-bound verifications, reviews, and controller-owned resources.
+Filesystem artifacts retain full JSONL, stderr, structured outcomes, and verifier
+output; SQLite retains paths, hashes, session IDs, exact SHAs, verdicts, and
+summaries needed to reject incomplete or mutated evidence.
+
+Run creation is idempotent by immutable issue/source-revision content and only
+one active run may own an issue. State transitions use a transaction with an
+expected-current-state comparison. External steps are entered from an already
+persisted intent state, and implementation/review attempts receive a persisted
+row and unique empty artifact directory before process execution. Candidate
+commit recovery accepts only the controller's fixed commit identity as the sole
+child of the persisted exact base; any other Git/SQLite disagreement fails
+closed.
+
+The SQLite adapter uses `modernc.org/sqlite`. Its pure-Go implementation avoids a
+CGO compiler/runtime dependency and keeps local and race-test execution
+portable. The trade-off is a larger indirect dependency graph and binary than a
+CGO-backed SQLite driver. The controller still has only one direct SQLite
+dependency and does not shell out to the `sqlite3` CLI.
+
+External events will eventually be at-least-once and deduplicated by request or
+event ID. A later reconciler will repair missed or reordered Linear and GitHub
+events; Phase 1B deliberately stops at local `approval_ready`.
