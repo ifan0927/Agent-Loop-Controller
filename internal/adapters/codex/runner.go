@@ -79,9 +79,17 @@ func runStructured[T any](ctx context.Context, runner processadapter.Runner, com
 	if result.ExitCode != 0 {
 		return zero, fmt.Errorf("Codex %s exited with code %d", name, result.ExitCode)
 	}
-	sessionID, err := extractSessionID(result.Stdout)
+	stdout, err := openProcessStdout(result)
 	if err != nil {
-		return zero, fmt.Errorf("Codex %s telemetry: %w", name, err)
+		return zero, fmt.Errorf("open Codex %s telemetry: %w", name, err)
+	}
+	sessionID, sessionErr := extractSessionID(stdout)
+	closeErr := stdout.Close()
+	if sessionErr != nil {
+		return zero, fmt.Errorf("Codex %s telemetry: %w", name, sessionErr)
+	}
+	if closeErr != nil {
+		return zero, fmt.Errorf("close Codex %s telemetry: %w", name, closeErr)
 	}
 	if err := writeJSONExclusive(filepath.Join(artifacts, name+"-session.json"), struct {
 		SessionID string `json:"session_id"`
@@ -102,8 +110,15 @@ func runStructured[T any](ctx context.Context, runner processadapter.Runner, com
 	return StructuredResult[T]{SessionID: sessionID, Outcome: outcome, Process: result}, nil
 }
 
-func extractSessionID(jsonl []byte) (string, error) {
-	scanner := bufio.NewScanner(bytes.NewReader(jsonl))
+func openProcessStdout(result processadapter.Result) (io.ReadCloser, error) {
+	if result.StdoutPath != "" {
+		return os.Open(result.StdoutPath)
+	}
+	return io.NopCloser(bytes.NewReader(result.Stdout)), nil
+}
+
+func extractSessionID(jsonl io.Reader) (string, error) {
+	scanner := bufio.NewScanner(jsonl)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	var sessionID string
 	for scanner.Scan() {

@@ -90,6 +90,12 @@ required flags before executing a plan. Managed commands do not use
 `--strict-config`: unrelated stale fields in a user's global Codex configuration
 must not prevent an otherwise compatible coding run.
 
+Subprocess stdout and stderr are captured directly to exclusive artifact files,
+not duplicated into unbounded memory buffers. Codex session extraction scans
+the JSONL artifact as a stream. Only the small version and help outputs are read
+through explicit size limits, and capability checks require exact option tokens
+from help declaration lines.
+
 Managed runs use `--ignore-user-config` so global MCP servers, hooks, or tools
 cannot bypass controller ownership of external side effects. Authentication and
 repository instructions remain available; required runtime behavior is supplied

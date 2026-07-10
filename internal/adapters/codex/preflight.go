@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,15 +63,23 @@ func (p Preflighter) Run(ctx context.Context, artifacts string) (PreflightEviden
 	if help.ExitCode != 0 {
 		return PreflightEvidence{}, fmt.Errorf("codex exec --help exited with code %d", help.ExitCode)
 	}
-	helpText := string(help.Stdout)
+	helpOutput, err := boundedStdout(help, 1<<20)
+	if err != nil {
+		return PreflightEvidence{}, fmt.Errorf("read codex exec help: %w", err)
+	}
+	helpFlags := declaredLongOptions(string(helpOutput))
 	var missing []string
 	for _, flag := range requiredExecFlags {
-		if !strings.Contains(helpText, flag) {
+		if _, ok := helpFlags[flag]; !ok {
 			missing = append(missing, flag)
 		}
 	}
+	versionOutput, err := boundedStdout(version, 4096)
+	if err != nil {
+		return PreflightEvidence{}, fmt.Errorf("read codex version: %w", err)
+	}
 	evidence := PreflightEvidence{
-		Version:       strings.TrimSpace(string(version.Stdout)),
+		Version:       strings.TrimSpace(string(versionOutput)),
 		RequiredFlags: append([]string(nil), requiredExecFlags...),
 		MissingFlags:  missing,
 	}
@@ -84,6 +93,45 @@ func (p Preflighter) Run(ctx context.Context, artifacts string) (PreflightEviden
 		return PreflightEvidence{}, fmt.Errorf("installed Codex CLI lacks required capabilities: %s", strings.Join(missing, ", "))
 	}
 	return evidence, nil
+}
+
+func declaredLongOptions(help string) map[string]struct{} {
+	options := make(map[string]struct{})
+	for _, line := range strings.Split(help, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "-") {
+			continue
+		}
+		for _, field := range strings.Fields(trimmed) {
+			option := strings.TrimSuffix(field, ",")
+			if strings.HasPrefix(option, "--") {
+				options[option] = struct{}{}
+			}
+		}
+	}
+	return options
+}
+
+func boundedStdout(result processadapter.Result, limit int64) ([]byte, error) {
+	if result.StdoutPath == "" {
+		if int64(len(result.Stdout)) > limit {
+			return nil, fmt.Errorf("stdout exceeds %d bytes", limit)
+		}
+		return result.Stdout, nil
+	}
+	file, err := os.Open(result.StdoutPath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("stdout exceeds %d bytes", limit)
+	}
+	return data, nil
 }
 
 func writeJSONExclusive(path string, value any) error {

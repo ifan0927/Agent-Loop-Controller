@@ -46,6 +46,28 @@ func TestOSRunnerRejectsSymlinkOutputLeaf(t *testing.T) {
 	}
 }
 
+func TestOSRunnerKeepsProductionOutputOnlyInArtifactFiles(t *testing.T) {
+	directory := t.TempDir()
+	stdoutPath := filepath.Join(directory, "stdout")
+	result, err := (OSRunner{}).Run(context.Background(), Spec{
+		Program: os.Args[0], Args: []string{"-test.run=TestProcessHelper", "--", "exit"},
+		StdoutPath: stdoutPath, StderrPath: filepath.Join(directory, "stderr"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Stdout) != 0 || result.StdoutPath != stdoutPath {
+		t.Fatalf("production output was copied into memory: %+v", result)
+	}
+	data, err := os.ReadFile(stdoutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "done\n" {
+		t.Fatalf("stdout artifact = %q", data)
+	}
+}
+
 func TestOSRunnerCancelsProcessGroupWithBoundedTermination(t *testing.T) {
 	directory := t.TempDir()
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)

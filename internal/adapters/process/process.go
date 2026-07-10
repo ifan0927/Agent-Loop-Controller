@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"syscall"
@@ -23,9 +22,11 @@ type Spec struct {
 }
 
 type Result struct {
-	ExitCode int
-	Stdout   []byte
-	Stderr   []byte
+	ExitCode   int
+	Stdout     []byte
+	Stderr     []byte
+	StdoutPath string
+	StderrPath string
 }
 
 type Runner interface {
@@ -56,12 +57,11 @@ func (r OSRunner) Run(ctx context.Context, spec Spec) (Result, error) {
 	}
 	defer stderrFile.Close()
 
-	var stdout, stderr bytes.Buffer
 	command := exec.Command(spec.Program, spec.Args...)
 	command.Dir = spec.WorkingDir
 	command.Stdin = bytes.NewBufferString(spec.Stdin)
-	command.Stdout = io.MultiWriter(stdoutFile, &stdout)
-	command.Stderr = io.MultiWriter(stderrFile, &stderr)
+	command.Stdout = stdoutFile
+	command.Stderr = stderrFile
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := command.Start(); err != nil {
 		return Result{}, fmt.Errorf("start %s: %w", spec.Program, err)
@@ -71,7 +71,7 @@ func (r OSRunner) Run(ctx context.Context, spec Spec) (Result, error) {
 	go func() { wait <- command.Wait() }()
 	select {
 	case waitErr := <-wait:
-		return processResult(command, stdout.Bytes(), stderr.Bytes(), waitErr)
+		return processResult(command, spec.StdoutPath, spec.StderrPath, waitErr)
 	case <-ctx.Done():
 		_ = syscall.Kill(-command.Process.Pid, syscall.SIGINT)
 		grace := r.InterruptGrace
@@ -86,7 +86,7 @@ func (r OSRunner) Run(ctx context.Context, spec Spec) (Result, error) {
 			_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
 			<-wait
 		}
-		return Result{ExitCode: command.ProcessState.ExitCode(), Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, ctx.Err()
+		return Result{ExitCode: command.ProcessState.ExitCode(), StdoutPath: spec.StdoutPath, StderrPath: spec.StderrPath}, ctx.Err()
 	}
 }
 
@@ -111,8 +111,8 @@ func requireAbsent(path string) error {
 	return nil
 }
 
-func processResult(command *exec.Cmd, stdout, stderr []byte, waitErr error) (Result, error) {
-	result := Result{ExitCode: command.ProcessState.ExitCode(), Stdout: stdout, Stderr: stderr}
+func processResult(command *exec.Cmd, stdoutPath, stderrPath string, waitErr error) (Result, error) {
+	result := Result{ExitCode: command.ProcessState.ExitCode(), StdoutPath: stdoutPath, StderrPath: stderrPath}
 	if waitErr == nil {
 		return result, nil
 	}
