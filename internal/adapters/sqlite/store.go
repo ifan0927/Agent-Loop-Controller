@@ -17,7 +17,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 type Store struct{ db *sql.DB }
 
@@ -90,6 +90,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV1
 		case 2:
 			statements = migrationV2
+		case 3:
+			statements = migrationV3
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -159,6 +161,13 @@ var migrationV2 = []string{
 	`ALTER TABLE verifications ADD COLUMN stderr_hash TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE verifications ADD COLUMN stdout_size INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE verifications ADD COLUMN stderr_size INTEGER NOT NULL DEFAULT 0`,
+}
+
+var migrationV3 = []string{
+	`ALTER TABLE reviews RENAME TO reviews_v2`,
+	`CREATE TABLE reviews (review_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), attempt_id INTEGER NOT NULL REFERENCES attempts(attempt_id), review_session_id TEXT NOT NULL, reviewed_head TEXT NOT NULL, verdict TEXT NOT NULL, outcome_path TEXT NOT NULL, outcome_hash TEXT NOT NULL, created_at TEXT NOT NULL)`,
+	`INSERT INTO reviews(review_id,run_id,attempt_id,review_session_id,reviewed_head,verdict,outcome_path,outcome_hash,created_at) SELECT review_id,run_id,attempt_id,review_session_id,reviewed_head,verdict,outcome_path,outcome_hash,created_at FROM reviews_v2`,
+	`DROP TABLE reviews_v2`,
 }
 
 func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput) (application.Run, bool, error) {
@@ -344,7 +353,7 @@ func (s *Store) SaveVerification(ctx context.Context, record application.Verific
 	return err
 }
 func (s *Store) SaveReview(ctx context.Context, record application.ReviewRecord) error {
-	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO reviews(run_id,attempt_id,review_session_id,reviewed_head,verdict,outcome_path,outcome_hash,created_at) VALUES(?,?,?,?,?,?,?,?)`,
+	_, err := s.db.ExecContext(ctx, `INSERT INTO reviews(run_id,attempt_id,review_session_id,reviewed_head,verdict,outcome_path,outcome_hash,created_at) VALUES(?,?,?,?,?,?,?,?)`,
 		record.RunID, record.AttemptID, record.SessionID, record.ReviewedHead, record.Verdict, record.OutcomePath, record.OutcomeHash, nowText())
 	return err
 }

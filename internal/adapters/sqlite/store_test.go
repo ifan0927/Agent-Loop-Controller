@@ -88,7 +88,7 @@ func TestMigratesVersionOneDatabaseToVersionTwo(t *testing.T) {
 	}
 	defer store.Close()
 	version, err := store.SchemaVersion(context.Background())
-	if err != nil || version != 2 {
+	if err != nil || version != schemaVersion {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	var count int

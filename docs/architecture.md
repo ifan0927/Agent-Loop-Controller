@@ -181,6 +181,11 @@ attempt JSONL, records the interrupted attempt and session in SQLite, and uses a
 new isolated resume attempt. Missing or malformed session evidence stops for
 manual handling.
 
+A simulated human decision is immutable evidence as well. Its transition stores
+the decision value, file digest, and the exact implementation-outcome path/hash
+that contained the offered options. Restart resume revalidates all bindings and
+rejects a changed file or a choice absent from the original request.
+
 Verifier adapters return partial evidence together with execution errors. The
 controller hashes and persists every check that actually ran, including failed
 exit codes, before returning the failure to the state machine. Failed verifier
@@ -189,6 +194,12 @@ Authorization groups records by their unique verification evidence path and
 selects the latest complete successful batch for the candidate HEAD; older
 failed batches remain auditable without permanently blocking a successful
 restart retry.
+
+Schema version 3 retains multiple review records for one candidate HEAD. A
+transient `failed` verdict may use a new isolated review attempt, while a
+`findings` verdict remains a safe stop until a later repair produces a new HEAD.
+Authorization considers the latest exact-HEAD review without discarding earlier
+review history.
 
 The SQLite adapter uses `modernc.org/sqlite`. Its pure-Go implementation avoids a
 CGO compiler/runtime dependency and keeps local and race-test execution

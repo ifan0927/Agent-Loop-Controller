@@ -48,6 +48,14 @@ type Decision struct {
 	Instructions string `json:"instructions"`
 }
 
+type persistedDecisionEvidence struct {
+	Path               string   `json:"path"`
+	Hash               string   `json:"sha256"`
+	Decision           Decision `json:"decision"`
+	RequestOutcomePath string   `json:"request_outcome_path"`
+	RequestOutcomeHash string   `json:"request_outcome_hash"`
+}
+
 type artifactOwnership struct {
 	Path         string `json:"path"`
 	AttemptsPath string `json:"attempts_path"`
@@ -709,11 +717,13 @@ func (c *LocalController) acceptDecision(ctx context.Context, run Run, decision 
 		return err
 	}
 	var outcome domain.AgentOutcome
+	var sourceAttempt Attempt
 	found := false
 	for i := len(inspection.Attempts) - 1; i >= 0; i-- {
 		attempt := inspection.Attempts[i]
 		if (attempt.Kind == "implementation" || attempt.Kind == "resume") && attempt.Status == "succeeded" {
 			outcome, err = readOutcome[domain.AgentOutcome](attempt.OutcomePath, attempt.OutcomeHash)
+			sourceAttempt = attempt
 			found = true
 			break
 		}
@@ -738,7 +748,8 @@ func (c *LocalController) acceptDecision(ctx context.Context, run Run, decision 
 	if err := writeExclusive(path, data); err != nil {
 		return err
 	}
-	return c.store.Transition(ctx, run.ID, domain.StateAwaitingHumanDecision, domain.StateExecuting, "accepted simulated human decision", path, "")
+	evidenceData, _ := json.Marshal(persistedDecisionEvidence{Path: path, Hash: bytesHash(data), Decision: decision, RequestOutcomePath: sourceAttempt.OutcomePath, RequestOutcomeHash: sourceAttempt.OutcomeHash})
+	return c.store.Transition(ctx, run.ID, domain.StateAwaitingHumanDecision, domain.StateExecuting, "accepted simulated human decision", string(evidenceData), "")
 }
 
 func (c *LocalController) verifyCandidate(ctx context.Context, run Run) error {
@@ -859,12 +870,15 @@ func (c *LocalController) freshReview(ctx context.Context, run Run) error {
 	if err != nil {
 		return err
 	}
-	for _, record := range inspection.Reviews {
-		if record.ReviewedHead == run.CandidateHead {
-			outcome, err := readOutcome[domain.ReviewOutcome](record.OutcomePath, record.OutcomeHash)
-			if err != nil {
-				return err
-			}
+	if record, ok := latestReviewForHead(inspection.Reviews, run.CandidateHead); ok {
+		outcome, err := readOutcome[domain.ReviewOutcome](record.OutcomePath, record.OutcomeHash)
+		if err != nil {
+			return err
+		}
+		if err := validateReviewAttempt(inspection.Attempts, record); err != nil {
+			return err
+		}
+		if outcome.Verdict != domain.ReviewFailed {
 			return c.authorizeReview(ctx, run, outcome, record.OutcomePath, inspection)
 		}
 	}
@@ -980,8 +994,8 @@ func (c *LocalController) validateApproval(ctx context.Context, run Run) error {
 	if err := validateVerificationBatch(batch, run.CandidateHead); err != nil {
 		return err
 	}
-	for _, review := range inspection.Reviews {
-		if review.ReviewedHead == run.CandidateHead && review.Verdict == string(domain.ReviewPass) {
+	if review, ok := latestReviewForHead(inspection.Reviews, run.CandidateHead); ok {
+		if review.Verdict == string(domain.ReviewPass) {
 			if err := validateReviewAttempt(inspection.Attempts, review); err != nil {
 				return err
 			}
@@ -995,6 +1009,18 @@ func (c *LocalController) validateApproval(ctx context.Context, run Run) error {
 		}
 	}
 	return errors.New("passing exact-HEAD review evidence is missing")
+}
+
+func latestReviewForHead(records []ReviewRecord, head string) (ReviewRecord, bool) {
+	var latest ReviewRecord
+	found := false
+	for _, record := range records {
+		if record.ReviewedHead == head && (!found || record.ID > latest.ID) {
+			latest = record
+			found = true
+		}
+	}
+	return latest, found
 }
 
 func validateReviewAttempt(attempts []Attempt, review ReviewRecord) error {
@@ -1200,9 +1226,16 @@ func findPersistedDecision(inspection RunInspection) (Decision, bool, error) {
 		if transition.From != domain.StateAwaitingHumanDecision || transition.To != domain.StateExecuting {
 			continue
 		}
-		data, err := os.ReadFile(transition.EvidenceReference)
+		var evidence persistedDecisionEvidence
+		if err := json.Unmarshal([]byte(transition.EvidenceReference), &evidence); err != nil {
+			return Decision{}, false, fmt.Errorf("decode persisted decision evidence: %w", err)
+		}
+		data, err := os.ReadFile(evidence.Path)
 		if err != nil {
 			return Decision{}, false, fmt.Errorf("read persisted decision: %w", err)
+		}
+		if bytesHash(data) != evidence.Hash {
+			return Decision{}, false, errors.New("persisted decision hash mismatch")
 		}
 		var decision Decision
 		decoder := json.NewDecoder(bytes.NewReader(data))
@@ -1212,6 +1245,32 @@ func findPersistedDecision(inspection RunInspection) (Decision, bool, error) {
 		}
 		if strings.TrimSpace(decision.ChoiceID) == "" || strings.TrimSpace(decision.Instructions) == "" {
 			return Decision{}, false, errors.New("persisted decision is incomplete")
+		}
+		if decision != evidence.Decision {
+			return Decision{}, false, errors.New("persisted decision does not match SQLite evidence")
+		}
+		attemptFound := false
+		var requestOutcome domain.AgentOutcome
+		for _, attempt := range inspection.Attempts {
+			if attempt.OutcomePath == evidence.RequestOutcomePath && attempt.OutcomeHash == evidence.RequestOutcomeHash && attempt.Status == "succeeded" {
+				requestOutcome, err = readOutcome[domain.AgentOutcome](attempt.OutcomePath, attempt.OutcomeHash)
+				if err != nil {
+					return Decision{}, false, err
+				}
+				attemptFound = true
+			}
+		}
+		if !attemptFound || requestOutcome.DecisionRequest == nil {
+			return Decision{}, false, errors.New("persisted decision request binding is missing")
+		}
+		choiceAllowed := false
+		for _, option := range requestOutcome.DecisionRequest.Options {
+			if option.ID == decision.ChoiceID {
+				choiceAllowed = true
+			}
+		}
+		if !choiceAllowed {
+			return Decision{}, false, errors.New("persisted decision choice is not in the bound request")
 		}
 		return decision, true, nil
 	}

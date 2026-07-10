@@ -97,6 +97,8 @@ func (w testWorktrees) ValidateOwned(ctx context.Context, r application.Worktree
 type durableFakeProcess struct {
 	mu                                            sync.Mutex
 	needsDecision                                 bool
+	failFirstReview                               bool
+	reviewFindings                                bool
 	implementationCalls, resumeCalls, reviewCalls int
 	resumeArgs                                    []string
 }
@@ -127,7 +129,15 @@ func (p *durableFakeProcess) Run(_ context.Context, s processadapter.Spec) (proc
 		} else if argument(s.Args, "--sandbox") == "read-only" {
 			p.reviewCalls++
 			head := gitHead(s.WorkingDir)
-			writeLastMessage(s.Args, fmt.Sprintf(`{"verdict":"pass","summary":"ready","reviewed_head_sha":%q,"findings":[]}`, head))
+			verdict, summary, findings := "pass", "ready", "[]"
+			if p.failFirstReview && p.reviewCalls == 1 {
+				verdict, summary = "failed", "transient reviewer failure"
+			}
+			if p.reviewFindings {
+				verdict, summary = "findings", "actionable finding"
+				findings = `[{"id":"f1","severity":"medium","title":"Finding","body":"Fix it","file":null,"line":null}]`
+			}
+			writeLastMessage(s.Args, fmt.Sprintf(`{"verdict":%q,"summary":%q,"reviewed_head_sha":%q,"findings":%s}`, verdict, summary, head, findings))
 			stdout = fmt.Sprintf("{\"type\":\"thread.started\",\"thread_id\":\"review-session-%d\"}\n", p.reviewCalls)
 		} else {
 			p.implementationCalls++
@@ -439,6 +449,92 @@ func TestExplicitSessionResumeSurvivesControllerRestart(t *testing.T) {
 			t.Fatal("attempt artifact directory was reused")
 		}
 		seen[attempt.ArtifactDir] = true
+	}
+}
+
+func TestPersistedDecisionTamperFailsBeforeResume(t *testing.T) {
+	lab := newLocalLab(t)
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	process := &durableFakeProcess{needsDecision: true}
+	wrapper := &failAfterTransitionStore{RunStore: store, from: domain.StateAwaitingHumanDecision, to: domain.StateExecuting, remaining: 1}
+	controller := newController(t, wrapper, lab, process, gitadapter.Workspace{})
+	run, err := controller.Start(context.Background(), startInput(lab))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err = controller.Continue(context.Background(), run.ID, &application.Decision{ChoiceID: "inclusive", Instructions: "Use inclusive bounds."})
+	if err == nil || run.State != domain.StateExecuting {
+		t.Fatalf("run=%+v err=%v", run, err)
+	}
+	inspection, _ := store.Inspect(context.Background(), run.ID)
+	var evidence struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal([]byte(inspection.Timeline[len(inspection.Timeline)-1].EvidenceReference), &evidence); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, evidence.Path, `{"choice_id":"exclusive","instructions":"tampered"}`)
+	_, err = newController(t, store, lab, process, gitadapter.Workspace{}).Continue(context.Background(), run.ID, nil)
+	if err == nil || !strings.Contains(err.Error(), "hash mismatch") {
+		t.Fatalf("error=%v", err)
+	}
+	if process.resumeCalls != 0 {
+		t.Fatal("resume used tampered decision")
+	}
+}
+
+func TestTransientFailedReviewCanRetrySameHead(t *testing.T) {
+	lab := newLocalLab(t)
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	process := &durableFakeProcess{failFirstReview: true}
+	controller := newController(t, store, lab, process, gitadapter.Workspace{})
+	run, err := controller.Start(context.Background(), startInput(lab))
+	if err == nil {
+		t.Fatal("expected transient failed review")
+	}
+	if run.State != domain.StateFreshReview {
+		t.Fatalf("state=%s", run.State)
+	}
+	run, err = newController(t, store, lab, process, gitadapter.Workspace{}).Continue(context.Background(), run.ID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.State != domain.StateApprovalReady || process.reviewCalls != 2 {
+		t.Fatalf("run=%+v reviews=%d", run, process.reviewCalls)
+	}
+	inspection, _ := store.Inspect(context.Background(), run.ID)
+	if len(inspection.Reviews) != 2 || inspection.Reviews[0].Verdict != "failed" || inspection.Reviews[1].Verdict != "pass" {
+		t.Fatalf("reviews=%+v", inspection.Reviews)
+	}
+}
+
+func TestReviewFindingsRemainSafeStopWithoutSameHeadRerun(t *testing.T) {
+	lab := newLocalLab(t)
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	process := &durableFakeProcess{reviewFindings: true}
+	controller := newController(t, store, lab, process, gitadapter.Workspace{})
+	run, err := controller.Start(context.Background(), startInput(lab))
+	if err == nil || run.State != domain.StateFreshReview {
+		t.Fatalf("run=%+v err=%v", run, err)
+	}
+	_, err = controller.Continue(context.Background(), run.ID, nil)
+	if err == nil {
+		t.Fatal("findings must remain a safe stop")
+	}
+	if process.reviewCalls != 1 {
+		t.Fatalf("review calls=%d", process.reviewCalls)
 	}
 }
 
