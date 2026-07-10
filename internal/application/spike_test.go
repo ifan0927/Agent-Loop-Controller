@@ -18,9 +18,10 @@ type fakeSpikeGit struct {
 	status string
 }
 
-func (g *fakeSpikeGit) Head(context.Context, string) (string, error)   { return g.head, nil }
-func (g *fakeSpikeGit) Branch(context.Context, string) (string, error) { return g.branch, nil }
-func (g *fakeSpikeGit) Status(context.Context, string) (string, error) { return g.status, nil }
+func (g *fakeSpikeGit) Head(context.Context, string) (string, error)                     { return g.head, nil }
+func (g *fakeSpikeGit) Branch(context.Context, string) (string, error)                   { return g.branch, nil }
+func (g *fakeSpikeGit) Status(context.Context, string) (string, error)                   { return g.status, nil }
+func (g *fakeSpikeGit) ValidateRemoteBase(context.Context, string, string, string) error { return nil }
 func (g *fakeSpikeGit) CommitCandidate(context.Context, string, string) (string, error) {
 	g.head = "candidate"
 	g.status = ""

@@ -100,6 +100,10 @@ implementation before the controller creates a candidate commit, then repeats
 the same verifier against the committed candidate. Only the second result is
 used as exact-HEAD authorization evidence. This preserves the required ordering
 without claiming that a pre-commit result was executed at a later commit SHA.
+The spike also treats ignored workspace files as dirty evidence and verifies
+that `refs/remotes/origin/<base>` exists and is an ancestor both before
+implementation and before fresh review. The reviewed branch delta therefore has
+a deterministic Git base and does not depend on uncommitted ignored inputs.
 
 If review reports findings, the controller resumes the implementation session,
 runs verification, creates a new candidate head, and launches another fresh

@@ -70,9 +70,10 @@ go run ./cmd/ifan-loop spike \
   --artifacts /absolute/path/to/new-empty-attempt-directory
 ```
 
-The fixture must be a clean Git repository on the task's working branch and may
-reference only the controller-owned `fixture-go-test` verifier. The controller
-runs verification before committing, creates the candidate commit itself, then
+The fixture must be a clean Git repository on the task's working branch, have a
+local `origin/<base_branch>` remote-tracking ref, contain no ignored workspace
+files, and reference only the controller-owned `fixture-go-test` verifier. The
+controller runs verification before committing, creates the candidate commit itself, then
 runs verification again so approval evidence is bound to the exact candidate
 HEAD. The fresh review is a new ephemeral read-only general `codex exec` run.
 

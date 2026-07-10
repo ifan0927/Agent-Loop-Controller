@@ -30,7 +30,31 @@ func (w Workspace) Branch(ctx context.Context, directory string) (string, error)
 }
 
 func (w Workspace) Status(ctx context.Context, directory string) (string, error) {
-	return w.run(ctx, directory, "status", "--porcelain=v1", "--untracked-files=all")
+	return w.run(ctx, directory, "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching")
+}
+
+func (w Workspace) ValidateRemoteBase(ctx context.Context, directory, baseBranch, head string) error {
+	ref := "refs/remotes/origin/" + baseBranch
+	base, err := w.run(ctx, directory, "rev-parse", "--verify", ref+"^{commit}")
+	if err != nil {
+		return fmt.Errorf("resolve remote base %s: %w", ref, err)
+	}
+	binary := w.Binary
+	if strings.TrimSpace(binary) == "" {
+		binary = "git"
+	}
+	command := exec.CommandContext(ctx, binary, "merge-base", "--is-ancestor", strings.TrimSpace(base), head)
+	command.Dir = directory
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		var exitError *exec.ExitError
+		if errors.As(err, &exitError) && exitError.ExitCode() == 1 {
+			return fmt.Errorf("remote base %s is not an ancestor of %s", ref, head)
+		}
+		return fmt.Errorf("validate remote base ancestry: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
 }
 
 func (w Workspace) CommitCandidate(ctx context.Context, directory, message string) (string, error) {

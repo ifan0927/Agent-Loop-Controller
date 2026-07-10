@@ -27,6 +27,7 @@ type GitWorkspace interface {
 	Head(context.Context, string) (string, error)
 	Branch(context.Context, string) (string, error)
 	Status(context.Context, string) (string, error)
+	ValidateRemoteBase(context.Context, string, string, string) error
 	CommitCandidate(context.Context, string, string) (string, error)
 }
 
@@ -73,6 +74,9 @@ func (s Spike) Run(ctx context.Context, task domain.CodingTask, workspace, artif
 	implementationBaseHead, err := s.git.Head(ctx, workspace)
 	if err != nil {
 		return SpikeResult{}, fmt.Errorf("read implementation base HEAD: %w", err)
+	}
+	if err := s.git.ValidateRemoteBase(ctx, workspace, task.BaseBranch, implementationBaseHead); err != nil {
+		return SpikeResult{}, fmt.Errorf("validate implementation base: %w", err)
 	}
 	initialStatus, err := s.git.Status(ctx, workspace)
 	if err != nil {
@@ -137,6 +141,9 @@ func (s Spike) Run(ctx context.Context, task domain.CodingTask, workspace, artif
 	}
 	if beforeReviewHead != candidateHead || strings.TrimSpace(beforeReviewStatus) != "" {
 		return SpikeResult{}, fmt.Errorf("candidate must be clean and unchanged before fresh review")
+	}
+	if err := s.git.ValidateRemoteBase(ctx, workspace, task.BaseBranch, candidateHead); err != nil {
+		return SpikeResult{}, fmt.Errorf("validate candidate base: %w", err)
 	}
 	plan.FreshReview.Stdin += fmt.Sprintf(`
 Controller candidate HEAD (review exactly this commit): %s
