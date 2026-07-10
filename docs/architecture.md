@@ -104,6 +104,9 @@ The spike also treats ignored workspace files as dirty evidence and verifies
 that `refs/remotes/origin/<base>` exists and is an ancestor both before
 implementation and before fresh review. The reviewed branch delta therefore has
 a deterministic Git base and does not depend on uncommitted ignored inputs.
+The working branch name is revalidated after every Codex or verifier boundary,
+so switching a symbolic branch without changing HEAD cannot redirect the
+controller-owned candidate commit.
 
 If review reports findings, the controller resumes the implementation session,
 runs verification, creates a new candidate head, and launches another fresh

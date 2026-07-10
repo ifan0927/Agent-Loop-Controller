@@ -33,6 +33,17 @@ type fakeSpikeVerifier struct {
 	candidateHeadOverride string
 }
 
+type branchSwitchingVerifier struct {
+	git *fakeSpikeGit
+}
+
+func (v branchSwitchingVerifier) Run(_ context.Context, _ []string, _, _, label string) (verifier.Evidence, error) {
+	if label == "precommit" {
+		v.git.branch = "other/branch"
+	}
+	return verifier.Evidence{VerifiedHeadSHA: v.git.head}, nil
+}
+
 func (v fakeSpikeVerifier) Run(_ context.Context, _ []string, _, _, label string) (verifier.Evidence, error) {
 	head := v.git.head
 	if label == "candidate" && v.candidateHeadOverride != "" {
@@ -98,6 +109,17 @@ func TestSpikeDetectsReviewMutation(t *testing.T) {
 	codexFake.reviewHook = func() { git.status = " M changed.go" }
 	_, err := runFakeSpikeWithGit(t, git, codexFake, "")
 	if err == nil || !strings.Contains(err.Error(), "mutated") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestSpikeRejectsVerifierBranchSwitch(t *testing.T) {
+	git := &fakeSpikeGit{branch: validTask().WorkingBranch, head: "base"}
+	workspace := t.TempDir()
+	artifacts := t.TempDir()
+	spike := NewSpike("codex", passingReview("candidate"), branchSwitchingVerifier{git: git}, git)
+	_, err := spike.Run(context.Background(), validTask(), workspace, artifacts)
+	if err == nil || !strings.Contains(err.Error(), "after pre-commit verification") {
 		t.Fatalf("error = %v", err)
 	}
 }

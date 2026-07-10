@@ -99,6 +99,9 @@ func (s Spike) Run(ctx context.Context, task domain.CodingTask, workspace, artif
 	if afterImplementationHead != implementationBaseHead {
 		return SpikeResult{}, fmt.Errorf("Codex implementation changed HEAD; candidate commits are controller-owned")
 	}
+	if err := s.requireWorkingBranch(ctx, workspace, task.WorkingBranch, "after implementation"); err != nil {
+		return SpikeResult{}, err
+	}
 	implementationStatus, err := s.git.Status(ctx, workspace)
 	if err != nil {
 		return SpikeResult{}, fmt.Errorf("read implementation status: %w", err)
@@ -112,6 +115,9 @@ func (s Spike) Run(ctx context.Context, task domain.CodingTask, workspace, artif
 	}
 	if afterPrecommitVerificationStatus != implementationStatus {
 		return SpikeResult{}, fmt.Errorf("pre-commit verifier mutated the implementation worktree")
+	}
+	if err := s.requireWorkingBranch(ctx, workspace, task.WorkingBranch, "after pre-commit verification"); err != nil {
+		return SpikeResult{}, err
 	}
 	candidateHead, err := s.git.CommitCandidate(ctx, workspace, "Phase 1A fixture candidate")
 	if err != nil {
@@ -130,6 +136,9 @@ func (s Spike) Run(ctx context.Context, task domain.CodingTask, workspace, artif
 	}
 	if verification.VerifiedHeadSHA != candidateHead {
 		return SpikeResult{}, fmt.Errorf("controller verification head does not match candidate HEAD")
+	}
+	if err := s.requireWorkingBranch(ctx, workspace, task.WorkingBranch, "after candidate verification"); err != nil {
+		return SpikeResult{}, err
 	}
 	beforeReviewHead, err := s.git.Head(ctx, workspace)
 	if err != nil {
@@ -169,6 +178,9 @@ files.
 	if afterHead != candidateHead || strings.TrimSpace(afterStatus) != "" {
 		return SpikeResult{}, fmt.Errorf("fresh review mutated the candidate worktree")
 	}
+	if err := s.requireWorkingBranch(ctx, workspace, task.WorkingBranch, "after fresh review"); err != nil {
+		return SpikeResult{}, err
+	}
 	if err := AuthorizePROpen(domain.StateFreshReview, PROpenEvidence{
 		Review: review.Outcome, CurrentHeadSHA: afterHead, VerificationHeadSHA: verification.VerifiedHeadSHA,
 	}); err != nil {
@@ -184,6 +196,17 @@ files.
 		return SpikeResult{}, err
 	}
 	return result, nil
+}
+
+func (s Spike) requireWorkingBranch(ctx context.Context, workspace, expected, phase string) error {
+	branch, err := s.git.Branch(ctx, workspace)
+	if err != nil {
+		return fmt.Errorf("read working branch %s: %w", phase, err)
+	}
+	if branch != expected {
+		return fmt.Errorf("working branch %s = %s, want %s", phase, branch, expected)
+	}
+	return nil
 }
 
 func writeSpikeResult(path string, result SpikeResult) error {
