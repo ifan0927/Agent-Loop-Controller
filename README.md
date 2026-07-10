@@ -37,8 +37,12 @@ This initial layout defines:
 - a `plan` command that validates a task snapshot and renders an execution plan;
 - MVP, architecture, roadmap, and Hermes handoff documentation.
 
-It intentionally does not yet execute Codex, call Linear, create worktrees, or
-write durable run state.
+Phase 1A also provides an experimental local executor spike for disposable
+fixture repositories. It materializes isolated artifacts, preflights the
+installed Codex CLI, runs structured implementation and fresh-review sessions,
+executes controller-owned verification, creates a local candidate commit, and
+stops at an approval-ready simulation. It does not call Linear, push a branch,
+open a pull request, or write durable run state.
 
 ## Try the contract planner
 
@@ -56,6 +60,28 @@ execution. Prompts are represented as stdin, not shell arguments.
 
 The workspace and artifact directories must already exist. The planner compares
 their filesystem identity and ancestor chain before producing a plan.
+
+## Run the experimental local spike
+
+```sh
+go run ./cmd/ifan-loop spike \
+  --task /absolute/path/to/fixture-task.json \
+  --workspace /absolute/path/to/disposable-fixture \
+  --artifacts /absolute/path/to/new-empty-attempt-directory
+```
+
+The fixture must be a clean Git repository on the task's working branch and may
+reference only the controller-owned `fixture-go-test` verifier. The controller
+runs verification before committing, creates the candidate commit itself, then
+runs verification again so approval evidence is bound to the exact candidate
+HEAD. The fresh review is a new ephemeral read-only general `codex exec` run.
+
+The real-model smoke test is deliberately opt-in and creates only temporary
+local repositories:
+
+```sh
+./scripts/live-spike.sh
+```
 
 ## Documentation
 

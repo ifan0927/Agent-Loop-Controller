@@ -95,6 +95,12 @@ cannot bypass controller ownership of external side effects. Authentication and
 repository instructions remain available; required runtime behavior is supplied
 explicitly by the command contract.
 
+The Phase 1A spike runs repository verification once against the uncommitted
+implementation before the controller creates a candidate commit, then repeats
+the same verifier against the committed candidate. Only the second result is
+used as exact-HEAD authorization evidence. This preserves the required ordering
+without claiming that a pre-commit result was executed at a later commit SHA.
+
 If review reports findings, the controller resumes the implementation session,
 runs verification, creates a new candidate head, and launches another fresh
 review. No reviewed SHA may be substituted with a later SHA.

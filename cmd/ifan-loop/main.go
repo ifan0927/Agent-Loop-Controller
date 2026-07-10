@@ -1,12 +1,19 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"time"
 
+	codexadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/codex"
+	gitadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/git"
+	processadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/process"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/verifier"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
@@ -25,6 +32,8 @@ func main() {
 		fmt.Println(version)
 	case "plan":
 		err = plan(os.Args[2:])
+	case "spike":
+		err = spike(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -33,6 +42,51 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+func spike(args []string) error {
+	flags := flag.NewFlagSet("spike", flag.ContinueOnError)
+	taskPath := flags.String("task", "", "path to a disposable fixture CodingTask JSON")
+	workspace := flags.String("workspace", "", "absolute disposable fixture repository path")
+	artifacts := flags.String("artifacts", "", "absolute new empty attempt directory")
+	codexBinary := flags.String("codex-binary", "codex", "Codex CLI binary")
+	timeout := flags.Duration("timeout", 30*time.Minute, "overall experimental spike timeout")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *taskPath == "" || *workspace == "" || *artifacts == "" {
+		return fmt.Errorf("--task, --workspace, and --artifacts are required")
+	}
+	file, err := os.Open(*taskPath)
+	if err != nil {
+		return fmt.Errorf("open task: %w", err)
+	}
+	defer file.Close()
+	task, err := decodeTask(file)
+	if err != nil {
+		return fmt.Errorf("decode task: %w", err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	ctx, cancel := context.WithTimeout(ctx, *timeout)
+	defer cancel()
+	process := processadapter.OSRunner{}
+	git := gitadapter.Workspace{}
+	registry := verifier.NewRegistry(map[string]verifier.Command{
+		"fixture-go-test": {Program: "go", Args: []string{"test", "./..."}},
+	}, process, git)
+	executor := codexadapter.NewExecutor(process, *codexBinary)
+	result, err := application.NewSpike(*codexBinary, executor, registry, git).Run(ctx, task, *workspace, *artifacts)
+	if err != nil {
+		return err
+	}
+	output, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(output))
+	return nil
 }
 
 func plan(args []string) error {
@@ -88,5 +142,5 @@ func decodeTask(reader io.Reader) (domain.CodingTask, error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: ifan-loop <version|plan> [options]")
+	fmt.Fprintln(os.Stderr, "usage: ifan-loop <version|plan|spike> [options]")
 }

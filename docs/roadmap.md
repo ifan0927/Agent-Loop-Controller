@@ -9,6 +9,18 @@
 
 ## Phase 1: Executable local vertical slice
 
+### Phase 1A: Local Codex executor spike
+
+- Disposable local fixture repository only.
+- Exclusive attempt artifacts and embedded structured-output schemas.
+- Codex CLI capability preflight, process lifecycle, JSONL/session capture, and
+  semantic outcome validation.
+- Controller-owned verifier, local candidate commit, exact-HEAD fresh review,
+  and approval-ready simulation.
+- No Linear, durable state, push, pull request, or external approval workflow.
+
+### Later Phase 1 slices
+
 - SQLite run store and transition journal.
 - Linear read adapter and IFAN admission policy.
 - Repository registry and worktree manager.
