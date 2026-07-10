@@ -158,6 +158,14 @@ worktree. SQLite foreign keys and busy timeout are configured in the driver DSN
 so they apply to every physical connection, including connections recreated by
 `database/sql`.
 
+The predictable per-run artifact path is reserved in `owned_resources` before
+filesystem creation. A random ownership nonce is persisted in SQLite and in an
+exclusive marker inside the newly created root. Every start or continue checks
+that the root and `attempts` are real directories, remain canonically contained
+under the configured run root, and match the marker before reading snapshots or
+creating a new attempt. A pre-existing path without the durable reservation is
+never adopted.
+
 Run creation is idempotent by immutable issue/source-revision content and only
 one active run may own an issue. State transitions use a transaction with an
 expected-current-state comparison. External steps are entered from an already
@@ -172,6 +180,11 @@ open a new implementation session. It recovers the explicit session ID from the
 attempt JSONL, records the interrupted attempt and session in SQLite, and uses a
 new isolated resume attempt. Missing or malformed session evidence stops for
 manual handling.
+
+Verifier adapters return partial evidence together with execution errors. The
+controller hashes and persists every check that actually ran, including failed
+exit codes, before returning the failure to the state machine. Failed verifier
+artifacts therefore remain reachable through SQLite status and inspection.
 
 The SQLite adapter uses `modernc.org/sqlite`. Its pure-Go implementation avoids a
 CGO compiler/runtime dependency and keeps local and race-test execution

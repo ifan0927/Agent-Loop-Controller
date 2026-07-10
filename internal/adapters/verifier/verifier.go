@@ -81,14 +81,14 @@ func (r Registry) Run(ctx context.Context, ids []string, workspace, artifacts, l
 			if writeErr := writeEvidence(filepath.Join(artifacts, label+"-verification.json"), evidence); writeErr != nil {
 				return Evidence{}, fmt.Errorf("run verifier %s: %v; persist evidence: %w", id, runErr, writeErr)
 			}
-			return Evidence{}, fmt.Errorf("run verifier %s: %w", id, runErr)
+			return evidence, fmt.Errorf("run verifier %s: %w", id, runErr)
 		}
 		if result.ExitCode != 0 {
 			reason := fmt.Errorf("verifier %s exited with code %d", id, result.ExitCode)
 			if writeErr := writeEvidence(filepath.Join(artifacts, label+"-verification.json"), evidence); writeErr != nil {
 				return Evidence{}, fmt.Errorf("%v; persist evidence: %w", reason, writeErr)
 			}
-			return Evidence{}, reason
+			return evidence, reason
 		}
 		after, err := r.git.Head(ctx, workspace)
 		if err != nil {
@@ -99,7 +99,7 @@ func (r Registry) Run(ctx context.Context, ids []string, workspace, artifacts, l
 			if writeErr := writeEvidence(filepath.Join(artifacts, label+"-verification.json"), evidence); writeErr != nil {
 				return Evidence{}, fmt.Errorf("%v; persist evidence: %w", reason, writeErr)
 			}
-			return Evidence{}, reason
+			return evidence, reason
 		}
 	}
 	path := filepath.Join(artifacts, label+"-verification.json")

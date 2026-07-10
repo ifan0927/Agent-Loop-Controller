@@ -202,6 +202,114 @@ func TestLocalDurableHappyPathAndDuplicateStart(t *testing.T) {
 	}
 }
 
+func TestArtifactRootRejectsPrecreatedDirectoryAndSymlink(t *testing.T) {
+	for _, kind := range []string{"directory", "symlink"} {
+		t.Run(kind, func(t *testing.T) {
+			lab := newLocalLab(t)
+			target := filepath.Join(lab.runs, lab.snapshot.Task.RunID)
+			if kind == "directory" {
+				if err := os.Mkdir(target, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				outside := t.TempDir()
+				if err := os.Symlink(outside, target); err != nil {
+					t.Fatal(err)
+				}
+			}
+			store, err := storeadapter.Open(lab.db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			process := &durableFakeProcess{}
+			_, err = newController(t, store, lab, process, gitadapter.Workspace{}).Start(context.Background(), startInput(lab))
+			if err == nil || !strings.Contains(err.Error(), "existed before") {
+				t.Fatalf("error=%v", err)
+			}
+			if process.implementationCalls != 0 {
+				t.Fatal("Codex ran with unowned artifact root")
+			}
+		})
+	}
+}
+
+func TestRestartRejectsAttemptsSymlinkEscape(t *testing.T) {
+	lab := newLocalLab(t)
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	process := &durableFakeProcess{needsDecision: true}
+	controller := newController(t, store, lab, process, gitadapter.Workspace{})
+	run, err := controller.Start(context.Background(), startInput(lab))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempts := filepath.Join(run.ArtifactRoot, "attempts")
+	backup := attempts + "-backup"
+	if err := os.Rename(attempts, backup); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), attempts); err != nil {
+		t.Fatal(err)
+	}
+	_, err = controller.Continue(context.Background(), run.ID, &application.Decision{ChoiceID: "inclusive", Instructions: "Use inclusive bounds."})
+	if err == nil || !strings.Contains(err.Error(), "attempts path must be a real directory") {
+		t.Fatalf("error=%v", err)
+	}
+	if process.resumeCalls != 0 {
+		t.Fatal("resume wrote through attempts symlink")
+	}
+}
+
+type exitVerifierProcess struct{}
+
+func (exitVerifierProcess) Run(_ context.Context, s processadapter.Spec) (processadapter.Result, error) {
+	if err := exclusiveWrite(s.StdoutPath, "failed verifier\n"); err != nil {
+		return processadapter.Result{}, err
+	}
+	if err := exclusiveWrite(s.StderrPath, "failure detail\n"); err != nil {
+		return processadapter.Result{}, err
+	}
+	return processadapter.Result{ExitCode: 7, StdoutPath: s.StdoutPath, StderrPath: s.StderrPath}, nil
+}
+
+func TestFailedVerifierEvidenceIsDurableAndInspectable(t *testing.T) {
+	lab := newLocalLab(t)
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	process := &durableFakeProcess{}
+	workspace := gitadapter.Workspace{}
+	registry := verifier.NewRegistry(map[string]verifier.Command{"fixture-go-test": {Program: "go", Args: []string{"test", "./..."}}}, exitVerifierProcess{}, workspace)
+	controller := application.NewLocalController(store, testWorktrees{}, codex.NewExecutor(process, "codex"), registry, workspace, "codex", lab.worktrees)
+	run, err := controller.Start(context.Background(), startInput(lab))
+	if err == nil {
+		t.Fatal("expected verifier failure")
+	}
+	if run.State != domain.StateVerifying {
+		t.Fatalf("state=%s", run.State)
+	}
+	inspection, inspectErr := store.Inspect(context.Background(), run.ID)
+	if inspectErr != nil {
+		t.Fatal(inspectErr)
+	}
+	if len(inspection.Verifications) != 1 {
+		t.Fatalf("verifications=%+v", inspection.Verifications)
+	}
+	record := inspection.Verifications[0]
+	if record.ExitCode != 7 || record.StdoutHash == "" || record.StderrHash == "" || record.EvidencePath == "" {
+		t.Fatalf("record=%+v", record)
+	}
+	if _, statErr := os.Stat(record.EvidencePath); statErr != nil {
+		t.Fatal(statErr)
+	}
+}
+
 func TestRestartRecoversProvisionedOwnedWorktree(t *testing.T) {
 	lab := newLocalLab(t)
 	store, err := storeadapter.Open(lab.db)

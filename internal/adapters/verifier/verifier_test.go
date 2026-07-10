@@ -2,6 +2,7 @@ package verifier
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -25,6 +26,27 @@ type successfulProcess struct{}
 
 func (successfulProcess) Run(context.Context, processadapter.Spec) (processadapter.Result, error) {
 	return processadapter.Result{}, nil
+}
+
+type failingProcess struct{}
+
+func (failingProcess) Run(context.Context, processadapter.Spec) (processadapter.Result, error) {
+	return processadapter.Result{ExitCode: 7}, nil
+}
+
+func TestRegistryReturnsFailedCheckEvidence(t *testing.T) {
+	artifacts := t.TempDir()
+	registry := NewRegistry(map[string]Command{"fixture-go-test": {Program: "go", Args: []string{"test", "./..."}}}, failingProcess{}, &fakeHead{heads: []string{"abc"}})
+	evidence, err := registry.Run(context.Background(), []string{"fixture-go-test"}, t.TempDir(), artifacts, "candidate")
+	if err == nil {
+		t.Fatal("expected verifier failure")
+	}
+	if len(evidence.Checks) != 1 || evidence.Checks[0].ExitCode != 7 || evidence.VerifiedHeadSHA != "abc" {
+		t.Fatalf("evidence=%+v", evidence)
+	}
+	if _, err := os.Stat(filepath.Join(artifacts, "candidate-verification.json")); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestRegistryRejectsUnknownVerifier(t *testing.T) {

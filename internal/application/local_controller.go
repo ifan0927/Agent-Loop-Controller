@@ -48,6 +48,14 @@ type Decision struct {
 	Instructions string `json:"instructions"`
 }
 
+type artifactOwnership struct {
+	Path         string `json:"path"`
+	AttemptsPath string `json:"attempts_path"`
+	RunRoot      string `json:"run_root"`
+	Nonce        string `json:"nonce"`
+	TaskHash     string `json:"task_hash"`
+}
+
 type DurableCodex interface {
 	Preflight(context.Context, string) (codex.PreflightEvidence, error)
 	Implementation(context.Context, codex.CommandSpec, string) (codex.StructuredResult[domain.AgentOutcome], error)
@@ -121,6 +129,10 @@ func (c *LocalController) Start(ctx context.Context, input LocalStartInput) (Run
 		return Run{}, err
 	}
 	c.worktreeRoot = input.WorktreeRoot
+	if err := c.ensureArtifactRoot(ctx, run); err != nil {
+		_ = c.store.SetLastError(ctx, run.ID, err.Error())
+		return Run{}, err
+	}
 	if err := c.materializeSnapshots(run); err != nil {
 		_ = c.store.SetLastError(ctx, run.ID, err.Error())
 		return Run{}, err
@@ -180,6 +192,10 @@ func (c *LocalController) Continue(ctx context.Context, runID string, decision *
 		if err != nil {
 			return Run{}, err
 		}
+		if err := c.ensureArtifactRoot(ctx, run); err != nil {
+			_ = c.store.SetLastError(ctx, run.ID, err.Error())
+			return run, err
+		}
 		if err := c.materializeSnapshots(run); err != nil {
 			_ = c.store.SetLastError(ctx, run.ID, err.Error())
 			return run, err
@@ -228,6 +244,161 @@ func (c *LocalController) Continue(ctx context.Context, runID string, decision *
 	return Run{}, errors.New("local controller exceeded transition safety limit")
 }
 
+func (c *LocalController) ensureArtifactRoot(ctx context.Context, run Run) error {
+	inspection, err := c.store.Inspect(ctx, run.ID)
+	if err != nil {
+		return err
+	}
+	var ownership artifactOwnership
+	resourceFound := false
+	resourceStatus := ""
+	for _, resource := range inspection.Resources {
+		if resource.Kind == "artifact_root" && resource.Name == run.ArtifactRoot {
+			if err := json.Unmarshal([]byte(resource.CreationEvidence), &ownership); err != nil {
+				return fmt.Errorf("decode artifact ownership: %w", err)
+			}
+			resourceFound = true
+			resourceStatus = resource.Status
+		}
+	}
+	_, pathErr := os.Lstat(run.ArtifactRoot)
+	pathExists := pathErr == nil
+	if pathErr != nil && !errors.Is(pathErr, os.ErrNotExist) {
+		return pathErr
+	}
+	if !resourceFound {
+		if pathExists {
+			return errors.New("artifact root existed before controller ownership reservation")
+		}
+		nonce, err := randomIdentifier("artifact-")
+		if err != nil {
+			return err
+		}
+		ownership = artifactOwnership{Path: run.ArtifactRoot, AttemptsPath: filepath.Join(run.ArtifactRoot, "attempts"), RunRoot: filepath.Dir(run.ArtifactRoot), Nonce: nonce, TaskHash: run.TaskHash}
+		data, _ := json.Marshal(ownership)
+		if err := c.store.AddOwnedResource(ctx, OwnedResource{RunID: run.ID, Kind: "artifact_root", Name: run.ArtifactRoot, CreationEvidence: string(data), Status: "reserved"}); err != nil {
+			return err
+		}
+		resourceFound = true
+		resourceStatus = "reserved"
+	}
+	if ownership.Path != run.ArtifactRoot || ownership.AttemptsPath != filepath.Join(run.ArtifactRoot, "attempts") || ownership.RunRoot != filepath.Dir(run.ArtifactRoot) || ownership.TaskHash != run.TaskHash || strings.TrimSpace(ownership.Nonce) == "" {
+		return errors.New("artifact ownership evidence does not match run")
+	}
+	if !pathExists {
+		if resourceStatus == "owned" {
+			return errors.New("owned artifact root is missing")
+		}
+		if err := os.Mkdir(run.ArtifactRoot, 0o700); err != nil {
+			return fmt.Errorf("create owned artifact root: %w", err)
+		}
+	}
+	rootInfo, err := os.Lstat(run.ArtifactRoot)
+	if err != nil {
+		return err
+	}
+	if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+		return errors.New("artifact root must be a real directory")
+	}
+	marker := filepath.Join(run.ArtifactRoot, ".controller-owned.json")
+	if _, err := os.Lstat(marker); errors.Is(err, os.ErrNotExist) {
+		entries, readErr := os.ReadDir(run.ArtifactRoot)
+		if readErr != nil {
+			return readErr
+		}
+		if len(entries) != 0 {
+			return errors.New("reserved artifact root contains unexpected content before ownership marker")
+		}
+		data, _ := json.Marshal(ownership)
+		if err := writeExclusive(marker, data); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	if _, err := os.Lstat(ownership.AttemptsPath); errors.Is(err, os.ErrNotExist) {
+		if err := os.Mkdir(ownership.AttemptsPath, 0o700); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	if err := validateArtifactOwnership(ownership, run); err != nil {
+		return err
+	}
+	data, _ := json.Marshal(ownership)
+	return c.store.AddOwnedResource(ctx, OwnedResource{RunID: run.ID, Kind: "artifact_root", Name: run.ArtifactRoot, CreationEvidence: string(data), Status: "owned"})
+}
+
+func validateArtifactOwnership(ownership artifactOwnership, run Run) error {
+	runRootInfo, err := os.Lstat(ownership.RunRoot)
+	if err != nil {
+		return err
+	}
+	if !runRootInfo.IsDir() || runRootInfo.Mode()&os.ModeSymlink != 0 {
+		return errors.New("run root must remain a real directory")
+	}
+	canonicalRunRoot, err := filepath.EvalSymlinks(ownership.RunRoot)
+	if err != nil {
+		return err
+	}
+	if canonicalRunRoot != ownership.RunRoot {
+		return errors.New("run root no longer matches its canonical ownership path")
+	}
+	rootInfo, err := os.Lstat(ownership.Path)
+	if err != nil {
+		return err
+	}
+	if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+		return errors.New("artifact root must be a real directory")
+	}
+	root, err := filepath.EvalSymlinks(ownership.Path)
+	if err != nil {
+		return err
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(ownership.Path))
+	if err != nil {
+		return err
+	}
+	if filepath.Dir(root) != parent || filepath.Base(root) != run.ID {
+		return errors.New("artifact root escapes its canonical run root")
+	}
+	attemptsInfo, err := os.Lstat(ownership.AttemptsPath)
+	if err != nil {
+		return err
+	}
+	if !attemptsInfo.IsDir() || attemptsInfo.Mode()&os.ModeSymlink != 0 {
+		return errors.New("attempts path must be a real directory")
+	}
+	attempts, err := filepath.EvalSymlinks(ownership.AttemptsPath)
+	if err != nil {
+		return err
+	}
+	if filepath.Dir(attempts) != root {
+		return errors.New("attempts path escapes owned artifact root")
+	}
+	marker := filepath.Join(root, ".controller-owned.json")
+	info, err := os.Lstat(marker)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("artifact ownership marker must be a regular file")
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		return err
+	}
+	var actual artifactOwnership
+	if err := json.Unmarshal(data, &actual); err != nil {
+		return err
+	}
+	if actual != ownership {
+		return errors.New("artifact ownership marker mismatch")
+	}
+	return nil
+}
+
 func (c *LocalController) materializeSnapshots(run Run) error {
 	if bytesHash([]byte(run.RawIssueJSON)) != run.RawIssueHash {
 		return errors.New("raw simulated issue hash mismatch")
@@ -235,24 +406,59 @@ func (c *LocalController) materializeSnapshots(run Run) error {
 	if bytesHash([]byte(run.NormalizedTaskJSON)) != run.TaskHash {
 		return errors.New("normalized task snapshot hash mismatch")
 	}
-	if err := os.MkdirAll(filepath.Join(run.ArtifactRoot, "attempts"), 0o700); err != nil {
+	if err := validateArtifactOwnershipFromStoreless(run); err != nil {
 		return err
 	}
 	for name, data := range map[string][]byte{"simulated-issue.json": []byte(run.RawIssueJSON), "coding-task.json": []byte(run.NormalizedTaskJSON)} {
 		path := filepath.Join(run.ArtifactRoot, name)
-		if existing, err := os.ReadFile(path); err == nil {
+		info, lstatErr := os.Lstat(path)
+		if lstatErr == nil {
+			if !info.Mode().IsRegular() {
+				return errors.New("snapshot artifact must be a regular file")
+			}
+			existing, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
 			if !bytes.Equal(existing, data) {
 				return fmt.Errorf("snapshot artifact conflict: %s", path)
 			}
 			continue
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
+		} else if !errors.Is(lstatErr, os.ErrNotExist) {
+			return lstatErr
 		}
 		if err := writeExclusive(path, data); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func validateArtifactOwnershipFromStoreless(run Run) error {
+	rootInfo, err := os.Lstat(run.ArtifactRoot)
+	if err != nil {
+		return err
+	}
+	if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+		return errors.New("artifact root must be a real directory")
+	}
+	marker := filepath.Join(run.ArtifactRoot, ".controller-owned.json")
+	markerInfo, err := os.Lstat(marker)
+	if err != nil {
+		return err
+	}
+	if !markerInfo.Mode().IsRegular() {
+		return errors.New("artifact ownership marker must be a regular file")
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		return err
+	}
+	var ownership artifactOwnership
+	if err := json.Unmarshal(data, &ownership); err != nil {
+		return err
+	}
+	return validateArtifactOwnership(ownership, run)
 }
 
 func (c *LocalController) provision(ctx context.Context, run Run) error {
@@ -908,8 +1114,12 @@ func newArtifactDirectory(root, kind string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	parentInfo, err := os.Lstat(filepath.Dir(path))
+	if err != nil {
 		return "", err
+	}
+	if !parentInfo.IsDir() || parentInfo.Mode()&os.ModeSymlink != 0 {
+		return "", errors.New("attempt parent must be a real directory")
 	}
 	if err := os.Mkdir(path, 0o700); err != nil {
 		return "", err
