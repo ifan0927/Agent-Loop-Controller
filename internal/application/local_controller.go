@@ -810,8 +810,8 @@ func (c *LocalController) verifyCandidate(ctx context.Context, run Run) error {
 		}
 		return errors.New("candidate worktree is not clean")
 	}
-	if hasCompleteVerification(inspection.Verifications, run.CandidateHead, taskVerifierIDs(run.NormalizedTaskJSON)) {
-		if err := validateVerificationFiles(inspection.Verifications, run.CandidateHead); err != nil {
+	if batch, ok := successfulVerificationBatch(inspection.Verifications, run.CandidateHead, taskVerifierIDs(run.NormalizedTaskJSON)); ok {
+		if err := validateVerificationBatch(batch, run.CandidateHead); err != nil {
 			return err
 		}
 	} else if _, err := c.runVerification(ctx, run, "candidate"); err != nil {
@@ -933,16 +933,11 @@ func (c *LocalController) authorizeReview(ctx context.Context, run Run, outcome 
 	if outcome.Verdict != domain.ReviewPass {
 		return fmt.Errorf("fresh review stopped with verdict %s", outcome.Verdict)
 	}
-	verificationHead := ""
-	for _, record := range inspection.Verifications {
-		if record.Phase == "candidate" && record.VerifiedHead == run.CandidateHead && record.ExitCode == 0 {
-			verificationHead = record.VerifiedHead
-		}
-	}
-	if !hasCompleteVerification(inspection.Verifications, run.CandidateHead, taskVerifierIDs(run.NormalizedTaskJSON)) {
+	batch, ok := successfulVerificationBatch(inspection.Verifications, run.CandidateHead, taskVerifierIDs(run.NormalizedTaskJSON))
+	if !ok {
 		return errors.New("candidate verification evidence is incomplete")
 	}
-	if err := validateVerificationFiles(inspection.Verifications, run.CandidateHead); err != nil {
+	if err := validateVerificationBatch(batch, run.CandidateHead); err != nil {
 		return err
 	}
 	reviewValidated := false
@@ -961,7 +956,7 @@ func (c *LocalController) authorizeReview(ctx context.Context, run Run, outcome 
 	if err != nil {
 		return err
 	}
-	if err := AuthorizePROpen(domain.StateFreshReview, PROpenEvidence{Review: outcome, CurrentHeadSHA: head, VerificationHeadSHA: verificationHead}); err != nil {
+	if err := AuthorizePROpen(domain.StateFreshReview, PROpenEvidence{Review: outcome, CurrentHeadSHA: head, VerificationHeadSHA: run.CandidateHead}); err != nil {
 		return err
 	}
 	if err := c.validateWorkspace(ctx, run, true); err != nil {
@@ -978,10 +973,11 @@ func (c *LocalController) validateApproval(ctx context.Context, run Run) error {
 	if err := c.validateWorkspace(ctx, run, true); err != nil {
 		return err
 	}
-	if !hasCompleteVerification(inspection.Verifications, run.CandidateHead, taskVerifierIDs(run.NormalizedTaskJSON)) {
+	batch, ok := successfulVerificationBatch(inspection.Verifications, run.CandidateHead, taskVerifierIDs(run.NormalizedTaskJSON))
+	if !ok {
 		return errors.New("candidate verification evidence is incomplete")
 	}
-	if err := validateVerificationFiles(inspection.Verifications, run.CandidateHead); err != nil {
+	if err := validateVerificationBatch(batch, run.CandidateHead); err != nil {
 		return err
 	}
 	for _, review := range inspection.Reviews {
@@ -1221,24 +1217,55 @@ func findPersistedDecision(inspection RunInspection) (Decision, bool, error) {
 	}
 	return Decision{}, false, nil
 }
-func hasCompleteVerification(records []VerificationRecord, head string, ids []string) bool {
-	for _, id := range ids {
-		found := false
-		for _, record := range records {
-			if record.Phase == "candidate" && record.VerifierID == id && record.VerifiedHead == head && record.ExitCode == 0 {
-				found = true
+func successfulVerificationBatch(records []VerificationRecord, head string, ids []string) ([]VerificationRecord, bool) {
+	if len(ids) == 0 {
+		return nil, false
+	}
+	groups := make(map[string][]VerificationRecord)
+	var order []string
+	for _, record := range records {
+		if record.Phase != "candidate" || record.VerifiedHead != head || record.EvidencePath == "" {
+			continue
+		}
+		if _, ok := groups[record.EvidencePath]; !ok {
+			order = append(order, record.EvidencePath)
+		}
+		groups[record.EvidencePath] = append(groups[record.EvidencePath], record)
+	}
+	var selected []VerificationRecord
+	for _, path := range order {
+		group := groups[path]
+		success := true
+		for _, record := range group {
+			if record.ExitCode != 0 {
+				success = false
 			}
 		}
-		if !found {
-			return false
+		for _, id := range ids {
+			found := false
+			for _, record := range group {
+				if record.VerifierID == id && record.ExitCode == 0 {
+					found = true
+				}
+			}
+			if !found {
+				success = false
+			}
+		}
+		if success {
+			selected = group
 		}
 	}
-	return len(ids) > 0
+	return selected, len(selected) > 0
 }
-func validateVerificationFiles(records []VerificationRecord, head string) error {
+func validateVerificationBatch(records []VerificationRecord, head string) error {
+	if len(records) == 0 {
+		return errors.New("verification batch is empty")
+	}
+	evidencePath := records[0].EvidencePath
 	for _, record := range records {
-		if record.Phase != "candidate" || record.VerifiedHead != head {
-			continue
+		if record.Phase != "candidate" || record.VerifiedHead != head || record.EvidencePath != evidencePath {
+			return errors.New("verification batch identity mismatch")
 		}
 		hash, err := fileHash(record.EvidencePath)
 		if err != nil {

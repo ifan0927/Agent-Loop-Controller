@@ -310,6 +310,70 @@ func TestFailedVerifierEvidenceIsDurableAndInspectable(t *testing.T) {
 	}
 }
 
+type failSecondVerifierProcess struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (p *failSecondVerifierProcess) Run(ctx context.Context, s processadapter.Spec) (processadapter.Result, error) {
+	p.mu.Lock()
+	p.calls++
+	call := p.calls
+	p.mu.Unlock()
+	if call == 2 {
+		if err := exclusiveWrite(s.StdoutPath, "transient failure\n"); err != nil {
+			return processadapter.Result{}, err
+		}
+		if err := exclusiveWrite(s.StderrPath, "retryable\n"); err != nil {
+			return processadapter.Result{}, err
+		}
+		return processadapter.Result{ExitCode: 7, StdoutPath: s.StdoutPath, StderrPath: s.StderrPath}, nil
+	}
+	return (processadapter.OSRunner{}).Run(ctx, s)
+}
+
+func TestCandidateVerificationFailureThenSuccessfulRestartAdvances(t *testing.T) {
+	lab := newLocalLab(t)
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	codexProcess := &durableFakeProcess{}
+	workspace := gitadapter.Workspace{}
+	verificationProcess := &failSecondVerifierProcess{}
+	registry := verifier.NewRegistry(map[string]verifier.Command{"fixture-go-test": {Program: "go", Args: []string{"test", "./..."}}}, verificationProcess, workspace)
+	controller := application.NewLocalController(store, testWorktrees{}, codex.NewExecutor(codexProcess, "codex"), registry, workspace, "codex", lab.worktrees)
+	run, err := controller.Start(context.Background(), startInput(lab))
+	if err == nil {
+		t.Fatal("expected transient candidate verification failure")
+	}
+	if run.State != domain.StateVerifying || run.CandidateHead == "" {
+		t.Fatalf("run=%+v", run)
+	}
+	run, err = application.NewLocalController(store, testWorktrees{}, codex.NewExecutor(codexProcess, "codex"), registry, workspace, "codex", lab.worktrees).Continue(context.Background(), run.ID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.State != domain.StateApprovalReady {
+		t.Fatalf("state=%s error=%s", run.State, run.LastError)
+	}
+	inspection, _ := store.Inspect(context.Background(), run.ID)
+	failed, passed := false, false
+	for _, record := range inspection.Verifications {
+		if record.Phase == "candidate" && record.VerifiedHead == run.CandidateHead {
+			if record.ExitCode == 0 {
+				passed = true
+			} else {
+				failed = true
+			}
+		}
+	}
+	if !failed || !passed {
+		t.Fatalf("verification history=%+v", inspection.Verifications)
+	}
+}
+
 func TestRestartRecoversProvisionedOwnedWorktree(t *testing.T) {
 	lab := newLocalLab(t)
 	store, err := storeadapter.Open(lab.db)

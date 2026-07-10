@@ -185,6 +185,10 @@ Verifier adapters return partial evidence together with execution errors. The
 controller hashes and persists every check that actually ran, including failed
 exit codes, before returning the failure to the state machine. Failed verifier
 artifacts therefore remain reachable through SQLite status and inspection.
+Authorization groups records by their unique verification evidence path and
+selects the latest complete successful batch for the candidate HEAD; older
+failed batches remain auditable without permanently blocking a successful
+restart retry.
 
 The SQLite adapter uses `modernc.org/sqlite`. Its pure-Go implementation avoids a
 CGO compiler/runtime dependency and keeps local and race-test execution
