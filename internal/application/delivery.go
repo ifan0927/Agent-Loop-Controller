@@ -139,10 +139,6 @@ func ReconcileReviews(ctx context.Context, github GitHubPort, store DeliveryStor
 			return domain.ReconciliationInfrastructure, errors.New("GitHub observation is not bound to expected head")
 		}
 		status := snapshot.Classify()
-		encoded, _ := jsonString(snapshot)
-		if err := store.SavePollObservation(deadline, PollObservation{RunID: runID, PRNumber: pr, Attempt: attempt, HeadSHA: head, Status: string(status), SnapshotJSON: encoded, ObservedAt: snapshot.ObservedAt}); err != nil {
-			return "", err
-		}
 		for _, finding := range snapshot.Findings {
 			if err := finding.Validate(); err != nil {
 				return "", err
@@ -151,6 +147,10 @@ func ReconcileReviews(ctx context.Context, github GitHubPort, store DeliveryStor
 			if err := store.SaveFinding(deadline, FindingRecord{RunID: runID, SourceID: finding.SourceID, ThreadID: finding.ThreadID, Source: finding.Source, File: finding.File, Line: finding.Line, Severity: finding.Severity, BodyDigest: hex.EncodeToString(digest[:]), Body: finding.Body, Resolved: finding.Resolved, Outdated: finding.Outdated, HeadSHA: head, ObservedAt: snapshot.ObservedAt}); err != nil {
 				return "", err
 			}
+		}
+		encoded, _ := jsonString(snapshot)
+		if err := store.SavePollObservation(deadline, PollObservation{RunID: runID, PRNumber: pr, Attempt: attempt, HeadSHA: head, Status: string(status), SnapshotJSON: encoded, ObservedAt: snapshot.ObservedAt}); err != nil {
+			return "", err
 		}
 		if status != domain.ReconciliationPending {
 			return status, nil

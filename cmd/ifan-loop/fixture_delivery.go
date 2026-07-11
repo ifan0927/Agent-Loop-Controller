@@ -423,7 +423,15 @@ func fixtureReconcile(ctx context.Context, store *sqlitestore.Store, run applica
 	now := time.Now().UTC()
 	pending := domain.ReviewSnapshot{HeadSHA: run.CandidateHead, RequiredChecks: []string{"fixture-go-test"}, Checks: []domain.Check{{ID: "check-1", Name: "fixture-go-test", Required: true, Status: "in_progress", ObservedSHA: run.CandidateHead}}, CodeRabbitStatus: "pending", ObservedAt: now}
 	passing := fixturePassingSnapshot(run.CandidateHead)
-	github := &fixtureGitHub{snapshots: []domain.ReviewSnapshot{pending, passing}}
+	progress, err := store.PollProgress(ctx, run.ID, 1, run.CandidateHead)
+	if err != nil {
+		return err
+	}
+	snapshots := []domain.ReviewSnapshot{pending, passing}
+	if len(progress) == 1 {
+		snapshots = []domain.ReviewSnapshot{passing}
+	}
+	github := &fixtureGitHub{snapshots: snapshots}
 	status, err := application.ReconcileReviews(ctx, github, store, run.ID, 1, run.CandidateHead, application.PollPolicy{MaxAttempts: 2, Interval: 0, Deadline: time.Second}, func(context.Context, time.Duration) error { return nil })
 	if err != nil {
 		return err
