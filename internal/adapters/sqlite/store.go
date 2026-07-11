@@ -439,16 +439,40 @@ func (s *Store) SaveFinding(ctx context.Context, record application.FindingRecor
 }
 
 func (s *Store) SaveHumanApproval(ctx context.Context, runID string, approval domain.HumanApproval) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO human_approvals(run_id,pr_number,approver,source,approved_sha,ci_status,coderabbit_status,internal_review_sha,approved_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET pr_number=excluded.pr_number,approver=excluded.approver,source=excluded.source,approved_sha=excluded.approved_sha,ci_status=excluded.ci_status,coderabbit_status=excluded.coderabbit_status,internal_review_sha=excluded.internal_review_sha,approved_at=excluded.approved_at`, runID, approval.PRNumber, approval.Approver, approval.Source, approval.ApprovedSHA, approval.CIStatus, approval.CodeRabbit, approval.ReviewSHA, formatTime(approval.ApprovedAt))
-	return err
+	_, err := s.db.ExecContext(ctx, `INSERT INTO human_approvals(run_id,pr_number,approver,source,approved_sha,ci_status,coderabbit_status,internal_review_sha,approved_at) VALUES(?,?,?,?,?,?,?,?,?)`, runID, approval.PRNumber, approval.Approver, approval.Source, approval.ApprovedSHA, approval.CIStatus, approval.CodeRabbit, approval.ReviewSHA, formatTime(approval.ApprovedAt))
+	if err == nil {
+		return nil
+	}
+	var existing domain.HumanApproval
+	var approvedAt string
+	if scanErr := s.db.QueryRowContext(ctx, `SELECT pr_number,approver,source,approved_sha,ci_status,coderabbit_status,internal_review_sha,approved_at FROM human_approvals WHERE run_id=?`, runID).Scan(&existing.PRNumber, &existing.Approver, &existing.Source, &existing.ApprovedSHA, &existing.CIStatus, &existing.CodeRabbit, &existing.ReviewSHA, &approvedAt); scanErr != nil {
+		return err
+	}
+	existing.ApprovedAt = parseTime(approvedAt)
+	if existing != approval {
+		return errors.New("conflicting immutable human approval evidence")
+	}
+	return nil
 }
 
 func (s *Store) SaveMerge(ctx context.Context, record application.MergeRecord) error {
 	if record.Method != "squash" {
 		return errors.New("only squash merge evidence is accepted")
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO merge_results(run_id,pr_number,pre_merge_head_sha,base_sha,merge_method,merge_sha,merged_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(run_id) DO NOTHING`, record.RunID, record.PRNumber, record.PreMergeSHA, record.BaseSHA, record.Method, record.MergeSHA, formatTime(record.MergedAt))
-	return err
+	_, err := s.db.ExecContext(ctx, `INSERT INTO merge_results(run_id,pr_number,pre_merge_head_sha,base_sha,merge_method,merge_sha,merged_at) VALUES(?,?,?,?,?,?,?)`, record.RunID, record.PRNumber, record.PreMergeSHA, record.BaseSHA, record.Method, record.MergeSHA, formatTime(record.MergedAt))
+	if err == nil {
+		return nil
+	}
+	var existing application.MergeRecord
+	var mergedAt string
+	if scanErr := s.db.QueryRowContext(ctx, `SELECT run_id,pr_number,pre_merge_head_sha,base_sha,merge_method,merge_sha,merged_at FROM merge_results WHERE run_id=?`, record.RunID).Scan(&existing.RunID, &existing.PRNumber, &existing.PreMergeSHA, &existing.BaseSHA, &existing.Method, &existing.MergeSHA, &mergedAt); scanErr != nil {
+		return err
+	}
+	existing.MergedAt = parseTime(mergedAt)
+	if existing != record {
+		return errors.New("conflicting immutable merge evidence")
+	}
+	return nil
 }
 
 func (s *Store) UpsertCleanup(ctx context.Context, record application.CleanupRecord) error {

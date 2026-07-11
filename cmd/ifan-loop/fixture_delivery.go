@@ -99,7 +99,14 @@ func localFixtureDeliver(args []string) error {
 			if inspection.PullRequest == nil {
 				return errors.New("missing persisted PR")
 			}
-			snapshot := fixturePassingSnapshot(run.CandidateHead)
+			controller := newLocalController(store, "codex", filepath.Dir(run.WorktreePath))
+			if err := controller.ValidateApprovalReady(ctx, runID); err != nil {
+				return err
+			}
+			snapshot, err := latestPersistedPassingSnapshot(inspection, run.CandidateHead)
+			if err != nil {
+				return err
+			}
 			if err := application.AuthorizeMerge(run, *inspection.PullRequest, snapshot, approval, run.CandidateHead, run.CandidateHead); err != nil {
 				return err
 			}
@@ -207,20 +214,66 @@ func fixturePassingSnapshot(head string) domain.ReviewSnapshot {
 	return domain.ReviewSnapshot{HeadSHA: head, RequiredChecks: []string{"fixture-go-test"}, Checks: []domain.Check{{ID: "check-1", Name: "fixture-go-test", Required: true, Status: "completed", Conclusion: "success", ObservedSHA: head}}, CodeRabbitStatus: "pass", ObservedAt: time.Now().UTC()}
 }
 
+func latestPersistedPassingSnapshot(inspection application.RunInspection, head string) (domain.ReviewSnapshot, error) {
+	for index := len(inspection.Polls) - 1; index >= 0; index-- {
+		poll := inspection.Polls[index]
+		if poll.HeadSHA != head || poll.Status != string(domain.ReconciliationPass) {
+			continue
+		}
+		var snapshot domain.ReviewSnapshot
+		if err := json.Unmarshal([]byte(poll.SnapshotJSON), &snapshot); err != nil {
+			return snapshot, err
+		}
+		if snapshot.HeadSHA != head || snapshot.Classify() != domain.ReconciliationPass {
+			return snapshot, errors.New("persisted passing observation is invalid")
+		}
+		return snapshot, nil
+	}
+	return domain.ReviewSnapshot{}, errors.New("missing persisted passing checks and CodeRabbit observation")
+}
+
 func fixtureReconcile(ctx context.Context, store *sqlitestore.Store, run application.Run) error {
 	now := time.Now().UTC()
 	pending := domain.ReviewSnapshot{HeadSHA: run.CandidateHead, RequiredChecks: []string{"fixture-go-test"}, Checks: []domain.Check{{ID: "check-1", Name: "fixture-go-test", Required: true, Status: "in_progress", ObservedSHA: run.CandidateHead}}, CodeRabbitStatus: "pending", ObservedAt: now}
 	passing := fixturePassingSnapshot(run.CandidateHead)
-	for attempt, snapshot := range []domain.ReviewSnapshot{pending, passing} {
-		encoded, _ := json.Marshal(snapshot)
-		if err := store.SavePollObservation(ctx, application.PollObservation{RunID: run.ID, PRNumber: 1, Attempt: attempt + 1, HeadSHA: run.CandidateHead, Status: string(snapshot.Classify()), SnapshotJSON: string(encoded), ObservedAt: snapshot.ObservedAt}); err != nil {
-			return err
-		}
+	github := &fixtureGitHub{snapshots: []domain.ReviewSnapshot{pending, passing}}
+	status, err := application.ReconcileReviews(ctx, github, store, run.ID, 1, run.CandidateHead, application.PollPolicy{MaxAttempts: 2, Interval: 0, Deadline: time.Second}, func(context.Context, time.Duration) error { return nil })
+	if err != nil {
+		return err
 	}
-	if passing.Classify() != domain.ReconciliationPass {
-		return errors.New("fixture checks did not pass")
+	if status == domain.ReconciliationActionable {
+		return store.Transition(ctx, run.ID, domain.StateReconcilingReviews, domain.StateRepairing, "actionable normalized finding", "finding digests", run.CandidateHead)
+	}
+	if status != domain.ReconciliationPass {
+		return fmt.Errorf("fixture reconciliation ended as %s", status)
 	}
 	return store.Transition(ctx, run.ID, domain.StateReconcilingReviews, domain.StateAwaitingHumanApproval, "checks and CodeRabbit pass", "fixture observations", run.CandidateHead)
+}
+
+type fixtureGitHub struct {
+	snapshots []domain.ReviewSnapshot
+	index     int
+}
+
+func (*fixtureGitHub) FindPullRequest(context.Context, string, string) (*domain.PullRequest, error) {
+	return nil, nil
+}
+func (*fixtureGitHub) CreatePullRequest(context.Context, string, string, string, string, string) (domain.PullRequest, error) {
+	return domain.PullRequest{}, errors.New("fixture PR creation is persisted separately")
+}
+func (f *fixtureGitHub) Observe(context.Context, int64, string) (domain.ReviewSnapshot, error) {
+	if f.index >= len(f.snapshots) {
+		return domain.ReviewSnapshot{}, errors.New("fixture observations exhausted")
+	}
+	value := f.snapshots[f.index]
+	f.index++
+	return value, nil
+}
+func (*fixtureGitHub) GetPullRequest(context.Context, int64) (domain.PullRequest, error) {
+	return domain.PullRequest{}, errors.New("fixture PR is read from SQLite")
+}
+func (*fixtureGitHub) SquashMerge(context.Context, int64, string) (domain.PullRequest, error) {
+	return domain.PullRequest{}, errors.New("fixture merge uses local bare origin")
 }
 
 func readFixtureApproval(path string) (domain.HumanApproval, error) {
@@ -277,6 +330,13 @@ func fixtureSquashMerge(repo fixtureRepository, run application.Run) (string, er
 	return strings.TrimSpace(sha), nil
 }
 func fixtureCleanup(ctx context.Context, store *sqlitestore.Store, repo fixtureRepository, run application.Run) error {
+	inspection, err := store.Inspect(ctx, run.ID)
+	if err != nil {
+		return err
+	}
+	if err := validateFixtureCleanupOwnership(run, repo, inspection.Resources); err != nil {
+		return err
+	}
 	steps := []application.CleanupRecord{{RunID: run.ID, Kind: "worktree", Name: run.WorktreePath, Status: "intent"}, {RunID: run.ID, Kind: "remote_branch", Name: run.WorkingBranch, Status: "intent"}, {RunID: run.ID, Kind: "local_branch", Name: run.WorkingBranch, Status: "intent"}}
 	for _, step := range steps {
 		inspection, err := store.Inspect(ctx, run.ID)
@@ -343,6 +403,42 @@ func fixtureCleanup(ctx context.Context, store *sqlitestore.Store, repo fixtureR
 		if err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func validateFixtureCleanupOwnership(run application.Run, repo fixtureRepository, resources []application.OwnedResource) error {
+	ownedWorktree, ownedBranch := false, false
+	for _, resource := range resources {
+		if resource.RunID != run.ID || resource.Status != "owned" {
+			continue
+		}
+		if resource.Kind != "worktree" && resource.Kind != "branch" {
+			continue
+		}
+		var evidence struct {
+			OriginPath string `json:"origin_path"`
+			SourcePath string `json:"source_path"`
+			Path       string `json:"path"`
+			Branch     string `json:"branch"`
+			BaseBranch string `json:"base_branch"`
+			BaseSHA    string `json:"base_sha"`
+		}
+		if err := json.Unmarshal([]byte(resource.CreationEvidence), &evidence); err != nil {
+			return err
+		}
+		if evidence.OriginPath != repo.OriginPath || evidence.SourcePath != repo.SourcePath || evidence.Path != run.WorktreePath || evidence.Branch != run.WorkingBranch || evidence.BaseBranch != run.BaseBranch || evidence.BaseSHA != run.BaseSHA {
+			return errors.New("cleanup ownership evidence does not match run")
+		}
+		if resource.Kind == "worktree" && resource.Name == run.WorktreePath {
+			ownedWorktree = true
+		}
+		if resource.Kind == "branch" && resource.Name == run.WorkingBranch {
+			ownedBranch = true
+		}
+	}
+	if !ownedWorktree || !ownedBranch {
+		return errors.New("cleanup requires durable owned worktree and branch evidence")
 	}
 	return nil
 }

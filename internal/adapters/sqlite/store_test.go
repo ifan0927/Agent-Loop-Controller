@@ -165,6 +165,44 @@ func TestSideEffectIntentSurvivesRestartWithoutDuplicate(t *testing.T) {
 	}
 }
 
+func TestApprovalAndMergeEvidenceAreImmutable(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	input := application.CreateRunInput{Run: application.Run{ID: "run-1", IssueID: "IFAN-1", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "repo:test", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "ifan/one", ArtifactRoot: "/tmp/run", ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}}
+	if _, _, err := store.CreateRun(ctx, input); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Nanosecond)
+	approval := domain.HumanApproval{PRNumber: 1, Approver: "I-Fan", Source: "github", ApprovedSHA: "h1", CIStatus: "pass", CodeRabbit: "pass", ReviewSHA: "h1", ApprovedAt: now}
+	if err := store.SaveHumanApproval(ctx, "run-1", approval); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveHumanApproval(ctx, "run-1", approval); err != nil {
+		t.Fatal(err)
+	}
+	changed := approval
+	changed.ApprovedSHA = "h2"
+	if err := store.SaveHumanApproval(ctx, "run-1", changed); err == nil {
+		t.Fatal("conflicting approval must fail closed")
+	}
+	merge := application.MergeRecord{RunID: "run-1", PRNumber: 1, PreMergeSHA: "h1", BaseSHA: "b1", Method: "squash", MergeSHA: "m1", MergedAt: now}
+	if err := store.SaveMerge(ctx, merge); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveMerge(ctx, merge); err != nil {
+		t.Fatal(err)
+	}
+	changedMerge := merge
+	changedMerge.MergeSHA = "m2"
+	if err := store.SaveMerge(ctx, changedMerge); err == nil {
+		t.Fatal("conflicting merge must fail closed")
+	}
+}
+
 func TestForeignKeysRemainEnabledAfterConnectionRecreation(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {

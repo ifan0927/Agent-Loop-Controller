@@ -1031,10 +1031,50 @@ func (c *LocalController) ValidateApprovalReady(ctx context.Context, runID strin
 	if err != nil {
 		return err
 	}
-	if run.State != domain.StateApprovalReady && run.State != domain.StatePushingBranch {
-		return fmt.Errorf("delivery approval validation requires approval_ready or pushing_branch, got %s", run.State)
+	if run.State != domain.StateApprovalReady && run.State != domain.StatePushingBranch && run.State != domain.StateAwaitingHumanApproval && run.State != domain.StateMerging {
+		return fmt.Errorf("delivery approval validation cannot authorize state %s", run.State)
 	}
 	return c.validateApproval(ctx, run)
+}
+
+// Repair resumes the persisted Terra implementation session with only
+// controller-normalized review data, then runs the ordinary verification and
+// fresh Sol review pipeline through Continue.
+func (c *LocalController) Repair(ctx context.Context, runID, normalizedPrompt string) (Run, error) {
+	if strings.TrimSpace(normalizedPrompt) == "" {
+		return Run{}, errors.New("normalized repair prompt must not be blank")
+	}
+	run, err := c.store.GetRun(ctx, runID)
+	if err != nil {
+		return Run{}, err
+	}
+	if run.State != domain.StateRepairing {
+		return run, fmt.Errorf("repair requires repairing state, got %s", run.State)
+	}
+	if err := validateRunModelPolicy(run); err != nil {
+		return run, err
+	}
+	inspection, err := c.store.Inspect(ctx, runID)
+	if err != nil {
+		return run, err
+	}
+	task, err := decodeTaskSnapshot(run.NormalizedTaskJSON)
+	if err != nil {
+		return run, err
+	}
+	count := 0
+	for _, attempt := range inspection.Attempts {
+		if attempt.Kind == "resume" {
+			count++
+		}
+	}
+	if count >= task.Policy.MaxRepairAttempts {
+		return run, errors.New("bounded repair attempts exhausted; manual intervention required")
+	}
+	if err := c.store.Transition(ctx, runID, domain.StateRepairing, domain.StateExecuting, "begin normalized GitHub finding repair", "controller-normalized finding digests", run.CandidateHead); err != nil {
+		return run, err
+	}
+	return c.Continue(ctx, runID, &Decision{ChoiceID: "controller-normalized-review-findings", Instructions: normalizedPrompt})
 }
 
 func validateRunModelPolicy(run Run) error {
