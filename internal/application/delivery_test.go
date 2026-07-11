@@ -103,8 +103,8 @@ func TestCodeRabbitFindingIsNormalizedWithoutBodyExecution(t *testing.T) {
 }
 
 func TestHumanApprovalAndMergeBindExactSHA(t *testing.T) {
-	run := Run{State: domain.StateAwaitingHumanApproval, CandidateHead: "h1"}
-	pr := domain.PullRequest{Number: 4, HeadSHA: "h1"}
+	run := Run{State: domain.StateAwaitingHumanApproval, CandidateHead: "h1", WorkingBranch: "ifan/one", BaseBranch: "main", IdempotencyKey: "key"}
+	pr := domain.PullRequest{Number: 4, NodeID: "node-4", HeadBranch: "ifan/one", BaseBranch: "main", HeadSHA: "h1", BodyDigest: "digest", OwnershipKey: "key"}
 	snap := domain.ReviewSnapshot{HeadSHA: "h1", RequiredChecks: []string{"test"}, CodeRabbitStatus: "pass", Checks: []domain.Check{{Name: "test", Required: true, Status: "completed", Conclusion: "success", ObservedSHA: "h1"}}}
 	approval := domain.HumanApproval{PRNumber: 4, Approver: "I-Fan", Source: "github_review", ApprovedSHA: "h1", CIStatus: "pass", CodeRabbit: "pass", ReviewSHA: "h1"}
 	if err := AuthorizeMerge(run, pr, snap, approval, "h1", "h1"); err != nil {
@@ -113,6 +113,11 @@ func TestHumanApprovalAndMergeBindExactSHA(t *testing.T) {
 	approval.ApprovedSHA = "old"
 	if err := AuthorizeMerge(run, pr, snap, approval, "h1", "h1"); err == nil {
 		t.Fatal("stale approval authorized merge")
+	}
+	approval.ApprovedSHA = "h1"
+	pr.BaseBranch = "other"
+	if err := AuthorizeMerge(run, pr, snap, approval, "h1", "h1"); err == nil {
+		t.Fatal("wrong PR ownership authorized merge")
 	}
 }
 

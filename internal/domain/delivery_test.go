@@ -40,3 +40,23 @@ func TestChecksMustBeCompleteAndBoundToExactSHA(t *testing.T) {
 		t.Fatal("complete exact-SHA checks should pass")
 	}
 }
+
+func TestCheckFailuresDistinguishActionableFromInfrastructure(t *testing.T) {
+	base := ReviewSnapshot{HeadSHA: "h1", RequiredChecks: []string{"test"}, CodeRabbitStatus: "pass", Checks: []Check{{Name: "test", Required: true, Status: "completed", ObservedSHA: "h1"}}}
+	base.Checks[0].Conclusion = "failure"
+	if base.Classify() != ReconciliationActionable {
+		t.Fatal("test failure should be actionable")
+	}
+	base.Checks[0].Conclusion = "action_required"
+	if base.Classify() != ReconciliationActionable {
+		t.Fatal("action_required should be actionable")
+	}
+	base.Checks[0].Conclusion = "cancelled"
+	if base.Classify() != ReconciliationInfrastructure {
+		t.Fatal("cancelled should be infrastructure")
+	}
+	base.Checks[0].Conclusion = "timed_out"
+	if base.Classify() != ReconciliationInfrastructure {
+		t.Fatal("timed_out should be infrastructure")
+	}
+}

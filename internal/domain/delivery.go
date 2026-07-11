@@ -115,7 +115,9 @@ func (s ReviewSnapshot) Classify() ReconciliationStatus {
 		}
 		switch check.Conclusion {
 		case "success", "neutral", "skipped":
-		case "failure", "cancelled", "timed_out", "action_required":
+		case "failure", "action_required":
+			return ReconciliationActionable
+		case "cancelled", "timed_out":
 			return ReconciliationInfrastructure
 		default:
 			return ReconciliationPending

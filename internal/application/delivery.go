@@ -150,6 +150,9 @@ func AuthorizeMerge(run Run, pr domain.PullRequest, snapshot domain.ReviewSnapsh
 	if run.CandidateHead == "" || pr.HeadSHA != run.CandidateHead || snapshot.HeadSHA != run.CandidateHead || verificationSHA != run.CandidateHead || reviewSHA != run.CandidateHead {
 		return errors.New("merge evidence is not bound to exact final head")
 	}
+	if err := pr.ValidateOwnership(run.WorkingBranch, run.BaseBranch, run.CandidateHead, run.IdempotencyKey); err != nil {
+		return err
+	}
 	if snapshot.Classify() != domain.ReconciliationPass {
 		return errors.New("merge requires passing required checks and CodeRabbit")
 	}
