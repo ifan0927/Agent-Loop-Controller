@@ -35,12 +35,15 @@ func SquashMergeCommand(repository string, number int64, expectedHead string) (C
 	return Command{Program: "gh", Args: []string{"pr", "merge", strconv.FormatInt(number, 10), "--repo", repository, "--squash", "--match-head-commit", expectedHead}}, nil
 }
 
-func DeleteRemoteBranchCommand(branch string) (Command, error) {
+func DeleteRemoteBranchCommand(branch, expectedSHA string) (Command, error) {
 	if err := domain.ValidateGitBranch(branch); err != nil {
 		return Command{}, err
 	}
 	if branch == "main" || branch == "master" {
 		return Command{}, fmt.Errorf("refusing to delete base branch %s", branch)
 	}
-	return Command{Program: "git", Args: []string{"push", "origin", "--delete", "refs/heads/" + branch}}, nil
+	if strings.TrimSpace(expectedSHA) == "" {
+		return Command{}, errors.New("expected remote branch SHA is required")
+	}
+	return Command{Program: "git", Args: []string{"push", "--force-with-lease=refs/heads/" + branch + ":" + expectedSHA, "origin", "--delete", "refs/heads/" + branch}}, nil
 }

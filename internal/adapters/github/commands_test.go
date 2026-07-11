@@ -33,7 +33,18 @@ func TestSquashMergeIsOnlyMethodAndDoesNotDeleteBranch(t *testing.T) {
 }
 
 func TestCleanupRejectsBaseBranch(t *testing.T) {
-	if _, err := DeleteRemoteBranchCommand("main"); err == nil {
+	if _, err := DeleteRemoteBranchCommand("main", "sha"); err == nil {
 		t.Fatal("expected base branch rejection")
+	}
+}
+
+func TestRemoteDeleteBindsExpectedOldSHA(t *testing.T) {
+	command, err := DeleteRemoteBranchCommand("ifan/one", "abc123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(command.Args, " ")
+	if !strings.Contains(joined, "--force-with-lease=refs/heads/ifan/one:abc123") {
+		t.Fatalf("unsafe delete: %v", command.Args)
 	}
 }

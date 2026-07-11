@@ -64,6 +64,11 @@ func (p Publisher) Push(ctx context.Context, workspace, branch, candidate, stdou
 	if err != nil {
 		return PushEvidence{}, err
 	}
+	if expectedRemote != "" {
+		if _, err := p.Workspace.run(ctx, workspace, "merge-base", "--is-ancestor", expectedRemote, candidate); err != nil {
+			return PushEvidence{}, errors.New("candidate is not a fast-forward of expected remote SHA")
+		}
+	}
 	spec, err := BuildPushSpecExpected(branch, expectedRemote)
 	if err != nil {
 		return PushEvidence{}, err
