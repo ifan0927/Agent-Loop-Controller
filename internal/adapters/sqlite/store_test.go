@@ -56,14 +56,14 @@ func TestGitHubV6EvidencePersistsMetadataWithoutSecrets(t *testing.T) {
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM github_read_evidence WHERE run_id='run-gh'`).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("evidence count=%d err=%v", count, err)
 	}
-	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM github_request_observations WHERE run_id='run-gh'`).Scan(&count); err != nil || count != 1 {
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM github_request_observations WHERE run_id='run-gh'`).Scan(&count); err != nil || count != 2 {
 		t.Fatalf("request count=%d err=%v", count, err)
 	}
 	inspection, err := store.Inspect(ctx, "run-gh")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inspection.GitHubInstallation == nil || len(inspection.GitHubRequests) != 1 || inspection.GitHubEvidence == nil {
+	if inspection.GitHubInstallation == nil || len(inspection.GitHubRequests) != 2 || inspection.GitHubEvidence == nil {
 		t.Fatalf("missing GitHub v6 inspection: %+v", inspection)
 	}
 	if inspection.PullRequest == nil || inspection.PullRequest.DatabaseID != 101 {

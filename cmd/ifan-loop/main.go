@@ -104,7 +104,15 @@ func githubRead(args []string) error {
 		expectedRepository = inspection.GitHubInstallation.Repository
 	}
 	observations := []application.GitHubRequestObservation{}
-	observer := func(o application.GitHubRequestObservation) { o.RunID = *runID; observations = append(observations, o) }
+	observationOverflow := false
+	observer := func(o application.GitHubRequestObservation) {
+		o.RunID = *runID
+		if len(observations) >= 10000 {
+			observationOverflow = true
+			return
+		}
+		observations = append(observations, o)
+	}
 	client, err := githubapp.New(cfg, githubapp.RealClock{}, observer)
 	if err != nil {
 		return err
@@ -115,12 +123,16 @@ func githubRead(args []string) error {
 	metadata := client.InstallationMetadata()
 	persistCtx, persistCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer persistCancel()
-	for _, o := range observations {
-		if saveErr := store.SaveGitHubRequest(persistCtx, o); saveErr != nil {
+	if observationOverflow {
+		if saveErr := store.SaveGitHubRequests(persistCtx, observations); saveErr != nil {
 			return saveErr
 		}
+		return errors.New("GitHub request observation limit exceeded")
 	}
 	if readErr != nil {
+		if saveErr := store.SaveGitHubRequests(persistCtx, observations); saveErr != nil {
+			return saveErr
+		}
 		return readErr
 	}
 	if expectedRepository.NodeID == "" {
@@ -132,13 +144,7 @@ func githubRead(args []string) error {
 	if inspection.GitHubInstallation != nil && (metadata.InstallationID != inspection.GitHubInstallation.InstallationID || metadata.AppID != inspection.GitHubInstallation.AppID) {
 		return errors.New("GitHub App installation binding mismatch")
 	}
-	if err := store.SavePullRequest(persistCtx, *runID, evidence.PullRequest); err != nil {
-		return err
-	}
-	if err := store.SaveGitHubInstallation(persistCtx, *runID, metadata); err != nil {
-		return err
-	}
-	if err := store.SaveGitHubEvidence(persistCtx, *runID, evidence); err != nil {
+	if err := store.SaveGitHubReadSuccess(persistCtx, *runID, observations, evidence.PullRequest, metadata, evidence); err != nil {
 		return err
 	}
 	return printJSON(struct {

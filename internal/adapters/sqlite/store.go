@@ -198,7 +198,7 @@ var migrationV5 = []string{
 var migrationV6 = []string{
 	`ALTER TABLE pull_requests ADD COLUMN database_id INTEGER NOT NULL DEFAULT 0`,
 	`CREATE TABLE github_installations (observation_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), app_id INTEGER NOT NULL, installation_id INTEGER NOT NULL, repository_id INTEGER NOT NULL, repository_node_id TEXT NOT NULL, repository_owner TEXT NOT NULL, repository_name TEXT NOT NULL, token_expires_at TEXT NOT NULL, permissions_digest TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE(run_id,app_id,installation_id,repository_id,token_expires_at,permissions_digest))`,
-	`CREATE TABLE github_request_observations (observation_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), operation_name TEXT NOT NULL, endpoint_category TEXT NOT NULL, http_status INTEGER NOT NULL, request_id TEXT NOT NULL DEFAULT '', rate_limit_limit INTEGER NOT NULL DEFAULT 0, rate_limit_remaining INTEGER NOT NULL DEFAULT 0, rate_limit_reset TEXT NOT NULL DEFAULT '', response_digest TEXT NOT NULL, error_class TEXT NOT NULL DEFAULT '', installation_id INTEGER NOT NULL, repository_id INTEGER NOT NULL, repository_node_id TEXT NOT NULL, repository_owner TEXT NOT NULL, repository_name TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE(run_id,operation_name,http_status,request_id,response_digest,error_class))`,
+	`CREATE TABLE github_request_observations (observation_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), operation_name TEXT NOT NULL, endpoint_category TEXT NOT NULL, http_status INTEGER NOT NULL, request_id TEXT NOT NULL DEFAULT '', rate_limit_limit INTEGER NOT NULL DEFAULT 0, rate_limit_remaining INTEGER NOT NULL DEFAULT 0, rate_limit_reset TEXT NOT NULL DEFAULT '', response_digest TEXT NOT NULL, error_class TEXT NOT NULL DEFAULT '', installation_id INTEGER NOT NULL, repository_id INTEGER NOT NULL, repository_node_id TEXT NOT NULL, repository_owner TEXT NOT NULL, repository_name TEXT NOT NULL, observed_at TEXT NOT NULL)`,
 	`CREATE TABLE github_read_evidence (evidence_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), head_sha TEXT NOT NULL, repository_id INTEGER NOT NULL, evidence_json TEXT NOT NULL, evidence_digest TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE(run_id,head_sha,evidence_digest))`,
 }
 
@@ -369,8 +369,69 @@ func (s *Store) SaveGitHubRequest(ctx context.Context, o application.GitHubReque
 		sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%d\x00%s", o.Operation, o.Category, o.HTTPStatus, o.ErrorClass)))
 		o.ResponseDigest = hex.EncodeToString(sum[:])
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO github_request_observations(run_id,operation_name,endpoint_category,http_status,request_id,rate_limit_limit,rate_limit_remaining,rate_limit_reset,response_digest,error_class,installation_id,repository_id,repository_node_id,repository_owner,repository_name,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,operation_name,http_status,request_id,response_digest,error_class) DO NOTHING`, o.RunID, o.Operation, o.Category, o.HTTPStatus, o.RequestID, o.RateLimitLimit, o.RateLimitRemaining, formatTime(o.RateLimitReset), o.ResponseDigest, o.ErrorClass, o.InstallationID, o.Repository.ID, o.Repository.NodeID, o.Repository.Owner, o.Repository.Name, formatTime(o.ObservedAt))
+	_, err := s.db.ExecContext(ctx, githubRequestInsert, githubRequestArgs(o)...)
 	return err
+}
+
+const githubRequestInsert = `INSERT INTO github_request_observations(run_id,operation_name,endpoint_category,http_status,request_id,rate_limit_limit,rate_limit_remaining,rate_limit_reset,response_digest,error_class,installation_id,repository_id,repository_node_id,repository_owner,repository_name,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+
+func githubRequestArgs(o application.GitHubRequestObservation) []any {
+	if strings.TrimSpace(o.ResponseDigest) == "" {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%d\x00%s", o.Operation, o.Category, o.HTTPStatus, o.ErrorClass)))
+		o.ResponseDigest = hex.EncodeToString(sum[:])
+	}
+	return []any{o.RunID, o.Operation, o.Category, o.HTTPStatus, o.RequestID, o.RateLimitLimit, o.RateLimitRemaining, formatTime(o.RateLimitReset), o.ResponseDigest, o.ErrorClass, o.InstallationID, o.Repository.ID, o.Repository.NodeID, o.Repository.Owner, o.Repository.Name, formatTime(o.ObservedAt)}
+}
+func (s *Store) SaveGitHubRequests(ctx context.Context, observations []application.GitHubRequestObservation) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, o := range observations {
+		if strings.TrimSpace(o.RunID) == "" {
+			return errors.New("GitHub request observation lacks run")
+		}
+		if _, err := tx.ExecContext(ctx, githubRequestInsert, githubRequestArgs(o)...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) SaveGitHubReadSuccess(ctx context.Context, runID string, observations []application.GitHubRequestObservation, pr domain.PullRequest, m application.GitHubInstallationMetadata, e domain.GitHubReadEvidence) error {
+	raw, err := json.Marshal(e)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(raw)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, o := range observations {
+		if o.RunID != runID {
+			return errors.New("GitHub observation run mismatch")
+		}
+		if _, err := tx.ExecContext(ctx, githubRequestInsert, githubRequestArgs(o)...); err != nil {
+			return err
+		}
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE pull_requests SET database_id=?,url=?,head_sha=?,body_digest=?,state=?,merged=?,merge_sha=?,merged_at=? WHERE run_id=? AND number=? AND node_id=? AND head_branch=? AND base_branch=? AND base_sha=? AND ownership_key=? AND database_id IN (0,?)`, pr.DatabaseID, pr.URL, pr.HeadSHA, pr.BodyDigest, pr.State, pr.Merged, pr.MergeSHA, formatTime(pr.MergedAt), runID, pr.Number, pr.NodeID, pr.HeadBranch, pr.BaseBranch, pr.BaseSHA, pr.OwnershipKey, pr.DatabaseID)
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return errors.New("atomic GitHub PR identity update mismatch")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO github_installations(run_id,app_id,installation_id,repository_id,repository_node_id,repository_owner,repository_name,token_expires_at,permissions_digest,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,app_id,installation_id,repository_id,token_expires_at,permissions_digest) DO NOTHING`, runID, m.AppID, m.InstallationID, m.Repository.ID, m.Repository.NodeID, m.Repository.Owner, m.Repository.Name, formatTime(m.TokenExpiresAt), m.PermissionsDigest, formatTime(m.ObservedAt)); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO github_read_evidence(run_id,head_sha,repository_id,evidence_json,evidence_digest,observed_at) VALUES(?,?,?,?,?,?) ON CONFLICT(run_id,head_sha,evidence_digest) DO NOTHING`, runID, e.PullRequest.HeadSHA, e.Repository.ID, string(raw), hex.EncodeToString(sum[:]), formatTime(e.ObservedAt)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) SaveGitHubEvidence(ctx context.Context, runID string, e domain.GitHubReadEvidence) error {
