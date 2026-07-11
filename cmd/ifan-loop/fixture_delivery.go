@@ -346,6 +346,17 @@ func fixturePush(ctx context.Context, store *sqlitestore.Store, run application.
 			return err
 		}
 	}
+	inspection, err := store.Inspect(ctx, run.ID)
+	if err != nil {
+		return err
+	}
+	for _, resource := range inspection.Resources {
+		if resource.Kind == "branch" && resource.Name == run.WorkingBranch {
+			if err := store.AddOwnedResource(ctx, application.OwnedResource{RunID: run.ID, Kind: "remote_branch", Name: run.WorkingBranch, CreationEvidence: resource.CreationEvidence, Status: "owned"}); err != nil {
+				return err
+			}
+		}
+	}
 	return store.Transition(ctx, run.ID, domain.StatePushingBranch, domain.StateBranchPushed, "remote exact SHA observed", side.ResultJSON, run.CandidateHead)
 }
 

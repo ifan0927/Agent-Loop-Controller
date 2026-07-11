@@ -1087,7 +1087,15 @@ func (c *LocalController) Repair(ctx context.Context, runID, normalizedPrompt st
 		}
 	}
 	if count >= task.Policy.MaxRepairAttempts {
-		return run, errors.New("bounded repair attempts exhausted; manual intervention required")
+		err := errors.New("bounded repair attempts exhausted; manual intervention required")
+		if transitionErr := c.store.Transition(ctx, runID, domain.StateRepairing, domain.StateManualIntervention, "repair policy exhausted", err.Error(), run.CandidateHead); transitionErr != nil {
+			return run, errors.Join(err, transitionErr)
+		}
+		updated, getErr := c.store.GetRun(ctx, runID)
+		if getErr != nil {
+			return run, errors.Join(err, getErr)
+		}
+		return updated, err
 	}
 	evidenceData, _ := json.Marshal(struct {
 		Prompt string `json:"normalized_prompt"`

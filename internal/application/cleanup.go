@@ -49,7 +49,7 @@ func CleanupOwned(ctx context.Context, store DeliveryStore, port CleanupPort, ru
 		switch resource.Kind {
 		case "worktree":
 			err = port.RemoveWorktree(ctx, run.Repository, resource.Name)
-		case "local_branch":
+		case "branch", "local_branch":
 			if resource.Name == run.BaseBranch {
 				err = errors.New("refusing to delete base branch")
 			} else if resource.Name != run.WorkingBranch {
@@ -97,7 +97,7 @@ func validateCleanupEvidence(run Run, resource OwnedResource) error {
 		if resource.Name != run.WorktreePath || evidence.Path != run.WorktreePath || evidence.Branch != run.WorkingBranch || evidence.BaseBranch != run.BaseBranch || evidence.BaseSHA != run.BaseSHA {
 			return errors.New("worktree cleanup ownership evidence mismatch")
 		}
-	case "local_branch", "remote_branch":
+	case "branch", "local_branch", "remote_branch":
 		if resource.Name != run.WorkingBranch || evidence.Branch != run.WorkingBranch || evidence.BaseBranch != run.BaseBranch || evidence.BaseSHA != run.BaseSHA {
 			return errors.New("branch cleanup ownership evidence mismatch")
 		}
