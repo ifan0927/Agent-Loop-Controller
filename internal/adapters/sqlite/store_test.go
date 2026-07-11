@@ -177,7 +177,7 @@ func TestApprovalAndMergeEvidenceAreImmutable(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC().Truncate(time.Nanosecond)
-	approval := domain.HumanApproval{PRNumber: 1, Approver: "I-Fan", Source: "github", ApprovedSHA: "h1", CIStatus: "pass", CodeRabbit: "pass", ReviewSHA: "h1", ApprovedAt: now}
+	approval := domain.HumanApproval{PRNumber: 1, Approver: "ifan0927", Source: "github_review", ApprovedSHA: "h1", CIStatus: "pass", CodeRabbit: "pass", ReviewSHA: "h1", ApprovedAt: now}
 	if err := store.SaveHumanApproval(ctx, "run-1", approval); err != nil {
 		t.Fatal(err)
 	}

@@ -530,6 +530,24 @@ func (s *Store) UpsertCleanup(ctx context.Context, record application.CleanupRec
 	_, err := s.db.ExecContext(ctx, `INSERT INTO cleanup_results(run_id,resource_kind,resource_name,status,last_error,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(run_id,resource_kind,resource_name) DO UPDATE SET status=excluded.status,last_error=excluded.last_error,updated_at=excluded.updated_at`, record.RunID, record.Kind, record.Name, record.Status, record.LastError, nowText())
 	return err
 }
+func (s *Store) CleanupProgress(ctx context.Context, runID string) ([]application.CleanupRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT cleanup_id,run_id,resource_kind,resource_name,status,last_error,updated_at FROM cleanup_results WHERE run_id=? ORDER BY cleanup_id`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []application.CleanupRecord
+	for rows.Next() {
+		var item application.CleanupRecord
+		var updated string
+		if err := rows.Scan(&item.ID, &item.RunID, &item.Kind, &item.Name, &item.Status, &item.LastError, &updated); err != nil {
+			return nil, err
+		}
+		item.UpdatedAt = parseTime(updated)
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
 
 func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspection, error) {
 	run, err := s.GetRun(ctx, id)

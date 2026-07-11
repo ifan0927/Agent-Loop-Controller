@@ -18,12 +18,25 @@ func CleanupOwned(ctx context.Context, store DeliveryStore, port CleanupPort, ru
 		return errors.New("cleanup requires persisted squash-merge evidence for the exact candidate")
 	}
 	var partial []error
+	progress, err := store.CleanupProgress(ctx, run.ID)
+	if err != nil {
+		return err
+	}
+	deleted := map[string]bool{}
+	for _, item := range progress {
+		if item.Status == "deleted" {
+			deleted[item.Kind+"\x00"+item.Name] = true
+		}
+	}
 	for _, resource := range resources {
 		if resource.RunID != run.ID || resource.Status == "deleted" {
 			continue
 		}
 		if resource.Status != "owned" {
 			return fmt.Errorf("cleanup resource %s is not durably owned", resource.Name)
+		}
+		if deleted[resource.Kind+"\x00"+resource.Name] {
+			continue
 		}
 		if err := validateCleanupEvidence(run, resource); err != nil {
 			return err

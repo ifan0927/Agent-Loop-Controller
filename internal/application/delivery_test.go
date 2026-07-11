@@ -40,6 +40,9 @@ func (s *deliveryMemoryStore) UpsertCleanup(_ context.Context, value CleanupReco
 	s.cleanup = append(s.cleanup, value)
 	return nil
 }
+func (s *deliveryMemoryStore) CleanupProgress(context.Context, string) ([]CleanupRecord, error) {
+	return append([]CleanupRecord(nil), s.cleanup...), nil
+}
 
 type fakeGitHub struct {
 	snapshots []domain.ReviewSnapshot
@@ -103,10 +106,10 @@ func TestCodeRabbitFindingIsNormalizedWithoutBodyExecution(t *testing.T) {
 }
 
 func TestHumanApprovalAndMergeBindExactSHA(t *testing.T) {
-	run := Run{State: domain.StateAwaitingHumanApproval, CandidateHead: "h1", WorkingBranch: "ifan/one", BaseBranch: "main", IdempotencyKey: "key"}
-	pr := domain.PullRequest{Number: 4, NodeID: "node-4", HeadBranch: "ifan/one", BaseBranch: "main", HeadSHA: "h1", BodyDigest: "digest", OwnershipKey: "key"}
+	run := Run{State: domain.StateAwaitingHumanApproval, CandidateHead: "h1", WorkingBranch: "ifan/one", BaseBranch: "main", BaseSHA: "b1", IdempotencyKey: "key"}
+	pr := domain.PullRequest{Number: 4, NodeID: "node-4", HeadBranch: "ifan/one", BaseBranch: "main", BaseSHA: "b1", HeadSHA: "h1", BodyDigest: "digest", OwnershipKey: "key"}
 	snap := domain.ReviewSnapshot{HeadSHA: "h1", RequiredChecks: []string{"test"}, CodeRabbitStatus: "pass", Checks: []domain.Check{{Name: "test", Required: true, Status: "completed", Conclusion: "success", ObservedSHA: "h1"}}}
-	approval := domain.HumanApproval{PRNumber: 4, Approver: "I-Fan", Source: "github_review", ApprovedSHA: "h1", CIStatus: "pass", CodeRabbit: "pass", ReviewSHA: "h1"}
+	approval := domain.HumanApproval{PRNumber: 4, Approver: "ifan0927", Source: "github_review", ApprovedSHA: "h1", CIStatus: "pass", CodeRabbit: "pass", ReviewSHA: "h1"}
 	if err := AuthorizeMerge(run, pr, snap, approval, "h1", "h1"); err != nil {
 		t.Fatal(err)
 	}
@@ -178,6 +181,21 @@ func TestCleanupRejectsReservedOrForgedResourcesWithoutCallingPort(t *testing.T)
 	}
 	if len(port.calls) != 0 {
 		t.Fatal("cleanup port called for forged resource")
+	}
+}
+
+func TestCleanupRestartSkipsPersistedDeletedResource(t *testing.T) {
+	store := &deliveryMemoryStore{cleanup: []CleanupRecord{{RunID: "r1", Kind: "worktree", Name: "/tmp/w", Status: "deleted"}}}
+	port := &fakeCleanup{}
+	run := Run{ID: "r1", Repository: "repo", BaseBranch: "main", BaseSHA: "b1", WorkingBranch: "ifan/one", CandidateHead: "h1", WorktreePath: "/tmp/w"}
+	merge := MergeRecord{RunID: "r1", PreMergeSHA: "h1", Method: "squash", MergeSHA: "m1"}
+	evidence := `{"path":"/tmp/w","branch":"ifan/one","base_branch":"main","base_sha":"b1"}`
+	resources := []OwnedResource{{RunID: "r1", Kind: "worktree", Name: "/tmp/w", Status: "owned", CreationEvidence: evidence}}
+	if err := CleanupOwned(context.Background(), store, port, run, merge, resources); err != nil {
+		t.Fatal(err)
+	}
+	if len(port.calls) != 0 {
+		t.Fatalf("deleted resource retried: %v", port.calls)
 	}
 }
 

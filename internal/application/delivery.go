@@ -84,6 +84,7 @@ type DeliveryStore interface {
 	SaveHumanApproval(context.Context, string, domain.HumanApproval) error
 	SaveMerge(context.Context, MergeRecord) error
 	UpsertCleanup(context.Context, CleanupRecord) error
+	CleanupProgress(context.Context, string) ([]CleanupRecord, error)
 }
 
 type GitHubPort interface {
@@ -149,6 +150,9 @@ func AuthorizeMerge(run Run, pr domain.PullRequest, snapshot domain.ReviewSnapsh
 	}
 	if run.CandidateHead == "" || pr.HeadSHA != run.CandidateHead || snapshot.HeadSHA != run.CandidateHead || verificationSHA != run.CandidateHead || reviewSHA != run.CandidateHead {
 		return errors.New("merge evidence is not bound to exact final head")
+	}
+	if pr.BaseSHA != run.BaseSHA {
+		return errors.New("pull request base SHA drift invalidates merge authorization")
 	}
 	if err := pr.ValidateOwnership(run.WorkingBranch, run.BaseBranch, run.CandidateHead, run.IdempotencyKey); err != nil {
 		return err

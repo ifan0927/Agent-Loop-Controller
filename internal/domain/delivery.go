@@ -40,7 +40,7 @@ func (p PullRequest) ValidateOwnership(branch, base, head, ownershipKey string) 
 	if strings.TrimSpace(ownershipKey) == "" || p.OwnershipKey != ownershipKey {
 		return errors.New("pull request lacks controller ownership evidence")
 	}
-	if p.Number < 1 || strings.TrimSpace(p.NodeID) == "" || strings.TrimSpace(p.BodyDigest) == "" {
+	if p.Number < 1 || strings.TrimSpace(p.NodeID) == "" || strings.TrimSpace(p.BodyDigest) == "" || strings.TrimSpace(p.BaseSHA) == "" {
 		return errors.New("pull request identity evidence is incomplete")
 	}
 	return nil
@@ -157,8 +157,8 @@ type HumanApproval struct {
 }
 
 func (a HumanApproval) Authorizes(pr PullRequest, head string) error {
-	if strings.TrimSpace(a.Approver) == "" || strings.TrimSpace(a.Source) == "" {
-		return errors.New("human approval identity and source are required")
+	if a.Approver != "ifan0927" || a.Source != "github_review" && a.Source != "fixture_explicit_approval" {
+		return errors.New("human approval is not from the trusted I-Fan identity adapter")
 	}
 	if a.PRNumber != pr.Number || a.ApprovedSHA != head || a.ReviewSHA != head {
 		return errors.New("human approval is not bound to the exact PR head")
