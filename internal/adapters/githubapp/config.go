@@ -91,17 +91,26 @@ func ReadPrivateKeyFile(path string) ([]byte, error) {
 	if !filepath.IsAbs(path) {
 		return nil, errors.New("private key file path must be absolute")
 	}
-	info, err := os.Lstat(path)
+	clean := filepath.Clean(path)
+	file, err := os.Open(clean)
 	if err != nil {
 		return nil, fmt.Errorf("open private key source: %w", err)
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	pathInfo, err := os.Lstat(clean)
+	if err != nil {
+		return nil, err
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || !os.SameFile(info, pathInfo) {
 		return nil, errors.New("private key source must be a non-symlink regular file")
 	}
 	if info.Mode().Perm()&0o077 != 0 {
 		return nil, errors.New("private key source must not be group or world accessible")
 	}
-	clean := filepath.Clean(path)
 	resolved, err := filepath.EvalSymlinks(clean)
 	if err != nil || resolved != clean {
 		return nil, errors.New("private key source path is ambiguous")
@@ -109,5 +118,12 @@ func ReadPrivateKeyFile(path string) ([]byte, error) {
 	if info.Size() > 64<<10 {
 		return nil, errors.New("private key source is too large")
 	}
-	return os.ReadFile(clean)
+	data, err := io.ReadAll(io.LimitReader(file, (64<<10)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > 64<<10 {
+		return nil, errors.New("private key source is too large")
+	}
+	return data, nil
 }

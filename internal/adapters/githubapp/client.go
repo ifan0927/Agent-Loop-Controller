@@ -125,11 +125,6 @@ func (c *Client) Read(ctx context.Context, pr int64, expectedHead string) (domai
 	e.Findings = findings
 	e.CodeRabbit = cr
 	e.UnknownEvents = append(unknown, unknown2...)
-	e.ReviewDecision = decision
-	e.Reviews = reviews
-	e.Findings = findings
-	e.CodeRabbit = cr
-	e.UnknownEvents = append(e.UnknownEvents, unknown2...)
 	var final rawPR
 	if err := c.rest(ctx, "pull_request_final", "GET", fmt.Sprintf("/repos/%s/%s/pulls/%d", c.cfg.RepositoryOwner, c.cfg.RepositoryName, pr), nil, &final, true); err != nil {
 		return e, err
