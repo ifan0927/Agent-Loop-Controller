@@ -43,6 +43,21 @@ name, repository-owned verifier IDs, policy, and source revision. Linear never
 carries executable verification commands. A material Linear edit
 after admission creates a human decision point; it never silently changes a run.
 
+### Repository registry
+
+Registry version 1 selects one repository by case-insensitive canonical
+`owner/name`. Each concrete entry binds non-symlink local checkout, origin,
+artifact, and worktree roots; `builtin:v1` verifier policy; base branch; a
+non-secret GitHub App profile reference; installation and immutable repository
+IDs; and allowed operator logins. Duplicate identities, shared or overlapping
+paths, unsupported verifiers, and incomplete legacy entries fail closed.
+
+The controller persists schema version 7 registry and selected-binding digests
+with the sanitized binding identity. Restart requires the same registry and
+rejects drift before resuming. Full paths remain in the private authority
+snapshot needed to reproduce the run, but status and inspect projections expose
+only non-secret identity, policy references, and digests.
+
 ### Codex implementation outcome
 
 Implementation is a resumable `codex exec` session. The semantic last message is
@@ -281,7 +296,7 @@ repository and valid credentials.
 
 ## Direct read-only GitHub App adapter
 
-Schema version 6 adds non-secret installation, repository, request, rate-limit,
+Schema version 6 added non-secret installation, repository, request, rate-limit,
 actor-derived normalized evidence, and response digests. JWTs, installation
 tokens, private keys, authorization headers, and raw token responses are never
 persisted. The adapter uses RS256 App JWTs and memory-only installation tokens,

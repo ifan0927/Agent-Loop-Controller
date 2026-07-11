@@ -7,9 +7,7 @@ lab="$($repo_root/scripts/create-local-lab.sh)"
 start_output="$(go run "$repo_root/cmd/ifan-loop" local start \
   --issue "$lab/simulated-issue.json" \
   --registry "$lab/repository-registry.json" \
-  --db "$lab/controller.db" \
-  --run-root "$lab/runs" \
-  --worktree-root "$lab/worktrees")"
+  --db "$lab/controller.db")"
 printf '%s\n' "$start_output"
 run_id="$(printf '%s\n' "$start_output" | sed -n 's/.*"run_id": "\([^"]*\)".*/\1/p' | head -n 1)"
 candidate="$(printf '%s\n' "$start_output" | sed -n 's/.*"candidate_head": "\([^"]*\)".*/\1/p' | head -n 1)"
@@ -19,7 +17,7 @@ printf '{"pr_number":1,"approver":"ifan0927","source":"fixture_explicit_approval
 
 # Starting a second public CLI process is the required restart boundary.
 go run "$repo_root/cmd/ifan-loop" local status "$run_id" --db "$lab/controller.db"
-go run "$repo_root/cmd/ifan-loop" local fixture-deliver "$run_id" --db "$lab/controller.db" --approval "$approval"
+go run "$repo_root/cmd/ifan-loop" local fixture-deliver "$run_id" --db "$lab/controller.db" --registry "$lab/repository-registry.json" --approval "$approval"
 go run "$repo_root/cmd/ifan-loop" local inspect "$run_id" --db "$lab/controller.db"
 
 test ! -e "$lab/worktrees/$run_id"

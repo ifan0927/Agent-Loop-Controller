@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -96,8 +98,11 @@ func githubRead(args []string) error {
 		return errors.New("requested PR or expected head does not match persisted run evidence")
 	}
 	parts := strings.Split(inspection.Run.Repository, "/")
-	if len(parts) != 2 || parts[0] != cfg.RepositoryOwner || parts[1] != cfg.RepositoryName {
+	if len(parts) != 2 || !strings.EqualFold(parts[0], cfg.RepositoryOwner) || !strings.EqualFold(parts[1], cfg.RepositoryName) {
 		return errors.New("configured repository does not match persisted run repository")
+	}
+	if inspection.RepositoryBinding != nil && (inspection.RepositoryBinding.ExpectedRepositoryID != cfg.RepositoryID || inspection.RepositoryBinding.GitHubInstallationID != cfg.InstallationID) {
+		return errors.New("configured GitHub authority does not match persisted repository binding")
 	}
 	expectedRepository := domain.RepositoryIdentity{ID: cfg.RepositoryID, Owner: cfg.RepositoryOwner, Name: cfg.RepositoryName}
 	if inspection.GitHubInstallation != nil {
@@ -174,15 +179,13 @@ func localStart(args []string) error {
 	issuePath := flags.String("issue", "", "simulated Linear issue JSON")
 	registryPath := flags.String("registry", "", "controller-owned local repository registry JSON")
 	dbPath := flags.String("db", "", "SQLite controller database")
-	runRoot := flags.String("run-root", "", "absolute run artifact root")
-	worktreeRoot := flags.String("worktree-root", "", "absolute dedicated worktree root")
 	codexBinary := flags.String("codex-binary", "codex", "Codex CLI binary")
 	timeout := flags.Duration("timeout", 30*time.Minute, "local run timeout")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if *issuePath == "" || *registryPath == "" || *dbPath == "" || *runRoot == "" || *worktreeRoot == "" {
-		return fmt.Errorf("--issue, --registry, --db, --run-root, and --worktree-root are required")
+	if *issuePath == "" || *registryPath == "" || *dbPath == "" {
+		return fmt.Errorf("--issue, --registry, and --db are required")
 	}
 	registry, err := localregistry.Load(*registryPath)
 	if err != nil {
@@ -210,13 +213,12 @@ func localStart(args []string) error {
 		return err
 	}
 	defer store.Close()
-	controller := newLocalController(store, *codexBinary, *worktreeRoot)
+	controller := newLocalController(store, *codexBinary, repo.WorktreeRoot)
 	ctx, cancel := localContext(*timeout)
 	defer cancel()
 	run, err := controller.Start(ctx, application.LocalStartInput{Task: snapshot.Task, RawIssueJSON: snapshot.RawJSON, RawIssueHash: snapshot.RawHash,
 		NormalizedJSON: snapshot.NormalizedJSON, TaskHash: snapshot.TaskHash, IdempotencyKey: snapshot.IdempotencyKey,
-		Repository: application.LocalRepository{Label: repo.Label, OriginPath: repo.OriginPath, SourcePath: repo.SourcePath, BaseBranch: repo.BaseBranch, VerifierIDs: repo.VerifierIDs},
-		RunRoot:    *runRoot, WorktreeRoot: *worktreeRoot})
+		Repository: localRepository(repo), RunRoot: repo.RunRoot, WorktreeRoot: repo.WorktreeRoot})
 	if err != nil {
 		return err
 	}
@@ -226,6 +228,7 @@ func localStart(args []string) error {
 func localContinue(args []string) error {
 	flags := flag.NewFlagSet("local continue", flag.ContinueOnError)
 	dbPath := flags.String("db", "", "SQLite controller database")
+	registryPath := flags.String("registry", "", "versioned repository registry used to create the run")
 	decisionPath := flags.String("decision", "", "optional simulated human decision JSON")
 	codexBinary := flags.String("codex-binary", "codex", "Codex CLI binary")
 	timeout := flags.Duration("timeout", 30*time.Minute, "local run timeout")
@@ -236,8 +239,8 @@ func localContinue(args []string) error {
 	if runID == "" && flags.NArg() == 1 {
 		runID = flags.Arg(0)
 	}
-	if runID == "" || *dbPath == "" {
-		return fmt.Errorf("usage: ifan-loop local continue <run-id> --db <controller.db> [--decision <decision.json>]")
+	if runID == "" || *dbPath == "" || *registryPath == "" {
+		return fmt.Errorf("usage: ifan-loop local continue <run-id> --db <controller.db> --registry <repository-registry.json> [--decision <decision.json>]")
 	}
 	store, err := sqlitestore.Open(*dbPath)
 	if err != nil {
@@ -246,6 +249,13 @@ func localContinue(args []string) error {
 	defer store.Close()
 	existing, err := store.GetRun(context.Background(), runID)
 	if err != nil {
+		return err
+	}
+	registry, err := localregistry.Load(*registryPath)
+	if err != nil {
+		return fmt.Errorf("load registry: %w", err)
+	}
+	if err := validatePersistedRegistryBinding(existing, registry); err != nil {
 		return err
 	}
 	var decision *application.Decision
@@ -269,6 +279,71 @@ func localContinue(args []string) error {
 		return err
 	}
 	return printJSON(run)
+}
+
+func localRepository(repo localregistry.Binding) application.LocalRepository {
+	return application.LocalRepository{RegistryVersion: repo.RegistryVersion, RegistryDigest: repo.RegistryDigest,
+		RepositoryBindingDigest: repo.RepositoryBindingDigest, CanonicalRepository: repo.CanonicalRepository,
+		OriginPath: repo.OriginPath, SourcePath: repo.SourcePath, RunRoot: repo.RunRoot, WorktreeRoot: repo.WorktreeRoot,
+		BaseBranch: repo.BaseBranch, VerifierRegistryRef: repo.VerifierRegistryRef, VerifierIDs: append([]string(nil), repo.VerifierIDs...),
+		GitHubAppProfileRef: repo.GitHubAppProfileRef, GitHubInstallationID: repo.GitHubInstallationID,
+		ExpectedRepositoryID: repo.ExpectedRepositoryID, AllowedOperatorLogins: append([]string(nil), repo.OperatorIdentityPolicy.AllowedLogins...)}
+}
+
+func localBinding(repo application.LocalRepository) localregistry.Binding {
+	return localregistry.Binding{RegistryVersion: repo.RegistryVersion, RegistryDigest: repo.RegistryDigest,
+		RepositoryBindingDigest: repo.RepositoryBindingDigest, CanonicalRepository: repo.CanonicalRepository,
+		OriginPath: repo.OriginPath, SourcePath: repo.SourcePath, RunRoot: repo.RunRoot, WorktreeRoot: repo.WorktreeRoot,
+		BaseBranch: repo.BaseBranch, VerifierRegistryRef: repo.VerifierRegistryRef, VerifierIDs: append([]string(nil), repo.VerifierIDs...),
+		GitHubAppProfileRef: repo.GitHubAppProfileRef, GitHubInstallationID: repo.GitHubInstallationID,
+		ExpectedRepositoryID:   repo.ExpectedRepositoryID,
+		OperatorIdentityPolicy: localregistry.OperatorIdentityPolicy{AllowedLogins: append([]string(nil), repo.AllowedOperatorLogins...)}}
+}
+
+func validatePersistedRegistryBinding(run application.Run, registry localregistry.Registry) error {
+	if run.RegistryVersion < 1 {
+		return errors.New("persisted repository binding is legacy-insufficient")
+	}
+	var persisted application.LocalRepository
+	if err := json.Unmarshal([]byte(run.RepositoryConfigJSON), &persisted); err != nil {
+		return errors.New("persisted repository binding is invalid")
+	}
+	rawIssueBytes := []byte(run.RawIssueJSON)
+	rawIssueDigest := sha256.Sum256(rawIssueBytes)
+	if hex.EncodeToString(rawIssueDigest[:]) != run.RawIssueHash {
+		return errors.New("persisted raw issue digest mismatch")
+	}
+	issue, decodedRaw, err := localissue.Decode(strings.NewReader(run.RawIssueJSON))
+	if err != nil {
+		return errors.New("persisted raw issue snapshot is invalid")
+	}
+	snapshot, err := localissue.Admit(issue, decodedRaw, registry)
+	if err != nil {
+		return fmt.Errorf("re-admit persisted issue snapshot: %w", err)
+	}
+	if snapshot.RawHash != run.RawIssueHash || snapshot.TaskHash != run.TaskHash || snapshot.IdempotencyKey != run.IdempotencyKey || string(snapshot.NormalizedJSON) != run.NormalizedTaskJSON {
+		return errors.New("persisted task snapshot does not match canonical issue admission")
+	}
+	taskBytes := []byte(run.NormalizedTaskJSON)
+	taskDigest := sha256.Sum256(taskBytes)
+	if hex.EncodeToString(taskDigest[:]) != run.TaskHash {
+		return errors.New("persisted normalized task digest mismatch")
+	}
+	var task domain.CodingTask
+	if err := json.Unmarshal(taskBytes, &task); err != nil || task.Validate() != nil {
+		return errors.New("persisted normalized task is invalid")
+	}
+	if task.RunID != run.ID || task.IssueID != run.IssueID || task.SourceRevision != run.SourceRevision ||
+		task.Repository != run.Repository || task.BaseBranch != run.BaseBranch || task.WorkingBranch != run.WorkingBranch {
+		return errors.New("persisted run columns do not match immutable task snapshot")
+	}
+	if run.Repository != persisted.CanonicalRepository || run.BaseBranch != persisted.BaseBranch ||
+		run.RegistryVersion != persisted.RegistryVersion || run.RegistryDigest != persisted.RegistryDigest ||
+		run.RepositoryBindingDigest != persisted.RepositoryBindingDigest ||
+		run.WorktreePath != filepath.Join(persisted.WorktreeRoot, run.ID) || run.ArtifactRoot != filepath.Join(persisted.RunRoot, run.ID) {
+		return errors.New("persisted run columns do not match repository authority binding")
+	}
+	return registry.VerifyPersisted(localBinding(persisted))
 }
 
 func decodeDecision(reader io.Reader) (application.Decision, error) {
@@ -309,7 +384,54 @@ func localInspect(command string, args []string) error {
 	if err != nil {
 		return err
 	}
+	sanitizeInspection(&inspection)
 	return printJSON(inspection)
+}
+
+func sanitizeInspection(inspection *application.RunInspection) {
+	inspection.Run.WorktreePath = ""
+	inspection.Run.ArtifactRoot = ""
+	inspection.Run.LastError = ""
+	for index := range inspection.Timeline {
+		inspection.Timeline[index].EvidenceReference = ""
+	}
+	for index := range inspection.Attempts {
+		inspection.Attempts[index].SessionID = ""
+		inspection.Attempts[index].StdoutPath = ""
+		inspection.Attempts[index].StderrPath = ""
+		inspection.Attempts[index].OutcomePath = ""
+		inspection.Attempts[index].ArtifactDir = ""
+	}
+	for index := range inspection.Verifications {
+		inspection.Verifications[index].StdoutPath = ""
+		inspection.Verifications[index].StderrPath = ""
+		inspection.Verifications[index].EvidencePath = ""
+	}
+	for index := range inspection.Reviews {
+		inspection.Reviews[index].SessionID = ""
+		inspection.Reviews[index].OutcomePath = ""
+	}
+	for index := range inspection.Resources {
+		inspection.Resources[index].Name = ""
+		inspection.Resources[index].CreationEvidence = ""
+	}
+	for index := range inspection.SideEffects {
+		inspection.SideEffects[index].IntentJSON = ""
+		inspection.SideEffects[index].ResultJSON = ""
+		inspection.SideEffects[index].StdoutPath = ""
+		inspection.SideEffects[index].StderrPath = ""
+	}
+	for index := range inspection.Polls {
+		inspection.Polls[index].SnapshotJSON = ""
+	}
+	for index := range inspection.Findings {
+		inspection.Findings[index].Body = ""
+		inspection.Findings[index].File = ""
+	}
+	for index := range inspection.Cleanup {
+		inspection.Cleanup[index].Name = ""
+		inspection.Cleanup[index].LastError = ""
+	}
 }
 
 func splitLeadingRunID(args []string) (string, []string) {

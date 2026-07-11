@@ -99,6 +99,13 @@ func TestMigrationAndRunIdempotency(t *testing.T) {
 	if _, created, err := store.CreateRun(context.Background(), input); err != nil || created {
 		t.Fatalf("repeat: created=%v err=%v", created, err)
 	}
+	drifted := input
+	drifted.Run.RegistryVersion = 1
+	drifted.Run.RegistryDigest = "changed"
+	drifted.Run.RepositoryBindingDigest = "changed"
+	if _, _, err := store.CreateRun(context.Background(), drifted); err == nil {
+		t.Fatal("idempotent start must reject changed repository authority")
+	}
 	other := input
 	other.Run.ID = "run-2"
 	other.Run.IdempotencyKey = "key-2"
@@ -197,7 +204,7 @@ func TestMigratesVersionFourDatabaseToCurrentVersion(t *testing.T) {
 	}
 	defer store.Close()
 	version, err := store.SchemaVersion(context.Background())
-	if err != nil || version != 6 {
+	if err != nil || version != schemaVersion {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	var count int

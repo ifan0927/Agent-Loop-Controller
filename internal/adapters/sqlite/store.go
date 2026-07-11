@@ -20,7 +20,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 6
+const schemaVersion = 7
 
 type Store struct{ db *sql.DB }
 
@@ -101,6 +101,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV5
 		case 6:
 			statements = migrationV6
+		case 7:
+			statements = migrationV7
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -202,6 +204,12 @@ var migrationV6 = []string{
 	`CREATE TABLE github_read_evidence (evidence_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), head_sha TEXT NOT NULL, repository_id INTEGER NOT NULL, evidence_json TEXT NOT NULL, evidence_digest TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE(run_id,head_sha,evidence_digest))`,
 }
 
+var migrationV7 = []string{
+	`ALTER TABLE runs ADD COLUMN registry_version INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE runs ADD COLUMN registry_digest TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE runs ADD COLUMN repository_binding_digest TEXT NOT NULL DEFAULT ''`,
+}
+
 func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput) (application.Run, bool, error) {
 	run := input.Run
 	now := time.Now().UTC()
@@ -211,9 +219,10 @@ func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput)
 	}
 	defer tx.Rollback()
 	_, err = tx.ExecContext(ctx, `INSERT INTO runs(run_id,issue_id,idempotency_key,source_revision,raw_issue_json,raw_issue_hash,
-		normalized_task_json,task_hash,repository,repository_config_json,base_branch,working_branch,worktree_path,artifact_root,current_state,implementation_model,review_model,created_at,updated_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, run.ID, run.IssueID, run.IdempotencyKey, run.SourceRevision, run.RawIssueJSON,
-		run.RawIssueHash, run.NormalizedTaskJSON, run.TaskHash, run.Repository, run.RepositoryConfigJSON, run.BaseBranch, run.WorkingBranch,
+		normalized_task_json,task_hash,repository,repository_config_json,registry_version,registry_digest,repository_binding_digest,base_branch,working_branch,worktree_path,artifact_root,current_state,implementation_model,review_model,created_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, run.ID, run.IssueID, run.IdempotencyKey, run.SourceRevision, run.RawIssueJSON,
+		run.RawIssueHash, run.NormalizedTaskJSON, run.TaskHash, run.Repository, run.RepositoryConfigJSON,
+		run.RegistryVersion, run.RegistryDigest, run.RepositoryBindingDigest, run.BaseBranch, run.WorkingBranch,
 		run.WorktreePath, run.ArtifactRoot, domain.StateReceived, run.ImplementationModel, run.ReviewModel, formatTime(now), formatTime(now))
 	if err != nil {
 		_ = tx.Rollback()
@@ -221,6 +230,9 @@ func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput)
 		if getErr == nil {
 			if existing.TaskHash != run.TaskHash || existing.SourceRevision != run.SourceRevision {
 				return application.Run{}, false, errors.New("idempotency key conflicts with a different task snapshot")
+			}
+			if existing.Repository != run.Repository || existing.RegistryVersion != run.RegistryVersion || existing.RegistryDigest != run.RegistryDigest || existing.RepositoryBindingDigest != run.RepositoryBindingDigest {
+				return application.Run{}, false, errors.New("idempotency key conflicts with a different repository authority binding")
 			}
 			return existing, false, nil
 		}
@@ -246,7 +258,7 @@ func (s *Store) getByIdempotency(ctx context.Context, key string) (application.R
 }
 
 const runSelect = `SELECT run_id,issue_id,idempotency_key,source_revision,raw_issue_json,raw_issue_hash,
-	normalized_task_json,task_hash,repository,repository_config_json,base_branch,working_branch,base_sha,worktree_path,artifact_root,
+	normalized_task_json,task_hash,repository,repository_config_json,registry_version,registry_digest,repository_binding_digest,base_branch,working_branch,base_sha,worktree_path,artifact_root,
 	current_state,candidate_head,implementation_session_id,implementation_model,review_model,last_error,lease_owner,lease_expires_unix,created_at,updated_at FROM runs`
 
 type rowScanner interface{ Scan(...any) error }
@@ -256,7 +268,7 @@ func scanRun(row rowScanner) (application.Run, error) {
 	var state, created, updated string
 	var leaseExpires int64
 	err := row.Scan(&run.ID, &run.IssueID, &run.IdempotencyKey, &run.SourceRevision, &run.RawIssueJSON, &run.RawIssueHash,
-		&run.NormalizedTaskJSON, &run.TaskHash, &run.Repository, &run.RepositoryConfigJSON, &run.BaseBranch, &run.WorkingBranch, &run.BaseSHA, &run.WorktreePath,
+		&run.NormalizedTaskJSON, &run.TaskHash, &run.Repository, &run.RepositoryConfigJSON, &run.RegistryVersion, &run.RegistryDigest, &run.RepositoryBindingDigest, &run.BaseBranch, &run.WorkingBranch, &run.BaseSHA, &run.WorktreePath,
 		&run.ArtifactRoot, &state, &run.CandidateHead, &run.ImplementationSession, &run.ImplementationModel, &run.ReviewModel, &run.LastError, &run.LeaseOwner, &leaseExpires, &created, &updated)
 	if err != nil {
 		return run, err
@@ -676,6 +688,18 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 		return application.RunInspection{}, err
 	}
 	inspection := application.RunInspection{Run: run}
+	if run.RegistryVersion > 0 {
+		var binding application.LocalRepository
+		if err := json.Unmarshal([]byte(run.RepositoryConfigJSON), &binding); err != nil {
+			return application.RunInspection{}, errors.New("persisted repository binding is invalid")
+		}
+		inspection.RepositoryBinding = &application.SanitizedRepositoryBinding{
+			CanonicalRepository: binding.CanonicalRepository, BaseBranch: binding.BaseBranch,
+			VerifierRegistryRef: binding.VerifierRegistryRef, VerifierIDs: append([]string(nil), binding.VerifierIDs...),
+			GitHubAppProfileRef: binding.GitHubAppProfileRef, GitHubInstallationID: binding.GitHubInstallationID,
+			ExpectedRepositoryID: binding.ExpectedRepositoryID, AllowedOperatorLogins: append([]string(nil), binding.AllowedOperatorLogins...),
+		}
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT sequence,from_state,to_state,reason,evidence_reference,bound_head,created_at FROM transitions WHERE run_id=? ORDER BY sequence`, id)
 	if err != nil {
 		return inspection, err

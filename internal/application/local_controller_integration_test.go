@@ -57,7 +57,7 @@ func newLocalLab(t *testing.T) localLab {
 	runs := filepath.Join(root, "runs")
 	mustMkdir(t, worktrees)
 	mustMkdir(t, runs)
-	return localLab{root: root, origin: origin, source: source, worktrees: worktrees, runs: runs, db: filepath.Join(root, "controller.db"), snapshot: snapshot, repository: application.LocalRepository{Label: "repo:test-project", OriginPath: origin, SourcePath: source, BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}}}
+	return localLab{root: root, origin: origin, source: source, worktrees: worktrees, runs: runs, db: filepath.Join(root, "controller.db"), snapshot: snapshot, repository: application.LocalRepository{CanonicalRepository: "repo:test-project", OriginPath: origin, SourcePath: source, RunRoot: runs, WorktreeRoot: worktrees, BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}}}
 }
 
 type labAdmissionRegistry struct{}

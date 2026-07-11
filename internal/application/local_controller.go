@@ -24,11 +24,21 @@ const candidateCommitSubject = "Controller-owned local candidate"
 const localLeaseTTL = 45 * time.Second
 
 type LocalRepository struct {
-	Label       string   `json:"label"`
-	OriginPath  string   `json:"origin_path"`
-	SourcePath  string   `json:"source_path"`
-	BaseBranch  string   `json:"base_branch"`
-	VerifierIDs []string `json:"verifier_ids"`
+	RegistryVersion         int      `json:"registry_version"`
+	RegistryDigest          string   `json:"registry_digest"`
+	RepositoryBindingDigest string   `json:"repository_binding_digest"`
+	CanonicalRepository     string   `json:"canonical_repository"`
+	OriginPath              string   `json:"origin_path"`
+	SourcePath              string   `json:"source_path"`
+	RunRoot                 string   `json:"run_root"`
+	WorktreeRoot            string   `json:"worktree_root"`
+	BaseBranch              string   `json:"base_branch"`
+	VerifierRegistryRef     string   `json:"verifier_registry_ref"`
+	VerifierIDs             []string `json:"verifier_ids"`
+	GitHubAppProfileRef     string   `json:"github_app_profile_ref"`
+	GitHubInstallationID    int64    `json:"github_installation_id"`
+	ExpectedRepositoryID    int64    `json:"expected_repository_id"`
+	AllowedOperatorLogins   []string `json:"allowed_operator_logins"`
 }
 
 type LocalStartInput struct {
@@ -120,7 +130,7 @@ func (c *LocalController) Start(ctx context.Context, input LocalStartInput) (Run
 		return Run{}, errors.New("run and worktree roots must not overlap")
 	}
 	input.RunRoot, input.WorktreeRoot = canonicalRuns, canonicalWorktrees
-	if input.Task.Repository != input.Repository.Label || input.Task.BaseBranch != input.Repository.BaseBranch {
+	if input.Task.Repository != input.Repository.CanonicalRepository || input.Task.BaseBranch != input.Repository.BaseBranch {
 		return Run{}, errors.New("task repository/base does not match the registry snapshot")
 	}
 	repositoryJSON, err := json.Marshal(input.Repository)
@@ -132,7 +142,9 @@ func (c *LocalController) Start(ctx context.Context, input LocalStartInput) (Run
 		IdempotencyKey: input.IdempotencyKey, SourceRevision: input.Task.SourceRevision, RawIssueJSON: string(input.RawIssueJSON),
 		RawIssueHash: input.RawIssueHash, NormalizedTaskJSON: string(input.NormalizedJSON), TaskHash: input.TaskHash,
 		Repository: input.Task.Repository, RepositoryConfigJSON: string(repositoryJSON), BaseBranch: input.Task.BaseBranch,
-		WorkingBranch: input.Task.WorkingBranch, WorktreePath: filepath.Join(input.WorktreeRoot, input.Task.RunID), ArtifactRoot: artifactRoot,
+		RegistryVersion: input.Repository.RegistryVersion, RegistryDigest: input.Repository.RegistryDigest,
+		RepositoryBindingDigest: input.Repository.RepositoryBindingDigest,
+		WorkingBranch:           input.Task.WorkingBranch, WorktreePath: filepath.Join(input.WorktreeRoot, input.Task.RunID), ArtifactRoot: artifactRoot,
 		ImplementationModel: codex.ImplementationModel, ReviewModel: codex.ReviewModel}})
 	if err != nil {
 		return Run{}, err

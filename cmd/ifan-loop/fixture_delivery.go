@@ -16,6 +16,7 @@ import (
 	"time"
 
 	gitadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/git"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/localregistry"
 	processadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/process"
 	sqlitestore "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
@@ -30,19 +31,31 @@ type fixtureRepository struct {
 func localFixtureDeliver(args []string) error {
 	flags := flag.NewFlagSet("local fixture-deliver", flag.ContinueOnError)
 	dbPath := flags.String("db", "", "SQLite controller database")
+	registryPath := flags.String("registry", "", "versioned repository registry used to create the run")
 	approvalPath := flags.String("approval", "", "explicit simulated human approval JSON")
 	runID, rest := splitLeadingRunID(args)
 	if err := flags.Parse(rest); err != nil {
 		return err
 	}
-	if runID == "" || *dbPath == "" {
-		return errors.New("usage: ifan-loop local fixture-deliver <run-id> --db <controller.db> --approval <approval.json>")
+	if runID == "" || *dbPath == "" || *registryPath == "" {
+		return errors.New("usage: ifan-loop local fixture-deliver <run-id> --db <controller.db> --registry <repository-registry.json> --approval <approval.json>")
 	}
 	store, err := sqlitestore.Open(*dbPath)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
+	registry, err := localregistry.Load(*registryPath)
+	if err != nil {
+		return fmt.Errorf("load registry: %w", err)
+	}
+	persistedRun, err := store.GetRun(context.Background(), runID)
+	if err != nil {
+		return err
+	}
+	if err := validatePersistedRegistryBinding(persistedRun, registry); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	leaseOwner := fmt.Sprintf("fixture-delivery-%d", time.Now().UTC().UnixNano())

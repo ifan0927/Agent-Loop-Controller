@@ -1,48 +1,168 @@
 package localregistry
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
-func TestRegistryLoadsPathsButUsesOnlyBuiltinVerifierCommands(t *testing.T) {
+func TestRegistrySelectsTwoRepositoriesDeterministically(t *testing.T) {
 	root := t.TempDir()
-	origin := filepath.Join(root, "origin.git")
-	source := filepath.Join(root, "source")
-	if err := os.Mkdir(origin, 0o700); err != nil {
+	first := fixtureRepository(t, root, "owner", "one", 101)
+	second := fixtureRepository(t, root, "OWNER", "two", 102)
+	registry := loadFixture(t, root, File{Version: CurrentVersion, Repositories: []Repository{first, second}})
+
+	one, err := registry.Resolve("Owner/One")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Mkdir(source, 0o700); err != nil {
+	if one.CanonicalRepository != "owner/one" || one.ExpectedRepositoryID != 101 || !registry.HasVerifier("OWNER/ONE", "fixture-go-test") {
+		t.Fatalf("unexpected binding: %+v", one.Sanitized())
+	}
+	two, err := registry.Resolve("owner/two")
+	if err != nil || two.ExpectedRepositoryID != 102 || one.RepositoryBindingDigest == two.RepositoryBindingDigest {
+		t.Fatalf("second binding=%+v err=%v", two.Sanitized(), err)
+	}
+	if one.RegistryDigest == "" || one.RepositoryBindingDigest == "" {
+		t.Fatal("versioned digests were not frozen")
+	}
+}
+
+func TestRegistryRejectsUnknownDuplicateIncompleteAndLegacyBindings(t *testing.T) {
+	root := t.TempDir()
+	valid := fixtureRepository(t, root, "owner", "repo", 101)
+	tests := []struct {
+		name string
+		file any
+	}{
+		{"legacy", map[string]any{"repositories": []any{map[string]any{"label": "repo:test"}}}},
+		{"unknown version", File{Version: 2, Repositories: []Repository{valid}}},
+		{"duplicate canonical", File{Version: 1, Repositories: []Repository{valid, valid}}},
+		{"incomplete authority", File{Version: 1, Repositories: []Repository{func() Repository { value := valid; value.ExpectedRepositoryID = 0; return value }()}}},
+		{"executable verifier", File{Version: 1, Repositories: []Repository{func() Repository { value := valid; value.VerifierIDs = []string{"go test ./..."}; return value }()}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(root, strings.ReplaceAll(test.name, " ", "-")+".json")
+			raw, _ := json.Marshal(test.file)
+			if err := os.WriteFile(path, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatal("invalid registry accepted")
+			}
+		})
+	}
+}
+
+func TestRegistryRejectsSymlinkAmbiguityAndAuthorityDrift(t *testing.T) {
+	root := t.TempDir()
+	repo := fixtureRepository(t, root, "owner", "repo", 101)
+	registry := loadFixture(t, root, File{Version: 1, Repositories: []Repository{repo}})
+	persisted, _ := registry.Resolve("owner/repo")
+
+	repo.ExpectedRepositoryID = 202
+	drifted := loadFixtureAt(t, filepath.Join(root, "drift.json"), File{Version: 1, Repositories: []Repository{repo}})
+	if err := drifted.VerifyPersisted(persisted); err == nil {
+		t.Fatal("authority-changing config drift accepted")
+	}
+	tampered := persisted
+	tampered.OriginPath = tampered.SourcePath
+	if err := registry.VerifyPersisted(tampered); err == nil {
+		t.Fatal("tampered persisted binding accepted with unchanged digests")
+	}
+
+	link := filepath.Join(root, "source-link")
+	if err := os.Symlink(repo.SourcePath, link); err != nil {
 		t.Fatal(err)
 	}
+	repo.SourcePath = link
+	path := filepath.Join(root, "symlink.json")
+	raw, _ := json.Marshal(File{Version: 1, Repositories: []Repository{repo}})
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("symlink-ambiguous path accepted")
+	}
+}
+
+func TestRegistryRejectsInvalidGitHubIdentities(t *testing.T) {
+	root := t.TempDir()
+	base := fixtureRepository(t, root, "owner", "repo", 101)
+	tests := []Repository{
+		func() Repository { value := base; value.Owner = "owner:admin"; return value }(),
+		func() Repository { value := base; value.Name = "repo:name"; return value }(),
+		func() Repository {
+			value := base
+			value.OperatorIdentityPolicy.AllowedLogins = []string{strings.Repeat("a", 40)}
+			return value
+		}(),
+		func() Repository {
+			value := base
+			value.GitHubAppProfileRef = "ghp_fixtureSecretMaterial"
+			return value
+		}(),
+	}
+	for index, repo := range tests {
+		path := filepath.Join(root, fmt.Sprintf("invalid-identity-%d.json", index))
+		raw, _ := json.Marshal(File{Version: 1, Repositories: []Repository{repo}})
+		if err := os.WriteFile(path, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil {
+			t.Fatal("invalid GitHub identity accepted")
+		}
+	}
+}
+
+func TestRegistryErrorsDoNotEchoSecretValues(t *testing.T) {
+	root := t.TempDir()
 	path := filepath.Join(root, "registry.json")
-	data := fmt.Sprintf(`{"repositories":[{"label":"repo:test-project","origin_path":%q,"source_path":%q,"base_branch":"main","verifier_ids":["fixture-go-test"]}]}`, origin, source)
-	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+	secret := "super-secret-private-key-material"
+	raw := `{"version":1,"private_key":"` + secret + `","repositories":[]}`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil || strings.Contains(err.Error(), secret) {
+		t.Fatalf("secret-bearing invalid registry error=%v", err)
+	}
+}
+
+func fixtureRepository(t *testing.T, root, owner, name string, id int64) Repository {
+	t.Helper()
+	base := filepath.Join(root, strings.ToLower(owner+"-"+name))
+	paths := make([]string, 4)
+	for i, part := range []string{"origin", "source", "runs", "worktrees"} {
+		paths[i] = filepath.Join(base, part)
+		if err := os.MkdirAll(paths[i], 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return Repository{Owner: owner, Name: name, OriginPath: paths[0], SourcePath: paths[1], RunRoot: paths[2], WorktreeRoot: paths[3],
+		BaseBranch: "main", VerifierRegistryRef: "builtin:v1", VerifierIDs: []string{"fixture-go-test"},
+		GitHubAppProfileRef: "github-app-profile:fixture", GitHubInstallationID: 22, ExpectedRepositoryID: id,
+		OperatorIdentityPolicy: OperatorIdentityPolicy{AllowedLogins: []string{"ifan0927"}}}
+}
+
+func loadFixture(t *testing.T, root string, file File) Registry {
+	t.Helper()
+	return loadFixtureAt(t, filepath.Join(root, "registry.json"), file)
+}
+
+func loadFixtureAt(t *testing.T, path string, file File) Registry {
+	t.Helper()
+	raw, _ := json.Marshal(file)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	registry, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !registry.HasRepository("repo:test-project") || !registry.HasVerifier("repo:test-project", "fixture-go-test") {
-		t.Fatal("registered repository/verifier missing")
-	}
-	command := BuiltinVerifierCommands()["fixture-go-test"]
-	if command.Program != "go" || len(command.Args) != 2 {
-		t.Fatalf("unexpected controller command: %+v", command)
-	}
-}
-
-func TestRegistryRejectsExecutableOrUnknownVerifierConfiguration(t *testing.T) {
-	root := t.TempDir()
-	path := filepath.Join(root, "registry.json")
-	data := fmt.Sprintf(`{"repositories":[{"label":"repo:test-project","origin_path":%q,"source_path":%q,"base_branch":"main","verifier_ids":["go test ./..."]}]}`, root, root)
-	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Load(path); err == nil {
-		t.Fatal("registry-provided executable text must be rejected")
-	}
+	return registry
 }
