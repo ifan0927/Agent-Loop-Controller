@@ -92,6 +92,9 @@ func githubRead(args []string) error {
 	if inspection.PullRequest == nil {
 		return errors.New("persisted PR identity is required")
 	}
+	if *pr != inspection.PullRequest.Number || *head != inspection.Run.CandidateHead {
+		return errors.New("requested PR or expected head does not match persisted run evidence")
+	}
 	parts := strings.Split(inspection.Run.Repository, "/")
 	if len(parts) != 2 || parts[0] != cfg.RepositoryOwner || parts[1] != cfg.RepositoryName {
 		return errors.New("configured repository does not match persisted run repository")

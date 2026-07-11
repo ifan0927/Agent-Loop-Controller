@@ -77,7 +77,7 @@ func TestLatestCheckRunWinsDeterministically(t *testing.T) {
 		fmt.Fprint(w, `{"contexts":[],"checks":[{"context":"test","app_id":8}]}`)
 	})
 	mux.HandleFunc("/repos/owner/repo/commits/head/check-runs", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"check_runs":[{"id":2,"name":"test","status":"completed","conclusion":"failure","started_at":"2026-07-11T00:02:00Z","completed_at":"2026-07-11T00:03:00Z","app":{"id":8}},{"id":1,"name":"test","status":"completed","conclusion":"success","started_at":"2026-07-11T00:00:00Z","completed_at":"2026-07-11T00:01:00Z","app":{"id":8}}]}`)
+		fmt.Fprint(w, `{"check_runs":[{"id":3,"name":"test","status":"in_progress","conclusion":"","started_at":"2026-07-11T00:04:00Z","completed_at":null,"app":{"id":8}},{"id":2,"name":"test","status":"completed","conclusion":"failure","started_at":"2026-07-11T00:02:00Z","completed_at":"2026-07-11T00:03:00Z","app":{"id":8}},{"id":1,"name":"test","status":"completed","conclusion":"success","started_at":"2026-07-11T00:00:00Z","completed_at":"2026-07-11T00:01:00Z","app":{"id":8}}]}`)
 	})
 	mux.HandleFunc("/repos/owner/repo/commits/head/status", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `{"total_count":0,"statuses":[]}`) })
 	srv := httptest.NewServer(mux)
@@ -87,7 +87,7 @@ func TestLatestCheckRunWinsDeterministically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(checks) != 1 || checks[0].State != domain.CheckFailure || cr != domain.CodeRabbitActionable {
+	if len(checks) != 1 || checks[0].State != domain.CheckInProgress || cr != domain.CodeRabbitPending {
 		t.Fatalf("checks=%+v coderabbit=%s", checks, cr)
 	}
 }

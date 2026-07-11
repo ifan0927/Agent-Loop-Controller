@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,6 +102,16 @@ func (c *Client) Read(ctx context.Context, pr int64, expectedHead string) (domai
 		return e, errors.New("review topology drifted while collecting GitHub evidence")
 	}
 	decision, reviews, findings, cr, unknown2 = decision2, reviews2, findings2, cr2, unknown3
+	checks2, coderabbitCheck2, unknownChecks2, err := c.readChecks(ctx, expectedHead, e.PullRequest.BaseBranch)
+	if err != nil {
+		return e, err
+	}
+	if checkTopologyDigest(checks, coderabbitCheck, unknown) != checkTopologyDigest(checks2, coderabbitCheck2, unknownChecks2) {
+		return e, errors.New("check topology drifted while collecting GitHub evidence")
+	}
+	checks, unknown = checks2, unknownChecks2
+	e.Checks = checks
+	e.UnknownEvents = unknown
 	e.ReviewDecision = decision
 	e.Reviews = reviews
 	e.Findings = findings
@@ -129,6 +140,23 @@ func reviewTopologyDigest(decision string, reviews []domain.GitHubReview, findin
 		CodeRabbit domain.CodeRabbitState
 		Unknown    []string
 	}{decision, reviews, copies, cr, unknown})
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+func checkTopologyDigest(checks []domain.GitHubCheck, cr domain.CodeRabbitState, unknown []string) string {
+	copies := append([]domain.GitHubCheck(nil), checks...)
+	for i := range copies {
+		copies[i].ObservedAt = time.Time{}
+	}
+	sort.Slice(copies, func(i, j int) bool { return copies[i].ID < copies[j].ID })
+	events := append([]string(nil), unknown...)
+	sort.Strings(events)
+	raw, _ := json.Marshal(struct {
+		Checks     []domain.GitHubCheck
+		CodeRabbit domain.CodeRabbitState
+		Unknown    []string
+	}{copies, cr, events})
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }
@@ -399,7 +427,7 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 		for _, r := range raw.CheckRuns {
 			key := fmt.Sprintf("%s\x00%d", r.Name, r.App.ID)
 			previous, ok := latestRuns[key]
-			if !ok || r.CompletedAt.After(previous.CompletedAt) || r.CompletedAt.Equal(previous.CompletedAt) && r.StartedAt.After(previous.StartedAt) || r.CompletedAt.Equal(previous.CompletedAt) && r.StartedAt.Equal(previous.StartedAt) && r.ID > previous.ID {
+			if !ok || r.ID > previous.ID || r.ID == previous.ID && r.StartedAt.After(previous.StartedAt) || r.ID == previous.ID && r.StartedAt.Equal(previous.StartedAt) && r.CompletedAt.After(previous.CompletedAt) {
 				latestRuns[key] = r
 			}
 		}
