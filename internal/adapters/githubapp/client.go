@@ -80,13 +80,13 @@ func (c *Client) Read(ctx context.Context, pr int64, expectedHead string) (domai
 	if e.PullRequest.HeadSHA != expectedHead {
 		return e, errors.New("pull request head SHA mismatch")
 	}
-	checks, coderabbitAppSeen, unknown, err := c.readChecks(ctx, expectedHead, e.PullRequest.BaseBranch)
+	checks, coderabbitCheck, unknown, err := c.readChecks(ctx, expectedHead, e.PullRequest.BaseBranch)
 	if err != nil {
 		return e, err
 	}
 	e.Checks = checks
 	e.UnknownEvents = unknown
-	decision, reviews, findings, cr, unknown2, err := c.readReviews(ctx, pr, expectedHead, coderabbitAppSeen)
+	decision, reviews, findings, cr, unknown2, err := c.readReviews(ctx, pr, expectedHead, coderabbitCheck)
 	if err != nil {
 		return e, err
 	}
@@ -95,6 +95,14 @@ func (c *Client) Read(ctx context.Context, pr int64, expectedHead string) (domai
 	e.Findings = findings
 	e.CodeRabbit = cr
 	e.UnknownEvents = append(e.UnknownEvents, unknown2...)
+	var final rawPR
+	if err := c.rest(ctx, "pull_request_final", "GET", fmt.Sprintf("/repos/%s/%s/pulls/%d", c.cfg.RepositoryOwner, c.cfg.RepositoryName, pr), nil, &final, true); err != nil {
+		return e, err
+	}
+	finalPR := final.normalized()
+	if final.Head.Repo.ID != c.cfg.RepositoryID || final.Base.Repo.ID != c.cfg.RepositoryID || finalPR.Number != e.PullRequest.Number || finalPR.DatabaseID != e.PullRequest.DatabaseID || finalPR.NodeID != e.PullRequest.NodeID || finalPR.HeadSHA != e.PullRequest.HeadSHA || finalPR.BaseSHA != e.PullRequest.BaseSHA || finalPR.HeadBranch != e.PullRequest.HeadBranch || finalPR.BaseBranch != e.PullRequest.BaseBranch || finalPR.BodyDigest != e.PullRequest.BodyDigest {
+		return e, errors.New("pull request drifted while collecting GitHub evidence")
+	}
 	return e, nil
 }
 
@@ -317,7 +325,7 @@ func ownershipMarker(body string) string {
 	return strings.TrimSpace(rest[:end])
 }
 
-func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.GitHubCheck, bool, []string, error) {
+func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.GitHubCheck, domain.CodeRabbitState, []string, error) {
 	var all []domain.GitHubCheck
 	var unknown []string
 	var protection struct {
@@ -328,7 +336,7 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 		} `json:"checks"`
 	}
 	if err := c.rest(ctx, "required_checks", "GET", fmt.Sprintf("/repos/%s/%s/branches/%s/protection/required_status_checks", c.cfg.RepositoryOwner, c.cfg.RepositoryName, url.PathEscape(base)), nil, &protection, true); err != nil {
-		return nil, false, nil, err
+		return nil, domain.CodeRabbitUnknown, nil, err
 	}
 	required := map[string]int64{}
 	for _, name := range protection.Contexts {
@@ -337,7 +345,7 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 	for _, check := range protection.Checks {
 		required[check.Context] = check.AppID
 	}
-	coderabbitAppSeen := false
+	coderabbitCheck := domain.CodeRabbitAbsent
 	page := 1
 	for page <= 20 {
 		var raw struct {
@@ -353,7 +361,7 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 		}
 		path := fmt.Sprintf("/repos/%s/%s/commits/%s/check-runs?per_page=100&page=%d", c.cfg.RepositoryOwner, c.cfg.RepositoryName, sha, page)
 		if err := c.rest(ctx, "check_runs", "GET", path, nil, &raw, true); err != nil {
-			return nil, false, nil, err
+			return nil, domain.CodeRabbitUnknown, nil, err
 		}
 		for _, r := range raw.CheckRuns {
 			state := mapCheck(r.Status, r.Conclusion)
@@ -362,7 +370,18 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 			}
 			requiredApp, requiredName := required[r.Name]
 			if c.cfg.CodeRabbitAppID > 0 && r.App.ID == c.cfg.CodeRabbitAppID {
-				coderabbitAppSeen = true
+				switch state {
+				case domain.CheckSuccess, domain.CheckNeutral, domain.CheckSkipped:
+					coderabbitCheck = domain.CodeRabbitPass
+				case domain.CheckQueued, domain.CheckInProgress, domain.CheckPending, domain.CheckRequested, domain.CheckWaiting:
+					coderabbitCheck = domain.CodeRabbitPending
+				case domain.CheckFailure, domain.CheckActionRequired:
+					coderabbitCheck = domain.CodeRabbitActionable
+				case domain.CheckCancelled, domain.CheckTimedOut, domain.CheckStale:
+					coderabbitCheck = domain.CodeRabbitInfrastructure
+				default:
+					coderabbitCheck = domain.CodeRabbitUnknown
+				}
 			}
 			all = append(all, domain.GitHubCheck{ID: strconv.FormatInt(r.ID, 10), Name: r.Name, Required: requiredName && (requiredApp == 0 || requiredApp == r.App.ID), Source: "check_run", AppID: r.App.ID, State: state, ObservedSHA: sha, SourceAt: r.CompletedAt, ObservedAt: c.clock.Now().UTC()})
 		}
@@ -372,7 +391,7 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 		page++
 	}
 	if page > 20 {
-		return nil, false, nil, errors.New("check-run pagination exceeded bounded limit")
+		return nil, domain.CodeRabbitUnknown, nil, errors.New("check-run pagination exceeded bounded limit")
 	}
 	var statuses struct {
 		TotalCount int `json:"total_count"`
@@ -383,13 +402,28 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 			UpdatedAt time.Time `json:"updated_at"`
 		} `json:"statuses"`
 	}
-	if statuses.TotalCount > len(statuses.Statuses) {
-		return nil, false, nil, errors.New("commit-status pagination exceeded bounded response")
-	}
 	if err := c.rest(ctx, "commit_statuses", "GET", fmt.Sprintf("/repos/%s/%s/commits/%s/status?per_page=100", c.cfg.RepositoryOwner, c.cfg.RepositoryName, sha), nil, &statuses, true); err != nil {
-		return nil, false, nil, err
+		return nil, domain.CodeRabbitUnknown, nil, err
 	}
+	if statuses.TotalCount > len(statuses.Statuses) {
+		return nil, domain.CodeRabbitUnknown, nil, errors.New("commit-status pagination exceeded bounded response")
+	}
+	latestStatuses := map[string]struct {
+		ID             int64
+		Context, State string
+		UpdatedAt      time.Time
+	}{}
 	for _, status := range statuses.Statuses {
+		previous, ok := latestStatuses[status.Context]
+		if !ok || status.UpdatedAt.After(previous.UpdatedAt) || status.UpdatedAt.Equal(previous.UpdatedAt) && status.ID > previous.ID {
+			latestStatuses[status.Context] = struct {
+				ID             int64
+				Context, State string
+				UpdatedAt      time.Time
+			}{status.ID, status.Context, status.State, status.UpdatedAt}
+		}
+	}
+	for _, status := range latestStatuses {
 		state := mapCheck("completed", status.State)
 		if status.State == "pending" {
 			state = domain.CheckPending
@@ -411,7 +445,7 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 			unknown = append(unknown, "missing_required_check:"+name)
 		}
 	}
-	return all, coderabbitAppSeen, unknown, nil
+	return all, coderabbitCheck, unknown, nil
 }
 func mapCheck(status, conclusion string) domain.CheckState {
 	if status != "completed" {
@@ -454,12 +488,12 @@ func mapCheck(status, conclusion string) domain.CheckState {
 
 const reviewQuery = `query ReadPullRequestReviews($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewDecision reviews(first:100){totalCount nodes{id databaseId state commit{oid} submittedAt author{login __typename ... on Bot{id databaseId}}}} reviewThreads(first:100,after:$cursor){nodes{id isResolved isOutdated comments(first:100){totalCount nodes{id databaseId body path line outdated createdAt author{login __typename ... on Bot{id databaseId}} authorAssociation}}}pageInfo{hasNextPage endCursor}}}}}`
 
-func (c *Client) readReviews(ctx context.Context, pr int64, head string, coderabbitAppSeen bool) (string, []domain.GitHubReview, []domain.NormalizedFinding, domain.CodeRabbitState, []string, error) {
+func (c *Client) readReviews(ctx context.Context, pr int64, head string, coderabbitCheck domain.CodeRabbitState) (string, []domain.GitHubReview, []domain.NormalizedFinding, domain.CodeRabbitState, []string, error) {
 	cursor := ""
 	var findings []domain.NormalizedFinding
 	var reviews []domain.GitHubReview
 	unknown := []string{}
-	cr := domain.CodeRabbitAbsent
+	cr := coderabbitCheck
 	decision := ""
 	seen := map[string]bool{}
 	reviewsLoaded := false
@@ -558,9 +592,12 @@ func (c *Client) readReviews(ctx context.Context, pr int64, head string, coderab
 				}
 				seen[id] = true
 				dig := sha256.Sum256([]byte(m.Body))
-				trusted := coderabbitAppSeen && c.cfg.CodeRabbitAppID > 0 && m.Author.DatabaseID == c.cfg.CodeRabbitActorID && m.Author.ID == c.cfg.CodeRabbitNodeID && m.Author.Typename == "Bot"
+				trusted := false
 				if strings.Contains(strings.ToLower(m.Author.Login), "coderabbit") && !trusted {
-					cr = domain.CodeRabbitUntrusted
+					unknown = append(unknown, "coderabbit_comment_app_provenance_unavailable:"+id)
+					if cr == domain.CodeRabbitAbsent {
+						cr = domain.CodeRabbitUntrusted
+					}
 				}
 				if trusted {
 					if t.IsResolved || t.IsOutdated || m.Outdated {

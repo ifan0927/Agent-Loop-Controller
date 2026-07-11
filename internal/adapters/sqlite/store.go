@@ -357,7 +357,7 @@ func (s *Store) SetLastError(ctx context.Context, id, message string) error {
 }
 
 func (s *Store) SaveGitHubInstallation(ctx context.Context, runID string, m application.GitHubInstallationMetadata) error {
-	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO github_installations(run_id,app_id,installation_id,repository_id,repository_node_id,repository_owner,repository_name,token_expires_at,permissions_digest,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, runID, m.AppID, m.InstallationID, m.Repository.ID, m.Repository.NodeID, m.Repository.Owner, m.Repository.Name, formatTime(m.TokenExpiresAt), m.PermissionsDigest, formatTime(m.ObservedAt))
+	_, err := s.db.ExecContext(ctx, `INSERT INTO github_installations(run_id,app_id,installation_id,repository_id,repository_node_id,repository_owner,repository_name,token_expires_at,permissions_digest,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,app_id,installation_id,repository_id,token_expires_at,permissions_digest) DO NOTHING`, runID, m.AppID, m.InstallationID, m.Repository.ID, m.Repository.NodeID, m.Repository.Owner, m.Repository.Name, formatTime(m.TokenExpiresAt), m.PermissionsDigest, formatTime(m.ObservedAt))
 	return err
 }
 
@@ -369,7 +369,7 @@ func (s *Store) SaveGitHubRequest(ctx context.Context, o application.GitHubReque
 		sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%d\x00%s", o.Operation, o.Category, o.HTTPStatus, o.ErrorClass)))
 		o.ResponseDigest = hex.EncodeToString(sum[:])
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO github_request_observations(run_id,operation_name,endpoint_category,http_status,request_id,rate_limit_limit,rate_limit_remaining,rate_limit_reset,response_digest,error_class,installation_id,repository_id,repository_node_id,repository_owner,repository_name,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, o.RunID, o.Operation, o.Category, o.HTTPStatus, o.RequestID, o.RateLimitLimit, o.RateLimitRemaining, formatTime(o.RateLimitReset), o.ResponseDigest, o.ErrorClass, o.InstallationID, o.Repository.ID, o.Repository.NodeID, o.Repository.Owner, o.Repository.Name, formatTime(o.ObservedAt))
+	_, err := s.db.ExecContext(ctx, `INSERT INTO github_request_observations(run_id,operation_name,endpoint_category,http_status,request_id,rate_limit_limit,rate_limit_remaining,rate_limit_reset,response_digest,error_class,installation_id,repository_id,repository_node_id,repository_owner,repository_name,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,operation_name,http_status,request_id,response_digest,error_class) DO NOTHING`, o.RunID, o.Operation, o.Category, o.HTTPStatus, o.RequestID, o.RateLimitLimit, o.RateLimitRemaining, formatTime(o.RateLimitReset), o.ResponseDigest, o.ErrorClass, o.InstallationID, o.Repository.ID, o.Repository.NodeID, o.Repository.Owner, o.Repository.Name, formatTime(o.ObservedAt))
 	return err
 }
 
@@ -379,7 +379,7 @@ func (s *Store) SaveGitHubEvidence(ctx context.Context, runID string, e domain.G
 		return err
 	}
 	sum := sha256.Sum256(raw)
-	_, err = s.db.ExecContext(ctx, `INSERT OR IGNORE INTO github_read_evidence(run_id,head_sha,repository_id,evidence_json,evidence_digest,observed_at) VALUES(?,?,?,?,?,?)`, runID, e.PullRequest.HeadSHA, e.Repository.ID, string(raw), hex.EncodeToString(sum[:]), formatTime(e.ObservedAt))
+	_, err = s.db.ExecContext(ctx, `INSERT INTO github_read_evidence(run_id,head_sha,repository_id,evidence_json,evidence_digest,observed_at) VALUES(?,?,?,?,?,?) ON CONFLICT(run_id,head_sha,evidence_digest) DO NOTHING`, runID, e.PullRequest.HeadSHA, e.Repository.ID, string(raw), hex.EncodeToString(sum[:]), formatTime(e.ObservedAt))
 	return err
 }
 

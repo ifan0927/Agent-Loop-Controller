@@ -122,7 +122,7 @@ func TestFixtureReplayAndRestartMint(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got.Repository.ID != 99 || got.PullRequest.HeadSHA != "headsha" || got.CodeRabbit != domain.CodeRabbitActionable || len(got.Findings) != 1 {
+		if got.Repository.ID != 99 || got.PullRequest.HeadSHA != "headsha" || got.CodeRabbit != domain.CodeRabbitPass || len(got.Findings) != 0 {
 			t.Fatalf("unexpected replay: %+v", got)
 		}
 	}
