@@ -25,3 +25,18 @@ func TestEveryCodeChangeInvalidatesApproval(t *testing.T) {
 		t.Fatal("approval for old head authorized new code")
 	}
 }
+
+func TestChecksMustBeCompleteAndBoundToExactSHA(t *testing.T) {
+	snapshot := ReviewSnapshot{HeadSHA: "h1", RequiredChecks: []string{"test"}, CodeRabbitStatus: "pass", Checks: []Check{{Name: "test", Required: true, Status: "completed", Conclusion: "success", ObservedSHA: "old"}}}
+	if snapshot.Classify() != ReconciliationInfrastructure {
+		t.Fatal("check for another SHA must fail closed")
+	}
+	snapshot.Checks = nil
+	if snapshot.Classify() != ReconciliationInfrastructure {
+		t.Fatal("missing required check must fail closed")
+	}
+	snapshot.Checks = []Check{{Name: "test", Required: true, Status: "completed", Conclusion: "success", ObservedSHA: "h1"}}
+	if snapshot.Classify() != ReconciliationPass {
+		t.Fatal("complete exact-SHA checks should pass")
+	}
+}

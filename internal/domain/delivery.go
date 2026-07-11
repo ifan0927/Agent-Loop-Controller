@@ -79,6 +79,7 @@ func (f ExternalFinding) Validate() error {
 
 type ReviewSnapshot struct {
 	HeadSHA          string            `json:"head_sha"`
+	RequiredChecks   []string          `json:"required_checks"`
 	Checks           []Check           `json:"checks"`
 	CodeRabbitStatus string            `json:"coderabbit_status"`
 	Findings         []ExternalFinding `json:"findings"`
@@ -87,10 +88,27 @@ type ReviewSnapshot struct {
 }
 
 func (s ReviewSnapshot) Classify() ReconciliationStatus {
+	if strings.TrimSpace(s.HeadSHA) == "" || len(s.RequiredChecks) == 0 {
+		return ReconciliationInfrastructure
+	}
+	required := make(map[string]bool, len(s.RequiredChecks))
+	for _, name := range s.RequiredChecks {
+		if strings.TrimSpace(name) == "" {
+			return ReconciliationInfrastructure
+		}
+		required[name] = false
+	}
 	for _, check := range s.Checks {
 		if !check.Required {
 			continue
 		}
+		if check.ObservedSHA != s.HeadSHA {
+			return ReconciliationInfrastructure
+		}
+		if _, ok := required[check.Name]; !ok {
+			continue
+		}
+		required[check.Name] = true
 		switch check.Status {
 		case "queued", "in_progress", "pending", "requested", "waiting":
 			return ReconciliationPending
@@ -101,6 +119,11 @@ func (s ReviewSnapshot) Classify() ReconciliationStatus {
 			return ReconciliationInfrastructure
 		default:
 			return ReconciliationPending
+		}
+	}
+	for _, observed := range required {
+		if !observed {
+			return ReconciliationInfrastructure
 		}
 	}
 	for _, finding := range s.Findings {

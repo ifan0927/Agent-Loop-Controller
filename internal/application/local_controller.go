@@ -1024,6 +1024,19 @@ func (c *LocalController) validateApproval(ctx context.Context, run Run) error {
 	return errors.New("passing exact-HEAD review evidence is missing")
 }
 
+// ValidateApprovalReady revalidates the complete persisted model, verification,
+// review, artifact, and exact-HEAD evidence before an external publisher runs.
+func (c *LocalController) ValidateApprovalReady(ctx context.Context, runID string) error {
+	run, err := c.store.GetRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	if run.State != domain.StateApprovalReady && run.State != domain.StatePushingBranch {
+		return fmt.Errorf("delivery approval validation requires approval_ready or pushing_branch, got %s", run.State)
+	}
+	return c.validateApproval(ctx, run)
+}
+
 func validateRunModelPolicy(run Run) error {
 	if run.ImplementationModel != codex.ImplementationModel {
 		return fmt.Errorf("run has missing or unsupported implementation model evidence: %q", run.ImplementationModel)

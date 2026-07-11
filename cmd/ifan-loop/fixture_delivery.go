@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -28,12 +29,13 @@ type fixtureRepository struct {
 func localFixtureDeliver(args []string) error {
 	flags := flag.NewFlagSet("local fixture-deliver", flag.ContinueOnError)
 	dbPath := flags.String("db", "", "SQLite controller database")
+	approvalPath := flags.String("approval", "", "explicit simulated human approval JSON")
 	runID, rest := splitLeadingRunID(args)
 	if err := flags.Parse(rest); err != nil {
 		return err
 	}
 	if runID == "" || *dbPath == "" {
-		return errors.New("usage: ifan-loop local fixture-deliver <run-id> --db <controller.db>")
+		return errors.New("usage: ifan-loop local fixture-deliver <run-id> --db <controller.db> --approval <approval.json>")
 	}
 	store, err := sqlitestore.Open(*dbPath)
 	if err != nil {
@@ -41,36 +43,121 @@ func localFixtureDeliver(args []string) error {
 	}
 	defer store.Close()
 	ctx := context.Background()
-	run, err := store.GetRun(ctx, runID)
-	if err != nil {
-		return err
+	for {
+		run, err := store.GetRun(ctx, runID)
+		if err != nil {
+			return err
+		}
+		var repo fixtureRepository
+		if err := json.Unmarshal([]byte(run.RepositoryConfigJSON), &repo); err != nil {
+			return err
+		}
+		if !strings.Contains(repo.OriginPath, "Agent-Loop-Controller-lab.") {
+			return errors.New("fixture delivery refuses non-lab origin")
+		}
+		switch run.State {
+		case domain.StateApprovalReady:
+			controller := newLocalController(store, "codex", filepath.Dir(run.WorktreePath))
+			if err := controller.ValidateApprovalReady(ctx, runID); err != nil {
+				return err
+			}
+			if err := store.Transition(ctx, runID, run.State, domain.StatePushingBranch, "persist push intent", run.WorkingBranch, run.CandidateHead); err != nil {
+				return err
+			}
+		case domain.StatePushingBranch:
+			if err := fixturePush(ctx, store, run); err != nil {
+				return err
+			}
+		case domain.StateBranchPushed:
+			if err := store.Transition(ctx, runID, run.State, domain.StateOpeningPR, "persist PR intent", "fake-github", run.CandidateHead); err != nil {
+				return err
+			}
+		case domain.StateOpeningPR:
+			if err := fixtureOpenPR(ctx, store, run); err != nil {
+				return err
+			}
+		case domain.StatePROpen:
+			if err := store.Transition(ctx, runID, run.State, domain.StateReconcilingReviews, "poll fixture GitHub", "fixture poll", run.CandidateHead); err != nil {
+				return err
+			}
+		case domain.StateReconcilingReviews:
+			if err := fixtureReconcile(ctx, store, run); err != nil {
+				return err
+			}
+		case domain.StateAwaitingHumanApproval:
+			if *approvalPath == "" {
+				return errors.New("explicit --approval is required; controller cannot approve its own PR")
+			}
+			approval, err := readFixtureApproval(*approvalPath)
+			if err != nil {
+				return err
+			}
+			inspection, err := store.Inspect(ctx, runID)
+			if err != nil {
+				return err
+			}
+			if inspection.PullRequest == nil {
+				return errors.New("missing persisted PR")
+			}
+			snapshot := fixturePassingSnapshot(run.CandidateHead)
+			if err := application.AuthorizeMerge(run, *inspection.PullRequest, snapshot, approval, run.CandidateHead, run.CandidateHead); err != nil {
+				return err
+			}
+			if err := store.SaveHumanApproval(ctx, runID, approval); err != nil {
+				return err
+			}
+			if err := store.Transition(ctx, runID, run.State, domain.StateMerging, "explicit simulated final approval bound to exact SHA", *approvalPath, run.CandidateHead); err != nil {
+				return err
+			}
+		case domain.StateMerging:
+			mergeSHA, err := fixtureReconcileOrMerge(repo, run)
+			if err != nil {
+				return err
+			}
+			merge := application.MergeRecord{RunID: runID, PRNumber: 1, PreMergeSHA: run.CandidateHead, BaseSHA: run.BaseSHA, Method: "squash", MergeSHA: mergeSHA, MergedAt: time.Now().UTC()}
+			if err := store.SaveMerge(ctx, merge); err != nil {
+				return err
+			}
+			if err := store.Transition(ctx, runID, run.State, domain.StateCleaning, "fixture squash merge observed", mergeSHA, run.CandidateHead); err != nil {
+				return err
+			}
+		case domain.StateCleaning:
+			inspection, err := store.Inspect(ctx, runID)
+			if err != nil {
+				return err
+			}
+			if inspection.Merge == nil {
+				return errors.New("cleanup lacks merge evidence")
+			}
+			if err := fixtureCleanup(ctx, store, repo, run); err != nil {
+				return err
+			}
+			if err := store.Transition(ctx, runID, run.State, domain.StateCompleted, "owned fixture resources cleaned", "fixture cleanup", inspection.Merge.MergeSHA); err != nil {
+				return err
+			}
+		case domain.StateCompleted:
+			result, err := store.Inspect(ctx, runID)
+			if err != nil {
+				return err
+			}
+			return printJSON(result)
+		default:
+			return fmt.Errorf("fixture delivery cannot resume state %s", run.State)
+		}
 	}
-	if run.State != domain.StateApprovalReady {
-		return fmt.Errorf("fixture delivery requires approval_ready, got %s", run.State)
-	}
-	inspection, err := store.Inspect(ctx, runID)
-	if err != nil {
-		return err
-	}
-	if err := fixtureExactHeadGate(run, inspection); err != nil {
-		return err
-	}
-	var repo fixtureRepository
-	if err := json.Unmarshal([]byte(run.RepositoryConfigJSON), &repo); err != nil {
-		return err
-	}
-	if !strings.Contains(repo.OriginPath, "Agent-Loop-Controller-lab.") {
-		return errors.New("fixture delivery refuses non-lab origin")
-	}
-	if err := store.Transition(ctx, runID, domain.StateApprovalReady, domain.StatePushingBranch, "persist push intent", run.WorkingBranch, run.CandidateHead); err != nil {
+}
+
+func fixturePush(ctx context.Context, store *sqlitestore.Store, run application.Run) error {
+	controller := newLocalController(store, "codex", filepath.Dir(run.WorktreePath))
+	if err := controller.ValidateApprovalReady(ctx, run.ID); err != nil {
 		return err
 	}
 	intent, _ := json.Marshal(map[string]string{"branch": run.WorkingBranch, "head": run.CandidateHead})
-	side, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{RunID: runID, Kind: "push", IdempotencyKey: run.CandidateHead, IntentJSON: string(intent), Attempt: 1})
+	side, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{RunID: run.ID, Kind: "push", IdempotencyKey: run.CandidateHead, IntentJSON: string(intent), Attempt: 1})
 	if err != nil {
 		return err
 	}
-	remote, err := gitadapter.Publisher{Workspace: gitadapter.Workspace{}}.RemoteSHA(ctx, run.WorktreePath, run.WorkingBranch)
+	remote, err := (gitadapter.Publisher{Workspace: gitadapter.Workspace{}}).RemoteSHA(ctx, run.WorktreePath, run.WorkingBranch)
 	if err != nil {
 		return err
 	}
@@ -78,25 +165,25 @@ func localFixtureDeliver(args []string) error {
 		return errors.New("remote branch SHA conflicts with candidate")
 	}
 	if remote == "" {
-		evidence, err := gitadapter.Publisher{Workspace: gitadapter.Workspace{}, Process: processadapter.OSRunner{}}.Push(ctx, run.WorktreePath, run.WorkingBranch, run.CandidateHead, filepath.Join(run.ArtifactRoot, "push.stdout"), filepath.Join(run.ArtifactRoot, "push.stderr"))
+		evidence, pushErr := (gitadapter.Publisher{Workspace: gitadapter.Workspace{}, Process: processadapter.OSRunner{}}).Push(ctx, run.WorktreePath, run.WorkingBranch, run.CandidateHead, filepath.Join(run.ArtifactRoot, "push.stdout"), filepath.Join(run.ArtifactRoot, "push.stderr"))
 		side.StdoutPath = evidence.Stdout
 		side.StderrPath = evidence.Stderr
-		if err != nil {
+		if pushErr != nil {
+			return pushErr
+		}
+	}
+	side.ResultJSON = fmt.Sprintf(`{"remote_ref":"refs/heads/%s","pushed_sha":"%s"}`, run.WorkingBranch, run.CandidateHead)
+	if side.Status != "observed" {
+		side.Status = "observed"
+		side.ObservedAt = time.Now().UTC()
+		if err := store.FinishSideEffect(ctx, side); err != nil {
 			return err
 		}
 	}
-	side.Status = "observed"
-	side.ResultJSON = fmt.Sprintf(`{"remote_ref":"refs/heads/%s","pushed_sha":"%s"}`, run.WorkingBranch, run.CandidateHead)
-	side.ObservedAt = time.Now().UTC()
-	if err := store.FinishSideEffect(ctx, side); err != nil {
-		return err
-	}
-	if err := store.Transition(ctx, runID, domain.StatePushingBranch, domain.StateBranchPushed, "remote exact SHA observed", side.ResultJSON, run.CandidateHead); err != nil {
-		return err
-	}
-	if err := store.Transition(ctx, runID, domain.StateBranchPushed, domain.StateOpeningPR, "persist PR intent", "fake-github", run.CandidateHead); err != nil {
-		return err
-	}
+	return store.Transition(ctx, run.ID, domain.StatePushingBranch, domain.StateBranchPushed, "remote exact SHA observed", side.ResultJSON, run.CandidateHead)
+}
+
+func fixtureOpenPR(ctx context.Context, store *sqlitestore.Store, run application.Run) error {
 	var task domain.CodingTask
 	if err := json.Unmarshal([]byte(run.NormalizedTaskJSON), &task); err != nil {
 		return err
@@ -107,74 +194,65 @@ func localFixtureDeliver(args []string) error {
 	}
 	digest := sha256.Sum256([]byte(body))
 	pr := domain.PullRequest{Number: 1, URL: "https://fixture.invalid/pr/1", NodeID: "fixture-pr-1", HeadBranch: run.WorkingBranch, BaseBranch: run.BaseBranch, HeadSHA: run.CandidateHead, BaseSHA: run.BaseSHA, BodyDigest: hex.EncodeToString(digest[:]), OwnershipKey: run.IdempotencyKey, State: "OPEN"}
-	if err := store.SavePullRequest(ctx, runID, pr); err != nil {
+	if err := pr.ValidateOwnership(run.WorkingBranch, run.BaseBranch, run.CandidateHead, run.IdempotencyKey); err != nil {
 		return err
 	}
-	if err := store.Transition(ctx, runID, domain.StateOpeningPR, domain.StatePROpen, "fake GitHub PR observed", pr.URL, run.CandidateHead); err != nil {
+	if err := store.SavePullRequest(ctx, run.ID, pr); err != nil {
 		return err
 	}
-	if err := store.Transition(ctx, runID, domain.StatePROpen, domain.StateReconcilingReviews, "poll fixture GitHub", "fixture poll 1", run.CandidateHead); err != nil {
-		return err
-	}
-	now := time.Now().UTC()
-	pending := application.PollObservation{RunID: runID, PRNumber: 1, Attempt: 1, HeadSHA: run.CandidateHead, Status: "pending", SnapshotJSON: `{"coderabbit_status":"pending"}`, ObservedAt: now}
-	passing := application.PollObservation{RunID: runID, PRNumber: 1, Attempt: 2, HeadSHA: run.CandidateHead, Status: "pass", SnapshotJSON: `{"checks":"pass","coderabbit_status":"pass"}`, ObservedAt: now}
-	if err := store.SavePollObservation(ctx, pending); err != nil {
-		return err
-	}
-	if err := store.SavePollObservation(ctx, passing); err != nil {
-		return err
-	}
-	if err := store.Transition(ctx, runID, domain.StateReconcilingReviews, domain.StateAwaitingHumanApproval, "checks and CodeRabbit pass", "fixture observations", run.CandidateHead); err != nil {
-		return err
-	}
-	approval := domain.HumanApproval{PRNumber: 1, Approver: "I-Fan (simulated fixture)", Source: "fixture-explicit-approval", ApprovedSHA: run.CandidateHead, CIStatus: "pass", CodeRabbit: "pass", ReviewSHA: run.CandidateHead, ApprovedAt: now}
-	if err := store.SaveHumanApproval(ctx, runID, approval); err != nil {
-		return err
-	}
-	if err := store.Transition(ctx, runID, domain.StateAwaitingHumanApproval, domain.StateMerging, "simulated final approval bound to exact SHA", "fixture approval", run.CandidateHead); err != nil {
-		return err
-	}
-	mergeSHA, err := fixtureSquashMerge(repo, run)
-	if err != nil {
-		return err
-	}
-	merge := application.MergeRecord{RunID: runID, PRNumber: 1, PreMergeSHA: run.CandidateHead, BaseSHA: run.BaseSHA, Method: "squash", MergeSHA: mergeSHA, MergedAt: time.Now().UTC()}
-	if err := store.SaveMerge(ctx, merge); err != nil {
-		return err
-	}
-	if err := store.Transition(ctx, runID, domain.StateMerging, domain.StateCleaning, "fixture squash merge observed", mergeSHA, run.CandidateHead); err != nil {
-		return err
-	}
-	if err := fixtureCleanup(ctx, store, repo, run); err != nil {
-		return err
-	}
-	if err := store.Transition(ctx, runID, domain.StateCleaning, domain.StateCompleted, "owned fixture resources cleaned", "fixture cleanup", mergeSHA); err != nil {
-		return err
-	}
-	result, err := store.Inspect(ctx, runID)
-	if err != nil {
-		return err
-	}
-	return printJSON(result)
+	return store.Transition(ctx, run.ID, domain.StateOpeningPR, domain.StatePROpen, "fake GitHub PR observed", pr.URL, run.CandidateHead)
 }
 
-func fixtureExactHeadGate(run application.Run, inspection application.RunInspection) error {
-	latestVerification, latestReview := "", ""
-	for _, v := range inspection.Verifications {
-		if v.ExitCode == 0 && v.VerifiedHead == run.CandidateHead {
-			latestVerification = v.VerifiedHead
+func fixturePassingSnapshot(head string) domain.ReviewSnapshot {
+	return domain.ReviewSnapshot{HeadSHA: head, RequiredChecks: []string{"fixture-go-test"}, Checks: []domain.Check{{ID: "check-1", Name: "fixture-go-test", Required: true, Status: "completed", Conclusion: "success", ObservedSHA: head}}, CodeRabbitStatus: "pass", ObservedAt: time.Now().UTC()}
+}
+
+func fixtureReconcile(ctx context.Context, store *sqlitestore.Store, run application.Run) error {
+	now := time.Now().UTC()
+	pending := domain.ReviewSnapshot{HeadSHA: run.CandidateHead, RequiredChecks: []string{"fixture-go-test"}, Checks: []domain.Check{{ID: "check-1", Name: "fixture-go-test", Required: true, Status: "in_progress", ObservedSHA: run.CandidateHead}}, CodeRabbitStatus: "pending", ObservedAt: now}
+	passing := fixturePassingSnapshot(run.CandidateHead)
+	for attempt, snapshot := range []domain.ReviewSnapshot{pending, passing} {
+		encoded, _ := json.Marshal(snapshot)
+		if err := store.SavePollObservation(ctx, application.PollObservation{RunID: run.ID, PRNumber: 1, Attempt: attempt + 1, HeadSHA: run.CandidateHead, Status: string(snapshot.Classify()), SnapshotJSON: string(encoded), ObservedAt: snapshot.ObservedAt}); err != nil {
+			return err
 		}
 	}
-	for _, r := range inspection.Reviews {
-		if r.Verdict == "pass" && r.ReviewedHead == run.CandidateHead {
-			latestReview = r.ReviewedHead
+	if passing.Classify() != domain.ReconciliationPass {
+		return errors.New("fixture checks did not pass")
+	}
+	return store.Transition(ctx, run.ID, domain.StateReconcilingReviews, domain.StateAwaitingHumanApproval, "checks and CodeRabbit pass", "fixture observations", run.CandidateHead)
+}
+
+func readFixtureApproval(path string) (domain.HumanApproval, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return domain.HumanApproval{}, err
+	}
+	var approval domain.HumanApproval
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&approval); err != nil {
+		return approval, err
+	}
+	return approval, nil
+}
+
+func fixtureReconcileOrMerge(repo fixtureRepository, run application.Run) (string, error) {
+	remote, err := runCommand(repo.SourcePath, "git", "ls-remote", "origin", "refs/heads/"+run.BaseBranch)
+	if err != nil {
+		return "", err
+	}
+	fields := strings.Fields(remote)
+	if len(fields) == 2 {
+		baseTree, treeErr := runCommand(repo.SourcePath, "git", "show", "-s", "--format=%T", fields[0])
+		if treeErr == nil {
+			candidateTree, candidateErr := runCommand(repo.SourcePath, "git", "show", "-s", "--format=%T", run.CandidateHead)
+			if candidateErr == nil && strings.TrimSpace(baseTree) == strings.TrimSpace(candidateTree) {
+				return fields[0], nil
+			}
 		}
 	}
-	if latestVerification != run.CandidateHead || latestReview != run.CandidateHead {
-		return errors.New("candidate lacks exact-HEAD verification and fresh review")
-	}
-	return nil
+	return fixtureSquashMerge(repo, run)
 }
 func fixtureSquashMerge(repo fixtureRepository, run application.Run) (string, error) {
 	if _, err := runCommand(repo.SourcePath, "git", "fetch", "origin", run.WorkingBranch); err != nil {
@@ -201,23 +279,55 @@ func fixtureSquashMerge(repo fixtureRepository, run application.Run) (string, er
 func fixtureCleanup(ctx context.Context, store *sqlitestore.Store, repo fixtureRepository, run application.Run) error {
 	steps := []application.CleanupRecord{{RunID: run.ID, Kind: "worktree", Name: run.WorktreePath, Status: "intent"}, {RunID: run.ID, Kind: "remote_branch", Name: run.WorkingBranch, Status: "intent"}, {RunID: run.ID, Kind: "local_branch", Name: run.WorkingBranch, Status: "intent"}}
 	for _, step := range steps {
+		inspection, err := store.Inspect(ctx, run.ID)
+		if err != nil {
+			return err
+		}
+		alreadyDeleted := false
+		for _, existing := range inspection.Cleanup {
+			if existing.Kind == step.Kind && existing.Name == step.Name && existing.Status == "deleted" {
+				alreadyDeleted = true
+			}
+		}
+		if alreadyDeleted {
+			continue
+		}
 		if err := store.UpsertCleanup(ctx, step); err != nil {
 			return err
 		}
-		var err error
+		err = nil
 		switch step.Kind {
 		case "worktree":
-			_, err = runCommand(repo.SourcePath, "git", "worktree", "remove", run.WorktreePath)
+			if _, statErr := os.Stat(run.WorktreePath); errors.Is(statErr, os.ErrNotExist) {
+				err = nil
+			} else {
+				_, err = runCommand(repo.SourcePath, "git", "worktree", "remove", run.WorktreePath)
+			}
 		case "remote_branch":
-			_, err = runCommand(repo.SourcePath, "git", "push", "origin", "--delete", "refs/heads/"+run.WorkingBranch)
+			remote, remoteErr := runCommand(repo.SourcePath, "git", "ls-remote", "origin", "refs/heads/"+run.WorkingBranch)
+			if remoteErr != nil {
+				err = remoteErr
+			} else if strings.TrimSpace(remote) == "" {
+				err = nil
+			} else if !strings.HasPrefix(remote, run.CandidateHead+"\t") {
+				err = errors.New("remote branch no longer matches persisted candidate")
+			} else {
+				_, err = runCommand(repo.SourcePath, "git", "push", "origin", "--delete", "refs/heads/"+run.WorkingBranch)
+			}
 		case "local_branch":
 			ref := "refs/heads/" + run.WorkingBranch
 			var actual string
 			actual, err = runCommand(repo.SourcePath, "git", "rev-parse", "--verify", ref)
-			if err == nil && strings.TrimSpace(actual) != run.CandidateHead {
-				err = errors.New("local branch no longer matches persisted candidate")
+			if err != nil && strings.Contains(err.Error(), "Needed a single revision") {
+				err = nil
+				actual = ""
 			}
-			if err == nil {
+			if err == nil && strings.TrimSpace(actual) != run.CandidateHead {
+				if strings.TrimSpace(actual) != "" {
+					err = errors.New("local branch no longer matches persisted candidate")
+				}
+			}
+			if err == nil && strings.TrimSpace(actual) != "" {
 				_, err = runCommand(repo.SourcePath, "git", "update-ref", "-d", ref, run.CandidateHead)
 			}
 		}
