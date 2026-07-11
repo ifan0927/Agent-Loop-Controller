@@ -8,31 +8,34 @@ import (
 )
 
 type Run struct {
-	ID                    string       `json:"run_id"`
-	IssueID               string       `json:"issue_id"`
-	IdempotencyKey        string       `json:"idempotency_key"`
-	SourceRevision        string       `json:"source_revision"`
-	RawIssueJSON          string       `json:"-"`
-	RawIssueHash          string       `json:"raw_issue_hash"`
-	NormalizedTaskJSON    string       `json:"-"`
-	TaskHash              string       `json:"task_snapshot_hash"`
-	Repository            string       `json:"repository"`
-	RepositoryConfigJSON  string       `json:"-"`
-	BaseBranch            string       `json:"base_branch"`
-	WorkingBranch         string       `json:"working_branch"`
-	BaseSHA               string       `json:"base_sha"`
-	WorktreePath          string       `json:"worktree_path"`
-	ArtifactRoot          string       `json:"artifact_root"`
-	State                 domain.State `json:"current_state"`
-	CandidateHead         string       `json:"candidate_head"`
-	ImplementationSession string       `json:"implementation_session_id"`
-	ImplementationModel   string       `json:"implementation_model"`
-	ReviewModel           string       `json:"review_model"`
-	LastError             string       `json:"last_durable_error"`
-	LeaseOwner            string       `json:"-"`
-	LeaseExpiresAt        time.Time    `json:"-"`
-	CreatedAt             time.Time    `json:"created_at"`
-	UpdatedAt             time.Time    `json:"updated_at"`
+	ID                      string       `json:"run_id"`
+	IssueID                 string       `json:"issue_id"`
+	IdempotencyKey          string       `json:"idempotency_key"`
+	SourceRevision          string       `json:"source_revision"`
+	RawIssueJSON            string       `json:"-"`
+	RawIssueHash            string       `json:"raw_issue_hash"`
+	NormalizedTaskJSON      string       `json:"-"`
+	TaskHash                string       `json:"task_snapshot_hash"`
+	Repository              string       `json:"repository"`
+	RepositoryConfigJSON    string       `json:"-"`
+	RegistryVersion         int          `json:"registry_version"`
+	RegistryDigest          string       `json:"registry_digest"`
+	RepositoryBindingDigest string       `json:"repository_binding_digest"`
+	BaseBranch              string       `json:"base_branch"`
+	WorkingBranch           string       `json:"working_branch"`
+	BaseSHA                 string       `json:"base_sha"`
+	WorktreePath            string       `json:"worktree_path"`
+	ArtifactRoot            string       `json:"artifact_root"`
+	State                   domain.State `json:"current_state"`
+	CandidateHead           string       `json:"candidate_head"`
+	ImplementationSession   string       `json:"implementation_session_id"`
+	ImplementationModel     string       `json:"implementation_model"`
+	ReviewModel             string       `json:"review_model"`
+	LastError               string       `json:"last_durable_error"`
+	LeaseOwner              string       `json:"-"`
+	LeaseExpiresAt          time.Time    `json:"-"`
+	CreatedAt               time.Time    `json:"created_at"`
+	UpdatedAt               time.Time    `json:"updated_at"`
 }
 
 type CreateRunInput struct {
@@ -115,6 +118,7 @@ type OwnedResource struct {
 
 type RunInspection struct {
 	Run                Run                         `json:"run"`
+	RepositoryBinding  *SanitizedRepositoryBinding `json:"repository_binding,omitempty"`
 	Timeline           []Transition                `json:"state_timeline"`
 	Attempts           []Attempt                   `json:"attempts"`
 	Verifications      []VerificationRecord        `json:"verifications"`
@@ -130,6 +134,17 @@ type RunInspection struct {
 	GitHubInstallation *GitHubInstallationMetadata `json:"github_installation,omitempty"`
 	GitHubRequests     []GitHubRequestObservation  `json:"github_request_observations"`
 	GitHubEvidence     *domain.GitHubReadEvidence  `json:"github_read_evidence,omitempty"`
+}
+
+type SanitizedRepositoryBinding struct {
+	CanonicalRepository   string   `json:"canonical_repository"`
+	BaseBranch            string   `json:"base_branch"`
+	VerifierRegistryRef   string   `json:"verifier_registry_ref"`
+	VerifierIDs           []string `json:"verifier_ids"`
+	GitHubAppProfileRef   string   `json:"github_app_profile_ref"`
+	GitHubInstallationID  int64    `json:"github_installation_id"`
+	ExpectedRepositoryID  int64    `json:"expected_repository_id"`
+	AllowedOperatorLogins []string `json:"allowed_operator_logins"`
 }
 
 type RunStore interface {

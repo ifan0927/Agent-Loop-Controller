@@ -119,9 +119,7 @@ lab="$(./scripts/create-local-lab.sh)"
 go run ./cmd/ifan-loop local start \
   --issue "$lab/simulated-issue.json" \
   --registry "$lab/repository-registry.json" \
-  --db "$lab/controller.db" \
-  --run-root "$lab/runs" \
-  --worktree-root "$lab/worktrees"
+  --db "$lab/controller.db"
 ```
 
 Inspect or continue the persisted run after restarting the process:
@@ -131,6 +129,7 @@ go run ./cmd/ifan-loop local status <run-id> --db "$lab/controller.db"
 go run ./cmd/ifan-loop local inspect <run-id> --db "$lab/controller.db"
 go run ./cmd/ifan-loop local continue <run-id> \
   --db "$lab/controller.db" \
+  --registry "$lab/repository-registry.json" \
   --decision "$lab/decision.json"
 ```
 
@@ -142,8 +141,12 @@ labs for inspection:
 ./scripts/live-local-resume.sh
 ```
 
-The local repository registry contains paths and allowed verifier IDs only.
-Executable verifier commands remain compiled controller policy.
+The versioned local repository registry binds canonical owner/name, local roots,
+base branch, verifier registry and allowed verifier IDs, GitHub App profile and
+installation identity, immutable repository ID, and allowed operator logins.
+It contains references and non-secret identity only; executable verifier
+commands remain compiled controller policy. A run freezes the registry and
+selected binding digests, and `local continue` rejects authority-changing drift.
 
 Post-approval destructive smoke must use a disposable local bare origin and fake
 GitHub service, or an explicitly authorized isolated GitHub test repository.

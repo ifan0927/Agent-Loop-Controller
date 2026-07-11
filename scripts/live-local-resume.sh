@@ -12,11 +12,11 @@ cat >"$issue" <<'JSON'
   "title": "Choose and implement integer Clamp boundaries",
   "description": "Add mathutil.Clamp, but stop for a human decision before editing because the issue intentionally leaves boundary behavior undecided. Offer inclusive and exclusive boundary options.",
   "team": "IFAN",
-  "labels": ["agent:codex", "repo:test-project"],
+  "labels": ["agent:codex", "fixture-owner/test-project"],
   "status": "Todo",
   "current_cycle": true,
   "cycle_id": "local-phase-1b",
-  "repository_label": "repo:test-project",
+  "repository_label": "fixture-owner/test-project",
   "base_branch": "main",
   "branch_name": "ifan/ifan-lab-resume-1-clamp",
   "goal": "Resolve boundary semantics, then implement Clamp with tests.",
@@ -37,9 +37,7 @@ JSON
 start_output="$(go run "$repo_root/cmd/ifan-loop" local start \
   --issue "$issue" \
   --registry "$lab/repository-registry.json" \
-  --db "$lab/controller.db" \
-  --run-root "$lab/runs" \
-  --worktree-root "$lab/worktrees")"
+  --db "$lab/controller.db")"
 printf '%s\n' "$start_output"
 run_id="$(printf '%s\n' "$start_output" | sed -n 's/.*"run_id": "\([^"]*\)".*/\1/p' | head -n 1)"
 outcome="$(find "$lab/runs/$run_id/attempts" -name implementation-outcome.json -type f | head -n 1)"
@@ -54,6 +52,7 @@ JSON
 
 go run "$repo_root/cmd/ifan-loop" local continue "$run_id" \
   --db "$lab/controller.db" \
+  --registry "$lab/repository-registry.json" \
   --decision "$decision"
 
 printf 'Local explicit-resume lab retained at %s\n' "$lab"

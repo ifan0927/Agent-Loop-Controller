@@ -40,13 +40,22 @@ git -C "$source" push origin main >/dev/null 2>&1
 
 cat >"$registry" <<JSON
 {
+	"version": 1,
   "repositories": [
     {
-      "label": "repo:test-project",
+	  "owner": "fixture-owner",
+	  "name": "test-project",
       "origin_path": "$origin",
       "source_path": "$source",
+	  "run_root": "$runs",
+	  "worktree_root": "$worktrees",
       "base_branch": "main",
-      "verifier_ids": ["fixture-go-test"]
+	  "verifier_registry_ref": "builtin:v1",
+	  "verifier_ids": ["fixture-go-test"],
+	  "github_app_profile_ref": "github-app-profile:fixture-readonly",
+	  "github_installation_id": 1,
+	  "expected_repository_id": 1,
+	  "operator_identity_policy": {"allowed_logins": ["ifan0927"]}
     }
   ]
 }
@@ -58,11 +67,11 @@ cat >"$issue" <<'JSON'
   "title": "Add deterministic integer Clamp",
   "description": "In package mathutil, add a pure Clamp(value, min, max int) int function and table-driven unit tests. Assume min is less than or equal to max.",
   "team": "IFAN",
-  "labels": ["agent:codex", "repo:test-project"],
+  "labels": ["agent:codex", "fixture-owner/test-project"],
   "status": "Todo",
   "current_cycle": true,
   "cycle_id": "local-phase-1b",
-  "repository_label": "repo:test-project",
+  "repository_label": "fixture-owner/test-project",
   "base_branch": "main",
   "branch_name": "ifan/ifan-lab-1-clamp",
   "goal": "Add a small deterministic Clamp function with tests.",
