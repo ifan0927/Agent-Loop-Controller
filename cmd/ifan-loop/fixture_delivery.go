@@ -162,7 +162,7 @@ func localFixtureDeliver(args []string) error {
 			if err != nil {
 				return err
 			}
-			if err := application.AuthorizeMerge(run, *inspection.PullRequest, snapshot, approval, run.CandidateHead, run.CandidateHead); err != nil {
+			if err := application.AuthorizeFixtureMerge(run, *inspection.PullRequest, snapshot, approval, run.CandidateHead, run.CandidateHead); err != nil {
 				return err
 			}
 			if err := store.SaveHumanApproval(ctx, runID, approval); err != nil {
@@ -187,7 +187,7 @@ func localFixtureDeliver(args []string) error {
 			if gateErr = controller.ValidateApprovalReady(ctx, runID); gateErr != nil {
 				return gateErr
 			}
-			if gateErr = application.AuthorizeMerge(run, *gateInspection.PullRequest, gateSnapshot, *gateInspection.Approval, run.CandidateHead, run.CandidateHead); gateErr != nil {
+			if gateErr = application.AuthorizeFixtureMerge(run, *gateInspection.PullRequest, gateSnapshot, *gateInspection.Approval, run.CandidateHead, run.CandidateHead); gateErr != nil {
 				return gateErr
 			}
 			intent, _ := json.Marshal(map[string]any{"pr_number": 1, "head": run.CandidateHead, "base_sha": run.BaseSHA, "method": "squash"})

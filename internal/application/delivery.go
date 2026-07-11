@@ -168,6 +168,16 @@ func ReconcileReviews(ctx context.Context, github GitHubPort, store DeliveryStor
 }
 
 func AuthorizeMerge(run Run, pr domain.PullRequest, snapshot domain.ReviewSnapshot, approval domain.HumanApproval, verificationSHA, reviewSHA string) error {
+	return authorizeMergeEvidence(run, pr, snapshot, approval, verificationSHA, reviewSHA, false)
+}
+
+// AuthorizeFixtureMerge is restricted to the disposable fixture adapter and
+// cannot authorize a production GitHub merge.
+func AuthorizeFixtureMerge(run Run, pr domain.PullRequest, snapshot domain.ReviewSnapshot, approval domain.HumanApproval, verificationSHA, reviewSHA string) error {
+	return authorizeMergeEvidence(run, pr, snapshot, approval, verificationSHA, reviewSHA, true)
+}
+
+func authorizeMergeEvidence(run Run, pr domain.PullRequest, snapshot domain.ReviewSnapshot, approval domain.HumanApproval, verificationSHA, reviewSHA string, fixture bool) error {
 	if run.State != domain.StateAwaitingHumanApproval {
 		return fmt.Errorf("merge requires awaiting_human_approval, got %s", run.State)
 	}
@@ -182,6 +192,14 @@ func AuthorizeMerge(run Run, pr domain.PullRequest, snapshot domain.ReviewSnapsh
 	}
 	if snapshot.Classify() != domain.ReconciliationPass {
 		return errors.New("merge requires passing required checks and CodeRabbit")
+	}
+	if fixture {
+		if approval.Approver != "ifan0927" || approval.Source != "fixture_explicit_approval" {
+			return errors.New("fixture approval source is invalid")
+		}
+		copy := approval
+		copy.Source = "github_review"
+		return copy.Authorizes(pr, run.CandidateHead)
 	}
 	return approval.Authorizes(pr, run.CandidateHead)
 }

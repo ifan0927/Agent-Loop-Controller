@@ -157,7 +157,7 @@ type HumanApproval struct {
 }
 
 func (a HumanApproval) Authorizes(pr PullRequest, head string) error {
-	if a.Approver != "ifan0927" || a.Source != "github_review" && a.Source != "fixture_explicit_approval" {
+	if a.Approver != "ifan0927" || a.Source != "github_review" {
 		return errors.New("human approval is not from the trusted I-Fan identity adapter")
 	}
 	if a.PRNumber != pr.Number || a.ApprovedSHA != head || a.ReviewSHA != head {

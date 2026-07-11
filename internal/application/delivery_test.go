@@ -154,6 +154,14 @@ func TestHumanApprovalAndMergeBindExactSHA(t *testing.T) {
 	if err := AuthorizeMerge(run, pr, snap, approval, "h1", "h1"); err == nil {
 		t.Fatal("wrong PR ownership authorized merge")
 	}
+	pr.BaseBranch = "main"
+	approval.Source = "fixture_explicit_approval"
+	if err := AuthorizeMerge(run, pr, snap, approval, "h1", "h1"); err == nil {
+		t.Fatal("fixture evidence authorized production merge")
+	}
+	if err := AuthorizeFixtureMerge(run, pr, snap, approval, "h1", "h1"); err != nil {
+		t.Fatalf("fixture gate: %v", err)
+	}
 }
 
 type fakeCleanup struct {
