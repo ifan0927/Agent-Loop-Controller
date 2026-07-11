@@ -176,15 +176,26 @@ func localFixtureDeliver(args []string) error {
 			if _, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{RunID: runID, Kind: "merge", IdempotencyKey: run.CandidateHead, IntentJSON: string(intent), Attempt: 1}); err != nil {
 				return err
 			}
+			inspection, inspectErr := store.Inspect(ctx, runID)
+			if inspectErr != nil {
+				return inspectErr
+			}
 			mergeSHA, err := fixtureReconcileOrMerge(repo, run)
 			if err != nil {
 				return err
 			}
 			merge := application.MergeRecord{RunID: runID, PRNumber: 1, PreMergeSHA: run.CandidateHead, BaseSHA: run.BaseSHA, Method: "squash", MergeSHA: mergeSHA, MergedAt: time.Now().UTC()}
+			if inspection.Merge != nil {
+				existing := *inspection.Merge
+				if existing.RunID != runID || existing.PRNumber != 1 || existing.PreMergeSHA != run.CandidateHead || existing.BaseSHA != run.BaseSHA || existing.Method != "squash" || existing.MergeSHA != mergeSHA {
+					return errors.New("persisted merge evidence conflicts with reconciled merge")
+				}
+				merge = existing
+			}
 			if err := store.SaveMerge(ctx, merge); err != nil {
 				return err
 			}
-			inspection, err := store.Inspect(ctx, runID)
+			inspection, err = store.Inspect(ctx, runID)
 			if err != nil {
 				return err
 			}

@@ -1072,8 +1072,8 @@ func (c *LocalController) Repair(ctx context.Context, runID, normalizedPrompt st
 		return run, err
 	}
 	count := 0
-	for _, attempt := range inspection.Attempts {
-		if attempt.Kind == "resume" {
+	for _, transition := range inspection.Timeline {
+		if transition.From == domain.StateRepairing && transition.To == domain.StateExecuting {
 			count++
 		}
 	}
