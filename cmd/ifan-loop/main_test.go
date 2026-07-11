@@ -75,3 +75,16 @@ func TestLocalStatusOutputsDurableInspection(t *testing.T) {
 		}
 	}
 }
+
+func TestPreviousObservedPushRequiresMatchingOwnedEvidence(t *testing.T) {
+	records := []application.SideEffectRecord{{Kind: "push", Status: "observed", ResultJSON: `{"pushed_sha":"old"}`}, {Kind: "push", Status: "failed", ResultJSON: `{"pushed_sha":"new"}`}}
+	if !previousObservedPush(records, "old") {
+		t.Fatal("matching observed push not found")
+	}
+	if previousObservedPush(records, "new") {
+		t.Fatal("failed push treated as evidence")
+	}
+	if previousObservedPush(records, "other") {
+		t.Fatal("unknown SHA treated as evidence")
+	}
+}

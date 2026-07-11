@@ -266,10 +266,20 @@ func fixturePush(ctx context.Context, store *sqlitestore.Store, run application.
 		return err
 	}
 	if remote != "" && remote != run.CandidateHead {
-		return errors.New("remote branch SHA conflicts with candidate")
+		inspection, inspectErr := store.Inspect(ctx, run.ID)
+		if inspectErr != nil {
+			return inspectErr
+		}
+		if !previousObservedPush(inspection.SideEffects, remote) {
+			return errors.New("remote branch SHA is not owned prior push evidence")
+		}
+		if _, ancestorErr := runCommand(run.WorktreePath, "git", "merge-base", "--is-ancestor", remote, run.CandidateHead); ancestorErr != nil {
+			return errors.New("repair candidate is not a fast-forward of prior pushed SHA")
+		}
+		remote = ""
 	}
 	if remote == "" {
-		evidence, pushErr := (gitadapter.Publisher{Workspace: gitadapter.Workspace{}, Process: processadapter.OSRunner{}}).Push(ctx, run.WorktreePath, run.WorkingBranch, run.CandidateHead, filepath.Join(run.ArtifactRoot, "push.stdout"), filepath.Join(run.ArtifactRoot, "push.stderr"))
+		evidence, pushErr := (gitadapter.Publisher{Workspace: gitadapter.Workspace{}, Process: processadapter.OSRunner{}}).Push(ctx, run.WorktreePath, run.WorkingBranch, run.CandidateHead, filepath.Join(run.ArtifactRoot, "push-"+run.CandidateHead+".stdout"), filepath.Join(run.ArtifactRoot, "push-"+run.CandidateHead+".stderr"))
 		side.StdoutPath = evidence.Stdout
 		side.StderrPath = evidence.Stderr
 		if pushErr != nil {
@@ -285,6 +295,21 @@ func fixturePush(ctx context.Context, store *sqlitestore.Store, run application.
 		}
 	}
 	return store.Transition(ctx, run.ID, domain.StatePushingBranch, domain.StateBranchPushed, "remote exact SHA observed", side.ResultJSON, run.CandidateHead)
+}
+
+func previousObservedPush(records []application.SideEffectRecord, sha string) bool {
+	for _, record := range records {
+		if record.Kind != "push" || record.Status != "observed" {
+			continue
+		}
+		var result struct {
+			PushedSHA string `json:"pushed_sha"`
+		}
+		if json.Unmarshal([]byte(record.ResultJSON), &result) == nil && result.PushedSHA == sha {
+			return true
+		}
+	}
+	return false
 }
 
 func fixtureOpenPR(ctx context.Context, store *sqlitestore.Store, run application.Run) error {
