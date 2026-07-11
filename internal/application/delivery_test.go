@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -212,5 +213,22 @@ func TestLatestRepairBaseUsesNewestRollover(t *testing.T) {
 	timeline := []Transition{{From: domain.StateRepairing, To: domain.StateExecuting, BoundHead: "old"}, {From: domain.StateRepairing, To: domain.StateExecuting, BoundHead: "new"}}
 	if got := latestRepairBase(timeline); got != "new" {
 		t.Fatalf("repair base=%s", got)
+	}
+}
+
+func TestPersistedRepairPromptSurvivesRestartAndRejectsTampering(t *testing.T) {
+	prompt := "repair normalized finding"
+	data, _ := json.Marshal(struct {
+		Prompt string `json:"normalized_prompt"`
+		Hash   string `json:"prompt_hash"`
+	}{prompt, bytesHash([]byte(prompt))})
+	timeline := []Transition{{From: domain.StateRepairing, To: domain.StateExecuting, EvidenceReference: string(data)}}
+	got, found, err := findPersistedRepair(timeline)
+	if err != nil || !found || got != prompt {
+		t.Fatalf("got=%q found=%v err=%v", got, found, err)
+	}
+	timeline[0].EvidenceReference = `{"normalized_prompt":"changed","prompt_hash":"wrong"}`
+	if _, _, err := findPersistedRepair(timeline); err == nil {
+		t.Fatal("tampered repair prompt accepted")
 	}
 }

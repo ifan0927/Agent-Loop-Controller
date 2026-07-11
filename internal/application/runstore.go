@@ -136,7 +136,7 @@ type RunStore interface {
 	SetWorkspace(context.Context, string, string, string) error
 	SetImplementationSession(context.Context, string, string) error
 	SetCandidateHead(context.Context, string, string) error
-	BeginRepair(context.Context, string, string) error
+	BeginRepair(context.Context, string, string, string) error
 	SetLastError(context.Context, string, string) error
 	AcquireLease(context.Context, string, string, time.Time) (bool, error)
 	RenewLease(context.Context, string, string, time.Time) (bool, error)

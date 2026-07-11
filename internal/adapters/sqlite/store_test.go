@@ -385,7 +385,7 @@ func TestBeginRepairAtomicallyRollsCandidateIntoTransition(t *testing.T) {
 	if err := store.SetCandidateHead(ctx, "run-1", "h1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.BeginRepair(ctx, "run-1", "h1"); err != nil {
+	if err := store.BeginRepair(ctx, "run-1", "h1", `{"normalized_prompt":"repair","prompt_hash":"hash"}`); err != nil {
 		t.Fatal(err)
 	}
 	inspection, err := store.Inspect(ctx, "run-1")

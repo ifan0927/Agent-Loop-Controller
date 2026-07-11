@@ -304,9 +304,12 @@ func (s *Store) SetImplementationSession(ctx context.Context, id, session string
 func (s *Store) SetCandidateHead(ctx context.Context, id, head string) error {
 	return execOne(ctx, s.db, `UPDATE runs SET candidate_head=?,updated_at=? WHERE run_id=?`, head, nowText(), id)
 }
-func (s *Store) BeginRepair(ctx context.Context, id, oldHead string) error {
+func (s *Store) BeginRepair(ctx context.Context, id, oldHead, evidence string) error {
 	if strings.TrimSpace(oldHead) == "" {
 		return errors.New("repair base head must not be blank")
+	}
+	if strings.TrimSpace(evidence) == "" {
+		return errors.New("repair evidence must not be blank")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -332,7 +335,7 @@ func (s *Store) BeginRepair(ctx context.Context, id, oldHead string) error {
 	if count, _ := result.RowsAffected(); count != 1 {
 		return errors.New("repair compare update lost")
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO transitions VALUES(?,?,?,?,?,?,?,?)`, id, sequence, domain.StateRepairing, domain.StateExecuting, "begin normalized GitHub finding repair", "controller-normalized finding digests", oldHead, now); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO transitions VALUES(?,?,?,?,?,?,?,?)`, id, sequence, domain.StateRepairing, domain.StateExecuting, "begin normalized GitHub finding repair", evidence, oldHead, now); err != nil {
 		return err
 	}
 	return tx.Commit()

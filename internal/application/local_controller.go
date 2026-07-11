@@ -563,6 +563,15 @@ func (c *LocalController) execute(ctx context.Context, run Run, decision *Decisi
 		if found {
 			decision = &persisted
 		}
+		if decision == nil {
+			repair, repairFound, repairErr := findPersistedRepair(inspection.Timeline)
+			if repairErr != nil {
+				return repairErr
+			}
+			if repairFound {
+				decision = &Decision{ChoiceID: "controller-normalized-review-findings", Instructions: repair}
+			}
+		}
 	}
 	recoveryResume := false
 	for _, attempt := range inspection.Attempts {
@@ -1080,10 +1089,35 @@ func (c *LocalController) Repair(ctx context.Context, runID, normalizedPrompt st
 	if count >= task.Policy.MaxRepairAttempts {
 		return run, errors.New("bounded repair attempts exhausted; manual intervention required")
 	}
-	if err := c.store.BeginRepair(ctx, runID, run.CandidateHead); err != nil {
+	evidenceData, _ := json.Marshal(struct {
+		Prompt string `json:"normalized_prompt"`
+		Hash   string `json:"prompt_hash"`
+	}{normalizedPrompt, bytesHash([]byte(normalizedPrompt))})
+	if err := c.store.BeginRepair(ctx, runID, run.CandidateHead, string(evidenceData)); err != nil {
 		return run, err
 	}
 	return c.Continue(ctx, runID, &Decision{ChoiceID: "controller-normalized-review-findings", Instructions: normalizedPrompt})
+}
+
+func findPersistedRepair(timeline []Transition) (string, bool, error) {
+	for index := len(timeline) - 1; index >= 0; index-- {
+		item := timeline[index]
+		if item.From != domain.StateRepairing || item.To != domain.StateExecuting {
+			continue
+		}
+		var evidence struct {
+			Prompt string `json:"normalized_prompt"`
+			Hash   string `json:"prompt_hash"`
+		}
+		if err := json.Unmarshal([]byte(item.EvidenceReference), &evidence); err != nil {
+			return "", false, err
+		}
+		if strings.TrimSpace(evidence.Prompt) == "" || evidence.Hash != bytesHash([]byte(evidence.Prompt)) {
+			return "", false, errors.New("persisted repair prompt evidence is invalid")
+		}
+		return evidence.Prompt, true, nil
+	}
+	return "", false, nil
 }
 
 func latestRepairBase(timeline []Transition) string {
