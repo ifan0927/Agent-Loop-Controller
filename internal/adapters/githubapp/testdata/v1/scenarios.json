@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "sanitized": true,
+  "scenarios": [
+    "valid_installation_token_metadata", "wrong_installation", "wrong_repository",
+    "token_expiry_refresh", "single_401_refresh", "repeated_401", "permission_403",
+    "rate_limit", "malformed_json", "graphql_partial_data_errors", "pagination",
+    "pr_open", "pr_closed_unmerged", "pr_squash_merged", "head_match", "head_mismatch",
+    "base_match", "base_mismatch", "required_checks_pass", "required_checks_pending",
+    "actionable_check_failure", "missing_required_check", "unknown_check_state",
+    "coderabbit_pass", "coderabbit_actionable", "coderabbit_absent",
+    "coderabbit_untrusted_lookalike", "resolved_thread", "outdated_comment",
+    "duplicate_finding", "unknown_review_event"
+  ]
+}

@@ -114,19 +114,22 @@ type OwnedResource struct {
 }
 
 type RunInspection struct {
-	Run           Run                   `json:"run"`
-	Timeline      []Transition          `json:"state_timeline"`
-	Attempts      []Attempt             `json:"attempts"`
-	Verifications []VerificationRecord  `json:"verifications"`
-	Reviews       []ReviewRecord        `json:"reviews"`
-	Resources     []OwnedResource       `json:"owned_resources"`
-	SideEffects   []SideEffectRecord    `json:"external_side_effects"`
-	PullRequest   *domain.PullRequest   `json:"pull_request,omitempty"`
-	Polls         []PollObservation     `json:"poll_observations"`
-	Findings      []FindingRecord       `json:"normalized_review_findings"`
-	Approval      *domain.HumanApproval `json:"human_approval,omitempty"`
-	Merge         *MergeRecord          `json:"merge_result,omitempty"`
-	Cleanup       []CleanupRecord       `json:"cleanup_progress"`
+	Run                Run                         `json:"run"`
+	Timeline           []Transition                `json:"state_timeline"`
+	Attempts           []Attempt                   `json:"attempts"`
+	Verifications      []VerificationRecord        `json:"verifications"`
+	Reviews            []ReviewRecord              `json:"reviews"`
+	Resources          []OwnedResource             `json:"owned_resources"`
+	SideEffects        []SideEffectRecord          `json:"external_side_effects"`
+	PullRequest        *domain.PullRequest         `json:"pull_request,omitempty"`
+	Polls              []PollObservation           `json:"poll_observations"`
+	Findings           []FindingRecord             `json:"normalized_review_findings"`
+	Approval           *domain.HumanApproval       `json:"human_approval,omitempty"`
+	Merge              *MergeRecord                `json:"merge_result,omitempty"`
+	Cleanup            []CleanupRecord             `json:"cleanup_progress"`
+	GitHubInstallation *GitHubInstallationMetadata `json:"github_installation,omitempty"`
+	GitHubRequests     []GitHubRequestObservation  `json:"github_request_observations"`
+	GitHubEvidence     *domain.GitHubReadEvidence  `json:"github_read_evidence,omitempty"`
 }
 
 type RunStore interface {

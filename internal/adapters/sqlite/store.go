@@ -2,7 +2,10 @@ package sqlite
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -17,7 +20,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 5
+const schemaVersion = 6
 
 type Store struct{ db *sql.DB }
 
@@ -96,6 +99,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV4
 		case 5:
 			statements = migrationV5
+		case 6:
+			statements = migrationV6
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -188,6 +193,12 @@ var migrationV5 = []string{
 	`CREATE TABLE human_approvals (approval_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), pr_number INTEGER NOT NULL, approver TEXT NOT NULL, source TEXT NOT NULL, approved_sha TEXT NOT NULL, ci_status TEXT NOT NULL, coderabbit_status TEXT NOT NULL, internal_review_sha TEXT NOT NULL, approved_at TEXT NOT NULL, UNIQUE(run_id,approved_sha))`,
 	`CREATE TABLE merge_results (run_id TEXT PRIMARY KEY REFERENCES runs(run_id), pr_number INTEGER NOT NULL, pre_merge_head_sha TEXT NOT NULL, base_sha TEXT NOT NULL, merge_method TEXT NOT NULL CHECK(merge_method='squash'), merge_sha TEXT NOT NULL, merged_at TEXT NOT NULL)`,
 	`CREATE TABLE cleanup_results (cleanup_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), resource_kind TEXT NOT NULL, resource_name TEXT NOT NULL, status TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, UNIQUE(run_id,resource_kind,resource_name))`,
+}
+
+var migrationV6 = []string{
+	`CREATE TABLE github_installations (run_id TEXT PRIMARY KEY REFERENCES runs(run_id), app_id INTEGER NOT NULL, installation_id INTEGER NOT NULL, repository_id INTEGER NOT NULL, repository_node_id TEXT NOT NULL, repository_owner TEXT NOT NULL, repository_name TEXT NOT NULL, token_expires_at TEXT NOT NULL, permissions_digest TEXT NOT NULL, observed_at TEXT NOT NULL)`,
+	`CREATE TABLE github_request_observations (observation_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), operation_name TEXT NOT NULL, endpoint_category TEXT NOT NULL, http_status INTEGER NOT NULL, request_id TEXT NOT NULL DEFAULT '', rate_limit_limit INTEGER NOT NULL DEFAULT 0, rate_limit_remaining INTEGER NOT NULL DEFAULT 0, rate_limit_reset TEXT NOT NULL DEFAULT '', response_digest TEXT NOT NULL, error_class TEXT NOT NULL DEFAULT '', installation_id INTEGER NOT NULL, repository_id INTEGER NOT NULL, repository_node_id TEXT NOT NULL, repository_owner TEXT NOT NULL, repository_name TEXT NOT NULL, observed_at TEXT NOT NULL)`,
+	`CREATE TABLE github_read_evidence (run_id TEXT PRIMARY KEY REFERENCES runs(run_id), evidence_json TEXT NOT NULL, evidence_digest TEXT NOT NULL, observed_at TEXT NOT NULL)`,
 }
 
 func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput) (application.Run, bool, error) {
@@ -342,6 +353,29 @@ func (s *Store) BeginRepair(ctx context.Context, id, oldHead, evidence string) e
 }
 func (s *Store) SetLastError(ctx context.Context, id, message string) error {
 	return execOne(ctx, s.db, `UPDATE runs SET last_error=?,updated_at=? WHERE run_id=?`, message, nowText(), id)
+}
+
+func (s *Store) SaveGitHubInstallation(ctx context.Context, runID string, m application.GitHubInstallationMetadata) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO github_installations(run_id,app_id,installation_id,repository_id,repository_node_id,repository_owner,repository_name,token_expires_at,permissions_digest,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET app_id=excluded.app_id,installation_id=excluded.installation_id,repository_id=excluded.repository_id,repository_node_id=excluded.repository_node_id,repository_owner=excluded.repository_owner,repository_name=excluded.repository_name,token_expires_at=excluded.token_expires_at,permissions_digest=excluded.permissions_digest,observed_at=excluded.observed_at`, runID, m.AppID, m.InstallationID, m.Repository.ID, m.Repository.NodeID, m.Repository.Owner, m.Repository.Name, formatTime(m.TokenExpiresAt), m.PermissionsDigest, formatTime(m.ObservedAt))
+	return err
+}
+
+func (s *Store) SaveGitHubRequest(ctx context.Context, o application.GitHubRequestObservation) error {
+	if strings.TrimSpace(o.RunID) == "" || strings.TrimSpace(o.ResponseDigest) == "" {
+		return errors.New("GitHub request observation lacks run or digest")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO github_request_observations(run_id,operation_name,endpoint_category,http_status,request_id,rate_limit_limit,rate_limit_remaining,rate_limit_reset,response_digest,error_class,installation_id,repository_id,repository_node_id,repository_owner,repository_name,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, o.RunID, o.Operation, o.Category, o.HTTPStatus, o.RequestID, o.RateLimitLimit, o.RateLimitRemaining, formatTime(o.RateLimitReset), o.ResponseDigest, o.ErrorClass, o.InstallationID, o.Repository.ID, o.Repository.NodeID, o.Repository.Owner, o.Repository.Name, formatTime(o.ObservedAt))
+	return err
+}
+
+func (s *Store) SaveGitHubEvidence(ctx context.Context, runID string, e domain.GitHubReadEvidence) error {
+	raw, err := json.Marshal(e)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(raw)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO github_read_evidence(run_id,evidence_json,evidence_digest,observed_at) VALUES(?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET evidence_json=excluded.evidence_json,evidence_digest=excluded.evidence_digest,observed_at=excluded.observed_at`, runID, string(raw), hex.EncodeToString(sum[:]), formatTime(e.ObservedAt))
+	return err
 }
 
 func (s *Store) AcquireLease(ctx context.Context, id, owner string, expires time.Time) (bool, error) {
@@ -744,6 +778,42 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 		inspection.Cleanup = append(inspection.Cleanup, v)
 	}
 	rows.Close()
+	var installation application.GitHubInstallationMetadata
+	var tokenExpiry, installationObserved string
+	if err := s.db.QueryRowContext(ctx, `SELECT app_id,installation_id,repository_id,repository_node_id,repository_owner,repository_name,token_expires_at,permissions_digest,observed_at FROM github_installations WHERE run_id=?`, id).Scan(&installation.AppID, &installation.InstallationID, &installation.Repository.ID, &installation.Repository.NodeID, &installation.Repository.Owner, &installation.Repository.Name, &tokenExpiry, &installation.PermissionsDigest, &installationObserved); err == nil {
+		installation.TokenExpiresAt = parseTime(tokenExpiry)
+		installation.ObservedAt = parseTime(installationObserved)
+		inspection.GitHubInstallation = &installation
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return inspection, err
+	}
+	rows, err = s.db.QueryContext(ctx, `SELECT operation_name,endpoint_category,http_status,request_id,rate_limit_limit,rate_limit_remaining,rate_limit_reset,response_digest,error_class,installation_id,repository_id,repository_node_id,repository_owner,repository_name,observed_at FROM github_request_observations WHERE run_id=? ORDER BY observation_id`, id)
+	if err != nil {
+		return inspection, err
+	}
+	for rows.Next() {
+		var o application.GitHubRequestObservation
+		var reset, observed string
+		o.RunID = id
+		if err := rows.Scan(&o.Operation, &o.Category, &o.HTTPStatus, &o.RequestID, &o.RateLimitLimit, &o.RateLimitRemaining, &reset, &o.ResponseDigest, &o.ErrorClass, &o.InstallationID, &o.Repository.ID, &o.Repository.NodeID, &o.Repository.Owner, &o.Repository.Name, &observed); err != nil {
+			rows.Close()
+			return inspection, err
+		}
+		o.RateLimitReset = parseTime(reset)
+		o.ObservedAt = parseTime(observed)
+		inspection.GitHubRequests = append(inspection.GitHubRequests, o)
+	}
+	rows.Close()
+	var evidenceJSON string
+	if err := s.db.QueryRowContext(ctx, `SELECT evidence_json FROM github_read_evidence WHERE run_id=?`, id).Scan(&evidenceJSON); err == nil {
+		var e domain.GitHubReadEvidence
+		if err := json.Unmarshal([]byte(evidenceJSON), &e); err != nil {
+			return inspection, err
+		}
+		inspection.GitHubEvidence = &e
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return inspection, err
+	}
 	return inspection, nil
 }
 

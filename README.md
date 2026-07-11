@@ -64,6 +64,11 @@ branch push, one-PR publication, bounded CI/CodeRabbit reconciliation, repair,
 I-Fan approval, squash merge, Linear completion observation, and owned cleanup.
 Default integration uses fake GitHub plus a disposable local bare origin.
 
+The direct read-only GitHub slice adds SQLite v6 sanitized observations, GitHub
+App JWT and installation-token authentication, and direct REST/GraphQL evidence
+collection without `gh` or user authentication. Real access is opt-in; see
+[the operator handoff](docs/github-app-operator.md).
+
 ## Try the contract planner
 
 ```sh

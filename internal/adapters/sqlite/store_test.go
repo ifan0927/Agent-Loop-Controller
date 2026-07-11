@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -12,6 +13,48 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
+
+func TestGitHubV6EvidencePersistsMetadataWithoutSecrets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "controller.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	input := application.CreateRunInput{Run: application.Run{ID: "run-gh", IssueID: "IFAN-GH", IdempotencyKey: "key-gh", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: "/tmp/run-gh", ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}}
+	if _, _, err := store.CreateRun(ctx, input); err != nil {
+		t.Fatal(err)
+	}
+	repo := domain.RepositoryIdentity{ID: 99, NodeID: "REPO", Owner: "owner", Name: "repo"}
+	now := time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC)
+	if err := store.SaveGitHubInstallation(ctx, "run-gh", application.GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: repo, TokenExpiresAt: now.Add(time.Hour), PermissionsDigest: "digest", ObservedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveGitHubRequest(ctx, application.GitHubRequestObservation{RunID: "run-gh", Operation: "repository", Category: "REST", HTTPStatus: 200, ResponseDigest: "response-digest", InstallationID: 2, Repository: repo, ObservedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	e := domain.GitHubReadEvidence{Repository: repo, PullRequest: domain.PullRequest{Number: 1, HeadSHA: "head", BaseSHA: "base"}, ObservedAt: now}
+	if err := store.SaveGitHubEvidence(ctx, "run-gh", e); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := store.Inspect(ctx, "run-gh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.GitHubInstallation == nil || len(inspection.GitHubRequests) != 1 || inspection.GitHubEvidence == nil {
+		t.Fatalf("missing GitHub v6 inspection: %+v", inspection)
+	}
+	store.Close()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range [][]byte{[]byte("fixture-installation-secret"), []byte("BEGIN PRIVATE KEY"), []byte("Bearer "), []byte("eyJhbGci")} {
+		if bytes.Contains(raw, secret) {
+			t.Fatalf("database contains secret marker %q", secret)
+		}
+	}
+}
 
 func TestMigrationAndRunIdempotency(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
@@ -103,7 +146,7 @@ func TestMigratesVersionOneDatabaseToVersionTwo(t *testing.T) {
 	}
 }
 
-func TestMigratesVersionFourDatabaseToVersionFive(t *testing.T) {
+func TestMigratesVersionFourDatabaseToCurrentVersion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
 	db, err := sql.Open("sqlite", sqliteDSN(path))
 	if err != nil {
@@ -129,7 +172,7 @@ func TestMigratesVersionFourDatabaseToVersionFive(t *testing.T) {
 	}
 	defer store.Close()
 	version, err := store.SchemaVersion(context.Background())
-	if err != nil || version != 5 {
+	if err != nil || version != 6 {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	var count int

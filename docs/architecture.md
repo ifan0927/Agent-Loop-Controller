@@ -278,3 +278,19 @@ used across a simulated restart, and artifacts remain inspectable. This
 repository's production remote is never a PR, merge, or cleanup fixture. Real
 GitHub and CodeRabbit smoke is opt-in and requires an explicitly authorized test
 repository and valid credentials.
+
+## Direct read-only GitHub App adapter
+
+Schema version 6 adds non-secret installation, repository, request, rate-limit,
+actor-derived normalized evidence, and response digests. JWTs, installation
+tokens, private keys, authorization headers, and raw token responses are never
+persisted. The adapter uses RS256 App JWTs and memory-only installation tokens,
+refreshes before expiry, and permits one refresh/retry after HTTP 401.
+
+REST owns installation token minting, repository and pull-request identity,
+check runs, and commit status evidence. GraphQL owns review decision and review
+thread/comment topology. Both transports are read-only, bounded, paginated, and
+fail closed on missing required identity. CodeRabbit trust requires configured
+numeric/node/App identity evidence; display names, login similarity, and body
+claims are insufficient. Production use is explicit through `github-read` and
+does not consult `gh` configuration or user credentials.

@@ -15,6 +15,7 @@ import (
 
 	codexadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/codex"
 	gitadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/git"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/githubapp"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/localissue"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/localregistry"
 	processadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/process"
@@ -42,6 +43,8 @@ func main() {
 		err = spike(os.Args[2:])
 	case "local":
 		err = local(os.Args[2:])
+	case "github-read":
+		err = githubRead(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -50,6 +53,75 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+func githubRead(args []string) error {
+	flags := flag.NewFlagSet("github-read", flag.ContinueOnError)
+	configPath := flags.String("config", "", "GitHub App read-only configuration")
+	pr := flags.Int64("pr", 0, "persisted pull request number")
+	head := flags.String("expected-head", "", "expected exact PR head SHA")
+	dbPath := flags.String("db", "", "optional controller SQLite database")
+	runID := flags.String("run-id", "", "run ID required with --db")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *configPath == "" || *pr < 1 || *head == "" {
+		return errors.New("--config, --pr, and --expected-head are required")
+	}
+	if (*dbPath == "") != (*runID == "") {
+		return errors.New("--db and --run-id must be provided together")
+	}
+	file, err := os.Open(*configPath)
+	if err != nil {
+		return err
+	}
+	cfg, decodeErr := githubapp.DecodeConfig(file)
+	file.Close()
+	if decodeErr != nil {
+		return decodeErr
+	}
+	var store *sqlitestore.Store
+	if *dbPath != "" {
+		store, err = sqlitestore.Open(*dbPath)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+	}
+	observations := []application.GitHubRequestObservation{}
+	observer := func(o application.GitHubRequestObservation) { o.RunID = *runID; observations = append(observations, o) }
+	client, err := githubapp.New(cfg, githubapp.RealClock{}, observer)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.HTTPTimeout*20)
+	defer cancel()
+	evidence, err := client.Read(ctx, *pr, *head)
+	if err != nil {
+		return err
+	}
+	metadata := client.InstallationMetadata()
+	if store != nil {
+		if _, err := store.GetRun(ctx, *runID); err != nil {
+			return err
+		}
+		if err := store.SaveGitHubInstallation(ctx, *runID, metadata); err != nil {
+			return err
+		}
+		for _, o := range observations {
+			if err := store.SaveGitHubRequest(ctx, o); err != nil {
+				return err
+			}
+		}
+		if err := store.SaveGitHubEvidence(ctx, *runID, evidence); err != nil {
+			return err
+		}
+	}
+	return printJSON(struct {
+		Installation application.GitHubInstallationMetadata `json:"installation"`
+		Requests     []application.GitHubRequestObservation `json:"requests"`
+		Evidence     domain.GitHubReadEvidence              `json:"evidence"`
+	}{metadata, observations, evidence})
 }
 
 func local(args []string) error {
@@ -352,5 +424,5 @@ func decodeTask(reader io.Reader) (domain.CodingTask, error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: ifan-loop <version|plan|spike|local> [options]")
+	fmt.Fprintln(os.Stderr, "usage: ifan-loop <version|plan|spike|local|github-read> [options]")
 }
