@@ -104,13 +104,8 @@ func githubRead(args []string) error {
 		expectedRepository = inspection.GitHubInstallation.Repository
 	}
 	observations := []application.GitHubRequestObservation{}
-	observationOverflow := false
 	observer := func(o application.GitHubRequestObservation) {
 		o.RunID = *runID
-		if len(observations) >= 10000 {
-			observationOverflow = true
-			return
-		}
 		observations = append(observations, o)
 	}
 	client, err := githubapp.New(cfg, githubapp.RealClock{}, observer)
@@ -123,29 +118,31 @@ func githubRead(args []string) error {
 	metadata := client.InstallationMetadata()
 	persistCtx, persistCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer persistCancel()
-	if observationOverflow {
-		if saveErr := store.SaveGitHubRequests(persistCtx, observations); saveErr != nil {
-			return saveErr
-		}
-		return errors.New("GitHub request observation limit exceeded")
-	}
 	if readErr != nil {
 		if saveErr := store.SaveGitHubRequests(persistCtx, observations); saveErr != nil {
 			return saveErr
 		}
 		return readErr
 	}
+	persistFailure := func(cause error) error {
+		failureCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := store.SaveGitHubRequests(failureCtx, observations); err != nil {
+			return errors.Join(cause, err)
+		}
+		return cause
+	}
 	if expectedRepository.NodeID == "" {
 		expectedRepository.NodeID = evidence.Repository.NodeID
 	}
 	if err := application.ReconcileGitHubRead(expectedRepository, *inspection.PullRequest, inspection.Run.WorkingBranch, inspection.Run.BaseBranch, inspection.Run.CandidateHead, inspection.Run.BaseSHA, inspection.Run.IdempotencyKey, inspection.PullRequest.BodyDigest, evidence); err != nil {
-		return err
+		return persistFailure(err)
 	}
 	if inspection.GitHubInstallation != nil && (metadata.InstallationID != inspection.GitHubInstallation.InstallationID || metadata.AppID != inspection.GitHubInstallation.AppID) {
-		return errors.New("GitHub App installation binding mismatch")
+		return persistFailure(errors.New("GitHub App installation binding mismatch"))
 	}
 	if err := store.SaveGitHubReadSuccess(persistCtx, *runID, observations, evidence.PullRequest, metadata, evidence); err != nil {
-		return err
+		return persistFailure(err)
 	}
 	return printJSON(struct {
 		Installation application.GitHubInstallationMetadata `json:"installation"`

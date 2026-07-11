@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -78,12 +79,25 @@ func (c Config) Validate() error {
 	if configuredCodeRabbit && (c.CodeRabbitActorID < 1 || c.CodeRabbitNodeID == "" || c.CodeRabbitAppID < 1) {
 		return errors.New("CodeRabbit identity must include actor, node, and App IDs")
 	}
-	for _, raw := range []string{c.APIBaseURL, c.GraphQLURL} {
-		if !strings.HasPrefix(raw, "https://") && !strings.HasPrefix(raw, "http://127.0.0.1:") {
-			return errors.New("GitHub endpoint must use HTTPS")
+	apiURL, err := url.Parse(c.APIBaseURL)
+	if err != nil {
+		return errors.New("invalid GitHub API URL")
+	}
+	graphURL, err := url.Parse(c.GraphQLURL)
+	if err != nil {
+		return errors.New("invalid GitHub GraphQL URL")
+	}
+	for _, u := range []*url.URL{apiURL, graphURL} {
+		if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			return errors.New("GitHub endpoint contains forbidden URL components")
 		}
 	}
-	_, err := ReadPrivateKeyFile(c.PrivateKeyFile)
+	official := apiURL.Scheme == "https" && apiURL.Host == "api.github.com" && apiURL.Path == "" && graphURL.Scheme == "https" && graphURL.Host == "api.github.com" && graphURL.Path == "/graphql"
+	fixture := apiURL.Scheme == "http" && strings.HasPrefix(apiURL.Host, "127.0.0.1:") && apiURL.Path == "" && graphURL.Scheme == apiURL.Scheme && graphURL.Host == apiURL.Host && graphURL.Path == "/graphql"
+	if !official && !fixture {
+		return errors.New("GitHub endpoint topology is not allowed")
+	}
+	_, err = ReadPrivateKeyFile(c.PrivateKeyFile)
 	return err
 }
 

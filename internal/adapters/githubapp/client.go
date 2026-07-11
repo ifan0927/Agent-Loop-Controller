@@ -21,6 +21,7 @@ import (
 )
 
 const maxBody = 4 << 20
+const maxRequestsPerRead = 10000
 
 type Observer func(application.GitHubRequestObservation)
 type Client struct {
@@ -29,6 +30,8 @@ type Client struct {
 	clock             Clock
 	observe           Observer
 	mu                sync.Mutex
+	budgetMu          sync.Mutex
+	requestCount      int
 	opMu              sync.Mutex
 	token             string
 	expires           time.Time
@@ -48,6 +51,9 @@ func New(cfg Config, clock Clock, observer Observer) (*Client, error) {
 func (c *Client) Read(ctx context.Context, pr int64, expectedHead string) (domain.GitHubReadEvidence, error) {
 	c.opMu.Lock()
 	defer c.opMu.Unlock()
+	c.budgetMu.Lock()
+	c.requestCount = 0
+	c.budgetMu.Unlock()
 	if pr < 1 || expectedHead == "" {
 		return domain.GitHubReadEvidence{}, errors.New("PR number and expected head are required")
 	}
@@ -279,6 +285,13 @@ func (e *statusError) Error() string {
 	return fmt.Sprintf("GitHub request failed: %s (%d)", e.class, e.status)
 }
 func (c *Client) do(ctx context.Context, op, category, method, target string, body io.Reader, auth string, out any, installation bool) error {
+	c.budgetMu.Lock()
+	if c.requestCount >= maxRequestsPerRead {
+		c.budgetMu.Unlock()
+		return errors.New("GitHub request budget exceeded")
+	}
+	c.requestCount++
+	c.budgetMu.Unlock()
 	req, err := http.NewRequestWithContext(ctx, method, target, body)
 	if err != nil {
 		return err
