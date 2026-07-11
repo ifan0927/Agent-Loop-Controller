@@ -473,7 +473,7 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 		}
 		all = append(all, domain.GitHubCheck{ID: strconv.FormatInt(r.ID, 10), Name: r.Name, Required: requiredName && (requiredApp == 0 || requiredApp == r.App.ID), Source: "check_run", AppID: r.App.ID, State: state, ObservedSHA: sha, SourceAt: sourceAt, ObservedAt: c.clock.Now().UTC()})
 	}
-	var statuses struct {
+	type statusPage struct {
 		TotalCount int `json:"total_count"`
 		Statuses   []struct {
 			ID        int64     `json:"id"`
@@ -482,11 +482,25 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 			UpdatedAt time.Time `json:"updated_at"`
 		} `json:"statuses"`
 	}
-	if err := c.rest(ctx, "commit_statuses", "GET", fmt.Sprintf("/repos/%s/%s/commits/%s/status?per_page=100", c.cfg.RepositoryOwner, c.cfg.RepositoryName, sha), nil, &statuses, true); err != nil {
-		return nil, domain.CodeRabbitUnknown, nil, err
+	var statuses statusPage
+	for page := 1; page <= 20; page++ {
+		var current statusPage
+		if err := c.rest(ctx, "commit_statuses", "GET", fmt.Sprintf("/repos/%s/%s/commits/%s/status?per_page=100&page=%d", c.cfg.RepositoryOwner, c.cfg.RepositoryName, sha, page), nil, &current, true); err != nil {
+			return nil, domain.CodeRabbitUnknown, nil, err
+		}
+		if page == 1 {
+			statuses.TotalCount = current.TotalCount
+		}
+		statuses.Statuses = append(statuses.Statuses, current.Statuses...)
+		if len(statuses.Statuses) >= statuses.TotalCount || len(current.Statuses) < 100 {
+			break
+		}
+		if page == 20 {
+			return nil, domain.CodeRabbitUnknown, nil, errors.New("commit-status pagination exceeded bounded limit")
+		}
 	}
-	if statuses.TotalCount > len(statuses.Statuses) {
-		return nil, domain.CodeRabbitUnknown, nil, errors.New("commit-status pagination exceeded bounded response")
+	if len(statuses.Statuses) < statuses.TotalCount {
+		return nil, domain.CodeRabbitUnknown, nil, errors.New("commit-status pagination was incomplete")
 	}
 	latestStatuses := map[string]struct {
 		ID             int64
@@ -591,17 +605,39 @@ func mapCheck(status, conclusion string) domain.CheckState {
 	}
 }
 
-const reviewQuery = `query ReadPullRequestReviews($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewDecision reviews(first:100){totalCount nodes{id databaseId state commit{oid} submittedAt author{login __typename ... on Bot{id databaseId}}}} reviewThreads(first:100,after:$cursor){nodes{id isResolved isOutdated comments(first:100){totalCount nodes{id databaseId body path line outdated createdAt author{login __typename ... on Bot{id databaseId}} authorAssociation}}}pageInfo{hasNextPage endCursor}}}}}`
+type rawReviewComment struct {
+	ID         string    `json:"id"`
+	DatabaseID int64     `json:"databaseId"`
+	Body       string    `json:"body"`
+	Path       string    `json:"path"`
+	Line       int       `json:"line"`
+	Outdated   bool      `json:"outdated"`
+	CreatedAt  time.Time `json:"createdAt"`
+	Author     struct {
+		Login      string `json:"login"`
+		Typename   string `json:"__typename"`
+		ID         string `json:"id"`
+		DatabaseID int64  `json:"databaseId"`
+	} `json:"author"`
+}
+type graphPageInfo struct {
+	HasNextPage bool   `json:"hasNextPage"`
+	EndCursor   string `json:"endCursor"`
+}
+
+const reviewQuery = `query ReadPullRequestReviews($owner:String!,$name:String!,$number:Int!,$cursor:String,$reviewCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewDecision reviews(first:100,after:$reviewCursor){nodes{id databaseId state commit{oid} submittedAt author{login __typename ... on Bot{id databaseId}}} pageInfo{hasNextPage endCursor}} reviewThreads(first:100,after:$cursor){nodes{id isResolved isOutdated comments(first:100){totalCount nodes{id databaseId body path line outdated createdAt author{login __typename ... on Bot{id databaseId}} authorAssociation pageInfo{hasNextPage endCursor}}}pageInfo{hasNextPage endCursor}}}}}`
+const threadCommentsQuery = `query ReadReviewThreadComments($id:ID!,$cursor:String){node(id:$id){... on PullRequestReviewThread{comments(first:100,after:$cursor){nodes{id databaseId body path line outdated createdAt author{login __typename ... on Bot{id databaseId}} authorAssociation pageInfo{hasNextPage endCursor}}}}}`
 
 func (c *Client) readReviews(ctx context.Context, pr int64, head string, coderabbitCheck domain.CodeRabbitState) (string, []domain.GitHubReview, []domain.NormalizedFinding, domain.CodeRabbitState, []string, error) {
 	cursor := ""
+	reviewCursor := ""
 	var findings []domain.NormalizedFinding
 	var reviews []domain.GitHubReview
 	unknown := []string{}
 	cr := coderabbitCheck
 	decision := ""
 	seen := map[string]bool{}
-	reviewsLoaded := false
+	reviewsDone := false
 	completedPages := false
 	for pages := 0; pages < 20; pages++ {
 		var env struct {
@@ -610,8 +646,7 @@ func (c *Client) readReviews(ctx context.Context, pr int64, head string, coderab
 					PullRequest *struct {
 						ReviewDecision string `json:"reviewDecision"`
 						Reviews        struct {
-							TotalCount int `json:"totalCount"`
-							Nodes      []struct {
+							Nodes []struct {
 								ID         string `json:"id"`
 								DatabaseID int64  `json:"databaseId"`
 								State      string `json:"state"`
@@ -626,6 +661,7 @@ func (c *Client) readReviews(ctx context.Context, pr int64, head string, coderab
 									DatabaseID int64  `json:"databaseId"`
 								} `json:"author"`
 							} `json:"nodes"`
+							PageInfo graphPageInfo `json:"pageInfo"`
 						} `json:"reviews"`
 						ReviewThreads struct {
 							Nodes []struct {
@@ -633,22 +669,9 @@ func (c *Client) readReviews(ctx context.Context, pr int64, head string, coderab
 								IsResolved bool   `json:"isResolved"`
 								IsOutdated bool   `json:"isOutdated"`
 								Comments   struct {
-									TotalCount int `json:"totalCount"`
-									Nodes      []struct {
-										ID         string    `json:"id"`
-										DatabaseID int64     `json:"databaseId"`
-										Body       string    `json:"body"`
-										Path       string    `json:"path"`
-										Line       int       `json:"line"`
-										Outdated   bool      `json:"outdated"`
-										CreatedAt  time.Time `json:"createdAt"`
-										Author     struct {
-											Login      string `json:"login"`
-											Typename   string `json:"__typename"`
-											ID         string `json:"id"`
-											DatabaseID int64  `json:"databaseId"`
-										} `json:"author"`
-									} `json:"nodes"`
+									TotalCount int                `json:"totalCount"`
+									Nodes      []rawReviewComment `json:"nodes"`
+									PageInfo   graphPageInfo      `json:"pageInfo"`
 								} `json:"comments"`
 							} `json:"nodes"`
 							PageInfo struct {
@@ -663,7 +686,7 @@ func (c *Client) readReviews(ctx context.Context, pr int64, head string, coderab
 				Message string `json:"message"`
 			} `json:"errors"`
 		}
-		if err := c.graphql(ctx, "ReadPullRequestReviews", reviewQuery, map[string]any{"owner": c.cfg.RepositoryOwner, "name": c.cfg.RepositoryName, "number": pr, "cursor": nullable(cursor)}, &env); err != nil {
+		if err := c.graphql(ctx, "ReadPullRequestReviews", reviewQuery, map[string]any{"owner": c.cfg.RepositoryOwner, "name": c.cfg.RepositoryName, "number": pr, "cursor": nullable(cursor), "reviewCursor": nullable(reviewCursor)}, &env); err != nil {
 			return "", nil, nil, "", nil, err
 		}
 		if len(env.Errors) > 0 {
@@ -673,21 +696,26 @@ func (c *Client) readReviews(ctx context.Context, pr int64, head string, coderab
 			return "", nil, nil, "", nil, errors.New("GitHub GraphQL response missing pull request")
 		}
 		p := env.Data.Repository.PullRequest
-		if !reviewsLoaded {
-			if p.Reviews.TotalCount > len(p.Reviews.Nodes) {
-				return "", nil, nil, "", nil, errors.New("review pagination exceeded bounded response")
-			}
+		if !reviewsDone {
 			for _, r := range p.Reviews.Nodes {
 				reviews = append(reviews, domain.GitHubReview{DatabaseID: r.DatabaseID, NodeID: r.ID, State: r.State, CommitSHA: r.Commit.OID, SourceAt: r.SubmittedAt, Actor: domain.ActorIdentity{DatabaseID: r.Author.DatabaseID, NodeID: r.Author.ID, Login: r.Author.Login, Type: r.Author.Typename}})
 			}
-			reviewsLoaded = true
+			if p.Reviews.PageInfo.HasNextPage {
+				if p.Reviews.PageInfo.EndCursor == "" {
+					return "", nil, nil, "", nil, errors.New("review pagination cursor missing")
+				}
+				reviewCursor = p.Reviews.PageInfo.EndCursor
+			} else {
+				reviewsDone = true
+			}
 		}
 		decision = p.ReviewDecision
 		for _, t := range p.ReviewThreads.Nodes {
-			if t.Comments.TotalCount > len(t.Comments.Nodes) {
-				return "", nil, nil, "", nil, errors.New("review-comment pagination exceeded bounded response")
+			comments, err := c.completeThreadComments(ctx, t.ID, t.Comments.Nodes, t.Comments.PageInfo)
+			if err != nil {
+				return "", nil, nil, "", nil, err
 			}
-			for _, m := range t.Comments.Nodes {
+			for _, m := range comments {
 				id := strconv.FormatInt(m.DatabaseID, 10)
 				if id == "0" {
 					id = m.ID
@@ -718,7 +746,7 @@ func (c *Client) readReviews(ctx context.Context, pr int64, head string, coderab
 				}
 			}
 		}
-		if !p.ReviewThreads.PageInfo.HasNextPage {
+		if !p.ReviewThreads.PageInfo.HasNextPage && reviewsDone {
 			completedPages = true
 			break
 		}
@@ -732,6 +760,44 @@ func (c *Client) readReviews(ctx context.Context, pr int64, head string, coderab
 	}
 	return decision, reviews, findings, cr, unknown, nil
 }
+
+func (c *Client) completeThreadComments(ctx context.Context, threadID string, initial []rawReviewComment, pageInfo graphPageInfo) ([]rawReviewComment, error) {
+	comments := append([]rawReviewComment(nil), initial...)
+	cursor := pageInfo.EndCursor
+	for page := 1; pageInfo.HasNextPage && page <= 20; page++ {
+		if cursor == "" {
+			return nil, errors.New("review-comment pagination cursor missing")
+		}
+		var env struct {
+			Data struct {
+				Node *struct {
+					Comments struct {
+						Nodes    []rawReviewComment `json:"nodes"`
+						PageInfo graphPageInfo      `json:"pageInfo"`
+					} `json:"comments"`
+				} `json:"node"`
+			} `json:"data"`
+			Errors []json.RawMessage `json:"errors"`
+		}
+		if err := c.graphql(ctx, "ReadReviewThreadComments", threadCommentsQuery, map[string]any{"id": threadID, "cursor": cursor}, &env); err != nil {
+			return nil, err
+		}
+		if len(env.Errors) > 0 {
+			return nil, errors.New("GitHub GraphQL returned comment pagination errors")
+		}
+		if env.Data.Node == nil {
+			return nil, errors.New("GitHub GraphQL response missing review thread")
+		}
+		comments = append(comments, env.Data.Node.Comments.Nodes...)
+		pageInfo = env.Data.Node.Comments.PageInfo
+		cursor = pageInfo.EndCursor
+	}
+	if pageInfo.HasNextPage {
+		return nil, errors.New("review-comment pagination exceeded bounded limit")
+	}
+	return comments, nil
+}
+
 func nullable(s string) any {
 	if s == "" {
 		return nil
