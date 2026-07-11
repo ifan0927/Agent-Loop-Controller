@@ -145,6 +145,11 @@ func TestHumanApprovalAndMergeBindExactSHA(t *testing.T) {
 	if err := AuthorizeMerge(run, pr, snap, approval, "h1", "h1"); err != nil {
 		t.Fatal(err)
 	}
+	run.State = domain.StateMerging
+	if err := AuthorizeMerge(run, pr, snap, approval, "h1", "h1"); err != nil {
+		t.Fatalf("merging restart gate: %v", err)
+	}
+	run.State = domain.StateAwaitingHumanApproval
 	approval.ApprovedSHA = "old"
 	if err := AuthorizeMerge(run, pr, snap, approval, "h1", "h1"); err == nil {
 		t.Fatal("stale approval authorized merge")

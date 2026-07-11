@@ -178,8 +178,8 @@ func AuthorizeFixtureMerge(run Run, pr domain.PullRequest, snapshot domain.Revie
 }
 
 func authorizeMergeEvidence(run Run, pr domain.PullRequest, snapshot domain.ReviewSnapshot, approval domain.HumanApproval, verificationSHA, reviewSHA string, fixture bool) error {
-	if run.State != domain.StateAwaitingHumanApproval {
-		return fmt.Errorf("merge requires awaiting_human_approval, got %s", run.State)
+	if run.State != domain.StateAwaitingHumanApproval && run.State != domain.StateMerging {
+		return fmt.Errorf("merge requires awaiting_human_approval or merging, got %s", run.State)
 	}
 	if run.CandidateHead == "" || pr.HeadSHA != run.CandidateHead || snapshot.HeadSHA != run.CandidateHead || verificationSHA != run.CandidateHead || reviewSHA != run.CandidateHead {
 		return errors.New("merge evidence is not bound to exact final head")
