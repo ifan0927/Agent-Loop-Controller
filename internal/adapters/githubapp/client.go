@@ -112,6 +112,19 @@ func (c *Client) Read(ctx context.Context, pr int64, expectedHead string) (domai
 	checks, unknown = checks2, unknownChecks2
 	e.Checks = checks
 	e.UnknownEvents = unknown
+	decision3, reviews3, findings3, cr3, unknown4, err := c.readReviews(ctx, pr, expectedHead, coderabbitCheck2)
+	if err != nil {
+		return e, err
+	}
+	if reviewTopologyDigest(decision2, reviews2, findings2, cr2, unknown3) != reviewTopologyDigest(decision3, reviews3, findings3, cr3, unknown4) {
+		return e, errors.New("review topology drifted after final check collection")
+	}
+	decision, reviews, findings, cr, unknown2 = decision3, reviews3, findings3, cr3, unknown4
+	e.ReviewDecision = decision
+	e.Reviews = reviews
+	e.Findings = findings
+	e.CodeRabbit = cr
+	e.UnknownEvents = append(unknown, unknown2...)
 	e.ReviewDecision = decision
 	e.Reviews = reviews
 	e.Findings = findings
@@ -459,7 +472,11 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 			}
 			coderabbitCheck = mergeCodeRabbitState(coderabbitCheck, candidate)
 		}
-		all = append(all, domain.GitHubCheck{ID: strconv.FormatInt(r.ID, 10), Name: r.Name, Required: requiredName && (requiredApp == 0 || requiredApp == r.App.ID), Source: "check_run", AppID: r.App.ID, State: state, ObservedSHA: sha, SourceAt: r.CompletedAt, ObservedAt: c.clock.Now().UTC()})
+		sourceAt := r.CompletedAt
+		if sourceAt.IsZero() {
+			sourceAt = r.StartedAt
+		}
+		all = append(all, domain.GitHubCheck{ID: strconv.FormatInt(r.ID, 10), Name: r.Name, Required: requiredName && (requiredApp == 0 || requiredApp == r.App.ID), Source: "check_run", AppID: r.App.ID, State: state, ObservedSHA: sha, SourceAt: sourceAt, ObservedAt: c.clock.Now().UTC()})
 	}
 	var statuses struct {
 		TotalCount int `json:"total_count"`
@@ -501,6 +518,23 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 		}
 		requiredApp, requiredName := required[status.Context]
 		all = append(all, domain.GitHubCheck{ID: "status:" + strconv.FormatInt(status.ID, 10), Name: status.Context, Required: requiredName && requiredApp == 0, Source: "commit_status", State: state, ObservedSHA: sha, SourceAt: status.UpdatedAt, ObservedAt: c.clock.Now().UTC()})
+	}
+	for i := range all {
+		all[i].Required = false
+	}
+	for name, appID := range required {
+		best := -1
+		for i := range all {
+			if all[i].Name != name || appID > 0 && all[i].AppID != appID {
+				continue
+			}
+			if best < 0 || all[i].SourceAt.After(all[best].SourceAt) || all[i].SourceAt.Equal(all[best].SourceAt) && all[i].ID > all[best].ID {
+				best = i
+			}
+		}
+		if best >= 0 {
+			all[best].Required = true
+		}
 	}
 	for name := range required {
 		found := false

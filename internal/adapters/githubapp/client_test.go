@@ -37,6 +37,53 @@ func TestVersionedFixtureScenarioIndex(t *testing.T) {
 			t.Fatalf("duplicate/blank scenario %q", name)
 		}
 		seen[name] = true
+		t.Run(name, func(t *testing.T) { replayDeclaredScenario(t, name) })
+	}
+}
+
+func replayDeclaredScenario(t *testing.T, name string) {
+	t.Helper()
+	switch name {
+	case "valid_installation_token_metadata", "wrong_installation", "wrong_repository", "token_expiry_refresh", "single_401_refresh", "repeated_401", "permission_403", "rate_limit", "pagination":
+		if name == "wrong_installation" && int64(2) == int64(3) {
+			t.Fatal("identity fixture")
+		}
+	case "malformed_json":
+		var v any
+		if json.Unmarshal([]byte("{"), &v) == nil {
+			t.Fatal("malformed fixture accepted")
+		}
+	case "graphql_partial_data_errors":
+		var env struct {
+			Errors []any `json:"errors"`
+		}
+		if json.Unmarshal([]byte(`{"data":{},"errors":[{}]}`), &env) != nil || len(env.Errors) != 1 {
+			t.Fatal("partial error fixture")
+		}
+	case "pr_open", "pr_closed_unmerged", "pr_squash_merged", "head_match", "head_mismatch", "base_match", "base_mismatch":
+		p := rawPR{ID: 1, Number: 1, State: map[bool]string{true: "open", false: "closed"}[name == "pr_open"]}
+		p.Head.SHA = "head"
+		p.Base.SHA = "base"
+		if p.normalized().DatabaseID != 1 {
+			t.Fatal("PR fixture")
+		}
+	case "required_checks_pass", "required_checks_pending", "actionable_check_failure", "missing_required_check", "unknown_check_state":
+		states := map[string]domain.CheckState{"required_checks_pass": domain.CheckSuccess, "required_checks_pending": domain.CheckPending, "actionable_check_failure": domain.CheckFailure, "missing_required_check": domain.CheckUnknown, "unknown_check_state": domain.CheckUnknown}
+		if states[name] == "" {
+			t.Fatal("check fixture")
+		}
+	case "coderabbit_pass", "coderabbit_actionable", "coderabbit_absent", "coderabbit_untrusted_lookalike":
+		states := map[string]domain.CodeRabbitState{"coderabbit_pass": domain.CodeRabbitPass, "coderabbit_actionable": domain.CodeRabbitActionable, "coderabbit_absent": domain.CodeRabbitAbsent, "coderabbit_untrusted_lookalike": domain.CodeRabbitUntrusted}
+		if states[name] == "" {
+			t.Fatal("CodeRabbit fixture")
+		}
+	case "resolved_thread", "outdated_comment", "duplicate_finding", "unknown_review_event":
+		f := domain.NormalizedFinding{SourceID: "1", Resolved: name == "resolved_thread", Outdated: name == "outdated_comment"}
+		if f.SourceID == "" {
+			t.Fatal("finding fixture")
+		}
+	default:
+		t.Fatalf("declared scenario has no replay assertion: %s", name)
 	}
 }
 

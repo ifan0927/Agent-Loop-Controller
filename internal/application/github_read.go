@@ -49,6 +49,9 @@ func ReconcileGitHubRead(expectedRepository domain.RepositoryIdentity, expectedP
 	if got.PullRequest.Number != expectedPR.Number || got.PullRequest.NodeID != expectedPR.NodeID || got.PullRequest.URL != expectedPR.URL || (expectedPR.DatabaseID > 0 && got.PullRequest.DatabaseID != expectedPR.DatabaseID) {
 		return fmt.Errorf("GitHub pull request identity mismatch")
 	}
+	if expectedPR.HeadSHA == "" || expectedPR.HeadSHA != head || got.PullRequest.HeadSHA != expectedPR.HeadSHA {
+		return fmt.Errorf("persisted pull request head SHA mismatch")
+	}
 	if err := got.PullRequest.ValidateOwnership(branch, base, head, ownershipKey); err != nil {
 		return err
 	}
