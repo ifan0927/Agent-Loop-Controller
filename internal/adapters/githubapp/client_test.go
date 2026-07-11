@@ -245,41 +245,66 @@ func replayCheckScenario(t *testing.T, name string) {
 	}
 }
 
-func replayCodeRabbitScenario(t *testing.T, name string) {
-	state := map[string]domain.CodeRabbitState{"coderabbit_pass": domain.CodeRabbitPass, "coderabbit_actionable": domain.CodeRabbitActionable, "coderabbit_absent": domain.CodeRabbitAbsent, "coderabbit_untrusted_lookalike": domain.CodeRabbitUntrusted}[name]
-	if got := mergeCodeRabbitState(domain.CodeRabbitAbsent, state); got != state {
-		t.Fatalf("state=%s want=%s", got, state)
-	}
-}
+func replayCodeRabbitScenario(t *testing.T, name string) { assertReviewVariant(t, name) }
 
-func replayFindingScenario(t *testing.T, name string) {
-	findings := []domain.NormalizedFinding{{SourceID: "1", Resolved: name == "resolved_thread", Outdated: name == "outdated_comment"}, {SourceID: "1"}}
-	seen := map[string]bool{}
-	unique := 0
-	for _, f := range findings {
-		if !seen[f.SourceID] {
-			seen[f.SourceID] = true
-			unique++
-		}
-	}
+func replayFindingScenario(t *testing.T, name string) { assertReviewVariant(t, name) }
+
+func assertReviewVariant(t *testing.T, name string) {
+	t.Helper()
+	thread := ""
+	checkApp := int64(8)
+	want := domain.CodeRabbitPass
+	findingCount := 0
+	unknown := false
 	switch name {
+	case "coderabbit_pass":
+	case "coderabbit_actionable":
+		thread = reviewThreadJSON(false, false, 7, "BOT", "coderabbitai[bot]", false)
+		want = domain.CodeRabbitActionable
+		findingCount = 1
+	case "coderabbit_absent":
+		checkApp = 9
+		want = domain.CodeRabbitAbsent
+	case "coderabbit_untrusted_lookalike":
+		thread = reviewThreadJSON(false, false, 99, "LOOK", "coderabbit-lookalike", false)
+		want = domain.CodeRabbitUntrusted
+		unknown = true
 	case "resolved_thread":
-		if !findings[0].Resolved {
-			t.Fatal("not resolved")
-		}
+		thread = reviewThreadJSON(true, false, 7, "BOT", "coderabbitai[bot]", false)
+		findingCount = 1
 	case "outdated_comment":
-		if !findings[0].Outdated {
-			t.Fatal("not outdated")
-		}
+		thread = reviewThreadJSON(false, true, 7, "BOT", "coderabbitai[bot]", true)
+		findingCount = 1
 	case "duplicate_finding":
-		if unique != 1 {
-			t.Fatalf("unique=%d", unique)
-		}
+		thread = reviewThreadJSON(false, false, 7, "BOT", "coderabbitai[bot]", false) + "," + reviewThreadJSON(false, false, 7, "BOT", "coderabbitai[bot]", false)
+		want = domain.CodeRabbitActionable
+		findingCount = 1
 	case "unknown_review_event":
-		digest := reviewTopologyDigest("", nil, nil, domain.CodeRabbitUnknown, []string{"unknown"})
-		if digest == "" {
-			t.Fatal("missing telemetry digest")
-		}
+		thread = reviewThreadJSON(false, false, 22, "OTHER", "human", false)
+		checkApp = 9
+		want = domain.CodeRabbitAbsent
+		unknown = true
+	}
+	_, key := testKey(t)
+	server := reviewVariantServer(t, thread, checkApp)
+	defer server.Close()
+	cfg := validConfig(key)
+	cfg.APIBaseURL = server.URL
+	cfg.GraphQLURL = server.URL + "/graphql"
+	cfg.RepositoryID = 99
+	cfg.CodeRabbitActorID = 7
+	cfg.CodeRabbitNodeID = "BOT"
+	cfg.CodeRabbitAppID = 8
+	client, err := New(cfg, fixedClock{time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := client.Read(context.Background(), 1, "headsha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CodeRabbit != want || len(got.Findings) != findingCount || (len(got.UnknownEvents) > 0) != unknown {
+		t.Fatalf("status=%s findings=%d unknown=%v", got.CodeRabbit, len(got.Findings), got.UnknownEvents)
 	}
 }
 
@@ -441,6 +466,72 @@ func TestFixtureReplayAndRestartMint(t *testing.T) {
 	if mint.Load() != 2 {
 		t.Fatalf("restart mint count=%d", mint.Load())
 	}
+}
+
+func TestReviewVariantsReplayThroughClientRead(t *testing.T) {
+	variants := []struct {
+		name, thread string
+		checkApp     int64
+		want         domain.CodeRabbitState
+		findings     int
+		unknown      bool
+	}{{"pass", "", 8, domain.CodeRabbitPass, 0, false}, {"actionable", reviewThreadJSON(false, false, 7, "BOT", "coderabbitai[bot]", false), 8, domain.CodeRabbitActionable, 1, false}, {"absent", "", 9, domain.CodeRabbitAbsent, 0, false}, {"lookalike", reviewThreadJSON(false, false, 99, "LOOK", "coderabbit-lookalike", false), 8, domain.CodeRabbitUntrusted, 0, true}, {"resolved", reviewThreadJSON(true, false, 7, "BOT", "coderabbitai[bot]", false), 8, domain.CodeRabbitPass, 1, false}, {"outdated", reviewThreadJSON(false, true, 7, "BOT", "coderabbitai[bot]", true), 8, domain.CodeRabbitPass, 1, false}, {"duplicate", reviewThreadJSON(false, false, 7, "BOT", "coderabbitai[bot]", false) + "," + reviewThreadJSON(false, false, 7, "BOT", "coderabbitai[bot]", false), 8, domain.CodeRabbitActionable, 1, false}, {"unknown", reviewThreadJSON(false, false, 22, "OTHER", "human", false), 9, domain.CodeRabbitAbsent, 0, true}}
+	for _, tc := range variants {
+		t.Run(tc.name, func(t *testing.T) {
+			_, key := testKey(t)
+			server := reviewVariantServer(t, tc.thread, tc.checkApp)
+			defer server.Close()
+			cfg := validConfig(key)
+			cfg.APIBaseURL = server.URL
+			cfg.GraphQLURL = server.URL + "/graphql"
+			cfg.RepositoryID = 99
+			cfg.CodeRabbitActorID = 7
+			cfg.CodeRabbitNodeID = "BOT"
+			cfg.CodeRabbitAppID = 8
+			client, err := New(cfg, fixedClock{time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC)}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := client.Read(context.Background(), 1, "headsha")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.CodeRabbit != tc.want || len(got.Findings) != tc.findings || (len(got.UnknownEvents) > 0) != tc.unknown {
+				t.Fatalf("status=%s findings=%d unknown=%v", got.CodeRabbit, len(got.Findings), got.UnknownEvents)
+			}
+		})
+	}
+}
+
+func reviewThreadJSON(resolved, outdated bool, actorID int64, nodeID, login string, commentOutdated bool) string {
+	return fmt.Sprintf(`{"id":"THREAD","isResolved":%t,"isOutdated":%t,"comments":{"totalCount":1,"nodes":[{"id":"COMMENT","databaseId":10,"body":"finding","path":"x.go","line":2,"outdated":%t,"createdAt":"2026-07-11T00:00:00Z","author":{"login":%q,"__typename":"Bot","id":%q,"databaseId":%d}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}`, resolved, outdated, commentOutdated, login, nodeID, actorID)
+}
+
+func reviewVariantServer(t *testing.T, threads string, checkApp int64) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	write := func(w http.ResponseWriter, s string) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, s)
+	}
+	mux.HandleFunc("/app/installations/2/access_tokens", func(w http.ResponseWriter, r *http.Request) {
+		write(w, `{"token":"fixture-token","expires_at":"2026-07-11T01:00:00Z","permissions":{"metadata":"read","contents":"read","pull_requests":"read","checks":"read","statuses":"read","administration":"read"},"repositories":[{"id":99,"name":"repo","owner":{"login":"owner"}}]}`)
+	})
+	mux.HandleFunc("/repos/owner/repo", func(w http.ResponseWriter, r *http.Request) {
+		write(w, `{"id":99,"node_id":"REPO","name":"repo","owner":{"login":"owner"}}`)
+	})
+	mux.HandleFunc("/repos/owner/repo/pulls/1", func(w http.ResponseWriter, r *http.Request) {
+		write(w, `{"id":101,"number":1,"html_url":"https://example.invalid/pr/1","node_id":"PR","state":"open","merged":false,"body":"body","head":{"ref":"feature","sha":"headsha","repo":{"id":99}},"base":{"ref":"main","sha":"basesha","repo":{"id":99}}}`)
+	})
+	mux.HandleFunc("/repos/owner/repo/branches/main/protection/required_status_checks", func(w http.ResponseWriter, r *http.Request) { write(w, `{"contexts":["test"],"checks":[]}`) })
+	mux.HandleFunc("/repos/owner/repo/commits/headsha/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"check_runs":[{"id":1,"name":"test","status":"completed","conclusion":"success","completed_at":"2026-07-11T00:00:00Z","app":{"id":%d}}]}`, checkApp)
+	})
+	mux.HandleFunc("/repos/owner/repo/commits/headsha/status", func(w http.ResponseWriter, r *http.Request) { write(w, `{"total_count":0,"statuses":[]}`) })
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"data":{"repository":{"pullRequest":{"reviewDecision":"REVIEW_REQUIRED","reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}},"reviewThreads":{"nodes":[%s],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`, threads)
+	})
+	return httptest.NewServer(mux)
 }
 
 func Test401RefreshOnceAndRepeatedFailure(t *testing.T) {

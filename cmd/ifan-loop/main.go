@@ -130,6 +130,9 @@ func githubRead(args []string) error {
 	if inspection.GitHubInstallation != nil && (metadata.InstallationID != inspection.GitHubInstallation.InstallationID || metadata.AppID != inspection.GitHubInstallation.AppID) {
 		return errors.New("GitHub App installation binding mismatch")
 	}
+	if err := store.SavePullRequest(ctx, *runID, evidence.PullRequest); err != nil {
+		return err
+	}
 	if err := store.SaveGitHubInstallation(ctx, *runID, metadata); err != nil {
 		return err
 	}

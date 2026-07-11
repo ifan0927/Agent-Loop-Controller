@@ -25,6 +25,15 @@ func TestGitHubV6EvidencePersistsMetadataWithoutSecrets(t *testing.T) {
 	if _, _, err := store.CreateRun(ctx, input); err != nil {
 		t.Fatal(err)
 	}
+	legacyPR := domain.PullRequest{Number: 1, URL: "https://example.invalid/pr/1", NodeID: "PR", HeadBranch: "feature", BaseBranch: "main", HeadSHA: "head", BaseSHA: "base", BodyDigest: "body", OwnershipKey: "key", State: "open"}
+	if err := store.SavePullRequest(ctx, "run-gh", legacyPR); err != nil {
+		t.Fatal(err)
+	}
+	verifiedPR := legacyPR
+	verifiedPR.DatabaseID = 101
+	if err := store.SavePullRequest(ctx, "run-gh", verifiedPR); err != nil {
+		t.Fatal(err)
+	}
 	repo := domain.RepositoryIdentity{ID: 99, NodeID: "REPO", Owner: "owner", Name: "repo"}
 	now := time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC)
 	if err := store.SaveGitHubInstallation(ctx, "run-gh", application.GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: repo, TokenExpiresAt: now.Add(time.Hour), PermissionsDigest: "digest", ObservedAt: now}); err != nil {
@@ -56,6 +65,9 @@ func TestGitHubV6EvidencePersistsMetadataWithoutSecrets(t *testing.T) {
 	}
 	if inspection.GitHubInstallation == nil || len(inspection.GitHubRequests) != 1 || inspection.GitHubEvidence == nil {
 		t.Fatalf("missing GitHub v6 inspection: %+v", inspection)
+	}
+	if inspection.PullRequest == nil || inspection.PullRequest.DatabaseID != 101 {
+		t.Fatalf("PR database ID was not backfilled: %+v", inspection.PullRequest)
 	}
 	store.Close()
 	raw, err := os.ReadFile(path)
