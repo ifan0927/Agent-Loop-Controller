@@ -186,8 +186,21 @@ func TestApprovalAndMergeEvidenceAreImmutable(t *testing.T) {
 	}
 	changed := approval
 	changed.ApprovedSHA = "h2"
-	if err := store.SaveHumanApproval(ctx, "run-1", changed); err == nil {
-		t.Fatal("conflicting approval must fail closed")
+	changed.ReviewSHA = "h2"
+	if err := store.SaveHumanApproval(ctx, "run-1", changed); err != nil {
+		t.Fatalf("new HEAD approval: %v", err)
+	}
+	conflict := changed
+	conflict.Approver = "mallory"
+	if err := store.SaveHumanApproval(ctx, "run-1", conflict); err == nil {
+		t.Fatal("conflicting same-HEAD approval must fail closed")
+	}
+	if err := store.SetCandidateHead(ctx, "run-1", "h2"); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := store.Inspect(ctx, "run-1")
+	if err != nil || inspection.Approval == nil || inspection.Approval.ApprovedSHA != "h2" {
+		t.Fatalf("current approval=%+v err=%v", inspection.Approval, err)
 	}
 	merge := application.MergeRecord{RunID: "run-1", PRNumber: 1, PreMergeSHA: "h1", BaseSHA: "b1", Method: "squash", MergeSHA: "m1", MergedAt: now}
 	if err := store.SaveMerge(ctx, merge); err != nil {

@@ -185,7 +185,7 @@ var migrationV5 = []string{
 	`CREATE TABLE pull_requests (run_id TEXT PRIMARY KEY REFERENCES runs(run_id), number INTEGER NOT NULL, url TEXT NOT NULL, node_id TEXT NOT NULL, head_branch TEXT NOT NULL, base_branch TEXT NOT NULL, head_sha TEXT NOT NULL, base_sha TEXT NOT NULL, body_digest TEXT NOT NULL, ownership_key TEXT NOT NULL, state TEXT NOT NULL, merged INTEGER NOT NULL DEFAULT 0, merge_sha TEXT NOT NULL DEFAULT '', merged_at TEXT NOT NULL DEFAULT '')`,
 	`CREATE TABLE poll_observations (observation_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), pr_number INTEGER NOT NULL, attempt INTEGER NOT NULL, head_sha TEXT NOT NULL, status TEXT NOT NULL, snapshot_json TEXT NOT NULL, observed_at TEXT NOT NULL)`,
 	`CREATE TABLE review_findings (finding_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), source_id TEXT NOT NULL, thread_id TEXT NOT NULL DEFAULT '', source TEXT NOT NULL, file TEXT NOT NULL DEFAULT '', line INTEGER NOT NULL DEFAULT 0, severity TEXT NOT NULL, body_digest TEXT NOT NULL, body_text TEXT NOT NULL, resolved INTEGER NOT NULL, outdated INTEGER NOT NULL, head_sha TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE(run_id,source,source_id,head_sha))`,
-	`CREATE TABLE human_approvals (run_id TEXT PRIMARY KEY REFERENCES runs(run_id), pr_number INTEGER NOT NULL, approver TEXT NOT NULL, source TEXT NOT NULL, approved_sha TEXT NOT NULL, ci_status TEXT NOT NULL, coderabbit_status TEXT NOT NULL, internal_review_sha TEXT NOT NULL, approved_at TEXT NOT NULL)`,
+	`CREATE TABLE human_approvals (approval_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), pr_number INTEGER NOT NULL, approver TEXT NOT NULL, source TEXT NOT NULL, approved_sha TEXT NOT NULL, ci_status TEXT NOT NULL, coderabbit_status TEXT NOT NULL, internal_review_sha TEXT NOT NULL, approved_at TEXT NOT NULL, UNIQUE(run_id,approved_sha))`,
 	`CREATE TABLE merge_results (run_id TEXT PRIMARY KEY REFERENCES runs(run_id), pr_number INTEGER NOT NULL, pre_merge_head_sha TEXT NOT NULL, base_sha TEXT NOT NULL, merge_method TEXT NOT NULL CHECK(merge_method='squash'), merge_sha TEXT NOT NULL, merged_at TEXT NOT NULL)`,
 	`CREATE TABLE cleanup_results (cleanup_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), resource_kind TEXT NOT NULL, resource_name TEXT NOT NULL, status TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, UNIQUE(run_id,resource_kind,resource_name))`,
 }
@@ -499,7 +499,7 @@ func (s *Store) SaveHumanApproval(ctx context.Context, runID string, approval do
 	}
 	var existing domain.HumanApproval
 	var approvedAt string
-	if scanErr := s.db.QueryRowContext(ctx, `SELECT pr_number,approver,source,approved_sha,ci_status,coderabbit_status,internal_review_sha,approved_at FROM human_approvals WHERE run_id=?`, runID).Scan(&existing.PRNumber, &existing.Approver, &existing.Source, &existing.ApprovedSHA, &existing.CIStatus, &existing.CodeRabbit, &existing.ReviewSHA, &approvedAt); scanErr != nil {
+	if scanErr := s.db.QueryRowContext(ctx, `SELECT pr_number,approver,source,approved_sha,ci_status,coderabbit_status,internal_review_sha,approved_at FROM human_approvals WHERE run_id=? AND approved_sha=?`, runID, approval.ApprovedSHA).Scan(&existing.PRNumber, &existing.Approver, &existing.Source, &existing.ApprovedSHA, &existing.CIStatus, &existing.CodeRabbit, &existing.ReviewSHA, &approvedAt); scanErr != nil {
 		return err
 	}
 	existing.ApprovedAt = parseTime(approvedAt)
@@ -715,7 +715,7 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 	rows.Close()
 	var approval domain.HumanApproval
 	var approvedAt string
-	if err := s.db.QueryRowContext(ctx, `SELECT pr_number,approver,source,approved_sha,ci_status,coderabbit_status,internal_review_sha,approved_at FROM human_approvals WHERE run_id=?`, id).Scan(&approval.PRNumber, &approval.Approver, &approval.Source, &approval.ApprovedSHA, &approval.CIStatus, &approval.CodeRabbit, &approval.ReviewSHA, &approvedAt); err == nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT pr_number,approver,source,approved_sha,ci_status,coderabbit_status,internal_review_sha,approved_at FROM human_approvals WHERE run_id=? AND approved_sha=? ORDER BY approval_id DESC LIMIT 1`, id, run.CandidateHead).Scan(&approval.PRNumber, &approval.Approver, &approval.Source, &approval.ApprovedSHA, &approval.CIStatus, &approval.CodeRabbit, &approval.ReviewSHA, &approvedAt); err == nil {
 		approval.ApprovedAt = parseTime(approvedAt)
 		inspection.Approval = &approval
 	} else if !errors.Is(err, sql.ErrNoRows) {
