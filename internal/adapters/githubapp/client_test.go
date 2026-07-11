@@ -44,46 +44,242 @@ func TestVersionedFixtureScenarioIndex(t *testing.T) {
 func replayDeclaredScenario(t *testing.T, name string) {
 	t.Helper()
 	switch name {
-	case "valid_installation_token_metadata", "wrong_installation", "wrong_repository", "token_expiry_refresh", "single_401_refresh", "repeated_401", "permission_403", "rate_limit", "pagination":
-		if name == "wrong_installation" && int64(2) == int64(3) {
-			t.Fatal("identity fixture")
-		}
-	case "malformed_json":
-		var v any
-		if json.Unmarshal([]byte("{"), &v) == nil {
-			t.Fatal("malformed fixture accepted")
-		}
-	case "graphql_partial_data_errors":
-		var env struct {
-			Errors []any `json:"errors"`
-		}
-		if json.Unmarshal([]byte(`{"data":{},"errors":[{}]}`), &env) != nil || len(env.Errors) != 1 {
-			t.Fatal("partial error fixture")
-		}
+	case "valid_installation_token_metadata", "wrong_installation", "wrong_repository", "token_expiry_refresh", "single_401_refresh", "repeated_401":
+		replayAuthScenario(t, name)
+	case "permission_403", "rate_limit", "malformed_json", "graphql_partial_data_errors":
+		replayTransportScenario(t, name)
+	case "pagination":
+		replayPaginationScenario(t)
 	case "pr_open", "pr_closed_unmerged", "pr_squash_merged", "head_match", "head_mismatch", "base_match", "base_mismatch":
-		p := rawPR{ID: 1, Number: 1, State: map[bool]string{true: "open", false: "closed"}[name == "pr_open"]}
-		p.Head.SHA = "head"
-		p.Base.SHA = "base"
-		if p.normalized().DatabaseID != 1 {
-			t.Fatal("PR fixture")
-		}
+		replayPRScenario(t, name)
 	case "required_checks_pass", "required_checks_pending", "actionable_check_failure", "missing_required_check", "unknown_check_state":
-		states := map[string]domain.CheckState{"required_checks_pass": domain.CheckSuccess, "required_checks_pending": domain.CheckPending, "actionable_check_failure": domain.CheckFailure, "missing_required_check": domain.CheckUnknown, "unknown_check_state": domain.CheckUnknown}
-		if states[name] == "" {
-			t.Fatal("check fixture")
-		}
+		replayCheckScenario(t, name)
 	case "coderabbit_pass", "coderabbit_actionable", "coderabbit_absent", "coderabbit_untrusted_lookalike":
-		states := map[string]domain.CodeRabbitState{"coderabbit_pass": domain.CodeRabbitPass, "coderabbit_actionable": domain.CodeRabbitActionable, "coderabbit_absent": domain.CodeRabbitAbsent, "coderabbit_untrusted_lookalike": domain.CodeRabbitUntrusted}
-		if states[name] == "" {
-			t.Fatal("CodeRabbit fixture")
-		}
+		replayCodeRabbitScenario(t, name)
 	case "resolved_thread", "outdated_comment", "duplicate_finding", "unknown_review_event":
-		f := domain.NormalizedFinding{SourceID: "1", Resolved: name == "resolved_thread", Outdated: name == "outdated_comment"}
-		if f.SourceID == "" {
-			t.Fatal("finding fixture")
-		}
+		replayFindingScenario(t, name)
 	default:
 		t.Fatalf("declared scenario has no replay assertion: %s", name)
+	}
+}
+
+func replayAuthScenario(t *testing.T, name string) {
+	_, key := testKey(t)
+	var mints, reads atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/app/installations/2/access_tokens", func(w http.ResponseWriter, r *http.Request) {
+		n := mints.Add(1)
+		repoID := 99
+		if name == "wrong_repository" {
+			repoID = 100
+		}
+		expiry := "2026-07-11T01:00:00Z"
+		if name == "token_expiry_refresh" {
+			expiry = "2026-07-11T00:03:00Z"
+		}
+		fmt.Fprintf(w, `{"token":"token-%d","expires_at":"%s","permissions":{"metadata":"read","contents":"read","pull_requests":"read","checks":"read","statuses":"read","administration":"read"},"repositories":[{"id":%d,"name":"repo","owner":{"login":"owner"}}]}`, n, expiry, repoID)
+	})
+	mux.HandleFunc("/repos/owner/repo", func(w http.ResponseWriter, r *http.Request) {
+		attempt := reads.Add(1)
+		if name == "repeated_401" || name == "single_401_refresh" && attempt == 1 {
+			w.WriteHeader(401)
+			return
+		}
+		fmt.Fprint(w, `{"id":99,"node_id":"R","name":"repo","owner":{"login":"owner"}}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	installation := int64(2)
+	if name == "wrong_installation" {
+		installation = 3
+	}
+	c := &Client{cfg: Config{APIBaseURL: srv.URL, AppID: 1, InstallationID: installation, RepositoryOwner: "owner", RepositoryName: "repo", RepositoryID: 99, PrivateKeyFile: key, TokenRefreshSkew: 5 * time.Minute, APIVersion: "2022-11-28"}, http: srv.Client(), clock: fixedClock{time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC)}}
+	err := c.ensureToken(context.Background(), false)
+	if name == "wrong_installation" || name == "wrong_repository" {
+		if err == nil {
+			t.Fatalf("%s accepted", name)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name == "token_expiry_refresh" {
+		if err := c.ensureToken(context.Background(), false); err != nil {
+			t.Fatal(err)
+		}
+		if mints.Load() != 2 {
+			t.Fatalf("refresh mints=%d", mints.Load())
+		}
+		return
+	}
+	if name == "valid_installation_token_metadata" {
+		if c.token == "" || c.expires.IsZero() {
+			t.Fatal("token metadata missing")
+		}
+		return
+	}
+	var repo map[string]any
+	err = c.rest(context.Background(), "repository", "GET", "/repos/owner/repo", nil, &repo, true)
+	if name == "repeated_401" {
+		if err == nil || mints.Load() != 2 {
+			t.Fatalf("repeated 401 err=%v mints=%d", err, mints.Load())
+		}
+		return
+	}
+	if err != nil || mints.Load() != 2 || reads.Load() != 2 {
+		t.Fatalf("single refresh err=%v mints=%d reads=%d", err, mints.Load(), reads.Load())
+	}
+}
+
+func replayTransportScenario(t *testing.T, name string) {
+	status := 200
+	body := `{}`
+	headers := map[string]string{}
+	category := "REST"
+	want := ""
+	switch name {
+	case "permission_403":
+		status = 403
+		want = "permission_denied"
+	case "rate_limit":
+		status = 403
+		headers["X-RateLimit-Remaining"] = "0"
+		want = "rate_limited"
+	case "malformed_json":
+		body = `{`
+		want = "malformed_json"
+	case "graphql_partial_data_errors":
+		category = "GraphQL"
+		body = `{"data":{},"errors":[{"message":"partial"}]}`
+		want = "graphql_errors"
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for k, v := range headers {
+			w.Header().Set(k, v)
+		}
+		w.WriteHeader(status)
+		fmt.Fprint(w, body)
+	}))
+	defer srv.Close()
+	var observed application.GitHubRequestObservation
+	c := &Client{cfg: Config{APIVersion: "2022-11-28"}, http: srv.Client(), clock: fixedClock{time.Now()}, observe: func(o application.GitHubRequestObservation) { observed = o }}
+	var out map[string]any
+	_ = c.do(context.Background(), name, category, "GET", srv.URL, nil, "Bearer fixture", &out, true)
+	if observed.ErrorClass != want {
+		t.Fatalf("class=%s want=%s", observed.ErrorClass, want)
+	}
+}
+
+func replayPaginationScenario(t *testing.T) {
+	var pages atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/owner/repo/branches/main/protection/required_status_checks", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `{"contexts":["required"],"checks":[]}`) })
+	mux.HandleFunc("/repos/owner/repo/commits/head/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		page := pages.Add(1)
+		if page == 1 {
+			fmt.Fprint(w, `{"check_runs":[`)
+			for i := 0; i < 100; i++ {
+				if i > 0 {
+					fmt.Fprint(w, ",")
+				}
+				fmt.Fprintf(w, `{"id":%d,"name":"n%d","status":"completed","conclusion":"success","app":{"id":1}}`, i+1, i)
+			}
+			fmt.Fprint(w, `]}`)
+			return
+		}
+		fmt.Fprint(w, `{"check_runs":[]}`)
+	})
+	mux.HandleFunc("/repos/owner/repo/commits/head/status", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `{"total_count":0,"statuses":[]}`) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := &Client{cfg: Config{APIBaseURL: srv.URL, RepositoryOwner: "owner", RepositoryName: "repo", APIVersion: "2022-11-28"}, http: srv.Client(), clock: fixedClock{time.Now()}, token: "token"}
+	if _, _, _, err := c.readChecks(context.Background(), "head", "main"); err != nil {
+		t.Fatal(err)
+	}
+	if pages.Load() != 2 {
+		t.Fatalf("pages=%d", pages.Load())
+	}
+}
+
+func replayPRScenario(t *testing.T, name string) {
+	repo := domain.RepositoryIdentity{ID: 1, NodeID: "R", Owner: "o", Name: "r"}
+	pr := domain.PullRequest{Number: 1, DatabaseID: 2, NodeID: "P", URL: "u", HeadBranch: "feature", BaseBranch: "main", HeadSHA: "head", BaseSHA: "base", OwnershipKey: "key", BodyDigest: "body", State: "open"}
+	if name == "pr_closed_unmerged" {
+		pr.State = "closed"
+	}
+	if name == "pr_squash_merged" {
+		pr.State = "closed"
+		pr.Merged = true
+		pr.MergeSHA = "merge"
+	}
+	got := domain.GitHubReadEvidence{Repository: repo, PullRequest: pr}
+	expected := pr
+	switch name {
+	case "head_mismatch":
+		got.PullRequest.HeadSHA = "wrong"
+	case "base_mismatch":
+		got.PullRequest.BaseSHA = "wrong"
+	}
+	err := application.ReconcileGitHubRead(repo, expected, "feature", "main", "head", "base", "key", "body", got)
+	wantError := strings.HasSuffix(name, "mismatch")
+	if (err != nil) != wantError {
+		t.Fatalf("%s err=%v", name, err)
+	}
+}
+
+func replayCheckScenario(t *testing.T, name string) {
+	state := map[string]domain.CheckState{"required_checks_pass": domain.CheckSuccess, "required_checks_pending": domain.CheckPending, "actionable_check_failure": domain.CheckFailure, "unknown_check_state": domain.CheckUnknown}[name]
+	checks := []domain.GitHubCheck{}
+	unknown := []string{}
+	if name == "missing_required_check" {
+		unknown = []string{"missing_required_check:test"}
+	} else {
+		checks = []domain.GitHubCheck{{Name: "test", Required: true, State: state, ObservedSHA: "head"}}
+	}
+	e := domain.GitHubReadEvidence{PullRequest: domain.PullRequest{HeadSHA: "head"}, Checks: checks, UnknownEvents: unknown}
+	got := e.RequiredChecksStatus()
+	want := map[string]domain.ReconciliationStatus{"required_checks_pass": domain.ReconciliationPass, "required_checks_pending": domain.ReconciliationPending, "actionable_check_failure": domain.ReconciliationActionable, "missing_required_check": domain.ReconciliationInfrastructure, "unknown_check_state": domain.ReconciliationInfrastructure}[name]
+	if got != want {
+		t.Fatalf("status=%s want=%s", got, want)
+	}
+}
+
+func replayCodeRabbitScenario(t *testing.T, name string) {
+	state := map[string]domain.CodeRabbitState{"coderabbit_pass": domain.CodeRabbitPass, "coderabbit_actionable": domain.CodeRabbitActionable, "coderabbit_absent": domain.CodeRabbitAbsent, "coderabbit_untrusted_lookalike": domain.CodeRabbitUntrusted}[name]
+	if got := mergeCodeRabbitState(domain.CodeRabbitAbsent, state); got != state {
+		t.Fatalf("state=%s want=%s", got, state)
+	}
+}
+
+func replayFindingScenario(t *testing.T, name string) {
+	findings := []domain.NormalizedFinding{{SourceID: "1", Resolved: name == "resolved_thread", Outdated: name == "outdated_comment"}, {SourceID: "1"}}
+	seen := map[string]bool{}
+	unique := 0
+	for _, f := range findings {
+		if !seen[f.SourceID] {
+			seen[f.SourceID] = true
+			unique++
+		}
+	}
+	switch name {
+	case "resolved_thread":
+		if !findings[0].Resolved {
+			t.Fatal("not resolved")
+		}
+	case "outdated_comment":
+		if !findings[0].Outdated {
+			t.Fatal("not outdated")
+		}
+	case "duplicate_finding":
+		if unique != 1 {
+			t.Fatalf("unique=%d", unique)
+		}
+	case "unknown_review_event":
+		digest := reviewTopologyDigest("", nil, nil, domain.CodeRabbitUnknown, []string{"unknown"})
+		if digest == "" {
+			t.Fatal("missing telemetry digest")
+		}
 	}
 }
 
@@ -154,6 +350,36 @@ func TestCodeRabbitStateAggregationIsConservative(t *testing.T) {
 	}
 	if got != domain.CodeRabbitActionable {
 		t.Fatalf("reverse got %s", got)
+	}
+}
+
+func TestReviewAndThreadConnectionsPaginateIndependently(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Variables map[string]any `json:"variables"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			return
+		}
+		call := calls.Add(1)
+		if call == 1 {
+			fmt.Fprint(w, `{"data":{"repository":{"pullRequest":{"reviewDecision":"REVIEW_REQUIRED","reviews":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"review-1"}},"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`)
+			return
+		}
+		if request.Variables["reviewCursor"] != "review-1" {
+			t.Errorf("reviewCursor=%v", request.Variables["reviewCursor"])
+		}
+		fmt.Fprint(w, `{"data":{"repository":{"pullRequest":{"reviewDecision":"REVIEW_REQUIRED","reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}},"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`)
+	}))
+	defer srv.Close()
+	c := &Client{cfg: Config{GraphQLURL: srv.URL, APIVersion: "2022-11-28"}, http: srv.Client(), clock: fixedClock{time.Now()}, token: "token"}
+	if _, _, _, _, _, err := c.readReviews(context.Background(), 1, "head", domain.CodeRabbitAbsent); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("calls=%d", calls.Load())
 	}
 }
 
