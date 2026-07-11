@@ -28,6 +28,7 @@ type Client struct {
 	clock             Clock
 	observe           Observer
 	mu                sync.Mutex
+	opMu              sync.Mutex
 	token             string
 	expires           time.Time
 	repo              domain.RepositoryIdentity
@@ -44,6 +45,8 @@ func New(cfg Config, clock Clock, observer Observer) (*Client, error) {
 	return &Client{cfg: cfg, http: &http.Client{Timeout: cfg.HTTPTimeout}, clock: clock, observe: observer}, nil
 }
 func (c *Client) Read(ctx context.Context, pr int64, expectedHead string) (domain.GitHubReadEvidence, error) {
+	c.opMu.Lock()
+	defer c.opMu.Unlock()
 	if pr < 1 || expectedHead == "" {
 		return domain.GitHubReadEvidence{}, errors.New("PR number and expected head are required")
 	}
@@ -167,6 +170,8 @@ func (c *Client) ensureToken(ctx context.Context, force bool) error {
 }
 
 func (c *Client) InstallationMetadata() application.GitHubInstallationMetadata {
+	c.opMu.Lock()
+	defer c.opMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return application.GitHubInstallationMetadata{AppID: c.cfg.AppID, InstallationID: c.cfg.InstallationID, Repository: c.repo, TokenExpiresAt: c.expires, PermissionsDigest: c.permissionsDigest, ObservedAt: c.clock.Now().UTC()}
@@ -389,18 +394,18 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 		}
 		requiredApp, requiredName := required[r.Name]
 		if c.cfg.CodeRabbitAppID > 0 && r.App.ID == c.cfg.CodeRabbitAppID {
+			candidate := domain.CodeRabbitUnknown
 			switch state {
 			case domain.CheckSuccess, domain.CheckNeutral, domain.CheckSkipped:
-				coderabbitCheck = domain.CodeRabbitPass
+				candidate = domain.CodeRabbitPass
 			case domain.CheckQueued, domain.CheckInProgress, domain.CheckPending, domain.CheckRequested, domain.CheckWaiting:
-				coderabbitCheck = domain.CodeRabbitPending
+				candidate = domain.CodeRabbitPending
 			case domain.CheckFailure, domain.CheckActionRequired:
-				coderabbitCheck = domain.CodeRabbitActionable
+				candidate = domain.CodeRabbitActionable
 			case domain.CheckCancelled, domain.CheckTimedOut, domain.CheckStale:
-				coderabbitCheck = domain.CodeRabbitInfrastructure
-			default:
-				coderabbitCheck = domain.CodeRabbitUnknown
+				candidate = domain.CodeRabbitInfrastructure
 			}
+			coderabbitCheck = mergeCodeRabbitState(coderabbitCheck, candidate)
 		}
 		all = append(all, domain.GitHubCheck{ID: strconv.FormatInt(r.ID, 10), Name: r.Name, Required: requiredName && (requiredApp == 0 || requiredApp == r.App.ID), Source: "check_run", AppID: r.App.ID, State: state, ObservedSHA: sha, SourceAt: r.CompletedAt, ObservedAt: c.clock.Now().UTC()})
 	}
@@ -457,6 +462,14 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 		}
 	}
 	return all, coderabbitCheck, unknown, nil
+}
+
+func mergeCodeRabbitState(current, next domain.CodeRabbitState) domain.CodeRabbitState {
+	priority := map[domain.CodeRabbitState]int{domain.CodeRabbitAbsent: 0, domain.CodeRabbitPass: 1, domain.CodeRabbitPending: 2, domain.CodeRabbitUnknown: 3, domain.CodeRabbitInfrastructure: 4, domain.CodeRabbitActionable: 5, domain.CodeRabbitUntrusted: 6}
+	if priority[next] > priority[current] {
+		return next
+	}
+	return current
 }
 func mapCheck(status, conclusion string) domain.CheckState {
 	if status != "completed" {

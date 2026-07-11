@@ -92,6 +92,24 @@ func TestLatestCheckRunWinsDeterministically(t *testing.T) {
 	}
 }
 
+func TestCodeRabbitStateAggregationIsConservative(t *testing.T) {
+	states := []domain.CodeRabbitState{domain.CodeRabbitPass, domain.CodeRabbitPending, domain.CodeRabbitInfrastructure, domain.CodeRabbitActionable}
+	got := domain.CodeRabbitAbsent
+	for _, state := range states {
+		got = mergeCodeRabbitState(got, state)
+	}
+	if got != domain.CodeRabbitActionable {
+		t.Fatalf("got %s", got)
+	}
+	got = domain.CodeRabbitAbsent
+	for i := len(states) - 1; i >= 0; i-- {
+		got = mergeCodeRabbitState(got, states[i])
+	}
+	if got != domain.CodeRabbitActionable {
+		t.Fatalf("reverse got %s", got)
+	}
+}
+
 func TestHTTPFailureClassificationAndBounds(t *testing.T) {
 	tests := []struct {
 		name    string
