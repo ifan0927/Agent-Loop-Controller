@@ -638,6 +638,7 @@ func (c *Client) readReviews(ctx context.Context, pr int64, head string, coderab
 	decision := ""
 	seen := map[string]bool{}
 	reviewsDone := false
+	threadsDone := false
 	completedPages := false
 	for pages := 0; pages < 20; pages++ {
 		var env struct {
@@ -710,50 +711,57 @@ func (c *Client) readReviews(ctx context.Context, pr int64, head string, coderab
 			}
 		}
 		decision = p.ReviewDecision
-		for _, t := range p.ReviewThreads.Nodes {
-			comments, err := c.completeThreadComments(ctx, t.ID, t.Comments.Nodes, t.Comments.PageInfo)
-			if err != nil {
-				return "", nil, nil, "", nil, err
-			}
-			for _, m := range comments {
-				id := strconv.FormatInt(m.DatabaseID, 10)
-				if id == "0" {
-					id = m.ID
+		if !threadsDone {
+			for _, t := range p.ReviewThreads.Nodes {
+				comments, err := c.completeThreadComments(ctx, t.ID, t.Comments.Nodes, t.Comments.PageInfo)
+				if err != nil {
+					return "", nil, nil, "", nil, err
 				}
-				if seen[id] {
-					continue
-				}
-				seen[id] = true
-				dig := sha256.Sum256([]byte(m.Body))
-				trusted := coderabbitCheck != domain.CodeRabbitAbsent && coderabbitCheck != domain.CodeRabbitUnknown && c.cfg.CodeRabbitAppID > 0 && m.Author.DatabaseID == c.cfg.CodeRabbitActorID && m.Author.ID == c.cfg.CodeRabbitNodeID && m.Author.Typename == "Bot"
-				if strings.Contains(strings.ToLower(m.Author.Login), "coderabbit") && !trusted {
-					unknown = append(unknown, "coderabbit_comment_app_provenance_unavailable:"+id)
-					cr = mergeCodeRabbitState(cr, domain.CodeRabbitUntrusted)
-				}
-				if trusted {
-					if t.IsResolved || t.IsOutdated || m.Outdated {
-						if cr == domain.CodeRabbitAbsent {
-							cr = domain.CodeRabbitPass
-						}
-					} else {
-						cr = domain.CodeRabbitActionable
+				for _, m := range comments {
+					id := strconv.FormatInt(m.DatabaseID, 10)
+					if id == "0" {
+						id = m.ID
 					}
-				}
-				if trusted {
-					findings = append(findings, domain.NormalizedFinding{Source: "coderabbit_review_comment", SourceID: id, ThreadID: t.ID, File: m.Path, Line: m.Line, Classification: "source_unspecified", BodyDigest: hex.EncodeToString(dig[:]), Resolved: t.IsResolved, Outdated: t.IsOutdated || m.Outdated, HeadSHA: head, SourceAt: m.CreatedAt, ObservedAt: c.clock.Now().UTC()})
-				} else {
-					unknown = append(unknown, "untrusted_review_comment:"+id)
+					if seen[id] {
+						continue
+					}
+					seen[id] = true
+					dig := sha256.Sum256([]byte(m.Body))
+					trusted := coderabbitCheck != domain.CodeRabbitAbsent && coderabbitCheck != domain.CodeRabbitUnknown && c.cfg.CodeRabbitAppID > 0 && m.Author.DatabaseID == c.cfg.CodeRabbitActorID && m.Author.ID == c.cfg.CodeRabbitNodeID && m.Author.Typename == "Bot"
+					if strings.Contains(strings.ToLower(m.Author.Login), "coderabbit") && !trusted {
+						unknown = append(unknown, "coderabbit_comment_app_provenance_unavailable:"+id)
+						cr = mergeCodeRabbitState(cr, domain.CodeRabbitUntrusted)
+					}
+					if trusted {
+						if t.IsResolved || t.IsOutdated || m.Outdated {
+							if cr == domain.CodeRabbitAbsent {
+								cr = domain.CodeRabbitPass
+							}
+						} else {
+							cr = domain.CodeRabbitActionable
+						}
+					}
+					if trusted {
+						findings = append(findings, domain.NormalizedFinding{Source: "coderabbit_review_comment", SourceID: id, ThreadID: t.ID, File: m.Path, Line: m.Line, Classification: "source_unspecified", BodyDigest: hex.EncodeToString(dig[:]), Resolved: t.IsResolved, Outdated: t.IsOutdated || m.Outdated, HeadSHA: head, SourceAt: m.CreatedAt, ObservedAt: c.clock.Now().UTC()})
+					} else {
+						unknown = append(unknown, "untrusted_review_comment:"+id)
+					}
 				}
 			}
 		}
-		if !p.ReviewThreads.PageInfo.HasNextPage && reviewsDone {
+		if !p.ReviewThreads.PageInfo.HasNextPage {
+			threadsDone = true
+		}
+		if threadsDone && reviewsDone {
 			completedPages = true
 			break
 		}
-		if p.ReviewThreads.PageInfo.EndCursor == "" {
+		if !threadsDone && p.ReviewThreads.PageInfo.EndCursor == "" {
 			return "", nil, nil, "", nil, errors.New("GraphQL pagination cursor missing")
 		}
-		cursor = p.ReviewThreads.PageInfo.EndCursor
+		if !threadsDone {
+			cursor = p.ReviewThreads.PageInfo.EndCursor
+		}
 	}
 	if !completedPages {
 		return "", nil, nil, "", nil, errors.New("review-thread pagination exceeded bounded limit")
