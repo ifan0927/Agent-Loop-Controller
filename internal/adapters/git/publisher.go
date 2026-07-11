@@ -16,11 +16,16 @@ type PushSpec struct {
 }
 
 func BuildPushSpec(branch string) (PushSpec, error) {
+	return BuildPushSpecExpected(branch, "")
+}
+
+func BuildPushSpecExpected(branch, expectedRemote string) (PushSpec, error) {
 	if err := domain.ValidateGitBranch(branch); err != nil {
 		return PushSpec{}, err
 	}
 	refspec := "refs/heads/" + branch + ":refs/heads/" + branch
-	return PushSpec{Program: "git", Args: []string{"push", "--porcelain", "origin", refspec}}, nil
+	lease := "--force-with-lease=refs/heads/" + branch + ":" + expectedRemote
+	return PushSpec{Program: "git", Args: []string{"push", "--porcelain", lease, "origin", refspec}}, nil
 }
 
 type PushEvidence struct {
@@ -55,7 +60,11 @@ func (p Publisher) RemoteSHA(ctx context.Context, workspace, branch string) (str
 }
 
 func (p Publisher) Push(ctx context.Context, workspace, branch, candidate, stdoutPath, stderrPath string) (PushEvidence, error) {
-	spec, err := BuildPushSpec(branch)
+	expectedRemote, err := p.RemoteSHA(ctx, workspace, branch)
+	if err != nil {
+		return PushEvidence{}, err
+	}
+	spec, err := BuildPushSpecExpected(branch, expectedRemote)
 	if err != nil {
 		return PushEvidence{}, err
 	}

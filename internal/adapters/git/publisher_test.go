@@ -22,6 +22,19 @@ func TestBuildPushSpecUsesExplicitRefspecWithoutForce(t *testing.T) {
 			t.Fatalf("force option: %s", arg)
 		}
 	}
+	if !slices.Contains(spec.Args, "--force-with-lease=refs/heads/ifan/ifan-42-safe:") {
+		t.Fatalf("missing atomic create lease: %v", spec.Args)
+	}
+}
+
+func TestRepairPushLeaseBindsExpectedOldSHA(t *testing.T) {
+	spec, err := BuildPushSpecExpected("ifan/ifan-42-safe", "oldsha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(spec.Args, "--force-with-lease=refs/heads/ifan/ifan-42-safe:oldsha") {
+		t.Fatalf("missing CAS lease: %v", spec.Args)
+	}
 }
 
 func TestExplicitPushToDisposableBareOrigin(t *testing.T) {

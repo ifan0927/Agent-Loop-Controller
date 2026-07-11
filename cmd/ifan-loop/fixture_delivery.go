@@ -583,7 +583,7 @@ func fixtureCleanup(ctx context.Context, store *sqlitestore.Store, repo fixtureR
 			} else if !strings.HasPrefix(remote, run.CandidateHead+"\t") {
 				err = errors.New("remote branch no longer matches persisted candidate")
 			} else {
-				_, err = runCommand(repo.SourcePath, "git", "push", "origin", "--delete", "refs/heads/"+run.WorkingBranch)
+				_, err = runCommand(repo.SourcePath, "git", "push", "--force-with-lease=refs/heads/"+run.WorkingBranch+":"+run.CandidateHead, "origin", "--delete", "refs/heads/"+run.WorkingBranch)
 			}
 		case "local_branch":
 			ref := "refs/heads/" + run.WorkingBranch
