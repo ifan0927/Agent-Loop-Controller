@@ -52,8 +52,8 @@ func localFixtureDeliver(args []string) error {
 		if err := json.Unmarshal([]byte(run.RepositoryConfigJSON), &repo); err != nil {
 			return err
 		}
-		if !strings.Contains(repo.OriginPath, "Agent-Loop-Controller-lab.") {
-			return errors.New("fixture delivery refuses non-lab origin")
+		if err := validateDisposableFixture(repo); err != nil {
+			return err
 		}
 		switch run.State {
 		case domain.StateApprovalReady:
@@ -152,6 +152,40 @@ func localFixtureDeliver(args []string) error {
 			return fmt.Errorf("fixture delivery cannot resume state %s", run.State)
 		}
 	}
+}
+
+func validateDisposableFixture(repo fixtureRepository) error {
+	origin, err := filepath.EvalSymlinks(repo.OriginPath)
+	if err != nil {
+		return err
+	}
+	source, err := filepath.EvalSymlinks(repo.SourcePath)
+	if err != nil {
+		return err
+	}
+	root := filepath.Dir(origin)
+	if filepath.Dir(source) != root || filepath.Base(origin) != "origin.git" || filepath.Base(source) != "source" || !strings.HasPrefix(filepath.Base(root), "Agent-Loop-Controller-lab.") {
+		return errors.New("fixture repository is not canonically contained in a disposable lab")
+	}
+	configured, err := runCommand(source, "git", "remote", "get-url", "origin")
+	if err != nil {
+		return err
+	}
+	configuredPath, err := filepath.EvalSymlinks(strings.TrimSpace(configured))
+	if err != nil {
+		return err
+	}
+	if configuredPath != origin {
+		return errors.New("fixture source origin does not match disposable bare origin")
+	}
+	bare, err := runCommand(origin, "git", "rev-parse", "--is-bare-repository")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(bare) != "true" {
+		return errors.New("fixture origin is not bare")
+	}
+	return nil
 }
 
 func fixturePush(ctx context.Context, store *sqlitestore.Store, run application.Run) error {

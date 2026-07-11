@@ -184,3 +184,10 @@ func contains(value, part string) bool {
 	}
 	return false
 }
+
+func TestLatestRepairBaseUsesNewestRollover(t *testing.T) {
+	timeline := []Transition{{From: domain.StateRepairing, To: domain.StateExecuting, BoundHead: "old"}, {From: domain.StateRepairing, To: domain.StateExecuting, BoundHead: "new"}}
+	if got := latestRepairBase(timeline); got != "new" {
+		t.Fatalf("repair base=%s", got)
+	}
+}

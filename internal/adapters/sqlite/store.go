@@ -304,6 +304,39 @@ func (s *Store) SetImplementationSession(ctx context.Context, id, session string
 func (s *Store) SetCandidateHead(ctx context.Context, id, head string) error {
 	return execOne(ctx, s.db, `UPDATE runs SET candidate_head=?,updated_at=? WHERE run_id=?`, head, nowText(), id)
 }
+func (s *Store) BeginRepair(ctx context.Context, id, oldHead string) error {
+	if strings.TrimSpace(oldHead) == "" {
+		return errors.New("repair base head must not be blank")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var current, candidate string
+	if err := tx.QueryRowContext(ctx, `SELECT current_state,candidate_head FROM runs WHERE run_id=?`, id).Scan(&current, &candidate); err != nil {
+		return err
+	}
+	if domain.State(current) != domain.StateRepairing || candidate != oldHead {
+		return errors.New("repair state or candidate compare failed")
+	}
+	var sequence int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM transitions WHERE run_id=?`, id).Scan(&sequence); err != nil {
+		return err
+	}
+	now := nowText()
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET current_state=?,candidate_head='',updated_at=? WHERE run_id=? AND current_state=? AND candidate_head=?`, domain.StateExecuting, now, id, domain.StateRepairing, oldHead)
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return errors.New("repair compare update lost")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO transitions VALUES(?,?,?,?,?,?,?,?)`, id, sequence, domain.StateRepairing, domain.StateExecuting, "begin normalized GitHub finding repair", "controller-normalized finding digests", oldHead, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 func (s *Store) SetLastError(ctx context.Context, id, message string) error {
 	return execOne(ctx, s.db, `UPDATE runs SET last_error=?,updated_at=? WHERE run_id=?`, message, nowText(), id)
 }

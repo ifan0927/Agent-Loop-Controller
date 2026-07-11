@@ -352,3 +352,38 @@ func TestOwnedResourceCannotBeClaimedByAnotherRun(t *testing.T) {
 		t.Fatal("second run must not claim an owned branch")
 	}
 }
+
+func TestBeginRepairAtomicallyRollsCandidateIntoTransition(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	input := application.CreateRunInput{Run: application.Run{ID: "run-1", IssueID: "IFAN-1", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "repo:test", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "ifan/one", ArtifactRoot: "/tmp/run"}}
+	if _, _, err := store.CreateRun(ctx, input); err != nil {
+		t.Fatal(err)
+	}
+	states := []domain.State{domain.StateAdmitting, domain.StateProvisioning, domain.StateExecuting, domain.StateVerifying, domain.StateFreshReview, domain.StateRepairing}
+	current := domain.StateReceived
+	for _, next := range states {
+		if err := store.Transition(ctx, "run-1", current, next, "test", "", "h1"); err != nil {
+			t.Fatal(err)
+		}
+		current = next
+	}
+	if err := store.SetCandidateHead(ctx, "run-1", "h1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginRepair(ctx, "run-1", "h1"); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := store.Inspect(ctx, "run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	latest := inspection.Timeline[len(inspection.Timeline)-1]
+	if inspection.Run.State != domain.StateExecuting || inspection.Run.CandidateHead != "" || latest.BoundHead != "h1" {
+		t.Fatalf("repair rollover=%+v", inspection)
+	}
+}

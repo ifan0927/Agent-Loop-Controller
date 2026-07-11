@@ -776,20 +776,29 @@ func (c *LocalController) verifyCandidate(ctx context.Context, run Run) error {
 		return err
 	}
 	if run.CandidateHead == "" {
+		repairBase := latestRepairBase(inspection.Timeline)
 		if strings.TrimSpace(status) == "" {
-			if head == run.BaseSHA {
+			if head == run.BaseSHA || head == repairBase {
 				return errors.New("completed implementation produced no candidate changes")
 			}
 			parent, subject, metaErr := c.git.CommitMetadata(ctx, run.WorktreePath, head)
 			if metaErr != nil {
 				return metaErr
 			}
-			if parent != run.BaseSHA || subject != candidateCommitSubject {
+			expectedParent := run.BaseSHA
+			if repairBase != "" {
+				expectedParent = repairBase
+			}
+			if parent != expectedParent || subject != candidateCommitSubject {
 				return errors.New("unpersisted HEAD is not a recoverable controller candidate")
 			}
 			run.CandidateHead = head
 		} else {
-			if head != run.BaseSHA {
+			expectedHead := run.BaseSHA
+			if repairBase != "" {
+				expectedHead = repairBase
+			}
+			if head != expectedHead {
 				return errors.New("Codex changed HEAD; candidate commits are controller-owned")
 			}
 			before := status
@@ -1071,10 +1080,20 @@ func (c *LocalController) Repair(ctx context.Context, runID, normalizedPrompt st
 	if count >= task.Policy.MaxRepairAttempts {
 		return run, errors.New("bounded repair attempts exhausted; manual intervention required")
 	}
-	if err := c.store.Transition(ctx, runID, domain.StateRepairing, domain.StateExecuting, "begin normalized GitHub finding repair", "controller-normalized finding digests", run.CandidateHead); err != nil {
+	if err := c.store.BeginRepair(ctx, runID, run.CandidateHead); err != nil {
 		return run, err
 	}
 	return c.Continue(ctx, runID, &Decision{ChoiceID: "controller-normalized-review-findings", Instructions: normalizedPrompt})
+}
+
+func latestRepairBase(timeline []Transition) string {
+	for index := len(timeline) - 1; index >= 0; index-- {
+		item := timeline[index]
+		if item.From == domain.StateRepairing && item.To == domain.StateExecuting {
+			return item.BoundHead
+		}
+	}
+	return ""
 }
 
 func validateRunModelPolicy(run Run) error {
