@@ -42,7 +42,34 @@ func localFixtureDeliver(args []string) error {
 		return err
 	}
 	defer store.Close()
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	leaseOwner := fmt.Sprintf("fixture-delivery-%d", time.Now().UTC().UnixNano())
+	acquired, err := store.AcquireLease(ctx, runID, leaseOwner, time.Now().UTC().Add(2*time.Minute))
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		return errors.New("run is actively leased by another delivery controller")
+	}
+	done := make(chan struct{})
+	defer func() { close(done); _ = store.ReleaseLease(context.Background(), runID, leaseOwner) }()
+	go func() {
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				ok, renewErr := store.RenewLease(context.Background(), runID, leaseOwner, time.Now().UTC().Add(2*time.Minute))
+				if renewErr != nil || !ok {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
 	for {
 		run, err := store.GetRun(ctx, runID)
 		if err != nil {
@@ -84,6 +111,24 @@ func localFixtureDeliver(args []string) error {
 			if err := fixtureReconcile(ctx, store, run); err != nil {
 				return err
 			}
+		case domain.StateRepairing:
+			inspection, err := store.Inspect(ctx, runID)
+			if err != nil {
+				return err
+			}
+			var findings []application.FindingRecord
+			for _, finding := range inspection.Findings {
+				if finding.HeadSHA == run.CandidateHead && !finding.Resolved && !finding.Outdated {
+					findings = append(findings, finding)
+				}
+			}
+			if len(findings) == 0 {
+				return errors.New("repairing state has no persisted actionable normalized findings")
+			}
+			controller := newLocalController(store, "codex", filepath.Dir(run.WorktreePath))
+			if _, err := controller.Repair(ctx, runID, application.BuildRepairPrompt(findings)); err != nil {
+				return err
+			}
 		case domain.StateAwaitingHumanApproval:
 			if *approvalPath == "" {
 				return errors.New("explicit --approval is required; controller cannot approve its own PR")
@@ -117,6 +162,10 @@ func localFixtureDeliver(args []string) error {
 				return err
 			}
 		case domain.StateMerging:
+			intent, _ := json.Marshal(map[string]any{"pr_number": 1, "head": run.CandidateHead, "base_sha": run.BaseSHA, "method": "squash"})
+			if _, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{RunID: runID, Kind: "merge", IdempotencyKey: run.CandidateHead, IntentJSON: string(intent), Attempt: 1}); err != nil {
+				return err
+			}
 			mergeSHA, err := fixtureReconcileOrMerge(repo, run)
 			if err != nil {
 				return err
@@ -124,6 +173,20 @@ func localFixtureDeliver(args []string) error {
 			merge := application.MergeRecord{RunID: runID, PRNumber: 1, PreMergeSHA: run.CandidateHead, BaseSHA: run.BaseSHA, Method: "squash", MergeSHA: mergeSHA, MergedAt: time.Now().UTC()}
 			if err := store.SaveMerge(ctx, merge); err != nil {
 				return err
+			}
+			inspection, err := store.Inspect(ctx, runID)
+			if err != nil {
+				return err
+			}
+			for _, side := range inspection.SideEffects {
+				if side.Kind == "merge" && side.IdempotencyKey == run.CandidateHead && side.Status != "observed" {
+					side.Status = "observed"
+					side.ResultJSON = fmt.Sprintf(`{"merge_sha":"%s"}`, mergeSHA)
+					side.ObservedAt = time.Now().UTC()
+					if err := store.FinishSideEffect(ctx, side); err != nil {
+						return err
+					}
+				}
 			}
 			if err := store.Transition(ctx, runID, run.State, domain.StateCleaning, "fixture squash merge observed", mergeSHA, run.CandidateHead); err != nil {
 				return err
@@ -234,12 +297,25 @@ func fixtureOpenPR(ctx context.Context, store *sqlitestore.Store, run applicatio
 		return err
 	}
 	digest := sha256.Sum256([]byte(body))
+	intent, _ := json.Marshal(map[string]string{"head_branch": run.WorkingBranch, "base_branch": run.BaseBranch, "head_sha": run.CandidateHead, "body_digest": hex.EncodeToString(digest[:])})
+	side, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{RunID: run.ID, Kind: "open_pr", IdempotencyKey: run.IdempotencyKey, IntentJSON: string(intent), Attempt: 1})
+	if err != nil {
+		return err
+	}
 	pr := domain.PullRequest{Number: 1, URL: "https://fixture.invalid/pr/1", NodeID: "fixture-pr-1", HeadBranch: run.WorkingBranch, BaseBranch: run.BaseBranch, HeadSHA: run.CandidateHead, BaseSHA: run.BaseSHA, BodyDigest: hex.EncodeToString(digest[:]), OwnershipKey: run.IdempotencyKey, State: "OPEN"}
 	if err := pr.ValidateOwnership(run.WorkingBranch, run.BaseBranch, run.CandidateHead, run.IdempotencyKey); err != nil {
 		return err
 	}
 	if err := store.SavePullRequest(ctx, run.ID, pr); err != nil {
 		return err
+	}
+	if side.Status != "observed" {
+		side.Status = "observed"
+		side.ResultJSON = fmt.Sprintf(`{"number":1,"node_id":"fixture-pr-1","head_sha":"%s"}`, run.CandidateHead)
+		side.ObservedAt = time.Now().UTC()
+		if err := store.FinishSideEffect(ctx, side); err != nil {
+			return err
+		}
 	}
 	return store.Transition(ctx, run.ID, domain.StateOpeningPR, domain.StatePROpen, "fake GitHub PR observed", pr.URL, run.CandidateHead)
 }
@@ -335,13 +411,24 @@ func fixtureReconcileOrMerge(repo fixtureRepository, run application.Run) (strin
 		if treeErr == nil {
 			candidateTree, candidateErr := runCommand(repo.SourcePath, "git", "show", "-s", "--format=%T", run.CandidateHead)
 			if candidateErr == nil && strings.TrimSpace(baseTree) == strings.TrimSpace(candidateTree) {
-				return fields[0], nil
+				parent, parentErr := runCommand(repo.SourcePath, "git", "show", "-s", "--format=%P", fields[0])
+				if parentErr == nil && strings.TrimSpace(parent) == run.BaseSHA {
+					return fields[0], nil
+				}
 			}
 		}
 	}
 	return fixtureSquashMerge(repo, run)
 }
 func fixtureSquashMerge(repo fixtureRepository, run application.Run) (string, error) {
+	remote, err := runCommand(repo.SourcePath, "git", "ls-remote", "origin", "refs/heads/"+run.BaseBranch)
+	if err != nil {
+		return "", err
+	}
+	fields := strings.Fields(remote)
+	if len(fields) != 2 || fields[0] != run.BaseSHA {
+		return "", errors.New("fixture base moved before squash merge")
+	}
 	if _, err := runCommand(repo.SourcePath, "git", "fetch", "origin", run.WorkingBranch); err != nil {
 		return "", err
 	}
