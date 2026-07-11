@@ -196,7 +196,13 @@ func (c *Client) ensureToken(ctx context.Context, force bool) error {
 		} `json:"repositories"`
 	}
 	path := fmt.Sprintf("/app/installations/%d/access_tokens", c.cfg.InstallationID)
-	if err := c.do(ctx, "mint_installation_token", "REST", "POST", c.cfg.APIBaseURL+path, bytes.NewReader([]byte("{}")), "Bearer "+jwt, &out, false); err != nil {
+	requestBody, err := json.Marshal(struct {
+		RepositoryIDs []int64 `json:"repository_ids"`
+	}{RepositoryIDs: []int64{c.cfg.RepositoryID}})
+	if err != nil {
+		return errors.New("encode installation token scope")
+	}
+	if err := c.do(ctx, "mint_installation_token", "REST", "POST", c.cfg.APIBaseURL+path, bytes.NewReader(requestBody), "Bearer "+jwt, &out, false); err != nil {
 		return err
 	}
 	if out.Token == "" || !out.ExpiresAt.After(c.clock.Now()) {
@@ -211,6 +217,9 @@ func (c *Client) ensureToken(ctx context.Context, force bool) error {
 		if out.Permissions[name] != "read" {
 			return fmt.Errorf("installation lacks required read-only permission %s", name)
 		}
+	}
+	if len(out.Repositories) != 1 {
+		return errors.New("installation token scope includes unexpected repositories")
 	}
 	found := false
 	for _, r := range out.Repositories {

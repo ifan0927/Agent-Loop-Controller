@@ -68,6 +68,13 @@ func replayAuthScenario(t *testing.T, name string) {
 	var mints, reads atomic.Int32
 	mux := http.NewServeMux()
 	mux.HandleFunc("/app/installations/2/access_tokens", func(w http.ResponseWriter, r *http.Request) {
+		var scope struct {
+			RepositoryIDs []int64 `json:"repository_ids"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&scope); err != nil || len(scope.RepositoryIDs) != 1 || scope.RepositoryIDs[0] != 99 {
+			http.Error(w, "invalid repository scope", http.StatusBadRequest)
+			return
+		}
 		n := mints.Add(1)
 		repoID := 99
 		if name == "wrong_repository" {
