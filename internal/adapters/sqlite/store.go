@@ -17,7 +17,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 type Store struct{ db *sql.DB }
 
@@ -92,6 +92,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV2
 		case 3:
 			statements = migrationV3
+		case 4:
+			statements = migrationV4
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -170,6 +172,12 @@ var migrationV3 = []string{
 	`DROP TABLE reviews_v2`,
 }
 
+var migrationV4 = []string{
+	`ALTER TABLE runs ADD COLUMN implementation_model TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE runs ADD COLUMN review_model TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE attempts ADD COLUMN requested_model TEXT NOT NULL DEFAULT ''`,
+}
+
 func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput) (application.Run, bool, error) {
 	run := input.Run
 	now := time.Now().UTC()
@@ -179,10 +187,10 @@ func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput)
 	}
 	defer tx.Rollback()
 	_, err = tx.ExecContext(ctx, `INSERT INTO runs(run_id,issue_id,idempotency_key,source_revision,raw_issue_json,raw_issue_hash,
-		normalized_task_json,task_hash,repository,repository_config_json,base_branch,working_branch,worktree_path,artifact_root,current_state,created_at,updated_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, run.ID, run.IssueID, run.IdempotencyKey, run.SourceRevision, run.RawIssueJSON,
+		normalized_task_json,task_hash,repository,repository_config_json,base_branch,working_branch,worktree_path,artifact_root,current_state,implementation_model,review_model,created_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, run.ID, run.IssueID, run.IdempotencyKey, run.SourceRevision, run.RawIssueJSON,
 		run.RawIssueHash, run.NormalizedTaskJSON, run.TaskHash, run.Repository, run.RepositoryConfigJSON, run.BaseBranch, run.WorkingBranch,
-		run.WorktreePath, run.ArtifactRoot, domain.StateReceived, formatTime(now), formatTime(now))
+		run.WorktreePath, run.ArtifactRoot, domain.StateReceived, run.ImplementationModel, run.ReviewModel, formatTime(now), formatTime(now))
 	if err != nil {
 		_ = tx.Rollback()
 		existing, getErr := s.getByIdempotency(ctx, run.IdempotencyKey)
@@ -215,7 +223,7 @@ func (s *Store) getByIdempotency(ctx context.Context, key string) (application.R
 
 const runSelect = `SELECT run_id,issue_id,idempotency_key,source_revision,raw_issue_json,raw_issue_hash,
 	normalized_task_json,task_hash,repository,repository_config_json,base_branch,working_branch,base_sha,worktree_path,artifact_root,
-	current_state,candidate_head,implementation_session_id,last_error,lease_owner,lease_expires_unix,created_at,updated_at FROM runs`
+	current_state,candidate_head,implementation_session_id,implementation_model,review_model,last_error,lease_owner,lease_expires_unix,created_at,updated_at FROM runs`
 
 type rowScanner interface{ Scan(...any) error }
 
@@ -225,7 +233,7 @@ func scanRun(row rowScanner) (application.Run, error) {
 	var leaseExpires int64
 	err := row.Scan(&run.ID, &run.IssueID, &run.IdempotencyKey, &run.SourceRevision, &run.RawIssueJSON, &run.RawIssueHash,
 		&run.NormalizedTaskJSON, &run.TaskHash, &run.Repository, &run.RepositoryConfigJSON, &run.BaseBranch, &run.WorkingBranch, &run.BaseSHA, &run.WorktreePath,
-		&run.ArtifactRoot, &state, &run.CandidateHead, &run.ImplementationSession, &run.LastError, &run.LeaseOwner, &leaseExpires, &created, &updated)
+		&run.ArtifactRoot, &state, &run.CandidateHead, &run.ImplementationSession, &run.ImplementationModel, &run.ReviewModel, &run.LastError, &run.LeaseOwner, &leaseExpires, &created, &updated)
 	if err != nil {
 		return run, err
 	}
@@ -320,7 +328,10 @@ func (s *Store) ReleaseLease(ctx context.Context, id, owner string) error {
 	return nil
 }
 
-func (s *Store) BeginAttempt(ctx context.Context, runID, kind, artifactDir string) (application.Attempt, error) {
+func (s *Store) BeginAttempt(ctx context.Context, runID, kind, requestedModel, artifactDir string) (application.Attempt, error) {
+	if strings.TrimSpace(requestedModel) == "" {
+		return application.Attempt{}, errors.New("attempt requested model must not be blank")
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return application.Attempt{}, err
@@ -331,7 +342,7 @@ func (s *Store) BeginAttempt(ctx context.Context, runID, kind, artifactDir strin
 		return application.Attempt{}, err
 	}
 	now := nowText()
-	result, err := tx.ExecContext(ctx, `INSERT INTO attempts(run_id,number,kind,status,started_at,artifact_dir) VALUES(?,?,?,'started',?,?)`, runID, number, kind, now, artifactDir)
+	result, err := tx.ExecContext(ctx, `INSERT INTO attempts(run_id,number,kind,status,requested_model,started_at,artifact_dir) VALUES(?,?,?,'started',?,?,?)`, runID, number, kind, requestedModel, now, artifactDir)
 	if err != nil {
 		return application.Attempt{}, err
 	}
@@ -339,7 +350,7 @@ func (s *Store) BeginAttempt(ctx context.Context, runID, kind, artifactDir strin
 	if err := tx.Commit(); err != nil {
 		return application.Attempt{}, err
 	}
-	return application.Attempt{ID: id, RunID: runID, Number: number, Kind: kind, Status: "started", StartedAt: parseTime(now), ArtifactDir: artifactDir}, nil
+	return application.Attempt{ID: id, RunID: runID, Number: number, Kind: kind, Status: "started", RequestedModel: requestedModel, StartedAt: parseTime(now), ArtifactDir: artifactDir}, nil
 }
 
 func (s *Store) FinishAttempt(ctx context.Context, attempt application.Attempt) error {
@@ -397,14 +408,14 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 		inspection.Timeline = append(inspection.Timeline, v)
 	}
 	rows.Close()
-	rows, err = s.db.QueryContext(ctx, `SELECT attempt_id,run_id,number,kind,status,codex_session_id,started_at,finished_at,exit_code,stdout_path,stderr_path,stdout_hash,stderr_hash,stdout_size,stderr_size,outcome_path,outcome_hash,artifact_dir,error_category FROM attempts WHERE run_id=? ORDER BY number`, id)
+	rows, err = s.db.QueryContext(ctx, `SELECT attempt_id,run_id,number,kind,status,codex_session_id,requested_model,started_at,finished_at,exit_code,stdout_path,stderr_path,stdout_hash,stderr_hash,stdout_size,stderr_size,outcome_path,outcome_hash,artifact_dir,error_category FROM attempts WHERE run_id=? ORDER BY number`, id)
 	if err != nil {
 		return inspection, err
 	}
 	for rows.Next() {
 		var v application.Attempt
 		var started, finished string
-		if err := rows.Scan(&v.ID, &v.RunID, &v.Number, &v.Kind, &v.Status, &v.SessionID, &started, &finished, &v.ExitCode, &v.StdoutPath, &v.StderrPath, &v.StdoutHash, &v.StderrHash, &v.StdoutSize, &v.StderrSize, &v.OutcomePath, &v.OutcomeHash, &v.ArtifactDir, &v.ErrorCategory); err != nil {
+		if err := rows.Scan(&v.ID, &v.RunID, &v.Number, &v.Kind, &v.Status, &v.SessionID, &v.RequestedModel, &started, &finished, &v.ExitCode, &v.StdoutPath, &v.StderrPath, &v.StdoutHash, &v.StderrHash, &v.StdoutSize, &v.StderrSize, &v.OutcomePath, &v.OutcomeHash, &v.ArtifactDir, &v.ErrorCategory); err != nil {
 			rows.Close()
 			return inspection, err
 		}

@@ -29,10 +29,10 @@ func (fixtureCodexProcess) Run(_ context.Context, spec processadapter.Spec) (pro
 		return processadapter.Result{Stdout: []byte("codex-cli fixture\n")}, nil
 	}
 	if len(spec.Args) == 2 && spec.Args[0] == "exec" && spec.Args[1] == "--help" {
-		return processadapter.Result{Stdout: []byte("--ignore-user-config --sandbox --cd --json --output-schema --output-last-message --ephemeral")}, nil
+		return processadapter.Result{Stdout: []byte("--model --ignore-user-config --sandbox --cd --json --output-schema --output-last-message --ephemeral")}, nil
 	}
 	if len(spec.Args) == 3 && spec.Args[0] == "exec" && spec.Args[1] == "resume" && spec.Args[2] == "--help" {
-		return processadapter.Result{Stdout: []byte("Usage: codex exec resume [OPTIONS] [SESSION_ID]\n--ignore-user-config --config --json --output-schema --output-last-message")}, nil
+		return processadapter.Result{Stdout: []byte("Usage: codex exec resume [OPTIONS] [SESSION_ID]\n--model --ignore-user-config --config --json --output-schema --output-last-message")}, nil
 	}
 	output := argumentValue(spec.Args, "--output-last-message")
 	if argumentValue(spec.Args, "--sandbox") == "workspace-write" {

@@ -132,7 +132,8 @@ func (c *LocalController) Start(ctx context.Context, input LocalStartInput) (Run
 		IdempotencyKey: input.IdempotencyKey, SourceRevision: input.Task.SourceRevision, RawIssueJSON: string(input.RawIssueJSON),
 		RawIssueHash: input.RawIssueHash, NormalizedTaskJSON: string(input.NormalizedJSON), TaskHash: input.TaskHash,
 		Repository: input.Task.Repository, RepositoryConfigJSON: string(repositoryJSON), BaseBranch: input.Task.BaseBranch,
-		WorkingBranch: input.Task.WorkingBranch, WorktreePath: filepath.Join(input.WorktreeRoot, input.Task.RunID), ArtifactRoot: artifactRoot}})
+		WorkingBranch: input.Task.WorkingBranch, WorktreePath: filepath.Join(input.WorktreeRoot, input.Task.RunID), ArtifactRoot: artifactRoot,
+		ImplementationModel: codex.ImplementationModel, ReviewModel: codex.ReviewModel}})
 	if err != nil {
 		return Run{}, err
 	}
@@ -547,6 +548,9 @@ func (c *LocalController) provision(ctx context.Context, run Run) error {
 }
 
 func (c *LocalController) execute(ctx context.Context, run Run, decision *Decision) error {
+	if run.ImplementationModel != codex.ImplementationModel {
+		return fmt.Errorf("run has missing or unsupported implementation model evidence: %q", run.ImplementationModel)
+	}
 	inspection, err := c.store.Inspect(ctx, run.ID)
 	if err != nil {
 		return err
@@ -570,6 +574,9 @@ func (c *LocalController) execute(ctx context.Context, run Run, decision *Decisi
 		attempt := inspection.Attempts[i]
 		if attempt.Kind != "implementation" && attempt.Kind != "resume" {
 			continue
+		}
+		if attempt.RequestedModel != run.ImplementationModel {
+			return errors.New("implementation session/model attempt evidence conflict")
 		}
 		if attempt.Status == "started" {
 			stdoutPath := filepath.Join(attempt.ArtifactDir, "implementation.stdout.jsonl")
@@ -632,7 +639,7 @@ func (c *LocalController) execute(ctx context.Context, run Run, decision *Decisi
 	if err != nil {
 		return err
 	}
-	attempt, err := c.store.BeginAttempt(ctx, run.ID, kind, directory)
+	attempt, err := c.store.BeginAttempt(ctx, run.ID, kind, run.ImplementationModel, directory)
 	if err != nil {
 		return err
 	}
@@ -659,7 +666,7 @@ func (c *LocalController) execute(ctx context.Context, run Run, decision *Decisi
 		if decision != nil {
 			instructions = fmt.Sprintf("Human decision: %s\n\n%s", decision.ChoiceID, decision.Instructions)
 		}
-		spec, specErr := c.commands.Resume(run.ImplementationSession, run.WorktreePath, directory, instructions)
+		spec, specErr := c.commands.Resume(run.ImplementationSession, run.ImplementationModel, run.WorktreePath, directory, instructions)
 		if specErr != nil {
 			return c.failAttempt(ctx, attempt, "resume_command", specErr)
 		}
@@ -863,6 +870,9 @@ func (c *LocalController) runVerification(ctx context.Context, run Run, phase st
 }
 
 func (c *LocalController) freshReview(ctx context.Context, run Run) error {
+	if run.ReviewModel != codex.ReviewModel {
+		return fmt.Errorf("run has missing or unsupported review model evidence: %q", run.ReviewModel)
+	}
 	if err := c.validateWorkspace(ctx, run, true); err != nil {
 		return err
 	}
@@ -875,7 +885,7 @@ func (c *LocalController) freshReview(ctx context.Context, run Run) error {
 		if err != nil {
 			return err
 		}
-		if err := validateReviewAttempt(inspection.Attempts, record); err != nil {
+		if err := validateReviewAttempt(inspection.Attempts, record, run.ReviewModel); err != nil {
 			return err
 		}
 		if outcome.Verdict != domain.ReviewFailed {
@@ -890,7 +900,7 @@ func (c *LocalController) freshReview(ctx context.Context, run Run) error {
 	if err != nil {
 		return err
 	}
-	attempt, err := c.store.BeginAttempt(ctx, run.ID, "review", directory)
+	attempt, err := c.store.BeginAttempt(ctx, run.ID, "review", run.ReviewModel, directory)
 	if err != nil {
 		return err
 	}
@@ -957,7 +967,7 @@ func (c *LocalController) authorizeReview(ctx context.Context, run Run, outcome 
 	reviewValidated := false
 	for _, record := range inspection.Reviews {
 		if record.ReviewedHead == run.CandidateHead && record.OutcomePath == evidence {
-			if err := validateReviewAttempt(inspection.Attempts, record); err != nil {
+			if err := validateReviewAttempt(inspection.Attempts, record, run.ReviewModel); err != nil {
 				return err
 			}
 			reviewValidated = true
@@ -996,7 +1006,7 @@ func (c *LocalController) validateApproval(ctx context.Context, run Run) error {
 	}
 	if review, ok := latestReviewForHead(inspection.Reviews, run.CandidateHead); ok {
 		if review.Verdict == string(domain.ReviewPass) {
-			if err := validateReviewAttempt(inspection.Attempts, review); err != nil {
+			if err := validateReviewAttempt(inspection.Attempts, review, run.ReviewModel); err != nil {
 				return err
 			}
 			outcome, err := readOutcome[domain.ReviewOutcome](review.OutcomePath, review.OutcomeHash)
@@ -1023,12 +1033,12 @@ func latestReviewForHead(records []ReviewRecord, head string) (ReviewRecord, boo
 	return latest, found
 }
 
-func validateReviewAttempt(attempts []Attempt, review ReviewRecord) error {
+func validateReviewAttempt(attempts []Attempt, review ReviewRecord, expectedModel string) error {
 	for _, attempt := range attempts {
 		if attempt.ID != review.AttemptID {
 			continue
 		}
-		if attempt.Kind != "review" || attempt.Status != "succeeded" || attempt.SessionID != review.SessionID || attempt.OutcomePath != review.OutcomePath {
+		if attempt.Kind != "review" || attempt.Status != "succeeded" || attempt.SessionID != review.SessionID || attempt.OutcomePath != review.OutcomePath || attempt.RequestedModel != expectedModel {
 			return errors.New("review attempt evidence does not match review record")
 		}
 		stdoutHash, stdoutSize, stdoutErr := fileDigest(attempt.StdoutPath)

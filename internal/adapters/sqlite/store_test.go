@@ -24,7 +24,7 @@ func TestMigrationAndRunIdempotency(t *testing.T) {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	input := application.CreateRunInput{Run: application.Run{ID: "run-1", IssueID: "ISSUE-1", IdempotencyKey: "key-1", SourceRevision: "v1",
-		RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "repo:test-project", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "ifan/test", ArtifactRoot: "/tmp/run-1"}}
+		RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "repo:test-project", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "ifan/test", ArtifactRoot: "/tmp/run-1", ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}}
 	if _, created, err := store.CreateRun(context.Background(), input); err != nil || !created {
 		t.Fatalf("create: created=%v err=%v", created, err)
 	}
@@ -92,11 +92,14 @@ func TestMigratesVersionOneDatabaseToVersionTwo(t *testing.T) {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	var count int
-	if err := store.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name IN ('lease_owner','lease_expires_unix')`).Scan(&count); err != nil {
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name IN ('lease_owner','lease_expires_unix','implementation_model','review_model')`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 2 {
-		t.Fatal("v2 run lease columns are missing")
+	if count != 4 {
+		t.Fatal("current run lease or model columns are missing")
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('attempts') WHERE name='requested_model'`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("attempt requested_model column missing: count=%d err=%v", count, err)
 	}
 }
 
@@ -184,10 +187,14 @@ func TestAttemptArtifactDirectoryCannotBeReused(t *testing.T) {
 	if _, _, err := store.CreateRun(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.BeginAttempt(context.Background(), "run-1", "implementation", "/tmp/run/attempt-1"); err != nil {
+	if _, err := store.BeginAttempt(context.Background(), "run-1", "implementation", "gpt-5.6-terra", "/tmp/run/attempt-1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.BeginAttempt(context.Background(), "run-1", "resume", "/tmp/run/attempt-1"); err == nil {
+	inspection, err := store.Inspect(context.Background(), "run-1")
+	if err != nil || len(inspection.Attempts) != 1 || inspection.Attempts[0].RequestedModel != "gpt-5.6-terra" {
+		t.Fatalf("requested model evidence not persisted: inspection=%+v err=%v", inspection, err)
+	}
+	if _, err := store.BeginAttempt(context.Background(), "run-1", "resume", "gpt-5.6-terra", "/tmp/run/attempt-1"); err == nil {
 		t.Fatal("artifact directory reuse must fail")
 	}
 }

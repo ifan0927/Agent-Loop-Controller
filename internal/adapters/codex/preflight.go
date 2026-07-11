@@ -13,6 +13,7 @@ import (
 )
 
 var requiredExecFlags = []string{
+	"--model",
 	"--ignore-user-config",
 	"--sandbox",
 	"--cd",
@@ -23,6 +24,7 @@ var requiredExecFlags = []string{
 }
 
 var requiredResumeFlags = []string{
+	"--model",
 	"--ignore-user-config",
 	"--config",
 	"--json",

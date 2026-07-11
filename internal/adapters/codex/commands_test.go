@@ -27,6 +27,9 @@ func TestImplementationUsesStdinAndSafeSandbox(t *testing.T) {
 	if !slices.Contains(spec.Args, "--ignore-user-config") {
 		t.Fatal("managed runs must not load global MCP, hook, or tool configuration")
 	}
+	if !containsPair(spec.Args, "--model", ImplementationModel) {
+		t.Fatal("implementation must request the exact controller-owned Terra model")
+	}
 	if len(spec.MustNotExist) != 1 {
 		t.Fatal("implementation output leaf must be absent before start")
 	}
@@ -54,6 +57,9 @@ func TestReviewIsFreshAndCoversBranchDelta(t *testing.T) {
 	if !slices.Contains(spec.Args, "--ignore-user-config") {
 		t.Fatal("fresh review must not load global MCP, hook, or tool configuration")
 	}
+	if !containsPair(spec.Args, "--model", ReviewModel) {
+		t.Fatal("review must request the exact controller-owned Sol model")
+	}
 	if len(spec.MustNotExist) != 1 {
 		t.Fatal("review output leaf must be absent before start")
 	}
@@ -66,7 +72,7 @@ func TestReviewIsFreshAndCoversBranchDelta(t *testing.T) {
 }
 
 func TestResumeRequiresExplicitSessionID(t *testing.T) {
-	spec, err := NewCommandBuilder("codex").Resume("session-123", "/tmp/worktree", "/tmp/run", "continue")
+	spec, err := NewCommandBuilder("codex").Resume("session-123", ImplementationModel, "/tmp/worktree", "/tmp/run", "continue")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,11 +85,22 @@ func TestResumeRequiresExplicitSessionID(t *testing.T) {
 	if !containsPair(spec.Args, "--config", `sandbox_mode="workspace-write"`) {
 		t.Fatal("resume must explicitly preserve the workspace-write sandbox")
 	}
+	if !containsPair(spec.Args, "--model", ImplementationModel) {
+		t.Fatal("resume must request the persisted Terra model")
+	}
+	for _, arg := range spec.Args {
+		if arg == "gpt-5.6" {
+			t.Fatal("model aliases must not be used")
+		}
+	}
 }
 
 func TestResumeRejectsBlankSessionID(t *testing.T) {
-	if _, err := NewCommandBuilder("codex").Resume(" ", "/tmp/worktree", "/tmp/run", "continue"); err == nil {
+	if _, err := NewCommandBuilder("codex").Resume(" ", ImplementationModel, "/tmp/worktree", "/tmp/run", "continue"); err == nil {
 		t.Fatal("blank session ID must be rejected")
+	}
+	if _, err := NewCommandBuilder("codex").Resume("session", "", "/tmp/worktree", "/tmp/run", "continue"); err == nil {
+		t.Fatal("missing persisted model must be rejected")
 	}
 }
 

@@ -8,6 +8,11 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
+const (
+	ImplementationModel = "gpt-5.6-terra"
+	ReviewModel         = "gpt-5.6-sol"
+)
+
 type CommandSpec struct {
 	Program       string   `json:"program"`
 	Args          []string `json:"args"`
@@ -36,6 +41,7 @@ func (b CommandBuilder) Implementation(task domain.CodingTask, workspace, artifa
 		Program: b.binary,
 		Args: []string{
 			"exec",
+			"--model", ImplementationModel,
 			"--ignore-user-config",
 			"--cd", workspace,
 			"--sandbox", "workspace-write",
@@ -54,14 +60,18 @@ func (b CommandBuilder) Implementation(task domain.CodingTask, workspace, artifa
 	}
 }
 
-func (b CommandBuilder) Resume(sessionID, workspace, artifacts, instructions string) (CommandSpec, error) {
+func (b CommandBuilder) Resume(sessionID, model, workspace, artifacts, instructions string) (CommandSpec, error) {
 	if strings.TrimSpace(sessionID) == "" {
 		return CommandSpec{}, fmt.Errorf("session ID must not be blank")
+	}
+	if model != ImplementationModel {
+		return CommandSpec{}, fmt.Errorf("persisted implementation model %q is not supported by controller policy", model)
 	}
 	return CommandSpec{
 		Program: b.binary,
 		Args: []string{
 			"exec", "resume",
+			"--model", model,
 			"--ignore-user-config",
 			"--config", `sandbox_mode="workspace-write"`,
 			"--json",
@@ -85,6 +95,7 @@ func (b CommandBuilder) FreshReview(task domain.CodingTask, workspace, artifacts
 		Program: b.binary,
 		Args: []string{
 			"exec",
+			"--model", ReviewModel,
 			"--ephemeral",
 			"--ignore-user-config",
 			"--sandbox", "read-only",

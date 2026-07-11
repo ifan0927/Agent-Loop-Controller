@@ -26,6 +26,8 @@ type Run struct {
 	State                 domain.State `json:"current_state"`
 	CandidateHead         string       `json:"candidate_head"`
 	ImplementationSession string       `json:"implementation_session_id"`
+	ImplementationModel   string       `json:"implementation_model"`
+	ReviewModel           string       `json:"review_model"`
 	LastError             string       `json:"last_durable_error"`
 	LeaseOwner            string       `json:"-"`
 	LeaseExpiresAt        time.Time    `json:"-"`
@@ -48,25 +50,26 @@ type Transition struct {
 }
 
 type Attempt struct {
-	ID            int64     `json:"attempt_id"`
-	RunID         string    `json:"run_id"`
-	Number        int       `json:"number"`
-	Kind          string    `json:"kind"`
-	Status        string    `json:"status"`
-	SessionID     string    `json:"codex_session_id"`
-	StartedAt     time.Time `json:"started_at"`
-	FinishedAt    time.Time `json:"finished_at,omitempty"`
-	ExitCode      int       `json:"exit_code"`
-	StdoutPath    string    `json:"stdout_path"`
-	StderrPath    string    `json:"stderr_path"`
-	StdoutHash    string    `json:"stdout_hash"`
-	StderrHash    string    `json:"stderr_hash"`
-	StdoutSize    int64     `json:"stdout_size"`
-	StderrSize    int64     `json:"stderr_size"`
-	OutcomePath   string    `json:"outcome_path"`
-	OutcomeHash   string    `json:"outcome_hash"`
-	ArtifactDir   string    `json:"artifact_directory"`
-	ErrorCategory string    `json:"error_category"`
+	ID             int64     `json:"attempt_id"`
+	RunID          string    `json:"run_id"`
+	Number         int       `json:"number"`
+	Kind           string    `json:"kind"`
+	Status         string    `json:"status"`
+	SessionID      string    `json:"codex_session_id"`
+	RequestedModel string    `json:"requested_model"`
+	StartedAt      time.Time `json:"started_at"`
+	FinishedAt     time.Time `json:"finished_at,omitempty"`
+	ExitCode       int       `json:"exit_code"`
+	StdoutPath     string    `json:"stdout_path"`
+	StderrPath     string    `json:"stderr_path"`
+	StdoutHash     string    `json:"stdout_hash"`
+	StderrHash     string    `json:"stderr_hash"`
+	StdoutSize     int64     `json:"stdout_size"`
+	StderrSize     int64     `json:"stderr_size"`
+	OutcomePath    string    `json:"outcome_path"`
+	OutcomeHash    string    `json:"outcome_hash"`
+	ArtifactDir    string    `json:"artifact_directory"`
+	ErrorCategory  string    `json:"error_category"`
 }
 
 type VerificationRecord struct {
@@ -130,7 +133,7 @@ type RunStore interface {
 	AcquireLease(context.Context, string, string, time.Time) (bool, error)
 	RenewLease(context.Context, string, string, time.Time) (bool, error)
 	ReleaseLease(context.Context, string, string) error
-	BeginAttempt(context.Context, string, string, string) (Attempt, error)
+	BeginAttempt(context.Context, string, string, string, string) (Attempt, error)
 	FinishAttempt(context.Context, Attempt) error
 	SaveVerification(context.Context, VerificationRecord) error
 	SaveReview(context.Context, ReviewRecord) error

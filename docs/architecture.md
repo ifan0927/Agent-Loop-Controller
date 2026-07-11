@@ -101,6 +101,13 @@ cannot bypass controller ownership of external side effects. Authentication and
 repository instructions remain available; required runtime behavior is supplied
 explicitly by the command contract.
 
+The model is controller-owned policy, not task input or Codex configuration.
+Implementation and every explicit resume request `gpt-5.6-terra`; a fresh,
+independent review requests `gpt-5.6-sol`. The implementation model and session
+ID are persisted together, and resume fails closed if either is missing or if
+attempt evidence conflicts. Review remains on Sol until representative
+evaluation demonstrates that Terra provides equivalent review quality.
+
 The Phase 1A spike runs repository verification once against the uncommitted
 implementation before the controller creates a candidate commit, then repeats
 the same verifier against the committed candidate. Only the second result is
@@ -200,6 +207,15 @@ transient `failed` verdict may use a new isolated review attempt, while a
 `findings` verdict remains a safe stop until a later repair produces a new HEAD.
 Authorization considers the latest exact-HEAD review without discarding earlier
 review history.
+
+SQLite schema version 4 persists the implementation and review models on each
+run and the requested model on every Codex attempt. Migration deliberately
+leaves these fields empty for pre-version-4 runs: that empty value is explicit
+legacy evidence, not permission to claim the current policy was historically
+used. Such runs fail closed before another Codex execution. Codex CLI 0.144.1
+does not provide a verified stable effective-model field in the JSONL contract,
+so the controller records the authoritative requested model and does not infer
+an effective model from unstable telemetry.
 
 The SQLite adapter uses `modernc.org/sqlite`. Its pure-Go implementation avoids a
 CGO compiler/runtime dependency and keeps local and race-test execution

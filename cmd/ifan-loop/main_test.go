@@ -32,13 +32,22 @@ func TestDecodeDecisionRejectsTrailingJSON(t *testing.T) {
 	}
 }
 
+func TestExternalJSONCannotOverrideModelPolicy(t *testing.T) {
+	if _, err := decodeTask(strings.NewReader(`{"model":"gpt-5.6"}`)); err == nil || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("task model override error=%v", err)
+	}
+	if _, err := decodeDecision(strings.NewReader(`{"choice_id":"a","instructions":"go","model":"gpt-5.6-sol"}`)); err == nil || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("decision model override error=%v", err)
+	}
+}
+
 func TestLocalStatusOutputsDurableInspection(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
 	store, err := sqlitestore.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	input := application.CreateRunInput{Run: application.Run{ID: "run-1", IssueID: "ISSUE-1", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw-hash", NormalizedTaskJSON: "{}", TaskHash: "task-hash", Repository: "repo:test-project", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "ifan/test", ArtifactRoot: "/tmp/run"}}
+	input := application.CreateRunInput{Run: application.Run{ID: "run-1", IssueID: "ISSUE-1", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw-hash", NormalizedTaskJSON: "{}", TaskHash: "task-hash", Repository: "repo:test-project", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "ifan/test", ArtifactRoot: "/tmp/run", ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}}
 	if _, _, err := store.CreateRun(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +69,7 @@ func TestLocalStatusOutputsDurableInspection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"current_state": "received"`, `"state_timeline"`, `"task_snapshot_hash": "task-hash"`, `"attempts"`, `"verifications"`, `"reviews"`, `"owned_resources"`, `"last_durable_error"`} {
+	for _, want := range []string{`"current_state": "received"`, `"implementation_model": "gpt-5.6-terra"`, `"review_model": "gpt-5.6-sol"`, `"state_timeline"`, `"task_snapshot_hash": "task-hash"`, `"attempts"`, `"verifications"`, `"reviews"`, `"owned_resources"`, `"last_durable_error"`} {
 		if !strings.Contains(string(output), want) {
 			t.Fatalf("status output missing %s: %s", want, output)
 		}

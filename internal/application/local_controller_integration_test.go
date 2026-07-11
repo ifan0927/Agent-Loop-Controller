@@ -111,9 +111,9 @@ func (p *durableFakeProcess) Run(_ context.Context, s processadapter.Spec) (proc
 	if slices.Equal(s.Args, []string{"--version"}) {
 		stdout = "codex-cli fake\n"
 	} else if slices.Equal(s.Args, []string{"exec", "--help"}) {
-		stdout = "--ignore-user-config\n--sandbox\n--cd\n--json\n--output-schema\n--output-last-message\n--ephemeral\n"
+		stdout = "--model\n--ignore-user-config\n--sandbox\n--cd\n--json\n--output-schema\n--output-last-message\n--ephemeral\n"
 	} else if slices.Equal(s.Args, []string{"exec", "resume", "--help"}) {
-		stdout = "Usage: codex exec resume [OPTIONS] [SESSION_ID]\n--ignore-user-config\n--config\n--json\n--output-schema\n--output-last-message\n"
+		stdout = "Usage: codex exec resume [OPTIONS] [SESSION_ID]\n--model\n--ignore-user-config\n--config\n--json\n--output-schema\n--output-last-message\n"
 	} else if len(s.Args) > 1 && s.Args[0] == "exec" {
 		if s.Args[1] == "resume" {
 			p.resumeCalls++
@@ -576,7 +576,7 @@ func TestRestartRecoversStartedAttemptSessionAndResumesExplicitly(t *testing.T) 
 	if err := os.Mkdir(directory, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.BeginAttempt(context.Background(), run.ID, "implementation", directory); err != nil {
+	if _, err := store.BeginAttempt(context.Background(), run.ID, "implementation", codex.ImplementationModel, directory); err != nil {
 		t.Fatal(err)
 	}
 	mustWrite(t, filepath.Join(directory, "implementation.stdout.jsonl"), "{\"type\":\"thread.started\",\"thread_id\":\"recovered-session\"}\n")
@@ -591,7 +591,13 @@ func TestRestartRecoversStartedAttemptSessionAndResumesExplicitly(t *testing.T) 
 	if process.resumeCalls != 1 || !slices.Contains(process.resumeArgs, "recovered-session") || slices.Contains(process.resumeArgs, "--last") {
 		t.Fatalf("resume args=%v", process.resumeArgs)
 	}
+	if argument(process.resumeArgs, "--model") != codex.ImplementationModel {
+		t.Fatalf("resume model=%q args=%v", argument(process.resumeArgs, "--model"), process.resumeArgs)
+	}
 	inspection, _ := store.Inspect(context.Background(), run.ID)
+	if inspection.Run.ImplementationModel != codex.ImplementationModel || inspection.Run.ReviewModel != codex.ReviewModel {
+		t.Fatalf("persisted model policy=%+v", inspection.Run)
+	}
 	found := false
 	for _, attempt := range inspection.Attempts {
 		if attempt.ErrorCategory == "controller_restart_session_recovered" && attempt.SessionID == "recovered-session" {

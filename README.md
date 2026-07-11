@@ -54,6 +54,11 @@ processes from operating one run concurrently, and artifact digests protect
 reused verification/review evidence. A successful trial stops at
 `approval_ready` without push or pull request creation.
 
+The durable controller owns model selection: implementation and explicit resume
+use `gpt-5.6-terra`, while fresh independent review uses `gpt-5.6-sol`. SQLite
+persists both run policy values and each attempt's requested model; legacy runs
+without this evidence are not resumed.
+
 ## Try the contract planner
 
 ```sh
