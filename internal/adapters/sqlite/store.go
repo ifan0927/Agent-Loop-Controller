@@ -407,12 +407,16 @@ func (s *Store) BeginSideEffect(ctx context.Context, record application.SideEffe
 		record.Status = "intent"
 		return record, true, nil
 	}
+	requested := record
 	row := s.db.QueryRowContext(ctx, `SELECT side_effect_id,run_id,kind,idempotency_key,intent_json,status,result_json,stdout_path,stderr_path,attempt,created_at,observed_at FROM side_effects WHERE run_id=? AND kind=? AND idempotency_key=?`, record.RunID, record.Kind, record.IdempotencyKey)
 	var created, observed string
 	if scanErr := row.Scan(&record.ID, &record.RunID, &record.Kind, &record.IdempotencyKey, &record.IntentJSON, &record.Status, &record.ResultJSON, &record.StdoutPath, &record.StderrPath, &record.Attempt, &created, &observed); scanErr != nil {
 		return record, false, err
 	}
 	record.CreatedAt, record.ObservedAt = parseTime(created), parseTime(observed)
+	if record.RunID != requested.RunID || record.Kind != requested.Kind || record.IdempotencyKey != requested.IdempotencyKey || record.IntentJSON != requested.IntentJSON || record.Attempt != requested.Attempt {
+		return record, false, errors.New("conflicting immutable side-effect intent")
+	}
 	return record, false, nil
 }
 
@@ -424,8 +428,22 @@ func (s *Store) FinishSideEffect(ctx context.Context, record application.SideEff
 }
 
 func (s *Store) SavePullRequest(ctx context.Context, runID string, pr domain.PullRequest) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO pull_requests(run_id,number,url,node_id,head_branch,base_branch,head_sha,base_sha,body_digest,ownership_key,state,merged,merge_sha,merged_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET url=excluded.url,state=excluded.state,merged=excluded.merged,merge_sha=excluded.merge_sha,merged_at=excluded.merged_at WHERE pull_requests.number=excluded.number AND pull_requests.node_id=excluded.node_id AND pull_requests.ownership_key=excluded.ownership_key`, runID, pr.Number, pr.URL, pr.NodeID, pr.HeadBranch, pr.BaseBranch, pr.HeadSHA, pr.BaseSHA, pr.BodyDigest, pr.OwnershipKey, pr.State, pr.Merged, pr.MergeSHA, formatTime(pr.MergedAt))
-	return err
+	_, err := s.db.ExecContext(ctx, `INSERT INTO pull_requests(run_id,number,url,node_id,head_branch,base_branch,head_sha,base_sha,body_digest,ownership_key,state,merged,merge_sha,merged_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, runID, pr.Number, pr.URL, pr.NodeID, pr.HeadBranch, pr.BaseBranch, pr.HeadSHA, pr.BaseSHA, pr.BodyDigest, pr.OwnershipKey, pr.State, pr.Merged, pr.MergeSHA, formatTime(pr.MergedAt))
+	if err == nil {
+		return nil
+	}
+	var existing domain.PullRequest
+	var merged int
+	var mergedAt string
+	if scanErr := s.db.QueryRowContext(ctx, `SELECT number,url,node_id,head_branch,base_branch,head_sha,base_sha,body_digest,ownership_key,state,merged,merge_sha,merged_at FROM pull_requests WHERE run_id=?`, runID).Scan(&existing.Number, &existing.URL, &existing.NodeID, &existing.HeadBranch, &existing.BaseBranch, &existing.HeadSHA, &existing.BaseSHA, &existing.BodyDigest, &existing.OwnershipKey, &existing.State, &merged, &existing.MergeSHA, &mergedAt); scanErr != nil {
+		return err
+	}
+	existing.Merged = merged != 0
+	existing.MergedAt = parseTime(mergedAt)
+	if existing.Number != pr.Number || existing.NodeID != pr.NodeID || existing.HeadBranch != pr.HeadBranch || existing.BaseBranch != pr.BaseBranch || existing.HeadSHA != pr.HeadSHA || existing.BaseSHA != pr.BaseSHA || existing.BodyDigest != pr.BodyDigest || existing.OwnershipKey != pr.OwnershipKey {
+		return errors.New("conflicting immutable pull request evidence")
+	}
+	return execOne(ctx, s.db, `UPDATE pull_requests SET url=?,state=?,merged=?,merge_sha=?,merged_at=? WHERE run_id=?`, pr.URL, pr.State, pr.Merged, pr.MergeSHA, formatTime(pr.MergedAt), runID)
 }
 
 func (s *Store) SavePollObservation(ctx context.Context, record application.PollObservation) error {

@@ -203,6 +203,37 @@ func TestApprovalAndMergeEvidenceAreImmutable(t *testing.T) {
 	}
 }
 
+func TestSideEffectAndPullRequestConflictsFailClosed(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	input := application.CreateRunInput{Run: application.Run{ID: "run-1", IssueID: "IFAN-1", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "repo:test", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "ifan/one", ArtifactRoot: "/tmp/run"}}
+	if _, _, err := store.CreateRun(ctx, input); err != nil {
+		t.Fatal(err)
+	}
+	intent := application.SideEffectRecord{RunID: "run-1", Kind: "push", IdempotencyKey: "h1", IntentJSON: `{"head":"h1"}`, Attempt: 1}
+	if _, _, err := store.BeginSideEffect(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	changed := intent
+	changed.IntentJSON = `{"head":"other"}`
+	if _, _, err := store.BeginSideEffect(ctx, changed); err == nil {
+		t.Fatal("conflicting side-effect intent must fail")
+	}
+	pr := domain.PullRequest{Number: 1, URL: "https://fixture/1", NodeID: "n1", HeadBranch: "ifan/one", BaseBranch: "main", HeadSHA: "h1", BaseSHA: "b1", BodyDigest: "d1", OwnershipKey: "key", State: "OPEN"}
+	if err := store.SavePullRequest(ctx, "run-1", pr); err != nil {
+		t.Fatal(err)
+	}
+	changedPR := pr
+	changedPR.HeadSHA = "other"
+	if err := store.SavePullRequest(ctx, "run-1", changedPR); err == nil {
+		t.Fatal("conflicting PR evidence must fail")
+	}
+}
+
 func TestForeignKeysRemainEnabledAfterConnectionRecreation(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {

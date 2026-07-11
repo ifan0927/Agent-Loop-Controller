@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 )
@@ -20,6 +21,12 @@ func CleanupOwned(ctx context.Context, store DeliveryStore, port CleanupPort, ru
 	for _, resource := range resources {
 		if resource.RunID != run.ID || resource.Status == "deleted" {
 			continue
+		}
+		if resource.Status != "owned" {
+			return fmt.Errorf("cleanup resource %s is not durably owned", resource.Name)
+		}
+		if err := validateCleanupEvidence(run, resource); err != nil {
+			return err
 		}
 		result := CleanupRecord{RunID: run.ID, Kind: resource.Kind, Name: resource.Name, Status: "intent"}
 		if err := store.UpsertCleanup(ctx, result); err != nil {
@@ -60,4 +67,29 @@ func CleanupOwned(ctx context.Context, store DeliveryStore, port CleanupPort, ru
 		}
 	}
 	return errors.Join(partial...)
+}
+
+func validateCleanupEvidence(run Run, resource OwnedResource) error {
+	var evidence struct {
+		Path       string `json:"path"`
+		Branch     string `json:"branch"`
+		BaseBranch string `json:"base_branch"`
+		BaseSHA    string `json:"base_sha"`
+	}
+	if err := json.Unmarshal([]byte(resource.CreationEvidence), &evidence); err != nil {
+		return fmt.Errorf("decode cleanup ownership evidence: %w", err)
+	}
+	switch resource.Kind {
+	case "worktree":
+		if resource.Name != run.WorktreePath || evidence.Path != run.WorktreePath || evidence.Branch != run.WorkingBranch || evidence.BaseBranch != run.BaseBranch || evidence.BaseSHA != run.BaseSHA {
+			return errors.New("worktree cleanup ownership evidence mismatch")
+		}
+	case "local_branch", "remote_branch":
+		if resource.Name != run.WorkingBranch || evidence.Branch != run.WorkingBranch || evidence.BaseBranch != run.BaseBranch || evidence.BaseSHA != run.BaseSHA {
+			return errors.New("branch cleanup ownership evidence mismatch")
+		}
+	default:
+		return fmt.Errorf("unsupported cleanup resource kind %s", resource.Kind)
+	}
+	return nil
 }

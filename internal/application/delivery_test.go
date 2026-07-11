@@ -140,9 +140,10 @@ func (f *fakeCleanup) DeleteRemoteBranch(_ context.Context, _, name, _ string) e
 func TestCleanupOnlyOwnedResourcesPersistsPartialFailure(t *testing.T) {
 	store := &deliveryMemoryStore{}
 	port := &fakeCleanup{failRemote: true}
-	run := Run{ID: "r1", Repository: "repo", BaseBranch: "main", WorkingBranch: "ifan/one", CandidateHead: "h1"}
+	run := Run{ID: "r1", Repository: "repo", BaseBranch: "main", BaseSHA: "b1", WorkingBranch: "ifan/one", CandidateHead: "h1", WorktreePath: "/tmp/w"}
 	merge := MergeRecord{RunID: "r1", PreMergeSHA: "h1", Method: "squash", MergeSHA: "m1"}
-	resources := []OwnedResource{{RunID: "r1", Kind: "worktree", Name: "/tmp/w", Status: "owned"}, {RunID: "r1", Kind: "remote_branch", Name: "ifan/one", Status: "owned"}, {RunID: "other", Kind: "local_branch", Name: "user", Status: "owned"}}
+	evidence := `{"path":"/tmp/w","branch":"ifan/one","base_branch":"main","base_sha":"b1"}`
+	resources := []OwnedResource{{RunID: "r1", Kind: "worktree", Name: "/tmp/w", Status: "owned", CreationEvidence: evidence}, {RunID: "r1", Kind: "remote_branch", Name: "ifan/one", Status: "owned", CreationEvidence: evidence}, {RunID: "other", Kind: "local_branch", Name: "user", Status: "owned", CreationEvidence: evidence}}
 	if err := CleanupOwned(context.Background(), store, port, run, merge, resources); err == nil {
 		t.Fatal("expected partial cleanup error")
 	}
@@ -151,6 +152,27 @@ func TestCleanupOnlyOwnedResourcesPersistsPartialFailure(t *testing.T) {
 	}
 	if store.cleanup[len(store.cleanup)-1].Status != "failed" {
 		t.Fatal("failed resource was not retained for restart")
+	}
+}
+
+func TestCleanupRejectsReservedOrForgedResourcesWithoutCallingPort(t *testing.T) {
+	store := &deliveryMemoryStore{}
+	port := &fakeCleanup{}
+	run := Run{ID: "r1", Repository: "repo", BaseBranch: "main", BaseSHA: "b1", WorkingBranch: "ifan/one", CandidateHead: "h1", WorktreePath: "/tmp/owned"}
+	merge := MergeRecord{RunID: "r1", PreMergeSHA: "h1", Method: "squash", MergeSHA: "m1"}
+	reserved := []OwnedResource{{RunID: "r1", Kind: "worktree", Name: "/tmp/owned", Status: "reserved", CreationEvidence: `{"path":"/tmp/owned","branch":"ifan/one","base_branch":"main","base_sha":"b1"}`}}
+	if err := CleanupOwned(context.Background(), store, port, run, merge, reserved); err == nil {
+		t.Fatal("reserved resource must be rejected")
+	}
+	if len(port.calls) != 0 {
+		t.Fatal("cleanup port called for reserved resource")
+	}
+	forged := []OwnedResource{{RunID: "r1", Kind: "worktree", Name: "/tmp/other", Status: "owned", CreationEvidence: `{"path":"/tmp/other","branch":"ifan/one","base_branch":"main","base_sha":"b1"}`}}
+	if err := CleanupOwned(context.Background(), store, port, run, merge, forged); err == nil {
+		t.Fatal("forged path must be rejected")
+	}
+	if len(port.calls) != 0 {
+		t.Fatal("cleanup port called for forged resource")
 	}
 }
 
