@@ -223,6 +223,58 @@ portable. The trade-off is a larger indirect dependency graph and binary than a
 CGO-backed SQLite driver. The controller still has only one direct SQLite
 dependency and does not shell out to the `sqlite3` CLI.
 
-External events will eventually be at-least-once and deduplicated by request or
-event ID. A later reconciler will repair missed or reordered Linear and GitHub
-events; Phase 1B deliberately stops at local `approval_ready`.
+## Post-approval delivery
+
+Schema version 5 extends the durable trial beyond `approval_ready` with explicit
+`pushing_branch`, `branch_pushed`, `opening_pr`, `pr_open`,
+`reconciling_reviews`, `repairing`, `awaiting_human_approval`, `merging`,
+`cleaning`, and terminal states. No generic publishing state hides multiple
+external operations.
+
+Every external operation follows an intent/reconcile/observe pattern. The
+controller commits an idempotency key and immutable intent before invoking Git
+or GitHub, compares actual external state, and then saves the observed result.
+A restart never treats an interrupted process as evidence of success or failure.
+
+Push uses the persisted branch in an explicit
+`refs/heads/<branch>:refs/heads/<branch>` refspec and never force-pushes. The
+controller revalidates the owned worktree, origin, clean status, candidate HEAD,
+exact-HEAD verification, and latest passing fresh review. A matching remote SHA
+is idempotent; a different SHA fails closed. Repairs create a new controller
+commit and use an ordinary fast-forward update.
+
+One run owns at most one pull request. Adoption requires durable ownership
+metadata plus matching head, base, candidate SHA, PR identity, and body digest.
+A same-named branch or matching head/base alone is insufficient. PR bodies carry
+summary, rationale, validation, fresh-review, out-of-scope, and Linear magic-word
+evidence.
+
+Checks and review threads use bounded polling attempts, intervals, and an overall
+deadline. Observations are pending, pass, actionable failure, infrastructure
+failure, or timeout. Unknown events remain telemetry. CodeRabbit is only the
+second automated reviewer and cannot replace the ephemeral Sol review.
+
+Findings are normalized to source/thread IDs, location, classification, body
+digest, and resolved/outdated state. Repair resumes only the persisted Terra
+session with controller-normalized stdin. Every new HEAD invalidates all older
+verification, review, push, check, CodeRabbit, and human-approval authorization.
+
+Only verifiable I-Fan approval for the exact PR HEAD, passing checks, reconciled
+CodeRabbit state, and latest passing internal review authorizes merge. The
+controller never approves its own PR. Merge is squash-only and records the
+pre-merge head, base SHA, result SHA, and timestamp after re-reading GitHub.
+
+Cleanup is a separate restart-safe state. Each owned resource has its own intent
+and result. Base branches, user-created resources, changed refs, dirty worktrees,
+and resources owned elsewhere are rejected. Partial failures preserve evidence
+and retry only unfinished resources. Linear completion is observed but not
+forced; production Linear writes remain deferred.
+
+## Fixture-first dogfooding
+
+Destructive integration is restricted to disposable repositories, local bare
+origins, and fake GitHub services. The normal SQLite state and public CLI are
+used across a simulated restart, and artifacts remain inspectable. This
+repository's production remote is never a PR, merge, or cleanup fixture. Real
+GitHub and CodeRabbit smoke is opt-in and requires an explicitly authorized test
+repository and valid credentials.

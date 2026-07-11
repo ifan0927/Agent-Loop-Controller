@@ -103,6 +103,68 @@ func TestMigratesVersionOneDatabaseToVersionTwo(t *testing.T) {
 	}
 }
 
+func TestMigratesVersionFourDatabaseToVersionFive(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "controller.db")
+	db, err := sql.Open("sqlite", sqliteDSN(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	for version, migration := range [][]string{migrationV1, migrationV2, migrationV3, migrationV4} {
+		for _, statement := range migration {
+			if _, err := db.Exec(statement); err != nil {
+				t.Fatalf("v%d: %v", version+1, err)
+			}
+		}
+		if _, err := db.Exec(`INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)`, version+1, fmt.Sprintf("v%d", version+1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	version, err := store.SchemaVersion(context.Background())
+	if err != nil || version != 5 {
+		t.Fatalf("version=%d err=%v", version, err)
+	}
+	var count int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('side_effects','pull_requests','poll_observations','review_findings','human_approvals','merge_results','cleanup_results')`).Scan(&count); err != nil || count != 7 {
+		t.Fatalf("delivery tables=%d err=%v", count, err)
+	}
+}
+
+func TestSideEffectIntentSurvivesRestartWithoutDuplicate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "controller.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := application.CreateRunInput{Run: application.Run{ID: "run-1", IssueID: "IFAN-1", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "repo:test", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "ifan/one", ArtifactRoot: "/tmp/run", ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}}
+	if _, _, err := store.CreateRun(context.Background(), input); err != nil {
+		t.Fatal(err)
+	}
+	intent := application.SideEffectRecord{RunID: "run-1", Kind: "push", IdempotencyKey: "h1", IntentJSON: `{"head":"h1"}`, Attempt: 1}
+	first, created, err := store.BeginSideEffect(context.Background(), intent)
+	if err != nil || !created {
+		t.Fatalf("created=%v err=%v", created, err)
+	}
+	store.Close()
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	second, created, err := store.BeginSideEffect(context.Background(), intent)
+	if err != nil || created || second.ID != first.ID || second.Status != "intent" {
+		t.Fatalf("first=%+v second=%+v created=%v err=%v", first, second, created, err)
+	}
+}
+
 func TestForeignKeysRemainEnabledAfterConnectionRecreation(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {

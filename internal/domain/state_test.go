@@ -24,7 +24,7 @@ func TestFreshReviewCanReachApprovalReadyButNotPROpen(t *testing.T) {
 }
 
 func TestCodeRabbitChangeReturnsToRepair(t *testing.T) {
-	if !CanTransition(StateCodeRabbitReview, StateRepairing) {
+	if !CanTransition(StateReconcilingReviews, StateRepairing) {
 		t.Fatal("CodeRabbit findings must return the run to repair")
 	}
 	if CanTransition(StateRepairing, StateAwaitingHumanApproval) {

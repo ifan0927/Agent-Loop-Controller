@@ -17,7 +17,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 4
+const schemaVersion = 5
 
 type Store struct{ db *sql.DB }
 
@@ -94,6 +94,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV3
 		case 4:
 			statements = migrationV4
+		case 5:
+			statements = migrationV5
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -176,6 +178,16 @@ var migrationV4 = []string{
 	`ALTER TABLE runs ADD COLUMN implementation_model TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE runs ADD COLUMN review_model TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE attempts ADD COLUMN requested_model TEXT NOT NULL DEFAULT ''`,
+}
+
+var migrationV5 = []string{
+	`CREATE TABLE side_effects (side_effect_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), kind TEXT NOT NULL, idempotency_key TEXT NOT NULL, intent_json TEXT NOT NULL, status TEXT NOT NULL, result_json TEXT NOT NULL DEFAULT '', stdout_path TEXT NOT NULL DEFAULT '', stderr_path TEXT NOT NULL DEFAULT '', attempt INTEGER NOT NULL, created_at TEXT NOT NULL, observed_at TEXT NOT NULL DEFAULT '', UNIQUE(run_id,kind,idempotency_key))`,
+	`CREATE TABLE pull_requests (run_id TEXT PRIMARY KEY REFERENCES runs(run_id), number INTEGER NOT NULL, url TEXT NOT NULL, node_id TEXT NOT NULL, head_branch TEXT NOT NULL, base_branch TEXT NOT NULL, head_sha TEXT NOT NULL, base_sha TEXT NOT NULL, body_digest TEXT NOT NULL, ownership_key TEXT NOT NULL, state TEXT NOT NULL, merged INTEGER NOT NULL DEFAULT 0, merge_sha TEXT NOT NULL DEFAULT '', merged_at TEXT NOT NULL DEFAULT '')`,
+	`CREATE TABLE poll_observations (observation_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), pr_number INTEGER NOT NULL, attempt INTEGER NOT NULL, head_sha TEXT NOT NULL, status TEXT NOT NULL, snapshot_json TEXT NOT NULL, observed_at TEXT NOT NULL)`,
+	`CREATE TABLE review_findings (finding_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), source_id TEXT NOT NULL, thread_id TEXT NOT NULL DEFAULT '', source TEXT NOT NULL, file TEXT NOT NULL DEFAULT '', line INTEGER NOT NULL DEFAULT 0, severity TEXT NOT NULL, body_digest TEXT NOT NULL, resolved INTEGER NOT NULL, outdated INTEGER NOT NULL, head_sha TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE(run_id,source,source_id,head_sha))`,
+	`CREATE TABLE human_approvals (run_id TEXT PRIMARY KEY REFERENCES runs(run_id), pr_number INTEGER NOT NULL, approver TEXT NOT NULL, source TEXT NOT NULL, approved_sha TEXT NOT NULL, ci_status TEXT NOT NULL, coderabbit_status TEXT NOT NULL, internal_review_sha TEXT NOT NULL, approved_at TEXT NOT NULL)`,
+	`CREATE TABLE merge_results (run_id TEXT PRIMARY KEY REFERENCES runs(run_id), pr_number INTEGER NOT NULL, pre_merge_head_sha TEXT NOT NULL, base_sha TEXT NOT NULL, merge_method TEXT NOT NULL CHECK(merge_method='squash'), merge_sha TEXT NOT NULL, merged_at TEXT NOT NULL)`,
+	`CREATE TABLE cleanup_results (cleanup_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), resource_kind TEXT NOT NULL, resource_name TEXT NOT NULL, status TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, UNIQUE(run_id,resource_kind,resource_name))`,
 }
 
 func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput) (application.Run, bool, error) {
@@ -385,6 +397,65 @@ func (s *Store) AddOwnedResource(ctx context.Context, record application.OwnedRe
 	return updateErr
 }
 
+func (s *Store) BeginSideEffect(ctx context.Context, record application.SideEffectRecord) (application.SideEffectRecord, bool, error) {
+	if strings.TrimSpace(record.IdempotencyKey) == "" || strings.TrimSpace(record.IntentJSON) == "" {
+		return record, false, errors.New("side-effect intent and idempotency key are required")
+	}
+	result, err := s.db.ExecContext(ctx, `INSERT INTO side_effects(run_id,kind,idempotency_key,intent_json,status,attempt,created_at) VALUES(?,?,?,?,?,?,?)`, record.RunID, record.Kind, record.IdempotencyKey, record.IntentJSON, "intent", record.Attempt, nowText())
+	if err == nil {
+		record.ID, _ = result.LastInsertId()
+		record.Status = "intent"
+		return record, true, nil
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT side_effect_id,run_id,kind,idempotency_key,intent_json,status,result_json,stdout_path,stderr_path,attempt,created_at,observed_at FROM side_effects WHERE run_id=? AND kind=? AND idempotency_key=?`, record.RunID, record.Kind, record.IdempotencyKey)
+	var created, observed string
+	if scanErr := row.Scan(&record.ID, &record.RunID, &record.Kind, &record.IdempotencyKey, &record.IntentJSON, &record.Status, &record.ResultJSON, &record.StdoutPath, &record.StderrPath, &record.Attempt, &created, &observed); scanErr != nil {
+		return record, false, err
+	}
+	record.CreatedAt, record.ObservedAt = parseTime(created), parseTime(observed)
+	return record, false, nil
+}
+
+func (s *Store) FinishSideEffect(ctx context.Context, record application.SideEffectRecord) error {
+	if record.Status != "observed" && record.Status != "failed" {
+		return errors.New("side-effect result status must be observed or failed")
+	}
+	return execOne(ctx, s.db, `UPDATE side_effects SET status=?,result_json=?,stdout_path=?,stderr_path=?,observed_at=? WHERE side_effect_id=? AND status IN ('intent','failed')`, record.Status, record.ResultJSON, record.StdoutPath, record.StderrPath, formatTime(record.ObservedAt), record.ID)
+}
+
+func (s *Store) SavePullRequest(ctx context.Context, runID string, pr domain.PullRequest) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO pull_requests(run_id,number,url,node_id,head_branch,base_branch,head_sha,base_sha,body_digest,ownership_key,state,merged,merge_sha,merged_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET url=excluded.url,state=excluded.state,merged=excluded.merged,merge_sha=excluded.merge_sha,merged_at=excluded.merged_at WHERE pull_requests.number=excluded.number AND pull_requests.node_id=excluded.node_id AND pull_requests.ownership_key=excluded.ownership_key`, runID, pr.Number, pr.URL, pr.NodeID, pr.HeadBranch, pr.BaseBranch, pr.HeadSHA, pr.BaseSHA, pr.BodyDigest, pr.OwnershipKey, pr.State, pr.Merged, pr.MergeSHA, formatTime(pr.MergedAt))
+	return err
+}
+
+func (s *Store) SavePollObservation(ctx context.Context, record application.PollObservation) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO poll_observations(run_id,pr_number,attempt,head_sha,status,snapshot_json,observed_at) VALUES(?,?,?,?,?,?,?)`, record.RunID, record.PRNumber, record.Attempt, record.HeadSHA, record.Status, record.SnapshotJSON, formatTime(record.ObservedAt))
+	return err
+}
+
+func (s *Store) SaveFinding(ctx context.Context, record application.FindingRecord) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO review_findings(run_id,source_id,thread_id,source,file,line,severity,body_digest,resolved,outdated,head_sha,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,source,source_id,head_sha) DO UPDATE SET thread_id=excluded.thread_id,file=excluded.file,line=excluded.line,severity=excluded.severity,body_digest=excluded.body_digest,resolved=excluded.resolved,outdated=excluded.outdated,observed_at=excluded.observed_at`, record.RunID, record.SourceID, record.ThreadID, record.Source, record.File, record.Line, record.Severity, record.BodyDigest, record.Resolved, record.Outdated, record.HeadSHA, formatTime(record.ObservedAt))
+	return err
+}
+
+func (s *Store) SaveHumanApproval(ctx context.Context, runID string, approval domain.HumanApproval) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO human_approvals(run_id,pr_number,approver,source,approved_sha,ci_status,coderabbit_status,internal_review_sha,approved_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET pr_number=excluded.pr_number,approver=excluded.approver,source=excluded.source,approved_sha=excluded.approved_sha,ci_status=excluded.ci_status,coderabbit_status=excluded.coderabbit_status,internal_review_sha=excluded.internal_review_sha,approved_at=excluded.approved_at`, runID, approval.PRNumber, approval.Approver, approval.Source, approval.ApprovedSHA, approval.CIStatus, approval.CodeRabbit, approval.ReviewSHA, formatTime(approval.ApprovedAt))
+	return err
+}
+
+func (s *Store) SaveMerge(ctx context.Context, record application.MergeRecord) error {
+	if record.Method != "squash" {
+		return errors.New("only squash merge evidence is accepted")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO merge_results(run_id,pr_number,pre_merge_head_sha,base_sha,merge_method,merge_sha,merged_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(run_id) DO NOTHING`, record.RunID, record.PRNumber, record.PreMergeSHA, record.BaseSHA, record.Method, record.MergeSHA, formatTime(record.MergedAt))
+	return err
+}
+
+func (s *Store) UpsertCleanup(ctx context.Context, record application.CleanupRecord) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO cleanup_results(run_id,resource_kind,resource_name,status,last_error,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(run_id,resource_kind,resource_name) DO UPDATE SET status=excluded.status,last_error=excluded.last_error,updated_at=excluded.updated_at`, record.RunID, record.Kind, record.Name, record.Status, record.LastError, nowText())
+	return err
+}
+
 func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspection, error) {
 	run, err := s.GetRun(ctx, id)
 	if err != nil {
@@ -467,6 +538,96 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 		}
 		v.CreatedAt = parseTime(created)
 		inspection.Resources = append(inspection.Resources, v)
+	}
+	rows.Close()
+	rows, err = s.db.QueryContext(ctx, `SELECT side_effect_id,run_id,kind,idempotency_key,intent_json,status,result_json,stdout_path,stderr_path,attempt,created_at,observed_at FROM side_effects WHERE run_id=? ORDER BY side_effect_id`, id)
+	if err != nil {
+		return inspection, err
+	}
+	for rows.Next() {
+		var v application.SideEffectRecord
+		var created, observed string
+		if err := rows.Scan(&v.ID, &v.RunID, &v.Kind, &v.IdempotencyKey, &v.IntentJSON, &v.Status, &v.ResultJSON, &v.StdoutPath, &v.StderrPath, &v.Attempt, &created, &observed); err != nil {
+			rows.Close()
+			return inspection, err
+		}
+		v.CreatedAt = parseTime(created)
+		v.ObservedAt = parseTime(observed)
+		inspection.SideEffects = append(inspection.SideEffects, v)
+	}
+	rows.Close()
+	var pr domain.PullRequest
+	var merged int
+	var mergedAt string
+	if err := s.db.QueryRowContext(ctx, `SELECT number,url,node_id,head_branch,base_branch,head_sha,base_sha,body_digest,ownership_key,state,merged,merge_sha,merged_at FROM pull_requests WHERE run_id=?`, id).Scan(&pr.Number, &pr.URL, &pr.NodeID, &pr.HeadBranch, &pr.BaseBranch, &pr.HeadSHA, &pr.BaseSHA, &pr.BodyDigest, &pr.OwnershipKey, &pr.State, &merged, &pr.MergeSHA, &mergedAt); err == nil {
+		pr.Merged = merged != 0
+		pr.MergedAt = parseTime(mergedAt)
+		inspection.PullRequest = &pr
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return inspection, err
+	}
+	rows, err = s.db.QueryContext(ctx, `SELECT observation_id,run_id,pr_number,attempt,head_sha,status,snapshot_json,observed_at FROM poll_observations WHERE run_id=? ORDER BY observation_id`, id)
+	if err != nil {
+		return inspection, err
+	}
+	for rows.Next() {
+		var v application.PollObservation
+		var observed string
+		if err := rows.Scan(&v.ID, &v.RunID, &v.PRNumber, &v.Attempt, &v.HeadSHA, &v.Status, &v.SnapshotJSON, &observed); err != nil {
+			rows.Close()
+			return inspection, err
+		}
+		v.ObservedAt = parseTime(observed)
+		inspection.Polls = append(inspection.Polls, v)
+	}
+	rows.Close()
+	rows, err = s.db.QueryContext(ctx, `SELECT finding_id,run_id,source_id,thread_id,source,file,line,severity,body_digest,resolved,outdated,head_sha,observed_at FROM review_findings WHERE run_id=? ORDER BY finding_id`, id)
+	if err != nil {
+		return inspection, err
+	}
+	for rows.Next() {
+		var v application.FindingRecord
+		var resolved, outdated int
+		var observed string
+		if err := rows.Scan(&v.ID, &v.RunID, &v.SourceID, &v.ThreadID, &v.Source, &v.File, &v.Line, &v.Severity, &v.BodyDigest, &resolved, &outdated, &v.HeadSHA, &observed); err != nil {
+			rows.Close()
+			return inspection, err
+		}
+		v.Resolved = resolved != 0
+		v.Outdated = outdated != 0
+		v.ObservedAt = parseTime(observed)
+		inspection.Findings = append(inspection.Findings, v)
+	}
+	rows.Close()
+	var approval domain.HumanApproval
+	var approvedAt string
+	if err := s.db.QueryRowContext(ctx, `SELECT pr_number,approver,source,approved_sha,ci_status,coderabbit_status,internal_review_sha,approved_at FROM human_approvals WHERE run_id=?`, id).Scan(&approval.PRNumber, &approval.Approver, &approval.Source, &approval.ApprovedSHA, &approval.CIStatus, &approval.CodeRabbit, &approval.ReviewSHA, &approvedAt); err == nil {
+		approval.ApprovedAt = parseTime(approvedAt)
+		inspection.Approval = &approval
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return inspection, err
+	}
+	var merge application.MergeRecord
+	var mergeAt string
+	if err := s.db.QueryRowContext(ctx, `SELECT run_id,pr_number,pre_merge_head_sha,base_sha,merge_method,merge_sha,merged_at FROM merge_results WHERE run_id=?`, id).Scan(&merge.RunID, &merge.PRNumber, &merge.PreMergeSHA, &merge.BaseSHA, &merge.Method, &merge.MergeSHA, &mergeAt); err == nil {
+		merge.MergedAt = parseTime(mergeAt)
+		inspection.Merge = &merge
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return inspection, err
+	}
+	rows, err = s.db.QueryContext(ctx, `SELECT cleanup_id,run_id,resource_kind,resource_name,status,last_error,updated_at FROM cleanup_results WHERE run_id=? ORDER BY cleanup_id`, id)
+	if err != nil {
+		return inspection, err
+	}
+	for rows.Next() {
+		var v application.CleanupRecord
+		var updated string
+		if err := rows.Scan(&v.ID, &v.RunID, &v.Kind, &v.Name, &v.Status, &v.LastError, &updated); err != nil {
+			rows.Close()
+			return inspection, err
+		}
+		v.UpdatedAt = parseTime(updated)
+		inspection.Cleanup = append(inspection.Cleanup, v)
 	}
 	rows.Close()
 	return inspection, nil

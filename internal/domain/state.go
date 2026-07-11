@@ -14,14 +14,18 @@ const (
 	StateVerifying             State = "verifying"
 	StateFreshReview           State = "fresh_review"
 	StateApprovalReady         State = "approval_ready"
+	StatePushingBranch         State = "pushing_branch"
+	StateBranchPushed          State = "branch_pushed"
+	StateOpeningPR             State = "opening_pr"
 	StateRepairing             State = "repairing"
 	StatePROpen                State = "pr_open"
-	StateCodeRabbitReview      State = "coderabbit_review"
+	StateReconcilingReviews    State = "reconciling_reviews"
 	StateAwaitingHumanApproval State = "awaiting_human_approval"
 	StateMerging               State = "merging"
 	StateCleaning              State = "cleaning"
 	StateCompleted             State = "completed"
 	StateFailed                State = "failed"
+	StateManualIntervention    State = "manual_intervention"
 )
 
 var allowedTransitions = map[State]map[State]struct{}{
@@ -32,13 +36,16 @@ var allowedTransitions = map[State]map[State]struct{}{
 	StateAwaitingHumanDecision: set(StateExecuting, StateFailed),
 	StateVerifying:             set(StateFreshReview, StateRepairing, StateFailed),
 	StateFreshReview:           set(StateApprovalReady, StateRepairing, StateFailed),
-	StateApprovalReady:         set(StateFailed),
-	StateRepairing:             set(StateExecuting, StateFailed),
-	StatePROpen:                set(StateCodeRabbitReview, StateFailed),
-	StateCodeRabbitReview:      set(StateAwaitingHumanApproval, StateRepairing, StateFailed),
-	StateAwaitingHumanApproval: set(StateMerging, StateRepairing, StateFailed),
-	StateMerging:               set(StateCleaning, StateFailed),
-	StateCleaning:              set(StateCompleted, StateFailed),
+	StateApprovalReady:         set(StatePushingBranch, StateFailed, StateManualIntervention),
+	StatePushingBranch:         set(StateBranchPushed, StateFailed, StateManualIntervention),
+	StateBranchPushed:          set(StateOpeningPR, StateFailed, StateManualIntervention),
+	StateOpeningPR:             set(StatePROpen, StateFailed, StateManualIntervention),
+	StateRepairing:             set(StateExecuting, StateVerifying, StateFailed, StateManualIntervention),
+	StatePROpen:                set(StateReconcilingReviews, StateFailed, StateManualIntervention),
+	StateReconcilingReviews:    set(StateAwaitingHumanApproval, StateRepairing, StateFailed, StateManualIntervention),
+	StateAwaitingHumanApproval: set(StateMerging, StateRepairing, StateReconcilingReviews, StateFailed, StateManualIntervention),
+	StateMerging:               set(StateCleaning, StateFailed, StateManualIntervention),
+	StateCleaning:              set(StateCompleted, StateFailed, StateManualIntervention),
 }
 
 func CanTransition(from, to State) bool {

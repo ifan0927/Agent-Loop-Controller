@@ -59,6 +59,11 @@ use `gpt-5.6-terra`, while fresh independent review uses `gpt-5.6-sol`. SQLite
 persists both run policy values and each attempt's requested model; legacy runs
 without this evidence are not resumed.
 
+The post-approval delivery slice adds SQLite v5 evidence and explicit states for
+branch push, one-PR publication, bounded CI/CodeRabbit reconciliation, repair,
+I-Fan approval, squash merge, Linear completion observation, and owned cleanup.
+Default integration uses fake GitHub plus a disposable local bare origin.
+
 ## Try the contract planner
 
 ```sh
@@ -134,6 +139,18 @@ labs for inspection:
 
 The local repository registry contains paths and allowed verifier IDs only.
 Executable verifier commands remain compiled controller policy.
+
+Post-approval destructive smoke must use a disposable local bare origin and fake
+GitHub service, or an explicitly authorized isolated GitHub test repository.
+Never use this repository's production remote as a dogfood target.
+
+The opt-in full dogfood scenario starts through the public CLI, uses real Terra
+implementation and fresh Sol review, restarts at the external boundary, and then
+uses a bare origin plus fake GitHub evidence through merge and cleanup:
+
+```sh
+./scripts/live-post-approval-dogfood.sh
+```
 
 ## Documentation
 

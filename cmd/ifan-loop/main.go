@@ -54,7 +54,7 @@ func main() {
 
 func local(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: ifan-loop local <start|continue|status|inspect>")
+		return fmt.Errorf("usage: ifan-loop local <start|continue|status|inspect|fixture-deliver>")
 	}
 	switch args[0] {
 	case "start":
@@ -63,6 +63,8 @@ func local(args []string) error {
 		return localContinue(args[1:])
 	case "status", "inspect":
 		return localInspect(args[0], args[1:])
+	case "fixture-deliver":
+		return localFixtureDeliver(args[1:])
 	default:
 		return fmt.Errorf("unknown experimental local command: %s", args[0])
 	}

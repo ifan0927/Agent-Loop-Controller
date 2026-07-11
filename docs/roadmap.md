@@ -33,12 +33,18 @@
   smoke scripts.
 - No real Linear adapter, push, pull request, CodeRabbit, merge, or cleanup.
 
-### Later Phase 1 slices
+### Phase 1C: Post-approval GitHub delivery
 
-- Linear read adapter and IFAN admission policy.
-- Review-finding repair and re-review loop.
-- GitHub PR publisher and human-gated finalizer.
-- Crash recovery and reconciliation CLI.
+- Explicit side-effect states and SQLite v5 evidence.
+- Fast-forward working-branch publisher and one-PR ownership contract.
+- Bounded GitHub checks and CodeRabbit reconciliation.
+- Review-finding normalization, Terra repair, verification, and fresh Sol review.
+- Exact-head I-Fan approval, squash merge, and restart-safe owned cleanup.
+- Fake GitHub and disposable bare-origin integration by default.
+
+Deferred production integration includes the real Linear read/completion
+adapter, GitHub App identity, CodeRabbit-specific production API compatibility,
+and opt-in isolated real GitHub dogfooding.
 
 ## Phase 2: External trigger adapters
 
