@@ -93,6 +93,14 @@ func (c *Client) Read(ctx context.Context, pr int64, expectedHead string) (domai
 	if err != nil {
 		return e, err
 	}
+	decision2, reviews2, findings2, cr2, unknown3, err := c.readReviews(ctx, pr, expectedHead, coderabbitCheck)
+	if err != nil {
+		return e, err
+	}
+	if reviewTopologyDigest(decision, reviews, findings, cr, unknown2) != reviewTopologyDigest(decision2, reviews2, findings2, cr2, unknown3) {
+		return e, errors.New("review topology drifted while collecting GitHub evidence")
+	}
+	decision, reviews, findings, cr, unknown2 = decision2, reviews2, findings2, cr2, unknown3
 	e.ReviewDecision = decision
 	e.Reviews = reviews
 	e.Findings = findings
@@ -107,6 +115,22 @@ func (c *Client) Read(ctx context.Context, pr int64, expectedHead string) (domai
 		return e, errors.New("pull request drifted while collecting GitHub evidence")
 	}
 	return e, nil
+}
+
+func reviewTopologyDigest(decision string, reviews []domain.GitHubReview, findings []domain.NormalizedFinding, cr domain.CodeRabbitState, unknown []string) string {
+	copies := append([]domain.NormalizedFinding(nil), findings...)
+	for i := range copies {
+		copies[i].ObservedAt = time.Time{}
+	}
+	raw, _ := json.Marshal(struct {
+		Decision   string
+		Reviews    []domain.GitHubReview
+		Findings   []domain.NormalizedFinding
+		CodeRabbit domain.CodeRabbitState
+		Unknown    []string
+	}{decision, reviews, copies, cr, unknown})
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }
 
 func (c *Client) ensureToken(ctx context.Context, force bool) error {
@@ -619,9 +643,7 @@ func (c *Client) readReviews(ctx context.Context, pr int64, head string, coderab
 				trusted := coderabbitCheck != domain.CodeRabbitAbsent && coderabbitCheck != domain.CodeRabbitUnknown && c.cfg.CodeRabbitAppID > 0 && m.Author.DatabaseID == c.cfg.CodeRabbitActorID && m.Author.ID == c.cfg.CodeRabbitNodeID && m.Author.Typename == "Bot"
 				if strings.Contains(strings.ToLower(m.Author.Login), "coderabbit") && !trusted {
 					unknown = append(unknown, "coderabbit_comment_app_provenance_unavailable:"+id)
-					if cr == domain.CodeRabbitAbsent {
-						cr = domain.CodeRabbitUntrusted
-					}
+					cr = mergeCodeRabbitState(cr, domain.CodeRabbitUntrusted)
 				}
 				if trusted {
 					if t.IsResolved || t.IsOutdated || m.Outdated {
