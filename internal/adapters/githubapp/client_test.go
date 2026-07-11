@@ -71,6 +71,27 @@ func TestPullRequestNormalizationStatesAndOwnership(t *testing.T) {
 	}
 }
 
+func TestLatestCheckRunWinsDeterministically(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/owner/repo/branches/main/protection/required_status_checks", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"contexts":[],"checks":[{"context":"test","app_id":8}]}`)
+	})
+	mux.HandleFunc("/repos/owner/repo/commits/head/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"check_runs":[{"id":2,"name":"test","status":"completed","conclusion":"failure","started_at":"2026-07-11T00:02:00Z","completed_at":"2026-07-11T00:03:00Z","app":{"id":8}},{"id":1,"name":"test","status":"completed","conclusion":"success","started_at":"2026-07-11T00:00:00Z","completed_at":"2026-07-11T00:01:00Z","app":{"id":8}}]}`)
+	})
+	mux.HandleFunc("/repos/owner/repo/commits/head/status", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `{"total_count":0,"statuses":[]}`) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := &Client{cfg: Config{APIBaseURL: srv.URL, RepositoryOwner: "owner", RepositoryName: "repo", APIVersion: "2022-11-28", CodeRabbitAppID: 8, InstallationID: 2}, http: srv.Client(), clock: fixedClock{time.Date(2026, 7, 11, 1, 0, 0, 0, time.UTC)}, token: "token"}
+	checks, cr, _, err := c.readChecks(context.Background(), "head", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(checks) != 1 || checks[0].State != domain.CheckFailure || cr != domain.CodeRabbitActionable {
+		t.Fatalf("checks=%+v coderabbit=%s", checks, cr)
+	}
+}
+
 func TestHTTPFailureClassificationAndBounds(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -122,7 +143,7 @@ func TestFixtureReplayAndRestartMint(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got.Repository.ID != 99 || got.PullRequest.HeadSHA != "headsha" || got.CodeRabbit != domain.CodeRabbitPass || len(got.Findings) != 0 {
+		if got.Repository.ID != 99 || got.PullRequest.HeadSHA != "headsha" || got.CodeRabbit != domain.CodeRabbitActionable || len(got.Findings) != 1 {
 			t.Fatalf("unexpected replay: %+v", got)
 		}
 	}
