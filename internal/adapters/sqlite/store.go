@@ -551,6 +551,24 @@ func (s *Store) CleanupProgress(ctx context.Context, runID string) ([]applicatio
 	}
 	return result, rows.Err()
 }
+func (s *Store) PollProgress(ctx context.Context, runID string, pr int64, head string) ([]application.PollObservation, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT observation_id,run_id,pr_number,attempt,head_sha,status,snapshot_json,observed_at FROM poll_observations WHERE run_id=? AND pr_number=? AND head_sha=? ORDER BY observation_id`, runID, pr, head)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []application.PollObservation
+	for rows.Next() {
+		var item application.PollObservation
+		var observed string
+		if err := rows.Scan(&item.ID, &item.RunID, &item.PRNumber, &item.Attempt, &item.HeadSHA, &item.Status, &item.SnapshotJSON, &observed); err != nil {
+			return nil, err
+		}
+		item.ObservedAt = parseTime(observed)
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
 
 func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspection, error) {
 	run, err := s.GetRun(ctx, id)

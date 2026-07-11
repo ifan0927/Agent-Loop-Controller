@@ -172,6 +172,24 @@ func localFixtureDeliver(args []string) error {
 				return err
 			}
 		case domain.StateMerging:
+			gateInspection, gateErr := store.Inspect(ctx, runID)
+			if gateErr != nil {
+				return gateErr
+			}
+			if gateInspection.PullRequest == nil || gateInspection.Approval == nil {
+				return errors.New("merge restart lacks persisted PR or human approval")
+			}
+			gateSnapshot, gateErr := latestPersistedPassingSnapshot(gateInspection, run.CandidateHead)
+			if gateErr != nil {
+				return gateErr
+			}
+			controller := newLocalController(store, "codex", filepath.Dir(run.WorktreePath))
+			if gateErr = controller.ValidateApprovalReady(ctx, runID); gateErr != nil {
+				return gateErr
+			}
+			if gateErr = application.AuthorizeMerge(run, *gateInspection.PullRequest, gateSnapshot, *gateInspection.Approval, run.CandidateHead, run.CandidateHead); gateErr != nil {
+				return gateErr
+			}
 			intent, _ := json.Marshal(map[string]any{"pr_number": 1, "head": run.CandidateHead, "base_sha": run.BaseSHA, "method": "squash"})
 			if _, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{RunID: runID, Kind: "merge", IdempotencyKey: run.CandidateHead, IntentJSON: string(intent), Attempt: 1}); err != nil {
 				return err

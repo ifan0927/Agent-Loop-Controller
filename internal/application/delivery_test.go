@@ -44,6 +44,15 @@ func (s *deliveryMemoryStore) UpsertCleanup(_ context.Context, value CleanupReco
 func (s *deliveryMemoryStore) CleanupProgress(context.Context, string) ([]CleanupRecord, error) {
 	return append([]CleanupRecord(nil), s.cleanup...), nil
 }
+func (s *deliveryMemoryStore) PollProgress(_ context.Context, runID string, pr int64, head string) ([]PollObservation, error) {
+	var result []PollObservation
+	for _, item := range s.polls {
+		if item.RunID == runID && item.PRNumber == pr && item.HeadSHA == head {
+			result = append(result, item)
+		}
+	}
+	return result, nil
+}
 
 type fakeGitHub struct {
 	snapshots []domain.ReviewSnapshot
@@ -89,6 +98,28 @@ func TestReconciliationTimesOutAtBound(t *testing.T) {
 	status, err := ReconcileReviews(context.Background(), gh, store, "run", 3, "h1", PollPolicy{MaxAttempts: 2, Interval: 0, Deadline: time.Second}, func(context.Context, time.Duration) error { return nil })
 	if err != nil || status != domain.ReconciliationTimeout || gh.calls != 2 {
 		t.Fatalf("status=%s calls=%d err=%v", status, gh.calls, err)
+	}
+}
+
+func TestReconciliationRestartUsesRemainingAttemptBudget(t *testing.T) {
+	now := time.Now()
+	pending := domain.ReviewSnapshot{HeadSHA: "h1", RequiredChecks: []string{"test"}, CodeRabbitStatus: "pending", Checks: []domain.Check{{Name: "test", Required: true, Status: "in_progress", ObservedSHA: "h1"}}, ObservedAt: now}
+	passing := domain.ReviewSnapshot{HeadSHA: "h1", RequiredChecks: []string{"test"}, CodeRabbitStatus: "pass", Checks: []domain.Check{{Name: "test", Required: true, Status: "completed", Conclusion: "success", ObservedSHA: "h1"}}, ObservedAt: now}
+	store := &deliveryMemoryStore{}
+	first := &fakeGitHub{snapshots: []domain.ReviewSnapshot{pending}}
+	status, err := ReconcileReviews(context.Background(), first, store, "run", 3, "h1", PollPolicy{MaxAttempts: 1, Deadline: time.Second}, func(context.Context, time.Duration) error { return nil })
+	if err != nil || status != domain.ReconciliationTimeout {
+		t.Fatalf("first status=%s err=%v", status, err)
+	}
+	second := &fakeGitHub{snapshots: []domain.ReviewSnapshot{passing}}
+	status, err = ReconcileReviews(context.Background(), second, store, "run", 3, "h1", PollPolicy{MaxAttempts: 2, Deadline: time.Second}, func(context.Context, time.Duration) error { return nil })
+	if err != nil || status != domain.ReconciliationPass || second.calls != 1 {
+		t.Fatalf("restart status=%s calls=%d err=%v", status, second.calls, err)
+	}
+	third := &fakeGitHub{snapshots: []domain.ReviewSnapshot{passing}}
+	status, err = ReconcileReviews(context.Background(), third, store, "run", 3, "h1", PollPolicy{MaxAttempts: 2, Deadline: time.Second}, func(context.Context, time.Duration) error { return nil })
+	if err != nil || status != domain.ReconciliationPass || third.calls != 0 {
+		t.Fatalf("replayed pass status=%s calls=%d err=%v", status, third.calls, err)
 	}
 }
 

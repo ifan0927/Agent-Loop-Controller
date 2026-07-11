@@ -86,6 +86,7 @@ type DeliveryStore interface {
 	SaveMerge(context.Context, MergeRecord) error
 	UpsertCleanup(context.Context, CleanupRecord) error
 	CleanupProgress(context.Context, string) ([]CleanupRecord, error)
+	PollProgress(context.Context, string, int64, string) ([]PollObservation, error)
 }
 
 type GitHubPort interface {
@@ -106,9 +107,30 @@ func ReconcileReviews(ctx context.Context, github GitHubPort, store DeliveryStor
 	if policy.MaxAttempts < 1 || policy.Interval < 0 || policy.Deadline <= 0 {
 		return "", errors.New("invalid bounded polling policy")
 	}
-	deadline, cancel := context.WithTimeout(ctx, policy.Deadline)
+	previous, err := store.PollProgress(ctx, runID, pr, head)
+	if err != nil {
+		return "", err
+	}
+	if len(previous) > 0 {
+		last := domain.ReconciliationStatus(previous[len(previous)-1].Status)
+		if last != domain.ReconciliationPending {
+			return last, nil
+		}
+	}
+	if len(previous) >= policy.MaxAttempts {
+		return domain.ReconciliationTimeout, nil
+	}
+	remainingDeadline := policy.Deadline
+	if len(previous) > 0 {
+		elapsed := time.Since(previous[0].ObservedAt)
+		remainingDeadline -= elapsed
+		if remainingDeadline <= 0 {
+			return domain.ReconciliationTimeout, nil
+		}
+	}
+	deadline, cancel := context.WithTimeout(ctx, remainingDeadline)
 	defer cancel()
-	for attempt := 1; attempt <= policy.MaxAttempts; attempt++ {
+	for attempt := len(previous) + 1; attempt <= policy.MaxAttempts; attempt++ {
 		snapshot, err := github.Observe(deadline, pr, head)
 		if err != nil {
 			return domain.ReconciliationInfrastructure, err
