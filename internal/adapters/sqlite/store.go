@@ -250,7 +250,19 @@ func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput)
 }
 
 func (s *Store) GetRun(ctx context.Context, id string) (application.Run, error) {
-	return scanRun(s.db.QueryRowContext(ctx, runSelect+` WHERE run_id=?`, id))
+	run, err := scanRun(s.db.QueryRowContext(ctx, runSelect+` WHERE run_id=?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return application.Run{}, application.ErrRunNotFound
+	}
+	return run, err
+}
+
+func (s *Store) GetRunByIdempotency(ctx context.Context, key string) (application.Run, bool, error) {
+	run, err := s.getByIdempotency(ctx, key)
+	if errors.Is(err, sql.ErrNoRows) {
+		return application.Run{}, false, nil
+	}
+	return run, err == nil, err
 }
 
 func (s *Store) getByIdempotency(ctx context.Context, key string) (application.Run, error) {
@@ -411,7 +423,7 @@ func (s *Store) SaveGitHubRequests(ctx context.Context, observations []applicati
 	return tx.Commit()
 }
 
-func (s *Store) SaveGitHubReadSuccess(ctx context.Context, runID string, observations []application.GitHubRequestObservation, pr domain.PullRequest, m application.GitHubInstallationMetadata, e domain.GitHubReadEvidence) error {
+func (s *Store) SaveGitHubReadSuccess(ctx context.Context, runID, leaseOwner string, expectedState domain.State, idempotencyKey string, observations []application.GitHubRequestObservation, pr domain.PullRequest, m application.GitHubInstallationMetadata, e domain.GitHubReadEvidence) error {
 	raw, err := json.Marshal(e)
 	if err != nil {
 		return err
@@ -422,6 +434,14 @@ func (s *Store) SaveGitHubReadSuccess(ctx context.Context, runID string, observa
 		return err
 	}
 	defer tx.Rollback()
+	var state, key, owner string
+	var leaseExpires int64
+	if err := tx.QueryRowContext(ctx, `SELECT current_state,idempotency_key,lease_owner,lease_expires_unix FROM runs WHERE run_id=?`, runID).Scan(&state, &key, &owner, &leaseExpires); err != nil {
+		return err
+	}
+	if domain.State(state) != expectedState || key != idempotencyKey || owner != leaseOwner || leaseExpires <= time.Now().UTC().UnixNano() {
+		return errors.New("GitHub reconciliation run authority changed")
+	}
 	for _, o := range observations {
 		if o.RunID != runID {
 			return errors.New("GitHub observation run mismatch")
@@ -442,6 +462,31 @@ func (s *Store) SaveGitHubReadSuccess(ctx context.Context, runID string, observa
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO github_read_evidence(run_id,head_sha,repository_id,evidence_json,evidence_digest,observed_at) VALUES(?,?,?,?,?,?) ON CONFLICT(run_id,head_sha,evidence_digest) DO NOTHING`, runID, e.PullRequest.HeadSHA, e.Repository.ID, string(raw), hex.EncodeToString(sum[:]), formatTime(e.ObservedAt)); err != nil {
 		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) SaveGitHubReadFailure(ctx context.Context, runID, leaseOwner string, expectedState domain.State, idempotencyKey string, observations []application.GitHubRequestObservation) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var state, key, owner string
+	var leaseExpires int64
+	if err := tx.QueryRowContext(ctx, `SELECT current_state,idempotency_key,lease_owner,lease_expires_unix FROM runs WHERE run_id=?`, runID).Scan(&state, &key, &owner, &leaseExpires); err != nil {
+		return err
+	}
+	if domain.State(state) != expectedState || key != idempotencyKey || owner != leaseOwner || leaseExpires <= time.Now().UTC().UnixNano() {
+		return errors.New("GitHub reconciliation run authority changed")
+	}
+	for _, o := range observations {
+		if o.RunID != runID {
+			return errors.New("GitHub observation run mismatch")
+		}
+		if _, err := tx.ExecContext(ctx, githubRequestInsert, githubRequestArgs(o)...); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

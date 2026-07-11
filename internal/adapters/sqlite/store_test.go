@@ -379,6 +379,32 @@ func TestRunLeaseUsesOwnerCASAndExpiry(t *testing.T) {
 	}
 }
 
+func TestGitHubFailureAuditUsesLeaseCAS(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run := application.Run{ID: "run-audit", IdempotencyKey: "key", Repository: "owner/repo", RepositoryConfigJSON: "{}"}
+	if _, _, err := store.CreateRun(context.Background(), application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := store.AcquireLease(context.Background(), run.ID, "owner", time.Now().Add(time.Minute)); err != nil || !ok {
+		t.Fatalf("acquire=%v err=%v", ok, err)
+	}
+	observation := application.GitHubRequestObservation{RunID: run.ID, Operation: "read", ErrorClass: "timeout"}
+	if err := store.SaveGitHubReadFailure(context.Background(), run.ID, "wrong", domain.StateReceived, "key", []application.GitHubRequestObservation{observation}); err == nil {
+		t.Fatal("wrong lease owner persisted failure audit")
+	}
+	if err := store.SaveGitHubReadFailure(context.Background(), run.ID, "owner", domain.StateReceived, "key", []application.GitHubRequestObservation{observation}); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM github_request_observations WHERE run_id=?`, run.ID).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("audit count=%d err=%v", count, err)
+	}
+}
+
 func TestTransitionUsesExpectedStateCompare(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {

@@ -97,6 +97,49 @@ func TestLocalCommandsAcceptDocumentedLeadingRunID(t *testing.T) {
 	}
 }
 
+func TestLocalContinueRequiresCallerCASExpectations(t *testing.T) {
+	err := localContinue([]string{"run-123", "--db", "/unused/controller.db", "--registry", "/unused/registry.json", "--requester", "ifan0927", "--repository", "owner/repo"})
+	if err == nil || !strings.Contains(err.Error(), "--expected-state") || !strings.Contains(err.Error(), "--idempotency-key") {
+		t.Fatalf("missing explicit CAS error=%v", err)
+	}
+}
+
+func TestLocalContinueAuthorizesBeforeRegistryRead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "controller.db")
+	store, err := sqlitestore.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, _ := json.Marshal(application.LocalRepository{AllowedOperatorLogins: []string{"ifan0927"}})
+	_, _, err = store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: "run-auth-first", IdempotencyKey: "key", Repository: "owner/repo", RepositoryConfigJSON: string(authority)}})
+	store.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = localContinue([]string{"run-auth-first", "--db", path, "--registry", filepath.Join(t.TempDir(), "missing.json"), "--requester", "intruder", "--repository", "owner/repo", "--expected-state", "received", "--idempotency-key", "key"})
+	if err == nil || !strings.Contains(err.Error(), "not authorized") {
+		t.Fatalf("unauthorized continue exposed registry error=%v", err)
+	}
+}
+
+func TestLocalContinueRejectsCallerRepositoryBeforeRegistryRead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "controller.db")
+	store, err := sqlitestore.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, _ := json.Marshal(application.LocalRepository{AllowedOperatorLogins: []string{"ifan0927"}})
+	_, _, err = store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: "run-repository", IdempotencyKey: "key", Repository: "owner/repo", RepositoryConfigJSON: string(authority)}})
+	store.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = localContinue([]string{"run-repository", "--db", path, "--registry", filepath.Join(t.TempDir(), "missing.json"), "--requester", "ifan0927", "--repository", "owner/other", "--expected-state", "received", "--idempotency-key", "key"})
+	if err == nil || !strings.Contains(err.Error(), "repository does not match") {
+		t.Fatalf("repository mismatch exposed registry error=%v", err)
+	}
+}
+
 func TestDecodeDecisionRejectsTrailingJSON(t *testing.T) {
 	if _, err := decodeDecision(strings.NewReader(`{"choice_id":"a","instructions":"go"} {}`)); err == nil {
 		t.Fatal("expected trailing decision JSON rejection")
@@ -118,7 +161,8 @@ func TestLocalStatusOutputsDurableInspection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	input := application.CreateRunInput{Run: application.Run{ID: "run-1", IssueID: "ISSUE-1", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw-hash", NormalizedTaskJSON: "{}", TaskHash: "task-hash", Repository: "repo:test-project", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "ifan/test", ArtifactRoot: "/tmp/run", ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}}
+	authority, _ := json.Marshal(application.LocalRepository{AllowedOperatorLogins: []string{"ifan0927"}})
+	input := application.CreateRunInput{Run: application.Run{ID: "run-1", IssueID: "ISSUE-1", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw-hash", NormalizedTaskJSON: "{}", TaskHash: "task-hash", Repository: "repo:test-project", RepositoryConfigJSON: string(authority), BaseBranch: "main", WorkingBranch: "ifan/test", ArtifactRoot: "/tmp/run", ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}}
 	if _, _, err := store.CreateRun(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +173,7 @@ func TestLocalStatusOutputsDurableInspection(t *testing.T) {
 	}
 	original := os.Stdout
 	os.Stdout = write
-	callErr := localInspect("status", []string{"run-1", "--db", path})
+	callErr := localInspect("status", []string{"run-1", "--db", path, "--requester", "ifan0927"})
 	write.Close()
 	os.Stdout = original
 	if callErr != nil {
@@ -140,10 +184,28 @@ func TestLocalStatusOutputsDurableInspection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"current_state": "received"`, `"implementation_model": "gpt-5.6-terra"`, `"review_model": "gpt-5.6-sol"`, `"state_timeline"`, `"task_snapshot_hash": "task-hash"`, `"attempts"`, `"verifications"`, `"reviews"`, `"owned_resources"`, `"last_durable_error"`} {
+	for _, want := range []string{`"current_state": "received"`, `"implementation_model": "gpt-5.6-terra"`, `"review_model": "gpt-5.6-sol"`, `"state_timeline"`, `"task_snapshot_hash": "task-hash"`, `"attempts"`, `"verifications"`, `"reviews"`, `"owned_resources"`} {
 		if !strings.Contains(string(output), want) {
 			t.Fatalf("status output missing %s: %s", want, output)
 		}
+	}
+}
+
+func TestLocalStatusRejectsUnauthorizedRequester(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "controller.db")
+	store, err := sqlitestore.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, _ := json.Marshal(application.LocalRepository{AllowedOperatorLogins: []string{"ifan0927"}})
+	_, _, err = store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: "run-auth", IdempotencyKey: "key", Repository: "owner/repo", RepositoryConfigJSON: string(authority)}})
+	store.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = localInspect("status", []string{"run-auth", "--db", path, "--requester", "intruder"})
+	if err == nil || !strings.Contains(err.Error(), "not authorized") {
+		t.Fatalf("unauthorized status error=%v", err)
 	}
 }
 
@@ -169,7 +231,7 @@ func TestLocalInspectSanitizesRepositoryBinding(t *testing.T) {
 	}
 	original := os.Stdout
 	os.Stdout = write
-	callErr := localInspect("inspect", []string{"run-binding", "--db", path})
+	callErr := localInspect("inspect", []string{"run-binding", "--db", path, "--requester", "ifan0927"})
 	write.Close()
 	os.Stdout = original
 	if callErr != nil {

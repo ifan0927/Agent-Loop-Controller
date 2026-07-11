@@ -2,10 +2,13 @@ package application
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
+
+var ErrRunNotFound = errors.New("run not found")
 
 type Run struct {
 	ID                      string       `json:"run_id"`
@@ -150,6 +153,7 @@ type SanitizedRepositoryBinding struct {
 type RunStore interface {
 	CreateRun(context.Context, CreateRunInput) (Run, bool, error)
 	GetRun(context.Context, string) (Run, error)
+	GetRunByIdempotency(context.Context, string) (Run, bool, error)
 	Transition(context.Context, string, domain.State, domain.State, string, string, string) error
 	SetWorkspace(context.Context, string, string, string) error
 	SetImplementationSession(context.Context, string, string) error

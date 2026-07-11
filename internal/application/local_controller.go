@@ -108,6 +108,10 @@ func NewLocalController(store RunStore, worktrees WorktreeProvisioner, executor 
 }
 
 func (c *LocalController) Start(ctx context.Context, input LocalStartInput) (Run, error) {
+	return c.StartAuthorized(ctx, input, nil)
+}
+
+func (c *LocalController) StartAuthorized(ctx context.Context, input LocalStartInput, authorizeExisting func(Run) error) (Run, error) {
 	if err := input.Task.Validate(); err != nil {
 		return Run{}, err
 	}
@@ -138,7 +142,7 @@ func (c *LocalController) Start(ctx context.Context, input LocalStartInput) (Run
 		return Run{}, err
 	}
 	artifactRoot := filepath.Join(input.RunRoot, input.Task.RunID)
-	run, _, err := c.store.CreateRun(ctx, CreateRunInput{Run: Run{ID: input.Task.RunID, IssueID: input.Task.IssueID,
+	run, created, err := c.store.CreateRun(ctx, CreateRunInput{Run: Run{ID: input.Task.RunID, IssueID: input.Task.IssueID,
 		IdempotencyKey: input.IdempotencyKey, SourceRevision: input.Task.SourceRevision, RawIssueJSON: string(input.RawIssueJSON),
 		RawIssueHash: input.RawIssueHash, NormalizedTaskJSON: string(input.NormalizedJSON), TaskHash: input.TaskHash,
 		Repository: input.Task.Repository, RepositoryConfigJSON: string(repositoryJSON), BaseBranch: input.Task.BaseBranch,
@@ -148,6 +152,11 @@ func (c *LocalController) Start(ctx context.Context, input LocalStartInput) (Run
 		ImplementationModel: codex.ImplementationModel, ReviewModel: codex.ReviewModel}})
 	if err != nil {
 		return Run{}, err
+	}
+	if !created && authorizeExisting != nil {
+		if err := authorizeExisting(run); err != nil {
+			return Run{}, err
+		}
 	}
 	c.worktreeRoot = input.WorktreeRoot
 	if err := c.ensureArtifactRoot(ctx, run); err != nil {
@@ -162,6 +171,17 @@ func (c *LocalController) Start(ctx context.Context, input LocalStartInput) (Run
 }
 
 func (c *LocalController) Continue(ctx context.Context, runID string, decision *Decision) (Run, error) {
+	return c.continueExpected(ctx, runID, "", "", decision)
+}
+
+func (c *LocalController) ContinueExpected(ctx context.Context, runID string, expectedState domain.State, idempotencyKey string, decision *Decision) (Run, error) {
+	if expectedState == "" || idempotencyKey == "" {
+		return Run{}, errors.New("expected state and idempotency key are required")
+	}
+	return c.continueExpected(ctx, runID, expectedState, idempotencyKey, decision)
+}
+
+func (c *LocalController) continueExpected(ctx context.Context, runID string, expectedState domain.State, idempotencyKey string, decision *Decision) (Run, error) {
 	owner, err := randomIdentifier("controller-")
 	if err != nil {
 		return Run{}, err
@@ -208,6 +228,15 @@ func (c *LocalController) Continue(ctx context.Context, runID string, decision *
 		_ = c.store.ReleaseLease(releaseCtx, runID, owner)
 	}()
 	ctx = leaseCtx
+	if expectedState != "" {
+		run, err := c.store.GetRun(ctx, runID)
+		if err != nil {
+			return Run{}, err
+		}
+		if run.State != expectedState || run.IdempotencyKey != idempotencyKey {
+			return Run{}, errors.New("run state or idempotency authority changed before the command was applied")
+		}
+	}
 	for steps := 0; steps < 20; steps++ {
 		run, err := c.store.GetRun(ctx, runID)
 		if err != nil {

@@ -3,12 +3,13 @@ package application
 import (
 	"context"
 	"fmt"
-	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 	"time"
+
+	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
 type GitHubReadPort interface {
-	Read(context.Context, int64, string) (domain.GitHubReadEvidence, error)
+	Read(context.Context, int64, string) (domain.GitHubReadEvidence, []GitHubRequestObservation, GitHubInstallationMetadata, error)
 }
 
 type GitHubRequestObservation struct {
@@ -43,7 +44,7 @@ type GitHubEvidenceStore interface {
 }
 
 func ReconcileGitHubRead(expectedRepository domain.RepositoryIdentity, expectedPR domain.PullRequest, branch, base, head, baseSHA, ownershipKey, bodyDigest string, got domain.GitHubReadEvidence) error {
-	if got.Repository != expectedRepository {
+	if got.Repository.ID != expectedRepository.ID || got.Repository.Owner != expectedRepository.Owner || got.Repository.Name != expectedRepository.Name || (expectedRepository.NodeID != "" && got.Repository.NodeID != expectedRepository.NodeID) {
 		return fmt.Errorf("GitHub repository identity mismatch")
 	}
 	if got.PullRequest.Number != expectedPR.Number || got.PullRequest.NodeID != expectedPR.NodeID || got.PullRequest.URL != expectedPR.URL || (expectedPR.DatabaseID > 0 && got.PullRequest.DatabaseID != expectedPR.DatabaseID) {

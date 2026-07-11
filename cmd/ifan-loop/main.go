@@ -64,14 +64,33 @@ func githubRead(args []string) error {
 	head := flags.String("expected-head", "", "expected exact PR head SHA")
 	dbPath := flags.String("db", "", "optional controller SQLite database")
 	runID := flags.String("run-id", "", "run ID required with --db")
+	requester := flags.String("requester", "", "authenticated GitHub login supplied by the invoking adapter")
+	repository := flags.String("repository", "", "previously observed canonical repository")
+	expectedState := flags.String("expected-state", "", "previously observed run state used as a compare-and-swap token")
+	idempotencyKey := flags.String("idempotency-key", "", "persisted run idempotency token")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if *configPath == "" || *pr < 1 || *head == "" {
 		return errors.New("--config, --pr, and --expected-head are required")
 	}
-	if *dbPath == "" || *runID == "" {
-		return errors.New("--db and --run-id are required for persisted ownership reconciliation")
+	if *dbPath == "" || *runID == "" || *requester == "" || *repository == "" || *expectedState == "" || *idempotencyKey == "" {
+		return errors.New("--db, --run-id, --requester, --repository, --expected-state, and --idempotency-key are required for persisted ownership reconciliation")
+	}
+	store, err := sqlitestore.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if _, err := application.NewQueryService(store).Status(context.Background(), application.QueryInput{Requester: cliRequester(*requester), RunID: *runID, Repository: *repository}); err != nil {
+		return err
+	}
+	inspection, err := store.Inspect(context.Background(), *runID)
+	if err != nil {
+		return err
+	}
+	if inspection.PullRequest == nil {
+		return errors.New("persisted PR identity is required")
 	}
 	file, err := os.Open(*configPath)
 	if err != nil {
@@ -82,18 +101,6 @@ func githubRead(args []string) error {
 	if decodeErr != nil {
 		return decodeErr
 	}
-	store, err := sqlitestore.Open(*dbPath)
-	if err != nil {
-		return err
-	}
-	defer store.Close()
-	inspection, err := store.Inspect(context.Background(), *runID)
-	if err != nil {
-		return err
-	}
-	if inspection.PullRequest == nil {
-		return errors.New("persisted PR identity is required")
-	}
 	if *pr != inspection.PullRequest.Number || *head != inspection.Run.CandidateHead {
 		return errors.New("requested PR or expected head does not match persisted run evidence")
 	}
@@ -103,10 +110,6 @@ func githubRead(args []string) error {
 	}
 	if inspection.RepositoryBinding != nil && (inspection.RepositoryBinding.ExpectedRepositoryID != cfg.RepositoryID || inspection.RepositoryBinding.GitHubInstallationID != cfg.InstallationID) {
 		return errors.New("configured GitHub authority does not match persisted repository binding")
-	}
-	expectedRepository := domain.RepositoryIdentity{ID: cfg.RepositoryID, Owner: cfg.RepositoryOwner, Name: cfg.RepositoryName}
-	if inspection.GitHubInstallation != nil {
-		expectedRepository = inspection.GitHubInstallation.Repository
 	}
 	observations := []application.GitHubRequestObservation{}
 	observer := func(o application.GitHubRequestObservation) {
@@ -119,41 +122,25 @@ func githubRead(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.HTTPTimeout*20)
 	defer cancel()
-	evidence, readErr := client.Read(ctx, *pr, *head)
-	metadata := client.InstallationMetadata()
-	persistCtx, persistCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer persistCancel()
-	if readErr != nil {
-		if saveErr := store.SaveGitHubRequests(persistCtx, observations); saveErr != nil {
-			return saveErr
-		}
-		return readErr
+	controller := application.NewCommandService(nil, store)
+	result, reconcileErr := controller.ReconcileFromGitHub(ctx, application.GitHubReconcileCommand{
+		Requester: cliRequester(*requester), RunID: *runID, Repository: *repository, ExpectedState: domain.State(*expectedState),
+		IdempotencyKey: *idempotencyKey, PullRequest: *pr, ExpectedHead: *head,
+	}, githubReadAdapter{client: client, observations: &observations})
+	if reconcileErr != nil {
+		return reconcileErr
 	}
-	persistFailure := func(cause error) error {
-		failureCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := store.SaveGitHubRequests(failureCtx, observations); err != nil {
-			return errors.Join(cause, err)
-		}
-		return cause
-	}
-	if expectedRepository.NodeID == "" {
-		expectedRepository.NodeID = evidence.Repository.NodeID
-	}
-	if err := application.ReconcileGitHubRead(expectedRepository, *inspection.PullRequest, inspection.Run.WorkingBranch, inspection.Run.BaseBranch, inspection.Run.CandidateHead, inspection.Run.BaseSHA, inspection.Run.IdempotencyKey, inspection.PullRequest.BodyDigest, evidence); err != nil {
-		return persistFailure(err)
-	}
-	if inspection.GitHubInstallation != nil && (metadata.InstallationID != inspection.GitHubInstallation.InstallationID || metadata.AppID != inspection.GitHubInstallation.AppID) {
-		return persistFailure(errors.New("GitHub App installation binding mismatch"))
-	}
-	if err := store.SaveGitHubReadSuccess(persistCtx, *runID, observations, evidence.PullRequest, metadata, evidence); err != nil {
-		return persistFailure(err)
-	}
-	return printJSON(struct {
-		Installation application.GitHubInstallationMetadata `json:"installation"`
-		Requests     []application.GitHubRequestObservation `json:"requests"`
-		Evidence     domain.GitHubReadEvidence              `json:"evidence"`
-	}{metadata, observations, evidence})
+	return printJSON(result)
+}
+
+type githubReadAdapter struct {
+	client       *githubapp.Client
+	observations *[]application.GitHubRequestObservation
+}
+
+func (a githubReadAdapter) Read(ctx context.Context, pr int64, head string) (domain.GitHubReadEvidence, []application.GitHubRequestObservation, application.GitHubInstallationMetadata, error) {
+	evidence, err := a.client.Read(ctx, pr, head)
+	return evidence, append([]application.GitHubRequestObservation(nil), (*a.observations)...), a.client.InstallationMetadata(), err
 }
 
 func local(args []string) error {
@@ -181,15 +168,24 @@ func localStart(args []string) error {
 	dbPath := flags.String("db", "", "SQLite controller database")
 	codexBinary := flags.String("codex-binary", "codex", "Codex CLI binary")
 	timeout := flags.Duration("timeout", 30*time.Minute, "local run timeout")
+	requester := flags.String("requester", "", "authenticated GitHub login supplied by the invoking adapter")
+	repository := flags.String("repository", "", "caller-selected canonical repository")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if *issuePath == "" || *registryPath == "" || *dbPath == "" {
-		return fmt.Errorf("--issue, --registry, and --db are required")
+	if *issuePath == "" || *registryPath == "" || *dbPath == "" || *requester == "" || *repository == "" {
+		return fmt.Errorf("--issue, --registry, --db, --requester, and --repository are required")
 	}
 	registry, err := localregistry.Load(*registryPath)
 	if err != nil {
 		return fmt.Errorf("load registry: %w", err)
+	}
+	repo, err := registry.Resolve(*repository)
+	if err != nil {
+		return err
+	}
+	if err := application.AuthorizeRequester(cliRequester(*requester), repo.OperatorIdentityPolicy.AllowedLogins); err != nil {
+		return err
 	}
 	file, err := os.Open(*issuePath)
 	if err != nil {
@@ -204,9 +200,8 @@ func localStart(args []string) error {
 	if err != nil {
 		return fmt.Errorf("simulated admission: %w", err)
 	}
-	repo, err := registry.Resolve(snapshot.Task.Repository)
-	if err != nil {
-		return err
+	if snapshot.Task.Repository != *repository {
+		return application.ClassifyError(errors.New("admitted task repository does not match caller selection"))
 	}
 	store, err := sqlitestore.Open(*dbPath)
 	if err != nil {
@@ -216,13 +211,14 @@ func localStart(args []string) error {
 	controller := newLocalController(store, *codexBinary, repo.WorktreeRoot)
 	ctx, cancel := localContext(*timeout)
 	defer cancel()
-	run, err := controller.Start(ctx, application.LocalStartInput{Task: snapshot.Task, RawIssueJSON: snapshot.RawJSON, RawIssueHash: snapshot.RawHash,
+	input := application.LocalStartInput{Task: snapshot.Task, RawIssueJSON: snapshot.RawJSON, RawIssueHash: snapshot.RawHash,
 		NormalizedJSON: snapshot.NormalizedJSON, TaskHash: snapshot.TaskHash, IdempotencyKey: snapshot.IdempotencyKey,
-		Repository: localRepository(repo), RunRoot: repo.RunRoot, WorktreeRoot: repo.WorktreeRoot})
+		Repository: localRepository(repo), RunRoot: repo.RunRoot, WorktreeRoot: repo.WorktreeRoot}
+	result, err := application.NewCommandService(controller, store).Start(ctx, application.StartCommand{Requester: cliRequester(*requester), RepositorySelection: snapshot.Task.Repository, IdempotencyKey: snapshot.IdempotencyKey, Input: input})
 	if err != nil {
 		return err
 	}
-	return printJSON(run)
+	return printJSON(result.Run)
 }
 
 func localContinue(args []string) error {
@@ -232,6 +228,10 @@ func localContinue(args []string) error {
 	decisionPath := flags.String("decision", "", "optional simulated human decision JSON")
 	codexBinary := flags.String("codex-binary", "codex", "Codex CLI binary")
 	timeout := flags.Duration("timeout", 30*time.Minute, "local run timeout")
+	requester := flags.String("requester", "", "authenticated GitHub login supplied by the invoking adapter")
+	repository := flags.String("repository", "", "previously observed canonical repository")
+	expectedState := flags.String("expected-state", "", "previously observed run state used as a compare-and-swap token")
+	idempotencyKey := flags.String("idempotency-key", "", "persisted run idempotency token")
 	runID, flagArgs := splitLeadingRunID(args)
 	if err := flags.Parse(flagArgs); err != nil {
 		return err
@@ -239,8 +239,8 @@ func localContinue(args []string) error {
 	if runID == "" && flags.NArg() == 1 {
 		runID = flags.Arg(0)
 	}
-	if runID == "" || *dbPath == "" || *registryPath == "" {
-		return fmt.Errorf("usage: ifan-loop local continue <run-id> --db <controller.db> --registry <repository-registry.json> [--decision <decision.json>]")
+	if runID == "" || *dbPath == "" || *registryPath == "" || *requester == "" || *repository == "" || *expectedState == "" || *idempotencyKey == "" {
+		return fmt.Errorf("usage: ifan-loop local continue <run-id> --db <controller.db> --registry <repository-registry.json> --requester <login> --repository <owner/repo> --expected-state <state> --idempotency-key <key> [--decision <decision.json>]")
 	}
 	store, err := sqlitestore.Open(*dbPath)
 	if err != nil {
@@ -249,6 +249,9 @@ func localContinue(args []string) error {
 	defer store.Close()
 	existing, err := store.GetRun(context.Background(), runID)
 	if err != nil {
+		return application.ClassifyError(err)
+	}
+	if _, err := application.NewQueryService(store).Status(context.Background(), application.QueryInput{Requester: cliRequester(*requester), RunID: runID, Repository: *repository}); err != nil {
 		return err
 	}
 	registry, err := localregistry.Load(*registryPath)
@@ -274,11 +277,11 @@ func localContinue(args []string) error {
 	controller := newLocalController(store, *codexBinary, filepath.Dir(existing.WorktreePath))
 	ctx, cancel := localContext(*timeout)
 	defer cancel()
-	run, err := controller.Continue(ctx, runID, decision)
+	result, err := application.NewCommandService(controller, store).Continue(ctx, application.ContinueCommand{Requester: cliRequester(*requester), RunID: runID, ExpectedState: domain.State(*expectedState), Repository: *repository, IdempotencyKey: *idempotencyKey, Decision: decision})
 	if err != nil {
 		return err
 	}
-	return printJSON(run)
+	return printJSON(result.Run)
 }
 
 func localRepository(repo localregistry.Binding) application.LocalRepository {
@@ -365,6 +368,7 @@ func decodeDecision(reader io.Reader) (application.Decision, error) {
 func localInspect(command string, args []string) error {
 	flags := flag.NewFlagSet("local "+command, flag.ContinueOnError)
 	dbPath := flags.String("db", "", "SQLite controller database")
+	requester := flags.String("requester", "", "authenticated GitHub login supplied by the invoking adapter")
 	runID, flagArgs := splitLeadingRunID(args)
 	if err := flags.Parse(flagArgs); err != nil {
 		return err
@@ -372,7 +376,7 @@ func localInspect(command string, args []string) error {
 	if runID == "" && flags.NArg() == 1 {
 		runID = flags.Arg(0)
 	}
-	if runID == "" || *dbPath == "" {
+	if runID == "" || *dbPath == "" || *requester == "" {
 		return fmt.Errorf("usage: ifan-loop local %s <run-id> --db <controller.db>", command)
 	}
 	store, err := sqlitestore.Open(*dbPath)
@@ -380,58 +384,32 @@ func localInspect(command string, args []string) error {
 		return err
 	}
 	defer store.Close()
-	inspection, err := store.Inspect(context.Background(), runID)
+	run, err := store.GetRun(context.Background(), runID)
+	if err != nil {
+		return application.ClassifyError(err)
+	}
+	queries := application.NewQueryService(store)
+	input := application.QueryInput{Requester: cliRequester(*requester), RunID: runID, Repository: run.Repository}
+	if command == "status" {
+		result, err := queries.Status(context.Background(), input)
+		if err != nil {
+			return err
+		}
+		return printJSON(result)
+	}
+	result, err := queries.Inspect(context.Background(), input)
 	if err != nil {
 		return err
 	}
-	sanitizeInspection(&inspection)
-	return printJSON(inspection)
+	return printJSON(result)
 }
 
 func sanitizeInspection(inspection *application.RunInspection) {
-	inspection.Run.WorktreePath = ""
-	inspection.Run.ArtifactRoot = ""
-	inspection.Run.LastError = ""
-	for index := range inspection.Timeline {
-		inspection.Timeline[index].EvidenceReference = ""
-	}
-	for index := range inspection.Attempts {
-		inspection.Attempts[index].SessionID = ""
-		inspection.Attempts[index].StdoutPath = ""
-		inspection.Attempts[index].StderrPath = ""
-		inspection.Attempts[index].OutcomePath = ""
-		inspection.Attempts[index].ArtifactDir = ""
-	}
-	for index := range inspection.Verifications {
-		inspection.Verifications[index].StdoutPath = ""
-		inspection.Verifications[index].StderrPath = ""
-		inspection.Verifications[index].EvidencePath = ""
-	}
-	for index := range inspection.Reviews {
-		inspection.Reviews[index].SessionID = ""
-		inspection.Reviews[index].OutcomePath = ""
-	}
-	for index := range inspection.Resources {
-		inspection.Resources[index].Name = ""
-		inspection.Resources[index].CreationEvidence = ""
-	}
-	for index := range inspection.SideEffects {
-		inspection.SideEffects[index].IntentJSON = ""
-		inspection.SideEffects[index].ResultJSON = ""
-		inspection.SideEffects[index].StdoutPath = ""
-		inspection.SideEffects[index].StderrPath = ""
-	}
-	for index := range inspection.Polls {
-		inspection.Polls[index].SnapshotJSON = ""
-	}
-	for index := range inspection.Findings {
-		inspection.Findings[index].Body = ""
-		inspection.Findings[index].File = ""
-	}
-	for index := range inspection.Cleanup {
-		inspection.Cleanup[index].Name = ""
-		inspection.Cleanup[index].LastError = ""
-	}
+	application.SanitizeInspection(inspection)
+}
+
+func cliRequester(login string) application.Requester {
+	return application.Requester{ID: login, Kind: "github_login"}
 }
 
 func splitLeadingRunID(args []string) (string, []string) {
