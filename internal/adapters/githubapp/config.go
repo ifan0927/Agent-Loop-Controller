@@ -74,6 +74,10 @@ func (c Config) Validate() error {
 	if c.HTTPTimeout <= 0 || c.HTTPTimeout > 2*time.Minute || c.TokenRefreshSkew < 0 || c.TokenRefreshSkew >= time.Hour {
 		return errors.New("invalid GitHub timeout or refresh skew")
 	}
+	configuredCodeRabbit := c.CodeRabbitActorID > 0 || c.CodeRabbitNodeID != "" || c.CodeRabbitAppID > 0
+	if configuredCodeRabbit && (c.CodeRabbitActorID < 1 || c.CodeRabbitNodeID == "" || c.CodeRabbitAppID < 1) {
+		return errors.New("CodeRabbit identity must include actor, node, and App IDs")
+	}
 	for _, raw := range []string{c.APIBaseURL, c.GraphQLURL} {
 		if !strings.HasPrefix(raw, "https://") && !strings.HasPrefix(raw, "http://127.0.0.1:") {
 			return errors.New("GitHub endpoint must use HTTPS")
@@ -93,6 +97,9 @@ func ReadPrivateKeyFile(path string) ([]byte, error) {
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return nil, errors.New("private key source must be a non-symlink regular file")
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return nil, errors.New("private key source must not be group or world accessible")
 	}
 	clean := filepath.Clean(path)
 	resolved, err := filepath.EvalSymlinks(clean)

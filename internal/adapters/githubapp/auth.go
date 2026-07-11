@@ -1,6 +1,7 @@
 package githubapp
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -30,8 +31,8 @@ func (s JWTSigner) Sign() (string, error) {
 	if s.AppID < 1 || s.Clock == nil {
 		return "", errors.New("invalid GitHub App JWT signer configuration")
 	}
-	block, _ := pem.Decode(s.KeyPEM)
-	if block == nil {
+	block, rest := pem.Decode(s.KeyPEM)
+	if block == nil || (block.Type != "PRIVATE KEY" && block.Type != "RSA PRIVATE KEY") || len(bytes.TrimSpace(rest)) != 0 {
 		return "", errors.New("invalid GitHub App private key format")
 	}
 	var key *rsa.PrivateKey
@@ -43,6 +44,9 @@ func (s JWTSigner) Sign() (string, error) {
 	}
 	if key == nil || key.N.BitLen() < 2048 {
 		return "", errors.New("GitHub App private key must be RSA with at least 2048 bits")
+	}
+	if err := key.Validate(); err != nil {
+		return "", errors.New("invalid GitHub App RSA private key")
 	}
 	now := s.Clock.Now().UTC()
 	header := map[string]string{"alg": "RS256", "typ": "JWT"}

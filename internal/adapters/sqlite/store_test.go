@@ -37,6 +37,19 @@ func TestGitHubV6EvidencePersistsMetadataWithoutSecrets(t *testing.T) {
 	if err := store.SaveGitHubEvidence(ctx, "run-gh", e); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.SaveGitHubEvidence(ctx, "run-gh", e); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveGitHubRequest(ctx, application.GitHubRequestObservation{RunID: "run-gh", Operation: "repository", Category: "REST", HTTPStatus: 200, ResponseDigest: "response-digest", InstallationID: 2, Repository: repo, ObservedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM github_read_evidence WHERE run_id='run-gh'`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("evidence count=%d err=%v", count, err)
+	}
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM github_request_observations WHERE run_id='run-gh'`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("request count=%d err=%v", count, err)
+	}
 	inspection, err := store.Inspect(ctx, "run-gh")
 	if err != nil {
 		t.Fatal(err)

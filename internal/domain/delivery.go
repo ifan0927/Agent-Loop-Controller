@@ -19,6 +19,7 @@ const (
 
 type PullRequest struct {
 	Number       int64     `json:"number"`
+	DatabaseID   int64     `json:"database_id,omitempty"`
 	URL          string    `json:"url"`
 	NodeID       string    `json:"node_id"`
 	HeadBranch   string    `json:"head_branch"`

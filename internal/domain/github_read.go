@@ -44,6 +44,7 @@ type GitHubCheck struct {
 	Name        string     `json:"name"`
 	Required    bool       `json:"required"`
 	Source      string     `json:"source"`
+	AppID       int64      `json:"app_id,omitempty"`
 	State       CheckState `json:"state"`
 	ObservedSHA string     `json:"observed_sha"`
 	SourceAt    time.Time  `json:"source_timestamp"`
@@ -77,6 +78,15 @@ type NormalizedFinding struct {
 	ObservedAt     time.Time `json:"observation_timestamp"`
 }
 
+type GitHubReview struct {
+	DatabaseID int64         `json:"database_id"`
+	NodeID     string        `json:"node_id"`
+	State      string        `json:"state"`
+	Actor      ActorIdentity `json:"actor"`
+	CommitSHA  string        `json:"commit_sha"`
+	SourceAt   time.Time     `json:"source_timestamp"`
+}
+
 type GitHubReadEvidence struct {
 	Repository     RepositoryIdentity  `json:"repository"`
 	PullRequest    PullRequest         `json:"pull_request"`
@@ -84,6 +94,7 @@ type GitHubReadEvidence struct {
 	ReviewDecision string              `json:"review_decision"`
 	CodeRabbit     CodeRabbitState     `json:"coderabbit_status"`
 	Findings       []NormalizedFinding `json:"findings"`
+	Reviews        []GitHubReview      `json:"reviews"`
 	UnknownEvents  []string            `json:"unknown_telemetry"`
 	ObservedAt     time.Time           `json:"observed_at"`
 }

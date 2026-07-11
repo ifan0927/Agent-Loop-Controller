@@ -54,6 +54,8 @@ Run the opt-in read-only smoke only against the selected fixture repository:
 ```sh
 go run ./cmd/ifan-loop github-read \
   --config /absolute/protected/path/github-app.json \
+  --db /absolute/path/controller.db \
+  --run-id '<persisted-run-id>' \
   --pr 1 \
   --expected-head '<exact-head-sha>'
 ```

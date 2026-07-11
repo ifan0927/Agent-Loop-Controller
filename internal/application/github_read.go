@@ -42,11 +42,11 @@ type GitHubEvidenceStore interface {
 	SaveGitHubEvidence(context.Context, string, domain.GitHubReadEvidence) error
 }
 
-func ReconcileGitHubRead(expectedRepository domain.RepositoryIdentity, expectedPR int64, branch, base, head, baseSHA, ownershipKey, bodyDigest string, got domain.GitHubReadEvidence) error {
+func ReconcileGitHubRead(expectedRepository domain.RepositoryIdentity, expectedPR domain.PullRequest, branch, base, head, baseSHA, ownershipKey, bodyDigest string, got domain.GitHubReadEvidence) error {
 	if got.Repository != expectedRepository {
 		return fmt.Errorf("GitHub repository identity mismatch")
 	}
-	if got.PullRequest.Number != expectedPR {
+	if got.PullRequest.Number != expectedPR.Number || got.PullRequest.NodeID != expectedPR.NodeID || got.PullRequest.URL != expectedPR.URL || (expectedPR.DatabaseID > 0 && got.PullRequest.DatabaseID != expectedPR.DatabaseID) {
 		return fmt.Errorf("GitHub pull request identity mismatch")
 	}
 	if err := got.PullRequest.ValidateOwnership(branch, base, head, ownershipKey); err != nil {

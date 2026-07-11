@@ -196,9 +196,10 @@ var migrationV5 = []string{
 }
 
 var migrationV6 = []string{
-	`CREATE TABLE github_installations (run_id TEXT PRIMARY KEY REFERENCES runs(run_id), app_id INTEGER NOT NULL, installation_id INTEGER NOT NULL, repository_id INTEGER NOT NULL, repository_node_id TEXT NOT NULL, repository_owner TEXT NOT NULL, repository_name TEXT NOT NULL, token_expires_at TEXT NOT NULL, permissions_digest TEXT NOT NULL, observed_at TEXT NOT NULL)`,
-	`CREATE TABLE github_request_observations (observation_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), operation_name TEXT NOT NULL, endpoint_category TEXT NOT NULL, http_status INTEGER NOT NULL, request_id TEXT NOT NULL DEFAULT '', rate_limit_limit INTEGER NOT NULL DEFAULT 0, rate_limit_remaining INTEGER NOT NULL DEFAULT 0, rate_limit_reset TEXT NOT NULL DEFAULT '', response_digest TEXT NOT NULL, error_class TEXT NOT NULL DEFAULT '', installation_id INTEGER NOT NULL, repository_id INTEGER NOT NULL, repository_node_id TEXT NOT NULL, repository_owner TEXT NOT NULL, repository_name TEXT NOT NULL, observed_at TEXT NOT NULL)`,
-	`CREATE TABLE github_read_evidence (run_id TEXT PRIMARY KEY REFERENCES runs(run_id), evidence_json TEXT NOT NULL, evidence_digest TEXT NOT NULL, observed_at TEXT NOT NULL)`,
+	`ALTER TABLE pull_requests ADD COLUMN database_id INTEGER NOT NULL DEFAULT 0`,
+	`CREATE TABLE github_installations (observation_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), app_id INTEGER NOT NULL, installation_id INTEGER NOT NULL, repository_id INTEGER NOT NULL, repository_node_id TEXT NOT NULL, repository_owner TEXT NOT NULL, repository_name TEXT NOT NULL, token_expires_at TEXT NOT NULL, permissions_digest TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE(run_id,app_id,installation_id,repository_id,token_expires_at,permissions_digest))`,
+	`CREATE TABLE github_request_observations (observation_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), operation_name TEXT NOT NULL, endpoint_category TEXT NOT NULL, http_status INTEGER NOT NULL, request_id TEXT NOT NULL DEFAULT '', rate_limit_limit INTEGER NOT NULL DEFAULT 0, rate_limit_remaining INTEGER NOT NULL DEFAULT 0, rate_limit_reset TEXT NOT NULL DEFAULT '', response_digest TEXT NOT NULL, error_class TEXT NOT NULL DEFAULT '', installation_id INTEGER NOT NULL, repository_id INTEGER NOT NULL, repository_node_id TEXT NOT NULL, repository_owner TEXT NOT NULL, repository_name TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE(run_id,operation_name,http_status,request_id,response_digest,error_class))`,
+	`CREATE TABLE github_read_evidence (evidence_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), head_sha TEXT NOT NULL, repository_id INTEGER NOT NULL, evidence_json TEXT NOT NULL, evidence_digest TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE(run_id,head_sha,evidence_digest))`,
 }
 
 func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput) (application.Run, bool, error) {
@@ -356,15 +357,19 @@ func (s *Store) SetLastError(ctx context.Context, id, message string) error {
 }
 
 func (s *Store) SaveGitHubInstallation(ctx context.Context, runID string, m application.GitHubInstallationMetadata) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO github_installations(run_id,app_id,installation_id,repository_id,repository_node_id,repository_owner,repository_name,token_expires_at,permissions_digest,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET app_id=excluded.app_id,installation_id=excluded.installation_id,repository_id=excluded.repository_id,repository_node_id=excluded.repository_node_id,repository_owner=excluded.repository_owner,repository_name=excluded.repository_name,token_expires_at=excluded.token_expires_at,permissions_digest=excluded.permissions_digest,observed_at=excluded.observed_at`, runID, m.AppID, m.InstallationID, m.Repository.ID, m.Repository.NodeID, m.Repository.Owner, m.Repository.Name, formatTime(m.TokenExpiresAt), m.PermissionsDigest, formatTime(m.ObservedAt))
+	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO github_installations(run_id,app_id,installation_id,repository_id,repository_node_id,repository_owner,repository_name,token_expires_at,permissions_digest,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, runID, m.AppID, m.InstallationID, m.Repository.ID, m.Repository.NodeID, m.Repository.Owner, m.Repository.Name, formatTime(m.TokenExpiresAt), m.PermissionsDigest, formatTime(m.ObservedAt))
 	return err
 }
 
 func (s *Store) SaveGitHubRequest(ctx context.Context, o application.GitHubRequestObservation) error {
-	if strings.TrimSpace(o.RunID) == "" || strings.TrimSpace(o.ResponseDigest) == "" {
-		return errors.New("GitHub request observation lacks run or digest")
+	if strings.TrimSpace(o.RunID) == "" {
+		return errors.New("GitHub request observation lacks run")
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO github_request_observations(run_id,operation_name,endpoint_category,http_status,request_id,rate_limit_limit,rate_limit_remaining,rate_limit_reset,response_digest,error_class,installation_id,repository_id,repository_node_id,repository_owner,repository_name,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, o.RunID, o.Operation, o.Category, o.HTTPStatus, o.RequestID, o.RateLimitLimit, o.RateLimitRemaining, formatTime(o.RateLimitReset), o.ResponseDigest, o.ErrorClass, o.InstallationID, o.Repository.ID, o.Repository.NodeID, o.Repository.Owner, o.Repository.Name, formatTime(o.ObservedAt))
+	if strings.TrimSpace(o.ResponseDigest) == "" {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%d\x00%s", o.Operation, o.Category, o.HTTPStatus, o.ErrorClass)))
+		o.ResponseDigest = hex.EncodeToString(sum[:])
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO github_request_observations(run_id,operation_name,endpoint_category,http_status,request_id,rate_limit_limit,rate_limit_remaining,rate_limit_reset,response_digest,error_class,installation_id,repository_id,repository_node_id,repository_owner,repository_name,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, o.RunID, o.Operation, o.Category, o.HTTPStatus, o.RequestID, o.RateLimitLimit, o.RateLimitRemaining, formatTime(o.RateLimitReset), o.ResponseDigest, o.ErrorClass, o.InstallationID, o.Repository.ID, o.Repository.NodeID, o.Repository.Owner, o.Repository.Name, formatTime(o.ObservedAt))
 	return err
 }
 
@@ -374,7 +379,7 @@ func (s *Store) SaveGitHubEvidence(ctx context.Context, runID string, e domain.G
 		return err
 	}
 	sum := sha256.Sum256(raw)
-	_, err = s.db.ExecContext(ctx, `INSERT INTO github_read_evidence(run_id,evidence_json,evidence_digest,observed_at) VALUES(?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET evidence_json=excluded.evidence_json,evidence_digest=excluded.evidence_digest,observed_at=excluded.observed_at`, runID, string(raw), hex.EncodeToString(sum[:]), formatTime(e.ObservedAt))
+	_, err = s.db.ExecContext(ctx, `INSERT OR IGNORE INTO github_read_evidence(run_id,head_sha,repository_id,evidence_json,evidence_digest,observed_at) VALUES(?,?,?,?,?,?)`, runID, e.PullRequest.HeadSHA, e.Repository.ID, string(raw), hex.EncodeToString(sum[:]), formatTime(e.ObservedAt))
 	return err
 }
 
@@ -498,14 +503,14 @@ func (s *Store) FinishSideEffect(ctx context.Context, record application.SideEff
 }
 
 func (s *Store) SavePullRequest(ctx context.Context, runID string, pr domain.PullRequest) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO pull_requests(run_id,number,url,node_id,head_branch,base_branch,head_sha,base_sha,body_digest,ownership_key,state,merged,merge_sha,merged_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, runID, pr.Number, pr.URL, pr.NodeID, pr.HeadBranch, pr.BaseBranch, pr.HeadSHA, pr.BaseSHA, pr.BodyDigest, pr.OwnershipKey, pr.State, pr.Merged, pr.MergeSHA, formatTime(pr.MergedAt))
+	_, err := s.db.ExecContext(ctx, `INSERT INTO pull_requests(run_id,number,database_id,url,node_id,head_branch,base_branch,head_sha,base_sha,body_digest,ownership_key,state,merged,merge_sha,merged_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, runID, pr.Number, pr.DatabaseID, pr.URL, pr.NodeID, pr.HeadBranch, pr.BaseBranch, pr.HeadSHA, pr.BaseSHA, pr.BodyDigest, pr.OwnershipKey, pr.State, pr.Merged, pr.MergeSHA, formatTime(pr.MergedAt))
 	if err == nil {
 		return nil
 	}
 	var existing domain.PullRequest
 	var merged int
 	var mergedAt string
-	if scanErr := s.db.QueryRowContext(ctx, `SELECT number,url,node_id,head_branch,base_branch,head_sha,base_sha,body_digest,ownership_key,state,merged,merge_sha,merged_at FROM pull_requests WHERE run_id=?`, runID).Scan(&existing.Number, &existing.URL, &existing.NodeID, &existing.HeadBranch, &existing.BaseBranch, &existing.HeadSHA, &existing.BaseSHA, &existing.BodyDigest, &existing.OwnershipKey, &existing.State, &merged, &existing.MergeSHA, &mergedAt); scanErr != nil {
+	if scanErr := s.db.QueryRowContext(ctx, `SELECT number,database_id,url,node_id,head_branch,base_branch,head_sha,base_sha,body_digest,ownership_key,state,merged,merge_sha,merged_at FROM pull_requests WHERE run_id=?`, runID).Scan(&existing.Number, &existing.DatabaseID, &existing.URL, &existing.NodeID, &existing.HeadBranch, &existing.BaseBranch, &existing.HeadSHA, &existing.BaseSHA, &existing.BodyDigest, &existing.OwnershipKey, &existing.State, &merged, &existing.MergeSHA, &mergedAt); scanErr != nil {
 		return err
 	}
 	existing.Merged = merged != 0
@@ -707,7 +712,7 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 	var pr domain.PullRequest
 	var merged int
 	var mergedAt string
-	if err := s.db.QueryRowContext(ctx, `SELECT number,url,node_id,head_branch,base_branch,head_sha,base_sha,body_digest,ownership_key,state,merged,merge_sha,merged_at FROM pull_requests WHERE run_id=?`, id).Scan(&pr.Number, &pr.URL, &pr.NodeID, &pr.HeadBranch, &pr.BaseBranch, &pr.HeadSHA, &pr.BaseSHA, &pr.BodyDigest, &pr.OwnershipKey, &pr.State, &merged, &pr.MergeSHA, &mergedAt); err == nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT number,database_id,url,node_id,head_branch,base_branch,head_sha,base_sha,body_digest,ownership_key,state,merged,merge_sha,merged_at FROM pull_requests WHERE run_id=?`, id).Scan(&pr.Number, &pr.DatabaseID, &pr.URL, &pr.NodeID, &pr.HeadBranch, &pr.BaseBranch, &pr.HeadSHA, &pr.BaseSHA, &pr.BodyDigest, &pr.OwnershipKey, &pr.State, &merged, &pr.MergeSHA, &mergedAt); err == nil {
 		pr.Merged = merged != 0
 		pr.MergedAt = parseTime(mergedAt)
 		inspection.PullRequest = &pr
@@ -780,7 +785,7 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 	rows.Close()
 	var installation application.GitHubInstallationMetadata
 	var tokenExpiry, installationObserved string
-	if err := s.db.QueryRowContext(ctx, `SELECT app_id,installation_id,repository_id,repository_node_id,repository_owner,repository_name,token_expires_at,permissions_digest,observed_at FROM github_installations WHERE run_id=?`, id).Scan(&installation.AppID, &installation.InstallationID, &installation.Repository.ID, &installation.Repository.NodeID, &installation.Repository.Owner, &installation.Repository.Name, &tokenExpiry, &installation.PermissionsDigest, &installationObserved); err == nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT app_id,installation_id,repository_id,repository_node_id,repository_owner,repository_name,token_expires_at,permissions_digest,observed_at FROM github_installations WHERE run_id=? ORDER BY observation_id DESC LIMIT 1`, id).Scan(&installation.AppID, &installation.InstallationID, &installation.Repository.ID, &installation.Repository.NodeID, &installation.Repository.Owner, &installation.Repository.Name, &tokenExpiry, &installation.PermissionsDigest, &installationObserved); err == nil {
 		installation.TokenExpiresAt = parseTime(tokenExpiry)
 		installation.ObservedAt = parseTime(installationObserved)
 		inspection.GitHubInstallation = &installation
@@ -804,8 +809,12 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 		inspection.GitHubRequests = append(inspection.GitHubRequests, o)
 	}
 	rows.Close()
-	var evidenceJSON string
-	if err := s.db.QueryRowContext(ctx, `SELECT evidence_json FROM github_read_evidence WHERE run_id=?`, id).Scan(&evidenceJSON); err == nil {
+	var evidenceJSON, evidenceDigest string
+	if err := s.db.QueryRowContext(ctx, `SELECT evidence_json,evidence_digest FROM github_read_evidence WHERE run_id=? ORDER BY evidence_id DESC LIMIT 1`, id).Scan(&evidenceJSON, &evidenceDigest); err == nil {
+		sum := sha256.Sum256([]byte(evidenceJSON))
+		if hex.EncodeToString(sum[:]) != evidenceDigest {
+			return inspection, errors.New("persisted GitHub evidence digest mismatch")
+		}
 		var e domain.GitHubReadEvidence
 		if err := json.Unmarshal([]byte(evidenceJSON), &e); err != nil {
 			return inspection, err

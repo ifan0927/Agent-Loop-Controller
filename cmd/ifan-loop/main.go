@@ -68,8 +68,8 @@ func githubRead(args []string) error {
 	if *configPath == "" || *pr < 1 || *head == "" {
 		return errors.New("--config, --pr, and --expected-head are required")
 	}
-	if (*dbPath == "") != (*runID == "") {
-		return errors.New("--db and --run-id must be provided together")
+	if *dbPath == "" || *runID == "" {
+		return errors.New("--db and --run-id are required for persisted ownership reconciliation")
 	}
 	file, err := os.Open(*configPath)
 	if err != nil {
@@ -80,13 +80,25 @@ func githubRead(args []string) error {
 	if decodeErr != nil {
 		return decodeErr
 	}
-	var store *sqlitestore.Store
-	if *dbPath != "" {
-		store, err = sqlitestore.Open(*dbPath)
-		if err != nil {
-			return err
-		}
-		defer store.Close()
+	store, err := sqlitestore.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	inspection, err := store.Inspect(context.Background(), *runID)
+	if err != nil {
+		return err
+	}
+	if inspection.PullRequest == nil {
+		return errors.New("persisted PR identity is required")
+	}
+	parts := strings.Split(inspection.Run.Repository, "/")
+	if len(parts) != 2 || parts[0] != cfg.RepositoryOwner || parts[1] != cfg.RepositoryName {
+		return errors.New("configured repository does not match persisted run repository")
+	}
+	expectedRepository := domain.RepositoryIdentity{ID: cfg.RepositoryID, Owner: cfg.RepositoryOwner, Name: cfg.RepositoryName}
+	if inspection.GitHubInstallation != nil {
+		expectedRepository = inspection.GitHubInstallation.Repository
 	}
 	observations := []application.GitHubRequestObservation{}
 	observer := func(o application.GitHubRequestObservation) { o.RunID = *runID; observations = append(observations, o) }
@@ -96,26 +108,30 @@ func githubRead(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.HTTPTimeout*20)
 	defer cancel()
-	evidence, err := client.Read(ctx, *pr, *head)
-	if err != nil {
+	evidence, readErr := client.Read(ctx, *pr, *head)
+	metadata := client.InstallationMetadata()
+	for _, o := range observations {
+		if saveErr := store.SaveGitHubRequest(ctx, o); saveErr != nil {
+			return saveErr
+		}
+	}
+	if readErr != nil {
+		return readErr
+	}
+	if expectedRepository.NodeID == "" {
+		expectedRepository.NodeID = evidence.Repository.NodeID
+	}
+	if err := application.ReconcileGitHubRead(expectedRepository, *inspection.PullRequest, inspection.Run.WorkingBranch, inspection.Run.BaseBranch, inspection.Run.CandidateHead, inspection.Run.BaseSHA, inspection.Run.IdempotencyKey, inspection.PullRequest.BodyDigest, evidence); err != nil {
 		return err
 	}
-	metadata := client.InstallationMetadata()
-	if store != nil {
-		if _, err := store.GetRun(ctx, *runID); err != nil {
-			return err
-		}
-		if err := store.SaveGitHubInstallation(ctx, *runID, metadata); err != nil {
-			return err
-		}
-		for _, o := range observations {
-			if err := store.SaveGitHubRequest(ctx, o); err != nil {
-				return err
-			}
-		}
-		if err := store.SaveGitHubEvidence(ctx, *runID, evidence); err != nil {
-			return err
-		}
+	if inspection.GitHubInstallation != nil && (metadata.InstallationID != inspection.GitHubInstallation.InstallationID || metadata.AppID != inspection.GitHubInstallation.AppID) {
+		return errors.New("GitHub App installation binding mismatch")
+	}
+	if err := store.SaveGitHubInstallation(ctx, *runID, metadata); err != nil {
+		return err
+	}
+	if err := store.SaveGitHubEvidence(ctx, *runID, evidence); err != nil {
+		return err
 	}
 	return printJSON(struct {
 		Installation application.GitHubInstallationMetadata `json:"installation"`
