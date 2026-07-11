@@ -613,7 +613,13 @@ type rawReviewComment struct {
 	Line       int       `json:"line"`
 	Outdated   bool      `json:"outdated"`
 	CreatedAt  time.Time `json:"createdAt"`
-	Author     struct {
+	Commit     struct {
+		OID string `json:"oid"`
+	} `json:"commit"`
+	OriginalCommit struct {
+		OID string `json:"oid"`
+	} `json:"originalCommit"`
+	Author struct {
 		Login      string `json:"login"`
 		Typename   string `json:"__typename"`
 		ID         string `json:"id"`
@@ -625,8 +631,8 @@ type graphPageInfo struct {
 	EndCursor   string `json:"endCursor"`
 }
 
-const reviewQuery = `query ReadPullRequestReviews($owner:String!,$name:String!,$number:Int!,$cursor:String,$reviewCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewDecision reviews(first:100,after:$reviewCursor){nodes{id databaseId state commit{oid} submittedAt author{login __typename ... on Bot{id databaseId}}} pageInfo{hasNextPage endCursor}} reviewThreads(first:100,after:$cursor){nodes{id isResolved isOutdated comments(first:100){totalCount nodes{id databaseId body path line outdated createdAt author{login __typename ... on Bot{id databaseId}} authorAssociation} pageInfo{hasNextPage endCursor}}}pageInfo{hasNextPage endCursor}}}}}`
-const threadCommentsQuery = `query ReadReviewThreadComments($id:ID!,$cursor:String){node(id:$id){... on PullRequestReviewThread{comments(first:100,after:$cursor){nodes{id databaseId body path line outdated createdAt author{login __typename ... on Bot{id databaseId}} authorAssociation} pageInfo{hasNextPage endCursor}}}}}`
+const reviewQuery = `query ReadPullRequestReviews($owner:String!,$name:String!,$number:Int!,$cursor:String,$reviewCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewDecision reviews(first:100,after:$reviewCursor){nodes{id databaseId state commit{oid} submittedAt author{login __typename ... on Bot{id databaseId}}} pageInfo{hasNextPage endCursor}} reviewThreads(first:100,after:$cursor){nodes{id isResolved isOutdated comments(first:100){totalCount nodes{id databaseId body path line outdated createdAt commit{oid} originalCommit{oid} author{login __typename ... on Bot{id databaseId}} authorAssociation} pageInfo{hasNextPage endCursor}}}pageInfo{hasNextPage endCursor}}}}}`
+const threadCommentsQuery = `query ReadReviewThreadComments($id:ID!,$cursor:String){node(id:$id){... on PullRequestReviewThread{comments(first:100,after:$cursor){nodes{id databaseId body path line outdated createdAt commit{oid} originalCommit{oid} author{login __typename ... on Bot{id databaseId}} authorAssociation} pageInfo{hasNextPage endCursor}}}}}`
 
 func (c *Client) readReviews(ctx context.Context, pr int64, head string, coderabbitCheck domain.CodeRabbitState) (string, []domain.GitHubReview, []domain.NormalizedFinding, domain.CodeRabbitState, []string, error) {
 	cursor := ""
@@ -728,6 +734,11 @@ func (c *Client) readReviews(ctx context.Context, pr int64, head string, coderab
 					seen[id] = true
 					dig := sha256.Sum256([]byte(m.Body))
 					trusted := coderabbitCheck != domain.CodeRabbitAbsent && coderabbitCheck != domain.CodeRabbitUnknown && c.cfg.CodeRabbitAppID > 0 && m.Author.DatabaseID == c.cfg.CodeRabbitActorID && m.Author.ID == c.cfg.CodeRabbitNodeID && m.Author.Typename == "Bot"
+					if trusted && m.Commit.OID != head {
+						unknown = append(unknown, "coderabbit_comment_head_binding_unavailable:"+id)
+						cr = mergeCodeRabbitState(cr, domain.CodeRabbitUnknown)
+						trusted = false
+					}
 					if strings.Contains(strings.ToLower(m.Author.Login), "coderabbit") && !trusted {
 						unknown = append(unknown, "coderabbit_comment_app_provenance_unavailable:"+id)
 						cr = mergeCodeRabbitState(cr, domain.CodeRabbitUntrusted)
@@ -742,7 +753,7 @@ func (c *Client) readReviews(ctx context.Context, pr int64, head string, coderab
 						}
 					}
 					if trusted {
-						findings = append(findings, domain.NormalizedFinding{Source: "coderabbit_review_comment", SourceID: id, ThreadID: t.ID, File: m.Path, Line: m.Line, Classification: "source_unspecified", BodyDigest: hex.EncodeToString(dig[:]), Resolved: t.IsResolved, Outdated: t.IsOutdated || m.Outdated, HeadSHA: head, SourceAt: m.CreatedAt, ObservedAt: c.clock.Now().UTC()})
+						findings = append(findings, domain.NormalizedFinding{Source: "coderabbit_review_comment", SourceID: id, ThreadID: t.ID, File: m.Path, Line: m.Line, Classification: "source_unspecified", BodyDigest: hex.EncodeToString(dig[:]), Resolved: t.IsResolved, Outdated: t.IsOutdated || m.Outdated, HeadSHA: m.Commit.OID, SourceAt: m.CreatedAt, ObservedAt: c.clock.Now().UTC()})
 					} else {
 						unknown = append(unknown, "untrusted_review_comment:"+id)
 					}

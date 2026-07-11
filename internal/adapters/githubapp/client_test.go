@@ -504,7 +504,7 @@ func TestReviewVariantsReplayThroughClientRead(t *testing.T) {
 }
 
 func reviewThreadJSON(resolved, outdated bool, actorID int64, nodeID, login string, commentOutdated bool) string {
-	return fmt.Sprintf(`{"id":"THREAD","isResolved":%t,"isOutdated":%t,"comments":{"totalCount":1,"nodes":[{"id":"COMMENT","databaseId":10,"body":"finding","path":"x.go","line":2,"outdated":%t,"createdAt":"2026-07-11T00:00:00Z","author":{"login":%q,"__typename":"Bot","id":%q,"databaseId":%d}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}`, resolved, outdated, commentOutdated, login, nodeID, actorID)
+	return fmt.Sprintf(`{"id":"THREAD","isResolved":%t,"isOutdated":%t,"comments":{"totalCount":1,"nodes":[{"id":"COMMENT","databaseId":10,"body":"finding","path":"x.go","line":2,"outdated":%t,"createdAt":"2026-07-11T00:00:00Z","commit":{"oid":"headsha"},"originalCommit":{"oid":"headsha"},"author":{"login":%q,"__typename":"Bot","id":%q,"databaseId":%d}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}`, resolved, outdated, commentOutdated, login, nodeID, actorID)
 }
 
 func reviewVariantServer(t *testing.T, threads string, checkApp int64) *httptest.Server {
@@ -610,7 +610,7 @@ func fixtureServer(t *testing.T, mint *atomic.Int32, always401 bool) *httptest.S
 			http.Error(w, "invalid comments connection selection", http.StatusBadRequest)
 			return
 		}
-		write(w, `{"data":{"repository":{"pullRequest":{"reviewDecision":"REVIEW_REQUIRED","reviewThreads":{"nodes":[{"id":"THREAD","isResolved":false,"isOutdated":false,"comments":{"totalCount":1,"nodes":[{"id":"COMMENT","databaseId":10,"body":"finding","path":"x.go","line":2,"outdated":false,"createdAt":"2026-07-11T00:00:00Z","author":{"login":"coderabbitai[bot]","__typename":"Bot","id":"BOT","databaseId":7}}]}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`)
+		write(w, `{"data":{"repository":{"pullRequest":{"reviewDecision":"REVIEW_REQUIRED","reviewThreads":{"nodes":[{"id":"THREAD","isResolved":false,"isOutdated":false,"comments":{"totalCount":1,"nodes":[{"id":"COMMENT","databaseId":10,"body":"finding","path":"x.go","line":2,"outdated":false,"createdAt":"2026-07-11T00:00:00Z","commit":{"oid":"headsha"},"originalCommit":{"oid":"headsha"},"author":{"login":"coderabbitai[bot]","__typename":"Bot","id":"BOT","databaseId":7}}]}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`)
 	})
 	return httptest.NewServer(mux)
 }
