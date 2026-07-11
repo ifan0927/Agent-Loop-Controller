@@ -488,13 +488,18 @@ func fixtureSquashMerge(repo fixtureRepository, run application.Run) (string, er
 	if len(fields) != 2 || fields[0] != run.BaseSHA {
 		return "", errors.New("fixture base moved before squash merge")
 	}
-	if _, err := runCommand(repo.SourcePath, "git", "fetch", "origin", run.WorkingBranch); err != nil {
+	workingRemote, err := runCommand(repo.SourcePath, "git", "ls-remote", "origin", "refs/heads/"+run.WorkingBranch)
+	if err != nil {
 		return "", err
+	}
+	workingFields := strings.Fields(workingRemote)
+	if len(workingFields) != 2 || workingFields[0] != run.CandidateHead {
+		return "", errors.New("remote working branch does not match exact approved candidate")
 	}
 	if _, err := runCommand(repo.SourcePath, "git", "checkout", run.BaseBranch); err != nil {
 		return "", err
 	}
-	if _, err := runCommand(repo.SourcePath, "git", "merge", "--squash", "refs/remotes/origin/"+run.WorkingBranch); err != nil {
+	if _, err := runCommand(repo.SourcePath, "git", "merge", "--squash", run.CandidateHead); err != nil {
 		return "", err
 	}
 	if _, err := runCommand(repo.SourcePath, "git", "commit", "-m", "Fixture squash merge"); err != nil {
