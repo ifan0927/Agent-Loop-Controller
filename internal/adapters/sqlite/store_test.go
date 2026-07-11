@@ -228,9 +228,19 @@ func TestSideEffectAndPullRequestConflictsFailClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	changedPR := pr
-	changedPR.HeadSHA = "other"
+	changedPR.BaseBranch = "other"
 	if err := store.SavePullRequest(ctx, "run-1", changedPR); err == nil {
 		t.Fatal("conflicting PR evidence must fail")
+	}
+	updatedPR := pr
+	updatedPR.HeadSHA = "h2"
+	updatedPR.BodyDigest = "d2"
+	if err := store.SavePullRequest(ctx, "run-1", updatedPR); err != nil {
+		t.Fatalf("owned PR head update: %v", err)
+	}
+	inspection, err := store.Inspect(ctx, "run-1")
+	if err != nil || inspection.PullRequest == nil || inspection.PullRequest.HeadSHA != "h2" {
+		t.Fatalf("updated PR=%+v err=%v", inspection.PullRequest, err)
 	}
 }
 

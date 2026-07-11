@@ -473,10 +473,10 @@ func (s *Store) SavePullRequest(ctx context.Context, runID string, pr domain.Pul
 	}
 	existing.Merged = merged != 0
 	existing.MergedAt = parseTime(mergedAt)
-	if existing.Number != pr.Number || existing.NodeID != pr.NodeID || existing.HeadBranch != pr.HeadBranch || existing.BaseBranch != pr.BaseBranch || existing.HeadSHA != pr.HeadSHA || existing.BaseSHA != pr.BaseSHA || existing.BodyDigest != pr.BodyDigest || existing.OwnershipKey != pr.OwnershipKey {
+	if existing.Number != pr.Number || existing.NodeID != pr.NodeID || existing.HeadBranch != pr.HeadBranch || existing.BaseBranch != pr.BaseBranch || existing.BaseSHA != pr.BaseSHA || existing.OwnershipKey != pr.OwnershipKey {
 		return errors.New("conflicting immutable pull request evidence")
 	}
-	return execOne(ctx, s.db, `UPDATE pull_requests SET url=?,state=?,merged=?,merge_sha=?,merged_at=? WHERE run_id=?`, pr.URL, pr.State, pr.Merged, pr.MergeSHA, formatTime(pr.MergedAt), runID)
+	return execOne(ctx, s.db, `UPDATE pull_requests SET url=?,head_sha=?,body_digest=?,state=?,merged=?,merge_sha=?,merged_at=? WHERE run_id=?`, pr.URL, pr.HeadSHA, pr.BodyDigest, pr.State, pr.Merged, pr.MergeSHA, formatTime(pr.MergedAt), runID)
 }
 
 func (s *Store) SavePollObservation(ctx context.Context, record application.PollObservation) error {

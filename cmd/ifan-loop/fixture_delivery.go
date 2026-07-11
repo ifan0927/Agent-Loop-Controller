@@ -202,7 +202,20 @@ func localFixtureDeliver(args []string) error {
 			if err := fixtureCleanup(ctx, store, repo, run); err != nil {
 				return err
 			}
-			if err := store.Transition(ctx, runID, run.State, domain.StateCompleted, "owned fixture resources cleaned", "fixture cleanup", inspection.Merge.MergeSHA); err != nil {
+			intent, _ := json.Marshal(map[string]string{"issue_id": run.IssueID, "merge_sha": inspection.Merge.MergeSHA, "expected_state": "Done via GitHub automation"})
+			linear, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{RunID: runID, Kind: "linear_completion_reconciliation", IdempotencyKey: inspection.Merge.MergeSHA, IntentJSON: string(intent), Attempt: 1})
+			if err != nil {
+				return err
+			}
+			if linear.Status != "observed" {
+				linear.Status = "observed"
+				linear.ResultJSON = `{"status":"pending_automation","controller_write":false}`
+				linear.ObservedAt = time.Now().UTC()
+				if err := store.FinishSideEffect(ctx, linear); err != nil {
+					return err
+				}
+			}
+			if err := store.Transition(ctx, runID, run.State, domain.StateCompleted, "owned resources cleaned; Linear automation observation persisted", linear.ResultJSON, inspection.Merge.MergeSHA); err != nil {
 				return err
 			}
 		case domain.StateCompleted:
@@ -323,7 +336,7 @@ func fixtureOpenPR(ctx context.Context, store *sqlitestore.Store, run applicatio
 	}
 	digest := sha256.Sum256([]byte(body))
 	intent, _ := json.Marshal(map[string]string{"head_branch": run.WorkingBranch, "base_branch": run.BaseBranch, "head_sha": run.CandidateHead, "body_digest": hex.EncodeToString(digest[:])})
-	side, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{RunID: run.ID, Kind: "open_pr", IdempotencyKey: run.IdempotencyKey, IntentJSON: string(intent), Attempt: 1})
+	side, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{RunID: run.ID, Kind: "open_pr", IdempotencyKey: run.IdempotencyKey + ":" + run.CandidateHead, IntentJSON: string(intent), Attempt: 1})
 	if err != nil {
 		return err
 	}
