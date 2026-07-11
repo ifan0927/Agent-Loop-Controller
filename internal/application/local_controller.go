@@ -548,8 +548,8 @@ func (c *LocalController) provision(ctx context.Context, run Run) error {
 }
 
 func (c *LocalController) execute(ctx context.Context, run Run, decision *Decision) error {
-	if run.ImplementationModel != codex.ImplementationModel {
-		return fmt.Errorf("run has missing or unsupported implementation model evidence: %q", run.ImplementationModel)
+	if err := validateRunModelPolicy(run); err != nil {
+		return err
 	}
 	inspection, err := c.store.Inspect(ctx, run.ID)
 	if err != nil {
@@ -870,8 +870,8 @@ func (c *LocalController) runVerification(ctx context.Context, run Run, phase st
 }
 
 func (c *LocalController) freshReview(ctx context.Context, run Run) error {
-	if run.ReviewModel != codex.ReviewModel {
-		return fmt.Errorf("run has missing or unsupported review model evidence: %q", run.ReviewModel)
+	if err := validateRunModelPolicy(run); err != nil {
+		return err
 	}
 	if err := c.validateWorkspace(ctx, run, true); err != nil {
 		return err
@@ -990,6 +990,9 @@ func (c *LocalController) authorizeReview(ctx context.Context, run Run, outcome 
 }
 
 func (c *LocalController) validateApproval(ctx context.Context, run Run) error {
+	if err := validateRunModelPolicy(run); err != nil {
+		return err
+	}
 	inspection, err := c.store.Inspect(ctx, run.ID)
 	if err != nil {
 		return err
@@ -1019,6 +1022,16 @@ func (c *LocalController) validateApproval(ctx context.Context, run Run) error {
 		}
 	}
 	return errors.New("passing exact-HEAD review evidence is missing")
+}
+
+func validateRunModelPolicy(run Run) error {
+	if run.ImplementationModel != codex.ImplementationModel {
+		return fmt.Errorf("run has missing or unsupported implementation model evidence: %q", run.ImplementationModel)
+	}
+	if run.ReviewModel != codex.ReviewModel {
+		return fmt.Errorf("run has missing or unsupported review model evidence: %q", run.ReviewModel)
+	}
+	return nil
 }
 
 func latestReviewForHead(records []ReviewRecord, head string) (ReviewRecord, bool) {

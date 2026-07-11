@@ -12,4 +12,7 @@ func TestLegacyRunWithoutModelEvidenceFailsClosed(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "missing or unsupported implementation model evidence") {
 		t.Fatalf("error=%v", err)
 	}
+	if err := validateRunModelPolicy(Run{ImplementationModel: "gpt-5.6-terra"}); err == nil || !strings.Contains(err.Error(), "review model evidence") {
+		t.Fatalf("legacy approval model error=%v", err)
+	}
 }
