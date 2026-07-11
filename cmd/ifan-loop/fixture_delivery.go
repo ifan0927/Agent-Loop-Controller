@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	gitadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/git"
@@ -53,8 +54,14 @@ func localFixtureDeliver(args []string) error {
 		return errors.New("run is actively leased by another delivery controller")
 	}
 	done := make(chan struct{})
-	defer func() { close(done); _ = store.ReleaseLease(context.Background(), runID, leaseOwner) }()
+	renewDone := make(chan struct{})
+	var stopOnce sync.Once
+	stopLease := func() {
+		stopOnce.Do(func() { close(done); <-renewDone; _ = store.ReleaseLease(context.Background(), runID, leaseOwner) })
+	}
+	defer stopLease()
 	go func() {
+		defer close(renewDone)
 		ticker := time.NewTicker(20 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -126,9 +133,12 @@ func localFixtureDeliver(args []string) error {
 				return errors.New("repairing state has no persisted actionable normalized findings")
 			}
 			controller := newLocalController(store, "codex", filepath.Dir(run.WorktreePath))
-			if _, err := controller.Repair(ctx, runID, application.BuildRepairPrompt(findings)); err != nil {
+			stopLease()
+			repaired, err := controller.Repair(ctx, runID, application.BuildRepairPrompt(findings))
+			if err != nil {
 				return err
 			}
+			return printJSON(repaired)
 		case domain.StateAwaitingHumanApproval:
 			if *approvalPath == "" {
 				return errors.New("explicit --approval is required; controller cannot approve its own PR")

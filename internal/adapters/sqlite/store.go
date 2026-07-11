@@ -184,7 +184,7 @@ var migrationV5 = []string{
 	`CREATE TABLE side_effects (side_effect_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), kind TEXT NOT NULL, idempotency_key TEXT NOT NULL, intent_json TEXT NOT NULL, status TEXT NOT NULL, result_json TEXT NOT NULL DEFAULT '', stdout_path TEXT NOT NULL DEFAULT '', stderr_path TEXT NOT NULL DEFAULT '', attempt INTEGER NOT NULL, created_at TEXT NOT NULL, observed_at TEXT NOT NULL DEFAULT '', UNIQUE(run_id,kind,idempotency_key))`,
 	`CREATE TABLE pull_requests (run_id TEXT PRIMARY KEY REFERENCES runs(run_id), number INTEGER NOT NULL, url TEXT NOT NULL, node_id TEXT NOT NULL, head_branch TEXT NOT NULL, base_branch TEXT NOT NULL, head_sha TEXT NOT NULL, base_sha TEXT NOT NULL, body_digest TEXT NOT NULL, ownership_key TEXT NOT NULL, state TEXT NOT NULL, merged INTEGER NOT NULL DEFAULT 0, merge_sha TEXT NOT NULL DEFAULT '', merged_at TEXT NOT NULL DEFAULT '')`,
 	`CREATE TABLE poll_observations (observation_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), pr_number INTEGER NOT NULL, attempt INTEGER NOT NULL, head_sha TEXT NOT NULL, status TEXT NOT NULL, snapshot_json TEXT NOT NULL, observed_at TEXT NOT NULL)`,
-	`CREATE TABLE review_findings (finding_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), source_id TEXT NOT NULL, thread_id TEXT NOT NULL DEFAULT '', source TEXT NOT NULL, file TEXT NOT NULL DEFAULT '', line INTEGER NOT NULL DEFAULT 0, severity TEXT NOT NULL, body_digest TEXT NOT NULL, resolved INTEGER NOT NULL, outdated INTEGER NOT NULL, head_sha TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE(run_id,source,source_id,head_sha))`,
+	`CREATE TABLE review_findings (finding_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), source_id TEXT NOT NULL, thread_id TEXT NOT NULL DEFAULT '', source TEXT NOT NULL, file TEXT NOT NULL DEFAULT '', line INTEGER NOT NULL DEFAULT 0, severity TEXT NOT NULL, body_digest TEXT NOT NULL, body_text TEXT NOT NULL, resolved INTEGER NOT NULL, outdated INTEGER NOT NULL, head_sha TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE(run_id,source,source_id,head_sha))`,
 	`CREATE TABLE human_approvals (run_id TEXT PRIMARY KEY REFERENCES runs(run_id), pr_number INTEGER NOT NULL, approver TEXT NOT NULL, source TEXT NOT NULL, approved_sha TEXT NOT NULL, ci_status TEXT NOT NULL, coderabbit_status TEXT NOT NULL, internal_review_sha TEXT NOT NULL, approved_at TEXT NOT NULL)`,
 	`CREATE TABLE merge_results (run_id TEXT PRIMARY KEY REFERENCES runs(run_id), pr_number INTEGER NOT NULL, pre_merge_head_sha TEXT NOT NULL, base_sha TEXT NOT NULL, merge_method TEXT NOT NULL CHECK(merge_method='squash'), merge_sha TEXT NOT NULL, merged_at TEXT NOT NULL)`,
 	`CREATE TABLE cleanup_results (cleanup_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), resource_kind TEXT NOT NULL, resource_name TEXT NOT NULL, status TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, UNIQUE(run_id,resource_kind,resource_name))`,
@@ -485,7 +485,7 @@ func (s *Store) SavePollObservation(ctx context.Context, record application.Poll
 }
 
 func (s *Store) SaveFinding(ctx context.Context, record application.FindingRecord) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO review_findings(run_id,source_id,thread_id,source,file,line,severity,body_digest,resolved,outdated,head_sha,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,source,source_id,head_sha) DO UPDATE SET thread_id=excluded.thread_id,file=excluded.file,line=excluded.line,severity=excluded.severity,body_digest=excluded.body_digest,resolved=excluded.resolved,outdated=excluded.outdated,observed_at=excluded.observed_at`, record.RunID, record.SourceID, record.ThreadID, record.Source, record.File, record.Line, record.Severity, record.BodyDigest, record.Resolved, record.Outdated, record.HeadSHA, formatTime(record.ObservedAt))
+	_, err := s.db.ExecContext(ctx, `INSERT INTO review_findings(run_id,source_id,thread_id,source,file,line,severity,body_digest,body_text,resolved,outdated,head_sha,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,source,source_id,head_sha) DO UPDATE SET thread_id=excluded.thread_id,file=excluded.file,line=excluded.line,severity=excluded.severity,body_digest=excluded.body_digest,body_text=excluded.body_text,resolved=excluded.resolved,outdated=excluded.outdated,observed_at=excluded.observed_at`, record.RunID, record.SourceID, record.ThreadID, record.Source, record.File, record.Line, record.Severity, record.BodyDigest, record.Body, record.Resolved, record.Outdated, record.HeadSHA, formatTime(record.ObservedAt))
 	return err
 }
 
@@ -674,7 +674,7 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 		inspection.Polls = append(inspection.Polls, v)
 	}
 	rows.Close()
-	rows, err = s.db.QueryContext(ctx, `SELECT finding_id,run_id,source_id,thread_id,source,file,line,severity,body_digest,resolved,outdated,head_sha,observed_at FROM review_findings WHERE run_id=? ORDER BY finding_id`, id)
+	rows, err = s.db.QueryContext(ctx, `SELECT finding_id,run_id,source_id,thread_id,source,file,line,severity,body_digest,body_text,resolved,outdated,head_sha,observed_at FROM review_findings WHERE run_id=? ORDER BY finding_id`, id)
 	if err != nil {
 		return inspection, err
 	}
@@ -682,7 +682,7 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 		var v application.FindingRecord
 		var resolved, outdated int
 		var observed string
-		if err := rows.Scan(&v.ID, &v.RunID, &v.SourceID, &v.ThreadID, &v.Source, &v.File, &v.Line, &v.Severity, &v.BodyDigest, &resolved, &outdated, &v.HeadSHA, &observed); err != nil {
+		if err := rows.Scan(&v.ID, &v.RunID, &v.SourceID, &v.ThreadID, &v.Source, &v.File, &v.Line, &v.Severity, &v.BodyDigest, &v.Body, &resolved, &outdated, &v.HeadSHA, &observed); err != nil {
 			rows.Close()
 			return inspection, err
 		}

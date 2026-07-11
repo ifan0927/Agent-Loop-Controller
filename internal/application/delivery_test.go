@@ -100,8 +100,8 @@ func TestCodeRabbitFindingIsNormalizedWithoutBodyExecution(t *testing.T) {
 	if err != nil || status != domain.ReconciliationActionable || len(store.findings) != 1 || store.findings[0].BodyDigest == body {
 		t.Fatalf("status=%s findings=%+v err=%v", status, store.findings, err)
 	}
-	if prompt := BuildRepairPrompt(store.findings); prompt == "" || contains(prompt, body) {
-		t.Fatalf("untrusted body entered repair prompt: %q", prompt)
+	if prompt := BuildRepairPrompt(store.findings); prompt == "" || !contains(prompt, body) || !contains(prompt, "untrusted_body=") {
+		t.Fatalf("normalized untrusted body missing from repair prompt: %q", prompt)
 	}
 }
 
