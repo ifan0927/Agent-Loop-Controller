@@ -572,7 +572,9 @@ func fixtureCleanup(ctx context.Context, store *sqlitestore.Store, repo fixtureR
 			if _, statErr := os.Stat(run.WorktreePath); errors.Is(statErr, os.ErrNotExist) {
 				err = nil
 			} else {
-				_, err = runCommand(repo.SourcePath, "git", "worktree", "remove", run.WorktreePath)
+				if err = validateCurrentFixtureWorktree(repo, run); err == nil {
+					_, err = runCommand(repo.SourcePath, "git", "worktree", "remove", run.WorktreePath)
+				}
 			}
 		case "remote_branch":
 			remote, remoteErr := runCommand(repo.SourcePath, "git", "ls-remote", "origin", "refs/heads/"+run.WorkingBranch)
@@ -614,6 +616,59 @@ func fixtureCleanup(ctx context.Context, store *sqlitestore.Store, repo fixtureR
 		if err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func validateCurrentFixtureWorktree(repo fixtureRepository, run application.Run) error {
+	canonical, err := filepath.EvalSymlinks(run.WorktreePath)
+	if err != nil {
+		return err
+	}
+	if canonical != run.WorktreePath {
+		return errors.New("worktree canonical path drift")
+	}
+	top, err := runCommand(run.WorktreePath, "git", "rev-parse", "--show-toplevel")
+	if err != nil || strings.TrimSpace(top) != canonical {
+		return errors.New("worktree path no longer identifies owned repository")
+	}
+	branch, err := runCommand(run.WorktreePath, "git", "branch", "--show-current")
+	if err != nil || strings.TrimSpace(branch) != run.WorkingBranch {
+		return errors.New("worktree branch ownership drift")
+	}
+	head, err := runCommand(run.WorktreePath, "git", "rev-parse", "HEAD")
+	if err != nil || strings.TrimSpace(head) != run.CandidateHead {
+		return errors.New("worktree HEAD ownership drift")
+	}
+	list, err := runCommand(repo.SourcePath, "git", "worktree", "list", "--porcelain")
+	if err != nil {
+		return err
+	}
+	wanted := "worktree " + canonical + "\n"
+	branchLine := "branch refs/heads/" + run.WorkingBranch
+	registered := false
+	for _, block := range strings.Split(strings.TrimSpace(list), "\n\n") {
+		if strings.Contains(block, wanted) && strings.Contains(block, branchLine) {
+			registered = true
+		}
+	}
+	if !registered {
+		return errors.New("worktree is no longer registered to owned source")
+	}
+	configured, err := runCommand(repo.SourcePath, "git", "remote", "get-url", "origin")
+	if err != nil {
+		return err
+	}
+	actual, err := filepath.EvalSymlinks(strings.TrimSpace(configured))
+	if err != nil {
+		return err
+	}
+	expected, err := filepath.EvalSymlinks(repo.OriginPath)
+	if err != nil {
+		return err
+	}
+	if actual != expected {
+		return errors.New("source origin ownership drift")
 	}
 	return nil
 }
