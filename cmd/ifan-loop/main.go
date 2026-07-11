@@ -113,8 +113,10 @@ func githubRead(args []string) error {
 	defer cancel()
 	evidence, readErr := client.Read(ctx, *pr, *head)
 	metadata := client.InstallationMetadata()
+	persistCtx, persistCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer persistCancel()
 	for _, o := range observations {
-		if saveErr := store.SaveGitHubRequest(ctx, o); saveErr != nil {
+		if saveErr := store.SaveGitHubRequest(persistCtx, o); saveErr != nil {
 			return saveErr
 		}
 	}

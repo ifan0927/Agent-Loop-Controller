@@ -43,7 +43,7 @@ func New(cfg Config, clock Clock, observer Observer) (*Client, error) {
 	if clock == nil {
 		clock = RealClock{}
 	}
-	return &Client{cfg: cfg, http: &http.Client{Timeout: cfg.HTTPTimeout}, clock: clock, observe: observer}, nil
+	return &Client{cfg: cfg, http: &http.Client{Timeout: cfg.HTTPTimeout}, clock: clock, observe: observer, repo: domain.RepositoryIdentity{ID: cfg.RepositoryID, Owner: cfg.RepositoryOwner, Name: cfg.RepositoryName}}, nil
 }
 func (c *Client) Read(ctx context.Context, pr int64, expectedHead string) (domain.GitHubReadEvidence, error) {
 	c.opMu.Lock()
