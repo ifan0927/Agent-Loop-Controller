@@ -69,6 +69,12 @@ App JWT and installation-token authentication, and direct REST/GraphQL evidence
 collection without `gh` or user authentication. Real access is opt-in; see
 [the operator handoff](docs/github-app-operator.md).
 
+The direct Linear read adapter now has the same fixture-first boundary: it reads
+one explicit IFAN identifier through a bounded GraphQL query, returns sanitized
+task-source and request evidence, and accepts only an external credential-source
+reference. It is not yet composed into a CLI command or admission workflow;
+those remain the responsibility of the next Linear admission slice.
+
 ## Try the contract planner
 
 ```sh

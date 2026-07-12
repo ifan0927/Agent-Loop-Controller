@@ -31,7 +31,9 @@
   `approval_ready` state.
 - Disposable fake-process integration plus opt-in real happy-path and resume
   smoke scripts.
-- No real Linear adapter, push, pull request, CodeRabbit, merge, or cleanup.
+- Direct read-only Linear issue normalization is implemented as a fixture-first
+  adapter, but it is not yet composed into admission or durable run state. Push,
+  pull request, CodeRabbit, merge, and cleanup remain outside this phase.
 
 ### Phase 1C: Post-approval GitHub delivery
 
@@ -42,9 +44,9 @@
 - Exact-head I-Fan approval, squash merge, and restart-safe owned cleanup.
 - Fake GitHub and disposable bare-origin integration by default.
 
-Deferred production integration includes the real Linear read/completion
-adapter, GitHub App identity, CodeRabbit-specific production API compatibility,
-and opt-in isolated real GitHub dogfooding.
+Deferred production integration includes Linear admission/completion composition,
+CodeRabbit-specific production API compatibility, and opt-in isolated real
+GitHub dogfooding.
 
 ## Phase 2: External trigger adapters
 
