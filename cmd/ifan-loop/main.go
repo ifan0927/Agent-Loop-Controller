@@ -18,6 +18,7 @@ import (
 	codexadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/codex"
 	gitadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/git"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/githubapp"
+	linearadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/linear"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/localissue"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/localregistry"
 	processadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/process"
@@ -45,6 +46,8 @@ func main() {
 		err = spike(os.Args[2:])
 	case "local":
 		err = local(os.Args[2:])
+	case "linear":
+		err = linear(os.Args[2:])
 	case "github-read":
 		err = githubRead(os.Args[2:])
 	default:
@@ -55,6 +58,88 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+func linear(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: ifan-loop linear start <IFAN-issue> --config <linear.json> --registry <repository-registry.json> --db <controller.db> --requester <login>")
+	}
+	switch args[0] {
+	case "start":
+		return linearStart(args[1:])
+	default:
+		return fmt.Errorf("unknown Linear command: %s", args[0])
+	}
+}
+
+func linearStart(args []string) error {
+	identifier, args := splitLinearStartIdentifier(args)
+	flags := flag.NewFlagSet("linear start", flag.ContinueOnError)
+	requesterIdentity := addRequesterFlags(flags)
+	configPath := flags.String("config", "", "Linear read-only configuration")
+	registryPath := flags.String("registry", "", "controller-owned local repository registry JSON")
+	dbPath := flags.String("db", "", "SQLite controller database")
+	codexBinary := flags.String("codex-binary", "codex", "Codex CLI binary")
+	timeout := flags.Duration("timeout", 30*time.Minute, "controller run timeout")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if identifier == "" && flags.NArg() == 1 {
+		identifier = flags.Arg(0)
+	}
+	if identifier == "" || flags.NArg() != 0 || *configPath == "" || *registryPath == "" || *dbPath == "" || !requesterIdentity.complete() {
+		return errors.New("one IFAN issue identifier plus --config, --registry, --db, and complete requester identity are required")
+	}
+	registry, err := localregistry.Load(*registryPath)
+	if err != nil {
+		return fmt.Errorf("load registry: %w", err)
+	}
+	configFile, err := os.Open(*configPath)
+	if err != nil {
+		return err
+	}
+	config, decodeErr := linearadapter.DecodeConfig(configFile)
+	configFile.Close()
+	if decodeErr != nil {
+		return decodeErr
+	}
+	reader, err := linearadapter.New(config, linearadapter.EnvironmentCredentialSource{Variable: "IFAN_LOOP_LINEAR_TOKEN"}, nil)
+	if err != nil {
+		return err
+	}
+	store, err := sqlitestore.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	service, err := application.NewLinearAdmissionService(reader, linearRegistryResolver{registry: registry}, store, newLocalController(store, *codexBinary, ""))
+	if err != nil {
+		return err
+	}
+	ctx, cancel := localContext(*timeout)
+	defer cancel()
+	result, _, err := service.Start(ctx, application.LinearStartCommand{Requester: requesterIdentity.value(), Identifier: identifier})
+	if err != nil {
+		return err
+	}
+	return printJSON(result.Run)
+}
+
+func splitLinearStartIdentifier(args []string) (string, []string) {
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		return args[0], args[1:]
+	}
+	return "", args
+}
+
+type linearRegistryResolver struct{ registry localregistry.Registry }
+
+func (r linearRegistryResolver) ResolveLinearAdmissionRepository(label string) (application.LocalRepository, bool) {
+	repository, err := r.registry.Resolve(label)
+	if err != nil {
+		return application.LocalRepository{}, false
+	}
+	return localRepository(repository), true
 }
 
 func githubRead(args []string) error {

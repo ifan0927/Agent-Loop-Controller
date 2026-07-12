@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -19,6 +20,7 @@ type Spec struct {
 	StdoutPath   string
 	StderrPath   string
 	MustNotExist []string
+	ExcludedEnv  []string
 }
 
 type Result struct {
@@ -62,6 +64,9 @@ func (r OSRunner) Run(ctx context.Context, spec Spec) (Result, error) {
 	command.Stdin = bytes.NewBufferString(spec.Stdin)
 	command.Stdout = stdoutFile
 	command.Stderr = stderrFile
+	if len(spec.ExcludedEnv) > 0 {
+		command.Env = withoutEnvironment(os.Environ(), spec.ExcludedEnv)
+	}
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := command.Start(); err != nil {
 		return Result{}, fmt.Errorf("start %s: %w", spec.Program, err)
@@ -88,6 +93,24 @@ func (r OSRunner) Run(ctx context.Context, spec Spec) (Result, error) {
 		}
 		return Result{ExitCode: command.ProcessState.ExitCode(), StdoutPath: spec.StdoutPath, StderrPath: spec.StderrPath}, ctx.Err()
 	}
+}
+
+func withoutEnvironment(environment, excluded []string) []string {
+	blocked := make(map[string]struct{}, len(excluded))
+	for _, name := range excluded {
+		blocked[name] = struct{}{}
+	}
+	filtered := make([]string, 0, len(environment))
+	for _, value := range environment {
+		name, _, found := strings.Cut(value, "=")
+		if found {
+			if _, reject := blocked[name]; reject {
+				continue
+			}
+		}
+		filtered = append(filtered, value)
+	}
+	return filtered
 }
 
 func openExclusive(path string) (*os.File, error) {

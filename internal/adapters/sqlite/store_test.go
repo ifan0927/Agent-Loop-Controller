@@ -115,6 +115,29 @@ func TestMigrationAndRunIdempotency(t *testing.T) {
 	}
 }
 
+func TestLinearSourceDriftHaltsTheExactActiveRun(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	input := application.CreateRunInput{Run: application.Run{ID: "run-drift", IssueID: "IFAN-42", IdempotencyKey: "key-drift", SourceRevision: "revision-1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "ifan/ifan-42", ArtifactRoot: "/tmp/run-drift", ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}}
+	if _, _, err := store.CreateRun(context.Background(), input); err != nil {
+		t.Fatal(err)
+	}
+	if marked, err := store.MarkLinearSourceDrift(context.Background(), "run-drift", domain.StateReceived, "revision-1", "linear-source-drift:digest"); err != nil || !marked {
+		t.Fatalf("marked=%t err=%v", marked, err)
+	}
+	run, found, err := store.GetRunByIssue(context.Background(), "IFAN-42")
+	if err != nil || !found || run.ID != "run-drift" || run.State != domain.StateManualIntervention {
+		t.Fatalf("run=%+v found=%t err=%v", run, found, err)
+	}
+	inspection, err := store.Inspect(context.Background(), "run-drift")
+	if err != nil || inspection.Run.State != domain.StateManualIntervention || len(inspection.Timeline) != 2 || inspection.Timeline[1].EvidenceReference != "linear-source-drift:digest" {
+		t.Fatalf("inspection=%+v err=%v", inspection, err)
+	}
+}
+
 func TestRunIdempotencyRejectsLocalOwnershipPathDrift(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {

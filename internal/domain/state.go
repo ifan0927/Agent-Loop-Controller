@@ -60,6 +60,20 @@ func ValidateTransition(from, to State) error {
 	return nil
 }
 
+// CanRequireManualIntervention permits an external authority conflict to halt
+// any non-terminal run without guessing how a human will resolve it.
+func CanRequireManualIntervention(from State) bool {
+	switch from {
+	case StateReceived, StateAdmitting, StateProvisioning, StateExecuting, StateAwaitingHumanDecision,
+		StateVerifying, StateFreshReview, StateApprovalReady, StatePushingBranch, StateBranchPushed,
+		StateOpeningPR, StateRepairing, StatePROpen, StateReconcilingReviews, StateAwaitingHumanApproval,
+		StateMerging, StateCleaning:
+		return true
+	default:
+		return false
+	}
+}
+
 func set(states ...State) map[State]struct{} {
 	result := make(map[State]struct{}, len(states))
 	for _, state := range states {

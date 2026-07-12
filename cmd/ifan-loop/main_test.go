@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -101,6 +102,19 @@ func TestLocalContinueRequiresCallerCASExpectations(t *testing.T) {
 	err := localContinue([]string{"run-123", "--db", "/unused/controller.db", "--registry", "/unused/registry.json", "--requester", "ifan0927", "--repository", "owner/repo"})
 	if err == nil || !strings.Contains(err.Error(), "--expected-state") || !strings.Contains(err.Error(), "--idempotency-key") {
 		t.Fatalf("missing explicit CAS error=%v", err)
+	}
+}
+
+func TestLinearStartRequiresExplicitIssueAndRequesterEvidence(t *testing.T) {
+	if err := linearStart(nil); err == nil || !strings.Contains(err.Error(), "IFAN issue identifier") {
+		t.Fatalf("missing input error=%v", err)
+	}
+}
+
+func TestLinearStartAcceptsIssueBeforeFlags(t *testing.T) {
+	identifier, remaining := splitLinearStartIdentifier([]string{"IFAN-42", "--config", "linear.json"})
+	if identifier != "IFAN-42" || !slices.Equal(remaining, []string{"--config", "linear.json"}) {
+		t.Fatalf("identifier=%q remaining=%q", identifier, remaining)
 	}
 }
 

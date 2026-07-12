@@ -76,6 +76,7 @@ func runStructured[T any](ctx context.Context, runner processadapter.Runner, com
 		StdoutPath:   filepath.Join(artifacts, name+".stdout.jsonl"),
 		StderrPath:   filepath.Join(artifacts, name+".stderr.txt"),
 		MustNotExist: command.MustNotExist,
+		ExcludedEnv:  controllerManagedExcludedEnvironment,
 	})
 	if err != nil {
 		return zero, err

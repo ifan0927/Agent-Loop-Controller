@@ -13,6 +13,9 @@ const (
 	ReviewModel         = "gpt-5.6-sol"
 )
 
+// Controller-managed Codex subprocesses must not inherit trigger credentials.
+var controllerManagedExcludedEnvironment = []string{"IFAN_LOOP_LINEAR_TOKEN"}
+
 type CommandSpec struct {
 	Program       string   `json:"program"`
 	Args          []string `json:"args"`

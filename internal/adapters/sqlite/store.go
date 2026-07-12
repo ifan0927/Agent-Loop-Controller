@@ -285,6 +285,52 @@ func (s *Store) GetRunByIdempotency(ctx context.Context, key string) (applicatio
 	return run, err == nil, err
 }
 
+func (s *Store) GetRunByIssue(ctx context.Context, issueID string) (application.Run, bool, error) {
+	run, err := scanRun(s.db.QueryRowContext(ctx, runSelect+` WHERE issue_id=? AND current_state NOT IN ('rejected','failed','completed')`, issueID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return application.Run{}, false, nil
+	}
+	return run, err == nil, err
+}
+
+func (s *Store) MarkLinearSourceDrift(ctx context.Context, runID string, expectedState domain.State, expectedSourceRevision, evidence string) (bool, error) {
+	if !domain.CanRequireManualIntervention(expectedState) || strings.TrimSpace(expectedSourceRevision) == "" || strings.TrimSpace(evidence) == "" {
+		return false, errors.New("invalid Linear source drift authority")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var currentState, currentRevision string
+	if err := tx.QueryRowContext(ctx, `SELECT current_state,source_revision FROM runs WHERE run_id=?`, runID).Scan(&currentState, &currentRevision); err != nil {
+		return false, err
+	}
+	if domain.State(currentState) != expectedState || currentRevision != expectedSourceRevision {
+		return false, nil
+	}
+	var sequence int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM transitions WHERE run_id=?`, runID).Scan(&sequence); err != nil {
+		return false, err
+	}
+	now := nowText()
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET current_state=?,last_error=?,updated_at=? WHERE run_id=? AND current_state=? AND source_revision=?`, domain.StateManualIntervention, "Linear source drift requires a human decision", now, runID, expectedState, expectedSourceRevision)
+	if err != nil {
+		return false, err
+	}
+	count, err := result.RowsAffected()
+	if err != nil || count != 1 {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO transitions VALUES(?,?,?,?,?,?,?,?)`, runID, sequence, expectedState, domain.StateManualIntervention, "Linear source drift requires a human decision", evidence, "", now); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *Store) getByIdempotency(ctx context.Context, key string) (application.Run, error) {
 	return scanRun(s.db.QueryRowContext(ctx, runSelect+` WHERE idempotency_key=?`, key))
 }

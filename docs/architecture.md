@@ -43,6 +43,18 @@ name, repository-owned verifier IDs, policy, and source revision. Linear never
 carries executable verification commands. A material Linear edit
 after admission creates a human decision point; it never silently changes a run.
 
+`linear start IFAN-xxx` is the explicit trigger adapter. Its only task input is
+the identifier; it fetches the issue through the configured read-only adapter.
+The issue must be in `Todo`, an active current cycle, team `IFAN`, labelled
+`agent:codex` (and not `agent:hermes`), and contain exactly one label that maps
+to a controller-owned repository profile. The issue description must have a
+`## Goal` or `## Outcome` section and a `## Acceptance Criteria` section;
+`## Out of Scope` is preserved when present. Verification always comes from the
+matched repository profile, never from Linear text. A repeated trigger with the
+same immutable source resumes the same run. A material source, branch, or
+repository change sends the active run to `manual_intervention` for a human
+decision rather than creating another active run or rewriting its snapshot.
+
 ### Repository registry
 
 Registry version 1 selects one repository by case-insensitive canonical

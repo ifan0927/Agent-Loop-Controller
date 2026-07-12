@@ -85,6 +85,23 @@ func TestOSRunnerCancelsProcessGroupWithBoundedTermination(t *testing.T) {
 	}
 }
 
+func TestOSRunnerExcludesConfiguredEnvironment(t *testing.T) {
+	t.Setenv("IFAN_LOOP_LINEAR_TOKEN", "secret")
+	directory := t.TempDir()
+	result, err := (OSRunner{}).Run(context.Background(), Spec{
+		Program: os.Args[0], Args: []string{"-test.run=TestProcessHelper", "--", "print-token"},
+		StdoutPath: filepath.Join(directory, "stdout"), StderrPath: filepath.Join(directory, "stderr"),
+		ExcludedEnv: []string{"IFAN_LOOP_LINEAR_TOKEN"},
+	})
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	data, err := os.ReadFile(filepath.Join(directory, "stdout"))
+	if err != nil || string(data) != "absent\n" {
+		t.Fatalf("stdout=%q err=%v", data, err)
+	}
+}
+
 func TestProcessHelper(t *testing.T) {
 	for index, arg := range os.Args {
 		if arg != "--" || index+1 >= len(os.Args) {
@@ -97,6 +114,13 @@ func TestProcessHelper(t *testing.T) {
 		case "ignore-interrupt":
 			signal.Ignore(os.Interrupt)
 			time.Sleep(10 * time.Second)
+			os.Exit(0)
+		case "print-token":
+			if _, found := os.LookupEnv("IFAN_LOOP_LINEAR_TOKEN"); found {
+				fmt.Println("present")
+			} else {
+				fmt.Println("absent")
+			}
 			os.Exit(0)
 		}
 	}

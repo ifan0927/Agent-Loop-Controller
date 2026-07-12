@@ -55,8 +55,9 @@ func NewPreflighter(process processadapter.Runner, binary string) Preflighter {
 func (p Preflighter) Run(ctx context.Context, artifacts string) (PreflightEvidence, error) {
 	version, err := p.process.Run(ctx, processadapter.Spec{
 		Program: p.binary, Args: []string{"--version"},
-		StdoutPath: filepath.Join(artifacts, "codex-version.stdout.txt"),
-		StderrPath: filepath.Join(artifacts, "codex-version.stderr.txt"),
+		StdoutPath:  filepath.Join(artifacts, "codex-version.stdout.txt"),
+		StderrPath:  filepath.Join(artifacts, "codex-version.stderr.txt"),
+		ExcludedEnv: controllerManagedExcludedEnvironment,
 	})
 	if err != nil {
 		return PreflightEvidence{}, fmt.Errorf("codex version: %w", err)
@@ -66,8 +67,9 @@ func (p Preflighter) Run(ctx context.Context, artifacts string) (PreflightEviden
 	}
 	help, err := p.process.Run(ctx, processadapter.Spec{
 		Program: p.binary, Args: []string{"exec", "--help"},
-		StdoutPath: filepath.Join(artifacts, "codex-exec-help.stdout.txt"),
-		StderrPath: filepath.Join(artifacts, "codex-exec-help.stderr.txt"),
+		StdoutPath:  filepath.Join(artifacts, "codex-exec-help.stdout.txt"),
+		StderrPath:  filepath.Join(artifacts, "codex-exec-help.stderr.txt"),
+		ExcludedEnv: controllerManagedExcludedEnvironment,
 	})
 	if err != nil {
 		return PreflightEvidence{}, fmt.Errorf("codex exec help: %w", err)
@@ -88,8 +90,9 @@ func (p Preflighter) Run(ctx context.Context, artifacts string) (PreflightEviden
 	}
 	resumeHelp, err := p.process.Run(ctx, processadapter.Spec{
 		Program: p.binary, Args: []string{"exec", "resume", "--help"},
-		StdoutPath: filepath.Join(artifacts, "codex-exec-resume-help.stdout.txt"),
-		StderrPath: filepath.Join(artifacts, "codex-exec-resume-help.stderr.txt"),
+		StdoutPath:  filepath.Join(artifacts, "codex-exec-resume-help.stdout.txt"),
+		StderrPath:  filepath.Join(artifacts, "codex-exec-resume-help.stderr.txt"),
+		ExcludedEnv: controllerManagedExcludedEnvironment,
 	})
 	if err != nil {
 		return PreflightEvidence{}, fmt.Errorf("codex exec resume help: %w", err)
