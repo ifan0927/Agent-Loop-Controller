@@ -37,7 +37,8 @@ JSON
 start_output="$(go run "$repo_root/cmd/ifan-loop" local start \
   --issue "$issue" \
   --registry "$lab/repository-registry.json" \
-  --db "$lab/controller.db")"
+  --db "$lab/controller.db" --repository fixture-owner/test-project \
+  --requester ifan0927 --requester-database-id 1 --requester-node-id MDQ6VXNlcjE= --requester-type User)"
 printf '%s\n' "$start_output"
 run_id="$(printf '%s\n' "$start_output" | sed -n 's/.*"run_id": "\([^"]*\)".*/\1/p' | head -n 1)"
 outcome="$(find "$lab/runs/$run_id/attempts" -name implementation-outcome.json -type f | head -n 1)"

@@ -9,6 +9,7 @@ import (
 )
 
 type GitHubReadPort interface {
+	Authority() GitHubInstallationMetadata
 	Read(context.Context, int64, string) (domain.GitHubReadEvidence, []GitHubRequestObservation, GitHubInstallationMetadata, error)
 }
 

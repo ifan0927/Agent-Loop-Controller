@@ -21,6 +21,10 @@ type Run struct {
 	TaskHash                string       `json:"task_snapshot_hash"`
 	Repository              string       `json:"repository"`
 	RepositoryConfigJSON    string       `json:"-"`
+	ProfileID               string       `json:"profile_id"`
+	ProfileSnapshotVersion  int          `json:"profile_snapshot_version"`
+	ProfileDigest           string       `json:"profile_digest"`
+	ProfileSnapshotJSON     string       `json:"-"`
 	RegistryVersion         int          `json:"registry_version"`
 	RegistryDigest          string       `json:"registry_digest"`
 	RepositoryBindingDigest string       `json:"repository_binding_digest"`
@@ -140,14 +144,19 @@ type RunInspection struct {
 }
 
 type SanitizedRepositoryBinding struct {
-	CanonicalRepository   string   `json:"canonical_repository"`
-	BaseBranch            string   `json:"base_branch"`
-	VerifierRegistryRef   string   `json:"verifier_registry_ref"`
-	VerifierIDs           []string `json:"verifier_ids"`
-	GitHubAppProfileRef   string   `json:"github_app_profile_ref"`
-	GitHubInstallationID  int64    `json:"github_installation_id"`
-	ExpectedRepositoryID  int64    `json:"expected_repository_id"`
-	AllowedOperatorLogins []string `json:"allowed_operator_logins"`
+	ProfileID              string                 `json:"profile_id"`
+	ProfileSnapshotVersion int                    `json:"profile_snapshot_version"`
+	ProfileDigest          string                 `json:"profile_digest"`
+	CanonicalRepository    string                 `json:"canonical_repository"`
+	BaseBranch             string                 `json:"base_branch"`
+	VerifierRegistryRef    string                 `json:"verifier_registry_ref"`
+	VerifierIDs            []string               `json:"verifier_ids"`
+	GitHubAppProfileRef    string                 `json:"github_app_profile_ref"`
+	GitHubAppID            int64                  `json:"github_app_id"`
+	GitHubInstallationID   int64                  `json:"github_installation_id"`
+	ExpectedRepositoryID   int64                  `json:"expected_repository_id"`
+	AllowedOperatorLogins  []string               `json:"allowed_operator_logins"`
+	TrustedOperatorActors  []TrustedActorIdentity `json:"trusted_operator_actors"`
 }
 
 type RunStore interface {

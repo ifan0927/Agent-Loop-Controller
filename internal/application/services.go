@@ -38,24 +38,35 @@ func serviceError(category ErrorCategory, message string, cause error) error {
 }
 
 type Requester struct {
-	ID   string `json:"id"`
-	Kind string `json:"kind"`
+	ID         string `json:"id"`
+	Kind       string `json:"kind"`
+	DatabaseID int64  `json:"database_id,omitempty"`
+	NodeID     string `json:"node_id,omitempty"`
+	ActorType  string `json:"actor_type,omitempty"`
 }
 
-func (r Requester) authorize(allowed []string) error {
+func (r Requester) authorize(allowed []string, trusted []TrustedActorIdentity) error {
 	if r.ID == "" || r.Kind != "github_login" {
 		return serviceError(ErrorInvalidInput, "requester identity is required", nil)
 	}
-	if !slices.Contains(allowed, r.ID) {
+	if !slices.ContainsFunc(allowed, func(login string) bool { return strings.EqualFold(login, r.ID) }) {
 		return serviceError(ErrorConflict, "requester is not authorized for the repository", nil)
+	}
+	if len(trusted) > 0 {
+		if !slices.ContainsFunc(trusted, func(actor TrustedActorIdentity) bool {
+			return actor.DatabaseID == r.DatabaseID && actor.NodeID == r.NodeID && strings.EqualFold(actor.Login, r.ID) && actor.Type == r.ActorType
+		}) {
+			return serviceError(ErrorConflict, "requester is not authorized for the repository", nil)
+		}
+		return nil
 	}
 	return nil
 }
 
 // AuthorizeRequester is the minimal adapter preflight for controller-owned
 // authority data that must be loaded before other untrusted inputs are read.
-func AuthorizeRequester(requester Requester, allowed []string) error {
-	return requester.authorize(allowed)
+func AuthorizeRequester(requester Requester, allowed []string, trusted ...TrustedActorIdentity) error {
+	return requester.authorize(allowed, trusted)
 }
 
 type StartCommand struct {
@@ -82,6 +93,9 @@ type RunResult struct {
 	RunID                   string       `json:"run_id"`
 	IssueID                 string       `json:"issue_id"`
 	Repository              string       `json:"repository"`
+	ProfileID               string       `json:"profile_id"`
+	ProfileSnapshotVersion  int          `json:"profile_snapshot_version"`
+	ProfileDigest           string       `json:"profile_digest"`
 	RegistryVersion         int          `json:"registry_version"`
 	RegistryDigest          string       `json:"registry_digest"`
 	RepositoryBindingDigest string       `json:"repository_binding_digest"`
@@ -126,7 +140,7 @@ func (s CommandService) Start(ctx context.Context, command StartCommand) (Comman
 		if err := authorizePersistedRequester(existing, command.Requester); err != nil {
 			return CommandResult{}, err
 		}
-		if existing.TaskHash != command.Input.TaskHash || existing.Repository != command.RepositorySelection {
+		if existing.TaskHash != command.Input.TaskHash || existing.Repository != command.RepositorySelection || !samePersistedProfile(existing, command.Input.Repository) {
 			return CommandResult{}, serviceError(ErrorConflict, "idempotency key belongs to a different run authority", nil)
 		}
 		run, err := s.controller.ContinueExpected(ctx, existing.ID, existing.State, existing.IdempotencyKey, nil)
@@ -135,7 +149,7 @@ func (s CommandService) Start(ctx context.Context, command StartCommand) (Comman
 		}
 		return CommandResult{Run: projectRunResult(run)}, nil
 	}
-	if err := command.Requester.authorize(command.Input.Repository.AllowedOperatorLogins); err != nil {
+	if err := command.Requester.authorize(command.Input.Repository.AllowedOperatorLogins, command.Input.Repository.TrustedOperatorActors); err != nil {
 		return CommandResult{}, err
 	}
 	run, err := s.controller.StartAuthorized(ctx, command.Input, func(existing Run) error {
@@ -145,6 +159,17 @@ func (s CommandService) Start(ctx context.Context, command StartCommand) (Comman
 		return CommandResult{}, classifyServiceError(err)
 	}
 	return CommandResult{Run: projectRunResult(run)}, nil
+}
+
+func samePersistedProfile(run Run, current LocalRepository) bool {
+	var persisted LocalRepository
+	if err := json.Unmarshal([]byte(run.RepositoryConfigJSON), &persisted); err != nil {
+		return false
+	}
+	return run.ProfileID == current.ProfileID && run.ProfileSnapshotVersion == current.ProfileSnapshotVersion &&
+		run.ProfileDigest == current.ProfileDigest && run.ProfileSnapshotJSON == current.ProfileSnapshotJSON &&
+		persisted.OriginPath == current.OriginPath && persisted.SourcePath == current.SourcePath &&
+		persisted.RunRoot == current.RunRoot && persisted.WorktreeRoot == current.WorktreeRoot
 }
 
 func (s CommandService) Continue(ctx context.Context, command ContinueCommand) (CommandResult, error) {
@@ -221,7 +246,7 @@ func authorizePersistedRequester(run Run, requester Requester) error {
 	if err := json.Unmarshal([]byte(run.RepositoryConfigJSON), &repository); err != nil {
 		return serviceError(ErrorConflict, "persisted repository authority is invalid", err)
 	}
-	return requester.authorize(repository.AllowedOperatorLogins)
+	return requester.authorize(repository.AllowedOperatorLogins, repository.TrustedOperatorActors)
 }
 
 type InspectionResult struct {
@@ -379,7 +404,8 @@ func sanitizedRun(run Run) Run {
 }
 
 func projectRunResult(run Run) RunResult {
-	return RunResult{RunID: run.ID, IssueID: run.IssueID, Repository: run.Repository, RegistryVersion: run.RegistryVersion,
+	return RunResult{RunID: run.ID, IssueID: run.IssueID, Repository: run.Repository, ProfileID: run.ProfileID,
+		ProfileSnapshotVersion: run.ProfileSnapshotVersion, ProfileDigest: run.ProfileDigest, RegistryVersion: run.RegistryVersion,
 		RegistryDigest: run.RegistryDigest, RepositoryBindingDigest: run.RepositoryBindingDigest, BaseBranch: run.BaseBranch,
 		WorkingBranch: run.WorkingBranch, BaseSHA: run.BaseSHA, State: run.State, CandidateHead: run.CandidateHead,
 		TaskHash: run.TaskHash, ImplementationModel: run.ImplementationModel, ReviewModel: run.ReviewModel}
@@ -422,6 +448,9 @@ func (s CommandService) ReconcileFromGitHub(ctx context.Context, command GitHubR
 		if inspection.PullRequest == nil || inspection.PullRequest.Number != command.PullRequest || inspection.Run.CandidateHead != command.ExpectedHead {
 			return ReconcileResult{}, serviceError(ErrorConflict, "requested PR or head does not match persisted evidence", nil)
 		}
+		if err := validateReaderAuthority(inspection, reader.Authority()); err != nil {
+			return ReconcileResult{}, err
+		}
 		evidence, observations, metadata, err := reader.Read(leaseCtx, command.PullRequest, command.ExpectedHead)
 		if err != nil {
 			persister, ok := s.store.(interface {
@@ -441,6 +470,26 @@ func (s CommandService) ReconcileFromGitHub(ctx context.Context, command GitHubR
 			IdempotencyKey: command.IdempotencyKey, Evidence: evidence, Observations: observations, Metadata: metadata}
 		return s.reconcileLocked(leaseCtx, full, inspection, owner)
 	})
+}
+
+func validateReaderAuthority(inspection RunInspection, authority GitHubInstallationMetadata) error {
+	if inspection.Run.ProfileSnapshotVersion < 1 || inspection.Run.ProfileID == "" || inspection.Run.ProfileDigest == "" || inspection.Run.ProfileSnapshotJSON == "" || inspection.RepositoryBinding == nil {
+		return serviceError(ErrorConflict, "persisted repository profile evidence is legacy-insufficient", nil)
+	}
+	if inspection.GitHubInstallation != nil {
+		persisted := inspection.GitHubInstallation
+		if authority.AppID != persisted.AppID || authority.InstallationID != persisted.InstallationID || authority.Repository.ID != persisted.Repository.ID ||
+			!strings.EqualFold(authority.Repository.Owner, persisted.Repository.Owner) || !strings.EqualFold(authority.Repository.Name, persisted.Repository.Name) {
+			return serviceError(ErrorConflict, "GitHub reader authority mismatch", nil)
+		}
+		return nil
+	}
+	parts := strings.Split(inspection.RepositoryBinding.CanonicalRepository, "/")
+	if len(parts) != 2 || authority.AppID != inspection.RepositoryBinding.GitHubAppID || authority.InstallationID != inspection.RepositoryBinding.GitHubInstallationID ||
+		authority.Repository.ID != inspection.RepositoryBinding.ExpectedRepositoryID || !strings.EqualFold(authority.Repository.Owner, parts[0]) || !strings.EqualFold(authority.Repository.Name, parts[1]) {
+		return serviceError(ErrorConflict, "GitHub reader authority mismatch", nil)
+	}
+	return nil
 }
 
 func (s CommandService) Reconcile(ctx context.Context, command ReconcileCommand) (ReconcileResult, error) {
@@ -544,7 +593,7 @@ func (s CommandService) reconcileLocked(ctx context.Context, command ReconcileCo
 		if command.Metadata.AppID != persisted.AppID || command.Metadata.InstallationID != persisted.InstallationID || command.Metadata.Repository != persisted.Repository {
 			return ReconcileResult{}, serviceError(ErrorConflict, "GitHub installation authority mismatch", nil)
 		}
-	} else if inspection.RepositoryBinding == nil || command.Metadata.AppID < 1 || command.Metadata.InstallationID != inspection.RepositoryBinding.GitHubInstallationID || command.Metadata.Repository != command.Evidence.Repository {
+	} else if inspection.RepositoryBinding == nil || command.Metadata.AppID != inspection.RepositoryBinding.GitHubAppID || command.Metadata.InstallationID != inspection.RepositoryBinding.GitHubInstallationID || command.Metadata.Repository != command.Evidence.Repository {
 		return ReconcileResult{}, serviceError(ErrorConflict, "GitHub installation authority mismatch", nil)
 	}
 	persister, ok := s.store.(interface {

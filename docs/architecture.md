@@ -52,11 +52,22 @@ non-secret GitHub App profile reference; installation and immutable repository
 IDs; and allowed operator logins. Duplicate identities, shared or overlapping
 paths, unsupported verifiers, and incomplete legacy entries fail closed.
 
-The controller persists schema version 7 registry and selected-binding digests
-with the sanitized binding identity. Restart requires the same registry and
-rejects drift before resuming. Full paths remain in the private authority
-snapshot needed to reproduce the run, but status and inspect projections expose
-only non-secret identity, policy references, and digests.
+SQLite schema version 8 freezes a stable `repository-profile:<owner>/<repo>` ID,
+the profile snapshot schema version, canonical credential-free JSON, and its
+SHA-256 digest for every new run. The snapshot binds repository and base branch,
+verifier policy, immutable GitHub App ID and profile identity, installation and
+repository IDs, and trusted operator database/node/type identities. JSON source field order cannot affect the
+canonical digest. Full local paths remain in the private binding needed to
+reproduce and protect controller-owned resources; status and inspect expose only
+the sanitized profile identity, policy references, and digests.
+
+Restart rejects any change to the selected profile snapshot or its local
+ownership paths, while unrelated repository entries may change without
+invalidating the run. GitHub App private-key or installation-token rotation does
+not change the profile when the configured App identity, installation, and
+repository identities are unchanged. Rows created before schema version 8 keep
+empty profile-evidence columns and fail closed because migration cannot prove
+their original authority binding.
 
 ### Codex implementation outcome
 

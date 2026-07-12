@@ -36,7 +36,7 @@ func TestPersistedBindingRejectsCrossRepositorySwap(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		repositories = append(repositories, localregistry.Repository{Owner: "owner", Name: name, OriginPath: paths[0], SourcePath: paths[1], RunRoot: paths[2], WorktreeRoot: paths[3], BaseBranch: "main", VerifierRegistryRef: "builtin:v1", VerifierIDs: []string{"fixture-go-test"}, GitHubAppProfileRef: "github-app-profile:fixture", GitHubInstallationID: int64(index + 1), ExpectedRepositoryID: int64(index + 101), OperatorIdentityPolicy: localregistry.OperatorIdentityPolicy{AllowedLogins: []string{"ifan0927"}}})
+		repositories = append(repositories, localregistry.Repository{Owner: "owner", Name: name, OriginPath: paths[0], SourcePath: paths[1], RunRoot: paths[2], WorktreeRoot: paths[3], BaseBranch: "main", VerifierRegistryRef: "builtin:v1", VerifierIDs: []string{"fixture-go-test"}, GitHubAppProfileRef: "github-app-profile:fixture", GitHubAppID: 10, GitHubInstallationID: int64(index + 1), ExpectedRepositoryID: int64(index + 101), OperatorIdentityPolicy: localregistry.OperatorIdentityPolicy{AllowedLogins: []string{"ifan0927"}, TrustedActors: []localregistry.TrustedActorIdentity{{DatabaseID: 33, NodeID: "MDQ6VXNlcjMz", Login: "ifan0927", Type: "User"}}}})
 	}
 	registryRaw, _ := json.Marshal(localregistry.File{Version: 1, Repositories: repositories})
 	registryPath := filepath.Join(root, "registry.json")
@@ -62,7 +62,7 @@ func TestPersistedBindingRejectsCrossRepositorySwap(t *testing.T) {
 	taskRaw, _ := json.Marshal(taskTwo)
 	taskHash := sha256.Sum256(taskRaw)
 	run := application.Run{ID: snapshot.Task.RunID, IssueID: issue.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: "v1", RawIssueJSON: string(rawIssue), RawIssueHash: snapshot.RawHash,
-		Repository: "owner/two", RepositoryConfigJSON: string(bindingRaw), RegistryVersion: bindingTwo.RegistryVersion, RegistryDigest: bindingTwo.RegistryDigest, RepositoryBindingDigest: bindingTwo.RepositoryBindingDigest,
+		Repository: "owner/two", RepositoryConfigJSON: string(bindingRaw), ProfileID: bindingTwo.ProfileID, ProfileSnapshotVersion: bindingTwo.ProfileSnapshotVersion, ProfileDigest: bindingTwo.ProfileDigest, ProfileSnapshotJSON: bindingTwo.ProfileSnapshotJSON, RegistryVersion: bindingTwo.RegistryVersion, RegistryDigest: bindingTwo.RegistryDigest, RepositoryBindingDigest: bindingTwo.RepositoryBindingDigest,
 		BaseBranch: "main", WorkingBranch: "ifan/test", NormalizedTaskJSON: string(taskRaw), TaskHash: fmt.Sprintf("%x", taskHash), WorktreePath: filepath.Join(bindingTwo.WorktreeRoot, snapshot.Task.RunID), ArtifactRoot: filepath.Join(bindingTwo.RunRoot, snapshot.Task.RunID)}
 	if err := validatePersistedRegistryBinding(run, registry); err == nil || !strings.Contains(err.Error(), "canonical issue admission") {
 		t.Fatalf("cross-repository persisted binding swap error=%v", err)
@@ -116,7 +116,7 @@ func TestLocalContinueAuthorizesBeforeRegistryRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = localContinue([]string{"run-auth-first", "--db", path, "--registry", filepath.Join(t.TempDir(), "missing.json"), "--requester", "intruder", "--repository", "owner/repo", "--expected-state", "received", "--idempotency-key", "key"})
+	err = localContinue([]string{"run-auth-first", "--db", path, "--registry", filepath.Join(t.TempDir(), "missing.json"), "--requester", "intruder", "--requester-database-id", "44", "--requester-node-id", "intruder-node", "--requester-type", "User", "--repository", "owner/repo", "--expected-state", "received", "--idempotency-key", "key"})
 	if err == nil || !strings.Contains(err.Error(), "not authorized") {
 		t.Fatalf("unauthorized continue exposed registry error=%v", err)
 	}
@@ -134,7 +134,7 @@ func TestLocalContinueRejectsCallerRepositoryBeforeRegistryRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = localContinue([]string{"run-repository", "--db", path, "--registry", filepath.Join(t.TempDir(), "missing.json"), "--requester", "ifan0927", "--repository", "owner/other", "--expected-state", "received", "--idempotency-key", "key"})
+	err = localContinue([]string{"run-repository", "--db", path, "--registry", filepath.Join(t.TempDir(), "missing.json"), "--requester", "ifan0927", "--requester-database-id", "33", "--requester-node-id", "MDQ6VXNlcjMz", "--requester-type", "User", "--repository", "owner/other", "--expected-state", "received", "--idempotency-key", "key"})
 	if err == nil || !strings.Contains(err.Error(), "repository does not match") {
 		t.Fatalf("repository mismatch exposed registry error=%v", err)
 	}
@@ -173,7 +173,7 @@ func TestLocalStatusOutputsDurableInspection(t *testing.T) {
 	}
 	original := os.Stdout
 	os.Stdout = write
-	callErr := localInspect("status", []string{"run-1", "--db", path, "--requester", "ifan0927"})
+	callErr := localInspect("status", []string{"run-1", "--db", path, "--requester", "ifan0927", "--requester-database-id", "33", "--requester-node-id", "MDQ6VXNlcjMz", "--requester-type", "User"})
 	write.Close()
 	os.Stdout = original
 	if callErr != nil {
@@ -203,7 +203,7 @@ func TestLocalStatusRejectsUnauthorizedRequester(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = localInspect("status", []string{"run-auth", "--db", path, "--requester", "intruder"})
+	err = localInspect("status", []string{"run-auth", "--db", path, "--requester", "intruder", "--requester-database-id", "44", "--requester-node-id", "intruder-node", "--requester-type", "User"})
 	if err == nil || !strings.Contains(err.Error(), "not authorized") {
 		t.Fatalf("unauthorized status error=%v", err)
 	}
@@ -216,11 +216,12 @@ func TestLocalInspectSanitizesRepositoryBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	binding := application.LocalRepository{RegistryVersion: 1, RegistryDigest: "registry-digest", RepositoryBindingDigest: "binding-digest",
+		ProfileID: "repository-profile:owner/repo", ProfileSnapshotVersion: 1, ProfileDigest: "profile-digest",
 		CanonicalRepository: "owner/repo", OriginPath: "/secret/origin", SourcePath: "/secret/source", RunRoot: "/secret/runs", WorktreeRoot: "/secret/worktrees",
-		BaseBranch: "main", VerifierRegistryRef: "builtin:v1", VerifierIDs: []string{"fixture-go-test"}, GitHubAppProfileRef: "github-app-profile:fixture",
-		GitHubInstallationID: 22, ExpectedRepositoryID: 33, AllowedOperatorLogins: []string{"ifan0927"}}
+		BaseBranch: "main", VerifierRegistryRef: "builtin:v1", VerifierIDs: []string{"fixture-go-test"}, GitHubAppProfileRef: "github-app-profile:fixture", GitHubAppID: 11,
+		GitHubInstallationID: 22, ExpectedRepositoryID: 33, AllowedOperatorLogins: []string{"ifan0927"}, TrustedOperatorActors: []application.TrustedActorIdentity{{DatabaseID: 33, NodeID: "MDQ6VXNlcjMz", Login: "ifan0927", Type: "User"}}}
 	raw, _ := json.Marshal(binding)
-	input := application.CreateRunInput{Run: application.Run{ID: "run-binding", IssueID: "ISSUE-2", IdempotencyKey: "binding-key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: string(raw), RegistryVersion: 1, RegistryDigest: "registry-digest", RepositoryBindingDigest: "binding-digest", BaseBranch: "main", WorkingBranch: "ifan/test", WorktreePath: "/secret/run-worktree", ArtifactRoot: "/secret/artifact"}}
+	input := application.CreateRunInput{Run: application.Run{ID: "run-binding", IssueID: "ISSUE-2", IdempotencyKey: "binding-key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: string(raw), ProfileID: binding.ProfileID, ProfileSnapshotVersion: binding.ProfileSnapshotVersion, ProfileDigest: binding.ProfileDigest, ProfileSnapshotJSON: `{}`, RegistryVersion: 1, RegistryDigest: "registry-digest", RepositoryBindingDigest: "binding-digest", BaseBranch: "main", WorkingBranch: "ifan/test", WorktreePath: "/secret/run-worktree", ArtifactRoot: "/secret/artifact"}}
 	if _, _, err := store.CreateRun(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +232,7 @@ func TestLocalInspectSanitizesRepositoryBinding(t *testing.T) {
 	}
 	original := os.Stdout
 	os.Stdout = write
-	callErr := localInspect("inspect", []string{"run-binding", "--db", path, "--requester", "ifan0927"})
+	callErr := localInspect("inspect", []string{"run-binding", "--db", path, "--requester", "ifan0927", "--requester-database-id", "33", "--requester-node-id", "MDQ6VXNlcjMz", "--requester-type", "User"})
 	write.Close()
 	os.Stdout = original
 	if callErr != nil {
@@ -246,6 +247,9 @@ func TestLocalInspectSanitizesRepositoryBinding(t *testing.T) {
 	}
 	if !strings.Contains(text, `"expected_repository_id": 33`) {
 		t.Fatalf("inspection omitted sanitized binding: %s", text)
+	}
+	if !strings.Contains(text, `"profile_id": "repository-profile:owner/repo"`) || !strings.Contains(text, `"profile_digest": "profile-digest"`) {
+		t.Fatalf("inspection omitted profile evidence: %s", text)
 	}
 }
 

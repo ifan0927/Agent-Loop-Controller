@@ -24,21 +24,34 @@ const candidateCommitSubject = "Controller-owned local candidate"
 const localLeaseTTL = 45 * time.Second
 
 type LocalRepository struct {
-	RegistryVersion         int      `json:"registry_version"`
-	RegistryDigest          string   `json:"registry_digest"`
-	RepositoryBindingDigest string   `json:"repository_binding_digest"`
-	CanonicalRepository     string   `json:"canonical_repository"`
-	OriginPath              string   `json:"origin_path"`
-	SourcePath              string   `json:"source_path"`
-	RunRoot                 string   `json:"run_root"`
-	WorktreeRoot            string   `json:"worktree_root"`
-	BaseBranch              string   `json:"base_branch"`
-	VerifierRegistryRef     string   `json:"verifier_registry_ref"`
-	VerifierIDs             []string `json:"verifier_ids"`
-	GitHubAppProfileRef     string   `json:"github_app_profile_ref"`
-	GitHubInstallationID    int64    `json:"github_installation_id"`
-	ExpectedRepositoryID    int64    `json:"expected_repository_id"`
-	AllowedOperatorLogins   []string `json:"allowed_operator_logins"`
+	ProfileID               string                 `json:"profile_id"`
+	ProfileSnapshotVersion  int                    `json:"profile_snapshot_version"`
+	ProfileDigest           string                 `json:"profile_digest"`
+	ProfileSnapshotJSON     string                 `json:"-"`
+	RegistryVersion         int                    `json:"registry_version"`
+	RegistryDigest          string                 `json:"registry_digest"`
+	RepositoryBindingDigest string                 `json:"repository_binding_digest"`
+	CanonicalRepository     string                 `json:"canonical_repository"`
+	OriginPath              string                 `json:"origin_path"`
+	SourcePath              string                 `json:"source_path"`
+	RunRoot                 string                 `json:"run_root"`
+	WorktreeRoot            string                 `json:"worktree_root"`
+	BaseBranch              string                 `json:"base_branch"`
+	VerifierRegistryRef     string                 `json:"verifier_registry_ref"`
+	VerifierIDs             []string               `json:"verifier_ids"`
+	GitHubAppProfileRef     string                 `json:"github_app_profile_ref"`
+	GitHubAppID             int64                  `json:"github_app_id"`
+	GitHubInstallationID    int64                  `json:"github_installation_id"`
+	ExpectedRepositoryID    int64                  `json:"expected_repository_id"`
+	AllowedOperatorLogins   []string               `json:"allowed_operator_logins"`
+	TrustedOperatorActors   []TrustedActorIdentity `json:"trusted_operator_actors"`
+}
+
+type TrustedActorIdentity struct {
+	DatabaseID int64  `json:"database_id"`
+	NodeID     string `json:"node_id"`
+	Login      string `json:"login"`
+	Type       string `json:"type"`
 }
 
 type LocalStartInput struct {
@@ -146,7 +159,9 @@ func (c *LocalController) StartAuthorized(ctx context.Context, input LocalStartI
 		IdempotencyKey: input.IdempotencyKey, SourceRevision: input.Task.SourceRevision, RawIssueJSON: string(input.RawIssueJSON),
 		RawIssueHash: input.RawIssueHash, NormalizedTaskJSON: string(input.NormalizedJSON), TaskHash: input.TaskHash,
 		Repository: input.Task.Repository, RepositoryConfigJSON: string(repositoryJSON), BaseBranch: input.Task.BaseBranch,
-		RegistryVersion: input.Repository.RegistryVersion, RegistryDigest: input.Repository.RegistryDigest,
+		ProfileID: input.Repository.ProfileID, ProfileSnapshotVersion: input.Repository.ProfileSnapshotVersion, ProfileDigest: input.Repository.ProfileDigest,
+		ProfileSnapshotJSON: input.Repository.ProfileSnapshotJSON,
+		RegistryVersion:     input.Repository.RegistryVersion, RegistryDigest: input.Repository.RegistryDigest,
 		RepositoryBindingDigest: input.Repository.RepositoryBindingDigest,
 		WorkingBranch:           input.Task.WorkingBranch, WorktreePath: filepath.Join(input.WorktreeRoot, input.Task.RunID), ArtifactRoot: artifactRoot,
 		ImplementationModel: codex.ImplementationModel, ReviewModel: codex.ReviewModel}})

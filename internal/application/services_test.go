@@ -55,11 +55,23 @@ type serviceController struct {
 	key       string
 }
 
+type foundServiceStore struct {
+	serviceStore
+	existing Run
+}
+
+func (s foundServiceStore) GetRunByIdempotency(context.Context, string) (Run, bool, error) {
+	return s.existing, true, nil
+}
+
 type serviceGitHubReader struct {
 	calls        int
 	observations []GitHubRequestObservation
 	err          error
+	authority    GitHubInstallationMetadata
 }
+
+func (r *serviceGitHubReader) Authority() GitHubInstallationMetadata { return r.authority }
 
 func (r *serviceGitHubReader) Read(context.Context, int64, string) (domain.GitHubReadEvidence, []GitHubRequestObservation, GitHubInstallationMetadata, error) {
 	r.calls++
@@ -79,6 +91,9 @@ func (c *serviceController) ContinueExpected(_ context.Context, _ string, expect
 func authorizeTestRun(run Run) Run {
 	raw, _ := json.Marshal(LocalRepository{AllowedOperatorLogins: []string{"operator"}})
 	run.RepositoryConfigJSON = string(raw)
+	if run.ProfileSnapshotVersion == 0 {
+		run.ProfileID, run.ProfileSnapshotVersion, run.ProfileDigest, run.ProfileSnapshotJSON = "repository-profile:owner/repo", 1, "profile", `{}`
+	}
 	return run
 }
 
@@ -89,6 +104,31 @@ func TestCommandServiceRejectsRepositoryMismatchBeforeStart(t *testing.T) {
 	var safe *ServiceError
 	if !errors.As(err, &safe) || safe.Category != ErrorInvalidInput || controller.started != 0 {
 		t.Fatalf("err=%v started=%d", err, controller.started)
+	}
+}
+
+func TestRequesterRequiresAllowlistAndImmutableIdentity(t *testing.T) {
+	actor := TrustedActorIdentity{DatabaseID: 33, NodeID: "node", Login: "operator", Type: "User"}
+	requester := Requester{ID: "operator", Kind: "github_login", DatabaseID: 33, NodeID: "node", ActorType: "User"}
+	if err := AuthorizeRequester(requester, []string{"other"}, actor); err == nil {
+		t.Fatal("trusted actor outside login allowlist was authorized")
+	}
+	if err := AuthorizeRequester(requester, []string{"OPERATOR"}, actor); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCommandServiceRestartRejectsProfileDrift(t *testing.T) {
+	persistedRepository := LocalRepository{ProfileID: "repository-profile:owner/repo", ProfileSnapshotVersion: 1, ProfileDigest: "old", OriginPath: "/origin", SourcePath: "/source", RunRoot: "/runs", WorktreeRoot: "/worktrees", AllowedOperatorLogins: []string{"operator"}}
+	raw, _ := json.Marshal(persistedRepository)
+	existing := Run{ID: "run", Repository: "owner/repo", IdempotencyKey: "key", TaskHash: "task", ProfileID: persistedRepository.ProfileID, ProfileSnapshotVersion: 1, ProfileDigest: "old", ProfileSnapshotJSON: `{"old":true}`, RepositoryConfigJSON: string(raw)}
+	current := persistedRepository
+	current.ProfileDigest = "new"
+	current.ProfileSnapshotJSON = `{"new":true}`
+	controller := &serviceController{run: existing}
+	_, err := NewCommandService(controller, foundServiceStore{existing: existing}).Start(context.Background(), StartCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RepositorySelection: "owner/repo", IdempotencyKey: "key", Input: LocalStartInput{Task: domain.CodingTask{Repository: "owner/repo"}, TaskHash: "task", Repository: current, IdempotencyKey: "key"}})
+	if err == nil || controller.continued != 0 {
+		t.Fatalf("profile drift error=%v continued=%d", err, controller.continued)
 	}
 }
 
@@ -139,13 +179,18 @@ func TestServiceErrorDoesNotRenderUnderlyingDetails(t *testing.T) {
 func TestReconcileUsesPersistedAuthority(t *testing.T) {
 	pr := domain.PullRequest{Number: 1, URL: "https://example.invalid/1", NodeID: "PR", HeadBranch: "feature", BaseBranch: "main", HeadSHA: "head", BaseSHA: "base", BodyDigest: "body", OwnershipKey: "key"}
 	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StatePROpen, IdempotencyKey: "key", WorkingBranch: "feature", BaseBranch: "main", CandidateHead: "head", BaseSHA: "base"})
-	binding := &SanitizedRepositoryBinding{CanonicalRepository: "owner/repo", ExpectedRepositoryID: 99, GitHubInstallationID: 2}
+	binding := &SanitizedRepositoryBinding{CanonicalRepository: "owner/repo", ExpectedRepositoryID: 99, GitHubAppID: 1, GitHubInstallationID: 2}
 	evidence := domain.GitHubReadEvidence{Repository: domain.RepositoryIdentity{ID: 99, NodeID: "REPO", Owner: "owner", Name: "repo"}, PullRequest: pr}
 	metadata := GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: evidence.Repository}
 	store := serviceStore{run: run, inspection: RunInspection{Run: run, RepositoryBinding: binding, PullRequest: &pr}}
 	service := NewCommandService(nil, store)
 	if _, err := service.Reconcile(context.Background(), ReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: "run", Repository: "owner/repo", ExpectedState: domain.StatePROpen, IdempotencyKey: "key", Evidence: evidence, Metadata: metadata}); err != nil {
 		t.Fatal(err)
+	}
+	wrongApp := metadata
+	wrongApp.AppID = 3
+	if _, err := service.Reconcile(context.Background(), ReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: "run", Repository: "owner/repo", ExpectedState: domain.StatePROpen, IdempotencyKey: "key", Evidence: evidence, Metadata: wrongApp}); err == nil {
+		t.Fatal("expected GitHub App identity mismatch to be rejected")
 	}
 	evidence.PullRequest.HeadSHA = "other"
 	if _, err := service.Reconcile(context.Background(), ReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: "run", Repository: "owner/repo", ExpectedState: domain.StatePROpen, IdempotencyKey: "key", Evidence: evidence, Metadata: metadata}); err == nil {
@@ -179,6 +224,18 @@ func TestGitHubReconcileRechecksCASUnderLeaseBeforeExternalRead(t *testing.T) {
 	}
 }
 
+func TestGitHubReconcileRejectsReaderAuthorityBeforeExternalRead(t *testing.T) {
+	pr := domain.PullRequest{Number: 1}
+	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StatePROpen, IdempotencyKey: "key", CandidateHead: "head"})
+	binding := &SanitizedRepositoryBinding{CanonicalRepository: "owner/repo", ExpectedRepositoryID: 99, GitHubAppID: 1, GitHubInstallationID: 2}
+	reader := &serviceGitHubReader{authority: GitHubInstallationMetadata{AppID: 3, InstallationID: 2, Repository: domain.RepositoryIdentity{ID: 99, Owner: "owner", Name: "repo"}}}
+	store := serviceStore{run: run, inspection: RunInspection{Run: run, RepositoryBinding: binding, PullRequest: &pr}}
+	_, err := NewCommandService(nil, store).ReconcileFromGitHub(context.Background(), GitHubReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: "run", Repository: "owner/repo", ExpectedState: domain.StatePROpen, IdempotencyKey: "key", PullRequest: 1, ExpectedHead: "head"}, reader)
+	if err == nil || reader.calls != 0 {
+		t.Fatalf("reader authority error=%v calls=%d", err, reader.calls)
+	}
+}
+
 func TestGitHubReconcileCancelsReadWhenLeaseIsLost(t *testing.T) {
 	originalTTL := reconcileLeaseTTL
 	reconcileLeaseTTL = 30 * time.Millisecond
@@ -186,7 +243,7 @@ func TestGitHubReconcileCancelsReadWhenLeaseIsLost(t *testing.T) {
 	pr := domain.PullRequest{Number: 1}
 	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StatePROpen, IdempotencyKey: "key", CandidateHead: "head"})
 	renewed := 0
-	store := serviceStore{run: run, inspection: RunInspection{Run: run, PullRequest: &pr}, renewed: &renewed, renewOK: false}
+	store := serviceStore{run: run, inspection: RunInspection{Run: run, RepositoryBinding: &SanitizedRepositoryBinding{CanonicalRepository: "owner/repo", ExpectedRepositoryID: 99, GitHubAppID: 1, GitHubInstallationID: 2}, PullRequest: &pr}, renewed: &renewed, renewOK: false}
 	reader := blockingGitHubReader{}
 	_, err := NewCommandService(nil, store).ReconcileFromGitHub(context.Background(), GitHubReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: "run", Repository: "owner/repo", ExpectedState: domain.StatePROpen, IdempotencyKey: "key", PullRequest: 1, ExpectedHead: "head"}, reader)
 	if err == nil || renewed == 0 {
@@ -195,6 +252,10 @@ func TestGitHubReconcileCancelsReadWhenLeaseIsLost(t *testing.T) {
 }
 
 type blockingGitHubReader struct{}
+
+func (blockingGitHubReader) Authority() GitHubInstallationMetadata {
+	return GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: domain.RepositoryIdentity{ID: 99, Owner: "owner", Name: "repo"}}
+}
 
 func (blockingGitHubReader) Read(ctx context.Context, _ int64, _ string) (domain.GitHubReadEvidence, []GitHubRequestObservation, GitHubInstallationMetadata, error) {
 	<-ctx.Done()
@@ -206,8 +267,8 @@ func TestGitHubReconcilePersistsPartialFailureObservations(t *testing.T) {
 	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StatePROpen, IdempotencyKey: "key", CandidateHead: "head"})
 	observation := GitHubRequestObservation{RunID: "run", Operation: "read", ErrorClass: "timeout"}
 	var saved []GitHubRequestObservation
-	store := serviceStore{run: run, inspection: RunInspection{Run: run, PullRequest: &pr}, failureSaved: &saved}
-	reader := &serviceGitHubReader{observations: []GitHubRequestObservation{observation}, err: errors.New("read failed")}
+	store := serviceStore{run: run, inspection: RunInspection{Run: run, RepositoryBinding: &SanitizedRepositoryBinding{CanonicalRepository: "owner/repo", ExpectedRepositoryID: 99, GitHubAppID: 1, GitHubInstallationID: 2}, PullRequest: &pr}, failureSaved: &saved}
+	reader := &serviceGitHubReader{authority: GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: domain.RepositoryIdentity{ID: 99, Owner: "owner", Name: "repo"}}, observations: []GitHubRequestObservation{observation}, err: errors.New("read failed")}
 	_, err := NewCommandService(nil, store).ReconcileFromGitHub(context.Background(), GitHubReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: "run", Repository: "owner/repo", ExpectedState: domain.StatePROpen, IdempotencyKey: "key", PullRequest: 1, ExpectedHead: "head"}, reader)
 	if err == nil || len(saved) != 1 || saved[0].ErrorClass != "timeout" {
 		t.Fatalf("failure error=%v saved=%+v", err, saved)

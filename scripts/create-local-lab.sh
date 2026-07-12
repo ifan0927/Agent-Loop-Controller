@@ -53,9 +53,13 @@ cat >"$registry" <<JSON
 	  "verifier_registry_ref": "builtin:v1",
 	  "verifier_ids": ["fixture-go-test"],
 	  "github_app_profile_ref": "github-app-profile:fixture-readonly",
+	  "github_app_id": 1,
 	  "github_installation_id": 1,
 	  "expected_repository_id": 1,
-	  "operator_identity_policy": {"allowed_logins": ["ifan0927"]}
+	  "operator_identity_policy": {
+	    "allowed_logins": ["ifan0927"],
+	    "trusted_actors": [{"database_id": 1, "node_id": "MDQ6VXNlcjE=", "login": "ifan0927", "type": "User"}]
+	  }
     }
   ]
 }

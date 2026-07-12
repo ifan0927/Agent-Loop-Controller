@@ -74,8 +74,8 @@ func TestGitHubReadCLIEndToEndPersistsAndRestarts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bindingJSON, _ := json.Marshal(application.LocalRepository{RegistryVersion: 1, RegistryDigest: "registry", RepositoryBindingDigest: "binding", CanonicalRepository: "owner/repo", BaseBranch: "main", ExpectedRepositoryID: 99, GitHubInstallationID: 2, AllowedOperatorLogins: []string{"ifan0927"}})
-	run := application.Run{ID: "run", IssueID: "IFAN-1", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: string(bindingJSON), RegistryVersion: 1, RegistryDigest: "registry", RepositoryBindingDigest: "binding", BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: filepath.Join(dir, "artifacts"), ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}
+	bindingJSON, _ := json.Marshal(application.LocalRepository{ProfileID: "repository-profile:owner/repo", ProfileSnapshotVersion: 1, ProfileDigest: "profile", RegistryVersion: 1, RegistryDigest: "registry", RepositoryBindingDigest: "binding", CanonicalRepository: "owner/repo", BaseBranch: "main", ExpectedRepositoryID: 99, GitHubAppID: 1, GitHubInstallationID: 2, AllowedOperatorLogins: []string{"ifan0927"}})
+	run := application.Run{ID: "run", IssueID: "IFAN-1", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: string(bindingJSON), ProfileID: "repository-profile:owner/repo", ProfileSnapshotVersion: 1, ProfileDigest: "profile", ProfileSnapshotJSON: `{}`, RegistryVersion: 1, RegistryDigest: "registry", RepositoryBindingDigest: "binding", BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: filepath.Join(dir, "artifacts"), ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}
 	if _, _, err := store.CreateRun(context.Background(), application.CreateRunInput{Run: run}); err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestGitHubReadCLIEndToEndPersistsAndRestarts(t *testing.T) {
 	}
 	original := os.Stdout
 	os.Stdout = pipeWrite
-	callErr := githubRead([]string{"--config", configPath, "--pr", "1", "--expected-head", "head", "--db", dbPath, "--run-id", "run", "--requester", "ifan0927", "--repository", "owner/repo", "--expected-state", "received", "--idempotency-key", "key"})
+	callErr := githubRead([]string{"--config", configPath, "--pr", "1", "--expected-head", "head", "--db", dbPath, "--run-id", "run", "--requester", "ifan0927", "--requester-database-id", "33", "--requester-node-id", "MDQ6VXNlcjMz", "--requester-type", "User", "--repository", "owner/repo", "--expected-state", "received", "--idempotency-key", "key"})
 	pipeWrite.Close()
 	os.Stdout = original
 	if callErr != nil {
@@ -121,7 +121,7 @@ func TestGitHubReadCLIEndToEndPersistsAndRestarts(t *testing.T) {
 		t.Fatalf("GitHub CLI leaked non-contract fields: %s", output)
 	}
 	baseline := requests.Load()
-	if err := githubRead([]string{"--config", configPath, "--pr", "1", "--expected-head", "head", "--db", dbPath, "--run-id", "run", "--requester", "ifan0927", "--repository", "owner/repo", "--expected-state", "executing", "--idempotency-key", "key"}); err == nil {
+	if err := githubRead([]string{"--config", configPath, "--pr", "1", "--expected-head", "head", "--db", dbPath, "--run-id", "run", "--requester", "ifan0927", "--requester-database-id", "33", "--requester-node-id", "MDQ6VXNlcjMz", "--requester-type", "User", "--repository", "owner/repo", "--expected-state", "executing", "--idempotency-key", "key"}); err == nil {
 		t.Fatal("stale expected state was accepted")
 	}
 	if requests.Load() != baseline {

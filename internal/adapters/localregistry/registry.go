@@ -18,6 +18,7 @@ import (
 )
 
 const CurrentVersion = 1
+const ProfileSnapshotVersion = 1
 
 var referencePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$`)
 var githubOwnerPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$`)
@@ -25,7 +26,15 @@ var githubRepositoryPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
 var githubAppProfilePattern = regexp.MustCompile(`^github-app-profile:[a-z0-9][a-z0-9._-]{0,63}$`)
 
 type OperatorIdentityPolicy struct {
-	AllowedLogins []string `json:"allowed_logins"`
+	AllowedLogins []string               `json:"allowed_logins"`
+	TrustedActors []TrustedActorIdentity `json:"trusted_actors"`
+}
+
+type TrustedActorIdentity struct {
+	DatabaseID int64  `json:"database_id"`
+	NodeID     string `json:"node_id"`
+	Login      string `json:"login"`
+	Type       string `json:"type"`
 }
 
 type Repository struct {
@@ -39,6 +48,7 @@ type Repository struct {
 	VerifierRegistryRef    string                 `json:"verifier_registry_ref"`
 	VerifierIDs            []string               `json:"verifier_ids"`
 	GitHubAppProfileRef    string                 `json:"github_app_profile_ref"`
+	GitHubAppID            int64                  `json:"github_app_id"`
 	GitHubInstallationID   int64                  `json:"github_installation_id"`
 	ExpectedRepositoryID   int64                  `json:"expected_repository_id"`
 	OperatorIdentityPolicy OperatorIdentityPolicy `json:"operator_identity_policy"`
@@ -54,6 +64,10 @@ type File struct {
 }
 
 type Binding struct {
+	ProfileID               string                 `json:"profile_id"`
+	ProfileSnapshotVersion  int                    `json:"profile_snapshot_version"`
+	ProfileDigest           string                 `json:"profile_digest"`
+	ProfileSnapshotJSON     string                 `json:"-"`
 	RegistryVersion         int                    `json:"registry_version"`
 	RegistryDigest          string                 `json:"registry_digest"`
 	RepositoryBindingDigest string                 `json:"repository_binding_digest"`
@@ -66,32 +80,57 @@ type Binding struct {
 	VerifierRegistryRef     string                 `json:"verifier_registry_ref"`
 	VerifierIDs             []string               `json:"verifier_ids"`
 	GitHubAppProfileRef     string                 `json:"github_app_profile_ref"`
+	GitHubAppID             int64                  `json:"github_app_id"`
 	GitHubInstallationID    int64                  `json:"github_installation_id"`
 	ExpectedRepositoryID    int64                  `json:"expected_repository_id"`
 	OperatorIdentityPolicy  OperatorIdentityPolicy `json:"operator_identity_policy"`
 }
 
+// ProfileSnapshot is the canonical, credential-free authority evidence frozen for a run.
+// Registry-wide metadata is intentionally excluded so unrelated registry edits do not
+// invalidate this repository profile. Local ownership paths remain separately bound.
+type ProfileSnapshot struct {
+	Version                int                    `json:"version"`
+	ProfileID              string                 `json:"profile_id"`
+	CanonicalRepository    string                 `json:"canonical_repository"`
+	BaseBranch             string                 `json:"base_branch"`
+	VerifierRegistryRef    string                 `json:"verifier_registry_ref"`
+	VerifierIDs            []string               `json:"verifier_ids"`
+	GitHubAppProfileRef    string                 `json:"github_app_profile_ref"`
+	GitHubAppID            int64                  `json:"github_app_id"`
+	GitHubInstallationID   int64                  `json:"github_installation_id"`
+	ExpectedRepositoryID   int64                  `json:"expected_repository_id"`
+	OperatorIdentityPolicy OperatorIdentityPolicy `json:"operator_identity_policy"`
+}
+
 type SanitizedBinding struct {
-	RegistryVersion         int      `json:"registry_version"`
-	RegistryDigest          string   `json:"registry_digest"`
-	RepositoryBindingDigest string   `json:"repository_binding_digest"`
-	CanonicalRepository     string   `json:"canonical_repository"`
-	BaseBranch              string   `json:"base_branch"`
-	VerifierRegistryRef     string   `json:"verifier_registry_ref"`
-	VerifierIDs             []string `json:"verifier_ids"`
-	GitHubAppProfileRef     string   `json:"github_app_profile_ref"`
-	GitHubInstallationID    int64    `json:"github_installation_id"`
-	ExpectedRepositoryID    int64    `json:"expected_repository_id"`
-	AllowedOperatorLogins   []string `json:"allowed_operator_logins"`
+	ProfileID               string                 `json:"profile_id"`
+	ProfileSnapshotVersion  int                    `json:"profile_snapshot_version"`
+	ProfileDigest           string                 `json:"profile_digest"`
+	RegistryVersion         int                    `json:"registry_version"`
+	RegistryDigest          string                 `json:"registry_digest"`
+	RepositoryBindingDigest string                 `json:"repository_binding_digest"`
+	CanonicalRepository     string                 `json:"canonical_repository"`
+	BaseBranch              string                 `json:"base_branch"`
+	VerifierRegistryRef     string                 `json:"verifier_registry_ref"`
+	VerifierIDs             []string               `json:"verifier_ids"`
+	GitHubAppProfileRef     string                 `json:"github_app_profile_ref"`
+	GitHubAppID             int64                  `json:"github_app_id"`
+	GitHubInstallationID    int64                  `json:"github_installation_id"`
+	ExpectedRepositoryID    int64                  `json:"expected_repository_id"`
+	AllowedOperatorLogins   []string               `json:"allowed_operator_logins"`
+	TrustedOperatorActors   []TrustedActorIdentity `json:"trusted_operator_actors"`
 }
 
 func (b Binding) Sanitized() SanitizedBinding {
-	return SanitizedBinding{RegistryVersion: b.RegistryVersion, RegistryDigest: b.RegistryDigest,
+	return SanitizedBinding{ProfileID: b.ProfileID, ProfileSnapshotVersion: b.ProfileSnapshotVersion, ProfileDigest: b.ProfileDigest,
+		RegistryVersion: b.RegistryVersion, RegistryDigest: b.RegistryDigest,
 		RepositoryBindingDigest: b.RepositoryBindingDigest, CanonicalRepository: b.CanonicalRepository,
 		BaseBranch: b.BaseBranch, VerifierRegistryRef: b.VerifierRegistryRef,
 		VerifierIDs: append([]string(nil), b.VerifierIDs...), GitHubAppProfileRef: b.GitHubAppProfileRef,
-		GitHubInstallationID: b.GitHubInstallationID, ExpectedRepositoryID: b.ExpectedRepositoryID,
-		AllowedOperatorLogins: append([]string(nil), b.OperatorIdentityPolicy.AllowedLogins...)}
+		GitHubAppID: b.GitHubAppID, GitHubInstallationID: b.GitHubInstallationID, ExpectedRepositoryID: b.ExpectedRepositoryID,
+		AllowedOperatorLogins: append([]string(nil), b.OperatorIdentityPolicy.AllowedLogins...),
+		TrustedOperatorActors: append([]TrustedActorIdentity(nil), b.OperatorIdentityPolicy.TrustedActors...)}
 }
 
 type Registry struct {
@@ -177,10 +216,10 @@ func validateRepository(version int, registryDigest string, repo Repository) (Bi
 			}
 		}
 	}
-	if !referencePattern.MatchString(repo.BaseBranch) || repo.VerifierRegistryRef != "builtin:v1" || !githubAppProfilePattern.MatchString(repo.GitHubAppProfileRef) || repo.GitHubInstallationID < 1 || repo.ExpectedRepositoryID < 1 {
+	if !referencePattern.MatchString(repo.BaseBranch) || repo.VerifierRegistryRef != "builtin:v1" || !githubAppProfilePattern.MatchString(repo.GitHubAppProfileRef) || repo.GitHubAppID < 1 || repo.GitHubInstallationID < 1 || repo.ExpectedRepositoryID < 1 {
 		return Binding{}, fmt.Errorf("repository %s has incomplete authority binding", canonical)
 	}
-	if len(repo.VerifierIDs) == 0 || len(repo.OperatorIdentityPolicy.AllowedLogins) == 0 {
+	if len(repo.VerifierIDs) == 0 || len(repo.OperatorIdentityPolicy.AllowedLogins) == 0 || len(repo.OperatorIdentityPolicy.TrustedActors) == 0 {
 		return Binding{}, fmt.Errorf("repository %s has incomplete policy", canonical)
 	}
 	for _, id := range repo.VerifierIDs {
@@ -193,15 +232,52 @@ func validateRepository(version int, registryDigest string, repo Repository) (Bi
 			return Binding{}, fmt.Errorf("repository %s has invalid operator identity policy", canonical)
 		}
 	}
+	for _, actor := range repo.OperatorIdentityPolicy.TrustedActors {
+		if actor.DatabaseID < 1 || actor.NodeID == "" || !validGitHubOwner(actor.Login) || actor.Type != "User" {
+			return Binding{}, fmt.Errorf("repository %s has invalid trusted operator identity", canonical)
+		}
+	}
+	actorLogins := make([]string, len(repo.OperatorIdentityPolicy.TrustedActors))
+	actorNodes := make([]string, len(repo.OperatorIdentityPolicy.TrustedActors))
+	actorDatabaseIDs := make(map[int64]struct{}, len(repo.OperatorIdentityPolicy.TrustedActors))
+	for i, actor := range repo.OperatorIdentityPolicy.TrustedActors {
+		actorLogins[i], actorNodes[i] = actor.Login, actor.NodeID
+		if _, exists := actorDatabaseIDs[actor.DatabaseID]; exists {
+			return Binding{}, fmt.Errorf("repository %s has duplicate trusted operator identity", canonical)
+		}
+		actorDatabaseIDs[actor.DatabaseID] = struct{}{}
+	}
+	if hasDuplicateFold(actorLogins) || hasDuplicate(actorNodes) {
+		return Binding{}, fmt.Errorf("repository %s has duplicate trusted operator identity", canonical)
+	}
+	for _, login := range repo.OperatorIdentityPolicy.AllowedLogins {
+		if !slices.ContainsFunc(actorLogins, func(actorLogin string) bool { return strings.EqualFold(login, actorLogin) }) {
+			return Binding{}, fmt.Errorf("repository %s operator login lacks immutable trusted identity", canonical)
+		}
+	}
 	if hasDuplicate(repo.VerifierIDs) || hasDuplicateFold(repo.OperatorIdentityPolicy.AllowedLogins) {
 		return Binding{}, fmt.Errorf("repository %s has duplicate policy values", canonical)
 	}
+	for i := range repo.OperatorIdentityPolicy.AllowedLogins {
+		repo.OperatorIdentityPolicy.AllowedLogins[i] = strings.ToLower(repo.OperatorIdentityPolicy.AllowedLogins[i])
+	}
+	for i := range repo.OperatorIdentityPolicy.TrustedActors {
+		repo.OperatorIdentityPolicy.TrustedActors[i].Login = strings.ToLower(repo.OperatorIdentityPolicy.TrustedActors[i].Login)
+	}
 	slices.Sort(repo.VerifierIDs)
 	slices.Sort(repo.OperatorIdentityPolicy.AllowedLogins)
-	binding := Binding{RegistryVersion: version, RegistryDigest: registryDigest, CanonicalRepository: canonical,
+	slices.SortFunc(repo.OperatorIdentityPolicy.TrustedActors, func(a, b TrustedActorIdentity) int { return strings.Compare(a.NodeID, b.NodeID) })
+	profileID := "repository-profile:" + canonical
+	profile := ProfileSnapshot{Version: ProfileSnapshotVersion, ProfileID: profileID, CanonicalRepository: canonical,
+		BaseBranch: repo.BaseBranch, VerifierRegistryRef: repo.VerifierRegistryRef, VerifierIDs: append([]string(nil), repo.VerifierIDs...),
+		GitHubAppProfileRef: repo.GitHubAppProfileRef, GitHubAppID: repo.GitHubAppID, GitHubInstallationID: repo.GitHubInstallationID,
+		ExpectedRepositoryID: repo.ExpectedRepositoryID, OperatorIdentityPolicy: repo.OperatorIdentityPolicy}
+	profileRaw, _ := json.Marshal(profile)
+	binding := Binding{ProfileID: profileID, ProfileSnapshotVersion: ProfileSnapshotVersion, ProfileDigest: digest(profileRaw), ProfileSnapshotJSON: string(profileRaw),
+		RegistryVersion: version, RegistryDigest: registryDigest, CanonicalRepository: canonical,
 		OriginPath: repo.OriginPath, SourcePath: repo.SourcePath, RunRoot: repo.RunRoot, WorktreeRoot: repo.WorktreeRoot,
 		BaseBranch: repo.BaseBranch, VerifierRegistryRef: repo.VerifierRegistryRef, VerifierIDs: repo.VerifierIDs,
-		GitHubAppProfileRef: repo.GitHubAppProfileRef, GitHubInstallationID: repo.GitHubInstallationID,
+		GitHubAppProfileRef: repo.GitHubAppProfileRef, GitHubAppID: repo.GitHubAppID, GitHubInstallationID: repo.GitHubInstallationID,
 		ExpectedRepositoryID: repo.ExpectedRepositoryID, OperatorIdentityPolicy: repo.OperatorIdentityPolicy}
 	raw, _ := json.Marshal(struct {
 		RegistryVersion int        `json:"registry_version"`
@@ -282,19 +358,26 @@ func (r Registry) VerifyPersisted(binding Binding) error {
 	if err != nil {
 		return err
 	}
-	if !sameBinding(binding, current) || binding.RegistryVersion != r.version || binding.RegistryDigest != r.digest {
+	if binding.ProfileSnapshotVersion != ProfileSnapshotVersion || binding.ProfileID == "" || binding.ProfileDigest == "" {
+		return errors.New("persisted repository profile evidence is legacy-insufficient")
+	}
+	if digest([]byte(binding.ProfileSnapshotJSON)) != binding.ProfileDigest || binding.ProfileSnapshotJSON != current.ProfileSnapshotJSON {
+		return errors.New("persisted repository profile snapshot is invalid")
+	}
+	if !sameBinding(binding, current) {
 		return errors.New("repository registry drift changes persisted authority")
 	}
 	return nil
 }
 
 func sameBinding(a, b Binding) bool {
-	return a.RegistryVersion == b.RegistryVersion && a.RegistryDigest == b.RegistryDigest &&
-		a.RepositoryBindingDigest == b.RepositoryBindingDigest && a.CanonicalRepository == b.CanonicalRepository &&
-		a.OriginPath == b.OriginPath && a.SourcePath == b.SourcePath && a.RunRoot == b.RunRoot && a.WorktreeRoot == b.WorktreeRoot &&
-		a.BaseBranch == b.BaseBranch && a.VerifierRegistryRef == b.VerifierRegistryRef && slices.Equal(a.VerifierIDs, b.VerifierIDs) &&
-		a.GitHubAppProfileRef == b.GitHubAppProfileRef && a.GitHubInstallationID == b.GitHubInstallationID &&
-		a.ExpectedRepositoryID == b.ExpectedRepositoryID && slices.Equal(a.OperatorIdentityPolicy.AllowedLogins, b.OperatorIdentityPolicy.AllowedLogins)
+	return a.ProfileID == b.ProfileID && a.ProfileSnapshotVersion == b.ProfileSnapshotVersion && a.ProfileDigest == b.ProfileDigest && a.ProfileSnapshotJSON == b.ProfileSnapshotJSON &&
+		a.CanonicalRepository == b.CanonicalRepository && a.OriginPath == b.OriginPath && a.SourcePath == b.SourcePath &&
+		a.RunRoot == b.RunRoot && a.WorktreeRoot == b.WorktreeRoot && a.BaseBranch == b.BaseBranch &&
+		a.VerifierRegistryRef == b.VerifierRegistryRef && slices.Equal(a.VerifierIDs, b.VerifierIDs) &&
+		a.GitHubAppProfileRef == b.GitHubAppProfileRef && a.GitHubAppID == b.GitHubAppID && a.GitHubInstallationID == b.GitHubInstallationID &&
+		a.ExpectedRepositoryID == b.ExpectedRepositoryID && slices.Equal(a.OperatorIdentityPolicy.AllowedLogins, b.OperatorIdentityPolicy.AllowedLogins) &&
+		slices.Equal(a.OperatorIdentityPolicy.TrustedActors, b.OperatorIdentityPolicy.TrustedActors)
 }
 
 func BuiltinVerifierCommands() map[string]verifier.Command {

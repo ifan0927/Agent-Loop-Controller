@@ -59,12 +59,12 @@ func main() {
 
 func githubRead(args []string) error {
 	flags := flag.NewFlagSet("github-read", flag.ContinueOnError)
+	requesterIdentity := addRequesterFlags(flags)
 	configPath := flags.String("config", "", "GitHub App read-only configuration")
 	pr := flags.Int64("pr", 0, "persisted pull request number")
 	head := flags.String("expected-head", "", "expected exact PR head SHA")
 	dbPath := flags.String("db", "", "optional controller SQLite database")
 	runID := flags.String("run-id", "", "run ID required with --db")
-	requester := flags.String("requester", "", "authenticated GitHub login supplied by the invoking adapter")
 	repository := flags.String("repository", "", "previously observed canonical repository")
 	expectedState := flags.String("expected-state", "", "previously observed run state used as a compare-and-swap token")
 	idempotencyKey := flags.String("idempotency-key", "", "persisted run idempotency token")
@@ -74,7 +74,7 @@ func githubRead(args []string) error {
 	if *configPath == "" || *pr < 1 || *head == "" {
 		return errors.New("--config, --pr, and --expected-head are required")
 	}
-	if *dbPath == "" || *runID == "" || *requester == "" || *repository == "" || *expectedState == "" || *idempotencyKey == "" {
+	if *dbPath == "" || *runID == "" || !requesterIdentity.complete() || *repository == "" || *expectedState == "" || *idempotencyKey == "" {
 		return errors.New("--db, --run-id, --requester, --repository, --expected-state, and --idempotency-key are required for persisted ownership reconciliation")
 	}
 	store, err := sqlitestore.Open(*dbPath)
@@ -82,7 +82,7 @@ func githubRead(args []string) error {
 		return err
 	}
 	defer store.Close()
-	if _, err := application.NewQueryService(store).Status(context.Background(), application.QueryInput{Requester: cliRequester(*requester), RunID: *runID, Repository: *repository}); err != nil {
+	if _, err := application.NewQueryService(store).Status(context.Background(), application.QueryInput{Requester: requesterIdentity.value(), RunID: *runID, Repository: *repository}); err != nil {
 		return err
 	}
 	inspection, err := store.Inspect(context.Background(), *runID)
@@ -124,7 +124,7 @@ func githubRead(args []string) error {
 	defer cancel()
 	controller := application.NewCommandService(nil, store)
 	result, reconcileErr := controller.ReconcileFromGitHub(ctx, application.GitHubReconcileCommand{
-		Requester: cliRequester(*requester), RunID: *runID, Repository: *repository, ExpectedState: domain.State(*expectedState),
+		Requester: requesterIdentity.value(), RunID: *runID, Repository: *repository, ExpectedState: domain.State(*expectedState),
 		IdempotencyKey: *idempotencyKey, PullRequest: *pr, ExpectedHead: *head,
 	}, githubReadAdapter{client: client, observations: &observations})
 	if reconcileErr != nil {
@@ -136,6 +136,10 @@ func githubRead(args []string) error {
 type githubReadAdapter struct {
 	client       *githubapp.Client
 	observations *[]application.GitHubRequestObservation
+}
+
+func (a githubReadAdapter) Authority() application.GitHubInstallationMetadata {
+	return a.client.InstallationMetadata()
 }
 
 func (a githubReadAdapter) Read(ctx context.Context, pr int64, head string) (domain.GitHubReadEvidence, []application.GitHubRequestObservation, application.GitHubInstallationMetadata, error) {
@@ -163,17 +167,17 @@ func local(args []string) error {
 
 func localStart(args []string) error {
 	flags := flag.NewFlagSet("local start", flag.ContinueOnError)
+	requesterIdentity := addRequesterFlags(flags)
 	issuePath := flags.String("issue", "", "simulated Linear issue JSON")
 	registryPath := flags.String("registry", "", "controller-owned local repository registry JSON")
 	dbPath := flags.String("db", "", "SQLite controller database")
 	codexBinary := flags.String("codex-binary", "codex", "Codex CLI binary")
 	timeout := flags.Duration("timeout", 30*time.Minute, "local run timeout")
-	requester := flags.String("requester", "", "authenticated GitHub login supplied by the invoking adapter")
 	repository := flags.String("repository", "", "caller-selected canonical repository")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if *issuePath == "" || *registryPath == "" || *dbPath == "" || *requester == "" || *repository == "" {
+	if *issuePath == "" || *registryPath == "" || *dbPath == "" || !requesterIdentity.complete() || *repository == "" {
 		return fmt.Errorf("--issue, --registry, --db, --requester, and --repository are required")
 	}
 	registry, err := localregistry.Load(*registryPath)
@@ -184,7 +188,7 @@ func localStart(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := application.AuthorizeRequester(cliRequester(*requester), repo.OperatorIdentityPolicy.AllowedLogins); err != nil {
+	if err := application.AuthorizeRequester(requesterIdentity.value(), repo.OperatorIdentityPolicy.AllowedLogins, applicationActors(repo.OperatorIdentityPolicy.TrustedActors)...); err != nil {
 		return err
 	}
 	file, err := os.Open(*issuePath)
@@ -214,7 +218,7 @@ func localStart(args []string) error {
 	input := application.LocalStartInput{Task: snapshot.Task, RawIssueJSON: snapshot.RawJSON, RawIssueHash: snapshot.RawHash,
 		NormalizedJSON: snapshot.NormalizedJSON, TaskHash: snapshot.TaskHash, IdempotencyKey: snapshot.IdempotencyKey,
 		Repository: localRepository(repo), RunRoot: repo.RunRoot, WorktreeRoot: repo.WorktreeRoot}
-	result, err := application.NewCommandService(controller, store).Start(ctx, application.StartCommand{Requester: cliRequester(*requester), RepositorySelection: snapshot.Task.Repository, IdempotencyKey: snapshot.IdempotencyKey, Input: input})
+	result, err := application.NewCommandService(controller, store).Start(ctx, application.StartCommand{Requester: requesterIdentity.value(), RepositorySelection: snapshot.Task.Repository, IdempotencyKey: snapshot.IdempotencyKey, Input: input})
 	if err != nil {
 		return err
 	}
@@ -223,12 +227,12 @@ func localStart(args []string) error {
 
 func localContinue(args []string) error {
 	flags := flag.NewFlagSet("local continue", flag.ContinueOnError)
+	requesterIdentity := addRequesterFlags(flags)
 	dbPath := flags.String("db", "", "SQLite controller database")
 	registryPath := flags.String("registry", "", "versioned repository registry used to create the run")
 	decisionPath := flags.String("decision", "", "optional simulated human decision JSON")
 	codexBinary := flags.String("codex-binary", "codex", "Codex CLI binary")
 	timeout := flags.Duration("timeout", 30*time.Minute, "local run timeout")
-	requester := flags.String("requester", "", "authenticated GitHub login supplied by the invoking adapter")
 	repository := flags.String("repository", "", "previously observed canonical repository")
 	expectedState := flags.String("expected-state", "", "previously observed run state used as a compare-and-swap token")
 	idempotencyKey := flags.String("idempotency-key", "", "persisted run idempotency token")
@@ -239,7 +243,7 @@ func localContinue(args []string) error {
 	if runID == "" && flags.NArg() == 1 {
 		runID = flags.Arg(0)
 	}
-	if runID == "" || *dbPath == "" || *registryPath == "" || *requester == "" || *repository == "" || *expectedState == "" || *idempotencyKey == "" {
+	if runID == "" || *dbPath == "" || *registryPath == "" || !requesterIdentity.complete() || *repository == "" || *expectedState == "" || *idempotencyKey == "" {
 		return fmt.Errorf("usage: ifan-loop local continue <run-id> --db <controller.db> --registry <repository-registry.json> --requester <login> --repository <owner/repo> --expected-state <state> --idempotency-key <key> [--decision <decision.json>]")
 	}
 	store, err := sqlitestore.Open(*dbPath)
@@ -251,7 +255,7 @@ func localContinue(args []string) error {
 	if err != nil {
 		return application.ClassifyError(err)
 	}
-	if _, err := application.NewQueryService(store).Status(context.Background(), application.QueryInput{Requester: cliRequester(*requester), RunID: runID, Repository: *repository}); err != nil {
+	if _, err := application.NewQueryService(store).Status(context.Background(), application.QueryInput{Requester: requesterIdentity.value(), RunID: runID, Repository: *repository}); err != nil {
 		return err
 	}
 	registry, err := localregistry.Load(*registryPath)
@@ -277,7 +281,7 @@ func localContinue(args []string) error {
 	controller := newLocalController(store, *codexBinary, filepath.Dir(existing.WorktreePath))
 	ctx, cancel := localContext(*timeout)
 	defer cancel()
-	result, err := application.NewCommandService(controller, store).Continue(ctx, application.ContinueCommand{Requester: cliRequester(*requester), RunID: runID, ExpectedState: domain.State(*expectedState), Repository: *repository, IdempotencyKey: *idempotencyKey, Decision: decision})
+	result, err := application.NewCommandService(controller, store).Continue(ctx, application.ContinueCommand{Requester: requesterIdentity.value(), RunID: runID, ExpectedState: domain.State(*expectedState), Repository: *repository, IdempotencyKey: *idempotencyKey, Decision: decision})
 	if err != nil {
 		return err
 	}
@@ -285,32 +289,54 @@ func localContinue(args []string) error {
 }
 
 func localRepository(repo localregistry.Binding) application.LocalRepository {
-	return application.LocalRepository{RegistryVersion: repo.RegistryVersion, RegistryDigest: repo.RegistryDigest,
+	return application.LocalRepository{ProfileID: repo.ProfileID, ProfileSnapshotVersion: repo.ProfileSnapshotVersion, ProfileDigest: repo.ProfileDigest,
+		ProfileSnapshotJSON: repo.ProfileSnapshotJSON,
+		RegistryVersion:     repo.RegistryVersion, RegistryDigest: repo.RegistryDigest,
 		RepositoryBindingDigest: repo.RepositoryBindingDigest, CanonicalRepository: repo.CanonicalRepository,
 		OriginPath: repo.OriginPath, SourcePath: repo.SourcePath, RunRoot: repo.RunRoot, WorktreeRoot: repo.WorktreeRoot,
 		BaseBranch: repo.BaseBranch, VerifierRegistryRef: repo.VerifierRegistryRef, VerifierIDs: append([]string(nil), repo.VerifierIDs...),
-		GitHubAppProfileRef: repo.GitHubAppProfileRef, GitHubInstallationID: repo.GitHubInstallationID,
-		ExpectedRepositoryID: repo.ExpectedRepositoryID, AllowedOperatorLogins: append([]string(nil), repo.OperatorIdentityPolicy.AllowedLogins...)}
+		GitHubAppProfileRef: repo.GitHubAppProfileRef, GitHubAppID: repo.GitHubAppID, GitHubInstallationID: repo.GitHubInstallationID,
+		ExpectedRepositoryID: repo.ExpectedRepositoryID, AllowedOperatorLogins: append([]string(nil), repo.OperatorIdentityPolicy.AllowedLogins...),
+		TrustedOperatorActors: applicationActors(repo.OperatorIdentityPolicy.TrustedActors)}
 }
 
 func localBinding(repo application.LocalRepository) localregistry.Binding {
-	return localregistry.Binding{RegistryVersion: repo.RegistryVersion, RegistryDigest: repo.RegistryDigest,
+	return localregistry.Binding{ProfileID: repo.ProfileID, ProfileSnapshotVersion: repo.ProfileSnapshotVersion, ProfileDigest: repo.ProfileDigest,
+		ProfileSnapshotJSON: repo.ProfileSnapshotJSON,
+		RegistryVersion:     repo.RegistryVersion, RegistryDigest: repo.RegistryDigest,
 		RepositoryBindingDigest: repo.RepositoryBindingDigest, CanonicalRepository: repo.CanonicalRepository,
 		OriginPath: repo.OriginPath, SourcePath: repo.SourcePath, RunRoot: repo.RunRoot, WorktreeRoot: repo.WorktreeRoot,
 		BaseBranch: repo.BaseBranch, VerifierRegistryRef: repo.VerifierRegistryRef, VerifierIDs: append([]string(nil), repo.VerifierIDs...),
-		GitHubAppProfileRef: repo.GitHubAppProfileRef, GitHubInstallationID: repo.GitHubInstallationID,
+		GitHubAppProfileRef: repo.GitHubAppProfileRef, GitHubAppID: repo.GitHubAppID, GitHubInstallationID: repo.GitHubInstallationID,
 		ExpectedRepositoryID:   repo.ExpectedRepositoryID,
-		OperatorIdentityPolicy: localregistry.OperatorIdentityPolicy{AllowedLogins: append([]string(nil), repo.AllowedOperatorLogins...)}}
+		OperatorIdentityPolicy: localregistry.OperatorIdentityPolicy{AllowedLogins: append([]string(nil), repo.AllowedOperatorLogins...), TrustedActors: registryActors(repo.TrustedOperatorActors)}}
+}
+
+func applicationActors(values []localregistry.TrustedActorIdentity) []application.TrustedActorIdentity {
+	result := make([]application.TrustedActorIdentity, len(values))
+	for i, actor := range values {
+		result[i] = application.TrustedActorIdentity{DatabaseID: actor.DatabaseID, NodeID: actor.NodeID, Login: actor.Login, Type: actor.Type}
+	}
+	return result
+}
+
+func registryActors(values []application.TrustedActorIdentity) []localregistry.TrustedActorIdentity {
+	result := make([]localregistry.TrustedActorIdentity, len(values))
+	for i, actor := range values {
+		result[i] = localregistry.TrustedActorIdentity{DatabaseID: actor.DatabaseID, NodeID: actor.NodeID, Login: actor.Login, Type: actor.Type}
+	}
+	return result
 }
 
 func validatePersistedRegistryBinding(run application.Run, registry localregistry.Registry) error {
-	if run.RegistryVersion < 1 {
+	if run.RegistryVersion < 1 || run.ProfileSnapshotVersion < 1 || run.ProfileID == "" || run.ProfileDigest == "" || run.ProfileSnapshotJSON == "" {
 		return errors.New("persisted repository binding is legacy-insufficient")
 	}
 	var persisted application.LocalRepository
 	if err := json.Unmarshal([]byte(run.RepositoryConfigJSON), &persisted); err != nil {
 		return errors.New("persisted repository binding is invalid")
 	}
+	persisted.ProfileSnapshotJSON = run.ProfileSnapshotJSON
 	rawIssueBytes := []byte(run.RawIssueJSON)
 	rawIssueDigest := sha256.Sum256(rawIssueBytes)
 	if hex.EncodeToString(rawIssueDigest[:]) != run.RawIssueHash {
@@ -341,6 +367,7 @@ func validatePersistedRegistryBinding(run application.Run, registry localregistr
 		return errors.New("persisted run columns do not match immutable task snapshot")
 	}
 	if run.Repository != persisted.CanonicalRepository || run.BaseBranch != persisted.BaseBranch ||
+		run.ProfileID != persisted.ProfileID || run.ProfileSnapshotVersion != persisted.ProfileSnapshotVersion || run.ProfileDigest != persisted.ProfileDigest ||
 		run.RegistryVersion != persisted.RegistryVersion || run.RegistryDigest != persisted.RegistryDigest ||
 		run.RepositoryBindingDigest != persisted.RepositoryBindingDigest ||
 		run.WorktreePath != filepath.Join(persisted.WorktreeRoot, run.ID) || run.ArtifactRoot != filepath.Join(persisted.RunRoot, run.ID) {
@@ -367,8 +394,8 @@ func decodeDecision(reader io.Reader) (application.Decision, error) {
 
 func localInspect(command string, args []string) error {
 	flags := flag.NewFlagSet("local "+command, flag.ContinueOnError)
+	requesterIdentity := addRequesterFlags(flags)
 	dbPath := flags.String("db", "", "SQLite controller database")
-	requester := flags.String("requester", "", "authenticated GitHub login supplied by the invoking adapter")
 	runID, flagArgs := splitLeadingRunID(args)
 	if err := flags.Parse(flagArgs); err != nil {
 		return err
@@ -376,7 +403,7 @@ func localInspect(command string, args []string) error {
 	if runID == "" && flags.NArg() == 1 {
 		runID = flags.Arg(0)
 	}
-	if runID == "" || *dbPath == "" || *requester == "" {
+	if runID == "" || *dbPath == "" || !requesterIdentity.complete() {
 		return fmt.Errorf("usage: ifan-loop local %s <run-id> --db <controller.db>", command)
 	}
 	store, err := sqlitestore.Open(*dbPath)
@@ -389,7 +416,7 @@ func localInspect(command string, args []string) error {
 		return application.ClassifyError(err)
 	}
 	queries := application.NewQueryService(store)
-	input := application.QueryInput{Requester: cliRequester(*requester), RunID: runID, Repository: run.Repository}
+	input := application.QueryInput{Requester: requesterIdentity.value(), RunID: runID, Repository: run.Repository}
 	if command == "status" {
 		result, err := queries.Status(context.Background(), input)
 		if err != nil {
@@ -406,6 +433,21 @@ func localInspect(command string, args []string) error {
 
 func sanitizeInspection(inspection *application.RunInspection) {
 	application.SanitizeInspection(inspection)
+}
+
+type requesterFlags struct {
+	login, nodeID, actorType *string
+	databaseID               *int64
+}
+
+func addRequesterFlags(flags *flag.FlagSet) requesterFlags {
+	return requesterFlags{login: flags.String("requester", "", "authenticated GitHub login"), databaseID: flags.Int64("requester-database-id", 0, "authenticated GitHub actor database ID"), nodeID: flags.String("requester-node-id", "", "authenticated GitHub actor node ID"), actorType: flags.String("requester-type", "", "authenticated GitHub actor type")}
+}
+func (r requesterFlags) complete() bool {
+	return *r.login != "" && *r.databaseID > 0 && *r.nodeID != "" && *r.actorType != ""
+}
+func (r requesterFlags) value() application.Requester {
+	return application.Requester{ID: *r.login, Kind: "github_login", DatabaseID: *r.databaseID, NodeID: *r.nodeID, ActorType: *r.actorType}
 }
 
 func cliRequester(login string) application.Requester {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -111,6 +112,26 @@ func TestMigrationAndRunIdempotency(t *testing.T) {
 	other.Run.IdempotencyKey = "key-2"
 	if _, _, err := store.CreateRun(context.Background(), other); err == nil {
 		t.Fatal("active issue uniqueness must reject second run")
+	}
+}
+
+func TestRunIdempotencyRejectsLocalOwnershipPathDrift(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	profile := application.LocalRepository{OriginPath: "/origin-a", SourcePath: "/source-a", RunRoot: "/runs-a", WorktreeRoot: "/worktrees-a"}
+	raw, _ := json.Marshal(profile)
+	input := application.CreateRunInput{Run: application.Run{ID: "run", IssueID: "issue", IdempotencyKey: "key", TaskHash: "task", SourceRevision: "v1", Repository: "owner/repo", RepositoryConfigJSON: string(raw), ProfileID: "repository-profile:owner/repo", ProfileSnapshotVersion: 1, ProfileDigest: "profile", ProfileSnapshotJSON: `{}`}}
+	if _, _, err := store.CreateRun(context.Background(), input); err != nil {
+		t.Fatal(err)
+	}
+	profile.WorktreeRoot = "/worktrees-b"
+	raw, _ = json.Marshal(profile)
+	input.Run.RepositoryConfigJSON = string(raw)
+	if _, _, err := store.CreateRun(context.Background(), input); err == nil {
+		t.Fatal("idempotent create accepted local ownership path drift")
 	}
 }
 

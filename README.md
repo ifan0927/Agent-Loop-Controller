@@ -142,11 +142,13 @@ labs for inspection:
 ```
 
 The versioned local repository registry binds canonical owner/name, local roots,
-base branch, verifier registry and allowed verifier IDs, GitHub App profile and
-installation identity, immutable repository ID, and allowed operator logins.
+base branch, verifier registry and allowed verifier IDs, immutable GitHub App and
+installation identity, immutable repository ID, and trusted operator identities.
 It contains references and non-secret identity only; executable verifier
-commands remain compiled controller policy. A run freezes the registry and
-selected binding digests, and `local continue` rejects authority-changing drift.
+commands remain compiled controller policy. A run freezes canonical sanitized
+profile evidence for the selected repository; `local continue` rejects material
+profile or local-ownership drift without treating unrelated registry edits or
+credential rotation with unchanged identity as authority changes.
 
 Post-approval destructive smoke must use a disposable local bare origin and fake
 GitHub service, or an explicitly authorized isolated GitHub test repository.

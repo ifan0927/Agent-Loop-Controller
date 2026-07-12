@@ -69,6 +69,12 @@ func TestRegistryRejectsSymlinkAmbiguityAndAuthorityDrift(t *testing.T) {
 	if err := drifted.VerifyPersisted(persisted); err == nil {
 		t.Fatal("authority-changing config drift accepted")
 	}
+	repo.ExpectedRepositoryID = 101
+	repo.OperatorIdentityPolicy.TrustedActors[0].DatabaseID++
+	actorDrift := loadFixtureAt(t, filepath.Join(root, "actor-drift.json"), File{Version: 1, Repositories: []Repository{repo}})
+	if err := actorDrift.VerifyPersisted(persisted); err == nil {
+		t.Fatal("trusted actor identity drift accepted")
+	}
 	tampered := persisted
 	tampered.OriginPath = tampered.SourcePath
 	if err := registry.VerifyPersisted(tampered); err == nil {
@@ -87,6 +93,86 @@ func TestRegistryRejectsSymlinkAmbiguityAndAuthorityDrift(t *testing.T) {
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("symlink-ambiguous path accepted")
+	}
+}
+
+func TestProfileDigestIsCanonicalAndScopedToResolvedRepository(t *testing.T) {
+	root := t.TempDir()
+	primary := fixtureRepository(t, root, "owner", "primary", 101)
+	other := fixtureRepository(t, root, "owner", "other", 102)
+	registry := loadFixtureAt(t, filepath.Join(root, "first.json"), File{Version: CurrentVersion, Repositories: []Repository{primary}})
+	persisted, err := registry.Resolve("owner/primary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var repositoryFields map[string]any
+	encodedPrimary, _ := json.Marshal(primary)
+	if err := json.Unmarshal(encodedPrimary, &repositoryFields); err != nil {
+		t.Fatal(err)
+	}
+	reorderedRaw, _ := json.Marshal(map[string]any{"repositories": []any{repositoryFields}, "version": CurrentVersion})
+	reorderedPath := filepath.Join(root, "reordered.json")
+	if err := os.WriteFile(reorderedPath, reorderedRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reorderedRegistry, err := Load(reorderedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reorderedBinding, _ := reorderedRegistry.Resolve("owner/primary")
+	if reorderedBinding.ProfileDigest != persisted.ProfileDigest || reorderedBinding.ProfileSnapshotJSON != persisted.ProfileSnapshotJSON {
+		t.Fatal("source JSON field order changed the canonical profile evidence")
+	}
+	caseChanged := primary
+	caseChanged.OperatorIdentityPolicy.AllowedLogins[0] = "IFAN0927"
+	caseChanged.OperatorIdentityPolicy.TrustedActors[0].Login = "Ifan0927"
+	caseRegistry := loadFixtureAt(t, filepath.Join(root, "case-changed.json"), File{Version: CurrentVersion, Repositories: []Repository{caseChanged}})
+	caseBinding, _ := caseRegistry.Resolve("owner/primary")
+	if caseBinding.ProfileDigest != persisted.ProfileDigest {
+		t.Fatal("GitHub login casing changed the canonical profile digest")
+	}
+
+	// Adding or changing another repository changes the registry file digest, but
+	// must not change the immutable authority evidence for this resolved profile.
+	other.ExpectedRepositoryID = 202
+	expanded := loadFixtureAt(t, filepath.Join(root, "expanded.json"), File{Version: CurrentVersion, Repositories: []Repository{other, primary}})
+	current, err := expanded.Resolve("owner/primary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.RegistryDigest == current.RegistryDigest || persisted.ProfileDigest != current.ProfileDigest {
+		t.Fatalf("registry/profile digests are not independently scoped: old=%+v new=%+v", persisted.Sanitized(), current.Sanitized())
+	}
+	if err := expanded.VerifyPersisted(persisted); err != nil {
+		t.Fatalf("unrelated registry edit invalidated profile: %v", err)
+	}
+
+	var snapshot ProfileSnapshot
+	if err := json.Unmarshal([]byte(persisted.ProfileSnapshotJSON), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.ProfileID != "repository-profile:owner/primary" || strings.Contains(persisted.ProfileSnapshotJSON, root) {
+		t.Fatalf("profile snapshot is unstable or contains local paths: %s", persisted.ProfileSnapshotJSON)
+	}
+}
+
+func TestProfileDigestRejectsTamperedCanonicalSnapshot(t *testing.T) {
+	root := t.TempDir()
+	repository := fixtureRepository(t, root, "owner", "repo", 101)
+	registry := loadFixture(t, root, File{Version: CurrentVersion, Repositories: []Repository{repository}})
+	persisted, _ := registry.Resolve("owner/repo")
+
+	var fields map[string]any
+	if err := json.Unmarshal([]byte(persisted.ProfileSnapshotJSON), &fields); err != nil {
+		t.Fatal(err)
+	}
+	reordered, _ := json.Marshal(fields)
+	if digest(reordered) == persisted.ProfileDigest && string(reordered) != persisted.ProfileSnapshotJSON {
+		t.Fatal("test did not produce a different JSON field order")
+	}
+	persisted.ProfileSnapshotJSON = string(reordered)
+	if err := registry.VerifyPersisted(persisted); err == nil {
+		t.Fatal("non-canonical persisted profile snapshot accepted")
 	}
 }
 
@@ -145,8 +231,8 @@ func fixtureRepository(t *testing.T, root, owner, name string, id int64) Reposit
 	}
 	return Repository{Owner: owner, Name: name, OriginPath: paths[0], SourcePath: paths[1], RunRoot: paths[2], WorktreeRoot: paths[3],
 		BaseBranch: "main", VerifierRegistryRef: "builtin:v1", VerifierIDs: []string{"fixture-go-test"},
-		GitHubAppProfileRef: "github-app-profile:fixture", GitHubInstallationID: 22, ExpectedRepositoryID: id,
-		OperatorIdentityPolicy: OperatorIdentityPolicy{AllowedLogins: []string{"ifan0927"}}}
+		GitHubAppProfileRef: "github-app-profile:fixture", GitHubAppID: 11, GitHubInstallationID: 22, ExpectedRepositoryID: id,
+		OperatorIdentityPolicy: OperatorIdentityPolicy{AllowedLogins: []string{"ifan0927"}, TrustedActors: []TrustedActorIdentity{{DatabaseID: 33, NodeID: "MDQ6VXNlcjMz", Login: "ifan0927", Type: "User"}}}}
 }
 
 func loadFixture(t *testing.T, root string, file File) Registry {
