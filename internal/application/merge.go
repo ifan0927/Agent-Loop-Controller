@@ -250,7 +250,7 @@ func (c *ProductionCoordinator) completeObservedMerge(ctx context.Context, run R
 			return ProductionMergeResult{}, classifyServiceError(err)
 		}
 	}
-	if err := c.store.Transition(ctx, run.ID, domain.StateMerging, domain.StateCleaning, "GitHub squash merge observed", merge.MergeSHA, run.CandidateHead); err != nil {
+	if err := c.store.Transition(ctx, run.ID, domain.StateMerging, domain.StateAwaitingLinearCompletion, "GitHub squash merge observed; awaiting Linear completion", merge.MergeSHA, run.CandidateHead); err != nil {
 		return ProductionMergeResult{}, classifyServiceError(err)
 	}
 	next, err := c.store.GetRun(ctx, run.ID)

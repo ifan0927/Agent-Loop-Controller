@@ -357,23 +357,24 @@ func authorizePersistedRequester(run Run, requester Requester) error {
 }
 
 type InspectionResult struct {
-	SchemaVersion     string                     `json:"schema_version"`
-	Run               RunResult                  `json:"run"`
-	RepositoryBinding *RepositoryBindingResult   `json:"repository_binding,omitempty"`
-	Timeline          []TransitionResult         `json:"state_timeline"`
-	Attempts          []AttemptResult            `json:"attempts"`
-	Verifications     []VerificationResult       `json:"verifications"`
-	Reviews           []ReviewResult             `json:"reviews"`
-	Resources         []ResourceResult           `json:"owned_resources"`
-	PullRequest       *PullRequestResult         `json:"pull_request,omitempty"`
-	Approval          *HumanApprovalResult       `json:"human_approval,omitempty"`
-	ApprovalStatus    *HumanApprovalStatusResult `json:"human_approval_status,omitempty"`
-	Merge             *MergeRecord               `json:"merge_result,omitempty"`
-	Cleanup           []CleanupResult            `json:"cleanup_progress"`
-	Checks            []CheckResult              `json:"checks"`
-	CodeRabbit        *CodeRabbitResult          `json:"coderabbit,omitempty"`
-	Findings          []FindingResult            `json:"review_findings"`
-	Telemetry         []TelemetryResult          `json:"unknown_telemetry"`
+	SchemaVersion     string                        `json:"schema_version"`
+	Run               RunResult                     `json:"run"`
+	RepositoryBinding *RepositoryBindingResult      `json:"repository_binding,omitempty"`
+	Timeline          []TransitionResult            `json:"state_timeline"`
+	Attempts          []AttemptResult               `json:"attempts"`
+	Verifications     []VerificationResult          `json:"verifications"`
+	Reviews           []ReviewResult                `json:"reviews"`
+	Resources         []ResourceResult              `json:"owned_resources"`
+	PullRequest       *PullRequestResult            `json:"pull_request,omitempty"`
+	Approval          *HumanApprovalResult          `json:"human_approval,omitempty"`
+	ApprovalStatus    *HumanApprovalStatusResult    `json:"human_approval_status,omitempty"`
+	Merge             *MergeRecord                  `json:"merge_result,omitempty"`
+	LinearCompletion  []LinearCompletionObservation `json:"linear_completion_observations"`
+	Cleanup           []CleanupResult               `json:"cleanup_progress"`
+	Checks            []CheckResult                 `json:"checks"`
+	CodeRabbit        *CodeRabbitResult             `json:"coderabbit,omitempty"`
+	Findings          []FindingResult               `json:"review_findings"`
+	Telemetry         []TelemetryResult             `json:"unknown_telemetry"`
 }
 type RunSummaryPage struct {
 	SchemaVersion string       `json:"schema_version"`
@@ -510,7 +511,7 @@ type PullRequestResult struct {
 
 func projectInspection(value RunInspection) InspectionResult {
 	result := InspectionResult{SchemaVersion: querySchemaVersion, Run: projectRunResult(value.Run), RepositoryBinding: projectRepositoryBinding(value.RepositoryBinding), Merge: value.Merge,
-		Timeline: []TransitionResult{}, Attempts: []AttemptResult{}, Verifications: []VerificationResult{}, Reviews: []ReviewResult{}, Resources: []ResourceResult{}, Cleanup: []CleanupResult{}, Checks: []CheckResult{}, Findings: []FindingResult{}, Telemetry: []TelemetryResult{}}
+		Timeline: []TransitionResult{}, Attempts: []AttemptResult{}, Verifications: []VerificationResult{}, Reviews: []ReviewResult{}, Resources: []ResourceResult{}, LinearCompletion: append([]LinearCompletionObservation(nil), value.LinearCompletion...), Cleanup: []CleanupResult{}, Checks: []CheckResult{}, Findings: []FindingResult{}, Telemetry: []TelemetryResult{}}
 	if value.Approval != nil {
 		result.Approval = &HumanApprovalResult{Approver: sanitizeUntrustedContent(value.Approval.Approver), ApprovedSHA: value.Approval.ApprovedSHA, SourceAt: value.Approval.ApprovedAt, ObservedAt: value.Approval.ObservedAt}
 	}

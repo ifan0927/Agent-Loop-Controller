@@ -420,6 +420,40 @@ func TestApprovalAndMergeEvidenceAreImmutable(t *testing.T) {
 	}
 }
 
+func TestLinearCompletionEvidenceSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "controller.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	run := application.Run{ID: "run-completion", IssueID: "IFAN-13", IdempotencyKey: "completion-key", SourceRevision: "2026-07-13T00:00:00Z", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "ifan/13", ArtifactRoot: "/tmp/run-completion"}
+	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 13, 4, 0, 0, 0, time.UTC)
+	if err := store.SaveLinearRequestObservation(ctx, run.ID, application.LinearRequestObservation{Operation: "read_issue", HTTPStatus: 200, ResponseDigest: "digest", ObservedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	record := application.LinearCompletionObservation{RunID: run.ID, MergeSHA: "merge", LinearIssueID: "linear-id", Identifier: run.IssueID, SourceRevision: now.Format(time.RFC3339Nano), StateID: "done", StateName: "Done", StateType: "completed", Status: application.LinearCompletionCompleted, ObservedAt: now}
+	if err := store.SaveLinearCompletionObservation(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	inspection, err := store.Inspect(ctx, run.ID)
+	if err != nil || len(inspection.LinearCompletion) != 1 {
+		t.Fatalf("inspection=%+v err=%v", inspection.LinearCompletion, err)
+	}
+	if got := inspection.LinearCompletion[0]; got.MergeSHA != "merge" || got.Status != application.LinearCompletionCompleted || got.ObservedAt != now {
+		t.Fatalf("completion=%+v", got)
+	}
+}
+
 func TestGitHubApprovalObservationSurvivesRestartWithSourceAndObservationTimes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
 	store, err := Open(path)

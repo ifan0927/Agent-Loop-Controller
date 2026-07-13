@@ -83,10 +83,13 @@ repository policy, and creates or resumes one durable run. A changed source,
 repository binding, or Linear branch never mutates an existing run: the run is
 halted for a human decision instead.
 
-`controller continue`, `controller open-pr`, and `controller reconcile` are the matching manual
+`controller continue`, `controller open-pr`, `controller reconcile`, and `controller reconcile-linear` are the matching manual
 restart entrypoints. All require the persisted run ID, requester identity,
 repository, expected state, and idempotency key. They re-read Linear before
-acting, reject source drift, and derive one action from durable state. Local
+acting, reject source drift, and derive one action from durable state. The
+post-merge `reconcile-linear` exception deliberately accepts the bounded
+revision update made by completion automation, while still validating the exact
+issue, team, and source-revision ordering against the persisted merge. Local
 execution uses the existing controller; GitHub reconciliation is read-only and
 requires persisted PR identity and exact candidate HEAD. States whose next step
 would write a branch, PR, or merge stop explicitly until their later lifecycle
@@ -137,7 +140,20 @@ go run ./cmd/ifan-loop controller reconcile <run-id> \
   --requester ifan0927 --requester-database-id 123 \
   --requester-node-id <github-node-id> --requester-type User \
   --repository owner/repo --expected-state pr_open --idempotency-key <key>
+
+go run ./cmd/ifan-loop controller reconcile-linear <run-id> \
+  --config /absolute/path/controller.json \
+  --requester ifan0927 --requester-database-id 123 \
+  --requester-node-id <github-node-id> --requester-type User \
+  --repository owner/repo --expected-state awaiting_linear_completion --idempotency-key <key>
 ```
+
+After an authoritative squash merge, `reconcile-linear` performs one read-only
+Linear observation per invocation. It records the immutable merge binding plus
+sanitized request metadata and the observed Linear completion state. A completed
+issue advances to owned cleanup. Canceled, ambiguous, or unreadable completion
+evidence fails closed for an operator; ten pending observations also time out to
+the same explicit intervention state.
 
 The controller configuration is strict JSON with this shape:
 

@@ -67,7 +67,7 @@ func main() {
 
 func controller(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: ifan-loop controller <start|continue|push|open-pr|reconcile|merge> ...")
+		return errors.New("usage: ifan-loop controller <start|continue|push|open-pr|reconcile|merge|reconcile-linear> ...")
 	}
 	switch args[0] {
 	case "start":
@@ -82,6 +82,8 @@ func controller(args []string) error {
 		return controllerReconcile(args[1:])
 	case "merge":
 		return controllerMerge(args[1:])
+	case "reconcile-linear":
+		return controllerReconcileLinear(args[1:])
 	default:
 		return fmt.Errorf("unknown controller command: %s", args[0])
 	}
@@ -314,6 +316,28 @@ func controllerMerge(args []string) error {
 	defer cancel()
 	adapter := githubReadAdapter{client: client, observations: &observations}
 	result, err := coordinator.MergePullRequest(ctx, application.ProductionMergeCommand{Requester: command.requester, RunID: command.run.ID, Repository: command.repository, ExpectedState: command.expectedState, IdempotencyKey: command.idempotencyKey}, validator, adapter, adapter)
+	if err != nil {
+		return err
+	}
+	return printJSON(result)
+}
+
+func controllerReconcileLinear(args []string) error {
+	command, loaded, store, err := productionCommand(args, "controller reconcile-linear")
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := validateProductionPersistedBinding(command.run, loaded.Registry); err != nil {
+		return application.ClassifyError(err)
+	}
+	coordinator, err := newProductionCoordinator(loaded, store, filepath.Dir(command.run.WorktreePath))
+	if err != nil {
+		return err
+	}
+	ctx, cancel := localContext(loaded.Linear.HTTPTimeout)
+	defer cancel()
+	result, err := coordinator.ReconcileLinearCompletion(ctx, application.ProductionLinearCompletionCommand{Requester: command.requester, RunID: command.run.ID, Repository: command.repository, ExpectedState: command.expectedState, IdempotencyKey: command.idempotencyKey})
 	if err != nil {
 		return err
 	}

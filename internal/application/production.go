@@ -17,6 +17,7 @@ const (
 	ProductionPush            ProductionAction = "push_verified_branch"
 	ProductionOpenPullRequest ProductionAction = "open_pull_request"
 	ProductionMerge           ProductionAction = "squash_merge_pull_request"
+	ProductionReconcileLinear ProductionAction = "reconcile_linear_completion"
 	ProductionStop            ProductionAction = "stop"
 )
 
@@ -138,6 +139,8 @@ func productionNextAction(state domain.State) (ProductionAction, string) {
 		return ProductionOpenPullRequest, "pushed exact candidate may open its one owned pull request"
 	case domain.StateMerging:
 		return ProductionMerge, "trusted exact-HEAD approval requires a guarded squash merge"
+	case domain.StateAwaitingLinearCompletion:
+		return ProductionReconcileLinear, "authoritative merge requires bounded read-only Linear completion observation"
 	case domain.StateCleaning:
 		return ProductionStop, "the next owned cleanup lifecycle is not implemented by this controller version"
 	case domain.StateManualIntervention:

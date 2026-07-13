@@ -20,7 +20,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 9
+const schemaVersion = 10
 
 type Store struct{ db *sql.DB }
 
@@ -107,6 +107,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV8
 		case 9:
 			statements = migrationV9
+		case 10:
+			statements = migrationV10
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -230,6 +232,11 @@ var migrationV9 = []string{
 	`ALTER TABLE human_approvals ADD COLUMN review_node_id TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE human_approvals ADD COLUMN observed_at TEXT NOT NULL DEFAULT ''`,
 	`CREATE TABLE human_approval_observations (observation_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), pr_number INTEGER NOT NULL, candidate_head TEXT NOT NULL, status TEXT NOT NULL, review_database_id INTEGER NOT NULL DEFAULT 0, review_node_id TEXT NOT NULL DEFAULT '', actor_database_id INTEGER NOT NULL DEFAULT 0, actor_node_id TEXT NOT NULL DEFAULT '', actor_login TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', review_head_sha TEXT NOT NULL DEFAULT '', source_at TEXT NOT NULL DEFAULT '', observed_at TEXT NOT NULL, evidence_digest TEXT NOT NULL)`,
+}
+
+var migrationV10 = []string{
+	`CREATE TABLE linear_completion_observations (observation_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), merge_sha TEXT NOT NULL, linear_issue_id TEXT NOT NULL DEFAULT '', issue_identifier TEXT NOT NULL, source_revision TEXT NOT NULL DEFAULT '', state_id TEXT NOT NULL DEFAULT '', state_name TEXT NOT NULL DEFAULT '', state_type TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, error_class TEXT NOT NULL DEFAULT '', observed_at TEXT NOT NULL)`,
+	`CREATE TABLE linear_request_observations (observation_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), operation_name TEXT NOT NULL, http_status INTEGER NOT NULL, request_id TEXT NOT NULL DEFAULT '', rate_limit_limit INTEGER NOT NULL DEFAULT 0, rate_limit_remaining INTEGER NOT NULL DEFAULT 0, rate_limit_reset TEXT NOT NULL DEFAULT '', response_digest TEXT NOT NULL DEFAULT '', error_class TEXT NOT NULL DEFAULT '', observed_at TEXT NOT NULL)`,
 }
 
 func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput) (application.Run, bool, error) {
@@ -857,6 +864,22 @@ func (s *Store) SaveMerge(ctx context.Context, record application.MergeRecord) e
 	return nil
 }
 
+func (s *Store) SaveLinearCompletionObservation(ctx context.Context, record application.LinearCompletionObservation) error {
+	if record.RunID == "" || record.MergeSHA == "" || record.Identifier == "" || record.Status == "" || record.ObservedAt.IsZero() {
+		return errors.New("incomplete Linear completion observation")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO linear_completion_observations(run_id,merge_sha,linear_issue_id,issue_identifier,source_revision,state_id,state_name,state_type,status,error_class,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, record.RunID, record.MergeSHA, record.LinearIssueID, record.Identifier, record.SourceRevision, record.StateID, record.StateName, record.StateType, record.Status, record.ErrorClass, formatTime(record.ObservedAt))
+	return err
+}
+
+func (s *Store) SaveLinearRequestObservation(ctx context.Context, runID string, record application.LinearRequestObservation) error {
+	if runID == "" || record.Operation == "" || record.ObservedAt.IsZero() {
+		return errors.New("incomplete Linear request observation")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO linear_request_observations(run_id,operation_name,http_status,request_id,rate_limit_limit,rate_limit_remaining,rate_limit_reset,response_digest,error_class,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, runID, record.Operation, record.HTTPStatus, record.RequestID, record.RateLimitLimit, record.RateLimitRemaining, formatTime(record.RateLimitReset), record.ResponseDigest, record.ErrorClass, formatTime(record.ObservedAt))
+	return err
+}
+
 func (s *Store) UpsertCleanup(ctx context.Context, record application.CleanupRecord) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO cleanup_results(run_id,resource_kind,resource_name,status,last_error,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(run_id,resource_kind,resource_name) DO UPDATE SET status=excluded.status,last_error=excluded.last_error,updated_at=excluded.updated_at`, record.RunID, record.Kind, record.Name, record.Status, record.LastError, nowText())
 	return err
@@ -1079,6 +1102,21 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return inspection, err
 	}
+	rows, err = s.db.QueryContext(ctx, `SELECT observation_id,run_id,merge_sha,linear_issue_id,issue_identifier,source_revision,state_id,state_name,state_type,status,error_class,observed_at FROM linear_completion_observations WHERE run_id=? ORDER BY observation_id`, id)
+	if err != nil {
+		return inspection, err
+	}
+	for rows.Next() {
+		var v application.LinearCompletionObservation
+		var observed string
+		if err := rows.Scan(&v.ID, &v.RunID, &v.MergeSHA, &v.LinearIssueID, &v.Identifier, &v.SourceRevision, &v.StateID, &v.StateName, &v.StateType, &v.Status, &v.ErrorClass, &observed); err != nil {
+			rows.Close()
+			return inspection, err
+		}
+		v.ObservedAt = parseTime(observed)
+		inspection.LinearCompletion = append(inspection.LinearCompletion, v)
+	}
+	rows.Close()
 	rows, err = s.db.QueryContext(ctx, `SELECT cleanup_id,run_id,resource_kind,resource_name,status,last_error,updated_at FROM cleanup_results WHERE run_id=? ORDER BY cleanup_id`, id)
 	if err != nil {
 		return inspection, err

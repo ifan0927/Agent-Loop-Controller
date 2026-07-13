@@ -138,10 +138,28 @@ type RunInspection struct {
 	ApprovalObservation *domain.HumanApprovalObservation `json:"human_approval_observation,omitempty"`
 	Approval            *domain.HumanApproval            `json:"human_approval,omitempty"`
 	Merge               *MergeRecord                     `json:"merge_result,omitempty"`
+	LinearCompletion    []LinearCompletionObservation    `json:"linear_completion_observations"`
 	Cleanup             []CleanupRecord                  `json:"cleanup_progress"`
 	GitHubInstallation  *GitHubInstallationMetadata      `json:"github_installation,omitempty"`
 	GitHubRequests      []GitHubRequestObservation       `json:"github_request_observations"`
 	GitHubEvidence      *domain.GitHubReadEvidence       `json:"github_read_evidence,omitempty"`
+}
+
+// LinearCompletionObservation is the bounded, sanitized result of re-reading
+// the canonical Linear issue after an authoritative GitHub merge.
+type LinearCompletionObservation struct {
+	ID             int64     `json:"observation_id"`
+	RunID          string    `json:"run_id"`
+	MergeSHA       string    `json:"merge_commit_sha"`
+	LinearIssueID  string    `json:"linear_issue_id,omitempty"`
+	Identifier     string    `json:"issue_identifier"`
+	SourceRevision string    `json:"source_revision,omitempty"`
+	StateID        string    `json:"state_id,omitempty"`
+	StateName      string    `json:"state_name,omitempty"`
+	StateType      string    `json:"state_type,omitempty"`
+	Status         string    `json:"status"`
+	ErrorClass     string    `json:"error_class,omitempty"`
+	ObservedAt     time.Time `json:"observed_at"`
 }
 
 type SanitizedRepositoryBinding struct {

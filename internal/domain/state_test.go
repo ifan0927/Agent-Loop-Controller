@@ -31,3 +31,15 @@ func TestCodeRabbitChangeReturnsToRepair(t *testing.T) {
 		t.Fatal("a repair must be reimplemented, verified, and freshly reviewed")
 	}
 }
+
+func TestMergedRunRequiresLinearCompletionBeforeCleanup(t *testing.T) {
+	if !CanTransition(StateMerging, StateAwaitingLinearCompletion) {
+		t.Fatal("an observed merge must enter Linear completion reconciliation")
+	}
+	if CanTransition(StateMerging, StateCleaning) {
+		t.Fatal("an observed merge must not bypass authoritative Linear completion")
+	}
+	if !CanTransition(StateAwaitingLinearCompletion, StateCleaning) || !CanTransition(StateAwaitingLinearCompletion, StateManualIntervention) {
+		t.Fatal("Linear completion must either authorize cleanup or require an operator")
+	}
+}

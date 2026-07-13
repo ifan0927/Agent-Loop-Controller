@@ -13,14 +13,15 @@ import (
 
 func TestProductionNextActionStopsBeforeUnimplementedWrites(t *testing.T) {
 	cases := map[domain.State]ProductionAction{
-		domain.StateExecuting:             ProductionContinueLocal,
-		domain.StateAwaitingHumanDecision: ProductionContinueLocal,
-		domain.StatePROpen:                ProductionReconcileGitHub,
-		domain.StateApprovalReady:         ProductionPush,
-		domain.StateBranchPushed:          ProductionOpenPullRequest,
-		domain.StatePushingBranch:         ProductionPush,
-		domain.StateManualIntervention:    ProductionStop,
-		domain.StateCompleted:             ProductionStop,
+		domain.StateExecuting:                ProductionContinueLocal,
+		domain.StateAwaitingHumanDecision:    ProductionContinueLocal,
+		domain.StatePROpen:                   ProductionReconcileGitHub,
+		domain.StateApprovalReady:            ProductionPush,
+		domain.StateBranchPushed:             ProductionOpenPullRequest,
+		domain.StatePushingBranch:            ProductionPush,
+		domain.StateAwaitingLinearCompletion: ProductionReconcileLinear,
+		domain.StateManualIntervention:       ProductionStop,
+		domain.StateCompleted:                ProductionStop,
 	}
 	for state, want := range cases {
 		if got, _ := productionNextAction(state); got != want {
@@ -55,17 +56,19 @@ func TestProductionContinueUsesOnlyPersistedRepairFindings(t *testing.T) {
 
 type pushTestStore struct {
 	admissionStore
-	run         Run
-	inspection  RunInspection
-	side        SideEffectRecord
-	transitions []Transition
-	resources   []OwnedResource
-	pr          *domain.PullRequest
-	merge       *MergeRecord
-	github      []domain.GitHubReadEvidence
-	requests    []GitHubRequestObservation
-	metadata    []GitHubInstallationMetadata
-	requestErr  error
+	run              Run
+	inspection       RunInspection
+	side             SideEffectRecord
+	transitions      []Transition
+	resources        []OwnedResource
+	pr               *domain.PullRequest
+	merge            *MergeRecord
+	github           []domain.GitHubReadEvidence
+	requests         []GitHubRequestObservation
+	linearCompletion []LinearCompletionObservation
+	linearRequests   []LinearRequestObservation
+	metadata         []GitHubInstallationMetadata
+	requestErr       error
 }
 
 func (s *pushTestStore) GetRun(context.Context, string) (Run, error) { return s.run, nil }
@@ -98,6 +101,9 @@ func (s *pushTestStore) Inspect(context.Context, string) (RunInspection, error) 
 	}
 	if s.side.ID != 0 && len(result.SideEffects) == 0 {
 		result.SideEffects = []SideEffectRecord{s.side}
+	}
+	if len(result.LinearCompletion) == 0 {
+		result.LinearCompletion = append([]LinearCompletionObservation(nil), s.linearCompletion...)
 	}
 	return result, nil
 }
@@ -147,6 +153,15 @@ func (s *pushTestStore) SaveGitHubEvidence(_ context.Context, _ string, value do
 	s.github = append(s.github, value)
 	return nil
 }
+func (s *pushTestStore) SaveLinearCompletionObservation(_ context.Context, value LinearCompletionObservation) error {
+	value.ID = int64(len(s.linearCompletion) + 1)
+	s.linearCompletion = append(s.linearCompletion, value)
+	return nil
+}
+func (s *pushTestStore) SaveLinearRequestObservation(_ context.Context, _ string, value LinearRequestObservation) error {
+	s.linearRequests = append(s.linearRequests, value)
+	return nil
+}
 
 type pushValidator struct{ calls int }
 
@@ -191,7 +206,7 @@ func newPushCoordinator(t *testing.T, state domain.State) (*ProductionCoordinato
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, BaseBranch: "main", BaseSHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", NormalizedTaskJSON: mustJSON(t, snapshot.Task), TaskHash: snapshot.TaskHash, State: state, CandidateHead: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", WorktreePath: "/owned/worktree", ArtifactRoot: "/owned/artifacts"})
+	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, BaseBranch: "main", BaseSHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", NormalizedTaskJSON: mustJSON(t, snapshot.Task), TaskHash: snapshot.TaskHash, State: state, CandidateHead: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", WorktreePath: "/owned/worktree", ArtifactRoot: "/owned/artifacts"})
 	store := &pushTestStore{run: run}
 	store.admissionStore = admissionStore{serviceStore: serviceStore{run: run}}
 	admission, err := NewLinearAdmissionService(reader, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, store, &serviceController{run: run})
@@ -333,7 +348,7 @@ func mergeCommand(run Run) ProductionMergeCommand {
 func TestProductionMergePersistsIntentAndObservedSquashResult(t *testing.T) {
 	coordinator, store, run, reader, writer := newMergeCoordinator(t)
 	result, err := coordinator.MergePullRequest(context.Background(), mergeCommand(run), &pushValidator{}, reader, writer)
-	if err != nil || result.Action != ProductionStop || result.MergeSHA != "merge" || result.Idempotent || writer.calls != 1 || store.run.State != domain.StateCleaning || store.merge == nil {
+	if err != nil || result.Action != ProductionStop || result.MergeSHA != "merge" || result.Idempotent || writer.calls != 1 || store.run.State != domain.StateAwaitingLinearCompletion || store.merge == nil {
 		t.Fatalf("result=%+v err=%v calls=%d state=%s merge=%+v", result, err, writer.calls, store.run.State, store.merge)
 	}
 	if store.side.Kind != "squash_merge" || store.side.Status != "observed" || !strings.Contains(store.side.IntentJSON, `"merge_method":"squash"`) || len(store.github) != 1 || len(store.requests) != 2 {
@@ -350,8 +365,81 @@ func TestProductionMergeReconcilesLostSuccessWithoutSecondWrite(t *testing.T) {
 	merged := writer.response
 	reader.evidence.PullRequest = merged
 	result, err := coordinator.MergePullRequest(context.Background(), mergeCommand(store.run), &pushValidator{}, reader, writer)
-	if err != nil || !result.Idempotent || writer.calls != 1 || store.run.State != domain.StateCleaning || store.merge == nil || store.merge.MergeSHA != "merge" {
+	if err != nil || !result.Idempotent || writer.calls != 1 || store.run.State != domain.StateAwaitingLinearCompletion || store.merge == nil || store.merge.MergeSHA != "merge" {
 		t.Fatalf("result=%+v err=%v calls=%d state=%s merge=%+v", result, err, writer.calls, store.run.State, store.merge)
+	}
+}
+
+func TestProductionLinearCompletionPersistsExactMergeBoundCompletedEvidence(t *testing.T) {
+	coordinator, store, run := newPushCoordinator(t, domain.StateAwaitingLinearCompletion)
+	mergedAt := time.Date(2026, 7, 13, 3, 0, 0, 0, time.UTC)
+	store.merge = &MergeRecord{RunID: run.ID, PRNumber: 7, PreMergeSHA: run.CandidateHead, BaseSHA: run.BaseSHA, Method: "squash", MergeSHA: "merge", MergedAt: mergedAt}
+	source := validLinearSource()
+	source.State = LinearState{ID: "done", Name: "Done", Type: "completed"}
+	source.UpdatedAt, source.ObservedAt = mergedAt.Add(time.Minute), mergedAt.Add(2*time.Minute)
+	source.SourceRevision = source.UpdatedAt.Format(time.RFC3339Nano)
+	coordinator.admission.reader = &admissionReader{source: source}
+	result, err := coordinator.ReconcileLinearCompletion(context.Background(), ProductionLinearCompletionCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey})
+	if err != nil || result.Action != ProductionStop || result.Status != LinearCompletionCompleted || store.run.State != domain.StateCleaning || len(store.linearCompletion) != 1 {
+		t.Fatalf("result=%+v err=%v state=%s observations=%+v", result, err, store.run.State, store.linearCompletion)
+	}
+	got := store.linearCompletion[0]
+	if got.MergeSHA != "merge" || got.LinearIssueID != "linear-id" || got.Status != LinearCompletionCompleted || got.SourceRevision != source.SourceRevision {
+		t.Fatalf("completion observation=%+v", got)
+	}
+}
+
+func TestProductionLinearCompletionTimesOutWithoutFabricatingSuccess(t *testing.T) {
+	coordinator, store, run := newPushCoordinator(t, domain.StateAwaitingLinearCompletion)
+	mergedAt := time.Date(2026, 7, 13, 3, 0, 0, 0, time.UTC)
+	store.merge = &MergeRecord{RunID: run.ID, PRNumber: 7, PreMergeSHA: run.CandidateHead, BaseSHA: run.BaseSHA, Method: "squash", MergeSHA: "merge", MergedAt: mergedAt}
+	source := validLinearSource()
+	source.State = LinearState{ID: "started", Name: "In Progress", Type: "started"}
+	source.UpdatedAt, source.ObservedAt = mergedAt.Add(time.Minute), mergedAt.Add(time.Minute)
+	source.SourceRevision = source.UpdatedAt.Format(time.RFC3339Nano)
+	coordinator.admission.reader = &admissionReader{source: source}
+	for attempt := 1; attempt <= MaxLinearCompletionObservations; attempt++ {
+		result, err := coordinator.ReconcileLinearCompletion(context.Background(), ProductionLinearCompletionCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: store.run.State, IdempotencyKey: run.IdempotencyKey})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if attempt < MaxLinearCompletionObservations && (result.Status != LinearCompletionPending || store.run.State != domain.StateAwaitingLinearCompletion) {
+			t.Fatalf("attempt=%d result=%+v state=%s", attempt, result, store.run.State)
+		}
+	}
+	if store.run.State != domain.StateManualIntervention || len(store.linearCompletion) != MaxLinearCompletionObservations || store.linearCompletion[len(store.linearCompletion)-1].Status != LinearCompletionTimeout {
+		t.Fatalf("state=%s observations=%+v", store.run.State, store.linearCompletion)
+	}
+}
+
+func TestProductionLinearCompletionRejectsCanceledIssue(t *testing.T) {
+	coordinator, store, run := newPushCoordinator(t, domain.StateAwaitingLinearCompletion)
+	mergedAt := time.Date(2026, 7, 13, 3, 0, 0, 0, time.UTC)
+	store.merge = &MergeRecord{RunID: run.ID, PRNumber: 7, PreMergeSHA: run.CandidateHead, BaseSHA: run.BaseSHA, Method: "squash", MergeSHA: "merge", MergedAt: mergedAt}
+	source := validLinearSource()
+	source.State = LinearState{ID: "cancelled", Name: "Canceled", Type: "canceled"}
+	source.UpdatedAt, source.ObservedAt = mergedAt.Add(time.Minute), mergedAt.Add(time.Minute)
+	source.SourceRevision = source.UpdatedAt.Format(time.RFC3339Nano)
+	coordinator.admission.reader = &admissionReader{source: source}
+	result, err := coordinator.ReconcileLinearCompletion(context.Background(), ProductionLinearCompletionCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey})
+	if err != nil || result.Status != LinearCompletionCanceled || store.run.State != domain.StateManualIntervention {
+		t.Fatalf("result=%+v err=%v state=%s", result, err, store.run.State)
+	}
+}
+
+func TestProductionLinearCompletionRejectsWrongPersistedIssueIdentity(t *testing.T) {
+	coordinator, store, run := newPushCoordinator(t, domain.StateAwaitingLinearCompletion)
+	mergedAt := time.Date(2026, 7, 13, 3, 0, 0, 0, time.UTC)
+	store.merge = &MergeRecord{RunID: run.ID, PRNumber: 7, PreMergeSHA: run.CandidateHead, BaseSHA: run.BaseSHA, Method: "squash", MergeSHA: "merge", MergedAt: mergedAt}
+	source := validLinearSource()
+	source.IssueID = "different-linear-id"
+	source.State = LinearState{ID: "done", Name: "Done", Type: "completed"}
+	source.UpdatedAt, source.ObservedAt = mergedAt.Add(time.Minute), mergedAt.Add(time.Minute)
+	source.SourceRevision = source.UpdatedAt.Format(time.RFC3339Nano)
+	coordinator.admission.reader = &admissionReader{source: source}
+	result, err := coordinator.ReconcileLinearCompletion(context.Background(), ProductionLinearCompletionCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey})
+	if err != nil || result.Status != LinearCompletionInvalid || store.run.State != domain.StateManualIntervention {
+		t.Fatalf("result=%+v err=%v state=%s", result, err, store.run.State)
 	}
 }
 
