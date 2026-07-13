@@ -344,7 +344,7 @@ func fixturePush(ctx context.Context, store *sqlitestore.Store, run application.
 		remote = ""
 	}
 	if remote == "" {
-		evidence, pushErr := (gitadapter.Publisher{Workspace: gitadapter.Workspace{}, Process: processadapter.OSRunner{}}).Push(ctx, run.WorktreePath, run.WorkingBranch, run.CandidateHead, filepath.Join(run.ArtifactRoot, "push-"+run.CandidateHead+".stdout"), filepath.Join(run.ArtifactRoot, "push-"+run.CandidateHead+".stderr"))
+		evidence, pushErr := (gitadapter.Publisher{Workspace: gitadapter.Workspace{}, Process: processadapter.OSRunner{}}).Push(ctx, run.WorktreePath, run.WorkingBranch, run.CandidateHead, "", run.ArtifactRoot)
 		side.StdoutPath = evidence.Stdout
 		side.StderrPath = evidence.Stderr
 		if pushErr != nil {

@@ -67,13 +67,15 @@ func main() {
 
 func controller(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: ifan-loop controller <start|continue|reconcile> ...")
+		return errors.New("usage: ifan-loop controller <start|continue|push|reconcile> ...")
 	}
 	switch args[0] {
 	case "start":
 		return linearStart(args[1:])
 	case "continue":
 		return controllerContinue(args[1:])
+	case "push":
+		return controllerPush(args[1:])
 	case "reconcile":
 		return controllerReconcile(args[1:])
 	default:
@@ -209,6 +211,41 @@ func controllerReconcile(args []string) error {
 		return err
 	}
 	return printJSON(result)
+}
+
+func controllerPush(args []string) error {
+	command, loaded, store, err := productionCommand(args, "controller push")
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := validateProductionPersistedBinding(command.run, loaded.Registry); err != nil {
+		return application.ClassifyError(err)
+	}
+	coordinator, err := newProductionCoordinator(loaded, store, filepath.Dir(command.run.WorktreePath))
+	if err != nil {
+		return err
+	}
+	validator := newLocalController(store, loaded.Controller.CodexBinary, filepath.Dir(command.run.WorktreePath))
+	publisher := productionPushAdapter{publisher: gitadapter.Publisher{Workspace: gitadapter.Workspace{}, Process: processadapter.OSRunner{}}}
+	ctx, cancel := localContext(loaded.Controller.RunTimeout)
+	defer cancel()
+	result, err := coordinator.Push(ctx, application.ProductionPushCommand{Requester: command.requester, RunID: command.run.ID, Repository: command.repository, ExpectedState: command.expectedState, IdempotencyKey: command.idempotencyKey}, validator, publisher)
+	if err != nil {
+		return err
+	}
+	return printJSON(result)
+}
+
+type productionPushAdapter struct{ publisher gitadapter.Publisher }
+
+func (a productionPushAdapter) RemoteSHA(ctx context.Context, workspace, branch string) (string, error) {
+	return a.publisher.RemoteSHA(ctx, workspace, branch)
+}
+
+func (a productionPushAdapter) Push(ctx context.Context, workspace, branch, candidate, expectedRemote, artifactRoot string) (application.PushEvidence, error) {
+	evidence, err := a.publisher.Push(ctx, workspace, branch, candidate, expectedRemote, artifactRoot)
+	return application.PushEvidence{RemoteRef: evidence.RemoteRef, SHA: evidence.SHA, ExitCode: evidence.ExitCode, StdoutPath: evidence.Stdout, StderrPath: evidence.Stderr}, err
 }
 
 type productionCLICommand struct {
