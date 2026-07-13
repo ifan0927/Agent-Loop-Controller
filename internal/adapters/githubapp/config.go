@@ -23,6 +23,7 @@ type Config struct {
 	HTTPTimeout       time.Duration `json:"http_timeout"`
 	TokenRefreshSkew  time.Duration `json:"token_refresh_skew"`
 	APIVersion        string        `json:"api_version"`
+	PullRequestsWrite bool          `json:"pull_requests_write"`
 	CodeRabbitActorID int64         `json:"coderabbit_actor_id"`
 	CodeRabbitNodeID  string        `json:"coderabbit_node_id"`
 	CodeRabbitAppID   int64         `json:"coderabbit_app_id"`
@@ -40,6 +41,7 @@ type configFile struct {
 	HTTPTimeout       string `json:"http_timeout"`
 	TokenRefreshSkew  string `json:"token_refresh_skew"`
 	APIVersion        string `json:"api_version"`
+	PullRequestsWrite bool   `json:"pull_requests_write"`
 	CodeRabbitActorID int64  `json:"coderabbit_actor_id"`
 	CodeRabbitNodeID  string `json:"coderabbit_node_id"`
 	CodeRabbitAppID   int64  `json:"coderabbit_app_id"`
@@ -76,7 +78,7 @@ func DecodeConfigWithoutPrivateKey(r io.Reader) (Config, error) {
 	if err != nil {
 		return Config{}, errors.New("invalid token_refresh_skew")
 	}
-	c := Config{APIBaseURL: f.APIBaseURL, GraphQLURL: f.GraphQLURL, AppID: f.AppID, InstallationID: f.InstallationID, RepositoryOwner: f.RepositoryOwner, RepositoryName: f.RepositoryName, RepositoryID: f.RepositoryID, PrivateKeyFile: f.PrivateKeyFile, HTTPTimeout: timeout, TokenRefreshSkew: skew, APIVersion: f.APIVersion, CodeRabbitActorID: f.CodeRabbitActorID, CodeRabbitNodeID: f.CodeRabbitNodeID, CodeRabbitAppID: f.CodeRabbitAppID}
+	c := Config{APIBaseURL: f.APIBaseURL, GraphQLURL: f.GraphQLURL, AppID: f.AppID, InstallationID: f.InstallationID, RepositoryOwner: f.RepositoryOwner, RepositoryName: f.RepositoryName, RepositoryID: f.RepositoryID, PrivateKeyFile: f.PrivateKeyFile, HTTPTimeout: timeout, TokenRefreshSkew: skew, APIVersion: f.APIVersion, PullRequestsWrite: f.PullRequestsWrite, CodeRabbitActorID: f.CodeRabbitActorID, CodeRabbitNodeID: f.CodeRabbitNodeID, CodeRabbitAppID: f.CodeRabbitAppID}
 	return c, c.ValidateWithoutPrivateKey()
 }
 

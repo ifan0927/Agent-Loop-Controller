@@ -77,8 +77,8 @@ repository policy, and creates or resumes one durable run. A changed source,
 repository binding, or Linear branch never mutates an existing run: the run is
 halted for a human decision instead.
 
-`controller continue` and `controller reconcile` are the matching manual
-restart entrypoints. Both require the persisted run ID, requester identity,
+`controller continue`, `controller open-pr`, and `controller reconcile` are the matching manual
+restart entrypoints. All require the persisted run ID, requester identity,
 repository, expected state, and idempotency key. They re-read Linear before
 acting, reject source drift, and derive one action from durable state. Local
 execution uses the existing controller; GitHub reconciliation is read-only and

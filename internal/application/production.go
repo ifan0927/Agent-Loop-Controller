@@ -15,6 +15,7 @@ const (
 	ProductionContinueLocal   ProductionAction = "continue_local"
 	ProductionReconcileGitHub ProductionAction = "reconcile_github_read"
 	ProductionPush            ProductionAction = "push_verified_branch"
+	ProductionOpenPullRequest ProductionAction = "open_pull_request"
 	ProductionStop            ProductionAction = "stop"
 )
 
@@ -107,7 +108,9 @@ func productionNextAction(state domain.State) (ProductionAction, string) {
 		return ProductionReconcileGitHub, "persisted pull request requires fresh GitHub read evidence"
 	case domain.StateApprovalReady, domain.StatePushingBranch:
 		return ProductionPush, "verified candidate may be reconciled with its owned working branch"
-	case domain.StateBranchPushed, domain.StateOpeningPR,
+	case domain.StateBranchPushed, domain.StateOpeningPR:
+		return ProductionOpenPullRequest, "pushed exact candidate may open its one owned pull request"
+	case
 		domain.StateRepairing, domain.StateMerging, domain.StateCleaning:
 		return ProductionStop, "the next external write lifecycle is not implemented by this controller version"
 	case domain.StateManualIntervention:

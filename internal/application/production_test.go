@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -16,6 +17,7 @@ func TestProductionNextActionStopsBeforeUnimplementedWrites(t *testing.T) {
 		domain.StateAwaitingHumanDecision: ProductionContinueLocal,
 		domain.StatePROpen:                ProductionReconcileGitHub,
 		domain.StateApprovalReady:         ProductionPush,
+		domain.StateBranchPushed:          ProductionOpenPullRequest,
 		domain.StatePushingBranch:         ProductionPush,
 		domain.StateManualIntervention:    ProductionStop,
 		domain.StateCompleted:             ProductionStop,
@@ -33,6 +35,7 @@ type pushTestStore struct {
 	side        SideEffectRecord
 	transitions []Transition
 	resources   []OwnedResource
+	pr          *domain.PullRequest
 }
 
 func (s *pushTestStore) GetRun(context.Context, string) (Run, error) { return s.run, nil }
@@ -52,6 +55,9 @@ func (s *pushTestStore) AddOwnedResource(_ context.Context, value OwnedResource)
 	s.resources = append(s.resources, value)
 	return nil
 }
+func (s *pushTestStore) Inspect(context.Context, string) (RunInspection, error) {
+	return RunInspection{Run: s.run, PullRequest: s.pr}, nil
+}
 func (s *pushTestStore) BeginSideEffect(_ context.Context, value SideEffectRecord) (SideEffectRecord, bool, error) {
 	if s.side.ID == 0 {
 		value.ID, value.Status = 1, "intent"
@@ -65,6 +71,14 @@ func (s *pushTestStore) BeginSideEffect(_ context.Context, value SideEffectRecor
 }
 func (s *pushTestStore) FinishSideEffect(_ context.Context, value SideEffectRecord) error {
 	s.side = value
+	return nil
+}
+func (s *pushTestStore) SavePullRequest(_ context.Context, _ string, value domain.PullRequest) error {
+	if s.pr != nil && (s.pr.Number != value.Number || s.pr.NodeID != value.NodeID) {
+		return errors.New("conflicting pull request")
+	}
+	copy := value
+	s.pr = &copy
 	return nil
 }
 
@@ -111,7 +125,7 @@ func newPushCoordinator(t *testing.T, state domain.State) (*ProductionCoordinato
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, State: state, CandidateHead: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", WorktreePath: "/owned/worktree", ArtifactRoot: "/owned/artifacts"})
+	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, BaseBranch: "main", BaseSHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", NormalizedTaskJSON: mustJSON(t, snapshot.Task), TaskHash: snapshot.TaskHash, State: state, CandidateHead: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", WorktreePath: "/owned/worktree", ArtifactRoot: "/owned/artifacts"})
 	store := &pushTestStore{run: run}
 	store.admissionStore = admissionStore{serviceStore: serviceStore{run: run}}
 	admission, err := NewLinearAdmissionService(reader, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, store, &serviceController{run: run})
@@ -123,6 +137,85 @@ func newPushCoordinator(t *testing.T, state domain.State) (*ProductionCoordinato
 		t.Fatal(err)
 	}
 	return coordinator, store, run
+}
+
+func mustJSON(t *testing.T, value any) string {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+type pullRequestOpener struct {
+	requests []PullRequestOpenRequest
+	response domain.PullRequest
+	err      error
+}
+
+func (o *pullRequestOpener) OpenPullRequest(_ context.Context, request PullRequestOpenRequest) (domain.PullRequest, error) {
+	o.requests = append(o.requests, request)
+	return o.response, o.err
+}
+
+func ownedPullRequest(request PullRequestOpenRequest) domain.PullRequest {
+	return domain.PullRequest{Number: 7, DatabaseID: 70, URL: "https://example.invalid/pull/7", NodeID: "PR_7", HeadBranch: request.HeadBranch, BaseBranch: request.BaseBranch, HeadSHA: request.CandidateSHA, BaseSHA: request.BaseSHA, BodyDigest: request.BodyDigest, OwnershipKey: request.OwnershipKey, State: "open"}
+}
+
+func TestProductionOpenPullRequestPersistsIntentBeforeOneOwnedPR(t *testing.T) {
+	coordinator, store, run := newPushCoordinator(t, domain.StateBranchPushed)
+	request, err := pullRequestIntent(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opener := &pullRequestOpener{response: ownedPullRequest(request)}
+	result, err := coordinator.OpenPullRequest(context.Background(), ProductionOpenPullRequestCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, &pushValidator{}, opener)
+	if err != nil || result.Action != ProductionReconcileGitHub || result.PullRequest != 7 || result.Idempotent || len(opener.requests) != 1 || store.run.State != domain.StatePROpen || store.pr == nil {
+		t.Fatalf("result=%+v err=%v requests=%d state=%s pr=%+v", result, err, len(opener.requests), store.run.State, store.pr)
+	}
+	if store.side.Kind != "open_pull_request" || store.side.Status != "observed" || !strings.Contains(store.side.IntentJSON, `"candidate_sha":"`+run.CandidateHead+`"`) || strings.Contains(store.side.IntentJSON, "/owned/") {
+		t.Fatalf("side=%+v", store.side)
+	}
+}
+
+func TestProductionOpenPullRequestRecoversPersistedPRWithoutSecondWrite(t *testing.T) {
+	coordinator, store, run := newPushCoordinator(t, domain.StateOpeningPR)
+	request, err := pullRequestIntent(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr := ownedPullRequest(request)
+	store.pr = &pr
+	opener := &pullRequestOpener{}
+	result, err := coordinator.OpenPullRequest(context.Background(), ProductionOpenPullRequestCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, &pushValidator{}, opener)
+	if err != nil || !result.Idempotent || len(opener.requests) != 0 || store.run.State != domain.StatePROpen {
+		t.Fatalf("result=%+v err=%v requests=%d state=%s", result, err, len(opener.requests), store.run.State)
+	}
+}
+
+func TestProductionOpenPullRequestRejectsMismatchedResponseAndPreservesRetryEvidence(t *testing.T) {
+	coordinator, store, run := newPushCoordinator(t, domain.StateBranchPushed)
+	request, err := pullRequestIntent(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr := ownedPullRequest(request)
+	pr.BodyDigest = "wrong"
+	opener := &pullRequestOpener{response: pr}
+	_, err = coordinator.OpenPullRequest(context.Background(), ProductionOpenPullRequestCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, &pushValidator{}, opener)
+	if err == nil || store.run.State != domain.StateManualIntervention || store.side.Status != "failed" || store.pr != nil {
+		t.Fatalf("err=%v state=%s side=%+v pr=%+v", err, store.run.State, store.side, store.pr)
+	}
+}
+
+func TestProductionOpenPullRequestLeavesFailedIntentForExplicitReconciliation(t *testing.T) {
+	coordinator, store, run := newPushCoordinator(t, domain.StateBranchPushed)
+	opener := &pullRequestOpener{err: errors.New("interrupted request")}
+	_, err := coordinator.OpenPullRequest(context.Background(), ProductionOpenPullRequestCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, &pushValidator{}, opener)
+	if err == nil || store.run.State != domain.StateOpeningPR || store.side.Status != "failed" || store.pr != nil {
+		t.Fatalf("err=%v state=%s side=%+v pr=%+v", err, store.run.State, store.side, store.pr)
+	}
 }
 
 func TestProductionPushReconcilesSameRemoteSHAWithoutInvokingGit(t *testing.T) {

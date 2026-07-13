@@ -67,7 +67,7 @@ func main() {
 
 func controller(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: ifan-loop controller <start|continue|push|reconcile> ...")
+		return errors.New("usage: ifan-loop controller <start|continue|push|open-pr|reconcile> ...")
 	}
 	switch args[0] {
 	case "start":
@@ -76,6 +76,8 @@ func controller(args []string) error {
 		return controllerContinue(args[1:])
 	case "push":
 		return controllerPush(args[1:])
+	case "open-pr":
+		return controllerOpenPullRequest(args[1:])
 	case "reconcile":
 		return controllerReconcile(args[1:])
 	default:
@@ -231,6 +233,43 @@ func controllerPush(args []string) error {
 	ctx, cancel := localContext(loaded.Controller.RunTimeout)
 	defer cancel()
 	result, err := coordinator.Push(ctx, application.ProductionPushCommand{Requester: command.requester, RunID: command.run.ID, Repository: command.repository, ExpectedState: command.expectedState, IdempotencyKey: command.idempotencyKey}, validator, publisher)
+	if err != nil {
+		return err
+	}
+	return printJSON(result)
+}
+
+func controllerOpenPullRequest(args []string) error {
+	command, loaded, store, err := productionCommand(args, "controller open-pr")
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := validateProductionPersistedBinding(command.run, loaded.Registry); err != nil {
+		return application.ClassifyError(err)
+	}
+	coordinator, err := newProductionCoordinator(loaded, store, filepath.Dir(command.run.WorktreePath))
+	if err != nil {
+		return err
+	}
+	profile, err := loaded.GitHubProfileForRepository(command.run.Repository)
+	if err != nil {
+		return err
+	}
+	if !profile.Config.PullRequestsWrite {
+		return errors.New("configured GitHub App profile does not enable the narrow pull request write capability")
+	}
+	if err := profile.Config.Validate(); err != nil {
+		return errors.New("configured GitHub App credential source is unavailable")
+	}
+	client, err := githubapp.New(profile.Config, githubapp.RealClock{}, nil)
+	if err != nil {
+		return err
+	}
+	validator := newLocalController(store, loaded.Controller.CodexBinary, filepath.Dir(command.run.WorktreePath))
+	ctx, cancel := localContext(loaded.Controller.RunTimeout)
+	defer cancel()
+	result, err := coordinator.OpenPullRequest(ctx, application.ProductionOpenPullRequestCommand{Requester: command.requester, RunID: command.run.ID, Repository: command.repository, ExpectedState: command.expectedState, IdempotencyKey: command.idempotencyKey}, validator, client)
 	if err != nil {
 		return err
 	}

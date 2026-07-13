@@ -215,14 +215,21 @@ func (c *Client) ensureToken(ctx context.Context, force bool) error {
 		return errors.New("invalid installation token metadata")
 	}
 	for name, level := range out.Permissions {
-		if level != "read" {
-			return fmt.Errorf("installation permission %s is not read-only", name)
+		if level != "read" && !(name == "pull_requests" && c.cfg.PullRequestsWrite && level == "write") {
+			return fmt.Errorf("installation permission %s exceeds controller policy", name)
 		}
 	}
-	for _, name := range []string{"metadata", "contents", "pull_requests", "checks", "statuses", "administration"} {
+	for _, name := range []string{"metadata", "contents", "checks", "statuses", "administration"} {
 		if out.Permissions[name] != "read" {
 			return fmt.Errorf("installation lacks required read-only permission %s", name)
 		}
+	}
+	wantPullRequests := "read"
+	if c.cfg.PullRequestsWrite {
+		wantPullRequests = "write"
+	}
+	if out.Permissions["pull_requests"] != wantPullRequests {
+		return fmt.Errorf("installation pull request permission does not match controller policy")
 	}
 	if len(out.Repositories) != 1 {
 		return errors.New("installation token scope includes unexpected repositories")
@@ -253,15 +260,33 @@ func (c *Client) InstallationMetadata() application.GitHubInstallationMetadata {
 }
 
 func (c *Client) rest(ctx context.Context, op, method, path string, body io.Reader, out any, retry bool) error {
-	err := c.do(ctx, op, "REST", method, c.cfg.APIBaseURL+path, body, "Bearer "+c.token, out, true)
+	payload, err := requestPayload(body)
+	if err != nil {
+		return err
+	}
+	err = c.do(ctx, op, "REST", method, c.cfg.APIBaseURL+path, bytes.NewReader(payload), "Bearer "+c.token, out, true)
 	var se *statusError
 	if retry && errors.As(err, &se) && se.status == 401 {
 		if e := c.ensureToken(ctx, true); e != nil {
 			return e
 		}
-		return c.do(ctx, op, "REST", method, c.cfg.APIBaseURL+path, body, "Bearer "+c.token, out, true)
+		return c.do(ctx, op, "REST", method, c.cfg.APIBaseURL+path, bytes.NewReader(payload), "Bearer "+c.token, out, true)
 	}
 	return err
+}
+
+func requestPayload(body io.Reader) ([]byte, error) {
+	if body == nil {
+		return nil, nil
+	}
+	payload, err := io.ReadAll(io.LimitReader(body, maxBody+1))
+	if err != nil {
+		return nil, errors.New("read GitHub request body")
+	}
+	if len(payload) > maxBody {
+		return nil, errors.New("GitHub request exceeds body limit")
+	}
+	return payload, nil
 }
 func (c *Client) graphql(ctx context.Context, op, query string, vars any, out any) error {
 	payload, _ := json.Marshal(map[string]any{"query": query, "variables": vars, "operationName": op})
