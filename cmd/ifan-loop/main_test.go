@@ -27,7 +27,10 @@ func TestDecodeTaskRejectsTrailingJSON(t *testing.T) {
 }
 
 func TestPersistedBindingRejectsCrossRepositorySwap(t *testing.T) {
-	root := t.TempDir()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	repositories := make([]localregistry.Repository, 0, 2)
 	for index, name := range []string{"one", "two"} {
 		base := filepath.Join(root, name)

@@ -90,6 +90,14 @@ func TestPrivateKeyBoundary(t *testing.T) {
 	}
 }
 
+func TestUnavailablePrivateKeyDoesNotExposePath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "private-key-not-for-output.pem")
+	_, err := ReadPrivateKeyFile(path)
+	if err == nil || strings.Contains(err.Error(), path) || strings.Contains(err.Error(), "not-for-output") {
+		t.Fatalf("credential error leaked path: %v", err)
+	}
+}
+
 func validConfig(path string) Config {
 	return Config{APIBaseURL: "https://api.github.com", GraphQLURL: "https://api.github.com/graphql", AppID: 1, InstallationID: 2, RepositoryOwner: "owner", RepositoryName: "repo", RepositoryID: 3, PrivateKeyFile: path, HTTPTimeout: time.Second, TokenRefreshSkew: time.Minute, APIVersion: "2022-11-28"}
 }

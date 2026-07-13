@@ -77,6 +77,53 @@ repository policy, and creates or resumes one durable run. A changed source,
 repository binding, or Linear branch never mutates an existing run: the run is
 halted for a human decision instead.
 
+## Controller configuration
+
+Production commands use one versioned controller composition file. It contains
+the controller database and Codex settings, an inline Linear read profile, a
+strict repository registry reference, and one GitHub App profile for each
+registered repository. Credentials remain external: the Linear profile names a
+credential source and a GitHub profile names a private-key file; neither value
+is emitted by inspection output.
+
+Validate or inspect this composition before starting a run:
+
+```sh
+go run ./cmd/ifan-loop config validate --config /absolute/path/controller.json
+go run ./cmd/ifan-loop config inspect --config /absolute/path/controller.json
+```
+
+Both commands are offline. They do not read GitHub CLI authentication, user
+tokens, environment credentials, database contents, or private-key contents,
+and they do not write files. They validate canonical non-symlink paths and the
+registry-to-GitHub identity bindings, then emit only stable profile IDs and
+digests. Linear admission and GitHub reconciliation use the same loader:
+
+```sh
+go run ./cmd/ifan-loop linear start IFAN-42 \
+  --config /absolute/path/controller.json \
+  --requester ifan0927 --requester-database-id 123 \
+  --requester-node-id <github-node-id> --requester-type User
+```
+
+The controller configuration is strict JSON with this shape:
+
+```json
+{
+  "version": 1,
+  "controller": {
+    "database_path": "/absolute/path/controller.db",
+    "codex_binary": "codex",
+    "run_timeout": "30m"
+  },
+  "linear": { "...": "the existing strict Linear read profile fields" },
+  "repository_registry_file": "/absolute/path/repository-registry.json",
+  "github_app_profiles": [
+    { "id": "github-app-profile:example", "config": { "...": "the existing GitHub App profile fields" } }
+  ]
+}
+```
+
 ## Try the contract planner
 
 ```sh

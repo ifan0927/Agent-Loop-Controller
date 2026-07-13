@@ -3,7 +3,6 @@ package githubapp
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/url"
 	"os"
@@ -47,6 +46,19 @@ type configFile struct {
 }
 
 func DecodeConfig(r io.Reader) (Config, error) {
+	c, err := DecodeConfigWithoutPrivateKey(r)
+	if err != nil {
+		return Config{}, err
+	}
+	if _, err := ReadPrivateKeyFile(c.PrivateKeyFile); err != nil {
+		return Config{}, err
+	}
+	return c, nil
+}
+
+// DecodeConfigWithoutPrivateKey validates the configuration topology without
+// opening the credential source. It is used by offline configuration checks.
+func DecodeConfigWithoutPrivateKey(r io.Reader) (Config, error) {
 	var f configFile
 	d := json.NewDecoder(io.LimitReader(r, 64<<10))
 	d.DisallowUnknownFields()
@@ -65,10 +77,19 @@ func DecodeConfig(r io.Reader) (Config, error) {
 		return Config{}, errors.New("invalid token_refresh_skew")
 	}
 	c := Config{APIBaseURL: f.APIBaseURL, GraphQLURL: f.GraphQLURL, AppID: f.AppID, InstallationID: f.InstallationID, RepositoryOwner: f.RepositoryOwner, RepositoryName: f.RepositoryName, RepositoryID: f.RepositoryID, PrivateKeyFile: f.PrivateKeyFile, HTTPTimeout: timeout, TokenRefreshSkew: skew, APIVersion: f.APIVersion, CodeRabbitActorID: f.CodeRabbitActorID, CodeRabbitNodeID: f.CodeRabbitNodeID, CodeRabbitAppID: f.CodeRabbitAppID}
-	return c, c.Validate()
+	return c, c.ValidateWithoutPrivateKey()
 }
 
 func (c Config) Validate() error {
+	if err := c.ValidateWithoutPrivateKey(); err != nil {
+		return err
+	}
+	_, err := ReadPrivateKeyFile(c.PrivateKeyFile)
+	return err
+}
+
+// ValidateWithoutPrivateKey never opens or reads the configured credential.
+func (c Config) ValidateWithoutPrivateKey() error {
 	if c.APIBaseURL == "" || c.GraphQLURL == "" || c.AppID < 1 || c.InstallationID < 1 || c.RepositoryID < 1 || c.RepositoryOwner == "" || c.RepositoryName == "" || c.PrivateKeyFile == "" || c.APIVersion == "" {
 		return errors.New("incomplete GitHub App configuration")
 	}
@@ -97,27 +118,36 @@ func (c Config) Validate() error {
 	if !official && !fixture {
 		return errors.New("GitHub endpoint topology is not allowed")
 	}
-	_, err = ReadPrivateKeyFile(c.PrivateKeyFile)
-	return err
+	return validatePrivateKeyPath(c.PrivateKeyFile)
+}
+
+func validatePrivateKeyPath(path string) error {
+	if !filepath.IsAbs(path) {
+		return errors.New("private key file path must be absolute")
+	}
+	if filepath.Clean(path) != path {
+		return errors.New("private key file path is not canonical")
+	}
+	return nil
 }
 
 func ReadPrivateKeyFile(path string) ([]byte, error) {
-	if !filepath.IsAbs(path) {
-		return nil, errors.New("private key file path must be absolute")
+	if err := validatePrivateKeyPath(path); err != nil {
+		return nil, err
 	}
 	clean := filepath.Clean(path)
 	file, err := os.Open(clean)
 	if err != nil {
-		return nil, fmt.Errorf("open private key source: %w", err)
+		return nil, errors.New("private key source is unavailable")
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil {
-		return nil, err
+		return nil, errors.New("private key source is unavailable")
 	}
 	pathInfo, err := os.Lstat(clean)
 	if err != nil {
-		return nil, err
+		return nil, errors.New("private key source is unavailable")
 	}
 	if pathInfo.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || !os.SameFile(info, pathInfo) {
 		return nil, errors.New("private key source must be a non-symlink regular file")
@@ -134,7 +164,7 @@ func ReadPrivateKeyFile(path string) ([]byte, error) {
 	}
 	data, err := io.ReadAll(io.LimitReader(file, (64<<10)+1))
 	if err != nil {
-		return nil, err
+		return nil, errors.New("private key source is unavailable")
 	}
 	if len(data) > 64<<10 {
 		return nil, errors.New("private key source is too large")

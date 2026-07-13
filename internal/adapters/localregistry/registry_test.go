@@ -96,6 +96,35 @@ func TestRegistryRejectsSymlinkAmbiguityAndAuthorityDrift(t *testing.T) {
 	}
 }
 
+func TestRegistryRejectsNonCanonicalAndSymlinkAncestorPaths(t *testing.T) {
+	root := t.TempDir()
+	valid := fixtureRepository(t, root, "owner", "repo", 101)
+	nonCanonical := valid
+	nonCanonical.RunRoot = valid.RunRoot + "/../runs"
+	path := filepath.Join(root, "noncanonical.json")
+	raw, _ := json.Marshal(File{Version: 1, Repositories: []Repository{nonCanonical}})
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("non-canonical path accepted")
+	}
+	alias := filepath.Join(root, "repo-alias")
+	if err := os.Symlink(filepath.Dir(valid.SourcePath), alias); err != nil {
+		t.Fatal(err)
+	}
+	symlinkAncestor := valid
+	symlinkAncestor.SourcePath = filepath.Join(alias, "source")
+	path = filepath.Join(root, "ancestor-symlink.json")
+	raw, _ = json.Marshal(File{Version: 1, Repositories: []Repository{symlinkAncestor}})
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("symlink ancestor path accepted")
+	}
+}
+
 func TestProfileDigestIsCanonicalAndScopedToResolvedRepository(t *testing.T) {
 	root := t.TempDir()
 	primary := fixtureRepository(t, root, "owner", "primary", 101)
@@ -221,6 +250,11 @@ func TestRegistryErrorsDoNotEchoSecretValues(t *testing.T) {
 
 func fixtureRepository(t *testing.T, root, owner, name string, id int64) Repository {
 	t.Helper()
+	canonicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root = canonicalRoot
 	base := filepath.Join(root, strings.ToLower(owner+"-"+name))
 	paths := make([]string, 4)
 	for i, part := range []string{"origin", "source", "runs", "worktrees"} {

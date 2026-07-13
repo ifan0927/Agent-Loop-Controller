@@ -288,8 +288,8 @@ func validateRepository(version int, registryDigest string, repo Repository) (Bi
 }
 
 func canonicalDirectory(path string) (string, error) {
-	if !filepath.IsAbs(path) {
-		return "", errors.New("path must be absolute")
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return "", errors.New("path must be absolute and canonical")
 	}
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -302,7 +302,10 @@ func canonicalDirectory(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Clean(resolved), nil
+	if resolved != path {
+		return "", errors.New("path must not traverse a symlink")
+	}
+	return path, nil
 }
 
 func overlaps(a, b string) bool {
@@ -352,6 +355,24 @@ func (r Registry) Resolve(name string) (Binding, error) {
 		return Binding{}, fmt.Errorf("unknown canonical repository: %s", name)
 	}
 	return repo, nil
+}
+
+// Bindings returns a stable copy of every configured repository binding.
+func (r Registry) Bindings() []Binding {
+	keys := make([]string, 0, len(r.repositories))
+	for key := range r.repositories {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	bindings := make([]Binding, 0, len(keys))
+	for _, key := range keys {
+		binding := r.repositories[key]
+		binding.VerifierIDs = append([]string(nil), binding.VerifierIDs...)
+		binding.OperatorIdentityPolicy.AllowedLogins = append([]string(nil), binding.OperatorIdentityPolicy.AllowedLogins...)
+		binding.OperatorIdentityPolicy.TrustedActors = append([]TrustedActorIdentity(nil), binding.OperatorIdentityPolicy.TrustedActors...)
+		bindings = append(bindings, binding)
+	}
+	return bindings
 }
 func (r Registry) VerifyPersisted(binding Binding) error {
 	current, err := r.Resolve(binding.CanonicalRepository)

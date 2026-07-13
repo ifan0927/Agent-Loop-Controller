@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/bootstrap"
 	codexadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/codex"
 	gitadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/git"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/githubapp"
@@ -48,6 +49,8 @@ func main() {
 		err = local(os.Args[2:])
 	case "linear":
 		err = linear(os.Args[2:])
+	case "config":
+		err = config(os.Args[2:])
 	case "github-read":
 		err = githubRead(os.Args[2:])
 	default:
@@ -62,7 +65,7 @@ func main() {
 
 func linear(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: ifan-loop linear start <IFAN-issue> --config <linear.json> --registry <repository-registry.json> --db <controller.db> --requester <login>")
+		return fmt.Errorf("usage: ifan-loop linear start <IFAN-issue> --config <controller.json> --requester <login>")
 	}
 	switch args[0] {
 	case "start":
@@ -72,51 +75,57 @@ func linear(args []string) error {
 	}
 }
 
+func config(args []string) error {
+	if len(args) == 0 || (args[0] != "validate" && args[0] != "inspect") {
+		return errors.New("usage: ifan-loop config <validate|inspect> --config <controller.json>")
+	}
+	flags := flag.NewFlagSet("config "+args[0], flag.ContinueOnError)
+	path := flags.String("config", "", "controller composition configuration")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if *path == "" || flags.NArg() != 0 {
+		return errors.New("--config is required")
+	}
+	loaded, err := bootstrap.Load(*path)
+	if err != nil {
+		return err
+	}
+	return printJSON(loaded.Readiness())
+}
+
 func linearStart(args []string) error {
 	identifier, args := splitLinearStartIdentifier(args)
 	flags := flag.NewFlagSet("linear start", flag.ContinueOnError)
 	requesterIdentity := addRequesterFlags(flags)
-	configPath := flags.String("config", "", "Linear read-only configuration")
-	registryPath := flags.String("registry", "", "controller-owned local repository registry JSON")
-	dbPath := flags.String("db", "", "SQLite controller database")
-	codexBinary := flags.String("codex-binary", "codex", "Codex CLI binary")
-	timeout := flags.Duration("timeout", 30*time.Minute, "controller run timeout")
+	configPath := flags.String("config", "", "controller composition configuration")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if identifier == "" && flags.NArg() == 1 {
 		identifier = flags.Arg(0)
 	}
-	if identifier == "" || flags.NArg() != 0 || *configPath == "" || *registryPath == "" || *dbPath == "" || !requesterIdentity.complete() {
-		return errors.New("one IFAN issue identifier plus --config, --registry, --db, and complete requester identity are required")
+	if identifier == "" || flags.NArg() != 0 || *configPath == "" || !requesterIdentity.complete() {
+		return errors.New("one IFAN issue identifier plus --config and complete requester identity are required")
 	}
-	registry, err := localregistry.Load(*registryPath)
-	if err != nil {
-		return fmt.Errorf("load registry: %w", err)
-	}
-	configFile, err := os.Open(*configPath)
+	loaded, err := bootstrap.Load(*configPath)
 	if err != nil {
 		return err
 	}
-	config, decodeErr := linearadapter.DecodeConfig(configFile)
-	configFile.Close()
-	if decodeErr != nil {
-		return decodeErr
-	}
-	reader, err := linearadapter.New(config, linearadapter.EnvironmentCredentialSource{Variable: "IFAN_LOOP_LINEAR_TOKEN"}, nil)
+	reader, err := linearadapter.New(loaded.Linear, linearadapter.EnvironmentCredentialSource{Variable: "IFAN_LOOP_LINEAR_TOKEN"}, nil)
 	if err != nil {
 		return err
 	}
-	store, err := sqlitestore.Open(*dbPath)
+	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	service, err := application.NewLinearAdmissionService(reader, linearRegistryResolver{registry: registry}, store, newLocalController(store, *codexBinary, ""))
+	service, err := application.NewLinearAdmissionService(reader, linearRegistryResolver{registry: loaded.Registry}, store, newLocalController(store, loaded.Controller.CodexBinary, ""))
 	if err != nil {
 		return err
 	}
-	ctx, cancel := localContext(*timeout)
+	ctx, cancel := localContext(loaded.Controller.RunTimeout)
 	defer cancel()
 	result, _, err := service.Start(ctx, application.LinearStartCommand{Requester: requesterIdentity.value(), Identifier: identifier})
 	if err != nil {
@@ -145,10 +154,9 @@ func (r linearRegistryResolver) ResolveLinearAdmissionRepository(label string) (
 func githubRead(args []string) error {
 	flags := flag.NewFlagSet("github-read", flag.ContinueOnError)
 	requesterIdentity := addRequesterFlags(flags)
-	configPath := flags.String("config", "", "GitHub App read-only configuration")
+	configPath := flags.String("config", "", "controller composition configuration")
 	pr := flags.Int64("pr", 0, "persisted pull request number")
 	head := flags.String("expected-head", "", "expected exact PR head SHA")
-	dbPath := flags.String("db", "", "optional controller SQLite database")
 	runID := flags.String("run-id", "", "run ID required with --db")
 	repository := flags.String("repository", "", "previously observed canonical repository")
 	expectedState := flags.String("expected-state", "", "previously observed run state used as a compare-and-swap token")
@@ -159,10 +167,14 @@ func githubRead(args []string) error {
 	if *configPath == "" || *pr < 1 || *head == "" {
 		return errors.New("--config, --pr, and --expected-head are required")
 	}
-	if *dbPath == "" || *runID == "" || !requesterIdentity.complete() || *repository == "" || *expectedState == "" || *idempotencyKey == "" {
-		return errors.New("--db, --run-id, --requester, --repository, --expected-state, and --idempotency-key are required for persisted ownership reconciliation")
+	if *runID == "" || !requesterIdentity.complete() || *repository == "" || *expectedState == "" || *idempotencyKey == "" {
+		return errors.New("--run-id, --requester, --repository, --expected-state, and --idempotency-key are required for persisted ownership reconciliation")
 	}
-	store, err := sqlitestore.Open(*dbPath)
+	loaded, err := bootstrap.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
 	if err != nil {
 		return err
 	}
@@ -177,23 +189,18 @@ func githubRead(args []string) error {
 	if inspection.PullRequest == nil {
 		return errors.New("persisted PR identity is required")
 	}
-	file, err := os.Open(*configPath)
-	if err != nil {
-		return err
-	}
-	cfg, decodeErr := githubapp.DecodeConfig(file)
-	file.Close()
-	if decodeErr != nil {
-		return decodeErr
-	}
 	if *pr != inspection.PullRequest.Number || *head != inspection.Run.CandidateHead {
 		return errors.New("requested PR or expected head does not match persisted run evidence")
 	}
-	parts := strings.Split(inspection.Run.Repository, "/")
-	if len(parts) != 2 || !strings.EqualFold(parts[0], cfg.RepositoryOwner) || !strings.EqualFold(parts[1], cfg.RepositoryName) {
-		return errors.New("configured repository does not match persisted run repository")
+	profile, err := loaded.GitHubProfileForRepository(inspection.Run.Repository)
+	if err != nil {
+		return err
 	}
-	if inspection.RepositoryBinding != nil && (inspection.RepositoryBinding.ExpectedRepositoryID != cfg.RepositoryID || inspection.RepositoryBinding.GitHubInstallationID != cfg.InstallationID) {
+	cfg := profile.Config
+	if err := cfg.Validate(); err != nil {
+		return errors.New("configured GitHub App credential source is unavailable")
+	}
+	if inspection.RepositoryBinding != nil && (inspection.RepositoryBinding.ExpectedRepositoryID != cfg.RepositoryID || inspection.RepositoryBinding.GitHubInstallationID != cfg.InstallationID || inspection.RepositoryBinding.GitHubAppID != cfg.AppID) {
 		return errors.New("configured GitHub authority does not match persisted repository binding")
 	}
 	observations := []application.GitHubRequestObservation{}
