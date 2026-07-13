@@ -448,9 +448,10 @@ type ResourceResult struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 type CleanupResult struct {
-	Kind      string    `json:"resource_kind"`
-	Status    string    `json:"status"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Kind       string    `json:"resource_kind"`
+	Status     string    `json:"status"`
+	ErrorClass string    `json:"error_class,omitempty"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 type CheckResult struct {
 	Name        string    `json:"name"`
@@ -538,7 +539,7 @@ func projectInspection(value RunInspection) InspectionResult {
 		result.Resources = append(result.Resources, ResourceResult{v.Kind, v.Status, v.CreatedAt})
 	}
 	for _, v := range value.Cleanup {
-		result.Cleanup = append(result.Cleanup, CleanupResult{v.Kind, v.Status, v.UpdatedAt})
+		result.Cleanup = append(result.Cleanup, CleanupResult{v.Kind, v.Status, v.ErrorClass, v.UpdatedAt})
 	}
 	for _, finding := range value.Findings {
 		result.Findings = append(result.Findings, FindingResult{Source: finding.Source, SourceID: finding.SourceID,

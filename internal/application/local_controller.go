@@ -535,11 +535,21 @@ func (c *LocalController) provision(ctx context.Context, run Run) error {
 	if path == "" {
 		path = filepath.Join(c.worktreeRoot, run.ID)
 	}
-	spec := WorktreeSpec{SourcePath: repository.SourcePath, OriginPath: repository.OriginPath, BaseBranch: run.BaseBranch, Branch: run.WorkingBranch, Path: path}
 	inspection, err := c.store.Inspect(ctx, run.ID)
 	if err != nil {
 		return err
 	}
+	nonce, err := persistedWorktreeNonce(inspection.Resources, path, run.WorkingBranch)
+	if err != nil {
+		return err
+	}
+	if nonce == "" {
+		nonce, err = randomIdentifier("")
+		if err != nil {
+			return fmt.Errorf("generate worktree ownership nonce: %w", err)
+		}
+	}
+	spec := WorktreeSpec{SourcePath: repository.SourcePath, OriginPath: repository.OriginPath, BaseBranch: run.BaseBranch, Branch: run.WorkingBranch, Path: path, Nonce: nonce}
 	reservedByRun := false
 	for _, resource := range inspection.Resources {
 		if resource.Kind == "worktree" && resource.Name == path {
@@ -561,7 +571,7 @@ func (c *LocalController) provision(ctx context.Context, run Run) error {
 		}
 	}
 	if run.WorktreePath != "" && run.BaseSHA != "" {
-		record := WorktreeRecord{SourcePath: repository.SourcePath, OriginPath: repository.OriginPath, Path: run.WorktreePath, Branch: run.WorkingBranch, BaseBranch: run.BaseBranch, BaseSHA: run.BaseSHA}
+		record := WorktreeRecord{SourcePath: repository.SourcePath, OriginPath: repository.OriginPath, Path: run.WorktreePath, Branch: run.WorkingBranch, BaseBranch: run.BaseBranch, BaseSHA: run.BaseSHA, Nonce: nonce}
 		if err := c.worktrees.ValidateOwned(ctx, record); err != nil {
 			return err
 		}
@@ -572,7 +582,7 @@ func (c *LocalController) provision(ctx context.Context, run Run) error {
 		if err != nil {
 			return err
 		}
-		record := WorktreeRecord{SourcePath: repository.SourcePath, OriginPath: repository.OriginPath, Path: path, Branch: run.WorkingBranch, BaseBranch: run.BaseBranch, BaseSHA: baseSHA}
+		record := WorktreeRecord{SourcePath: repository.SourcePath, OriginPath: repository.OriginPath, Path: path, Branch: run.WorkingBranch, BaseBranch: run.BaseBranch, BaseSHA: baseSHA, Nonce: nonce}
 		if err := c.worktrees.ValidateOwned(ctx, record); err != nil {
 			return fmt.Errorf("recover provisioned worktree: %w", err)
 		}
@@ -601,6 +611,30 @@ func (c *LocalController) provision(ctx context.Context, run Run) error {
 		}
 	}
 	return c.store.Transition(ctx, run.ID, domain.StateProvisioning, domain.StateExecuting, "provisioned owned dedicated worktree", record.Path, record.BaseSHA)
+}
+
+func persistedWorktreeNonce(resources []OwnedResource, path, branch string) (string, error) {
+	var nonce string
+	for _, resource := range resources {
+		if (resource.Kind != "worktree" || resource.Name != path) && (resource.Kind != "branch" || resource.Name != branch) {
+			continue
+		}
+		var evidence struct {
+			Nonce string `json:"nonce"`
+		}
+		if err := json.Unmarshal([]byte(resource.CreationEvidence), &evidence); err != nil {
+			return "", fmt.Errorf("decode persisted %s ownership evidence: %w", resource.Kind, err)
+		}
+		current := strings.TrimSpace(evidence.Nonce)
+		if current == "" {
+			continue
+		}
+		if nonce != "" && nonce != current {
+			return "", errors.New("persisted worktree ownership nonce mismatch")
+		}
+		nonce = current
+	}
+	return nonce, nil
 }
 
 func (c *LocalController) execute(ctx context.Context, run Run, decision *Decision) error {

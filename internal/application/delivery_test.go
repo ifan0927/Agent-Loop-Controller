@@ -175,11 +175,11 @@ type fakeCleanup struct {
 	calls      []string
 }
 
-func (f *fakeCleanup) RemoveWorktree(_ context.Context, _, name string) error {
+func (f *fakeCleanup) RemoveWorktree(_ context.Context, _, name, _, _ string) error {
 	f.calls = append(f.calls, "worktree:"+name)
 	return nil
 }
-func (f *fakeCleanup) DeleteLocalBranch(_ context.Context, _, name string) error {
+func (f *fakeCleanup) DeleteLocalBranch(_ context.Context, _, name, _ string) error {
 	f.calls = append(f.calls, "local:"+name)
 	return nil
 }
@@ -194,17 +194,14 @@ func (f *fakeCleanup) DeleteRemoteBranch(_ context.Context, _, name, _ string) e
 func TestCleanupOnlyOwnedResourcesPersistsPartialFailure(t *testing.T) {
 	store := &deliveryMemoryStore{}
 	port := &fakeCleanup{failRemote: true}
-	run := Run{ID: "r1", Repository: "repo", BaseBranch: "main", BaseSHA: "b1", WorkingBranch: "ifan/one", CandidateHead: "h1", WorktreePath: "/tmp/w"}
-	merge := MergeRecord{RunID: "r1", PreMergeSHA: "h1", Method: "squash", MergeSHA: "m1"}
-	evidence := `{"path":"/tmp/w","branch":"ifan/one","base_branch":"main","base_sha":"b1"}`
-	resources := []OwnedResource{{RunID: "r1", Kind: "worktree", Name: "/tmp/w", Status: "owned", CreationEvidence: evidence}, {RunID: "r1", Kind: "remote_branch", Name: "ifan/one", Status: "owned", CreationEvidence: evidence}, {RunID: "other", Kind: "local_branch", Name: "user", Status: "owned", CreationEvidence: evidence}}
+	run, merge, resources := ownedCleanupFixture()
 	if err := CleanupOwned(context.Background(), store, port, run, merge, resources); err == nil {
 		t.Fatal("expected partial cleanup error")
 	}
-	if len(port.calls) != 2 || len(store.cleanup) != 4 {
+	if len(port.calls) != 3 || len(store.cleanup) != 8 {
 		t.Fatalf("calls=%v cleanup=%v", port.calls, store.cleanup)
 	}
-	if store.cleanup[len(store.cleanup)-1].Status != "failed" {
+	if store.cleanup[5].Status != "failed" || store.cleanup[5].ErrorClass != "remote_conflict" {
 		t.Fatal("failed resource was not retained for restart")
 	}
 }
@@ -212,8 +209,8 @@ func TestCleanupOnlyOwnedResourcesPersistsPartialFailure(t *testing.T) {
 func TestCleanupRejectsReservedOrForgedResourcesWithoutCallingPort(t *testing.T) {
 	store := &deliveryMemoryStore{}
 	port := &fakeCleanup{}
-	run := Run{ID: "r1", Repository: "repo", BaseBranch: "main", BaseSHA: "b1", WorkingBranch: "ifan/one", CandidateHead: "h1", WorktreePath: "/tmp/owned"}
-	merge := MergeRecord{RunID: "r1", PreMergeSHA: "h1", Method: "squash", MergeSHA: "m1"}
+	run, merge, _ := ownedCleanupFixture()
+	run.WorktreePath = "/tmp/owned"
 	reserved := []OwnedResource{{RunID: "r1", Kind: "worktree", Name: "/tmp/owned", Status: "reserved", CreationEvidence: `{"path":"/tmp/owned","branch":"ifan/one","base_branch":"main","base_sha":"b1"}`}}
 	if err := CleanupOwned(context.Background(), store, port, run, merge, reserved); err == nil {
 		t.Fatal("reserved resource must be rejected")
@@ -233,16 +230,37 @@ func TestCleanupRejectsReservedOrForgedResourcesWithoutCallingPort(t *testing.T)
 func TestCleanupRestartSkipsPersistedDeletedResource(t *testing.T) {
 	store := &deliveryMemoryStore{cleanup: []CleanupRecord{{RunID: "r1", Kind: "worktree", Name: "/tmp/w", Status: "deleted"}}}
 	port := &fakeCleanup{}
-	run := Run{ID: "r1", Repository: "repo", BaseBranch: "main", BaseSHA: "b1", WorkingBranch: "ifan/one", CandidateHead: "h1", WorktreePath: "/tmp/w"}
-	merge := MergeRecord{RunID: "r1", PreMergeSHA: "h1", Method: "squash", MergeSHA: "m1"}
-	evidence := `{"path":"/tmp/w","branch":"ifan/one","base_branch":"main","base_sha":"b1"}`
-	resources := []OwnedResource{{RunID: "r1", Kind: "worktree", Name: "/tmp/w", Status: "owned", CreationEvidence: evidence}}
+	run, merge, resources := ownedCleanupFixture()
 	if err := CleanupOwned(context.Background(), store, port, run, merge, resources); err != nil {
 		t.Fatal(err)
 	}
-	if len(port.calls) != 0 {
-		t.Fatalf("deleted resource retried: %v", port.calls)
+	if len(port.calls) != 2 {
+		t.Fatalf("deleted worktree retried or remaining resources skipped: %v", port.calls)
 	}
+}
+
+func TestCleanupSupportsPreNonceOwnedResources(t *testing.T) {
+	store := &deliveryMemoryStore{}
+	port := &fakeCleanup{}
+	run, merge, resources := ownedCleanupFixture()
+	legacy := `{"source_path":"/tmp/source","origin_path":"/tmp/origin","path":"/tmp/w","branch":"ifan/one","base_branch":"main","base_sha":"b1"}`
+	resources[1].CreationEvidence = legacy
+	resources[2].CreationEvidence = legacy
+	resources[3].CreationEvidence = "push:1"
+	if err := CleanupOwned(context.Background(), store, port, run, merge, resources); err != nil {
+		t.Fatalf("legacy cleanup failed: %v", err)
+	}
+	if len(port.calls) != 3 {
+		t.Fatalf("calls=%v", port.calls)
+	}
+}
+
+func ownedCleanupFixture() (Run, MergeRecord, []OwnedResource) {
+	run := Run{ID: "r1", State: domain.StateCleaning, Repository: "repo", BaseBranch: "main", BaseSHA: "b1", WorkingBranch: "ifan/one", CandidateHead: "h1", WorktreePath: "/tmp/w", ArtifactRoot: "/tmp/artifacts", TaskHash: "task-hash"}
+	merge := MergeRecord{RunID: "r1", PreMergeSHA: "h1", Method: "squash", MergeSHA: "m1", MergedAt: time.Now().UTC()}
+	evidence := `{"source_path":"/tmp/source","origin_path":"/tmp/origin","path":"/tmp/w","branch":"ifan/one","base_branch":"main","base_sha":"b1","nonce":"nonce"}`
+	artifact := `{"path":"/tmp/artifacts","attempts_path":"/tmp/artifacts/attempts","run_root":"/tmp","nonce":"artifact-nonce","task_hash":"task-hash"}`
+	return run, merge, []OwnedResource{{RunID: "r1", Kind: "artifact_root", Name: run.ArtifactRoot, Status: "owned", CreationEvidence: artifact}, {RunID: "r1", Kind: "worktree", Name: run.WorktreePath, Status: "owned", CreationEvidence: evidence}, {RunID: "r1", Kind: "branch", Name: run.WorkingBranch, Status: "owned", CreationEvidence: evidence}, {RunID: "r1", Kind: "remote_branch", Name: run.WorkingBranch, Status: "owned", CreationEvidence: evidence}}
 }
 
 func contains(value, part string) bool {

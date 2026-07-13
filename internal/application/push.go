@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
@@ -143,7 +142,11 @@ func (c *ProductionCoordinator) completePush(ctx context.Context, run Run, effec
 			return ProductionPushResult{}, classifyServiceError(err)
 		}
 	}
-	if err := c.store.AddOwnedResource(ctx, OwnedResource{RunID: run.ID, Kind: "remote_branch", Name: run.WorkingBranch, CreationEvidence: "push:" + fmt.Sprint(side.ID), Status: "owned"}); err != nil {
+	ownership, err := remoteBranchOwnershipEvidence(ctx, c.store, run)
+	if err != nil {
+		return ProductionPushResult{}, classifyServiceError(err)
+	}
+	if err := c.store.AddOwnedResource(ctx, OwnedResource{RunID: run.ID, Kind: "remote_branch", Name: run.WorkingBranch, CreationEvidence: ownership, Status: "owned"}); err != nil {
 		return ProductionPushResult{}, classifyServiceError(err)
 	}
 	if err := c.store.Transition(ctx, run.ID, domain.StatePushingBranch, domain.StateBranchPushed, "remote exact SHA observed", "push evidence", run.CandidateHead); err != nil {
@@ -154,6 +157,26 @@ func (c *ProductionCoordinator) completePush(ctx context.Context, run Run, effec
 		return ProductionPushResult{}, classifyServiceError(err)
 	}
 	return ProductionPushResult{Action: ProductionStop, Run: projectRunResult(next), RemoteSHA: run.CandidateHead, Idempotent: idempotent}, nil
+}
+
+func remoteBranchOwnershipEvidence(ctx context.Context, store RunStore, run Run) (string, error) {
+	inspection, err := store.Inspect(ctx, run.ID)
+	if err != nil {
+		return "", err
+	}
+	for _, resource := range inspection.Resources {
+		if resource.RunID == run.ID && resource.Kind == "branch" && resource.Name == run.WorkingBranch && resource.Status == "owned" {
+			_, legacy, err := cleanupResourceNonce(resource)
+			if err != nil {
+				return "", err
+			}
+			if err := validateCleanupEvidenceMode(run, resource, legacy); err != nil {
+				return "", err
+			}
+			return resource.CreationEvidence, nil
+		}
+	}
+	return "", errors.New("owned local branch evidence is required before remote ownership is recorded")
 }
 
 func (c *ProductionCoordinator) rejectDivergentPush(ctx context.Context, run Run, effects pushStore, side SideEffectRecord, remote string) error {

@@ -70,11 +70,11 @@ func (labAdmissionRegistry) HasVerifier(label, id string) bool {
 type testWorktrees struct{ manager gitadapter.WorktreeManager }
 
 func (w testWorktrees) Provision(ctx context.Context, s application.WorktreeSpec) (application.WorktreeRecord, error) {
-	e, err := w.manager.Provision(ctx, gitadapter.WorktreeRequest{SourcePath: s.SourcePath, OriginPath: s.OriginPath, BaseBranch: s.BaseBranch, Branch: s.Branch, Path: s.Path})
+	e, err := w.manager.Provision(ctx, gitadapter.WorktreeRequest{SourcePath: s.SourcePath, OriginPath: s.OriginPath, BaseBranch: s.BaseBranch, Branch: s.Branch, Path: s.Path, Nonce: s.Nonce})
 	if err != nil {
 		return application.WorktreeRecord{}, err
 	}
-	return application.WorktreeRecord{SourcePath: e.SourcePath, OriginPath: e.OriginPath, Path: e.Path, Branch: e.Branch, BaseBranch: e.BaseBranch, BaseSHA: e.BaseSHA}, nil
+	return application.WorktreeRecord{SourcePath: e.SourcePath, OriginPath: e.OriginPath, Path: e.Path, Branch: e.Branch, BaseBranch: e.BaseBranch, BaseSHA: e.BaseSHA, Nonce: e.Nonce}, nil
 }
 
 type crashAfterWorktree struct {
@@ -91,7 +91,7 @@ func (w *crashAfterWorktree) Provision(ctx context.Context, s application.Worktr
 	return record, err
 }
 func (w testWorktrees) ValidateOwned(ctx context.Context, r application.WorktreeRecord) error {
-	return w.manager.ValidateOwned(ctx, gitadapter.WorktreeEvidence{SourcePath: r.SourcePath, OriginPath: r.OriginPath, Path: r.Path, Branch: r.Branch, BaseBranch: r.BaseBranch, BaseSHA: r.BaseSHA})
+	return w.manager.ValidateOwned(ctx, gitadapter.WorktreeEvidence{SourcePath: r.SourcePath, OriginPath: r.OriginPath, Path: r.Path, Branch: r.Branch, BaseBranch: r.BaseBranch, BaseSHA: r.BaseSHA, Nonce: r.Nonce})
 }
 
 type durableFakeProcess struct {
@@ -409,6 +409,21 @@ func TestRestartRecoversProvisionedOwnedWorktree(t *testing.T) {
 	}
 	if run.State != domain.StateApprovalReady {
 		t.Fatalf("state=%s error=%s", run.State, run.LastError)
+	}
+	inspection, err := store.Inspect(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, resource := range inspection.Resources {
+		if resource.Kind != "worktree" && resource.Kind != "branch" {
+			continue
+		}
+		var evidence struct {
+			Nonce string `json:"nonce"`
+		}
+		if err := json.Unmarshal([]byte(resource.CreationEvidence), &evidence); err != nil || evidence.Nonce == "" {
+			t.Fatalf("recovered resource=%+v nonce=%q err=%v", resource, evidence.Nonce, err)
+		}
 	}
 }
 

@@ -67,13 +67,14 @@ type MergeRecord struct {
 }
 
 type CleanupRecord struct {
-	ID        int64     `json:"cleanup_id"`
-	RunID     string    `json:"run_id"`
-	Kind      string    `json:"resource_kind"`
-	Name      string    `json:"resource_name"`
-	Status    string    `json:"status"`
-	LastError string    `json:"last_error"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID         int64     `json:"cleanup_id"`
+	RunID      string    `json:"run_id"`
+	Kind       string    `json:"resource_kind"`
+	Name       string    `json:"resource_name"`
+	Status     string    `json:"status"`
+	ErrorClass string    `json:"error_class,omitempty"`
+	LastError  string    `json:"last_error"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 type DeliveryStore interface {

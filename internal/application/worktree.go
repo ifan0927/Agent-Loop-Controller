@@ -8,6 +8,7 @@ type WorktreeSpec struct {
 	BaseBranch string
 	Branch     string
 	Path       string
+	Nonce      string
 }
 
 type WorktreeRecord struct {
@@ -17,6 +18,7 @@ type WorktreeRecord struct {
 	Branch     string `json:"branch"`
 	BaseBranch string `json:"base_branch"`
 	BaseSHA    string `json:"base_sha"`
+	Nonce      string `json:"nonce"`
 }
 
 type WorktreeProvisioner interface {

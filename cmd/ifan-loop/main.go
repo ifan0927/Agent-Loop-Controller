@@ -67,7 +67,7 @@ func main() {
 
 func controller(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: ifan-loop controller <start|continue|push|open-pr|reconcile|merge|reconcile-linear> ...")
+		return errors.New("usage: ifan-loop controller <start|continue|push|open-pr|reconcile|merge|reconcile-linear|cleanup> ...")
 	}
 	switch args[0] {
 	case "start":
@@ -84,6 +84,8 @@ func controller(args []string) error {
 		return controllerMerge(args[1:])
 	case "reconcile-linear":
 		return controllerReconcileLinear(args[1:])
+	case "cleanup":
+		return controllerCleanup(args[1:])
 	default:
 		return fmt.Errorf("unknown controller command: %s", args[0])
 	}
@@ -338,6 +340,33 @@ func controllerReconcileLinear(args []string) error {
 	ctx, cancel := localContext(loaded.Linear.HTTPTimeout)
 	defer cancel()
 	result, err := coordinator.ReconcileLinearCompletion(ctx, application.ProductionLinearCompletionCommand{Requester: command.requester, RunID: command.run.ID, Repository: command.repository, ExpectedState: command.expectedState, IdempotencyKey: command.idempotencyKey})
+	if err != nil {
+		return err
+	}
+	return printJSON(result)
+}
+
+func controllerCleanup(args []string) error {
+	command, loaded, store, err := productionCommand(args, "controller cleanup")
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := validateProductionPersistedBinding(command.run, loaded.Registry); err != nil {
+		return application.ClassifyError(err)
+	}
+	coordinator, err := newProductionCoordinator(loaded, store, filepath.Dir(command.run.WorktreePath))
+	if err != nil {
+		return err
+	}
+	var repository application.LocalRepository
+	if err := json.Unmarshal([]byte(command.run.RepositoryConfigJSON), &repository); err != nil {
+		return application.ClassifyError(errors.New("persisted repository authority is invalid"))
+	}
+	adapter := gitadapter.Cleanup{Workspace: gitadapter.Workspace{}, SourcePath: repository.SourcePath, OriginPath: repository.OriginPath}
+	ctx, cancel := localContext(loaded.Controller.RunTimeout)
+	defer cancel()
+	result, err := coordinator.Cleanup(ctx, application.ProductionCleanupCommand{Requester: command.requester, RunID: command.run.ID, Repository: command.repository, ExpectedState: command.expectedState, IdempotencyKey: command.idempotencyKey}, adapter)
 	if err != nil {
 		return err
 	}
@@ -889,14 +918,14 @@ func splitLeadingRunID(args []string) (string, []string) {
 type commandWorktrees struct{ manager gitadapter.WorktreeManager }
 
 func (w commandWorktrees) Provision(ctx context.Context, spec application.WorktreeSpec) (application.WorktreeRecord, error) {
-	e, err := w.manager.Provision(ctx, gitadapter.WorktreeRequest{SourcePath: spec.SourcePath, OriginPath: spec.OriginPath, BaseBranch: spec.BaseBranch, Branch: spec.Branch, Path: spec.Path})
+	e, err := w.manager.Provision(ctx, gitadapter.WorktreeRequest{SourcePath: spec.SourcePath, OriginPath: spec.OriginPath, BaseBranch: spec.BaseBranch, Branch: spec.Branch, Path: spec.Path, Nonce: spec.Nonce})
 	if err != nil {
 		return application.WorktreeRecord{}, err
 	}
-	return application.WorktreeRecord{SourcePath: e.SourcePath, OriginPath: e.OriginPath, Path: e.Path, Branch: e.Branch, BaseBranch: e.BaseBranch, BaseSHA: e.BaseSHA}, nil
+	return application.WorktreeRecord{SourcePath: e.SourcePath, OriginPath: e.OriginPath, Path: e.Path, Branch: e.Branch, BaseBranch: e.BaseBranch, BaseSHA: e.BaseSHA, Nonce: e.Nonce}, nil
 }
 func (w commandWorktrees) ValidateOwned(ctx context.Context, r application.WorktreeRecord) error {
-	return w.manager.ValidateOwned(ctx, gitadapter.WorktreeEvidence{SourcePath: r.SourcePath, OriginPath: r.OriginPath, Path: r.Path, Branch: r.Branch, BaseBranch: r.BaseBranch, BaseSHA: r.BaseSHA})
+	return w.manager.ValidateOwned(ctx, gitadapter.WorktreeEvidence{SourcePath: r.SourcePath, OriginPath: r.OriginPath, Path: r.Path, Branch: r.Branch, BaseBranch: r.BaseBranch, BaseSHA: r.BaseSHA, Nonce: r.Nonce})
 }
 
 func newLocalController(store application.RunStore, codexBinary, worktreeRoot string) *application.LocalController {

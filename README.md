@@ -146,6 +146,12 @@ go run ./cmd/ifan-loop controller reconcile-linear <run-id> \
   --requester ifan0927 --requester-database-id 123 \
   --requester-node-id <github-node-id> --requester-type User \
   --repository owner/repo --expected-state awaiting_linear_completion --idempotency-key <key>
+
+go run ./cmd/ifan-loop controller cleanup <run-id> \
+  --config /absolute/path/controller.json \
+  --requester ifan0927 --requester-database-id 123 \
+  --requester-node-id <github-node-id> --requester-type User \
+  --repository owner/repo --expected-state cleaning --idempotency-key <key>
 ```
 
 After an authoritative squash merge, `reconcile-linear` performs one read-only
@@ -154,6 +160,12 @@ sanitized request metadata and the observed Linear completion state. A completed
 issue advances to owned cleanup. Canceled, ambiguous, or unreadable completion
 evidence fails closed for an operator; ten pending observations also time out to
 the same explicit intervention state.
+
+`cleanup` consumes the persisted merge and completed Linear evidence. It
+revalidates each owned resource before deleting the dedicated worktree and
+owned local and remote branches; artifact directories are retained. Any
+mismatch, dirty worktree, or partial failure remains auditable and leaves the
+run in `cleaning` for an idempotent retry.
 
 The controller configuration is strict JSON with this shape:
 

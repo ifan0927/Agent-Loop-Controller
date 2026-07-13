@@ -18,6 +18,7 @@ const (
 	ProductionOpenPullRequest ProductionAction = "open_pull_request"
 	ProductionMerge           ProductionAction = "squash_merge_pull_request"
 	ProductionReconcileLinear ProductionAction = "reconcile_linear_completion"
+	ProductionCleanup         ProductionAction = "cleanup_owned_resources"
 	ProductionStop            ProductionAction = "stop"
 )
 
@@ -142,7 +143,7 @@ func productionNextAction(state domain.State) (ProductionAction, string) {
 	case domain.StateAwaitingLinearCompletion:
 		return ProductionReconcileLinear, "authoritative merge requires bounded read-only Linear completion observation"
 	case domain.StateCleaning:
-		return ProductionStop, "the next owned cleanup lifecycle is not implemented by this controller version"
+		return ProductionCleanup, "completed Linear evidence authorizes owned cleanup"
 	case domain.StateManualIntervention:
 		return ProductionStop, "durable evidence requires a human decision"
 	default:

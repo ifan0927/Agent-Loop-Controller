@@ -16,6 +16,7 @@ type WorktreeRequest struct {
 	BaseBranch string
 	Branch     string
 	Path       string
+	Nonce      string
 }
 
 type WorktreeEvidence struct {
@@ -25,6 +26,7 @@ type WorktreeEvidence struct {
 	Branch     string `json:"branch"`
 	BaseBranch string `json:"base_branch"`
 	BaseSHA    string `json:"base_sha"`
+	Nonce      string `json:"nonce"`
 }
 
 type WorktreeManager struct{ Workspace }
@@ -34,6 +36,9 @@ func (m WorktreeManager) Provision(ctx context.Context, request WorktreeRequest)
 		if !filepath.IsAbs(path) {
 			return WorktreeEvidence{}, fmt.Errorf("%s path must be absolute", name)
 		}
+	}
+	if strings.TrimSpace(request.Nonce) == "" {
+		return WorktreeEvidence{}, errors.New("worktree ownership nonce is required")
 	}
 	if _, err := os.Lstat(request.Path); err == nil {
 		return WorktreeEvidence{}, fmt.Errorf("worktree path already exists: %s", request.Path)
@@ -65,7 +70,7 @@ func (m WorktreeManager) Provision(ctx context.Context, request WorktreeRequest)
 		return WorktreeEvidence{}, fmt.Errorf("create dedicated worktree: %w", err)
 	}
 	evidence := WorktreeEvidence{SourcePath: request.SourcePath, OriginPath: request.OriginPath, Path: request.Path,
-		Branch: request.Branch, BaseBranch: request.BaseBranch, BaseSHA: strings.TrimSpace(base)}
+		Branch: request.Branch, BaseBranch: request.BaseBranch, BaseSHA: strings.TrimSpace(base), Nonce: request.Nonce}
 	if err := m.ValidateOwned(ctx, evidence); err != nil {
 		return WorktreeEvidence{}, err
 	}

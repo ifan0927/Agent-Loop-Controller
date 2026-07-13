@@ -20,7 +20,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 10
+const schemaVersion = 11
 
 type Store struct{ db *sql.DB }
 
@@ -109,6 +109,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV9
 		case 10:
 			statements = migrationV10
+		case 11:
+			statements = migrationV11
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -237,6 +239,10 @@ var migrationV9 = []string{
 var migrationV10 = []string{
 	`CREATE TABLE linear_completion_observations (observation_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), merge_sha TEXT NOT NULL, linear_issue_id TEXT NOT NULL DEFAULT '', issue_identifier TEXT NOT NULL, source_revision TEXT NOT NULL DEFAULT '', state_id TEXT NOT NULL DEFAULT '', state_name TEXT NOT NULL DEFAULT '', state_type TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, error_class TEXT NOT NULL DEFAULT '', observed_at TEXT NOT NULL)`,
 	`CREATE TABLE linear_request_observations (observation_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), operation_name TEXT NOT NULL, http_status INTEGER NOT NULL, request_id TEXT NOT NULL DEFAULT '', rate_limit_limit INTEGER NOT NULL DEFAULT 0, rate_limit_remaining INTEGER NOT NULL DEFAULT 0, rate_limit_reset TEXT NOT NULL DEFAULT '', response_digest TEXT NOT NULL DEFAULT '', error_class TEXT NOT NULL DEFAULT '', observed_at TEXT NOT NULL)`,
+}
+
+var migrationV11 = []string{
+	`ALTER TABLE cleanup_results ADD COLUMN error_class TEXT NOT NULL DEFAULT ''`,
 }
 
 func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput) (application.Run, bool, error) {
@@ -881,11 +887,11 @@ func (s *Store) SaveLinearRequestObservation(ctx context.Context, runID string, 
 }
 
 func (s *Store) UpsertCleanup(ctx context.Context, record application.CleanupRecord) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO cleanup_results(run_id,resource_kind,resource_name,status,last_error,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(run_id,resource_kind,resource_name) DO UPDATE SET status=excluded.status,last_error=excluded.last_error,updated_at=excluded.updated_at`, record.RunID, record.Kind, record.Name, record.Status, record.LastError, nowText())
+	_, err := s.db.ExecContext(ctx, `INSERT INTO cleanup_results(run_id,resource_kind,resource_name,status,error_class,last_error,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(run_id,resource_kind,resource_name) DO UPDATE SET status=excluded.status,error_class=excluded.error_class,last_error=excluded.last_error,updated_at=excluded.updated_at`, record.RunID, record.Kind, record.Name, record.Status, record.ErrorClass, record.LastError, nowText())
 	return err
 }
 func (s *Store) CleanupProgress(ctx context.Context, runID string) ([]application.CleanupRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT cleanup_id,run_id,resource_kind,resource_name,status,last_error,updated_at FROM cleanup_results WHERE run_id=? ORDER BY cleanup_id`, runID)
+	rows, err := s.db.QueryContext(ctx, `SELECT cleanup_id,run_id,resource_kind,resource_name,status,error_class,last_error,updated_at FROM cleanup_results WHERE run_id=? ORDER BY cleanup_id`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -894,7 +900,7 @@ func (s *Store) CleanupProgress(ctx context.Context, runID string) ([]applicatio
 	for rows.Next() {
 		var item application.CleanupRecord
 		var updated string
-		if err := rows.Scan(&item.ID, &item.RunID, &item.Kind, &item.Name, &item.Status, &item.LastError, &updated); err != nil {
+		if err := rows.Scan(&item.ID, &item.RunID, &item.Kind, &item.Name, &item.Status, &item.ErrorClass, &item.LastError, &updated); err != nil {
 			return nil, err
 		}
 		item.UpdatedAt = parseTime(updated)
@@ -1117,14 +1123,14 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 		inspection.LinearCompletion = append(inspection.LinearCompletion, v)
 	}
 	rows.Close()
-	rows, err = s.db.QueryContext(ctx, `SELECT cleanup_id,run_id,resource_kind,resource_name,status,last_error,updated_at FROM cleanup_results WHERE run_id=? ORDER BY cleanup_id`, id)
+	rows, err = s.db.QueryContext(ctx, `SELECT cleanup_id,run_id,resource_kind,resource_name,status,error_class,last_error,updated_at FROM cleanup_results WHERE run_id=? ORDER BY cleanup_id`, id)
 	if err != nil {
 		return inspection, err
 	}
 	for rows.Next() {
 		var v application.CleanupRecord
 		var updated string
-		if err := rows.Scan(&v.ID, &v.RunID, &v.Kind, &v.Name, &v.Status, &v.LastError, &updated); err != nil {
+		if err := rows.Scan(&v.ID, &v.RunID, &v.Kind, &v.Name, &v.Status, &v.ErrorClass, &v.LastError, &updated); err != nil {
 			rows.Close()
 			return inspection, err
 		}
