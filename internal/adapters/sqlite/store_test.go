@@ -3,7 +3,9 @@ package sqlite
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -108,7 +110,9 @@ func TestGitHubReadSuccessPersistsEvidenceAndGateTransitionAtomically(t *testing
 		t.Fatalf("lease acquired=%v err=%v", acquired, err)
 	}
 	repo := domain.RepositoryIdentity{ID: 99, NodeID: "REPO", Owner: "owner", Name: "repo"}
-	evidence := domain.GitHubReadEvidence{Repository: repo, PullRequest: pr, Checks: []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: "head", State: domain.CheckSuccess}}, CodeRabbit: domain.CodeRabbitPass, ObservedAt: time.Now().UTC()}
+	body := "untrusted CodeRabbit finding retained only for repair"
+	sum := sha256.Sum256([]byte(body))
+	evidence := domain.GitHubReadEvidence{Repository: repo, PullRequest: pr, Checks: []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: "head", State: domain.CheckSuccess}}, CodeRabbit: domain.CodeRabbitPass, Findings: []domain.NormalizedFinding{{Source: "coderabbit_review_comment", SourceID: "finding-1", BodyDigest: hex.EncodeToString(sum[:]), Body: body, HeadSHA: "head", ObservedAt: time.Now().UTC()}}, ObservedAt: time.Now().UTC()}
 	metadata := application.GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: repo, TokenExpiresAt: time.Now().Add(time.Hour), PermissionsDigest: "permissions", ObservedAt: time.Now().UTC()}
 	if err := store.SaveGitHubReadSuccess(ctx, run.ID, owner, domain.StatePROpen, run.IdempotencyKey, []application.GitHubRequestObservation{{RunID: run.ID, Operation: "read", Category: "REST", HTTPStatus: 200, ResponseDigest: "response", InstallationID: 2, Repository: repo, ObservedAt: time.Now().UTC()}}, pr, metadata, evidence, domain.StateReconcilingReviews, "GitHub evidence collection started"); err != nil {
 		t.Fatal(err)
@@ -117,8 +121,12 @@ func TestGitHubReadSuccessPersistsEvidenceAndGateTransitionAtomically(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inspection.Run.State != domain.StateReconcilingReviews || inspection.GitHubEvidence == nil || len(inspection.GitHubRequests) != 1 || len(inspection.Timeline) != 2 || inspection.Timeline[1].BoundHead != "head" {
+	if inspection.Run.State != domain.StateReconcilingReviews || inspection.GitHubEvidence == nil || len(inspection.GitHubRequests) != 1 || len(inspection.Findings) != 1 || inspection.Findings[0].Body != body || len(inspection.Timeline) != 2 || inspection.Timeline[1].BoundHead != "head" {
 		t.Fatalf("incomplete atomic reconciliation: %+v", inspection)
+	}
+	var evidenceJSON string
+	if err := store.db.QueryRowContext(ctx, `SELECT evidence_json FROM github_read_evidence WHERE run_id=?`, run.ID).Scan(&evidenceJSON); err != nil || bytes.Contains([]byte(evidenceJSON), []byte(body)) {
+		t.Fatalf("finding body leaked into public GitHub evidence: err=%v evidence=%q", err, evidenceJSON)
 	}
 	if err := store.SaveGitHubReadSuccess(ctx, run.ID, owner, domain.StateReconcilingReviews, run.IdempotencyKey, nil, pr, metadata, evidence, domain.StateCleaning, "invalid transition"); err == nil {
 		t.Fatal("invalid gate transition was accepted")

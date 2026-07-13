@@ -611,6 +611,24 @@ func (c *LocalController) execute(ctx context.Context, run Run, decision *Decisi
 	if err != nil {
 		return err
 	}
+	hasPersistedRepair := false
+	var repairStartedAt time.Time
+	if _, found, repairErr := findPersistedRepair(inspection.Timeline); repairErr != nil {
+		return repairErr
+	} else if found {
+		hasPersistedRepair = true
+		repairStartedAt = latestRepairStartedAt(inspection.Timeline)
+		deadline, expired := repairDeadlineAt(inspection.Timeline, time.Now().UTC())
+		if expired {
+			if transitionErr := c.store.Transition(ctx, run.ID, domain.StateExecuting, domain.StateManualIntervention, "repair policy deadline exceeded", "repair resume exceeded controller deadline", latestRepairBase(inspection.Timeline)); transitionErr != nil {
+				return errors.Join(errors.New("bounded repair deadline exceeded; manual intervention required"), transitionErr)
+			}
+			return errors.New("bounded repair deadline exceeded; manual intervention required")
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
 	if run.ImplementationSession != "" && decision == nil {
 		persisted, found, loadErr := findPersistedDecision(inspection)
 		if loadErr != nil {
@@ -680,7 +698,7 @@ func (c *LocalController) execute(ctx context.Context, run Run, decision *Decisi
 			recoveryResume = true
 			break
 		}
-		if attempt.Status == "succeeded" && decision == nil {
+		if attempt.Status == "succeeded" && (decision == nil || hasPersistedRepair && !attempt.StartedAt.Before(repairStartedAt)) {
 			outcome, err := readOutcome[domain.AgentOutcome](attempt.OutcomePath, attempt.OutcomeHash)
 			if err != nil {
 				return err
@@ -1115,6 +1133,32 @@ func (c *LocalController) ValidateApprovalReady(ctx context.Context, runID strin
 // controller-normalized review data, then runs the ordinary verification and
 // fresh Sol review pipeline through Continue.
 func (c *LocalController) Repair(ctx context.Context, runID, normalizedPrompt string) (Run, error) {
+	return c.repair(ctx, runID, normalizedPrompt, nil)
+}
+
+// RepairFindings resumes the persisted Terra session using a deterministic,
+// bounded selection of controller-owned normalized findings.
+func (c *LocalController) RepairFindings(ctx context.Context, runID string, findings []FindingRecord) (Run, error) {
+	run, err := c.store.GetRun(ctx, runID)
+	if err != nil {
+		return Run{}, err
+	}
+	selected, err := RepairableFindings(findings, run.CandidateHead)
+	if err != nil {
+		if run.State == domain.StateRepairing {
+			_ = c.store.Transition(ctx, runID, domain.StateRepairing, domain.StateManualIntervention, "unsupported actionable review findings", "repair finding selection failed", run.CandidateHead)
+			updated, getErr := c.store.GetRun(ctx, runID)
+			if getErr == nil {
+				return updated, err
+			}
+		}
+		return run, err
+	}
+	evidence := repairEvidenceFor(selected)
+	return c.repair(ctx, runID, evidence.Prompt, &evidence)
+}
+
+func (c *LocalController) repair(ctx context.Context, runID, normalizedPrompt string, persisted *repairEvidence) (Run, error) {
 	if strings.TrimSpace(normalizedPrompt) == "" {
 		return Run{}, errors.New("normalized repair prompt must not be blank")
 	}
@@ -1131,6 +1175,17 @@ func (c *LocalController) Repair(ctx context.Context, runID, normalizedPrompt st
 	inspection, err := c.store.Inspect(ctx, runID)
 	if err != nil {
 		return run, err
+	}
+	if repairDeadlineExceeded(inspection.Timeline, time.Now().UTC()) {
+		err := errors.New("bounded repair deadline exceeded; manual intervention required")
+		if transitionErr := c.store.Transition(ctx, runID, domain.StateRepairing, domain.StateManualIntervention, "repair policy deadline exceeded", err.Error(), run.CandidateHead); transitionErr != nil {
+			return run, errors.Join(err, transitionErr)
+		}
+		updated, getErr := c.store.GetRun(ctx, runID)
+		if getErr != nil {
+			return run, errors.Join(err, getErr)
+		}
+		return updated, err
 	}
 	task, err := decodeTaskSnapshot(run.NormalizedTaskJSON)
 	if err != nil {
@@ -1153,14 +1208,33 @@ func (c *LocalController) Repair(ctx context.Context, runID, normalizedPrompt st
 		}
 		return updated, err
 	}
-	evidenceData, _ := json.Marshal(struct {
-		Prompt string `json:"normalized_prompt"`
-		Hash   string `json:"prompt_hash"`
-	}{normalizedPrompt, bytesHash([]byte(normalizedPrompt))})
+	if persisted == nil {
+		fallback := repairEvidence{Prompt: normalizedPrompt, Hash: bytesHash([]byte(normalizedPrompt))}
+		persisted = &fallback
+	}
+	evidenceData, _ := json.Marshal(persisted)
 	if err := c.store.BeginRepair(ctx, runID, run.CandidateHead, string(evidenceData)); err != nil {
 		return run, err
 	}
-	return c.Continue(ctx, runID, &Decision{ChoiceID: "controller-normalized-review-findings", Instructions: normalizedPrompt})
+	deadline, _ := repairDeadlineAt(inspection.Timeline, time.Now().UTC())
+	if persisted != nil {
+		deadline = time.Now().UTC().Add(repairDeadline)
+	}
+	repairCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	updated, continueErr := c.Continue(repairCtx, runID, &Decision{ChoiceID: "controller-normalized-review-findings", Instructions: normalizedPrompt})
+	if continueErr == nil || !errors.Is(context.Cause(repairCtx), context.DeadlineExceeded) {
+		return updated, continueErr
+	}
+	if updated.State == domain.StateExecuting {
+		transitionErr := c.store.Transition(ctx, runID, domain.StateExecuting, domain.StateManualIntervention, "repair policy deadline exceeded", "repair execution exceeded controller deadline", latestRepairBase(inspection.Timeline))
+		if transitionErr == nil {
+			if persistedRun, getErr := c.store.GetRun(ctx, runID); getErr == nil {
+				return persistedRun, continueErr
+			}
+		}
+	}
+	return updated, continueErr
 }
 
 func findPersistedRepair(timeline []Transition) (string, bool, error) {
@@ -1192,6 +1266,16 @@ func latestRepairBase(timeline []Transition) string {
 		}
 	}
 	return ""
+}
+
+func latestRepairStartedAt(timeline []Transition) time.Time {
+	for index := len(timeline) - 1; index >= 0; index-- {
+		item := timeline[index]
+		if item.From == domain.StateRepairing && item.To == domain.StateExecuting {
+			return item.CreatedAt
+		}
+	}
+	return time.Time{}
 }
 
 func validateRunModelPolicy(run Run) error {

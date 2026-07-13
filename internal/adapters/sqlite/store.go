@@ -521,6 +521,14 @@ func (s *Store) SaveGitHubRequests(ctx context.Context, observations []applicati
 }
 
 func (s *Store) SaveGitHubReadSuccess(ctx context.Context, runID, leaseOwner string, expectedState domain.State, idempotencyKey string, observations []application.GitHubRequestObservation, pr domain.PullRequest, m application.GitHubInstallationMetadata, e domain.GitHubReadEvidence, nextState domain.State, transitionReason string) error {
+	if len(e.Findings) > application.MaxNormalizedFindings {
+		return errors.New("GitHub finding count exceeds controller bounds")
+	}
+	for _, finding := range e.Findings {
+		if len([]byte(finding.Body)) > application.MaxNormalizedFindingBodyBytes || strings.ContainsRune(finding.Body, '\x00') {
+			return errors.New("GitHub finding body exceeds controller bounds")
+		}
+	}
 	raw, err := json.Marshal(e)
 	if err != nil {
 		return err
@@ -559,6 +567,14 @@ func (s *Store) SaveGitHubReadSuccess(ctx context.Context, runID, leaseOwner str
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO github_read_evidence(run_id,head_sha,repository_id,evidence_json,evidence_digest,observed_at) VALUES(?,?,?,?,?,?) ON CONFLICT(run_id,head_sha,evidence_digest) DO NOTHING`, runID, e.PullRequest.HeadSHA, e.Repository.ID, string(raw), hex.EncodeToString(sum[:]), formatTime(e.ObservedAt)); err != nil {
 		return err
+	}
+	for _, finding := range e.Findings {
+		if finding.Body == "" {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO review_findings(run_id,source_id,thread_id,source,file,line,severity,body_digest,body_text,resolved,outdated,head_sha,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,source,source_id,head_sha) DO UPDATE SET thread_id=excluded.thread_id,file=excluded.file,line=excluded.line,severity=excluded.severity,body_digest=excluded.body_digest,body_text=excluded.body_text,resolved=excluded.resolved,outdated=excluded.outdated,observed_at=excluded.observed_at`, runID, finding.SourceID, finding.ThreadID, finding.Source, finding.File, finding.Line, finding.Classification, finding.BodyDigest, finding.Body, finding.Resolved, finding.Outdated, finding.HeadSHA, formatTime(finding.ObservedAt)); err != nil {
+			return err
+		}
 	}
 	if nextState != expectedState {
 		if err := domain.ValidateTransition(expectedState, nextState); err != nil {

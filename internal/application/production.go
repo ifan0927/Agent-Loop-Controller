@@ -47,16 +47,21 @@ type ProductionResult struct {
 // transport or adapter details to the domain. It first revalidates the immutable
 // Linear source, then derives one legal action from durable state.
 type ProductionCoordinator struct {
-	admission *LinearAdmissionService
-	commands  CommandService
-	store     RunStore
+	admission  *LinearAdmissionService
+	controller LocalRunController
+	commands   CommandService
+	store      RunStore
+}
+
+type findingRepairController interface {
+	RepairFindings(context.Context, string, []FindingRecord) (Run, error)
 }
 
 func NewProductionCoordinator(admission *LinearAdmissionService, controller LocalRunController, store RunStore) (*ProductionCoordinator, error) {
 	if admission == nil || controller == nil || store == nil {
 		return nil, errors.New("production coordinator dependencies are required")
 	}
-	return &ProductionCoordinator{admission: admission, commands: NewCommandService(controller, store), store: store}, nil
+	return &ProductionCoordinator{admission: admission, controller: controller, commands: NewCommandService(controller, store), store: store}, nil
 }
 
 func (c *ProductionCoordinator) Continue(ctx context.Context, command ProductionContinueCommand) (ProductionResult, error) {
@@ -65,6 +70,22 @@ func (c *ProductionCoordinator) Continue(ctx context.Context, command Production
 		return ProductionResult{}, err
 	}
 	action, reason := productionNextAction(run.State)
+	if run.State == domain.StateRepairing {
+		inspection, inspectErr := c.store.Inspect(ctx, run.ID)
+		if inspectErr != nil {
+			return ProductionResult{}, classifyServiceError(inspectErr)
+		}
+		repairer, ok := c.controller.(findingRepairController)
+		if !ok {
+			return ProductionResult{}, serviceError(ErrorInternal, "repair controller capability is unavailable", nil)
+		}
+		repaired, repairErr := repairer.RepairFindings(ctx, run.ID, inspection.Findings)
+		if repairErr != nil {
+			return ProductionResult{}, repairErr
+		}
+		next, nextReason := productionNextAction(repaired.State)
+		return ProductionResult{Action: next, Run: projectRunResult(repaired), Reason: nextReason}, nil
+	}
 	if action != ProductionContinueLocal {
 		return ProductionResult{Action: action, Run: projectRunResult(run), Reason: reason}, nil
 	}
@@ -106,14 +127,15 @@ func productionNextAction(state domain.State) (ProductionAction, string) {
 	case domain.StateReceived, domain.StateAdmitting, domain.StateProvisioning, domain.StateExecuting,
 		domain.StateAwaitingHumanDecision, domain.StateVerifying, domain.StateFreshReview:
 		return ProductionContinueLocal, "local controller evidence is resumable"
+	case domain.StateRepairing:
+		return ProductionContinueLocal, "persisted trusted review findings require a bounded Terra repair"
 	case domain.StatePROpen, domain.StateReconcilingReviews, domain.StateAwaitingHumanApproval:
 		return ProductionReconcileGitHub, "persisted pull request requires fresh GitHub read evidence"
 	case domain.StateApprovalReady, domain.StatePushingBranch:
 		return ProductionPush, "verified candidate may be reconciled with its owned working branch"
 	case domain.StateBranchPushed, domain.StateOpeningPR:
 		return ProductionOpenPullRequest, "pushed exact candidate may open its one owned pull request"
-	case
-		domain.StateRepairing, domain.StateMerging, domain.StateCleaning:
+	case domain.StateMerging, domain.StateCleaning:
 		return ProductionStop, "the next external write lifecycle is not implemented by this controller version"
 	case domain.StateManualIntervention:
 		return ProductionStop, "durable evidence requires a human decision"

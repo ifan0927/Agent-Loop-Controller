@@ -64,18 +64,21 @@ const (
 )
 
 type NormalizedFinding struct {
-	Source         string    `json:"source"`
-	SourceID       string    `json:"source_id"`
-	ThreadID       string    `json:"thread_id,omitempty"`
-	File           string    `json:"file,omitempty"`
-	Line           int       `json:"line,omitempty"`
-	Classification string    `json:"classification"`
-	BodyDigest     string    `json:"body_digest"`
-	Resolved       bool      `json:"resolved"`
-	Outdated       bool      `json:"outdated"`
-	HeadSHA        string    `json:"observed_head_sha"`
-	SourceAt       time.Time `json:"source_timestamp"`
-	ObservedAt     time.Time `json:"observation_timestamp"`
+	Source         string `json:"source"`
+	SourceID       string `json:"source_id"`
+	ThreadID       string `json:"thread_id,omitempty"`
+	File           string `json:"file,omitempty"`
+	Line           int    `json:"line,omitempty"`
+	Classification string `json:"classification"`
+	BodyDigest     string `json:"body_digest"`
+	// Body is deliberately excluded from GitHub evidence JSON. It is retained
+	// only in the bounded, controller-owned finding record used for repair.
+	Body       string    `json:"-"`
+	Resolved   bool      `json:"resolved"`
+	Outdated   bool      `json:"outdated"`
+	HeadSHA    string    `json:"observed_head_sha"`
+	SourceAt   time.Time `json:"source_timestamp"`
+	ObservedAt time.Time `json:"observation_timestamp"`
 }
 
 type GitHubReview struct {

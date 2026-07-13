@@ -32,7 +32,7 @@ var allowedTransitions = map[State]map[State]struct{}{
 	StateReceived:              set(StateAdmitting),
 	StateAdmitting:             set(StateRejected, StateProvisioning, StateFailed),
 	StateProvisioning:          set(StateExecuting, StateFailed),
-	StateExecuting:             set(StateAwaitingHumanDecision, StateVerifying, StateFailed),
+	StateExecuting:             set(StateAwaitingHumanDecision, StateVerifying, StateFailed, StateManualIntervention),
 	StateAwaitingHumanDecision: set(StateExecuting, StateFailed),
 	StateVerifying:             set(StateFreshReview, StateRepairing, StateFailed),
 	StateFreshReview:           set(StateApprovalReady, StateRepairing, StateFailed),

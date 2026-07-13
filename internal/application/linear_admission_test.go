@@ -96,6 +96,9 @@ func TestLinearAdmissionFreezesControllerOwnedTask(t *testing.T) {
 	if len(task.VerifierIDs) != 1 || task.VerifierIDs[0] != "fixture-go-test" || strings.Contains(strings.Join(task.VerifierIDs, " "), "echo") {
 		t.Fatalf("Linear text changed verifier policy: %+v", task.VerifierIDs)
 	}
+	if task.Policy.MaxRepairAttempts != domain.DefaultMaxRepairAttempts {
+		t.Fatalf("repair policy was not frozen: %+v", task.Policy)
+	}
 	if controller.input.RawIssueHash == "" || controller.input.TaskHash == "" || controller.input.IdempotencyKey == "" || !strings.Contains(string(controller.input.RawIssueJSON), "echo untrusted") {
 		t.Fatalf("immutable source evidence was not frozen: %+v", controller.input)
 	}

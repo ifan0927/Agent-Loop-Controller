@@ -908,7 +908,19 @@ func (s CommandService) reconcileLocked(ctx context.Context, command ReconcileCo
 		return ReconcileResult{}, serviceError(ErrorConflict, "GitHub installation authority mismatch", nil)
 	}
 	status := command.Evidence.DeliveryStatus()
+	if status == domain.ReconciliationActionable {
+		findings, _, err := repairableEvidenceFindings(command.Evidence, run.CandidateHead)
+		if err == nil {
+			command.Evidence.Findings = findings
+		}
+	}
 	next, reason := nextGitHubReconciliationState(run.State, command.Evidence, status)
+	if status == domain.ReconciliationActionable && next == domain.StateRepairing {
+		if _, _, err := repairableEvidenceFindings(command.Evidence, run.CandidateHead); err != nil {
+			next = domain.StateManualIntervention
+			reason = "GitHub evidence has unsupported actionable findings"
+		}
+	}
 	persister, ok := s.store.(interface {
 		SaveGitHubReadSuccess(context.Context, string, string, domain.State, string, []GitHubRequestObservation, domain.PullRequest, GitHubInstallationMetadata, domain.GitHubReadEvidence, domain.State, string) error
 	})

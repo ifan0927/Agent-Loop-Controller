@@ -28,6 +28,8 @@ type TaskPolicy struct {
 	CreateDerivedIssues   bool   `json:"create_derived_issues"`
 }
 
+const DefaultMaxRepairAttempts = 3
+
 type CodingTask struct {
 	RunID              string     `json:"run_id"`
 	IssueID            string     `json:"issue_id"`

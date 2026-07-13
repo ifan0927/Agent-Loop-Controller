@@ -211,7 +211,7 @@ func admitLinearTask(source LinearTaskSource, resolver LinearAdmissionRepository
 	task := domain.CodingTask{RunID: "run-" + idempotencyKey[:16], IssueID: source.Identifier, IssueURL: source.URL,
 		Title: source.Title, Description: source.Description, Repository: repository.CanonicalRepository, BaseBranch: repository.BaseBranch,
 		WorkingBranch: source.BranchName, Goal: goal, AcceptanceCriteria: acceptance, OutOfScope: outOfScope,
-		VerifierIDs: append([]string(nil), repository.VerifierIDs...), Policy: domain.TaskPolicy{HumanApprovalRequired: true, MergeMethod: "squash"},
+		VerifierIDs: append([]string(nil), repository.VerifierIDs...), Policy: domain.TaskPolicy{HumanApprovalRequired: true, MergeMethod: "squash", MaxRepairAttempts: domain.DefaultMaxRepairAttempts},
 		SourceRevision: source.SourceRevision, CreatedAt: source.CreatedAt}
 	if err := task.Validate(); err != nil {
 		return linearAdmissionSnapshot{}, LocalRepository{}, fmt.Errorf("normalized Linear CodingTask: %w", err)

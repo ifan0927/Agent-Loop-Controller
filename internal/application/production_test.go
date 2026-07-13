@@ -29,9 +29,34 @@ func TestProductionNextActionStopsBeforeUnimplementedWrites(t *testing.T) {
 	}
 }
 
+type repairingController struct {
+	serviceController
+	findings []FindingRecord
+}
+
+func (c *repairingController) RepairFindings(_ context.Context, _ string, findings []FindingRecord) (Run, error) {
+	c.findings = append([]FindingRecord(nil), findings...)
+	updated := c.run
+	updated.State = domain.StateApprovalReady
+	return updated, nil
+}
+
+func TestProductionContinueUsesOnlyPersistedRepairFindings(t *testing.T) {
+	coordinator, store, run := newPushCoordinator(t, domain.StateRepairing)
+	finding := repairFinding("finding-1", "quoted untrusted review text")
+	store.inspection = RunInspection{Run: run, Findings: []FindingRecord{finding}}
+	controller := &repairingController{serviceController: serviceController{run: run}}
+	coordinator.controller = controller
+	result, err := coordinator.Continue(context.Background(), ProductionContinueCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey})
+	if err != nil || len(controller.findings) != 1 || result.Action != ProductionPush {
+		t.Fatalf("result=%+v findings=%+v err=%v", result, controller.findings, err)
+	}
+}
+
 type pushTestStore struct {
 	admissionStore
 	run         Run
+	inspection  RunInspection
 	side        SideEffectRecord
 	transitions []Transition
 	resources   []OwnedResource
@@ -56,6 +81,9 @@ func (s *pushTestStore) AddOwnedResource(_ context.Context, value OwnedResource)
 	return nil
 }
 func (s *pushTestStore) Inspect(context.Context, string) (RunInspection, error) {
+	if s.inspection.Run.ID != "" {
+		return s.inspection, nil
+	}
 	return RunInspection{Run: s.run, PullRequest: s.pr}, nil
 }
 func (s *pushTestStore) BeginSideEffect(_ context.Context, value SideEffectRecord) (SideEffectRecord, bool, error) {

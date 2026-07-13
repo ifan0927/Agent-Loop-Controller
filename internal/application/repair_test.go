@@ -1,0 +1,82 @@
+package application
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"testing"
+	"time"
+
+	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
+)
+
+func repairFinding(id, body string) FindingRecord {
+	sum := sha256.Sum256([]byte(body))
+	return FindingRecord{Source: "coderabbit_review_comment", SourceID: id, Body: body, BodyDigest: hex.EncodeToString(sum[:]), HeadSHA: "head"}
+}
+
+func TestRepairableFindingsAreBoundedDeterministicAndIdempotent(t *testing.T) {
+	first := repairFinding("b", "second")
+	second := repairFinding("a", "first")
+	resolved := repairFinding("resolved", "done")
+	resolved.Resolved = true
+	stale := repairFinding("stale", "old")
+	stale.HeadSHA = "old"
+	selected, err := RepairableFindings([]FindingRecord{first, resolved, second, first, stale}, "head")
+	if err != nil || len(selected) != 2 || selected[0].SourceID != "a" || selected[1].SourceID != "b" {
+		t.Fatalf("selected=%+v err=%v", selected, err)
+	}
+	if prompt := BuildRepairPrompt(selected); prompt == "" || len(prompt) > (MaxNormalizedFindingBodyBytes*2) {
+		t.Fatalf("unexpected prompt length=%d", len(prompt))
+	}
+}
+
+func TestRepairableFindingsFailClosedOnUnsupportedOrTamperedBodies(t *testing.T) {
+	unsupported := repairFinding("one", "body")
+	unsupported.Source = "ci_failure"
+	if _, err := RepairableFindings([]FindingRecord{unsupported}, "head"); err == nil {
+		t.Fatal("unsupported finding source entered repair")
+	}
+	tampered := repairFinding("two", "body")
+	tampered.Body = "changed"
+	if _, err := RepairableFindings([]FindingRecord{tampered}, "head"); err == nil {
+		t.Fatal("tampered finding body entered repair")
+	}
+	oversize := repairFinding("three", string(make([]byte, MaxNormalizedFindingBodyBytes+1)))
+	if _, err := RepairableFindings([]FindingRecord{oversize}, "head"); err == nil {
+		t.Fatal("oversized finding body entered repair")
+	}
+	many := make([]FindingRecord, 0, MaxNormalizedFindings+1)
+	for i := 0; i <= MaxNormalizedFindings; i++ {
+		many = append(many, repairFinding(string(rune('a'+i)), "body"))
+	}
+	if _, err := RepairableFindings(many, "head"); err == nil {
+		t.Fatal("unbounded finding set entered repair")
+	}
+}
+
+func TestRepairableEvidenceSynthesizesTrustedRequiredCheckFinding(t *testing.T) {
+	evidence := domain.GitHubReadEvidence{Checks: []domain.GitHubCheck{{ID: "check-1", Name: "go test", Required: true, Source: "check_run", State: domain.CheckFailure, ObservedSHA: "head"}}}
+	findings, selected, err := repairableEvidenceFindings(evidence, "head")
+	if err != nil || len(findings) != 1 || len(selected) != 1 || selected[0].Source != "github_required_check" {
+		t.Fatalf("findings=%+v selected=%+v err=%v", findings, selected, err)
+	}
+}
+
+func TestRepairDeadlineUsesFirstPersistedRepairAttempt(t *testing.T) {
+	now := time.Now().UTC()
+	if !repairDeadlineExceeded([]Transition{{From: domain.StateRepairing, To: domain.StateExecuting, CreatedAt: now.Add(-repairDeadline)}}, now) {
+		t.Fatal("deadline boundary was not enforced")
+	}
+	if repairDeadlineExceeded([]Transition{{From: domain.StateRepairing, To: domain.StateExecuting, CreatedAt: now.Add(-repairDeadline + time.Second)}}, now) {
+		t.Fatal("repair before deadline was rejected")
+	}
+}
+
+func TestLatestRepairStartedAtUsesNewestRepairTransition(t *testing.T) {
+	first := time.Now().UTC().Add(-time.Minute)
+	second := time.Now().UTC()
+	timeline := []Transition{{From: domain.StateRepairing, To: domain.StateExecuting, CreatedAt: first}, {From: domain.StateRepairing, To: domain.StateExecuting, CreatedAt: second}}
+	if got := latestRepairStartedAt(timeline); !got.Equal(second) {
+		t.Fatalf("repair start=%s want=%s", got, second)
+	}
+}

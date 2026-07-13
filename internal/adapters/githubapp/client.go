@@ -771,6 +771,9 @@ func (c *Client) readReviews(ctx context.Context, pr int64, head string, coderab
 					return "", nil, nil, "", nil, err
 				}
 				for _, m := range comments {
+					if len([]byte(m.Body)) > application.MaxNormalizedFindingBodyBytes || strings.ContainsRune(m.Body, '\x00') {
+						return "", nil, nil, "", nil, errors.New("review finding body exceeds controller bounds")
+					}
 					id := strconv.FormatInt(m.DatabaseID, 10)
 					if id == "0" {
 						id = m.ID
@@ -800,7 +803,10 @@ func (c *Client) readReviews(ctx context.Context, pr int64, head string, coderab
 						}
 					}
 					if trusted {
-						findings = append(findings, domain.NormalizedFinding{Source: "coderabbit_review_comment", SourceID: id, ThreadID: t.ID, File: m.Path, Line: m.Line, Classification: "source_unspecified", BodyDigest: hex.EncodeToString(dig[:]), Resolved: t.IsResolved, Outdated: t.IsOutdated || m.Outdated, HeadSHA: m.Commit.OID, SourceAt: m.CreatedAt, ObservedAt: c.clock.Now().UTC()})
+						findings = append(findings, domain.NormalizedFinding{Source: "coderabbit_review_comment", SourceID: id, ThreadID: t.ID, File: m.Path, Line: m.Line, Classification: "source_unspecified", BodyDigest: hex.EncodeToString(dig[:]), Body: m.Body, Resolved: t.IsResolved, Outdated: t.IsOutdated || m.Outdated, HeadSHA: m.Commit.OID, SourceAt: m.CreatedAt, ObservedAt: c.clock.Now().UTC()})
+						if len(findings) > application.MaxNormalizedFindings {
+							return "", nil, nil, "", nil, errors.New("review finding count exceeds controller bounds")
+						}
 					} else {
 						unknown = append(unknown, "untrusted_review_comment:"+id)
 					}
