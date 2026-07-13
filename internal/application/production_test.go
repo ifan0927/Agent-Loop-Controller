@@ -61,6 +61,11 @@ type pushTestStore struct {
 	transitions []Transition
 	resources   []OwnedResource
 	pr          *domain.PullRequest
+	merge       *MergeRecord
+	github      []domain.GitHubReadEvidence
+	requests    []GitHubRequestObservation
+	metadata    []GitHubInstallationMetadata
+	requestErr  error
 }
 
 func (s *pushTestStore) GetRun(context.Context, string) (Run, error) { return s.run, nil }
@@ -81,10 +86,20 @@ func (s *pushTestStore) AddOwnedResource(_ context.Context, value OwnedResource)
 	return nil
 }
 func (s *pushTestStore) Inspect(context.Context, string) (RunInspection, error) {
-	if s.inspection.Run.ID != "" {
-		return s.inspection, nil
+	result := s.inspection
+	if result.Run.ID == "" {
+		result.Run = s.run
 	}
-	return RunInspection{Run: s.run, PullRequest: s.pr}, nil
+	if result.PullRequest == nil && s.pr != nil {
+		result.PullRequest = s.pr
+	}
+	if result.Merge == nil && s.merge != nil {
+		result.Merge = s.merge
+	}
+	if s.side.ID != 0 && len(result.SideEffects) == 0 {
+		result.SideEffects = []SideEffectRecord{s.side}
+	}
+	return result, nil
 }
 func (s *pushTestStore) BeginSideEffect(_ context.Context, value SideEffectRecord) (SideEffectRecord, bool, error) {
 	if s.side.ID == 0 {
@@ -107,6 +122,29 @@ func (s *pushTestStore) SavePullRequest(_ context.Context, _ string, value domai
 	}
 	copy := value
 	s.pr = &copy
+	return nil
+}
+func (s *pushTestStore) SaveMerge(_ context.Context, value MergeRecord) error {
+	if s.merge != nil && *s.merge != value {
+		return errors.New("conflicting merge")
+	}
+	copy := value
+	s.merge = &copy
+	return nil
+}
+func (s *pushTestStore) SaveGitHubInstallation(_ context.Context, _ string, value GitHubInstallationMetadata) error {
+	s.metadata = append(s.metadata, value)
+	return nil
+}
+func (s *pushTestStore) SaveGitHubRequest(_ context.Context, value GitHubRequestObservation) error {
+	if s.requestErr != nil {
+		return s.requestErr
+	}
+	s.requests = append(s.requests, value)
+	return nil
+}
+func (s *pushTestStore) SaveGitHubEvidence(_ context.Context, _ string, value domain.GitHubReadEvidence) error {
+	s.github = append(s.github, value)
 	return nil
 }
 
@@ -243,6 +281,103 @@ func TestProductionOpenPullRequestLeavesFailedIntentForExplicitReconciliation(t 
 	_, err := coordinator.OpenPullRequest(context.Background(), ProductionOpenPullRequestCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, &pushValidator{}, opener)
 	if err == nil || store.run.State != domain.StateOpeningPR || store.side.Status != "failed" || store.pr != nil {
 		t.Fatalf("err=%v state=%s side=%+v pr=%+v", err, store.run.State, store.side, store.pr)
+	}
+}
+
+type mergeReader struct {
+	authority    GitHubInstallationMetadata
+	evidence     domain.GitHubReadEvidence
+	observations []GitHubRequestObservation
+	calls        int
+}
+
+func (r *mergeReader) Authority() GitHubInstallationMetadata { return r.authority }
+func (r *mergeReader) Read(_ context.Context, _ int64, _ string) (domain.GitHubReadEvidence, []GitHubRequestObservation, GitHubInstallationMetadata, error) {
+	r.calls++
+	return r.evidence, append([]GitHubRequestObservation(nil), r.observations...), r.authority, nil
+}
+
+type mergeWriter struct {
+	response domain.PullRequest
+	err      error
+	calls    int
+}
+
+func (w *mergeWriter) SquashMerge(_ context.Context, _ SquashMergeRequest) (domain.PullRequest, []GitHubRequestObservation, GitHubInstallationMetadata, error) {
+	w.calls++
+	return w.response, []GitHubRequestObservation{{Operation: "squash_merge", Category: "pull_request", ResponseDigest: "digest", ObservedAt: time.Now().UTC()}}, GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: domain.RepositoryIdentity{ID: 99, Owner: "owner", Name: "repo"}}, w.err
+}
+
+func newMergeCoordinator(t *testing.T) (*ProductionCoordinator, *pushTestStore, Run, *mergeReader, *mergeWriter) {
+	t.Helper()
+	coordinator, store, run := newPushCoordinator(t, domain.StateMerging)
+	pr := domain.PullRequest{Number: 7, DatabaseID: 70, URL: "https://example.invalid/pull/7", NodeID: "PR_7", HeadBranch: run.WorkingBranch, BaseBranch: run.BaseBranch, HeadSHA: run.CandidateHead, BaseSHA: run.BaseSHA, BodyDigest: "body", OwnershipKey: run.IdempotencyKey, State: "open"}
+	now := time.Date(2026, 7, 13, 2, 0, 0, 0, time.UTC)
+	actor := domain.ActorIdentity{DatabaseID: 33, NodeID: "USER_33", Login: "ifan0927", Type: "User"}
+	approval := domain.HumanApproval{PRNumber: pr.Number, Approver: actor.Login, Actor: actor, ReviewDatabaseID: 9, ReviewNodeID: "PRR_9", Source: "github_pull_request_review", ApprovedSHA: run.CandidateHead, CIStatus: "pass", CodeRabbit: "pass", ReviewSHA: run.CandidateHead, ApprovedAt: now, ObservedAt: now}
+	binding := &SanitizedRepositoryBinding{CanonicalRepository: "owner/repo", ExpectedRepositoryID: 99, GitHubAppID: 1, GitHubInstallationID: 2, TrustedOperatorActors: []TrustedActorIdentity{{DatabaseID: actor.DatabaseID, NodeID: actor.NodeID, Login: actor.Login, Type: actor.Type}}}
+	evidence := domain.GitHubReadEvidence{Repository: domain.RepositoryIdentity{ID: 99, NodeID: "REPO", Owner: "owner", Name: "repo"}, PullRequest: pr, Checks: []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: run.CandidateHead, State: domain.CheckSuccess}}, ReviewDecision: "APPROVED", CodeRabbit: domain.CodeRabbitPass, Reviews: []domain.GitHubReview{{DatabaseID: 9, NodeID: "PRR_9", State: "APPROVED", CommitSHA: run.CandidateHead, SourceAt: now, Actor: actor}}, ObservedAt: now}
+	store.pr = &pr
+	store.inspection = RunInspection{Run: run, RepositoryBinding: binding, PullRequest: &pr, Approval: &approval}
+	reader := &mergeReader{authority: GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: evidence.Repository}, evidence: evidence, observations: []GitHubRequestObservation{{Operation: "merge_preflight", Category: "pull_request", ResponseDigest: "digest", ObservedAt: time.Now().UTC()}}}
+	merged := pr
+	merged.State, merged.Merged, merged.MergeSHA, merged.MergedAt = "closed", true, "merge", now.Add(time.Minute)
+	writer := &mergeWriter{response: merged}
+	return coordinator, store, run, reader, writer
+}
+
+func mergeCommand(run Run) ProductionMergeCommand {
+	return ProductionMergeCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}
+}
+
+func TestProductionMergePersistsIntentAndObservedSquashResult(t *testing.T) {
+	coordinator, store, run, reader, writer := newMergeCoordinator(t)
+	result, err := coordinator.MergePullRequest(context.Background(), mergeCommand(run), &pushValidator{}, reader, writer)
+	if err != nil || result.Action != ProductionStop || result.MergeSHA != "merge" || result.Idempotent || writer.calls != 1 || store.run.State != domain.StateCleaning || store.merge == nil {
+		t.Fatalf("result=%+v err=%v calls=%d state=%s merge=%+v", result, err, writer.calls, store.run.State, store.merge)
+	}
+	if store.side.Kind != "squash_merge" || store.side.Status != "observed" || !strings.Contains(store.side.IntentJSON, `"merge_method":"squash"`) || len(store.github) != 1 || len(store.requests) != 2 {
+		t.Fatalf("side=%+v github=%d requests=%d", store.side, len(store.github), len(store.requests))
+	}
+}
+
+func TestProductionMergeReconcilesLostSuccessWithoutSecondWrite(t *testing.T) {
+	coordinator, store, run, reader, writer := newMergeCoordinator(t)
+	writer.err = errors.New("response lost after GitHub accepted merge")
+	if _, err := coordinator.MergePullRequest(context.Background(), mergeCommand(run), &pushValidator{}, reader, writer); err == nil || writer.calls != 1 || store.run.State != domain.StateMerging || store.side.Status != "failed" {
+		t.Fatalf("err=%v calls=%d state=%s side=%+v", err, writer.calls, store.run.State, store.side)
+	}
+	merged := writer.response
+	reader.evidence.PullRequest = merged
+	result, err := coordinator.MergePullRequest(context.Background(), mergeCommand(store.run), &pushValidator{}, reader, writer)
+	if err != nil || !result.Idempotent || writer.calls != 1 || store.run.State != domain.StateCleaning || store.merge == nil || store.merge.MergeSHA != "merge" {
+		t.Fatalf("result=%+v err=%v calls=%d state=%s merge=%+v", result, err, writer.calls, store.run.State, store.merge)
+	}
+}
+
+func TestProductionMergeClosedUnmergedFailsClosedBeforeWrite(t *testing.T) {
+	coordinator, store, run, reader, writer := newMergeCoordinator(t)
+	reader.evidence.PullRequest.State = "closed"
+	if _, err := coordinator.MergePullRequest(context.Background(), mergeCommand(run), &pushValidator{}, reader, writer); err == nil || writer.calls != 0 || store.run.State != domain.StateManualIntervention {
+		t.Fatalf("err=%v calls=%d state=%s", err, writer.calls, store.run.State)
+	}
+}
+
+func TestProductionMergeRejectedResultPersistsGitHubTelemetry(t *testing.T) {
+	coordinator, store, run, reader, writer := newMergeCoordinator(t)
+	writer.err = &MergeRejectedError{Cause: errors.New("GitHub rejected merge")}
+	if _, err := coordinator.MergePullRequest(context.Background(), mergeCommand(run), &pushValidator{}, reader, writer); err == nil || writer.calls != 1 || store.run.State != domain.StateManualIntervention || len(store.requests) != 2 {
+		t.Fatalf("err=%v calls=%d state=%s requests=%d", err, writer.calls, store.run.State, len(store.requests))
+	}
+}
+
+func TestProductionMergeRejectedResultFailsClosedEvenWhenRequestTelemetryCannotPersist(t *testing.T) {
+	coordinator, store, run, reader, writer := newMergeCoordinator(t)
+	reader.observations = nil
+	store.requestErr = errors.New("telemetry storage unavailable")
+	writer.err = &MergeRejectedError{Cause: errors.New("GitHub rejected merge")}
+	if _, err := coordinator.MergePullRequest(context.Background(), mergeCommand(run), &pushValidator{}, reader, writer); err == nil || writer.calls != 1 || store.run.State != domain.StateManualIntervention || store.side.Status != "failed" {
+		t.Fatalf("err=%v calls=%d state=%s side=%+v", err, writer.calls, store.run.State, store.side)
 	}
 }
 

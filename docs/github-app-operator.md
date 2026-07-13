@@ -14,6 +14,14 @@
   This enables exactly one controller operation: create-or-adopt a PR with a
   persisted ownership marker. It does not authorize comments, reviews, merge,
   close, branch deletion, or any generic GitHub write client.
+- A merge-capable isolated fixture profile must additionally set
+  `squash_merge_write` to `true` and change only the App's **Contents**
+  repository permission to **Read and write**. GitHub requires Contents write
+  for the conditional `PUT /pulls/{number}/merge` endpoint. This capability is
+  limited to a persisted exact-head squash request; it does not enable merge
+  commits, rebase, auto-merge, force, admin bypass, reviews, comments, branch
+  deletion, or repository settings. Keep both write capabilities disabled for
+  ordinary read-only profiles.
 - Select **Only selected repositories** and initially choose only an isolated
   fixture repository. Do not select production or STDS repositories.
 
@@ -45,6 +53,7 @@ Create a configuration file outside the repository:
   "token_refresh_skew": "5m",
   "api_version": "2022-11-28",
   "pull_requests_write": false,
+  "squash_merge_write": false,
   "coderabbit_actor_id": 0,
   "coderabbit_node_id": "",
   "coderabbit_app_id": 0
@@ -83,3 +92,24 @@ The adapter first validates the installation token and numeric repository
 identity, then looks up an exact marker/body-digest match before POSTing. A
 transport interruption leaves immutable intent in SQLite; a later invocation
 adopts only that exact PR and never adopts a merely matching branch or title.
+
+To exercise the guarded merge path, use a separate selected-repository
+installation with the two write switches described above. The controller
+re-reads the PR, exact head/base, required checks, CodeRabbit, fresh local Sol
+evidence, and I-Fan's immutable-identity approval immediately before recording
+the merge intent. It sends only `merge_method: squash` with the expected head
+SHA, then re-reads the PR to persist its merge SHA and timestamp. If the
+process loses a successful response, a restart observes the merged PR and does
+not send another merge request; a closed-but-unmerged PR fails closed.
+
+## Base freshness boundary
+
+GitHub's direct merge endpoint conditions the write on the PR head SHA, not an
+expected base SHA. The controller therefore records and re-reads the current
+base immediately before the conditional squash request, but does not rebase,
+update a branch, or retry a rejected merge. The selected repository must make
+GitHub branch protection the final base-freshness authority: require branches
+to be up to date, require the configured CI and CodeRabbit checks, dismiss
+stale approvals after new commits, and do not allow bypass. A GitHub rejection
+or any conflicting evidence is persisted as `manual_intervention` for an
+operator to resolve; it is not a controller repair action.

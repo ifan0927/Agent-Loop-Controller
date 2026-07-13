@@ -16,6 +16,7 @@ const (
 	ProductionReconcileGitHub ProductionAction = "reconcile_github_read"
 	ProductionPush            ProductionAction = "push_verified_branch"
 	ProductionOpenPullRequest ProductionAction = "open_pull_request"
+	ProductionMerge           ProductionAction = "squash_merge_pull_request"
 	ProductionStop            ProductionAction = "stop"
 )
 
@@ -135,8 +136,10 @@ func productionNextAction(state domain.State) (ProductionAction, string) {
 		return ProductionPush, "verified candidate may be reconciled with its owned working branch"
 	case domain.StateBranchPushed, domain.StateOpeningPR:
 		return ProductionOpenPullRequest, "pushed exact candidate may open its one owned pull request"
-	case domain.StateMerging, domain.StateCleaning:
-		return ProductionStop, "the next external write lifecycle is not implemented by this controller version"
+	case domain.StateMerging:
+		return ProductionMerge, "trusted exact-HEAD approval requires a guarded squash merge"
+	case domain.StateCleaning:
+		return ProductionStop, "the next owned cleanup lifecycle is not implemented by this controller version"
 	case domain.StateManualIntervention:
 		return ProductionStop, "durable evidence requires a human decision"
 	default:

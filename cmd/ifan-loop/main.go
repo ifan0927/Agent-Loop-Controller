@@ -67,7 +67,7 @@ func main() {
 
 func controller(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: ifan-loop controller <start|continue|push|open-pr|reconcile> ...")
+		return errors.New("usage: ifan-loop controller <start|continue|push|open-pr|reconcile|merge> ...")
 	}
 	switch args[0] {
 	case "start":
@@ -80,6 +80,8 @@ func controller(args []string) error {
 		return controllerOpenPullRequest(args[1:])
 	case "reconcile":
 		return controllerReconcile(args[1:])
+	case "merge":
+		return controllerMerge(args[1:])
 	default:
 		return fmt.Errorf("unknown controller command: %s", args[0])
 	}
@@ -276,6 +278,48 @@ func controllerOpenPullRequest(args []string) error {
 	return printJSON(result)
 }
 
+func controllerMerge(args []string) error {
+	command, loaded, store, err := productionCommand(args, "controller merge")
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := validateProductionPersistedBinding(command.run, loaded.Registry); err != nil {
+		return application.ClassifyError(err)
+	}
+	coordinator, err := newProductionCoordinator(loaded, store, filepath.Dir(command.run.WorktreePath))
+	if err != nil {
+		return err
+	}
+	profile, err := loaded.GitHubProfileForRepository(command.run.Repository)
+	if err != nil {
+		return err
+	}
+	if !profile.Config.SquashMergeWrite {
+		return errors.New("configured GitHub App profile does not enable the narrow squash merge capability")
+	}
+	if err := profile.Config.Validate(); err != nil {
+		return errors.New("configured GitHub App credential source is unavailable")
+	}
+	observations := []application.GitHubRequestObservation{}
+	client, err := githubapp.New(profile.Config, githubapp.RealClock{}, func(o application.GitHubRequestObservation) {
+		o.RunID = command.run.ID
+		observations = append(observations, o)
+	})
+	if err != nil {
+		return err
+	}
+	validator := newLocalController(store, loaded.Controller.CodexBinary, filepath.Dir(command.run.WorktreePath))
+	ctx, cancel := context.WithTimeout(context.Background(), profile.Config.HTTPTimeout*30)
+	defer cancel()
+	adapter := githubReadAdapter{client: client, observations: &observations}
+	result, err := coordinator.MergePullRequest(ctx, application.ProductionMergeCommand{Requester: command.requester, RunID: command.run.ID, Repository: command.repository, ExpectedState: command.expectedState, IdempotencyKey: command.idempotencyKey}, validator, adapter, adapter)
+	if err != nil {
+		return err
+	}
+	return printJSON(result)
+}
+
 type productionPushAdapter struct{ publisher gitadapter.Publisher }
 
 func (a productionPushAdapter) RemoteSHA(ctx context.Context, workspace, branch string) (string, error) {
@@ -459,8 +503,15 @@ func (a githubReadAdapter) Authority() application.GitHubInstallationMetadata {
 }
 
 func (a githubReadAdapter) Read(ctx context.Context, pr int64, head string) (domain.GitHubReadEvidence, []application.GitHubRequestObservation, application.GitHubInstallationMetadata, error) {
+	start := len(*a.observations)
 	evidence, err := a.client.Read(ctx, pr, head)
-	return evidence, append([]application.GitHubRequestObservation(nil), (*a.observations)...), a.client.InstallationMetadata(), err
+	return evidence, append([]application.GitHubRequestObservation(nil), (*a.observations)[start:]...), a.client.InstallationMetadata(), err
+}
+
+func (a githubReadAdapter) SquashMerge(ctx context.Context, request application.SquashMergeRequest) (domain.PullRequest, []application.GitHubRequestObservation, application.GitHubInstallationMetadata, error) {
+	start := len(*a.observations)
+	pr, err := a.client.SquashMerge(ctx, request)
+	return pr, append([]application.GitHubRequestObservation(nil), (*a.observations)[start:]...), a.client.InstallationMetadata(), err
 }
 
 func local(args []string) error {

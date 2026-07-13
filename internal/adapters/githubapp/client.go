@@ -214,22 +214,20 @@ func (c *Client) ensureToken(ctx context.Context, force bool) error {
 	if out.Token == "" || !out.ExpiresAt.After(c.clock.Now()) {
 		return errors.New("invalid installation token metadata")
 	}
+	writable := map[string]bool{"pull_requests": c.cfg.PullRequestsWrite, "contents": c.cfg.SquashMergeWrite}
 	for name, level := range out.Permissions {
-		if level != "read" && !(name == "pull_requests" && c.cfg.PullRequestsWrite && level == "write") {
+		if level != "read" && !(writable[name] && level == "write") {
 			return fmt.Errorf("installation permission %s exceeds controller policy", name)
 		}
 	}
-	for _, name := range []string{"metadata", "contents", "checks", "statuses", "administration"} {
-		if out.Permissions[name] != "read" {
-			return fmt.Errorf("installation lacks required read-only permission %s", name)
+	for _, name := range []string{"metadata", "contents", "checks", "statuses", "administration", "pull_requests"} {
+		want := "read"
+		if writable[name] {
+			want = "write"
 		}
-	}
-	wantPullRequests := "read"
-	if c.cfg.PullRequestsWrite {
-		wantPullRequests = "write"
-	}
-	if out.Permissions["pull_requests"] != wantPullRequests {
-		return fmt.Errorf("installation pull request permission does not match controller policy")
+		if out.Permissions[name] != want {
+			return fmt.Errorf("installation permission %s does not match controller policy", name)
+		}
 	}
 	if len(out.Repositories) != 1 {
 		return errors.New("installation token scope includes unexpected repositories")
