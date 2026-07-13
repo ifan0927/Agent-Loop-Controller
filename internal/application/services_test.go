@@ -41,7 +41,7 @@ func (s serviceStore) ListRuns(_ context.Context, _ string, before time.Time, be
 	}
 	return s.runs, nil
 }
-func (s serviceStore) SaveGitHubReadSuccess(context.Context, string, string, domain.State, string, []GitHubRequestObservation, domain.PullRequest, GitHubInstallationMetadata, domain.GitHubReadEvidence) error {
+func (s serviceStore) SaveGitHubReadSuccess(context.Context, string, string, domain.State, string, []GitHubRequestObservation, domain.PullRequest, GitHubInstallationMetadata, domain.GitHubReadEvidence, domain.State, string) error {
 	return nil
 }
 func (s serviceStore) SaveGitHubReadFailure(_ context.Context, _ string, _ string, _ domain.State, _ string, observations []GitHubRequestObservation) error {
@@ -358,5 +358,39 @@ func TestGitHubReconcilePersistsPartialFailureObservations(t *testing.T) {
 	_, err := NewCommandService(nil, store).ReconcileFromGitHub(context.Background(), GitHubReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: "run", Repository: "owner/repo", ExpectedState: domain.StatePROpen, IdempotencyKey: "key", PullRequest: 1, ExpectedHead: "head"}, reader)
 	if err == nil || len(saved) != 1 || saved[0].ErrorClass != "timeout" {
 		t.Fatalf("failure error=%v saved=%+v", err, saved)
+	}
+}
+
+func TestNextGitHubReconciliationStateUsesOnlyLegalFailClosedGates(t *testing.T) {
+	passing := domain.GitHubReadEvidence{PullRequest: domain.PullRequest{State: "open", HeadSHA: "head"}, Checks: []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: "head", State: domain.CheckSuccess}}, CodeRabbit: domain.CodeRabbitPass}
+	actionable := passing
+	actionable.Findings = []domain.NormalizedFinding{{Source: "coderabbit_review_comment", SourceID: "finding", BodyDigest: "digest", HeadSHA: "head"}}
+	closed := passing
+	closed.PullRequest.State = "closed"
+	cases := []struct {
+		name     string
+		current  domain.State
+		evidence domain.GitHubReadEvidence
+		status   domain.ReconciliationStatus
+		want     domain.State
+	}{
+		{name: "first observation", current: domain.StatePROpen, evidence: passing, status: domain.ReconciliationPass, want: domain.StateReconcilingReviews},
+		{name: "passing reconciliation", current: domain.StateReconcilingReviews, evidence: passing, status: domain.ReconciliationPass, want: domain.StateAwaitingHumanApproval},
+		{name: "actionable finding", current: domain.StateReconcilingReviews, evidence: actionable, status: domain.ReconciliationActionable, want: domain.StateRepairing},
+		{name: "pending evidence revokes approval readiness", current: domain.StateAwaitingHumanApproval, evidence: passing, status: domain.ReconciliationPending, want: domain.StateReconcilingReviews},
+		{name: "closed PR", current: domain.StateAwaitingHumanApproval, evidence: closed, status: domain.ReconciliationInfrastructure, want: domain.StateManualIntervention},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := nextGitHubReconciliationState(tc.current, tc.evidence, tc.status)
+			if got != tc.want {
+				t.Fatalf("state=%s want=%s", got, tc.want)
+			}
+			if got != tc.current {
+				if err := domain.ValidateTransition(tc.current, got); err != nil {
+					t.Fatalf("illegal transition %s -> %s: %v", tc.current, got, err)
+				}
+			}
+		})
 	}
 }

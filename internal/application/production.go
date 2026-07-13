@@ -96,7 +96,9 @@ func (c *ProductionCoordinator) ReconcileGitHub(ctx context.Context, command Pro
 	if err != nil {
 		return ProductionResult{}, err
 	}
-	return ProductionResult{Action: ProductionReconcileGitHub, Run: projectRunResult(run), Head: result.Head}, nil
+	run.State = result.State
+	next, reason := productionNextAction(run.State)
+	return ProductionResult{Action: next, Run: projectRunResult(run), Head: result.Head, Reason: reason}, nil
 }
 
 func productionNextAction(state domain.State) (ProductionAction, string) {

@@ -131,3 +131,47 @@ func (e GitHubReadEvidence) RequiredChecksStatus() ReconciliationStatus {
 	}
 	return ReconciliationPass
 }
+
+// DeliveryStatus classifies the GitHub evidence that gates the delivery loop.
+// Unknown or incomplete observations deliberately never authorize a later
+// lifecycle state.
+func (e GitHubReadEvidence) DeliveryStatus() ReconciliationStatus {
+	if !strings.EqualFold(e.PullRequest.State, "open") || e.PullRequest.Merged {
+		return ReconciliationInfrastructure
+	}
+	if status := e.RequiredChecksStatus(); status != ReconciliationPass {
+		return status
+	}
+	if len(e.UnknownEvents) > 0 {
+		return ReconciliationInfrastructure
+	}
+	for _, finding := range e.Findings {
+		if finding.Source == "" || finding.SourceID == "" || finding.BodyDigest == "" || finding.HeadSHA != e.PullRequest.HeadSHA {
+			return ReconciliationInfrastructure
+		}
+		if !finding.Resolved && !finding.Outdated {
+			return ReconciliationActionable
+		}
+	}
+	switch e.ReviewDecision {
+	case "APPROVED", "REVIEW_REQUIRED":
+	case "CHANGES_REQUESTED":
+		return ReconciliationActionable
+	case "":
+		return ReconciliationPending
+	default:
+		return ReconciliationInfrastructure
+	}
+	switch e.CodeRabbit {
+	case CodeRabbitPass:
+		return ReconciliationPass
+	case CodeRabbitAbsent, CodeRabbitPending:
+		return ReconciliationPending
+	case CodeRabbitActionable:
+		return ReconciliationActionable
+	case CodeRabbitInfrastructure, CodeRabbitUntrusted, CodeRabbitUnknown:
+		return ReconciliationInfrastructure
+	default:
+		return ReconciliationInfrastructure
+	}
+}

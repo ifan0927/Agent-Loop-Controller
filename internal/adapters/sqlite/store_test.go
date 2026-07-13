@@ -82,6 +82,53 @@ func TestGitHubV6EvidencePersistsMetadataWithoutSecrets(t *testing.T) {
 	}
 }
 
+func TestGitHubReadSuccessPersistsEvidenceAndGateTransitionAtomically(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	run := application.Run{ID: "run-gate", IssueID: "IFAN-GATE", IdempotencyKey: "gate-key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "feature", BaseSHA: "base", ArtifactRoot: "/tmp/run-gate", ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}
+	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCandidateHead(ctx, run.ID, "head"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE runs SET current_state=? WHERE run_id=?`, domain.StatePROpen, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	pr := domain.PullRequest{Number: 1, DatabaseID: 101, URL: "https://example.invalid/pr/1", NodeID: "PR", HeadBranch: "feature", BaseBranch: "main", HeadSHA: "head", BaseSHA: "base", BodyDigest: "body", OwnershipKey: "gate-key", State: "open"}
+	if err := store.SavePullRequest(ctx, run.ID, pr); err != nil {
+		t.Fatal(err)
+	}
+	owner := "lease-owner"
+	if acquired, err := store.AcquireLease(ctx, run.ID, owner, time.Now().Add(time.Minute)); err != nil || !acquired {
+		t.Fatalf("lease acquired=%v err=%v", acquired, err)
+	}
+	repo := domain.RepositoryIdentity{ID: 99, NodeID: "REPO", Owner: "owner", Name: "repo"}
+	evidence := domain.GitHubReadEvidence{Repository: repo, PullRequest: pr, Checks: []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: "head", State: domain.CheckSuccess}}, CodeRabbit: domain.CodeRabbitPass, ObservedAt: time.Now().UTC()}
+	metadata := application.GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: repo, TokenExpiresAt: time.Now().Add(time.Hour), PermissionsDigest: "permissions", ObservedAt: time.Now().UTC()}
+	if err := store.SaveGitHubReadSuccess(ctx, run.ID, owner, domain.StatePROpen, run.IdempotencyKey, []application.GitHubRequestObservation{{RunID: run.ID, Operation: "read", Category: "REST", HTTPStatus: 200, ResponseDigest: "response", InstallationID: 2, Repository: repo, ObservedAt: time.Now().UTC()}}, pr, metadata, evidence, domain.StateReconcilingReviews, "GitHub evidence collection started"); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := store.Inspect(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Run.State != domain.StateReconcilingReviews || inspection.GitHubEvidence == nil || len(inspection.GitHubRequests) != 1 || len(inspection.Timeline) != 2 || inspection.Timeline[1].BoundHead != "head" {
+		t.Fatalf("incomplete atomic reconciliation: %+v", inspection)
+	}
+	if err := store.SaveGitHubReadSuccess(ctx, run.ID, owner, domain.StateReconcilingReviews, run.IdempotencyKey, nil, pr, metadata, evidence, domain.StateCleaning, "invalid transition"); err == nil {
+		t.Fatal("invalid gate transition was accepted")
+	}
+	var evidenceCount int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM github_read_evidence WHERE run_id=?`, run.ID).Scan(&evidenceCount); err != nil || evidenceCount != 1 {
+		t.Fatalf("rollback evidence count=%d err=%v", evidenceCount, err)
+	}
+}
+
 func TestMigrationAndRunIdempotency(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {

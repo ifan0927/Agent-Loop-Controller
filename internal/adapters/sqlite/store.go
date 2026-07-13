@@ -520,7 +520,7 @@ func (s *Store) SaveGitHubRequests(ctx context.Context, observations []applicati
 	return tx.Commit()
 }
 
-func (s *Store) SaveGitHubReadSuccess(ctx context.Context, runID, leaseOwner string, expectedState domain.State, idempotencyKey string, observations []application.GitHubRequestObservation, pr domain.PullRequest, m application.GitHubInstallationMetadata, e domain.GitHubReadEvidence) error {
+func (s *Store) SaveGitHubReadSuccess(ctx context.Context, runID, leaseOwner string, expectedState domain.State, idempotencyKey string, observations []application.GitHubRequestObservation, pr domain.PullRequest, m application.GitHubInstallationMetadata, e domain.GitHubReadEvidence, nextState domain.State, transitionReason string) error {
 	raw, err := json.Marshal(e)
 	if err != nil {
 		return err
@@ -559,6 +559,25 @@ func (s *Store) SaveGitHubReadSuccess(ctx context.Context, runID, leaseOwner str
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO github_read_evidence(run_id,head_sha,repository_id,evidence_json,evidence_digest,observed_at) VALUES(?,?,?,?,?,?) ON CONFLICT(run_id,head_sha,evidence_digest) DO NOTHING`, runID, e.PullRequest.HeadSHA, e.Repository.ID, string(raw), hex.EncodeToString(sum[:]), formatTime(e.ObservedAt)); err != nil {
 		return err
+	}
+	if nextState != expectedState {
+		if err := domain.ValidateTransition(expectedState, nextState); err != nil {
+			return err
+		}
+		var sequence int64
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM transitions WHERE run_id=?`, runID).Scan(&sequence); err != nil {
+			return err
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE runs SET current_state=?,updated_at=? WHERE run_id=? AND current_state=? AND idempotency_key=? AND lease_owner=? AND lease_expires_unix>?`, nextState, nowText(), runID, expectedState, idempotencyKey, leaseOwner, time.Now().UTC().UnixNano())
+		if err != nil {
+			return err
+		}
+		if count, _ := result.RowsAffected(); count != 1 {
+			return errors.New("atomic GitHub reconciliation state update mismatch")
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO transitions(run_id,sequence,from_state,to_state,reason,evidence_reference,bound_head,created_at) VALUES(?,?,?,?,?,?,?,?)`, runID, sequence, expectedState, nextState, transitionReason, "github_read_evidence:"+hex.EncodeToString(sum[:]), e.PullRequest.HeadSHA, nowText()); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

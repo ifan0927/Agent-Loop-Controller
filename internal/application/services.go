@@ -732,7 +732,9 @@ type ReconcileCommand struct {
 }
 
 type ReconcileResult struct {
-	Head string `json:"reconciled_head"`
+	Head   string                      `json:"reconciled_head"`
+	Status domain.ReconciliationStatus `json:"reconciliation_status"`
+	State  domain.State                `json:"current_state"`
 }
 
 type GitHubReconcileCommand struct {
@@ -905,16 +907,40 @@ func (s CommandService) reconcileLocked(ctx context.Context, command ReconcileCo
 	} else if inspection.RepositoryBinding == nil || command.Metadata.AppID != inspection.RepositoryBinding.GitHubAppID || command.Metadata.InstallationID != inspection.RepositoryBinding.GitHubInstallationID || command.Metadata.Repository != command.Evidence.Repository {
 		return ReconcileResult{}, serviceError(ErrorConflict, "GitHub installation authority mismatch", nil)
 	}
+	status := command.Evidence.DeliveryStatus()
+	next, reason := nextGitHubReconciliationState(run.State, command.Evidence, status)
 	persister, ok := s.store.(interface {
-		SaveGitHubReadSuccess(context.Context, string, string, domain.State, string, []GitHubRequestObservation, domain.PullRequest, GitHubInstallationMetadata, domain.GitHubReadEvidence) error
+		SaveGitHubReadSuccess(context.Context, string, string, domain.State, string, []GitHubRequestObservation, domain.PullRequest, GitHubInstallationMetadata, domain.GitHubReadEvidence, domain.State, string) error
 	})
 	if !ok {
 		return ReconcileResult{}, serviceError(ErrorInternal, "reconciliation persistence is unavailable", nil)
 	}
-	if err := persister.SaveGitHubReadSuccess(ctx, run.ID, owner, command.ExpectedState, command.IdempotencyKey, command.Observations, command.Evidence.PullRequest, command.Metadata, command.Evidence); err != nil {
+	if err := persister.SaveGitHubReadSuccess(ctx, run.ID, owner, command.ExpectedState, command.IdempotencyKey, command.Observations, command.Evidence.PullRequest, command.Metadata, command.Evidence, next, reason); err != nil {
 		return ReconcileResult{}, classifyServiceError(err)
 	}
-	return ReconcileResult{Head: run.CandidateHead}, nil
+	return ReconcileResult{Head: run.CandidateHead, Status: status, State: next}, nil
+}
+
+func nextGitHubReconciliationState(current domain.State, evidence domain.GitHubReadEvidence, status domain.ReconciliationStatus) (domain.State, string) {
+	if current != domain.StatePROpen && current != domain.StateReconcilingReviews && current != domain.StateAwaitingHumanApproval {
+		return current, "GitHub evidence recorded outside the production delivery gate"
+	}
+	if !strings.EqualFold(evidence.PullRequest.State, "open") || evidence.PullRequest.Merged {
+		return domain.StateManualIntervention, "GitHub pull request closed or merged outside the controller gate"
+	}
+	if current == domain.StatePROpen {
+		return domain.StateReconcilingReviews, "GitHub evidence collection started"
+	}
+	switch status {
+	case domain.ReconciliationPass:
+		return domain.StateAwaitingHumanApproval, "required checks and trusted CodeRabbit evidence passed"
+	case domain.ReconciliationActionable:
+		return domain.StateRepairing, "GitHub evidence has actionable review or check findings"
+	case domain.ReconciliationPending, domain.ReconciliationInfrastructure:
+		return domain.StateReconcilingReviews, "GitHub evidence is pending or incomplete"
+	default:
+		return domain.StateReconcilingReviews, "GitHub evidence has an unknown reconciliation status"
+	}
 }
 
 func validateReconcileInspection(command ReconcileCommand, inspection RunInspection) error {

@@ -131,7 +131,7 @@ func TestGitHubReadCLIEndToEndPersistsAndRestarts(t *testing.T) {
 	if err := json.Unmarshal(output, &rendered); err != nil {
 		t.Fatal(err)
 	}
-	if len(rendered) != 1 || rendered["reconciled_head"] != "head" {
+	if len(rendered) != 3 || rendered["reconciled_head"] != "head" || rendered["reconciliation_status"] != "pending" || rendered["current_state"] != "received" {
 		t.Fatalf("GitHub CLI leaked non-contract fields: %s", output)
 	}
 	baseline := requests.Load()
