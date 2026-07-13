@@ -141,7 +141,8 @@ func TestHumanApprovalAndMergeBindExactSHA(t *testing.T) {
 	run := Run{State: domain.StateAwaitingHumanApproval, CandidateHead: "h1", WorkingBranch: "ifan/one", BaseBranch: "main", BaseSHA: "b1", IdempotencyKey: "key"}
 	pr := domain.PullRequest{Number: 4, NodeID: "node-4", HeadBranch: "ifan/one", BaseBranch: "main", BaseSHA: "b1", HeadSHA: "h1", BodyDigest: "digest", OwnershipKey: "key"}
 	snap := domain.ReviewSnapshot{HeadSHA: "h1", RequiredChecks: []string{"test"}, CodeRabbitStatus: "pass", Checks: []domain.Check{{Name: "test", Required: true, Status: "completed", Conclusion: "success", ObservedSHA: "h1"}}}
-	approval := domain.HumanApproval{PRNumber: 4, Approver: "ifan0927", Source: "github_review", ApprovedSHA: "h1", CIStatus: "pass", CodeRabbit: "pass", ReviewSHA: "h1"}
+	now := time.Now().UTC()
+	approval := domain.HumanApproval{PRNumber: 4, Approver: "ifan0927", Actor: domain.ActorIdentity{DatabaseID: 33, NodeID: "USER_33", Login: "ifan0927", Type: "User"}, ReviewDatabaseID: 55, ReviewNodeID: "PRR_55", Source: "github_pull_request_review", ApprovedSHA: "h1", CIStatus: "pass", CodeRabbit: "pass", ReviewSHA: "h1", ApprovedAt: now, ObservedAt: now}
 	if err := AuthorizeMerge(run, pr, snap, approval, "h1", "h1"); err != nil {
 		t.Fatal(err)
 	}

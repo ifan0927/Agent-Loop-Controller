@@ -20,7 +20,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 8
+const schemaVersion = 9
 
 type Store struct{ db *sql.DB }
 
@@ -105,6 +105,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV7
 		case 8:
 			statements = migrationV8
+		case 9:
+			statements = migrationV9
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -217,6 +219,17 @@ var migrationV8 = []string{
 	`ALTER TABLE runs ADD COLUMN profile_snapshot_version INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE runs ADD COLUMN profile_digest TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE runs ADD COLUMN profile_snapshot_json TEXT NOT NULL DEFAULT ''`,
+}
+
+var migrationV9 = []string{
+	`ALTER TABLE human_approvals ADD COLUMN actor_database_id INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE human_approvals ADD COLUMN actor_node_id TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE human_approvals ADD COLUMN actor_login TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE human_approvals ADD COLUMN actor_type TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE human_approvals ADD COLUMN review_database_id INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE human_approvals ADD COLUMN review_node_id TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE human_approvals ADD COLUMN observed_at TEXT NOT NULL DEFAULT ''`,
+	`CREATE TABLE human_approval_observations (observation_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), pr_number INTEGER NOT NULL, candidate_head TEXT NOT NULL, status TEXT NOT NULL, review_database_id INTEGER NOT NULL DEFAULT 0, review_node_id TEXT NOT NULL DEFAULT '', actor_database_id INTEGER NOT NULL DEFAULT 0, actor_node_id TEXT NOT NULL DEFAULT '', actor_login TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', review_head_sha TEXT NOT NULL DEFAULT '', source_at TEXT NOT NULL DEFAULT '', observed_at TEXT NOT NULL, evidence_digest TEXT NOT NULL)`,
 }
 
 func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput) (application.Run, bool, error) {
@@ -520,7 +533,7 @@ func (s *Store) SaveGitHubRequests(ctx context.Context, observations []applicati
 	return tx.Commit()
 }
 
-func (s *Store) SaveGitHubReadSuccess(ctx context.Context, runID, leaseOwner string, expectedState domain.State, idempotencyKey string, observations []application.GitHubRequestObservation, pr domain.PullRequest, m application.GitHubInstallationMetadata, e domain.GitHubReadEvidence, nextState domain.State, transitionReason string) error {
+func (s *Store) SaveGitHubReadSuccess(ctx context.Context, runID, leaseOwner string, expectedState domain.State, idempotencyKey string, observations []application.GitHubRequestObservation, pr domain.PullRequest, m application.GitHubInstallationMetadata, e domain.GitHubReadEvidence, approvalObservation *domain.HumanApprovalObservation, approval *domain.HumanApproval, nextState domain.State, transitionReason string) error {
 	if len(e.Findings) > application.MaxNormalizedFindings {
 		return errors.New("GitHub finding count exceeds controller bounds")
 	}
@@ -567,6 +580,19 @@ func (s *Store) SaveGitHubReadSuccess(ctx context.Context, runID, leaseOwner str
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO github_read_evidence(run_id,head_sha,repository_id,evidence_json,evidence_digest,observed_at) VALUES(?,?,?,?,?,?) ON CONFLICT(run_id,head_sha,evidence_digest) DO NOTHING`, runID, e.PullRequest.HeadSHA, e.Repository.ID, string(raw), hex.EncodeToString(sum[:]), formatTime(e.ObservedAt)); err != nil {
 		return err
+	}
+	if approvalObservation != nil {
+		if approvalObservation.PRNumber != pr.Number || approvalObservation.CandidateHead != pr.HeadSHA || approvalObservation.ObservedAt.IsZero() {
+			return errors.New("human approval observation is not bound to the observed pull request")
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO human_approval_observations(run_id,pr_number,candidate_head,status,review_database_id,review_node_id,actor_database_id,actor_node_id,actor_login,actor_type,review_head_sha,source_at,observed_at,evidence_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, runID, approvalObservation.PRNumber, approvalObservation.CandidateHead, approvalObservation.Status, approvalObservation.ReviewDatabaseID, approvalObservation.ReviewNodeID, approvalObservation.Actor.DatabaseID, approvalObservation.Actor.NodeID, approvalObservation.Actor.Login, approvalObservation.Actor.Type, approvalObservation.ReviewHeadSHA, formatTime(approvalObservation.SourceAt), formatTime(approvalObservation.ObservedAt), hex.EncodeToString(sum[:])); err != nil {
+			return err
+		}
+	}
+	if approval != nil {
+		if err := saveHumanApprovalTx(ctx, tx, runID, *approval); err != nil {
+			return err
+		}
 	}
 	for _, finding := range e.Findings {
 		if finding.Body == "" {
@@ -782,16 +808,29 @@ func (s *Store) SaveFinding(ctx context.Context, record application.FindingRecor
 }
 
 func (s *Store) SaveHumanApproval(ctx context.Context, runID string, approval domain.HumanApproval) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO human_approvals(run_id,pr_number,approver,source,approved_sha,ci_status,coderabbit_status,internal_review_sha,approved_at) VALUES(?,?,?,?,?,?,?,?,?)`, runID, approval.PRNumber, approval.Approver, approval.Source, approval.ApprovedSHA, approval.CIStatus, approval.CodeRabbit, approval.ReviewSHA, formatTime(approval.ApprovedAt))
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := saveHumanApprovalTx(ctx, tx, runID, approval); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func saveHumanApprovalTx(ctx context.Context, tx *sql.Tx, runID string, approval domain.HumanApproval) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO human_approvals(run_id,pr_number,approver,source,approved_sha,ci_status,coderabbit_status,internal_review_sha,approved_at,actor_database_id,actor_node_id,actor_login,actor_type,review_database_id,review_node_id,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, runID, approval.PRNumber, approval.Approver, approval.Source, approval.ApprovedSHA, approval.CIStatus, approval.CodeRabbit, approval.ReviewSHA, formatTime(approval.ApprovedAt), approval.Actor.DatabaseID, approval.Actor.NodeID, approval.Actor.Login, approval.Actor.Type, approval.ReviewDatabaseID, approval.ReviewNodeID, formatTime(approval.ObservedAt))
 	if err == nil {
 		return nil
 	}
 	var existing domain.HumanApproval
-	var approvedAt string
-	if scanErr := s.db.QueryRowContext(ctx, `SELECT pr_number,approver,source,approved_sha,ci_status,coderabbit_status,internal_review_sha,approved_at FROM human_approvals WHERE run_id=? AND approved_sha=?`, runID, approval.ApprovedSHA).Scan(&existing.PRNumber, &existing.Approver, &existing.Source, &existing.ApprovedSHA, &existing.CIStatus, &existing.CodeRabbit, &existing.ReviewSHA, &approvedAt); scanErr != nil {
+	var approvedAt, observedAt string
+	if scanErr := tx.QueryRowContext(ctx, `SELECT pr_number,approver,source,approved_sha,ci_status,coderabbit_status,internal_review_sha,approved_at,actor_database_id,actor_node_id,actor_login,actor_type,review_database_id,review_node_id,observed_at FROM human_approvals WHERE run_id=? AND approved_sha=?`, runID, approval.ApprovedSHA).Scan(&existing.PRNumber, &existing.Approver, &existing.Source, &existing.ApprovedSHA, &existing.CIStatus, &existing.CodeRabbit, &existing.ReviewSHA, &approvedAt, &existing.Actor.DatabaseID, &existing.Actor.NodeID, &existing.Actor.Login, &existing.Actor.Type, &existing.ReviewDatabaseID, &existing.ReviewNodeID, &observedAt); scanErr != nil {
 		return err
 	}
 	existing.ApprovedAt = parseTime(approvedAt)
+	existing.ObservedAt = parseTime(observedAt)
 	if existing != approval {
 		return errors.New("conflicting immutable human approval evidence")
 	}
@@ -1017,10 +1056,18 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 	}
 	rows.Close()
 	var approval domain.HumanApproval
-	var approvedAt string
-	if err := s.db.QueryRowContext(ctx, `SELECT pr_number,approver,source,approved_sha,ci_status,coderabbit_status,internal_review_sha,approved_at FROM human_approvals WHERE run_id=? AND approved_sha=? ORDER BY approval_id DESC LIMIT 1`, id, run.CandidateHead).Scan(&approval.PRNumber, &approval.Approver, &approval.Source, &approval.ApprovedSHA, &approval.CIStatus, &approval.CodeRabbit, &approval.ReviewSHA, &approvedAt); err == nil {
-		approval.ApprovedAt = parseTime(approvedAt)
+	var approvedAt, approvalObservedAt string
+	if err := s.db.QueryRowContext(ctx, `SELECT pr_number,approver,source,approved_sha,ci_status,coderabbit_status,internal_review_sha,approved_at,actor_database_id,actor_node_id,actor_login,actor_type,review_database_id,review_node_id,observed_at FROM human_approvals WHERE run_id=? AND approved_sha=? ORDER BY approval_id DESC LIMIT 1`, id, run.CandidateHead).Scan(&approval.PRNumber, &approval.Approver, &approval.Source, &approval.ApprovedSHA, &approval.CIStatus, &approval.CodeRabbit, &approval.ReviewSHA, &approvedAt, &approval.Actor.DatabaseID, &approval.Actor.NodeID, &approval.Actor.Login, &approval.Actor.Type, &approval.ReviewDatabaseID, &approval.ReviewNodeID, &approvalObservedAt); err == nil {
+		approval.ApprovedAt, approval.ObservedAt = parseTime(approvedAt), parseTime(approvalObservedAt)
 		inspection.Approval = &approval
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return inspection, err
+	}
+	var approvalObservation domain.HumanApprovalObservation
+	var sourceAt, observedAt string
+	if err := s.db.QueryRowContext(ctx, `SELECT pr_number,candidate_head,status,review_database_id,review_node_id,actor_database_id,actor_node_id,actor_login,actor_type,review_head_sha,source_at,observed_at FROM human_approval_observations WHERE run_id=? AND candidate_head=? ORDER BY observation_id DESC LIMIT 1`, id, run.CandidateHead).Scan(&approvalObservation.PRNumber, &approvalObservation.CandidateHead, &approvalObservation.Status, &approvalObservation.ReviewDatabaseID, &approvalObservation.ReviewNodeID, &approvalObservation.Actor.DatabaseID, &approvalObservation.Actor.NodeID, &approvalObservation.Actor.Login, &approvalObservation.Actor.Type, &approvalObservation.ReviewHeadSHA, &sourceAt, &observedAt); err == nil {
+		approvalObservation.SourceAt, approvalObservation.ObservedAt = parseTime(sourceAt), parseTime(observedAt)
+		inspection.ApprovalObservation = &approvalObservation
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return inspection, err
 	}

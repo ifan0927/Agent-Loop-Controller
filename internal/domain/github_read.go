@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"fmt"
 	"strings"
 	"time"
 )
@@ -88,6 +89,134 @@ type GitHubReview struct {
 	Actor      ActorIdentity `json:"actor"`
 	CommitSHA  string        `json:"commit_sha"`
 	SourceAt   time.Time     `json:"source_timestamp"`
+}
+
+type HumanApprovalStatus string
+
+const (
+	HumanApprovalPending          HumanApprovalStatus = "pending"
+	HumanApprovalApproved         HumanApprovalStatus = "approved"
+	HumanApprovalDismissed        HumanApprovalStatus = "dismissed"
+	HumanApprovalChangesRequested HumanApprovalStatus = "changes_requested"
+	HumanApprovalStaleHead        HumanApprovalStatus = "stale_head"
+	HumanApprovalUntrustedActor   HumanApprovalStatus = "untrusted_actor"
+	HumanApprovalAmbiguous        HumanApprovalStatus = "ambiguous"
+)
+
+// HumanApprovalObservation is a sanitized, immutable-identity interpretation
+// of the current GitHub review topology for one candidate head.
+type HumanApprovalObservation struct {
+	PRNumber         int64               `json:"pr_number"`
+	CandidateHead    string              `json:"candidate_head"`
+	Status           HumanApprovalStatus `json:"status"`
+	ReviewDatabaseID int64               `json:"review_database_id,omitempty"`
+	ReviewNodeID     string              `json:"review_node_id,omitempty"`
+	Actor            ActorIdentity       `json:"actor,omitempty"`
+	ReviewHeadSHA    string              `json:"review_head_sha,omitempty"`
+	SourceAt         time.Time           `json:"source_timestamp,omitempty"`
+	ObservedAt       time.Time           `json:"observation_timestamp"`
+}
+
+// NormalizeHumanApproval accepts only a configured immutable User identity.
+// A matching login with different immutable identity is deliberately rejected,
+// so bots, Apps, and lookalikes cannot become an approval by name alone.
+func NormalizeHumanApproval(pr PullRequest, reviews []GitHubReview, trusted []ActorIdentity, observedAt time.Time) (HumanApprovalObservation, *HumanApproval, error) {
+	if pr.Number < 1 || strings.TrimSpace(pr.HeadSHA) == "" || observedAt.IsZero() {
+		return HumanApprovalObservation{}, nil, fmt.Errorf("pull request and observation timestamp are required")
+	}
+	trustedByLogin := make(map[string]ActorIdentity, len(trusted))
+	for _, actor := range trusted {
+		if actor.DatabaseID < 1 || strings.TrimSpace(actor.NodeID) == "" || strings.TrimSpace(actor.Login) == "" || actor.Type != "User" {
+			return HumanApprovalObservation{}, nil, fmt.Errorf("trusted human actor identity is incomplete")
+		}
+		login := strings.ToLower(actor.Login)
+		if _, exists := trustedByLogin[login]; exists {
+			return HumanApprovalObservation{}, nil, fmt.Errorf("trusted human actor identity is ambiguous")
+		}
+		trustedByLogin[login] = actor
+	}
+	if len(trustedByLogin) == 0 {
+		return HumanApprovalObservation{}, nil, fmt.Errorf("trusted human actor identity is required")
+	}
+	base := HumanApprovalObservation{PRNumber: pr.Number, CandidateHead: pr.HeadSHA, Status: HumanApprovalPending, ObservedAt: observedAt.UTC()}
+	var untrusted *GitHubReview
+	var ambiguous *GitHubReview
+	latest := make(map[string]*GitHubReview, len(trustedByLogin))
+	for index := range reviews {
+		review := &reviews[index]
+		configured, loginKnown := trustedByLogin[strings.ToLower(review.Actor.Login)]
+		if !loginKnown {
+			continue
+		}
+		if review.Actor.Type != "User" || review.Actor.DatabaseID != configured.DatabaseID || review.Actor.NodeID != configured.NodeID || !strings.EqualFold(review.Actor.Login, configured.Login) {
+			untrusted = review
+			continue
+		}
+		if review.DatabaseID < 1 || strings.TrimSpace(review.NodeID) == "" || review.SourceAt.IsZero() {
+			ambiguous = review
+			continue
+		}
+		key := review.Actor.NodeID
+		if previous, found := latest[key]; found {
+			if review.SourceAt.Equal(previous.SourceAt) {
+				ambiguous = review
+				continue
+			}
+			if review.SourceAt.Before(previous.SourceAt) {
+				continue
+			}
+		}
+		latest[key] = review
+	}
+	var approval *GitHubReview
+	var stale *GitHubReview
+	var dismissal *GitHubReview
+	var changes *GitHubReview
+	for _, review := range latest {
+		switch review.State {
+		case "APPROVED":
+			if review.CommitSHA == pr.HeadSHA {
+				if approval != nil {
+					ambiguous = review
+					continue
+				}
+				approval = review
+			} else {
+				stale = review
+			}
+		case "DISMISSED":
+			dismissal = review
+		case "CHANGES_REQUESTED":
+			changes = review
+		default:
+			ambiguous = review
+		}
+	}
+	selected := func(status HumanApprovalStatus, review *GitHubReview) HumanApprovalObservation {
+		result := base
+		result.Status = status
+		if review != nil {
+			result.ReviewDatabaseID, result.ReviewNodeID, result.Actor, result.ReviewHeadSHA, result.SourceAt = review.DatabaseID, review.NodeID, review.Actor, review.CommitSHA, review.SourceAt.UTC()
+		}
+		return result
+	}
+	switch {
+	case changes != nil:
+		return selected(HumanApprovalChangesRequested, changes), nil, nil
+	case dismissal != nil:
+		return selected(HumanApprovalDismissed, dismissal), nil, nil
+	case ambiguous != nil:
+		return selected(HumanApprovalAmbiguous, ambiguous), nil, nil
+	case untrusted != nil:
+		return selected(HumanApprovalUntrustedActor, untrusted), nil, nil
+	case approval != nil:
+		observation := selected(HumanApprovalApproved, approval)
+		return observation, &HumanApproval{PRNumber: pr.Number, Approver: approval.Actor.Login, Actor: approval.Actor, ReviewDatabaseID: approval.DatabaseID, ReviewNodeID: approval.NodeID, Source: "github_pull_request_review", ApprovedSHA: pr.HeadSHA, CIStatus: "pass", CodeRabbit: "pass", ReviewSHA: pr.HeadSHA, ApprovedAt: approval.SourceAt.UTC(), ObservedAt: observedAt.UTC()}, nil
+	case stale != nil:
+		return selected(HumanApprovalStaleHead, stale), nil, nil
+	default:
+		return base, nil, nil
+	}
 }
 
 type GitHubReadEvidence struct {

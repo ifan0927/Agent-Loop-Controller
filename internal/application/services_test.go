@@ -13,14 +13,17 @@ import (
 
 type serviceStore struct {
 	RunStore
-	run          Run
-	getErr       error
-	inspection   RunInspection
-	runs         []Run
-	listCall     *runListCall
-	renewed      *int
-	renewOK      bool
-	failureSaved *[]GitHubRequestObservation
+	run              Run
+	getErr           error
+	inspection       RunInspection
+	runs             []Run
+	listCall         *runListCall
+	renewed          *int
+	renewOK          bool
+	failureSaved     *[]GitHubRequestObservation
+	approvalSaved    **domain.HumanApproval
+	approvalObserved **domain.HumanApprovalObservation
+	nextState        *domain.State
 }
 
 type runListCall struct {
@@ -41,7 +44,16 @@ func (s serviceStore) ListRuns(_ context.Context, _ string, before time.Time, be
 	}
 	return s.runs, nil
 }
-func (s serviceStore) SaveGitHubReadSuccess(context.Context, string, string, domain.State, string, []GitHubRequestObservation, domain.PullRequest, GitHubInstallationMetadata, domain.GitHubReadEvidence, domain.State, string) error {
+func (s serviceStore) SaveGitHubReadSuccess(_ context.Context, _ string, _ string, _ domain.State, _ string, _ []GitHubRequestObservation, _ domain.PullRequest, _ GitHubInstallationMetadata, _ domain.GitHubReadEvidence, observed *domain.HumanApprovalObservation, approval *domain.HumanApproval, next domain.State, _ string) error {
+	if s.approvalSaved != nil {
+		*s.approvalSaved = approval
+	}
+	if s.approvalObserved != nil {
+		*s.approvalObserved = observed
+	}
+	if s.nextState != nil {
+		*s.nextState = next
+	}
 	return nil
 }
 func (s serviceStore) SaveGitHubReadFailure(_ context.Context, _ string, _ string, _ domain.State, _ string, observations []GitHubRequestObservation) error {
@@ -396,5 +408,30 @@ func TestNextGitHubReconciliationStateUsesOnlyLegalFailClosedGates(t *testing.T)
 				}
 			}
 		})
+	}
+}
+
+func TestGitHubReconcileRecordsOnlyTrustedExactHeadHumanApproval(t *testing.T) {
+	now := time.Now().UTC()
+	pr := domain.PullRequest{Number: 1, DatabaseID: 7, URL: "https://example.invalid/1", NodeID: "PR", HeadBranch: "feature", BaseBranch: "main", HeadSHA: "head", BaseSHA: "base", BodyDigest: "body", OwnershipKey: "key", State: "open"}
+	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateAwaitingHumanApproval, IdempotencyKey: "key", WorkingBranch: "feature", BaseBranch: "main", CandidateHead: "head", BaseSHA: "base"})
+	trusted := TrustedActorIdentity{DatabaseID: 33, NodeID: "USER_33", Login: "ifan0927", Type: "User"}
+	binding := &SanitizedRepositoryBinding{CanonicalRepository: "owner/repo", ExpectedRepositoryID: 99, GitHubAppID: 1, GitHubInstallationID: 2, TrustedOperatorActors: []TrustedActorIdentity{trusted}}
+	evidence := domain.GitHubReadEvidence{Repository: domain.RepositoryIdentity{ID: 99, NodeID: "REPO", Owner: "owner", Name: "repo"}, PullRequest: pr, Checks: []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: "head", State: domain.CheckSuccess}}, ReviewDecision: "APPROVED", CodeRabbit: domain.CodeRabbitPass, Reviews: []domain.GitHubReview{{DatabaseID: 9, NodeID: "PRR", State: "APPROVED", CommitSHA: "head", SourceAt: now, Actor: domain.ActorIdentity{DatabaseID: 33, NodeID: "USER_33", Login: "ifan0927", Type: "User"}}}, ObservedAt: now}
+	metadata := GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: evidence.Repository}
+	var approval *domain.HumanApproval
+	var observed *domain.HumanApprovalObservation
+	var next domain.State
+	store := serviceStore{run: run, inspection: RunInspection{Run: run, RepositoryBinding: binding, PullRequest: &pr}, approvalSaved: &approval, approvalObserved: &observed, nextState: &next}
+	result, err := NewCommandService(nil, store).Reconcile(context.Background(), ReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey, Evidence: evidence, Metadata: metadata})
+	if err != nil || result.State != domain.StateMerging || next != domain.StateMerging || approval == nil || observed == nil || observed.Status != domain.HumanApprovalApproved {
+		t.Fatalf("result=%+v next=%s approval=%+v observed=%+v err=%v", result, next, approval, observed, err)
+	}
+
+	evidence.Reviews[0].Actor = domain.ActorIdentity{DatabaseID: 33, NodeID: "BOT_33", Login: "ifan0927", Type: "Bot"}
+	approval, observed, next = nil, nil, ""
+	result, err = NewCommandService(nil, store).Reconcile(context.Background(), ReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey, Evidence: evidence, Metadata: metadata})
+	if err != nil || result.State != domain.StateAwaitingHumanApproval || next != domain.StateAwaitingHumanApproval || approval != nil || observed == nil || observed.Status != domain.HumanApprovalUntrustedActor {
+		t.Fatalf("bot result=%+v next=%s approval=%+v observed=%+v err=%v", result, next, approval, observed, err)
 	}
 }

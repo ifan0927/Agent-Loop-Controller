@@ -198,7 +198,15 @@ func authorizeMergeEvidence(run Run, pr domain.PullRequest, snapshot domain.Revi
 			return errors.New("fixture approval source is invalid")
 		}
 		copy := approval
-		copy.Source = "github_review"
+		copy.Source = "github_pull_request_review"
+		copy.Actor = domain.ActorIdentity{DatabaseID: 1, NodeID: "fixture-ifan", Login: "ifan0927", Type: "User"}
+		copy.ReviewDatabaseID, copy.ReviewNodeID = 1, "fixture-review"
+		if copy.ApprovedAt.IsZero() {
+			copy.ApprovedAt = time.Unix(1, 0).UTC()
+		}
+		if copy.ObservedAt.IsZero() {
+			copy.ObservedAt = copy.ApprovedAt
+		}
 		return copy.Authorizes(pr, run.CandidateHead)
 	}
 	return approval.Authorizes(pr, run.CandidateHead)

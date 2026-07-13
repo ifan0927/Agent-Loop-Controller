@@ -415,6 +415,29 @@ func TestReviewAndThreadConnectionsPaginateIndependently(t *testing.T) {
 	}
 }
 
+func TestReviewReadIncludesImmutableUserIdentity(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Query string `json:"query"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			return
+		}
+		if !strings.Contains(request.Query, "... on User{id databaseId}") {
+			http.Error(w, "user identity fields missing", http.StatusBadRequest)
+			return
+		}
+		fmt.Fprint(w, `{"data":{"repository":{"pullRequest":{"reviewDecision":"APPROVED","reviews":{"nodes":[{"id":"PRR_55","databaseId":55,"state":"APPROVED","commit":{"oid":"head"},"submittedAt":"2026-07-13T01:00:00Z","author":{"login":"ifan0927","__typename":"User","id":"USER_33","databaseId":33}}],"pageInfo":{"hasNextPage":false,"endCursor":""}},"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`)
+	}))
+	defer srv.Close()
+	c := &Client{cfg: Config{GraphQLURL: srv.URL, APIVersion: "2022-11-28"}, http: srv.Client(), clock: fixedClock{time.Now()}, token: "token"}
+	_, reviews, _, _, _, err := c.readReviews(context.Background(), 1, "head", domain.CodeRabbitAbsent)
+	if err != nil || len(reviews) != 1 || reviews[0].Actor.DatabaseID != 33 || reviews[0].Actor.NodeID != "USER_33" || reviews[0].Actor.Type != "User" {
+		t.Fatalf("reviews=%+v err=%v", reviews, err)
+	}
+}
+
 func TestHTTPFailureClassificationAndBounds(t *testing.T) {
 	tests := []struct {
 		name    string

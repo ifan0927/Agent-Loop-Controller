@@ -147,21 +147,25 @@ func (s ReviewSnapshot) Classify() ReconciliationStatus {
 }
 
 type HumanApproval struct {
-	PRNumber    int64     `json:"pr_number"`
-	Approver    string    `json:"approver"`
-	Source      string    `json:"source"`
-	ApprovedSHA string    `json:"approved_sha"`
-	CIStatus    string    `json:"ci_status"`
-	CodeRabbit  string    `json:"coderabbit_status"`
-	ReviewSHA   string    `json:"internal_review_sha"`
-	ApprovedAt  time.Time `json:"approved_at"`
+	PRNumber         int64         `json:"pr_number"`
+	Approver         string        `json:"approver"`
+	Actor            ActorIdentity `json:"actor"`
+	ReviewDatabaseID int64         `json:"review_database_id"`
+	ReviewNodeID     string        `json:"review_node_id"`
+	Source           string        `json:"source"`
+	ApprovedSHA      string        `json:"approved_sha"`
+	CIStatus         string        `json:"ci_status"`
+	CodeRabbit       string        `json:"coderabbit_status"`
+	ReviewSHA        string        `json:"internal_review_sha"`
+	ApprovedAt       time.Time     `json:"source_timestamp"`
+	ObservedAt       time.Time     `json:"observation_timestamp"`
 }
 
 func (a HumanApproval) Authorizes(pr PullRequest, head string) error {
-	if a.Approver != "ifan0927" || a.Source != "github_review" {
-		return errors.New("human approval is not from the trusted I-Fan identity adapter")
+	if a.Source != "github_pull_request_review" || a.Actor.Type != "User" || a.Actor.DatabaseID < 1 || strings.TrimSpace(a.Actor.NodeID) == "" || strings.TrimSpace(a.Actor.Login) == "" || a.ReviewDatabaseID < 1 || strings.TrimSpace(a.ReviewNodeID) == "" {
+		return errors.New("human approval lacks immutable trusted review identity")
 	}
-	if a.PRNumber != pr.Number || a.ApprovedSHA != head || a.ReviewSHA != head {
+	if !strings.EqualFold(a.Approver, a.Actor.Login) || a.PRNumber != pr.Number || a.ApprovedSHA != head || a.ReviewSHA != head || a.ApprovedAt.IsZero() || a.ObservedAt.IsZero() {
 		return errors.New("human approval is not bound to the exact PR head")
 	}
 	if a.CIStatus != "pass" || a.CodeRabbit != "pass" {

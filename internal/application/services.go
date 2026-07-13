@@ -357,22 +357,23 @@ func authorizePersistedRequester(run Run, requester Requester) error {
 }
 
 type InspectionResult struct {
-	SchemaVersion     string                   `json:"schema_version"`
-	Run               RunResult                `json:"run"`
-	RepositoryBinding *RepositoryBindingResult `json:"repository_binding,omitempty"`
-	Timeline          []TransitionResult       `json:"state_timeline"`
-	Attempts          []AttemptResult          `json:"attempts"`
-	Verifications     []VerificationResult     `json:"verifications"`
-	Reviews           []ReviewResult           `json:"reviews"`
-	Resources         []ResourceResult         `json:"owned_resources"`
-	PullRequest       *PullRequestResult       `json:"pull_request,omitempty"`
-	Approval          *domain.HumanApproval    `json:"human_approval,omitempty"`
-	Merge             *MergeRecord             `json:"merge_result,omitempty"`
-	Cleanup           []CleanupResult          `json:"cleanup_progress"`
-	Checks            []CheckResult            `json:"checks"`
-	CodeRabbit        *CodeRabbitResult        `json:"coderabbit,omitempty"`
-	Findings          []FindingResult          `json:"review_findings"`
-	Telemetry         []TelemetryResult        `json:"unknown_telemetry"`
+	SchemaVersion     string                     `json:"schema_version"`
+	Run               RunResult                  `json:"run"`
+	RepositoryBinding *RepositoryBindingResult   `json:"repository_binding,omitempty"`
+	Timeline          []TransitionResult         `json:"state_timeline"`
+	Attempts          []AttemptResult            `json:"attempts"`
+	Verifications     []VerificationResult       `json:"verifications"`
+	Reviews           []ReviewResult             `json:"reviews"`
+	Resources         []ResourceResult           `json:"owned_resources"`
+	PullRequest       *PullRequestResult         `json:"pull_request,omitempty"`
+	Approval          *HumanApprovalResult       `json:"human_approval,omitempty"`
+	ApprovalStatus    *HumanApprovalStatusResult `json:"human_approval_status,omitempty"`
+	Merge             *MergeRecord               `json:"merge_result,omitempty"`
+	Cleanup           []CleanupResult            `json:"cleanup_progress"`
+	Checks            []CheckResult              `json:"checks"`
+	CodeRabbit        *CodeRabbitResult          `json:"coderabbit,omitempty"`
+	Findings          []FindingResult            `json:"review_findings"`
+	Telemetry         []TelemetryResult          `json:"unknown_telemetry"`
 }
 type RunSummaryPage struct {
 	SchemaVersion string       `json:"schema_version"`
@@ -462,6 +463,19 @@ type CodeRabbitResult struct {
 	State      string    `json:"state"`
 	ObservedAt time.Time `json:"observed_at"`
 }
+type HumanApprovalResult struct {
+	Approver    string    `json:"approver"`
+	ApprovedSHA string    `json:"approved_sha"`
+	SourceAt    time.Time `json:"source_timestamp"`
+	ObservedAt  time.Time `json:"observation_timestamp"`
+}
+type HumanApprovalStatusResult struct {
+	Status        string    `json:"status"`
+	CandidateHead string    `json:"candidate_head"`
+	ReviewHeadSHA string    `json:"review_head_sha,omitempty"`
+	SourceAt      time.Time `json:"source_timestamp,omitempty"`
+	ObservedAt    time.Time `json:"observation_timestamp"`
+}
 type FindingResult struct {
 	Source       string    `json:"source"`
 	SourceID     string    `json:"source_id"`
@@ -495,8 +509,14 @@ type PullRequestResult struct {
 }
 
 func projectInspection(value RunInspection) InspectionResult {
-	result := InspectionResult{SchemaVersion: querySchemaVersion, Run: projectRunResult(value.Run), RepositoryBinding: projectRepositoryBinding(value.RepositoryBinding), Approval: value.Approval, Merge: value.Merge,
+	result := InspectionResult{SchemaVersion: querySchemaVersion, Run: projectRunResult(value.Run), RepositoryBinding: projectRepositoryBinding(value.RepositoryBinding), Merge: value.Merge,
 		Timeline: []TransitionResult{}, Attempts: []AttemptResult{}, Verifications: []VerificationResult{}, Reviews: []ReviewResult{}, Resources: []ResourceResult{}, Cleanup: []CleanupResult{}, Checks: []CheckResult{}, Findings: []FindingResult{}, Telemetry: []TelemetryResult{}}
+	if value.Approval != nil {
+		result.Approval = &HumanApprovalResult{Approver: sanitizeUntrustedContent(value.Approval.Approver), ApprovedSHA: value.Approval.ApprovedSHA, SourceAt: value.Approval.ApprovedAt, ObservedAt: value.Approval.ObservedAt}
+	}
+	if value.ApprovalObservation != nil {
+		result.ApprovalStatus = &HumanApprovalStatusResult{Status: string(value.ApprovalObservation.Status), CandidateHead: value.ApprovalObservation.CandidateHead, ReviewHeadSHA: value.ApprovalObservation.ReviewHeadSHA, SourceAt: value.ApprovalObservation.SourceAt, ObservedAt: value.ApprovalObservation.ObservedAt}
+	}
 	if value.PullRequest != nil {
 		v := value.PullRequest
 		result.PullRequest = &PullRequestResult{v.Number, sanitizeExternalURL(v.URL), v.HeadBranch, v.BaseBranch, v.HeadSHA, v.BaseSHA, v.State, v.Merged, v.MergeSHA, v.MergedAt}
@@ -908,6 +928,19 @@ func (s CommandService) reconcileLocked(ctx context.Context, command ReconcileCo
 		return ReconcileResult{}, serviceError(ErrorConflict, "GitHub installation authority mismatch", nil)
 	}
 	status := command.Evidence.DeliveryStatus()
+	var approvalObservation *domain.HumanApprovalObservation
+	var approval *domain.HumanApproval
+	if run.State == domain.StateAwaitingHumanApproval {
+		trusted, err := trustedHumanActors(inspection)
+		if err != nil {
+			return ReconcileResult{}, serviceError(ErrorConflict, "trusted human approval identity is unavailable", err)
+		}
+		observed, normalized, err := domain.NormalizeHumanApproval(command.Evidence.PullRequest, command.Evidence.Reviews, trusted, command.Evidence.ObservedAt)
+		if err != nil {
+			return ReconcileResult{}, serviceError(ErrorConflict, "human approval evidence is ambiguous", err)
+		}
+		approvalObservation, approval = &observed, normalized
+	}
 	if status == domain.ReconciliationActionable {
 		findings, _, err := repairableEvidenceFindings(command.Evidence, run.CandidateHead)
 		if err == nil {
@@ -921,16 +954,33 @@ func (s CommandService) reconcileLocked(ctx context.Context, command ReconcileCo
 			reason = "GitHub evidence has unsupported actionable findings"
 		}
 	}
+	if run.State == domain.StateAwaitingHumanApproval && status == domain.ReconciliationPass && approvalObservation != nil && approvalObservation.Status == domain.HumanApprovalApproved && approval != nil {
+		if err := approval.Authorizes(command.Evidence.PullRequest, run.CandidateHead); err != nil {
+			return ReconcileResult{}, serviceError(ErrorConflict, "human approval is not bound to the exact final head", err)
+		}
+		next, reason = domain.StateMerging, "trusted human approval is bound to the exact final head"
+	}
 	persister, ok := s.store.(interface {
-		SaveGitHubReadSuccess(context.Context, string, string, domain.State, string, []GitHubRequestObservation, domain.PullRequest, GitHubInstallationMetadata, domain.GitHubReadEvidence, domain.State, string) error
+		SaveGitHubReadSuccess(context.Context, string, string, domain.State, string, []GitHubRequestObservation, domain.PullRequest, GitHubInstallationMetadata, domain.GitHubReadEvidence, *domain.HumanApprovalObservation, *domain.HumanApproval, domain.State, string) error
 	})
 	if !ok {
 		return ReconcileResult{}, serviceError(ErrorInternal, "reconciliation persistence is unavailable", nil)
 	}
-	if err := persister.SaveGitHubReadSuccess(ctx, run.ID, owner, command.ExpectedState, command.IdempotencyKey, command.Observations, command.Evidence.PullRequest, command.Metadata, command.Evidence, next, reason); err != nil {
+	if err := persister.SaveGitHubReadSuccess(ctx, run.ID, owner, command.ExpectedState, command.IdempotencyKey, command.Observations, command.Evidence.PullRequest, command.Metadata, command.Evidence, approvalObservation, approval, next, reason); err != nil {
 		return ReconcileResult{}, classifyServiceError(err)
 	}
 	return ReconcileResult{Head: run.CandidateHead, Status: status, State: next}, nil
+}
+
+func trustedHumanActors(inspection RunInspection) ([]domain.ActorIdentity, error) {
+	if inspection.RepositoryBinding == nil || len(inspection.RepositoryBinding.TrustedOperatorActors) == 0 {
+		return nil, errors.New("persisted repository profile has no trusted human actor")
+	}
+	actors := make([]domain.ActorIdentity, 0, len(inspection.RepositoryBinding.TrustedOperatorActors))
+	for _, actor := range inspection.RepositoryBinding.TrustedOperatorActors {
+		actors = append(actors, domain.ActorIdentity{DatabaseID: actor.DatabaseID, NodeID: actor.NodeID, Login: actor.Login, Type: actor.Type})
+	}
+	return actors, nil
 }
 
 func nextGitHubReconciliationState(current domain.State, evidence domain.GitHubReadEvidence, status domain.ReconciliationStatus) (domain.State, string) {

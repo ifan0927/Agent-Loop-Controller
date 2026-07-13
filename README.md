@@ -69,6 +69,12 @@ App JWT and installation-token authentication, and direct REST/GraphQL evidence
 collection without `gh` or user authentication. Real access is opt-in; see
 [the operator handoff](docs/github-app-operator.md).
 
+When a run is awaiting final human approval, reconciliation accepts only an
+exact-HEAD `APPROVED` pull-request review from a configured immutable GitHub
+`User` identity. The controller records source and observation timestamps for
+approval, dismissal, changes-requested, stale-head, and rejected lookalike
+evidence; it never treats a login or App/Bot identity as human approval.
+
 The `controller start` command composes the direct Linear reader with durable
 admission. It accepts one explicit IFAN identifier and complete requester
 identity, re-fetches the authoritative source, enforces coding-ready eligibility,

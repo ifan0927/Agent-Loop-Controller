@@ -1,6 +1,9 @@
 package domain
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestRequiredChecksFailClosed(t *testing.T) {
 	base := GitHubReadEvidence{PullRequest: PullRequest{HeadSHA: "h"}, Checks: []GitHubCheck{{Name: "test", Required: true, ObservedSHA: "h", State: CheckSuccess}}}
@@ -58,5 +61,67 @@ func TestDeliveryStatusRequiresOpenPRTrustedCodeRabbitAndExactFindings(t *testin
 	base.ReviewDecision = "UNRECOGNIZED"
 	if got := base.DeliveryStatus(); got != ReconciliationInfrastructure {
 		t.Fatalf("unknown review decision status=%s", got)
+	}
+}
+
+func TestNormalizeHumanApprovalRequiresConfiguredImmutableUserAtExactHead(t *testing.T) {
+	now := time.Date(2026, 7, 13, 1, 2, 3, 0, time.UTC)
+	pr := PullRequest{Number: 7, HeadSHA: "head"}
+	trusted := []ActorIdentity{{DatabaseID: 33, NodeID: "USER_33", Login: "ifan0927", Type: "User"}}
+	review := GitHubReview{DatabaseID: 44, NodeID: "PRR_44", State: "APPROVED", CommitSHA: "head", SourceAt: now, Actor: trusted[0]}
+	observation, approval, err := NormalizeHumanApproval(pr, []GitHubReview{review}, trusted, now.Add(time.Second))
+	if err != nil || observation.Status != HumanApprovalApproved || approval == nil || approval.Actor.DatabaseID != 33 || approval.ReviewNodeID != "PRR_44" {
+		t.Fatalf("observation=%+v approval=%+v err=%v", observation, approval, err)
+	}
+	if err := approval.Authorizes(pr, "head"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNormalizeHumanApprovalRejectsBotAndLoginLookalike(t *testing.T) {
+	now := time.Now().UTC()
+	pr := PullRequest{Number: 7, HeadSHA: "head"}
+	trusted := []ActorIdentity{{DatabaseID: 33, NodeID: "USER_33", Login: "ifan0927", Type: "User"}}
+	for _, actor := range []ActorIdentity{
+		{DatabaseID: 33, NodeID: "BOT_33", Login: "ifan0927", Type: "Bot"},
+		{DatabaseID: 99, NodeID: "USER_99", Login: "ifan0927", Type: "User"},
+	} {
+		observation, approval, err := NormalizeHumanApproval(pr, []GitHubReview{{DatabaseID: 44, NodeID: "PRR_44", State: "APPROVED", CommitSHA: "head", SourceAt: now, Actor: actor}}, trusted, now)
+		if err != nil || approval != nil || observation.Status != HumanApprovalUntrustedActor {
+			t.Fatalf("actor=%+v observation=%+v approval=%+v err=%v", actor, observation, approval, err)
+		}
+	}
+}
+
+func TestNormalizeHumanApprovalPersistsDismissalChangesAndStaleHead(t *testing.T) {
+	now := time.Now().UTC()
+	pr := PullRequest{Number: 7, HeadSHA: "head"}
+	trusted := []ActorIdentity{{DatabaseID: 33, NodeID: "USER_33", Login: "ifan0927", Type: "User"}}
+	for _, tc := range []struct {
+		state, commit string
+		want          HumanApprovalStatus
+	}{
+		{"DISMISSED", "head", HumanApprovalDismissed},
+		{"CHANGES_REQUESTED", "head", HumanApprovalChangesRequested},
+		{"APPROVED", "old", HumanApprovalStaleHead},
+	} {
+		observation, approval, err := NormalizeHumanApproval(pr, []GitHubReview{{DatabaseID: 44, NodeID: "PRR_44", State: tc.state, CommitSHA: tc.commit, SourceAt: now, Actor: trusted[0]}}, trusted, now)
+		if err != nil || approval != nil || observation.Status != tc.want || observation.SourceAt.IsZero() || observation.ObservedAt.IsZero() {
+			t.Fatalf("case=%+v observation=%+v approval=%+v err=%v", tc, observation, approval, err)
+		}
+	}
+}
+
+func TestNormalizeHumanApprovalUsesLatestTrustedReview(t *testing.T) {
+	now := time.Now().UTC()
+	pr := PullRequest{Number: 7, HeadSHA: "head"}
+	trusted := []ActorIdentity{{DatabaseID: 33, NodeID: "USER_33", Login: "ifan0927", Type: "User"}}
+	reviews := []GitHubReview{
+		{DatabaseID: 44, NodeID: "PRR_44", State: "CHANGES_REQUESTED", CommitSHA: "old", SourceAt: now, Actor: trusted[0]},
+		{DatabaseID: 45, NodeID: "PRR_45", State: "APPROVED", CommitSHA: "head", SourceAt: now.Add(time.Minute), Actor: trusted[0]},
+	}
+	observation, approval, err := NormalizeHumanApproval(pr, reviews, trusted, now.Add(2*time.Minute))
+	if err != nil || observation.Status != HumanApprovalApproved || approval == nil || approval.ReviewDatabaseID != 45 {
+		t.Fatalf("observation=%+v approval=%+v err=%v", observation, approval, err)
 	}
 }
