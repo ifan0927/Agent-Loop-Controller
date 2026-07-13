@@ -2,9 +2,13 @@ package application
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"path"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -199,10 +203,37 @@ func (s CommandService) Continue(ctx context.Context, command ContinueCommand) (
 	return CommandResult{Run: projectRunResult(run)}, nil
 }
 
+const querySchemaVersion = "v1"
+
+const (
+	defaultRunSummaryLimit = 25
+	maximumRunSummaryLimit = 100
+)
+
 type QueryInput struct {
 	Requester  Requester `json:"requester"`
 	RunID      string    `json:"run_id"`
 	Repository string    `json:"repository"`
+}
+
+// RunSummaryQuery is a repository-scoped, bounded read request. Cursor is an
+// opaque value issued by a previous RunSummaryPage.
+type RunSummaryQuery struct {
+	Requester  Requester `json:"requester"`
+	Repository string    `json:"repository"`
+	Limit      int       `json:"limit,omitempty"`
+	Cursor     string    `json:"cursor,omitempty"`
+}
+
+type RunDetailQuery struct {
+	Requester Requester `json:"requester"`
+	RunID     string    `json:"run_id"`
+}
+
+type runSummaryCursor struct {
+	Version   string    `json:"version"`
+	CreatedAt time.Time `json:"created_at"`
+	RunID     string    `json:"run_id"`
 }
 
 type QueryService struct{ store RunStore }
@@ -222,6 +253,82 @@ func (s QueryService) Inspect(ctx context.Context, input QueryInput) (Inspection
 		return InspectionResult{}, classifyServiceError(err)
 	}
 	return projectInspection(inspection), nil
+}
+
+// GetRunDetail reads and authorizes one run entirely through the application
+// boundary so transport adapters do not render persistence aggregates.
+func (s QueryService) GetRunDetail(ctx context.Context, query RunDetailQuery) (InspectionResult, error) {
+	if query.RunID == "" {
+		return InspectionResult{}, serviceError(ErrorInvalidInput, "run is required", nil)
+	}
+	run, err := s.store.GetRun(ctx, query.RunID)
+	if err != nil {
+		return InspectionResult{}, classifyServiceError(err)
+	}
+	return s.Inspect(ctx, QueryInput{Requester: query.Requester, RunID: query.RunID, Repository: run.Repository})
+}
+
+// ListRunSummaries returns a deterministic, repository-scoped page. It reads
+// one extra row only to decide whether a following cursor exists.
+func (s QueryService) ListRunSummaries(ctx context.Context, query RunSummaryQuery) (RunSummaryPage, error) {
+	if query.Repository == "" {
+		return RunSummaryPage{}, serviceError(ErrorInvalidInput, "repository is required", nil)
+	}
+	limit := query.Limit
+	if limit == 0 {
+		limit = defaultRunSummaryLimit
+	}
+	if limit < 1 || limit > maximumRunSummaryLimit {
+		return RunSummaryPage{}, serviceError(ErrorInvalidInput, "limit must be between 1 and 100", nil)
+	}
+	cursor, err := decodeRunSummaryCursor(query.Cursor)
+	if err != nil {
+		return RunSummaryPage{}, err
+	}
+	runs, err := s.store.ListRuns(ctx, query.Repository, cursor.CreatedAt, cursor.RunID, limit+1)
+	if err != nil {
+		return RunSummaryPage{}, classifyServiceError(err)
+	}
+	for _, run := range runs {
+		if run.Repository != query.Repository {
+			return RunSummaryPage{}, serviceError(ErrorInternal, "run list repository mismatch", nil)
+		}
+		if err := authorizePersistedRequester(run, query.Requester); err != nil {
+			return RunSummaryPage{}, err
+		}
+	}
+	page := RunSummaryPage{SchemaVersion: querySchemaVersion, Repository: query.Repository}
+	if len(runs) > limit {
+		page.HasMore = true
+		runs = runs[:limit]
+	}
+	for _, run := range runs {
+		page.Runs = append(page.Runs, projectRunSummary(run))
+	}
+	if page.HasMore && len(runs) > 0 {
+		page.NextCursor = encodeRunSummaryCursor(runSummaryCursor{Version: querySchemaVersion, CreatedAt: runs[len(runs)-1].CreatedAt, RunID: runs[len(runs)-1].ID})
+	}
+	return page, nil
+}
+
+func decodeRunSummaryCursor(value string) (runSummaryCursor, error) {
+	if value == "" {
+		return runSummaryCursor{}, nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return runSummaryCursor{}, serviceError(ErrorInvalidInput, "cursor is invalid", nil)
+	}
+	var cursor runSummaryCursor
+	if err := json.Unmarshal(raw, &cursor); err != nil || cursor.Version != querySchemaVersion || cursor.CreatedAt.IsZero() || cursor.RunID == "" {
+		return runSummaryCursor{}, serviceError(ErrorInvalidInput, "cursor is invalid", nil)
+	}
+	return cursor, nil
+}
+
+func encodeRunSummaryCursor(cursor runSummaryCursor) string {
+	raw, _ := json.Marshal(cursor)
+	return base64.RawURLEncoding.EncodeToString(raw)
 }
 
 func (s QueryService) authorize(ctx context.Context, input QueryInput) (Run, error) {
@@ -250,17 +357,53 @@ func authorizePersistedRequester(run Run, requester Requester) error {
 }
 
 type InspectionResult struct {
-	Run               RunResult                   `json:"run"`
-	RepositoryBinding *SanitizedRepositoryBinding `json:"repository_binding,omitempty"`
-	Timeline          []TransitionResult          `json:"state_timeline"`
-	Attempts          []AttemptResult             `json:"attempts"`
-	Verifications     []VerificationResult        `json:"verifications"`
-	Reviews           []ReviewResult              `json:"reviews"`
-	Resources         []ResourceResult            `json:"owned_resources"`
-	PullRequest       *PullRequestResult          `json:"pull_request,omitempty"`
-	Approval          *domain.HumanApproval       `json:"human_approval,omitempty"`
-	Merge             *MergeRecord                `json:"merge_result,omitempty"`
-	Cleanup           []CleanupResult             `json:"cleanup_progress"`
+	SchemaVersion     string                   `json:"schema_version"`
+	Run               RunResult                `json:"run"`
+	RepositoryBinding *RepositoryBindingResult `json:"repository_binding,omitempty"`
+	Timeline          []TransitionResult       `json:"state_timeline"`
+	Attempts          []AttemptResult          `json:"attempts"`
+	Verifications     []VerificationResult     `json:"verifications"`
+	Reviews           []ReviewResult           `json:"reviews"`
+	Resources         []ResourceResult         `json:"owned_resources"`
+	PullRequest       *PullRequestResult       `json:"pull_request,omitempty"`
+	Approval          *domain.HumanApproval    `json:"human_approval,omitempty"`
+	Merge             *MergeRecord             `json:"merge_result,omitempty"`
+	Cleanup           []CleanupResult          `json:"cleanup_progress"`
+	Checks            []CheckResult            `json:"checks"`
+	CodeRabbit        *CodeRabbitResult        `json:"coderabbit,omitempty"`
+	Findings          []FindingResult          `json:"review_findings"`
+	Telemetry         []TelemetryResult        `json:"unknown_telemetry"`
+}
+type RunSummaryPage struct {
+	SchemaVersion string       `json:"schema_version"`
+	Repository    string       `json:"repository"`
+	Runs          []RunSummary `json:"runs"`
+	NextCursor    string       `json:"next_cursor,omitempty"`
+	HasMore       bool         `json:"has_more"`
+}
+type RunSummary struct {
+	RunID                  string       `json:"run_id"`
+	IssueID                string       `json:"issue_id"`
+	Repository             string       `json:"repository"`
+	ProfileID              string       `json:"profile_id"`
+	ProfileSnapshotVersion int          `json:"profile_snapshot_version"`
+	ProfileDigest          string       `json:"profile_digest"`
+	State                  domain.State `json:"current_state"`
+	CandidateHead          string       `json:"candidate_head"`
+	CreatedAt              time.Time    `json:"created_at"`
+	UpdatedAt              time.Time    `json:"updated_at"`
+}
+type RepositoryBindingResult struct {
+	ProfileID              string   `json:"profile_id"`
+	ProfileSnapshotVersion int      `json:"profile_snapshot_version"`
+	ProfileDigest          string   `json:"profile_digest"`
+	CanonicalRepository    string   `json:"canonical_repository"`
+	BaseBranch             string   `json:"base_branch"`
+	VerifierRegistryRef    string   `json:"verifier_registry_ref"`
+	VerifierIDs            []string `json:"verifier_ids"`
+	GitHubAppID            int64    `json:"github_app_id"`
+	GitHubInstallationID   int64    `json:"github_installation_id"`
+	ExpectedRepositoryID   int64    `json:"expected_repository_id"`
 }
 type TransitionResult struct {
 	Sequence  int64        `json:"sequence"`
@@ -271,15 +414,17 @@ type TransitionResult struct {
 	CreatedAt time.Time    `json:"timestamp"`
 }
 type AttemptResult struct {
-	Number         int       `json:"number"`
-	Kind           string    `json:"kind"`
-	Status         string    `json:"status"`
-	RequestedModel string    `json:"requested_model"`
-	ErrorCategory  string    `json:"error_category"`
-	StartedAt      time.Time `json:"started_at"`
-	FinishedAt     time.Time `json:"finished_at,omitempty"`
-	ExitCode       int       `json:"exit_code"`
-	OutcomeHash    string    `json:"outcome_hash"`
+	Number           int       `json:"number"`
+	Kind             string    `json:"kind"`
+	Status           string    `json:"status"`
+	RequestedModel   string    `json:"requested_model"`
+	ErrorCategory    string    `json:"error_category"`
+	StartedAt        time.Time `json:"started_at"`
+	FinishedAt       time.Time `json:"finished_at,omitempty"`
+	ExitCode         int       `json:"exit_code"`
+	OutcomeHash      string    `json:"outcome_hash"`
+	SessionRecorded  bool      `json:"session_recorded"`
+	ArtifactRecorded bool      `json:"artifact_recorded"`
 }
 type VerificationResult struct {
 	VerifierID   string    `json:"verifier_id"`
@@ -305,6 +450,37 @@ type CleanupResult struct {
 	Status    string    `json:"status"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
+type CheckResult struct {
+	Name        string    `json:"name"`
+	Required    bool      `json:"required"`
+	Source      string    `json:"source"`
+	State       string    `json:"state"`
+	ObservedSHA string    `json:"observed_sha"`
+	ObservedAt  time.Time `json:"observed_at"`
+}
+type CodeRabbitResult struct {
+	State      string    `json:"state"`
+	ObservedAt time.Time `json:"observed_at"`
+}
+type FindingResult struct {
+	Source       string    `json:"source"`
+	SourceID     string    `json:"source_id"`
+	File         string    `json:"file,omitempty"`
+	Line         int       `json:"line,omitempty"`
+	Severity     string    `json:"severity"`
+	BodyDigest   string    `json:"body_digest"`
+	Content      string    `json:"content,omitempty"`
+	ContentTrust string    `json:"content_trust"`
+	Resolved     bool      `json:"resolved"`
+	Outdated     bool      `json:"outdated"`
+	HeadSHA      string    `json:"observed_head_sha"`
+	ObservedAt   time.Time `json:"observed_at"`
+}
+type TelemetryResult struct {
+	Kind       string    `json:"kind"`
+	Value      string    `json:"value"`
+	ObservedAt time.Time `json:"observed_at,omitempty"`
+}
 type PullRequestResult struct {
 	Number     int64     `json:"number"`
 	URL        string    `json:"url"`
@@ -319,16 +495,17 @@ type PullRequestResult struct {
 }
 
 func projectInspection(value RunInspection) InspectionResult {
-	result := InspectionResult{Run: projectRunResult(value.Run), RepositoryBinding: value.RepositoryBinding, Approval: value.Approval, Merge: value.Merge}
+	result := InspectionResult{SchemaVersion: querySchemaVersion, Run: projectRunResult(value.Run), RepositoryBinding: projectRepositoryBinding(value.RepositoryBinding), Approval: value.Approval, Merge: value.Merge,
+		Timeline: []TransitionResult{}, Attempts: []AttemptResult{}, Verifications: []VerificationResult{}, Reviews: []ReviewResult{}, Resources: []ResourceResult{}, Cleanup: []CleanupResult{}, Checks: []CheckResult{}, Findings: []FindingResult{}, Telemetry: []TelemetryResult{}}
 	if value.PullRequest != nil {
 		v := value.PullRequest
-		result.PullRequest = &PullRequestResult{v.Number, v.URL, v.HeadBranch, v.BaseBranch, v.HeadSHA, v.BaseSHA, v.State, v.Merged, v.MergeSHA, v.MergedAt}
+		result.PullRequest = &PullRequestResult{v.Number, sanitizeExternalURL(v.URL), v.HeadBranch, v.BaseBranch, v.HeadSHA, v.BaseSHA, v.State, v.Merged, v.MergeSHA, v.MergedAt}
 	}
 	for _, v := range value.Timeline {
-		result.Timeline = append(result.Timeline, TransitionResult{v.Sequence, v.From, v.To, v.Reason, v.BoundHead, v.CreatedAt})
+		result.Timeline = append(result.Timeline, TransitionResult{v.Sequence, v.From, v.To, sanitizeUntrustedContent(v.Reason), v.BoundHead, v.CreatedAt})
 	}
 	for _, v := range value.Attempts {
-		result.Attempts = append(result.Attempts, AttemptResult{v.Number, v.Kind, v.Status, v.RequestedModel, v.ErrorCategory, v.StartedAt, v.FinishedAt, v.ExitCode, v.OutcomeHash})
+		result.Attempts = append(result.Attempts, AttemptResult{v.Number, v.Kind, v.Status, v.RequestedModel, v.ErrorCategory, v.StartedAt, v.FinishedAt, v.ExitCode, v.OutcomeHash, v.SessionID != "", v.ArtifactDir != ""})
 	}
 	for _, v := range value.Verifications {
 		result.Verifications = append(result.Verifications, VerificationResult{v.VerifierID, v.Phase, v.VerifiedHead, v.ExitCode, v.EvidenceHash, v.CreatedAt})
@@ -342,7 +519,139 @@ func projectInspection(value RunInspection) InspectionResult {
 	for _, v := range value.Cleanup {
 		result.Cleanup = append(result.Cleanup, CleanupResult{v.Kind, v.Status, v.UpdatedAt})
 	}
+	for _, finding := range value.Findings {
+		result.Findings = append(result.Findings, FindingResult{Source: finding.Source, SourceID: finding.SourceID,
+			File: sanitizeRepositoryPath(finding.File), Line: finding.Line, Severity: finding.Severity, BodyDigest: finding.BodyDigest,
+			Content: sanitizeUntrustedContent(finding.Body), ContentTrust: "untrusted", Resolved: finding.Resolved,
+			Outdated: finding.Outdated, HeadSHA: finding.HeadSHA, ObservedAt: finding.ObservedAt})
+	}
+	appendUnknownTelemetry(&result, value)
 	return result
+}
+
+func projectRunSummary(run Run) RunSummary {
+	return RunSummary{RunID: run.ID, IssueID: run.IssueID, Repository: run.Repository, ProfileID: run.ProfileID,
+		ProfileSnapshotVersion: run.ProfileSnapshotVersion, ProfileDigest: run.ProfileDigest, State: run.State,
+		CandidateHead: run.CandidateHead, CreatedAt: run.CreatedAt, UpdatedAt: run.UpdatedAt}
+}
+
+func projectRepositoryBinding(value *SanitizedRepositoryBinding) *RepositoryBindingResult {
+	if value == nil {
+		return nil
+	}
+	return &RepositoryBindingResult{ProfileID: value.ProfileID, ProfileSnapshotVersion: value.ProfileSnapshotVersion,
+		ProfileDigest: value.ProfileDigest, CanonicalRepository: value.CanonicalRepository, BaseBranch: value.BaseBranch,
+		VerifierRegistryRef: value.VerifierRegistryRef, VerifierIDs: append([]string(nil), value.VerifierIDs...), GitHubAppID: value.GitHubAppID,
+		GitHubInstallationID: value.GitHubInstallationID, ExpectedRepositoryID: value.ExpectedRepositoryID}
+}
+
+func appendUnknownTelemetry(result *InspectionResult, value RunInspection) {
+	if value.Run.State != "" && !knownState(value.Run.State) {
+		result.Telemetry = append(result.Telemetry, TelemetryResult{Kind: "run_state", Value: sanitizeTelemetryValue(string(value.Run.State)), ObservedAt: value.Run.UpdatedAt})
+	}
+	for _, transition := range value.Timeline {
+		if transition.From != "" && !knownState(transition.From) {
+			result.Telemetry = append(result.Telemetry, TelemetryResult{Kind: "transition_from_state", Value: sanitizeTelemetryValue(string(transition.From)), ObservedAt: transition.CreatedAt})
+		}
+		if transition.To != "" && !knownState(transition.To) {
+			result.Telemetry = append(result.Telemetry, TelemetryResult{Kind: "transition_to_state", Value: sanitizeTelemetryValue(string(transition.To)), ObservedAt: transition.CreatedAt})
+		}
+	}
+	if value.GitHubEvidence == nil {
+		return
+	}
+	evidence := value.GitHubEvidence
+	for _, check := range evidence.Checks {
+		state := string(check.State)
+		if !knownCheckState(check.State) {
+			state = sanitizeTelemetryValue(state)
+		}
+		result.Checks = append(result.Checks, CheckResult{Name: sanitizeUntrustedContent(check.Name), Required: check.Required, Source: sanitizeUntrustedContent(check.Source),
+			State: state, ObservedSHA: check.ObservedSHA, ObservedAt: check.ObservedAt})
+		if !knownCheckState(check.State) {
+			result.Telemetry = append(result.Telemetry, TelemetryResult{Kind: "check_state", Value: sanitizeTelemetryValue(string(check.State)), ObservedAt: check.ObservedAt})
+		}
+	}
+	codeRabbitState := string(evidence.CodeRabbit)
+	if !knownCodeRabbitState(evidence.CodeRabbit) {
+		codeRabbitState = sanitizeTelemetryValue(codeRabbitState)
+	}
+	result.CodeRabbit = &CodeRabbitResult{State: codeRabbitState, ObservedAt: evidence.ObservedAt}
+	if evidence.CodeRabbit != "" && !knownCodeRabbitState(evidence.CodeRabbit) {
+		result.Telemetry = append(result.Telemetry, TelemetryResult{Kind: "coderabbit_state", Value: sanitizeTelemetryValue(string(evidence.CodeRabbit)), ObservedAt: evidence.ObservedAt})
+	}
+	for _, event := range evidence.UnknownEvents {
+		result.Telemetry = append(result.Telemetry, TelemetryResult{Kind: "github_event", Value: sanitizeTelemetryValue(event), ObservedAt: evidence.ObservedAt})
+	}
+}
+
+func knownState(value domain.State) bool {
+	switch value {
+	case domain.StateReceived, domain.StateAdmitting, domain.StateProvisioning, domain.StateExecuting, domain.StateAwaitingHumanDecision, domain.StateVerifying, domain.StateFreshReview, domain.StateApprovalReady, domain.StatePushingBranch, domain.StateBranchPushed, domain.StateOpeningPR, domain.StateRepairing, domain.StatePROpen, domain.StateReconcilingReviews, domain.StateAwaitingHumanApproval, domain.StateMerging, domain.StateCleaning, domain.StateFailed, domain.StateCompleted, domain.StateRejected, domain.StateManualIntervention:
+		return true
+	default:
+		return false
+	}
+}
+
+func knownCheckState(value domain.CheckState) bool {
+	switch value {
+	case domain.CheckQueued, domain.CheckInProgress, domain.CheckPending, domain.CheckRequested, domain.CheckWaiting, domain.CheckSuccess, domain.CheckNeutral, domain.CheckSkipped, domain.CheckFailure, domain.CheckActionRequired, domain.CheckCancelled, domain.CheckTimedOut, domain.CheckStale, domain.CheckUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+func knownCodeRabbitState(value domain.CodeRabbitState) bool {
+	switch value {
+	case domain.CodeRabbitAbsent, domain.CodeRabbitPending, domain.CodeRabbitPass, domain.CodeRabbitActionable, domain.CodeRabbitInfrastructure, domain.CodeRabbitUntrusted, domain.CodeRabbitUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+var (
+	sensitiveValuePattern = regexp.MustCompile(`(?i)(authorization\s*[:=]\s*(?:bearer|basic|token)?\s*|(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|secret|credential)\s*[:=]\s*)[^\s,;]+`)
+	absolutePathPattern   = regexp.MustCompile(`(^|\s)/[^\s]+`)
+)
+
+func sanitizeUntrustedContent(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || json.Valid([]byte(value)) {
+		return ""
+	}
+	value = sensitiveValuePattern.ReplaceAllString(value, "[redacted]")
+	value = absolutePathPattern.ReplaceAllString(value, "$1[redacted path]")
+	if len(value) > 4096 {
+		value = value[:4096] + "…"
+	}
+	return value
+}
+
+func sanitizeTelemetryValue(value string) string {
+	if sanitized := sanitizeUntrustedContent(value); sanitized != "" {
+		return sanitized
+	}
+	return "[untrusted structured value omitted]"
+}
+
+func sanitizeRepositoryPath(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.HasPrefix(value, "/") || strings.Contains(value, "\\\\") || strings.HasPrefix(value, "~") || path.Clean(value) != value || strings.HasPrefix(value, "../") {
+		return ""
+	}
+	return value
+}
+
+func sanitizeExternalURL(value string) string {
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	parsed.User, parsed.RawQuery, parsed.ForceQuery, parsed.Fragment = nil, "", false, ""
+	return parsed.String()
 }
 
 func classifyServiceError(err error) error {

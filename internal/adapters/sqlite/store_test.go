@@ -115,6 +115,36 @@ func TestMigrationAndRunIdempotency(t *testing.T) {
 	}
 }
 
+func TestListRunsUsesRepositoryScopedDeterministicCursor(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	base := time.Date(2026, 7, 13, 0, 0, 0, 0, time.UTC)
+	for index, id := range []string{"run-a", "run-b", "run-c"} {
+		input := application.CreateRunInput{Run: application.Run{ID: id, IssueID: fmt.Sprintf("ISSUE-%d", index), IdempotencyKey: fmt.Sprintf("key-%d", index), SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "ifan/test"}}
+		if _, _, err := store.CreateRun(ctx, input); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.db.ExecContext(ctx, `UPDATE runs SET created_at=? WHERE run_id=?`, formatTime(base.Add(time.Duration(index)*time.Second)), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, err := store.ListRuns(ctx, "owner/repo", time.Time{}, "", 2)
+	if err != nil || len(page) != 2 || page[0].ID != "run-c" || page[1].ID != "run-b" {
+		t.Fatalf("first page=%+v err=%v", page, err)
+	}
+	next, err := store.ListRuns(ctx, "owner/repo", page[1].CreatedAt, page[1].ID, 2)
+	if err != nil || len(next) != 1 || next[0].ID != "run-a" {
+		t.Fatalf("next page=%+v err=%v", next, err)
+	}
+	if _, err := store.ListRuns(ctx, "owner/repo", time.Time{}, "", 102); err == nil {
+		t.Fatal("unbounded list limit was accepted")
+	}
+}
+
 func TestLinearSourceDriftHaltsTheExactActiveRun(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {

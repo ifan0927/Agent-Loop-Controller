@@ -163,6 +163,7 @@ type RunStore interface {
 	CreateRun(context.Context, CreateRunInput) (Run, bool, error)
 	GetRun(context.Context, string) (Run, error)
 	GetRunByIdempotency(context.Context, string) (Run, bool, error)
+	ListRuns(context.Context, string, time.Time, string, int) ([]Run, error)
 	Transition(context.Context, string, domain.State, domain.State, string, string, string) error
 	SetWorkspace(context.Context, string, string, string) error
 	SetImplementationSession(context.Context, string, string) error

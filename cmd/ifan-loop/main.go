@@ -496,20 +496,15 @@ func localInspect(command string, args []string) error {
 		return err
 	}
 	defer store.Close()
-	run, err := store.GetRun(context.Background(), runID)
-	if err != nil {
-		return application.ClassifyError(err)
-	}
 	queries := application.NewQueryService(store)
-	input := application.QueryInput{Requester: requesterIdentity.value(), RunID: runID, Repository: run.Repository}
 	if command == "status" {
-		result, err := queries.Status(context.Background(), input)
+		result, err := queries.GetRunDetail(context.Background(), application.RunDetailQuery{Requester: requesterIdentity.value(), RunID: runID})
 		if err != nil {
 			return err
 		}
 		return printJSON(result)
 	}
-	result, err := queries.Inspect(context.Background(), input)
+	result, err := queries.GetRunDetail(context.Background(), application.RunDetailQuery{Requester: requesterIdentity.value(), RunID: runID})
 	if err != nil {
 		return err
 	}

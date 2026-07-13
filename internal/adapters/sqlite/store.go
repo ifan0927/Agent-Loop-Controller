@@ -285,6 +285,37 @@ func (s *Store) GetRunByIdempotency(ctx context.Context, key string) (applicatio
 	return run, err == nil, err
 }
 
+// ListRuns returns a deterministic page ordered by newest creation time and run ID.
+// The application query service owns cursor validation and authorization.
+func (s *Store) ListRuns(ctx context.Context, repository string, beforeCreatedAt time.Time, beforeID string, limit int) ([]application.Run, error) {
+	if limit < 1 || limit > 101 {
+		return nil, errors.New("run list limit is out of bounds")
+	}
+	query := runSelect + ` WHERE repository=?`
+	args := []any{repository}
+	if !beforeCreatedAt.IsZero() {
+		query += ` AND (created_at < ? OR (created_at = ? AND run_id < ?))`
+		before := formatTime(beforeCreatedAt)
+		args = append(args, before, before, beforeID)
+	}
+	query += ` ORDER BY created_at DESC, run_id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	runs := []application.Run{}
+	for rows.Next() {
+		run, err := scanRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		runs = append(runs, run)
+	}
+	return runs, rows.Err()
+}
+
 func (s *Store) GetRunByIssue(ctx context.Context, issueID string) (application.Run, bool, error) {
 	run, err := scanRun(s.db.QueryRowContext(ctx, runSelect+` WHERE issue_id=? AND current_state NOT IN ('rejected','failed','completed')`, issueID))
 	if errors.Is(err, sql.ErrNoRows) {
