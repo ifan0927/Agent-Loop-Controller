@@ -49,6 +49,8 @@ func main() {
 		err = local(os.Args[2:])
 	case "linear":
 		err = linear(os.Args[2:])
+	case "controller":
+		err = controller(os.Args[2:])
 	case "config":
 		err = config(os.Args[2:])
 	case "github-read":
@@ -60,6 +62,22 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
+	}
+}
+
+func controller(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: ifan-loop controller <start|continue|reconcile> ...")
+	}
+	switch args[0] {
+	case "start":
+		return linearStart(args[1:])
+	case "continue":
+		return controllerContinue(args[1:])
+	case "reconcile":
+		return controllerReconcile(args[1:])
+	default:
+		return fmt.Errorf("unknown controller command: %s", args[0])
 	}
 }
 
@@ -112,15 +130,15 @@ func linearStart(args []string) error {
 	if err != nil {
 		return err
 	}
-	reader, err := linearadapter.New(loaded.Linear, linearadapter.EnvironmentCredentialSource{Variable: "IFAN_LOOP_LINEAR_TOKEN"}, nil)
-	if err != nil {
-		return err
-	}
 	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
+	reader, err := linearadapter.New(loaded.Linear, linearadapter.EnvironmentCredentialSource{Variable: "IFAN_LOOP_LINEAR_TOKEN"}, nil)
+	if err != nil {
+		return err
+	}
 	service, err := application.NewLinearAdmissionService(reader, linearRegistryResolver{registry: loaded.Registry}, store, newLocalController(store, loaded.Controller.CodexBinary, ""))
 	if err != nil {
 		return err
@@ -132,6 +150,136 @@ func linearStart(args []string) error {
 		return err
 	}
 	return printJSON(result.Run)
+}
+
+func controllerContinue(args []string) error {
+	command, loaded, store, err := productionCommand(args, "controller continue")
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := validateProductionPersistedBinding(command.run, loaded.Registry); err != nil {
+		return application.ClassifyError(err)
+	}
+	coordinator, err := newProductionCoordinator(loaded, store, filepath.Dir(command.run.WorktreePath))
+	if err != nil {
+		return err
+	}
+	ctx, cancel := localContext(loaded.Controller.RunTimeout)
+	defer cancel()
+	result, err := coordinator.Continue(ctx, application.ProductionContinueCommand{Requester: command.requester, RunID: command.run.ID, Repository: command.repository, ExpectedState: command.expectedState, IdempotencyKey: command.idempotencyKey, Decision: command.decision})
+	if err != nil {
+		return err
+	}
+	return printJSON(result)
+}
+
+func controllerReconcile(args []string) error {
+	command, loaded, store, err := productionCommand(args, "controller reconcile")
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := validateProductionPersistedBinding(command.run, loaded.Registry); err != nil {
+		return application.ClassifyError(err)
+	}
+	coordinator, err := newProductionCoordinator(loaded, store, filepath.Dir(command.run.WorktreePath))
+	if err != nil {
+		return err
+	}
+	profile, err := loaded.GitHubProfileForRepository(command.run.Repository)
+	if err != nil {
+		return err
+	}
+	if err := profile.Config.Validate(); err != nil {
+		return errors.New("configured GitHub App credential source is unavailable")
+	}
+	observations := []application.GitHubRequestObservation{}
+	client, err := githubapp.New(profile.Config, githubapp.RealClock{}, func(o application.GitHubRequestObservation) {
+		o.RunID = command.run.ID
+		observations = append(observations, o)
+	})
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), profile.Config.HTTPTimeout*20)
+	defer cancel()
+	result, err := coordinator.ReconcileGitHub(ctx, application.ProductionReconcileCommand{Requester: command.requester, RunID: command.run.ID, Repository: command.repository, ExpectedState: command.expectedState, IdempotencyKey: command.idempotencyKey}, githubReadAdapter{client: client, observations: &observations})
+	if err != nil {
+		return err
+	}
+	return printJSON(result)
+}
+
+type productionCLICommand struct {
+	run            application.Run
+	requester      application.Requester
+	repository     string
+	expectedState  domain.State
+	idempotencyKey string
+	decision       *application.Decision
+}
+
+func productionCommand(args []string, name string) (productionCLICommand, bootstrap.Bootstrap, *sqlitestore.Store, error) {
+	flags := flag.NewFlagSet(name, flag.ContinueOnError)
+	requester := addRequesterFlags(flags)
+	configPath := flags.String("config", "", "controller composition configuration")
+	repository := flags.String("repository", "", "previously observed canonical repository")
+	expectedState := flags.String("expected-state", "", "previously observed run state used as a compare-and-swap token")
+	idempotencyKey := flags.String("idempotency-key", "", "persisted run idempotency token")
+	decisionPath := flags.String("decision", "", "optional human decision JSON")
+	runID, remaining := splitLeadingRunID(args)
+	if err := flags.Parse(remaining); err != nil {
+		return productionCLICommand{}, bootstrap.Bootstrap{}, nil, err
+	}
+	if runID == "" && flags.NArg() == 1 {
+		runID = flags.Arg(0)
+	}
+	if runID == "" || flags.NArg() != 0 || *configPath == "" || !requester.complete() || *repository == "" || *expectedState == "" || *idempotencyKey == "" {
+		return productionCLICommand{}, bootstrap.Bootstrap{}, nil, errors.New("run ID, --config, complete requester identity, --repository, --expected-state, and --idempotency-key are required")
+	}
+	loaded, err := bootstrap.Load(*configPath)
+	if err != nil {
+		return productionCLICommand{}, bootstrap.Bootstrap{}, nil, err
+	}
+	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
+	if err != nil {
+		return productionCLICommand{}, bootstrap.Bootstrap{}, nil, err
+	}
+	run, err := store.GetRun(context.Background(), runID)
+	if err != nil {
+		store.Close()
+		return productionCLICommand{}, bootstrap.Bootstrap{}, nil, application.ClassifyError(err)
+	}
+	var decision *application.Decision
+	if *decisionPath != "" {
+		file, err := os.Open(*decisionPath)
+		if err != nil {
+			store.Close()
+			return productionCLICommand{}, bootstrap.Bootstrap{}, nil, err
+		}
+		value, err := decodeDecision(file)
+		file.Close()
+		if err != nil {
+			store.Close()
+			return productionCLICommand{}, bootstrap.Bootstrap{}, nil, err
+		}
+		decision = &value
+	}
+	return productionCLICommand{run: run, requester: requester.value(), repository: *repository, expectedState: domain.State(*expectedState), idempotencyKey: *idempotencyKey, decision: decision}, loaded, store, nil
+}
+
+func newProductionCoordinator(loaded bootstrap.Bootstrap, store *sqlitestore.Store, worktreeRoot string) (*application.ProductionCoordinator, error) {
+	reader, err := linearadapter.New(loaded.Linear, linearadapter.EnvironmentCredentialSource{Variable: "IFAN_LOOP_LINEAR_TOKEN"}, nil)
+	if err != nil {
+		return nil, err
+	}
+	local := newLocalController(store, loaded.Controller.CodexBinary, worktreeRoot)
+	admission, err := application.NewLinearAdmissionService(reader, linearRegistryResolver{registry: loaded.Registry}, store, local)
+	if err != nil {
+		return nil, err
+	}
+	return application.NewProductionCoordinator(admission, local, store)
 }
 
 func splitLinearStartIdentifier(args []string) (string, []string) {
@@ -444,6 +592,45 @@ func validatePersistedRegistryBinding(run application.Run, registry localregistr
 	}
 	if snapshot.RawHash != run.RawIssueHash || snapshot.TaskHash != run.TaskHash || snapshot.IdempotencyKey != run.IdempotencyKey || string(snapshot.NormalizedJSON) != run.NormalizedTaskJSON {
 		return errors.New("persisted task snapshot does not match canonical issue admission")
+	}
+	taskBytes := []byte(run.NormalizedTaskJSON)
+	taskDigest := sha256.Sum256(taskBytes)
+	if hex.EncodeToString(taskDigest[:]) != run.TaskHash {
+		return errors.New("persisted normalized task digest mismatch")
+	}
+	var task domain.CodingTask
+	if err := json.Unmarshal(taskBytes, &task); err != nil || task.Validate() != nil {
+		return errors.New("persisted normalized task is invalid")
+	}
+	if task.RunID != run.ID || task.IssueID != run.IssueID || task.SourceRevision != run.SourceRevision ||
+		task.Repository != run.Repository || task.BaseBranch != run.BaseBranch || task.WorkingBranch != run.WorkingBranch {
+		return errors.New("persisted run columns do not match immutable task snapshot")
+	}
+	if run.Repository != persisted.CanonicalRepository || run.BaseBranch != persisted.BaseBranch ||
+		run.ProfileID != persisted.ProfileID || run.ProfileSnapshotVersion != persisted.ProfileSnapshotVersion || run.ProfileDigest != persisted.ProfileDigest ||
+		run.RegistryVersion != persisted.RegistryVersion || run.RegistryDigest != persisted.RegistryDigest ||
+		run.RepositoryBindingDigest != persisted.RepositoryBindingDigest ||
+		run.WorktreePath != filepath.Join(persisted.WorktreeRoot, run.ID) || run.ArtifactRoot != filepath.Join(persisted.RunRoot, run.ID) {
+		return errors.New("persisted run columns do not match repository authority binding")
+	}
+	return registry.VerifyPersisted(localBinding(persisted))
+}
+
+// validateProductionPersistedBinding verifies the credential-free authority
+// frozen on any run. Unlike the local-fixture validator above, production runs
+// contain a sanitized Linear source rather than localissue.Issue JSON.
+func validateProductionPersistedBinding(run application.Run, registry localregistry.Registry) error {
+	if run.RegistryVersion < 1 || run.ProfileSnapshotVersion < 1 || run.ProfileID == "" || run.ProfileDigest == "" || run.ProfileSnapshotJSON == "" {
+		return errors.New("persisted repository binding is legacy-insufficient")
+	}
+	var persisted application.LocalRepository
+	if err := json.Unmarshal([]byte(run.RepositoryConfigJSON), &persisted); err != nil {
+		return errors.New("persisted repository binding is invalid")
+	}
+	persisted.ProfileSnapshotJSON = run.ProfileSnapshotJSON
+	rawIssueDigest := sha256.Sum256([]byte(run.RawIssueJSON))
+	if hex.EncodeToString(rawIssueDigest[:]) != run.RawIssueHash {
+		return errors.New("persisted raw issue digest mismatch")
 	}
 	taskBytes := []byte(run.NormalizedTaskJSON)
 	taskDigest := sha256.Sum256(taskBytes)

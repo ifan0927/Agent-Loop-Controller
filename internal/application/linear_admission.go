@@ -32,6 +32,16 @@ type LinearStartCommand struct {
 	Identifier string    `json:"identifier"`
 }
 
+// LinearRevalidateCommand binds a manual continuation to the persisted run and
+// makes source drift observable before any Git, Codex, or GitHub action.
+type LinearRevalidateCommand struct {
+	Requester      Requester
+	RunID          string
+	Repository     string
+	ExpectedState  domain.State
+	IdempotencyKey string
+}
+
 // LinearAdmissionService composes an authoritative read-only Linear adapter
 // with the controller-owned admission and durable-run boundaries.
 type LinearAdmissionService struct {
@@ -92,6 +102,40 @@ func (s *LinearAdmissionService) Start(ctx context.Context, command LinearStartC
 		return CommandResult{}, observations, err
 	}
 	return result, observations, nil
+}
+
+func (s *LinearAdmissionService) Revalidate(ctx context.Context, command LinearRevalidateCommand) (Run, error) {
+	if command.RunID == "" || command.Repository == "" || command.ExpectedState == "" || command.IdempotencyKey == "" {
+		return Run{}, serviceError(ErrorInvalidInput, "run, expected state, repository, and idempotency key are required", nil)
+	}
+	run, err := s.store.GetRun(ctx, command.RunID)
+	if err != nil {
+		return Run{}, classifyServiceError(err)
+	}
+	if run.Repository != command.Repository || run.State != command.ExpectedState || run.IdempotencyKey != command.IdempotencyKey {
+		return Run{}, serviceError(ErrorConflict, "run authority or state changed before reconciliation", nil)
+	}
+	if err := authorizePersistedRequester(run, command.Requester); err != nil {
+		return Run{}, err
+	}
+	source, _, err := s.reader.ReadIssue(ctx, run.IssueID)
+	if err != nil {
+		return Run{}, classifyServiceError(err)
+	}
+	snapshot, repository, err := admitLinearTask(source, s.resolver)
+	if err != nil {
+		return Run{}, classifyServiceError(err)
+	}
+	if err := command.Requester.authorize(repository.AllowedOperatorLogins, repository.TrustedOperatorActors); err != nil {
+		return Run{}, err
+	}
+	if snapshot.Task.IssueID != run.IssueID {
+		return Run{}, serviceError(ErrorConflict, "Linear source does not match the persisted run", nil)
+	}
+	if err := s.requireStableLinearSource(ctx, run, snapshot, repository); err != nil {
+		return Run{}, err
+	}
+	return run, nil
 }
 
 func (s *LinearAdmissionService) requireStableLinearSource(ctx context.Context, existing Run, snapshot linearAdmissionSnapshot, repository LocalRepository) error {

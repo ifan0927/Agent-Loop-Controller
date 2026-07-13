@@ -69,13 +69,22 @@ App JWT and installation-token authentication, and direct REST/GraphQL evidence
 collection without `gh` or user authentication. Real access is opt-in; see
 [the operator handoff](docs/github-app-operator.md).
 
-The `linear start` command composes the direct Linear reader with durable
+The `controller start` command composes the direct Linear reader with durable
 admission. It accepts one explicit IFAN identifier and complete requester
 identity, re-fetches the authoritative source, enforces coding-ready eligibility,
 matches exactly one controller-configured repository label, freezes the task and
 repository policy, and creates or resumes one durable run. A changed source,
 repository binding, or Linear branch never mutates an existing run: the run is
 halted for a human decision instead.
+
+`controller continue` and `controller reconcile` are the matching manual
+restart entrypoints. Both require the persisted run ID, requester identity,
+repository, expected state, and idempotency key. They re-read Linear before
+acting, reject source drift, and derive one action from durable state. Local
+execution uses the existing controller; GitHub reconciliation is read-only and
+requires persisted PR identity and exact candidate HEAD. States whose next step
+would write a branch, PR, or merge stop explicitly until their later lifecycle
+issue is implemented.
 
 ## Controller configuration
 
@@ -100,10 +109,28 @@ registry-to-GitHub identity bindings, then emit only stable profile IDs and
 digests. Linear admission and GitHub reconciliation use the same loader:
 
 ```sh
-go run ./cmd/ifan-loop linear start IFAN-42 \
+go run ./cmd/ifan-loop controller start IFAN-42 \
   --config /absolute/path/controller.json \
   --requester ifan0927 --requester-database-id 123 \
   --requester-node-id <github-node-id> --requester-type User
+```
+
+After reading the previous sanitized status result, an operator may resume or
+perform the read-only external reconciliation with the same compare-and-swap
+evidence:
+
+```sh
+go run ./cmd/ifan-loop controller continue <run-id> \
+  --config /absolute/path/controller.json \
+  --requester ifan0927 --requester-database-id 123 \
+  --requester-node-id <github-node-id> --requester-type User \
+  --repository owner/repo --expected-state executing --idempotency-key <key>
+
+go run ./cmd/ifan-loop controller reconcile <run-id> \
+  --config /absolute/path/controller.json \
+  --requester ifan0927 --requester-database-id 123 \
+  --requester-node-id <github-node-id> --requester-type User \
+  --repository owner/repo --expected-state pr_open --idempotency-key <key>
 ```
 
 The controller configuration is strict JSON with this shape:

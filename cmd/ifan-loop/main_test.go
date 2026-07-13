@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/localregistry"
 	sqlitestore "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
 func TestDecodeTaskRejectsTrailingJSON(t *testing.T) {
@@ -70,6 +72,45 @@ func TestPersistedBindingRejectsCrossRepositorySwap(t *testing.T) {
 		BaseBranch: "main", WorkingBranch: "ifan/test", NormalizedTaskJSON: string(taskRaw), TaskHash: fmt.Sprintf("%x", taskHash), WorktreePath: filepath.Join(bindingTwo.WorktreeRoot, snapshot.Task.RunID), ArtifactRoot: filepath.Join(bindingTwo.RunRoot, snapshot.Task.RunID)}
 	if err := validatePersistedRegistryBinding(run, registry); err == nil || !strings.Contains(err.Error(), "canonical issue admission") {
 		t.Fatalf("cross-repository persisted binding swap error=%v", err)
+	}
+}
+
+func TestProductionPersistedBindingAcceptsLinearSnapshot(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := []string{filepath.Join(root, "origin"), filepath.Join(root, "source"), filepath.Join(root, "runs"), filepath.Join(root, "worktrees")}
+	for _, path := range paths {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	registryRaw, _ := json.Marshal(localregistry.File{Version: 1, Repositories: []localregistry.Repository{{Owner: "owner", Name: "repo", OriginPath: paths[0], SourcePath: paths[1], RunRoot: paths[2], WorktreeRoot: paths[3], BaseBranch: "main", VerifierRegistryRef: "builtin:v1", VerifierIDs: []string{"fixture-go-test"}, GitHubAppProfileRef: "github-app-profile:fixture", GitHubAppID: 1, GitHubInstallationID: 2, ExpectedRepositoryID: 3, OperatorIdentityPolicy: localregistry.OperatorIdentityPolicy{AllowedLogins: []string{"ifan0927"}, TrustedActors: []localregistry.TrustedActorIdentity{{DatabaseID: 1, NodeID: "actor", Login: "ifan0927", Type: "User"}}}}}})
+	registryPath := filepath.Join(root, "registry.json")
+	if err := os.WriteFile(registryPath, registryRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := localregistry.Load(registryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := registry.Resolve("owner/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := domain.CodingTask{RunID: "run-linear", IssueID: "IFAN-42", IssueURL: "https://linear.app/ifan/issue/IFAN-42/test", Title: "Task", Description: "## Goal\nTask\n## Acceptance Criteria\n- Pass", Repository: "owner/repo", BaseBranch: "main", WorkingBranch: "ifan/ifan-42", Goal: "Task", AcceptanceCriteria: []string{"Pass"}, VerifierIDs: []string{"fixture-go-test"}, Policy: domain.TaskPolicy{HumanApprovalRequired: true, MergeMethod: "squash"}, SourceRevision: "revision", CreatedAt: time.Now().UTC()}
+	if err := task.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	normalized, _ := json.Marshal(task)
+	raw := []byte(`{"provider":"linear","identifier":"IFAN-42"}`)
+	rawDigest, taskDigest := sha256.Sum256(raw), sha256.Sum256(normalized)
+	repository := localRepository(binding)
+	repositoryRaw, _ := json.Marshal(repository)
+	run := application.Run{ID: task.RunID, IssueID: task.IssueID, IdempotencyKey: "key", SourceRevision: task.SourceRevision, RawIssueJSON: string(raw), RawIssueHash: hex.EncodeToString(rawDigest[:]), NormalizedTaskJSON: string(normalized), TaskHash: hex.EncodeToString(taskDigest[:]), Repository: task.Repository, RepositoryConfigJSON: string(repositoryRaw), ProfileID: repository.ProfileID, ProfileSnapshotVersion: repository.ProfileSnapshotVersion, ProfileDigest: repository.ProfileDigest, ProfileSnapshotJSON: repository.ProfileSnapshotJSON, RegistryVersion: repository.RegistryVersion, RegistryDigest: repository.RegistryDigest, RepositoryBindingDigest: repository.RepositoryBindingDigest, BaseBranch: task.BaseBranch, WorkingBranch: task.WorkingBranch, WorktreePath: filepath.Join(repository.WorktreeRoot, task.RunID), ArtifactRoot: filepath.Join(repository.RunRoot, task.RunID)}
+	if err := validateProductionPersistedBinding(run, registry); err != nil {
+		t.Fatal(err)
 	}
 }
 
