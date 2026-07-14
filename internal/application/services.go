@@ -717,7 +717,7 @@ func appendUnknownTelemetry(result *InspectionResult, value RunInspection) {
 
 func knownState(value domain.State) bool {
 	switch value {
-	case domain.StateReceived, domain.StateAdmitting, domain.StateProvisioning, domain.StateExecuting, domain.StateAwaitingHumanDecision, domain.StateVerifying, domain.StateFreshReview, domain.StateApprovalReady, domain.StatePushingBranch, domain.StateBranchPushed, domain.StateOpeningPR, domain.StateRepairing, domain.StatePROpen, domain.StateReconcilingReviews, domain.StateAwaitingHumanApproval, domain.StateMerging, domain.StateCleaning, domain.StateFailed, domain.StateCompleted, domain.StateRejected, domain.StateManualIntervention:
+	case domain.StateReceived, domain.StateAdmitting, domain.StateProvisioning, domain.StateExecuting, domain.StateAwaitingHumanDecision, domain.StateVerifying, domain.StateFreshReview, domain.StateApprovalReady, domain.StatePushingBranch, domain.StateBranchPushed, domain.StateOpeningPR, domain.StateRepairing, domain.StatePROpen, domain.StateReconcilingReviews, domain.StateAwaitingHumanApproval, domain.StateMerging, domain.StateAwaitingGitHubMergeability, domain.StateCleaning, domain.StateFailed, domain.StateCompleted, domain.StateRejected, domain.StateManualIntervention:
 		return true
 	default:
 		return false
@@ -951,6 +951,34 @@ func (s CommandService) ReconcileFromGitHub(ctx context.Context, command GitHubR
 	})
 }
 
+// reconcileMergeabilityChangesRequested reuses the ordinary trusted-feedback
+// normalization and atomic repair selection while the run still holds the
+// mergeability reconciliation lease. A GitHub conversation resolution wait
+// must never turn a new exact-head change request into a passive approval wait.
+func (s CommandService) reconcileMergeabilityChangesRequested(ctx context.Context, command ReconcileCommand, inspection RunInspection, owner string, evidence domain.GitHubReadEvidence, handoff domain.InlineReviewBodyHandoff, observations []GitHubRequestObservation, metadata GitHubInstallationMetadata) (ReconcileResult, error) {
+	existingFeedback := make([]domain.TrustedReviewFeedback, len(inspection.TrustedFeedback))
+	for index, item := range inspection.TrustedFeedback {
+		existingFeedback[index] = item.TrustedReviewFeedback
+	}
+	trusted, err := trustedHumanActors(inspection)
+	if err != nil {
+		return ReconcileResult{}, serviceError(ErrorConflict, "trusted human feedback identity is unavailable", err)
+	}
+	normalized, err := domain.NormalizeTrustedChangesRequested(evidence.PullRequest, evidence.Reviews, evidence.ReviewThreads, handoff, trusted, evidence.ObservedAt)
+	if err != nil {
+		return ReconcileResult{}, serviceError(ErrorUnavailable, "inline review evidence is incomplete", err)
+	}
+	feedback := make([]TrustedReviewFeedbackRecord, len(normalized.Feedback))
+	for index, item := range normalized.Feedback {
+		feedback[index] = TrustedReviewFeedbackRecord{RunID: command.RunID, TrustedReviewFeedback: item}
+	}
+	full := ReconcileCommand{Requester: command.Requester, RunID: command.RunID, Repository: command.Repository, ExpectedState: command.ExpectedState,
+		IdempotencyKey: command.IdempotencyKey, Evidence: evidence, Observations: observations, Metadata: metadata, TrustedFeedback: feedback,
+		FeedbackUnsupported: normalized.Unsupported, FeedbackDrift: domain.TrustedFeedbackDrift(existingFeedback, evidence.PullRequest, evidence.Reviews, evidence.ReviewThreads, handoff)}
+	full.Evidence.Findings = normalized.Findings
+	return s.reconcileLocked(ctx, full, inspection, owner)
+}
+
 func trustedFeedbackDriftReference(existing []TrustedReviewFeedbackRecord, handoff domain.InlineReviewBodyHandoff) (string, string) {
 	bodies := make(map[string]string, len(handoff.Comments))
 	for _, body := range handoff.Comments {
@@ -1116,7 +1144,7 @@ func (s CommandService) reconcileLocked(ctx context.Context, command ReconcileCo
 	if command.FeedbackUnsupported || command.FeedbackDrift || trustedFeedbackConflicts(inspection.TrustedFeedback, command.TrustedFeedback) {
 		next, reason = domain.StateManualIntervention, "trusted inline change request requires manual intervention"
 	}
-	if len(command.TrustedFeedback) > 0 && next != domain.StateManualIntervention && (run.State == domain.StateReconcilingReviews || run.State == domain.StateAwaitingHumanApproval) {
+	if len(command.TrustedFeedback) > 0 && next != domain.StateManualIntervention && (run.State == domain.StateReconcilingReviews || run.State == domain.StateAwaitingHumanApproval || run.State == domain.StateAwaitingGitHubMergeability) {
 		next, reason = domain.StateRepairing, "trusted exact-head inline change request requires repair"
 	}
 	if status == domain.ReconciliationActionable && next == domain.StateRepairing {
@@ -1188,7 +1216,7 @@ func trustedHumanActors(inspection RunInspection) ([]domain.ActorIdentity, error
 }
 
 func nextGitHubReconciliationState(current domain.State, evidence domain.GitHubReadEvidence, status domain.ReconciliationStatus) (domain.State, string) {
-	if current != domain.StatePROpen && current != domain.StateReconcilingReviews && current != domain.StateAwaitingHumanApproval {
+	if current != domain.StatePROpen && current != domain.StateReconcilingReviews && current != domain.StateAwaitingHumanApproval && current != domain.StateAwaitingGitHubMergeability {
 		return current, "GitHub evidence recorded outside the production delivery gate"
 	}
 	if !strings.EqualFold(evidence.PullRequest.State, "open") || evidence.PullRequest.Merged {

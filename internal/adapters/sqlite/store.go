@@ -922,6 +922,86 @@ func (s *Store) FinishSideEffect(ctx context.Context, record application.SideEff
 	return execOne(ctx, s.db, `UPDATE side_effects SET status=?,result_json=?,stdout_path=?,stderr_path=?,observed_at=? WHERE side_effect_id=? AND status IN ('intent','failed')`, record.Status, record.ResultJSON, record.StdoutPath, record.StderrPath, formatTime(record.ObservedAt), record.ID)
 }
 
+// RecordMergePolicyPending atomically records the rejected merge-policy
+// topology and moves the run into its read-only wait state. Keeping both facts
+// in one transaction prevents a restart from treating an unrecorded policy
+// rejection as a normal merge retry.
+func (s *Store) RecordMergePolicyPending(ctx context.Context, runID string, record application.SideEffectRecord, candidateHead string) error {
+	if runID == "" || candidateHead == "" || record.ID < 1 || record.RunID != runID || record.Kind != "squash_merge" || record.IdempotencyKey != candidateHead || record.Status != "failed" || !strings.Contains(record.ResultJSON, `"category":"merge_policy_pending"`) {
+		return errors.New("merge policy pending record is invalid")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var current, head string
+	if err := tx.QueryRowContext(ctx, `SELECT current_state,candidate_head FROM runs WHERE run_id=?`, runID).Scan(&current, &head); err != nil {
+		return err
+	}
+	if domain.State(current) != domain.StateMerging || head != candidateHead {
+		return errors.New("merge policy pending state authority changed")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE side_effects SET status='failed',result_json=?,stdout_path=?,stderr_path=?,observed_at=? WHERE side_effect_id=? AND run_id=? AND kind='squash_merge' AND idempotency_key=? AND status IN ('intent','failed')`, record.ResultJSON, record.StdoutPath, record.StderrPath, formatTime(record.ObservedAt), record.ID, runID, candidateHead)
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return errors.New("merge policy pending side-effect compare lost")
+	}
+	var sequence int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM transitions WHERE run_id=?`, runID).Scan(&sequence); err != nil {
+		return err
+	}
+	now := nowText()
+	result, err = tx.ExecContext(ctx, `UPDATE runs SET current_state=?,last_error='merge_policy_pending',updated_at=? WHERE run_id=? AND current_state=? AND candidate_head=?`, domain.StateAwaitingGitHubMergeability, now, runID, domain.StateMerging, candidateHead)
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return errors.New("merge policy pending state compare lost")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO transitions(run_id,sequence,from_state,to_state,reason,evidence_reference,bound_head,created_at) VALUES(?,?,?,?,?,?,?,?)`, runID, sequence, domain.StateMerging, domain.StateAwaitingGitHubMergeability, "GitHub merge protection awaits human thread resolution", "merge_policy_pending", candidateHead, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// RetryMergeSideEffect atomically claims one retry after a persisted
+// merge_policy_pending result. The compare-and-swap prevents a restarted or
+// concurrent driver from issuing a duplicate merge write for the same policy
+// resolution observation.
+func (s *Store) RetryMergeSideEffect(ctx context.Context, record application.SideEffectRecord) (application.SideEffectRecord, bool, error) {
+	if record.ID < 1 || record.RunID == "" || record.Kind != "squash_merge" || record.IdempotencyKey == "" || record.Status != "failed" {
+		return application.SideEffectRecord{}, false, errors.New("merge retry intent is invalid")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return application.SideEffectRecord{}, false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE side_effects SET status='intent',attempt=attempt+1,result_json='{"category":"merge_policy_retry_claimed"}',observed_at='' WHERE side_effect_id=? AND run_id=? AND kind='squash_merge' AND idempotency_key=? AND status='failed' AND result_json LIKE '%"category":"merge_policy_pending"%'`, record.ID, record.RunID, record.IdempotencyKey)
+	if err != nil {
+		return application.SideEffectRecord{}, false, err
+	}
+	changed, _ := result.RowsAffected()
+	if changed == 0 {
+		if err := tx.Commit(); err != nil {
+			return application.SideEffectRecord{}, false, err
+		}
+		return record, false, nil
+	}
+	var created, observed string
+	if err := tx.QueryRowContext(ctx, `SELECT side_effect_id,run_id,kind,idempotency_key,intent_json,status,result_json,stdout_path,stderr_path,attempt,created_at,observed_at FROM side_effects WHERE side_effect_id=?`, record.ID).Scan(&record.ID, &record.RunID, &record.Kind, &record.IdempotencyKey, &record.IntentJSON, &record.Status, &record.ResultJSON, &record.StdoutPath, &record.StderrPath, &record.Attempt, &created, &observed); err != nil {
+		return application.SideEffectRecord{}, false, err
+	}
+	record.CreatedAt, record.ObservedAt = parseTime(created), parseTime(observed)
+	if err := tx.Commit(); err != nil {
+		return application.SideEffectRecord{}, false, err
+	}
+	return record, true, nil
+}
+
 func (s *Store) requireReviewReplyLease(ctx context.Context, runID, owner string) error {
 	var current string
 	var expires int64

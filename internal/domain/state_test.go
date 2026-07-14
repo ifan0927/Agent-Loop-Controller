@@ -44,6 +44,18 @@ func TestMergedRunRequiresLinearCompletionBeforeCleanup(t *testing.T) {
 	}
 }
 
+func TestMergeProtectionWaitIsReadOnlyAndMustRevalidateBeforeRetry(t *testing.T) {
+	if !CanTransition(StateMerging, StateAwaitingGitHubMergeability) {
+		t.Fatal("a protected merge rejection must enter the narrow GitHub wait")
+	}
+	if !CanTransition(StateAwaitingGitHubMergeability, StateMerging) || !CanTransition(StateAwaitingGitHubMergeability, StateAwaitingHumanApproval) || !CanTransition(StateAwaitingGitHubMergeability, StateRepairing) {
+		t.Fatal("mergeability wait must only resume through fresh GitHub authority")
+	}
+	if CanTransition(StateAwaitingGitHubMergeability, StateAwaitingLinearCompletion) {
+		t.Fatal("waiting for conversation resolution must not imply a merge")
+	}
+}
+
 func TestManualInterventionHasOnlyTheNarrowOwnedPushRecoveryEdge(t *testing.T) {
 	if !CanTransition(StateManualIntervention, StateApprovalReady) {
 		t.Fatal("owned push recovery must be able to restore the guarded push gate")

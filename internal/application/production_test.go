@@ -14,15 +14,16 @@ import (
 
 func TestProductionNextActionStopsBeforeUnimplementedWrites(t *testing.T) {
 	cases := map[domain.State]ProductionAction{
-		domain.StateExecuting:                ProductionContinueLocal,
-		domain.StateAwaitingHumanDecision:    ProductionContinueLocal,
-		domain.StatePROpen:                   ProductionReconcileGitHub,
-		domain.StateApprovalReady:            ProductionPush,
-		domain.StateBranchPushed:             ProductionOpenPullRequest,
-		domain.StatePushingBranch:            ProductionPush,
-		domain.StateAwaitingLinearCompletion: ProductionReconcileLinear,
-		domain.StateManualIntervention:       ProductionStop,
-		domain.StateCompleted:                ProductionStop,
+		domain.StateExecuting:                  ProductionContinueLocal,
+		domain.StateAwaitingHumanDecision:      ProductionContinueLocal,
+		domain.StatePROpen:                     ProductionReconcileGitHub,
+		domain.StateApprovalReady:              ProductionPush,
+		domain.StateBranchPushed:               ProductionOpenPullRequest,
+		domain.StatePushingBranch:              ProductionPush,
+		domain.StateAwaitingGitHubMergeability: ProductionReconcileGitHub,
+		domain.StateAwaitingLinearCompletion:   ProductionReconcileLinear,
+		domain.StateManualIntervention:         ProductionStop,
+		domain.StateCompleted:                  ProductionStop,
 	}
 	for state, want := range cases {
 		if got, _ := productionNextAction(state); got != want {
@@ -65,6 +66,7 @@ type pushTestStore struct {
 	pr               *domain.PullRequest
 	merge            *MergeRecord
 	github           []domain.GitHubReadEvidence
+	savedFeedback    []TrustedReviewFeedbackRecord
 	requests         []GitHubRequestObservation
 	linearCompletion []LinearCompletionObservation
 	linearRequests   []LinearRequestObservation
@@ -73,6 +75,7 @@ type pushTestStore struct {
 	cleanupWrites    int
 	cleanupFailAt    int
 	requestErr       error
+	mergePolicyErr   error
 	finalizeErr      error
 	finalizeCalls    int
 	completion       ReviewReplyCompletion
@@ -159,6 +162,26 @@ func (s *pushTestStore) BeginSideEffect(_ context.Context, value SideEffectRecor
 }
 func (s *pushTestStore) FinishSideEffect(_ context.Context, value SideEffectRecord) error {
 	s.side = value
+	return nil
+}
+func (s *pushTestStore) RetryMergeSideEffect(_ context.Context, value SideEffectRecord) (SideEffectRecord, bool, error) {
+	if s.side.ID != value.ID || s.side.Status != "failed" || !mergePolicySideEffect(s.side) {
+		return s.side, false, nil
+	}
+	s.side.Status, s.side.Attempt, s.side.ResultJSON = "intent", s.side.Attempt+1, `{"category":"merge_policy_retry_claimed"}`
+	return s.side, true, nil
+}
+func (s *pushTestStore) RecordMergePolicyPending(_ context.Context, runID string, value SideEffectRecord, head string) error {
+	if s.mergePolicyErr != nil {
+		return s.mergePolicyErr
+	}
+	if runID != s.run.ID || head != s.run.CandidateHead || s.run.State != domain.StateMerging || s.side.ID != value.ID || value.Status != "failed" || !mergePolicySideEffect(value) {
+		return errors.New("unexpected merge policy pending record")
+	}
+	s.side = value
+	s.run.State = domain.StateAwaitingGitHubMergeability
+	s.run.LastError = "merge_policy_pending"
+	s.transitions = append(s.transitions, Transition{From: domain.StateMerging, To: domain.StateAwaitingGitHubMergeability, Reason: "GitHub merge protection awaits human thread resolution", EvidenceReference: "merge_policy_pending", BoundHead: head})
 	return nil
 }
 func (s *pushTestStore) BeginReviewReplySideEffect(_ context.Context, _ string, value SideEffectRecord) (SideEffectRecord, bool, error) {
@@ -268,6 +291,29 @@ func (s *pushTestStore) SaveReviewReplyObservations(_ context.Context, _ string,
 }
 func (s *pushTestStore) SaveGitHubEvidence(_ context.Context, _ string, value domain.GitHubReadEvidence) error {
 	s.github = append(s.github, value)
+	return nil
+}
+func (s *pushTestStore) SaveGitHubReadSuccess(_ context.Context, _ string, _ string, expected domain.State, key string, observations []GitHubRequestObservation, pr domain.PullRequest, metadata GitHubInstallationMetadata, evidence domain.GitHubReadEvidence, feedback []TrustedReviewFeedbackRecord, observed *domain.HumanApprovalObservation, approval *domain.HumanApproval, next domain.State, reason string) error {
+	if s.run.State != expected || s.run.IdempotencyKey != key {
+		return errors.New("unexpected GitHub read authority")
+	}
+	s.requests = append(s.requests, observations...)
+	s.metadata = append(s.metadata, metadata)
+	s.github = append(s.github, evidence)
+	s.savedFeedback = append([]TrustedReviewFeedbackRecord(nil), feedback...)
+	s.pr = &pr
+	s.inspection.PullRequest, s.inspection.GitHubEvidence = &pr, &evidence
+	s.inspection.ApprovalObservation, s.inspection.Approval = observed, approval
+	if next != expected {
+		return s.Transition(context.Background(), "", expected, next, reason, "github_read_evidence", s.run.CandidateHead)
+	}
+	return nil
+}
+func (s *pushTestStore) SaveGitHubReadFailure(_ context.Context, _ string, _ string, expected domain.State, key string, observations []GitHubRequestObservation) error {
+	if s.run.State != expected || s.run.IdempotencyKey != key {
+		return errors.New("unexpected GitHub read failure authority")
+	}
+	s.requests = append(s.requests, observations...)
 	return nil
 }
 func (s *pushTestStore) SaveLinearCompletionObservation(_ context.Context, value LinearCompletionObservation) error {
@@ -460,14 +506,21 @@ func TestProductionOpenPullRequestLeavesFailedIntentForExplicitReconciliation(t 
 type mergeReader struct {
 	authority    GitHubInstallationMetadata
 	evidence     domain.GitHubReadEvidence
+	handoff      domain.InlineReviewBodyHandoff
 	observations []GitHubRequestObservation
+	err          error
+	errorAt      int
+	errorHandoff domain.InlineReviewBodyHandoff
 	calls        int
 }
 
 func (r *mergeReader) Authority() GitHubInstallationMetadata { return r.authority }
 func (r *mergeReader) Read(_ context.Context, _ int64, _ string) (domain.GitHubReadEvidence, domain.InlineReviewBodyHandoff, []GitHubRequestObservation, GitHubInstallationMetadata, error) {
 	r.calls++
-	return r.evidence, domain.InlineReviewBodyHandoff{}, append([]GitHubRequestObservation(nil), r.observations...), r.authority, nil
+	if r.err != nil && (r.errorAt == 0 || r.errorAt == r.calls) {
+		return r.evidence, r.errorHandoff, append([]GitHubRequestObservation(nil), r.observations...), r.authority, r.err
+	}
+	return r.evidence, r.handoff, append([]GitHubRequestObservation(nil), r.observations...), r.authority, nil
 }
 
 type mergeWriter struct {
@@ -688,6 +741,222 @@ func TestProductionMergeRejectedResultFailsClosedEvenWhenRequestTelemetryCannotP
 	if _, err := coordinator.MergePullRequest(context.Background(), mergeCommand(run), &pushValidator{}, reader, writer); err == nil || writer.calls != 1 || store.run.State != domain.StateManualIntervention || store.side.Status != "failed" {
 		t.Fatalf("err=%v calls=%d state=%s side=%+v", err, writer.calls, store.run.State, store.side)
 	}
+}
+
+func TestProductionMergeabilityWaitPollsWithoutMergeAndRetriesOnlyAfterResolution(t *testing.T) {
+	coordinator, store, run, reader, _ := newMergeCoordinator(t)
+	store.run.State, run.State = domain.StateAwaitingGitHubMergeability, domain.StateAwaitingGitHubMergeability
+	configureMergeabilityFixture(t, store, run, reader)
+	setMergePolicyPendingSide(t, store, run, reader)
+
+	command := ProductionReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}
+	for attempt := 0; attempt < 2; attempt++ {
+		result, err := coordinator.ReconcileGitHub(context.Background(), command, reader)
+		if err != nil || result.Action != ProductionReconcileGitHub || store.run.State != domain.StateAwaitingGitHubMergeability {
+			t.Fatalf("attempt=%d result=%+v err=%v state=%s last=%q transitions=%+v", attempt, result, err, store.run.State, store.run.LastError, store.transitions)
+		}
+	}
+	if reader.calls != 2 || len(store.transitions) != 0 {
+		t.Fatalf("wait must only reread GitHub: calls=%d transitions=%+v", reader.calls, store.transitions)
+	}
+
+	reader.evidence.ReviewThreads[0].Resolved = true
+	result, err := coordinator.ReconcileGitHub(context.Background(), command, reader)
+	if err != nil || result.Action != ProductionMerge || store.run.State != domain.StateMerging || reader.calls != 3 {
+		t.Fatalf("result=%+v err=%v state=%s calls=%d", result, err, store.run.State, reader.calls)
+	}
+}
+
+func TestProductionMergePolicyRejectionEntersDurableReadOnlyWait(t *testing.T) {
+	coordinator, store, run, reader, writer := newMergeCoordinator(t)
+	configureMergeabilityFixture(t, store, run, reader)
+	writer.err = &MergeRejectedError{HTTPStatus: 409, Operation: "squash_merge_pull_request", Cause: errors.New("merge protection rejected unresolved thread")}
+	result, err := coordinator.MergePullRequest(context.Background(), mergeCommand(run), &pushValidator{}, reader, writer)
+	if err == nil || result.Action != ProductionReconcileGitHub || writer.calls != 1 || reader.calls != 2 || store.run.State != domain.StateAwaitingGitHubMergeability {
+		t.Fatalf("result=%+v err=%v writes=%d reads=%d state=%s", result, err, writer.calls, reader.calls, store.run.State)
+	}
+	if store.side.Status != "failed" || !strings.Contains(store.side.ResultJSON, `"category":"merge_policy_pending"`) {
+		t.Fatalf("merge policy wait did not retain sanitized result: %+v", store.side)
+	}
+	if _, err := coordinator.MergePullRequest(context.Background(), mergeCommand(store.run), &pushValidator{}, reader, writer); err == nil || writer.calls != 1 {
+		t.Fatalf("restart must not issue another merge while waiting: err=%v writes=%d", err, writer.calls)
+	}
+}
+
+func TestProductionMergePolicyRetryReturnsToReadOnlyWaitWhenThreadReopens(t *testing.T) {
+	coordinator, store, run, reader, writer := newMergeCoordinator(t)
+	configureMergeabilityFixture(t, store, run, reader)
+	writer.err = &MergeRejectedError{HTTPStatus: 409, Operation: "squash_merge_pull_request", Cause: errors.New("merge protection rejected unresolved thread")}
+	if _, err := coordinator.MergePullRequest(context.Background(), mergeCommand(run), &pushValidator{}, reader, writer); err == nil || store.run.State != domain.StateAwaitingGitHubMergeability || writer.calls != 1 {
+		t.Fatalf("initial wait err=%v state=%s writes=%d", err, store.run.State, writer.calls)
+	}
+	reader.evidence.ReviewThreads[0].Resolved = true
+	store.inspection.Run = store.run
+	if result, err := coordinator.ReconcileGitHub(context.Background(), ProductionReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: store.run.State, IdempotencyKey: run.IdempotencyKey}, reader); err != nil || result.Action != ProductionMerge || store.run.State != domain.StateMerging {
+		t.Fatalf("resolution result=%+v err=%v state=%s", result, err, store.run.State)
+	}
+	// The conversation can reopen after the resolution poll and before the
+	// guarded retry's own fresh read. That retry must not issue a merge write.
+	reader.evidence.ReviewThreads[0].Resolved = false
+	store.inspection.Run = store.run
+	result, err := coordinator.MergePullRequest(context.Background(), mergeCommand(store.run), &pushValidator{}, reader, writer)
+	if err == nil || result.Action != ProductionReconcileGitHub || store.run.State != domain.StateAwaitingGitHubMergeability || writer.calls != 1 {
+		t.Fatalf("result=%+v err=%v state=%s writes=%d", result, err, store.run.State, writer.calls)
+	}
+}
+
+func TestProductionMergePolicyRetryFailsClosedWhenFollowupChangesTopology(t *testing.T) {
+	coordinator, store, run, reader, writer := newMergeCoordinator(t)
+	configureMergeabilityFixture(t, store, run, reader)
+	writer.err = &MergeRejectedError{HTTPStatus: 409, Operation: "squash_merge_pull_request", Cause: errors.New("merge protection rejected unresolved thread")}
+	if _, err := coordinator.MergePullRequest(context.Background(), mergeCommand(run), &pushValidator{}, reader, writer); err == nil || store.run.State != domain.StateAwaitingGitHubMergeability || writer.calls != 1 {
+		t.Fatalf("initial wait err=%v state=%s writes=%d", err, store.run.State, writer.calls)
+	}
+	reader.evidence.ReviewThreads[0].Resolved = true
+	store.inspection.Run = store.run
+	if _, err := coordinator.ReconcileGitHub(context.Background(), ProductionReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: store.run.State, IdempotencyKey: run.IdempotencyKey}, reader); err != nil || store.run.State != domain.StateMerging {
+		t.Fatalf("resolution err=%v state=%s", err, store.run.State)
+	}
+	// A human follow-up is retained only as a digest. It changes the tracked
+	// topology, so a retry must stop before claiming the merge side effect.
+	followup := domain.GitHubReviewComment{DatabaseID: 12, NodeID: "FOLLOWUP", ReplyToDatabaseID: 10, ReplyToNodeID: "ROOT", BodyDigest: domain.TrustedReviewFeedbackDigest("untrusted follow-up"), CreatedAt: reader.evidence.ObservedAt, UpdatedAt: reader.evidence.ObservedAt}
+	reader.evidence.ReviewThreads[0].Comments = append(reader.evidence.ReviewThreads[0].Comments, followup)
+	reader.handoff.Comments = append(reader.handoff.Comments, domain.InlineReviewBody{ThreadNodeID: reader.evidence.ReviewThreads[0].NodeID, CommentNodeID: followup.NodeID, Body: "untrusted follow-up", BodyDigest: followup.BodyDigest})
+	store.inspection.Run = store.run
+	if _, err := coordinator.MergePullRequest(context.Background(), mergeCommand(store.run), &pushValidator{}, reader, writer); err == nil || store.run.State != domain.StateManualIntervention || writer.calls != 1 {
+		t.Fatalf("topology drift err=%v state=%s writes=%d", err, store.run.State, writer.calls)
+	}
+}
+
+func TestProductionMergePolicyPendingPersistenceFailureCannotBypassOnRestart(t *testing.T) {
+	coordinator, store, run, reader, writer := newMergeCoordinator(t)
+	configureMergeabilityFixture(t, store, run, reader)
+	writer.err = &MergeRejectedError{HTTPStatus: 409, Operation: "squash_merge_pull_request", Cause: errors.New("merge protection rejected unresolved thread")}
+	store.mergePolicyErr = errors.New("injected pending-policy transaction failure")
+	if _, err := coordinator.MergePullRequest(context.Background(), mergeCommand(run), &pushValidator{}, reader, writer); err == nil || store.run.State != domain.StateMerging || store.side.Status != "intent" || writer.calls != 1 {
+		t.Fatalf("failed persistence err=%v state=%s side=%+v writes=%d", err, store.run.State, store.side, writer.calls)
+	}
+
+	// Emulate a recovered controller process after the tracked thread resolves.
+	// The original merge intent has no durable policy outcome, so it must be
+	// escalated instead of issuing a second merge write.
+	store.mergePolicyErr = nil
+	reader.evidence.ReviewThreads[0].Resolved = true
+	store.inspection.Run = store.run
+	restarted, err := NewProductionCoordinator(coordinator.admission, coordinator.controller, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restarted.MergePullRequest(context.Background(), mergeCommand(store.run), &pushValidator{}, reader, writer); err == nil || store.run.State != domain.StateManualIntervention || writer.calls != 1 {
+		t.Fatalf("restart err=%v state=%s writes=%d", err, store.run.State, writer.calls)
+	}
+}
+
+func TestProductionMergePolicyRereadFailureDoesNotValidateHandoffOrEnterManual(t *testing.T) {
+	coordinator, store, run, reader, writer := newMergeCoordinator(t)
+	configureMergeabilityFixture(t, store, run, reader)
+	writer.err = &MergeRejectedError{HTTPStatus: 409, Operation: "squash_merge_pull_request", Cause: errors.New("merge protection rejected unresolved thread")}
+	reader.err, reader.errorAt = errors.New("temporary GitHub read failure"), 2
+	reader.errorHandoff = domain.InlineReviewBodyHandoff{Comments: []domain.InlineReviewBody{{ThreadNodeID: "", CommentNodeID: "", Body: "", BodyDigest: ""}}}
+	if _, err := coordinator.MergePullRequest(context.Background(), mergeCommand(run), &pushValidator{}, reader, writer); err == nil || writer.calls != 1 || reader.calls != 2 || store.run.State != domain.StateMerging || store.side.Status != "failed" || !strings.Contains(store.side.ResultJSON, `"category":"merge_response_unavailable"`) {
+		t.Fatalf("err=%v writes=%d reads=%d state=%s side=%+v", err, writer.calls, reader.calls, store.run.State, store.side)
+	}
+}
+
+func TestProductionMergeabilityWaitExitsForApprovalAndAuthorityChanges(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		mutate    func(*mergeReader)
+		wantState domain.State
+		wantError bool
+	}{
+		{name: "approval dismissed", mutate: func(reader *mergeReader) { reader.evidence.Reviews[0].State = "DISMISSED" }, wantState: domain.StateAwaitingHumanApproval},
+		{name: "new change request", mutate: addExactHeadTrustedChangeRequest, wantState: domain.StateRepairing},
+		{name: "head drift", mutate: func(reader *mergeReader) { reader.evidence.PullRequest.HeadSHA = strings.Repeat("b", 40) }, wantState: domain.StateManualIntervention, wantError: true},
+		{name: "deleted reply", mutate: func(reader *mergeReader) {
+			reader.evidence.ReviewThreads[0].Comments = reader.evidence.ReviewThreads[0].Comments[:1]
+		}, wantState: domain.StateManualIntervention, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			coordinator, store, run, reader, _ := newMergeCoordinator(t)
+			store.run.State, run.State = domain.StateAwaitingGitHubMergeability, domain.StateAwaitingGitHubMergeability
+			configureMergeabilityFixture(t, store, run, reader)
+			setMergePolicyPendingSide(t, store, run, reader)
+			tc.mutate(reader)
+			result, err := coordinator.ReconcileGitHub(context.Background(), ProductionReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, reader)
+			if (err != nil) != tc.wantError || store.run.State != tc.wantState {
+				t.Fatalf("result=%+v err=%v state=%s transitions=%+v feedback=%+v", result, err, store.run.State, store.transitions, store.inspection.TrustedFeedback)
+			}
+			if tc.wantState == domain.StateRepairing && result.Action != ProductionContinueLocal {
+				t.Fatalf("new trusted change request must enter repair, result=%+v", result)
+			}
+			if tc.wantState == domain.StateRepairing && (len(store.savedFeedback) != 1 || store.savedFeedback[0].RootCommentNodeID != "NEW_ROOT") {
+				t.Fatalf("new trusted change request was not normalized for repair: %+v", store.savedFeedback)
+			}
+		})
+	}
+}
+
+func addExactHeadTrustedChangeRequest(reader *mergeReader) {
+	now := reader.evidence.ObservedAt.Add(time.Minute)
+	actor := reader.evidence.Reviews[0].Actor
+	body := "new exact-head change request"
+	digest := domain.TrustedReviewFeedbackDigest(body)
+	review := domain.GitHubReview{DatabaseID: 44, NodeID: "NEW_REVIEW", State: "CHANGES_REQUESTED", CommitSHA: reader.evidence.PullRequest.HeadSHA, SourceAt: now, Actor: actor}
+	reader.evidence.Reviews = []domain.GitHubReview{review}
+	reader.evidence.ReviewThreads = append(reader.evidence.ReviewThreads, domain.GitHubReviewThread{NodeID: "NEW_THREAD", OriginalCommitSHA: reader.evidence.PullRequest.HeadSHA, Comments: []domain.GitHubReviewComment{{DatabaseID: 45, NodeID: "NEW_ROOT", Author: &actor, Review: review, BodyDigest: digest, CreatedAt: now, UpdatedAt: now}}})
+	reader.handoff.Comments = append(reader.handoff.Comments, domain.InlineReviewBody{ThreadNodeID: "NEW_THREAD", CommentNodeID: "NEW_ROOT", Body: body, BodyDigest: digest})
+}
+
+func configureMergeabilityFixture(t *testing.T, store *pushTestStore, run Run, reader *mergeReader) {
+	t.Helper()
+	inspection, threadEvidence, handoff := mergePolicyThreadFixture(t)
+	feedback := &inspection.TrustedFeedback[0]
+	feedback.RunID = run.ID
+	feedback.PRNumber, feedback.PRDatabaseID, feedback.PRNodeID = store.pr.Number, store.pr.DatabaseID, store.pr.NodeID
+	feedback.OriginalReviewHeadSHA, feedback.BoundRepairHead = run.CandidateHead, run.CandidateHead
+	inspection.ReviewReplies[0].RunID = run.ID
+	inspection.ReviewReplies[0].PullRequestNumber, inspection.ReviewReplies[0].RepairedHead = store.pr.Number, run.CandidateHead
+	marker, markerDigest, err := domain.ReviewReplyMarker(run.ID, feedback.PRNumber, feedback.ThreadNodeID, feedback.RootCommentDatabaseID, feedback.RootCommentNodeID, feedback.BodyDigest, feedback.BoundRepairHead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replyBody, err := domain.ReviewReplyBody(feedback.BoundRepairHead, marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	feedback.ReplyIntentKey, inspection.ReviewReplies[0].MarkerDigest = markerDigest, markerDigest
+	handoff.Comments[1].Body = replyBody
+	handoff.Comments[1].BodyDigest = domain.TrustedReviewFeedbackDigest(replyBody)
+	threadEvidence.ReviewThreads[0].Comments[1].BodyDigest = handoff.Comments[1].BodyDigest
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	actor := feedback.Author
+	approval := domain.HumanApproval{PRNumber: store.pr.Number, Approver: actor.Login, Actor: actor, ReviewDatabaseID: 9, ReviewNodeID: "APPROVAL", Source: "github_pull_request_review", ApprovedSHA: run.CandidateHead, CIStatus: "pass", ReviewSHA: run.CandidateHead, ApprovedAt: now, ObservedAt: now}
+	store.inspection.Run = run
+	store.inspection.TrustedFeedback, store.inspection.ReviewReplies = inspection.TrustedFeedback, inspection.ReviewReplies
+	store.inspection.Approval = &approval
+	store.inspection.RepositoryBinding.TrustedOperatorActors = []TrustedActorIdentity{{DatabaseID: actor.DatabaseID, NodeID: actor.NodeID, Login: actor.Login, Type: actor.Type}}
+	threadEvidence.Repository, threadEvidence.PullRequest = reader.evidence.Repository, *store.pr
+	threadEvidence.Checks = []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: run.CandidateHead, State: domain.CheckSuccess}}
+	threadEvidence.Reviews = []domain.GitHubReview{{DatabaseID: 9, NodeID: "APPROVAL", State: "APPROVED", CommitSHA: run.CandidateHead, SourceAt: now, Actor: actor}}
+	threadEvidence.ObservedAt = now
+	reader.evidence, reader.handoff = threadEvidence, handoff
+	if threads, err := controllerRepliedMergeThreads(store.inspection, reader.evidence, reader.handoff); err != nil || len(threads) != 1 {
+		t.Fatalf("fixture topology threads=%+v err=%v", threads, err)
+	}
+}
+
+func setMergePolicyPendingSide(t *testing.T, store *pushTestStore, run Run, reader *mergeReader) {
+	t.Helper()
+	threads, err := controllerRepliedMergeThreads(store.inspection, reader.evidence, reader.handoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := mergePolicyPendingResult(run.CandidateHead, threads)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.side = SideEffectRecord{ID: 1, RunID: run.ID, Kind: "squash_merge", IdempotencyKey: run.CandidateHead, Status: "failed", ResultJSON: string(result), Attempt: 1}
 }
 
 func TestProductionPushReconcilesSameRemoteSHAWithoutInvokingGit(t *testing.T) {

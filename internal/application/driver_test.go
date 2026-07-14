@@ -300,6 +300,27 @@ func TestProductionDriverReturnsDurableManualStopAfterConflict(t *testing.T) {
 	}
 }
 
+func TestProductionDriverWaitsByReadingOnlyForGitHubMergeability(t *testing.T) {
+	reader := &driverRunReader{run: driverRun(domain.StateAwaitingGitHubMergeability)}
+	coordinator := &driverCoordinator{runs: reader}
+	coordinator.apply = func(action ProductionAction) error {
+		if action != ProductionReconcileGitHub {
+			t.Fatalf("unexpected action %s", action)
+		}
+		reader.run.State = domain.StateManualIntervention
+		return nil
+	}
+	driver := newDriverForTest(t, reader, coordinator, func(context.Context, time.Duration) error {
+		t.Fatal("read-only reconciliation moved to a durable stop and must not poll")
+		return nil
+	})
+
+	result, err := driver.Drive(context.Background(), driverCommand())
+	if err != nil || result.Run.State != domain.StateManualIntervention || len(coordinator.calls) != 1 || coordinator.calls[0] != ProductionReconcileGitHub {
+		t.Fatalf("result=%+v calls=%v err=%v", result, coordinator.calls, err)
+	}
+}
+
 func TestProductionDriverRequiresPersistedRequesterAuthorization(t *testing.T) {
 	reader := &driverRunReader{run: driverRun(domain.StateAwaitingHumanDecision)}
 	coordinator := &driverCoordinator{runs: reader}

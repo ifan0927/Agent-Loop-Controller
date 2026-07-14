@@ -103,8 +103,27 @@ func TestSquashMergeClassifiesForbiddenAsRejected(t *testing.T) {
 	defer server.Close()
 	_, err := mergeClient(t, key, server).SquashMerge(context.Background(), request)
 	var rejected *application.MergeRejectedError
-	if !errors.As(err, &rejected) || merges != 0 {
-		t.Fatalf("err=%v merges=%d", err, merges)
+	if !errors.As(err, &rejected) || rejected.HTTPStatus != http.StatusForbidden || rejected.Operation != "merge_pull_request_preflight" || merges != 0 {
+		t.Fatalf("err=%v rejected=%+v merges=%d", err, rejected, merges)
+	}
+}
+
+func TestSquashMergePreservesPolicyEligibleHTTPStatus(t *testing.T) {
+	_, key := testKey(t)
+	request := application.SquashMergeRequest{PullRequest: 7, HeadBranch: "ifan/one", BaseBranch: "main", ExpectedHeadSHA: "head", ExpectedBaseSHA: "base", OwnershipKey: "key"}
+	mux := http.NewServeMux()
+	installMergeToken(t, mux)
+	mux.HandleFunc("/repos/owner/repo", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"id":99,"node_id":"REPO","name":"repo","owner":{"login":"owner"}}`)
+	})
+	mux.HandleFunc("/repos/owner/repo/pulls/7", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, mergePullRequestJSON(false)) })
+	mux.HandleFunc("/repos/owner/repo/pulls/7/merge", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusConflict) })
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	_, err := mergeClient(t, key, server).SquashMerge(context.Background(), request)
+	var rejected *application.MergeRejectedError
+	if !errors.As(err, &rejected) || rejected.HTTPStatus != http.StatusConflict || rejected.Operation != "squash_merge_pull_request" {
+		t.Fatalf("err=%v rejected=%+v", err, rejected)
 	}
 }
 

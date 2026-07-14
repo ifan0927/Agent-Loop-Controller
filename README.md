@@ -75,6 +75,16 @@ exact-HEAD `APPROVED` pull-request review from a configured immutable GitHub
 approval, dismissal, changes-requested, stale-head, and rejected lookalike
 evidence; it never treats a login or App/Bot identity as human approval.
 
+If GitHub rejects an otherwise guarded squash merge with a policy-compatible
+`405`, `409`, or `422`, the controller does one new stable read. It enters
+`awaiting_github_mergeability` only when that read still proves the immutable
+owned PR, exact head, passing checks, valid approval, and an unresolved thread
+previously replied to by the controller. This state is read-only: it never
+resolves a conversation or repeats a merge request. Once GitHub shows the
+tracked thread resolved, the ordinary exact-head merge gates are read again
+before one retry. Authority drift, ambiguous topology, missing reply evidence,
+or any other rejection requires `manual_intervention`.
+
 `controller run` is the normal production entrypoint. It accepts one explicit
 IFAN identifier and complete requester identity, re-fetches the authoritative
 source, enforces coding-ready eligibility, matches exactly one

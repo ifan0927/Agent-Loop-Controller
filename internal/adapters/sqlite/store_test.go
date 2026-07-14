@@ -85,6 +85,81 @@ func TestGitHubV6EvidencePersistsMetadataWithoutSecrets(t *testing.T) {
 	}
 }
 
+func TestRetryMergeSideEffectClaimsOnePolicyRetry(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run := application.Run{ID: "merge-retry", IssueID: "IFAN-MERGE", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: "/tmp/merge-retry", ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}
+	if _, _, err := store.CreateRun(context.Background(), application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	side, _, err := store.BeginSideEffect(context.Background(), application.SideEffectRecord{RunID: run.ID, Kind: "squash_merge", IdempotencyKey: strings.Repeat("a", 40), IntentJSON: `{"pull_request":1}`, Attempt: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	side.Status, side.ResultJSON = "failed", `{"category":"merge_policy_pending"}`
+	if err := store.FinishSideEffect(context.Background(), side); err != nil {
+		t.Fatal(err)
+	}
+	claimed, changed, err := store.RetryMergeSideEffect(context.Background(), side)
+	if err != nil || !changed || claimed.Status != "intent" || claimed.Attempt != 2 || !strings.Contains(claimed.ResultJSON, "merge_policy_retry_claimed") {
+		t.Fatalf("claimed=%+v changed=%v err=%v", claimed, changed, err)
+	}
+	if _, changed, err := store.RetryMergeSideEffect(context.Background(), side); err != nil || changed {
+		t.Fatalf("second claim changed=%v err=%v", changed, err)
+	}
+}
+
+func TestRecordMergePolicyPendingAtomicallyPersistsWaitAndTopology(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	head := strings.Repeat("b", 40)
+	run := application.Run{ID: "merge-policy-pending", IssueID: "IFAN-POLICY", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: "/tmp/merge-policy-pending", ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}
+	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCandidateHead(ctx, run.ID, head); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE runs SET current_state=? WHERE run_id=?`, domain.StateMerging, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	side, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{RunID: run.ID, Kind: "squash_merge", IdempotencyKey: head, IntentJSON: `{"pull_request":1}`, Attempt: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := json.Marshal(struct {
+		Category string                          `json:"category"`
+		Head     string                          `json:"head"`
+		Threads  []application.MergePolicyThread `json:"threads"`
+	}{Category: "merge_policy_pending", Head: head, Threads: []application.MergePolicyThread{{ThreadNodeID: "THREAD", RootCommentNodeID: "ROOT", RootCommentID: 1, ReplyNodeID: "REPLY", ReplyID: 2, TopologyDigest: strings.Repeat("c", 64)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	side.Status, side.ResultJSON, side.ObservedAt = "failed", string(pending), time.Now().UTC()
+	if err := store.RecordMergePolicyPending(ctx, run.ID, side, head); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.GetRun(ctx, run.ID)
+	if err != nil || stored.State != domain.StateAwaitingGitHubMergeability || stored.LastError != "merge_policy_pending" {
+		t.Fatalf("run=%+v err=%v", stored, err)
+	}
+	inspection, err := store.Inspect(ctx, run.ID)
+	if err != nil || len(inspection.SideEffects) != 1 || inspection.SideEffects[0].Status != "failed" || !strings.Contains(inspection.SideEffects[0].ResultJSON, `"category":"merge_policy_pending"`) {
+		t.Fatalf("inspection=%+v err=%v", inspection, err)
+	}
+	var transitions int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM transitions WHERE run_id=? AND from_state=? AND to_state=?`, run.ID, domain.StateMerging, domain.StateAwaitingGitHubMergeability).Scan(&transitions); err != nil || transitions != 1 {
+		t.Fatalf("transitions=%d err=%v", transitions, err)
+	}
+}
+
 func TestGitHubReadSuccessPersistsEvidenceAndGateTransitionAtomically(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {

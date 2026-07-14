@@ -33,13 +33,13 @@ func (c *Client) SquashMerge(ctx context.Context, request application.SquashMerg
 		return domain.PullRequest{}, err
 	}
 	if err := c.verifyRepository(ctx); err != nil {
-		return domain.PullRequest{}, mergeRequestFailure(err)
+		return domain.PullRequest{}, mergeRequestFailure("verify_repository", err)
 	}
 
 	var before rawPR
 	path := fmt.Sprintf("/repos/%s/%s/pulls/%d", url.PathEscape(c.cfg.RepositoryOwner), url.PathEscape(c.cfg.RepositoryName), request.PullRequest)
 	if err := c.rest(ctx, "merge_pull_request_preflight", "GET", path, nil, &before, true); err != nil {
-		return domain.PullRequest{}, mergeRequestFailure(err)
+		return domain.PullRequest{}, mergeRequestFailure("merge_pull_request_preflight", err)
 	}
 	if err := c.validateMergeTarget(before, request, false); err != nil {
 		return domain.PullRequest{}, mergeRejected(err)
@@ -57,7 +57,7 @@ func (c *Client) SquashMerge(ctx context.Context, request application.SquashMerg
 		Message string `json:"message"`
 	}
 	if err := c.rest(ctx, "squash_merge_pull_request", "PUT", path+"/merge", bytes.NewReader(payload), &response, true); err != nil {
-		return domain.PullRequest{}, mergeRequestFailure(err)
+		return domain.PullRequest{}, mergeRequestFailure("squash_merge_pull_request", err)
 	}
 	if !response.Merged || strings.TrimSpace(response.SHA) == "" {
 		return domain.PullRequest{}, mergeRejected(errors.New("GitHub did not confirm squash merge"))
@@ -76,7 +76,7 @@ func (c *Client) SquashMerge(ctx context.Context, request application.SquashMerg
 	return merged, nil
 }
 
-func mergeRequestFailure(err error) error {
+func mergeRequestFailure(operation string, err error) error {
 	var status *statusError
 	if !errors.As(err, &status) {
 		return err
@@ -84,7 +84,7 @@ func mergeRequestFailure(err error) error {
 	if status.status != http.StatusForbidden && status.status != http.StatusNotFound && status.status != http.StatusMethodNotAllowed && status.status != http.StatusConflict && status.status != http.StatusUnprocessableEntity {
 		return err
 	}
-	return &application.MergeRejectedError{Cause: err}
+	return &application.MergeRejectedError{HTTPStatus: status.status, Operation: operation, Cause: err}
 }
 
 func mergeRejected(err error) error { return &application.MergeRejectedError{Cause: err} }

@@ -110,6 +110,9 @@ func (c *ProductionCoordinator) ReconcileGitHub(ctx context.Context, command Pro
 	if action != ProductionReconcileGitHub {
 		return ProductionResult{Action: action, Run: projectRunResult(run), Reason: reason}, nil
 	}
+	if run.State == domain.StateAwaitingGitHubMergeability {
+		return c.reconcileMergeability(ctx, command, run, reader)
+	}
 	inspection, err := c.store.Inspect(ctx, run.ID)
 	if err != nil {
 		return ProductionResult{}, classifyServiceError(err)
@@ -143,6 +146,8 @@ func productionNextAction(state domain.State) (ProductionAction, string) {
 		return ProductionOpenPullRequest, "pushed exact candidate may open its one owned pull request"
 	case domain.StateMerging:
 		return ProductionMerge, "trusted exact-HEAD approval requires a guarded squash merge"
+	case domain.StateAwaitingGitHubMergeability:
+		return ProductionReconcileGitHub, "GitHub merge protection requires read-only resolution observation"
 	case domain.StateAwaitingLinearCompletion:
 		return ProductionReconcileLinear, "authoritative merge requires bounded read-only Linear completion observation"
 	case domain.StateCleaning:
