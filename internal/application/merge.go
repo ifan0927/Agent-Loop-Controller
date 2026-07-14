@@ -386,7 +386,11 @@ func (c *ProductionCoordinator) reconcileMergeability(ctx context.Context, comma
 			return ReconcileResult{}, serviceError(ErrorInternal, "build immutable squash merge intent", err)
 		}
 		expectedRepository, err := mergeExpectedRepository(inspection)
-		if err != nil || ReconcileGitHubRead(expectedRepository, *inspection.PullRequest, request.HeadBranch, request.BaseBranch, request.ExpectedHeadSHA, request.ExpectedBaseSHA, request.OwnershipKey, inspection.PullRequest.BodyDigest, evidence) != nil {
+		reconcileErr := ReconcileGitHubRead(expectedRepository, *inspection.PullRequest, request.HeadBranch, request.BaseBranch, request.ExpectedHeadSHA, request.ExpectedBaseSHA, request.OwnershipKey, inspection.PullRequest.BodyDigest, evidence)
+		if err != nil || reconcileErr != nil {
+			if err == nil && sameMergeabilityRepository(expectedRepository, evidence.Repository) && pullRequestTargetDrift(*inspection.PullRequest, evidence.PullRequest) {
+				return ReconcileResult{}, c.mergeabilityManualTargetDriftAfterRead(leaseCtx, inspection.Run, owner, *inspection.PullRequest, expectedRepository, observations, metadata, evidence)
+			}
 			return ReconcileResult{}, c.mergeabilityManualAfterRead(leaseCtx, inspection.Run, owner, observations, metadata, evidence, "GitHub mergeability authority drifted")
 		}
 		if evidence.DeliveryStatus() != domain.ReconciliationPass {
@@ -479,6 +483,34 @@ func (c *ProductionCoordinator) mergeabilityManualAfterRead(ctx context.Context,
 		return err
 	}
 	return serviceError(ErrorConflict, "GitHub mergeability requires manual intervention", nil)
+}
+
+// mergeabilityManualTargetDriftAfterRead preserves the original immutable PR
+// binding while atomically retaining only sanitized conflict evidence. This is
+// intentionally limited to the read-only mergeability wait: no normal
+// reconciliation path may use a conflicting target as a persisted PR update.
+func (c *ProductionCoordinator) mergeabilityManualTargetDriftAfterRead(ctx context.Context, run Run, owner string, persisted domain.PullRequest, repository domain.RepositoryIdentity, observations []GitHubRequestObservation, metadata GitHubInstallationMetadata, evidence domain.GitHubReadEvidence) error {
+	persister, ok := c.store.(interface {
+		SaveGitHubManualPRTargetDrift(context.Context, string, string, domain.State, string, domain.RepositoryIdentity, domain.PullRequest, []GitHubRequestObservation, GitHubInstallationMetadata, domain.GitHubReadEvidence, string) error
+	})
+	if !ok {
+		return serviceError(ErrorInternal, "manual GitHub target-drift persistence is unavailable", nil)
+	}
+	if err := persister.SaveGitHubManualPRTargetDrift(ctx, run.ID, owner, domain.StateAwaitingGitHubMergeability, run.IdempotencyKey, repository, persisted, observations, metadata, evidence, "GitHub pull request target drifted while awaiting thread resolution"); err != nil {
+		return classifyServiceError(err)
+	}
+	return serviceError(ErrorConflict, "GitHub mergeability requires manual intervention", nil)
+}
+
+func pullRequestTargetDrift(persisted, observed domain.PullRequest) bool {
+	if observed.Number != persisted.Number || observed.NodeID != persisted.NodeID || observed.URL != persisted.URL || (persisted.DatabaseID > 0 && observed.DatabaseID != persisted.DatabaseID) {
+		return false
+	}
+	return observed.BodyDigest == persisted.BodyDigest && (observed.HeadBranch != persisted.HeadBranch || observed.BaseBranch != persisted.BaseBranch || observed.HeadSHA != persisted.HeadSHA || observed.BaseSHA != persisted.BaseSHA || observed.OwnershipKey != persisted.OwnershipKey)
+}
+
+func sameMergeabilityRepository(expected, observed domain.RepositoryIdentity) bool {
+	return expected.ID == observed.ID && (expected.NodeID == "" || expected.NodeID == observed.NodeID) && strings.EqualFold(expected.Owner, observed.Owner) && strings.EqualFold(expected.Name, observed.Name)
 }
 
 func (c *ProductionCoordinator) mergeabilityManual(ctx context.Context, run Run, reason string) error {

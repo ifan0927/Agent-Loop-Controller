@@ -58,30 +58,34 @@ func TestProductionContinueUsesOnlyPersistedRepairFindings(t *testing.T) {
 
 type pushTestStore struct {
 	admissionStore
-	run              Run
-	inspection       RunInspection
-	side             SideEffectRecord
-	transitions      []Transition
-	resources        []OwnedResource
-	pr               *domain.PullRequest
-	merge            *MergeRecord
-	github           []domain.GitHubReadEvidence
-	savedFeedback    []TrustedReviewFeedbackRecord
-	requests         []GitHubRequestObservation
-	linearCompletion []LinearCompletionObservation
-	linearRequests   []LinearRequestObservation
-	metadata         []GitHubInstallationMetadata
-	cleanup          []CleanupRecord
-	cleanupWrites    int
-	cleanupFailAt    int
-	requestErr       error
-	mergePolicyErr   error
-	finalizeErr      error
-	finalizeCalls    int
-	completion       ReviewReplyCompletion
-	leaseMu          sync.Mutex
-	leaseHeld        bool
-	leaseLost        bool
+	run               Run
+	inspection        RunInspection
+	side              SideEffectRecord
+	transitions       []Transition
+	resources         []OwnedResource
+	pr                *domain.PullRequest
+	merge             *MergeRecord
+	github            []domain.GitHubReadEvidence
+	savedFeedback     []TrustedReviewFeedbackRecord
+	requests          []GitHubRequestObservation
+	linearCompletion  []LinearCompletionObservation
+	linearRequests    []LinearRequestObservation
+	metadata          []GitHubInstallationMetadata
+	cleanup           []CleanupRecord
+	cleanupWrites     int
+	cleanupFailAt     int
+	requestErr        error
+	genericReadErr    error
+	manualTargetErr   error
+	genericReadCalls  int
+	manualTargetCalls int
+	mergePolicyErr    error
+	finalizeErr       error
+	finalizeCalls     int
+	completion        ReviewReplyCompletion
+	leaseMu           sync.Mutex
+	leaseHeld         bool
+	leaseLost         bool
 }
 
 func (s *pushTestStore) AcquireLease(context.Context, string, string, time.Time) (bool, error) {
@@ -294,8 +298,12 @@ func (s *pushTestStore) SaveGitHubEvidence(_ context.Context, _ string, value do
 	return nil
 }
 func (s *pushTestStore) SaveGitHubReadSuccess(_ context.Context, _ string, _ string, expected domain.State, key string, observations []GitHubRequestObservation, pr domain.PullRequest, metadata GitHubInstallationMetadata, evidence domain.GitHubReadEvidence, feedback []TrustedReviewFeedbackRecord, observed *domain.HumanApprovalObservation, approval *domain.HumanApproval, next domain.State, reason string) error {
+	s.genericReadCalls++
 	if s.run.State != expected || s.run.IdempotencyKey != key {
 		return errors.New("unexpected GitHub read authority")
+	}
+	if s.genericReadErr != nil {
+		return s.genericReadErr
 	}
 	s.requests = append(s.requests, observations...)
 	s.metadata = append(s.metadata, metadata)
@@ -308,6 +316,20 @@ func (s *pushTestStore) SaveGitHubReadSuccess(_ context.Context, _ string, _ str
 		return s.Transition(context.Background(), "", expected, next, reason, "github_read_evidence", s.run.CandidateHead)
 	}
 	return nil
+}
+func (s *pushTestStore) SaveGitHubManualPRTargetDrift(_ context.Context, _ string, _ string, expected domain.State, key string, _ domain.RepositoryIdentity, persisted domain.PullRequest, observations []GitHubRequestObservation, metadata GitHubInstallationMetadata, evidence domain.GitHubReadEvidence, reason string) error {
+	s.manualTargetCalls++
+	if s.run.State != expected || s.run.IdempotencyKey != key || s.pr == nil || *s.pr != persisted {
+		return errors.New("unexpected manual target-drift authority")
+	}
+	if s.manualTargetErr != nil {
+		return s.manualTargetErr
+	}
+	s.requests = append(s.requests, observations...)
+	s.metadata = append(s.metadata, metadata)
+	s.github = append(s.github, evidence)
+	s.inspection.GitHubEvidence = &evidence
+	return s.Transition(context.Background(), "", expected, domain.StateManualIntervention, reason, "github_read_evidence", persisted.HeadSHA)
 }
 func (s *pushTestStore) SaveGitHubReadFailure(_ context.Context, _ string, _ string, expected domain.State, key string, observations []GitHubRequestObservation) error {
 	if s.run.State != expected || s.run.IdempotencyKey != key {
@@ -831,6 +853,13 @@ func TestProductionMergeabilityResolutionDriftRemainsManual(t *testing.T) {
 		{name: "head", mutate: func(reader *mergeReader) {
 			reader.evidence.PullRequest.HeadSHA = strings.Repeat("b", 40)
 		}},
+		{name: "base", mutate: func(reader *mergeReader) {
+			reader.evidence.PullRequest.BaseBranch = "release"
+			reader.evidence.PullRequest.BaseSHA = strings.Repeat("c", 40)
+		}},
+		{name: "ownership", mutate: func(reader *mergeReader) {
+			reader.evidence.PullRequest.OwnershipKey = "different-controller"
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			coordinator, store, run, reader, writer := newMergeCoordinator(t)
@@ -843,8 +872,70 @@ func TestProductionMergeabilityResolutionDriftRemainsManual(t *testing.T) {
 			tc.mutate(reader)
 
 			_, err := coordinator.ReconcileGitHub(context.Background(), ProductionReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: store.run.State, IdempotencyKey: run.IdempotencyKey}, reader)
-			if err == nil || store.run.State != domain.StateManualIntervention || writer.calls != 0 {
+			if err == nil || store.run.State != domain.StateManualIntervention || writer.calls != 0 || store.pr == nil || *store.pr != *store.inspection.PullRequest {
 				t.Fatalf("err=%v state=%s writes=%d", err, store.run.State, writer.calls)
+			}
+		})
+	}
+}
+
+func TestProductionMergeabilityTargetDriftUsesSpecialPersistence(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*mergeReader)
+	}{
+		{name: "base", mutate: func(reader *mergeReader) {
+			reader.evidence.PullRequest.BaseBranch, reader.evidence.PullRequest.BaseSHA = "release", strings.Repeat("c", 40)
+		}},
+		{name: "head", mutate: func(reader *mergeReader) {
+			reader.evidence.PullRequest.HeadBranch, reader.evidence.PullRequest.HeadSHA = "other-feature", strings.Repeat("b", 40)
+		}},
+		{name: "ownership", mutate: func(reader *mergeReader) { reader.evidence.PullRequest.OwnershipKey = "other-controller" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			coordinator, store, run, reader, writer := newMergeCoordinator(t)
+			store.run.State, run.State = domain.StateAwaitingGitHubMergeability, domain.StateAwaitingGitHubMergeability
+			configureMergeabilityFixture(t, store, run, reader)
+			setMergePolicyPendingSide(t, store, run, reader)
+			store.inspection.Run = store.run
+			persisted := *store.pr
+			store.genericReadErr = errors.New("generic persistence must not receive target-only drift")
+			reader.evidence.ReviewThreads[0].Resolved = true
+			reader.evidence.ObservedAt = reader.evidence.ObservedAt.Add(time.Minute)
+			tc.mutate(reader)
+
+			_, err := coordinator.ReconcileGitHub(context.Background(), ProductionReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: store.run.State, IdempotencyKey: run.IdempotencyKey}, reader)
+			if err == nil || store.run.State != domain.StateManualIntervention || writer.calls != 0 || store.manualTargetCalls != 1 || store.genericReadCalls != 0 || store.pr == nil || *store.pr != persisted {
+				t.Fatalf("target drift route err=%v state=%s writes=%d special=%d generic=%d persisted=%+v", err, store.run.State, writer.calls, store.manualTargetCalls, store.genericReadCalls, store.pr)
+			}
+		})
+	}
+}
+
+func TestProductionMergeabilityNonTargetDriftUsesGenericPersistenceAndFails(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*mergeReader)
+	}{
+		{name: "repository", mutate: func(reader *mergeReader) { reader.evidence.Repository.ID = 100 }},
+		{name: "body", mutate: func(reader *mergeReader) { reader.evidence.PullRequest.BodyDigest = "other-body" }},
+		{name: "pull request identity", mutate: func(reader *mergeReader) { reader.evidence.PullRequest.URL = "https://example.invalid/pr/other" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			coordinator, store, run, reader, writer := newMergeCoordinator(t)
+			store.run.State, run.State = domain.StateAwaitingGitHubMergeability, domain.StateAwaitingGitHubMergeability
+			configureMergeabilityFixture(t, store, run, reader)
+			setMergePolicyPendingSide(t, store, run, reader)
+			store.inspection.Run = store.run
+			persisted := *store.pr
+			store.genericReadErr = errors.New("generic persistence rejected immutable drift")
+			reader.evidence.ReviewThreads[0].Resolved = true
+			reader.evidence.ObservedAt = reader.evidence.ObservedAt.Add(time.Minute)
+			tc.mutate(reader)
+
+			_, err := coordinator.ReconcileGitHub(context.Background(), ProductionReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: store.run.State, IdempotencyKey: run.IdempotencyKey}, reader)
+			if err == nil || store.run.State != domain.StateAwaitingGitHubMergeability || writer.calls != 0 || store.manualTargetCalls != 0 || store.genericReadCalls != 1 || store.pr == nil || *store.pr != persisted {
+				t.Fatalf("non-target drift route err=%v state=%s writes=%d special=%d generic=%d persisted=%+v", err, store.run.State, writer.calls, store.manualTargetCalls, store.genericReadCalls, store.pr)
 			}
 		})
 	}
