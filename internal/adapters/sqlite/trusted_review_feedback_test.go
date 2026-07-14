@@ -260,6 +260,126 @@ func TestTrustedReviewFeedbackTransitionRequiresStageEvidence(t *testing.T) {
 	}
 }
 
+func TestFinalizeReviewReplyIsAtomicAcrossLifecycleEvidenceAndSideEffect(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	createFeedbackRun(t, store, "atomic-reply")
+	if ok, err := store.AcquireLease(ctx, "atomic-reply", "reply-owner", time.Now().Add(time.Minute)); err != nil || !ok {
+		t.Fatalf("acquire lease ok=%t err=%v", ok, err)
+	}
+	if err := store.SaveReviewReplyObservations(ctx, "atomic-reply", "reply-owner", []application.GitHubRequestObservation{{RunID: "atomic-reply", Operation: "review_comment_replies", Category: "REST", ErrorClass: "transport_failure", InstallationID: 2, Repository: domain.RepositoryIdentity{ID: 99, Owner: "owner", Name: "repo"}, ObservedAt: time.Now().UTC()}}); err != nil {
+		t.Fatal(err)
+	}
+	feedback := feedbackRecord("atomic-reply")
+	feedback.RootCommentNodeID, feedback.RootCommentDatabaseID = "COMMENT_atomic", 71
+	if _, _, err := store.SaveTrustedReviewFeedback(ctx, feedback); err != nil {
+		t.Fatal(err)
+	}
+	head := strings.Repeat("b", 40)
+	if _, ok, err := store.TransitionTrustedReviewFeedback(ctx, feedback.RunID, feedback.RootCommentNodeID, domain.TrustedReviewFeedbackObserved, domain.TrustedReviewFeedbackSelectedForRepair, "", "", 0, "", false, false); err != nil || !ok {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.TransitionTrustedReviewFeedback(ctx, feedback.RunID, feedback.RootCommentNodeID, domain.TrustedReviewFeedbackSelectedForRepair, domain.TrustedReviewFeedbackRepairVerified, head, "", 0, "", false, false); err != nil || !ok {
+		t.Fatal(err)
+	}
+	intent := strings.Repeat("c", 64)
+	side, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{RunID: feedback.RunID, Kind: "reply_to_review_comment", IdempotencyKey: intent, IntentJSON: `{"pull_request":1}`, Attempt: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.TransitionTrustedReviewFeedback(ctx, feedback.RunID, feedback.RootCommentNodeID, domain.TrustedReviewFeedbackRepairVerified, domain.TrustedReviewFeedbackReplyPending, head, intent, 0, "", false, false); err != nil || !ok {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE runs SET lease_expires_unix=0 WHERE run_id=?`, feedback.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, changed, err := store.TransitionReviewReplyFeedback(ctx, feedback.RunID, "reply-owner", feedback.RootCommentNodeID, domain.TrustedReviewFeedbackReplyPending, domain.TrustedReviewFeedbackResolved, head, intent, 0, "", true, false); err == nil || changed {
+		t.Fatalf("expired lease changed=%t err=%v", changed, err)
+	}
+	if ok, err := store.AcquireLease(ctx, feedback.RunID, "reply-owner", time.Now().Add(time.Minute)); err != nil || !ok {
+		t.Fatalf("reacquire lease ok=%t err=%v", ok, err)
+	}
+	side.Status = "failed"
+	if err := store.FinishReviewReplySideEffect(ctx, "reply-owner", side); err != nil {
+		t.Fatal(err)
+	}
+	if retried, changed, err := store.RetryReviewReplySideEffect(ctx, "reply-owner", side, 3); err != nil || !changed || retried.Status != "intent" || retried.Attempt != 2 {
+		t.Fatalf("retried=%+v changed=%t err=%v", retried, changed, err)
+	}
+	completion := application.ReviewReplyCompletion{Feedback: feedback, Head: head, Side: side, Reply: domain.ReviewReply{DatabaseID: 72, NodeID: "COMMENT_REPLY_72", ReplyToID: feedback.RootCommentDatabaseID, Actor: domain.ActorIdentity{AppID: 1}, CreatedAt: time.Now().UTC()}, Observations: []application.GitHubRequestObservation{{RunID: feedback.RunID, Operation: "reply_to_review_comment", Category: "REST", HTTPStatus: 201, ResponseDigest: strings.Repeat("d", 64), InstallationID: 2, Repository: domain.RepositoryIdentity{ID: 99, NodeID: "REPO", Owner: "owner", Name: "repo"}, ObservedAt: time.Now().UTC()}}, LeaseOwner: "reply-owner"}
+	assertPending := func() {
+		inspection, inspectErr := store.Inspect(ctx, feedback.RunID)
+		if inspectErr != nil || inspection.TrustedFeedback[0].Lifecycle != domain.TrustedReviewFeedbackReplyPending || len(inspection.ReviewReplies) != 0 || inspection.SideEffects[0].Status != "intent" {
+			t.Fatalf("inspection=%+v err=%v", inspection, inspectErr)
+		}
+	}
+	wrongPR := completion
+	wrongPR.Feedback.PRNumber++
+	if ok, err := store.FinalizeReviewReply(ctx, wrongPR); err != nil || ok {
+		t.Fatalf("wrong PR ok=%t err=%v", ok, err)
+	}
+	assertPending()
+	wrongCallerRoot := completion
+	wrongCallerRoot.Feedback.RootCommentDatabaseID++
+	if ok, err := store.FinalizeReviewReply(ctx, wrongCallerRoot); err != nil || ok {
+		t.Fatalf("wrong caller root ok=%t err=%v", ok, err)
+	}
+	assertPending()
+	wrongRoot := completion
+	wrongRoot.Reply.ReplyToID++
+	if ok, err := store.FinalizeReviewReply(ctx, wrongRoot); err != nil || ok {
+		t.Fatalf("wrong root ok=%t err=%v", ok, err)
+	}
+	assertPending()
+	if _, err := store.db.ExecContext(ctx, `CREATE TRIGGER fail_reply_evidence BEFORE INSERT ON trusted_review_reply_evidence BEGIN SELECT RAISE(ABORT,'fault'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := store.FinalizeReviewReply(ctx, completion); err == nil || ok {
+		t.Fatalf("ok=%t err=%v", ok, err)
+	}
+	inspection, err := store.Inspect(ctx, feedback.RunID)
+	if err != nil || inspection.TrustedFeedback[0].Lifecycle != domain.TrustedReviewFeedbackReplyPending || len(inspection.ReviewReplies) != 0 || inspection.SideEffects[0].Status != "intent" {
+		t.Fatalf("inspection=%+v err=%v", inspection, err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DROP TRIGGER fail_reply_evidence`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `CREATE TRIGGER fail_reply_observation BEFORE INSERT ON github_request_observations BEGIN SELECT RAISE(ABORT,'fault'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := store.FinalizeReviewReply(ctx, completion); err == nil || ok {
+		t.Fatalf("ok=%t err=%v", ok, err)
+	}
+	assertPending()
+	if _, err := store.db.ExecContext(ctx, `DROP TRIGGER fail_reply_observation`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `CREATE TRIGGER fail_reply_side_effect BEFORE UPDATE OF status ON side_effects BEGIN SELECT RAISE(ABORT,'fault'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := store.FinalizeReviewReply(ctx, completion); err == nil || ok {
+		t.Fatalf("ok=%t err=%v", ok, err)
+	}
+	inspection, err = store.Inspect(ctx, feedback.RunID)
+	if err != nil || inspection.TrustedFeedback[0].Lifecycle != domain.TrustedReviewFeedbackReplyPending || len(inspection.ReviewReplies) != 0 || inspection.SideEffects[0].Status != "intent" {
+		t.Fatalf("inspection=%+v err=%v", inspection, err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DROP TRIGGER fail_reply_side_effect`); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := store.FinalizeReviewReply(ctx, completion); err != nil || !ok {
+		t.Fatalf("ok=%t err=%v", ok, err)
+	}
+	inspection, err = store.Inspect(ctx, feedback.RunID)
+	if err != nil || inspection.TrustedFeedback[0].Lifecycle != domain.TrustedReviewFeedbackReplied || len(inspection.ReviewReplies) != 1 || len(inspection.GitHubRequests) != 2 || inspection.SideEffects[0].Status != "observed" {
+		t.Fatalf("inspection=%+v err=%v", inspection, err)
+	}
+}
+
 func TestTrustedReviewFeedbackMigratesExistingRuns(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
 	store, err := Open(path)

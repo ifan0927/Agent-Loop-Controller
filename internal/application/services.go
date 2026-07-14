@@ -1125,7 +1125,10 @@ func (s CommandService) reconcileLocked(ctx context.Context, command ReconcileCo
 			reason = "GitHub evidence has unsupported actionable findings"
 		}
 	}
-	if run.State == domain.StateAwaitingHumanApproval && status == domain.ReconciliationPass && approvalObservation != nil && approvalObservation.Status == domain.HumanApprovalApproved && approval != nil {
+	if status == domain.ReconciliationPass && hasOutstandingReviewReply(inspection.TrustedFeedback, run.CandidateHead) {
+		next, reason = domain.StateReplyingReviewFeedback, "verified trusted inline repair requires a controller reply"
+	}
+	if next != domain.StateReplyingReviewFeedback && run.State == domain.StateAwaitingHumanApproval && status == domain.ReconciliationPass && approvalObservation != nil && approvalObservation.Status == domain.HumanApprovalApproved && approval != nil {
 		if err := approval.Authorizes(command.Evidence.PullRequest, run.CandidateHead); err != nil {
 			return ReconcileResult{}, serviceError(ErrorConflict, "human approval is not bound to the exact final head", err)
 		}
@@ -1162,6 +1165,15 @@ func selectedFeedbackForAdmission(observed []TrustedReviewFeedbackRecord) []Trus
 		result[index].Lifecycle = domain.TrustedReviewFeedbackSelectedForRepair
 	}
 	return result
+}
+
+func hasOutstandingReviewReply(items []TrustedReviewFeedbackRecord, head string) bool {
+	for _, item := range items {
+		if (item.Lifecycle == domain.TrustedReviewFeedbackRepairVerified || item.Lifecycle == domain.TrustedReviewFeedbackReplyPending) && !item.Resolved && item.BoundRepairHead == head {
+			return true
+		}
+	}
+	return false
 }
 
 func trustedHumanActors(inspection RunInspection) ([]domain.ActorIdentity, error) {

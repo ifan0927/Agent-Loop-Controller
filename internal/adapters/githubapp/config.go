@@ -12,35 +12,37 @@ import (
 )
 
 type Config struct {
-	APIBaseURL        string        `json:"api_base_url"`
-	GraphQLURL        string        `json:"graphql_url"`
-	AppID             int64         `json:"app_id"`
-	InstallationID    int64         `json:"installation_id"`
-	RepositoryOwner   string        `json:"repository_owner"`
-	RepositoryName    string        `json:"repository_name"`
-	RepositoryID      int64         `json:"repository_id"`
-	PrivateKeyFile    string        `json:"private_key_file"`
-	HTTPTimeout       time.Duration `json:"http_timeout"`
-	TokenRefreshSkew  time.Duration `json:"token_refresh_skew"`
-	APIVersion        string        `json:"api_version"`
-	PullRequestsWrite bool          `json:"pull_requests_write"`
-	SquashMergeWrite  bool          `json:"squash_merge_write"`
+	APIBaseURL          string        `json:"api_base_url"`
+	GraphQLURL          string        `json:"graphql_url"`
+	AppID               int64         `json:"app_id"`
+	InstallationID      int64         `json:"installation_id"`
+	RepositoryOwner     string        `json:"repository_owner"`
+	RepositoryName      string        `json:"repository_name"`
+	RepositoryID        int64         `json:"repository_id"`
+	PrivateKeyFile      string        `json:"private_key_file"`
+	HTTPTimeout         time.Duration `json:"http_timeout"`
+	TokenRefreshSkew    time.Duration `json:"token_refresh_skew"`
+	APIVersion          string        `json:"api_version"`
+	PullRequestsWrite   bool          `json:"pull_requests_write"`
+	SquashMergeWrite    bool          `json:"squash_merge_write"`
+	ReviewCommentsWrite bool          `json:"review_comments_write"`
 }
 
 type configFile struct {
-	APIBaseURL        string `json:"api_base_url"`
-	GraphQLURL        string `json:"graphql_url"`
-	AppID             int64  `json:"app_id"`
-	InstallationID    int64  `json:"installation_id"`
-	RepositoryOwner   string `json:"repository_owner"`
-	RepositoryName    string `json:"repository_name"`
-	RepositoryID      int64  `json:"repository_id"`
-	PrivateKeyFile    string `json:"private_key_file"`
-	HTTPTimeout       string `json:"http_timeout"`
-	TokenRefreshSkew  string `json:"token_refresh_skew"`
-	APIVersion        string `json:"api_version"`
-	PullRequestsWrite bool   `json:"pull_requests_write"`
-	SquashMergeWrite  bool   `json:"squash_merge_write"`
+	APIBaseURL          string `json:"api_base_url"`
+	GraphQLURL          string `json:"graphql_url"`
+	AppID               int64  `json:"app_id"`
+	InstallationID      int64  `json:"installation_id"`
+	RepositoryOwner     string `json:"repository_owner"`
+	RepositoryName      string `json:"repository_name"`
+	RepositoryID        int64  `json:"repository_id"`
+	PrivateKeyFile      string `json:"private_key_file"`
+	HTTPTimeout         string `json:"http_timeout"`
+	TokenRefreshSkew    string `json:"token_refresh_skew"`
+	APIVersion          string `json:"api_version"`
+	PullRequestsWrite   bool   `json:"pull_requests_write"`
+	SquashMergeWrite    bool   `json:"squash_merge_write"`
+	ReviewCommentsWrite bool   `json:"review_comments_write"`
 }
 
 func DecodeConfig(r io.Reader) (Config, error) {
@@ -74,7 +76,7 @@ func DecodeConfigWithoutPrivateKey(r io.Reader) (Config, error) {
 	if err != nil {
 		return Config{}, errors.New("invalid token_refresh_skew")
 	}
-	c := Config{APIBaseURL: f.APIBaseURL, GraphQLURL: f.GraphQLURL, AppID: f.AppID, InstallationID: f.InstallationID, RepositoryOwner: f.RepositoryOwner, RepositoryName: f.RepositoryName, RepositoryID: f.RepositoryID, PrivateKeyFile: f.PrivateKeyFile, HTTPTimeout: timeout, TokenRefreshSkew: skew, APIVersion: f.APIVersion, PullRequestsWrite: f.PullRequestsWrite, SquashMergeWrite: f.SquashMergeWrite}
+	c := Config{APIBaseURL: f.APIBaseURL, GraphQLURL: f.GraphQLURL, AppID: f.AppID, InstallationID: f.InstallationID, RepositoryOwner: f.RepositoryOwner, RepositoryName: f.RepositoryName, RepositoryID: f.RepositoryID, PrivateKeyFile: f.PrivateKeyFile, HTTPTimeout: timeout, TokenRefreshSkew: skew, APIVersion: f.APIVersion, PullRequestsWrite: f.PullRequestsWrite, SquashMergeWrite: f.SquashMergeWrite, ReviewCommentsWrite: f.ReviewCommentsWrite}
 	return c, c.ValidateWithoutPrivateKey()
 }
 

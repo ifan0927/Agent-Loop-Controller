@@ -129,11 +129,11 @@ func ValidateTrustedReviewFeedbackTransition(expected, next TrustedReviewFeedbac
 			return nil
 		}
 	case TrustedReviewFeedbackRepairVerified:
-		if next == TrustedReviewFeedbackReplyPending || next == TrustedReviewFeedbackSuperseded {
+		if next == TrustedReviewFeedbackReplyPending || next == TrustedReviewFeedbackResolved || next == TrustedReviewFeedbackSuperseded {
 			return nil
 		}
 	case TrustedReviewFeedbackReplyPending:
-		if next == TrustedReviewFeedbackReplied || next == TrustedReviewFeedbackSuperseded {
+		if next == TrustedReviewFeedbackReplied || next == TrustedReviewFeedbackResolved || next == TrustedReviewFeedbackSuperseded {
 			return nil
 		}
 	case TrustedReviewFeedbackReplied:

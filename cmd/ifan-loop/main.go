@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/bootstrap"
@@ -306,8 +307,8 @@ func driveProductionRun(ctx context.Context, loaded bootstrap.Bootstrap, store *
 	if err != nil {
 		return application.ProductionDriveResult{}, err
 	}
-	if !profile.Config.PullRequestsWrite || !profile.Config.SquashMergeWrite {
-		return application.ProductionDriveResult{}, errors.New("automatic delivery requires narrow pull request and squash merge write capabilities")
+	if !profile.Config.PullRequestsWrite || !profile.Config.SquashMergeWrite || !profile.Config.ReviewCommentsWrite {
+		return application.ProductionDriveResult{}, errors.New("automatic delivery requires narrow pull request, review reply, and squash merge write capabilities")
 	}
 	if err := profile.Config.Validate(); err != nil {
 		return application.ProductionDriveResult{}, errors.New("configured GitHub App credential source is unavailable")
@@ -329,6 +330,17 @@ func driveProductionRun(ctx context.Context, loaded bootstrap.Bootstrap, store *
 	if err != nil {
 		return application.ProductionDriveResult{}, err
 	}
+	var replyMu sync.Mutex
+	replyObservations := []application.GitHubRequestObservation{}
+	replyClient, err := githubapp.New(profile.Config, githubapp.RealClock{}, func(observation application.GitHubRequestObservation) {
+		replyMu.Lock()
+		defer replyMu.Unlock()
+		observation.RunID = run.ID
+		replyObservations = append(replyObservations, observation)
+	})
+	if err != nil {
+		return application.ProductionDriveResult{}, err
+	}
 	coordinator, err := newProductionCoordinator(loaded, store, filepath.Dir(run.WorktreePath))
 	if err != nil {
 		return application.ProductionDriveResult{}, err
@@ -340,13 +352,14 @@ func driveProductionRun(ctx context.Context, loaded bootstrap.Bootstrap, store *
 	validator := newLocalController(store, loaded.Controller.CodexBinary, filepath.Dir(run.WorktreePath))
 	github := githubReadAdapter{client: readClient, observations: &observations}
 	driver, err := application.NewProductionDriver(coordinator, store, application.ProductionDriverPorts{
-		GitHubReader:      github,
-		ApprovalValidator: validator,
-		BranchPublisher:   productionPushAdapter{publisher: gitadapter.Publisher{Workspace: gitadapter.Workspace{}, Process: processadapter.OSRunner{}}},
-		PullRequestOpener: writeClient,
-		SquashMerger:      github,
-		CleanupPort:       gitadapter.Cleanup{Workspace: gitadapter.Workspace{}, SourcePath: repository.SourcePath, OriginPath: repository.OriginPath},
-		SourceSyncPort:    sourceSyncAdapter{sync: gitadapter.SourceSynchronizer{}},
+		GitHubReader:       github,
+		ReviewCommentReply: githubReplyAdapter{client: replyClient, observations: &replyObservations, mu: &replyMu},
+		ApprovalValidator:  validator,
+		BranchPublisher:    productionPushAdapter{publisher: gitadapter.Publisher{Workspace: gitadapter.Workspace{}, Process: processadapter.OSRunner{}}},
+		PullRequestOpener:  writeClient,
+		SquashMerger:       github,
+		CleanupPort:        gitadapter.Cleanup{Workspace: gitadapter.Workspace{}, SourcePath: repository.SourcePath, OriginPath: repository.OriginPath},
+		SourceSyncPort:     sourceSyncAdapter{sync: gitadapter.SourceSynchronizer{}},
 	}, policy, nil)
 	if err != nil {
 		return application.ProductionDriveResult{}, err
@@ -817,6 +830,31 @@ func githubRead(args []string) error {
 type githubReadAdapter struct {
 	client       *githubapp.Client
 	observations *[]application.GitHubRequestObservation
+}
+
+// githubReplyAdapter exposes the sole review-comment write capability and
+// drains metadata-only observations from its dedicated client per operation.
+// The production coordinator's persisted lease serializes calls for a run.
+type githubReplyAdapter struct {
+	client       *githubapp.Client
+	observations *[]application.GitHubRequestObservation
+	mu           *sync.Mutex
+}
+
+func (a githubReplyAdapter) FindReviewCommentReplies(ctx context.Context, pr, root int64) ([]domain.ReviewReply, error) {
+	return a.client.FindReviewCommentReplies(ctx, pr, root)
+}
+
+func (a githubReplyAdapter) ReplyToReviewComment(ctx context.Context, request application.ReplyToReviewCommentRequest) (domain.ReviewReply, error) {
+	return a.client.ReplyToReviewComment(ctx, request)
+}
+
+func (a githubReplyAdapter) DrainReviewReplyObservations() []application.GitHubRequestObservation {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	result := append([]application.GitHubRequestObservation(nil), (*a.observations)...)
+	*a.observations = (*a.observations)[:0]
+	return result
 }
 
 func (a githubReadAdapter) Authority() application.GitHubInstallationMetadata {

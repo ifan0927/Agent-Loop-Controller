@@ -136,6 +136,7 @@ type RunInspection struct {
 	Polls               []PollObservation                `json:"poll_observations"`
 	Findings            []FindingRecord                  `json:"normalized_review_findings"`
 	TrustedFeedback     []TrustedReviewFeedbackRecord    `json:"trusted_review_feedback"`
+	ReviewReplies       []ReviewReplyEvidence            `json:"review_reply_evidence"`
 	FeedbackConflicts   []TrustedReviewFeedbackConflict  `json:"trusted_review_feedback_conflicts"`
 	ApprovalObservation *domain.HumanApprovalObservation `json:"human_approval_observation,omitempty"`
 	Approval            *domain.HumanApproval            `json:"human_approval,omitempty"`
@@ -145,6 +146,21 @@ type RunInspection struct {
 	GitHubInstallation  *GitHubInstallationMetadata      `json:"github_installation,omitempty"`
 	GitHubRequests      []GitHubRequestObservation       `json:"github_request_observations"`
 	GitHubEvidence      *domain.GitHubReadEvidence       `json:"github_read_evidence,omitempty"`
+}
+
+// ReviewReplyEvidence is immutable sanitized evidence of the one permitted
+// public reply. It never stores external comment body text.
+type ReviewReplyEvidence struct {
+	RunID             string    `json:"run_id"`
+	RootCommentNodeID string    `json:"root_comment_node_id"`
+	PullRequestNumber int64     `json:"pull_request"`
+	RootCommentID     int64     `json:"root_comment_id"`
+	RepairedHead      string    `json:"repaired_head"`
+	MarkerDigest      string    `json:"marker_digest"`
+	ReplyDatabaseID   int64     `json:"reply_database_id"`
+	ReplyNodeID       string    `json:"reply_node_id"`
+	AppID             int64     `json:"app_id"`
+	ObservedAt        time.Time `json:"observed_at"`
 }
 
 // LinearCompletionObservation is the bounded, sanitized result of re-reading

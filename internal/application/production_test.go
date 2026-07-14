@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -72,6 +73,35 @@ type pushTestStore struct {
 	cleanupWrites    int
 	cleanupFailAt    int
 	requestErr       error
+	finalizeErr      error
+	finalizeCalls    int
+	completion       ReviewReplyCompletion
+	leaseMu          sync.Mutex
+	leaseHeld        bool
+	leaseLost        bool
+}
+
+func (s *pushTestStore) AcquireLease(context.Context, string, string, time.Time) (bool, error) {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	if s.leaseHeld {
+		return false, nil
+	}
+	s.leaseHeld = true
+	return true, nil
+}
+
+func (s *pushTestStore) ReleaseLease(context.Context, string, string) error {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	s.leaseHeld = false
+	return nil
+}
+
+func (s *pushTestStore) RenewLease(context.Context, string, string, time.Time) (bool, error) {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	return s.leaseHeld && !s.leaseLost, nil
 }
 
 func (s *pushTestStore) GetRun(context.Context, string) (Run, error) { return s.run, nil }
@@ -131,6 +161,32 @@ func (s *pushTestStore) FinishSideEffect(_ context.Context, value SideEffectReco
 	s.side = value
 	return nil
 }
+func (s *pushTestStore) BeginReviewReplySideEffect(_ context.Context, _ string, value SideEffectRecord) (SideEffectRecord, bool, error) {
+	return s.BeginSideEffect(context.Background(), value)
+}
+func (s *pushTestStore) FinishReviewReplySideEffect(_ context.Context, _ string, value SideEffectRecord) error {
+	return s.FinishSideEffect(context.Background(), value)
+}
+func (s *pushTestStore) RetryReviewReplySideEffect(_ context.Context, _ string, value SideEffectRecord, maximum int) (SideEffectRecord, bool, error) {
+	if s.side.ID != value.ID || s.side.Status != "failed" || s.side.Attempt >= maximum {
+		return s.side, false, nil
+	}
+	s.side.Status, s.side.Attempt, s.side.ResultJSON = "intent", s.side.Attempt+1, ""
+	return s.side, true, nil
+}
+func (s *pushTestStore) TransitionReviewReplyFeedback(_ context.Context, _ string, _ string, root string, expected, next domain.TrustedReviewFeedbackLifecycle, head, intent string, replyID int64, replyNode string, resolved, outdated bool) (TrustedReviewFeedbackRecord, bool, error) {
+	return s.TransitionTrustedReviewFeedback(context.Background(), "", root, expected, next, head, intent, replyID, replyNode, resolved, outdated)
+}
+func (s *pushTestStore) ResolveReviewReplyFeedback(_ context.Context, _ string, _ string, feedback TrustedReviewFeedbackRecord, head string, outdated bool, observations []GitHubRequestObservation) (bool, error) {
+	_, changed, err := s.TransitionTrustedReviewFeedback(context.Background(), "", feedback.RootCommentNodeID, feedback.Lifecycle, domain.TrustedReviewFeedbackResolved, head, feedback.ReplyIntentKey, 0, "", true, outdated)
+	if err == nil && changed {
+		s.requests = append(s.requests, observations...)
+	}
+	return changed, err
+}
+func (s *pushTestStore) TransitionReviewReplyRun(_ context.Context, _ string, _ string, expected, next domain.State, reason, evidence, head string) error {
+	return s.Transition(context.Background(), "", expected, next, reason, evidence, head)
+}
 func (s *pushTestStore) SavePullRequest(_ context.Context, _ string, value domain.PullRequest) error {
 	if s.pr != nil && (s.pr.Number != value.Number || s.pr.NodeID != value.NodeID) {
 		return errors.New("conflicting pull request")
@@ -146,6 +202,46 @@ func (s *pushTestStore) SaveMerge(_ context.Context, value MergeRecord) error {
 	copy := value
 	s.merge = &copy
 	return nil
+}
+func (*pushTestStore) SaveReviewReplyEvidence(context.Context, ReviewReplyEvidence) error { return nil }
+func (s *pushTestStore) FinalizeReviewReply(_ context.Context, value ReviewReplyCompletion) (bool, error) {
+	s.finalizeCalls++
+	s.completion = value
+	if s.finalizeErr != nil {
+		return false, s.finalizeErr
+	}
+	for index := range s.inspection.TrustedFeedback {
+		if s.inspection.TrustedFeedback[index].RootCommentNodeID == value.Feedback.RootCommentNodeID {
+			s.inspection.TrustedFeedback[index].Lifecycle = domain.TrustedReviewFeedbackReplied
+			s.inspection.TrustedFeedback[index].ReplyDatabaseID, s.inspection.TrustedFeedback[index].ReplyNodeID = value.Reply.DatabaseID, value.Reply.NodeID
+		}
+	}
+	s.inspection.ReviewReplies = append(s.inspection.ReviewReplies, ReviewReplyEvidence{RunID: value.Feedback.RunID, RootCommentNodeID: value.Feedback.RootCommentNodeID, PullRequestNumber: value.Feedback.PRNumber, RootCommentID: value.Feedback.RootCommentDatabaseID, RepairedHead: value.Head, MarkerDigest: value.Side.IdempotencyKey, ReplyDatabaseID: value.Reply.DatabaseID, ReplyNodeID: value.Reply.NodeID, AppID: value.Reply.Actor.AppID, ObservedAt: value.Reply.CreatedAt})
+	s.side.Status = "observed"
+	return true, nil
+}
+func (s *pushTestStore) TransitionTrustedReviewFeedback(_ context.Context, _ string, root string, expected, next domain.TrustedReviewFeedbackLifecycle, head, intent string, replyID int64, replyNode string, resolved, outdated bool) (TrustedReviewFeedbackRecord, bool, error) {
+	for index := range s.inspection.TrustedFeedback {
+		item := &s.inspection.TrustedFeedback[index]
+		if item.RootCommentNodeID != root {
+			continue
+		}
+		if item.Lifecycle != expected {
+			return *item, false, nil
+		}
+		item.Lifecycle, item.Resolved, item.Outdated = next, resolved, outdated
+		if head != "" {
+			item.BoundRepairHead = head
+		}
+		if intent != "" {
+			item.ReplyIntentKey = intent
+		}
+		if replyID != 0 {
+			item.ReplyDatabaseID, item.ReplyNodeID = replyID, replyNode
+		}
+		return *item, true, nil
+	}
+	return TrustedReviewFeedbackRecord{}, false, errors.New("feedback missing")
 }
 func (*pushTestStore) SavePollObservation(context.Context, PollObservation) error { return nil }
 func (*pushTestStore) SaveFinding(context.Context, FindingRecord) error           { return nil }
@@ -164,6 +260,10 @@ func (s *pushTestStore) SaveGitHubRequest(_ context.Context, value GitHubRequest
 		return s.requestErr
 	}
 	s.requests = append(s.requests, value)
+	return nil
+}
+func (s *pushTestStore) SaveReviewReplyObservations(_ context.Context, _ string, _ string, values []GitHubRequestObservation) error {
+	s.requests = append(s.requests, values...)
 	return nil
 }
 func (s *pushTestStore) SaveGitHubEvidence(_ context.Context, _ string, value domain.GitHubReadEvidence) error {

@@ -20,6 +20,7 @@ const (
 	StateRepairing                State = "repairing"
 	StatePROpen                   State = "pr_open"
 	StateReconcilingReviews       State = "reconciling_reviews"
+	StateReplyingReviewFeedback   State = "replying_review_feedback"
 	StateAwaitingHumanApproval    State = "awaiting_human_approval"
 	StateMerging                  State = "merging"
 	StateAwaitingLinearCompletion State = "awaiting_linear_completion"
@@ -43,8 +44,9 @@ var allowedTransitions = map[State]map[State]struct{}{
 	StateOpeningPR:                set(StatePROpen, StateFailed, StateManualIntervention),
 	StateRepairing:                set(StateExecuting, StateVerifying, StateFailed, StateManualIntervention),
 	StatePROpen:                   set(StateReconcilingReviews, StateFailed, StateManualIntervention),
-	StateReconcilingReviews:       set(StateAwaitingHumanApproval, StateRepairing, StateFailed, StateManualIntervention),
-	StateAwaitingHumanApproval:    set(StateMerging, StateRepairing, StateReconcilingReviews, StateFailed, StateManualIntervention),
+	StateReconcilingReviews:       set(StateAwaitingHumanApproval, StateReplyingReviewFeedback, StateRepairing, StateFailed, StateManualIntervention),
+	StateReplyingReviewFeedback:   set(StateAwaitingHumanApproval, StateFailed, StateManualIntervention),
+	StateAwaitingHumanApproval:    set(StateMerging, StateRepairing, StateReconcilingReviews, StateReplyingReviewFeedback, StateFailed, StateManualIntervention),
 	StateMerging:                  set(StateAwaitingLinearCompletion, StateFailed, StateManualIntervention),
 	StateAwaitingLinearCompletion: set(StateCleaning, StateFailed, StateManualIntervention),
 	StateCleaning:                 set(StateCompleted, StateFailed, StateManualIntervention),
@@ -71,7 +73,7 @@ func CanRequireManualIntervention(from State) bool {
 	switch from {
 	case StateReceived, StateAdmitting, StateProvisioning, StateExecuting, StateAwaitingHumanDecision,
 		StateVerifying, StateFreshReview, StateApprovalReady, StatePushingBranch, StateBranchPushed,
-		StateOpeningPR, StateRepairing, StatePROpen, StateReconcilingReviews, StateAwaitingHumanApproval,
+		StateOpeningPR, StateRepairing, StatePROpen, StateReconcilingReviews, StateReplyingReviewFeedback, StateAwaitingHumanApproval,
 		StateMerging, StateAwaitingLinearCompletion, StateCleaning:
 		return true
 	default:

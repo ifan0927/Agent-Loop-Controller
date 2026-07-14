@@ -12,14 +12,15 @@ import (
 type ProductionAction string
 
 const (
-	ProductionContinueLocal   ProductionAction = "continue_local"
-	ProductionReconcileGitHub ProductionAction = "reconcile_github_read"
-	ProductionPush            ProductionAction = "push_verified_branch"
-	ProductionOpenPullRequest ProductionAction = "open_pull_request"
-	ProductionMerge           ProductionAction = "squash_merge_pull_request"
-	ProductionReconcileLinear ProductionAction = "reconcile_linear_completion"
-	ProductionCleanup         ProductionAction = "cleanup_owned_resources"
-	ProductionStop            ProductionAction = "stop"
+	ProductionContinueLocal       ProductionAction = "continue_local"
+	ProductionReconcileGitHub     ProductionAction = "reconcile_github_read"
+	ProductionReplyReviewFeedback ProductionAction = "reply_to_review_comment"
+	ProductionPush                ProductionAction = "push_verified_branch"
+	ProductionOpenPullRequest     ProductionAction = "open_pull_request"
+	ProductionMerge               ProductionAction = "squash_merge_pull_request"
+	ProductionReconcileLinear     ProductionAction = "reconcile_linear_completion"
+	ProductionCleanup             ProductionAction = "cleanup_owned_resources"
+	ProductionStop                ProductionAction = "stop"
 )
 
 type ProductionContinueCommand struct {
@@ -134,6 +135,8 @@ func productionNextAction(state domain.State) (ProductionAction, string) {
 		return ProductionContinueLocal, "persisted trusted review findings require a bounded Terra repair"
 	case domain.StatePROpen, domain.StateReconcilingReviews, domain.StateAwaitingHumanApproval:
 		return ProductionReconcileGitHub, "persisted pull request requires fresh GitHub read evidence"
+	case domain.StateReplyingReviewFeedback:
+		return ProductionReplyReviewFeedback, "verified review repair requires one restart-safe reply"
 	case domain.StateApprovalReady, domain.StatePushingBranch:
 		return ProductionPush, "verified candidate may be reconciled with its owned working branch"
 	case domain.StateBranchPushed, domain.StateOpeningPR:

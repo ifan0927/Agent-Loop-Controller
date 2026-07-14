@@ -1196,7 +1196,7 @@ func (c *LocalController) ValidateApprovalReady(ctx context.Context, runID strin
 	if err != nil {
 		return err
 	}
-	if run.State != domain.StateApprovalReady && run.State != domain.StatePushingBranch && run.State != domain.StateBranchPushed && run.State != domain.StateOpeningPR && run.State != domain.StateAwaitingHumanApproval && run.State != domain.StateMerging {
+	if run.State != domain.StateApprovalReady && run.State != domain.StatePushingBranch && run.State != domain.StateBranchPushed && run.State != domain.StateOpeningPR && run.State != domain.StateReplyingReviewFeedback && run.State != domain.StateAwaitingHumanApproval && run.State != domain.StateMerging {
 		return fmt.Errorf("delivery approval validation cannot authorize state %s", run.State)
 	}
 	return c.validateApproval(ctx, run)

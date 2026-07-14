@@ -20,7 +20,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 13
+const schemaVersion = 14
 
 type Store struct{ db *sql.DB }
 
@@ -115,6 +115,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV12
 		case 13:
 			statements = migrationV13
+		case 14:
+			statements = migrationV14
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -266,6 +268,10 @@ var migrationV13 = []string{
 	`CREATE TABLE trusted_review_feedback (feedback_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), root_comment_node_id TEXT NOT NULL, pr_number INTEGER NOT NULL, pr_database_id INTEGER NOT NULL, pr_node_id TEXT NOT NULL, review_database_id INTEGER NOT NULL, review_node_id TEXT NOT NULL, thread_node_id TEXT NOT NULL, root_comment_database_id INTEGER NOT NULL, author_database_id INTEGER NOT NULL, author_node_id TEXT NOT NULL, author_login TEXT NOT NULL, author_type TEXT NOT NULL, original_review_head_sha TEXT NOT NULL, path TEXT NOT NULL DEFAULT '', line INTEGER, body_text TEXT NOT NULL, body_digest TEXT NOT NULL, source_at TEXT NOT NULL, observed_at TEXT NOT NULL, lifecycle TEXT NOT NULL CHECK(lifecycle IN ('observed','selected_for_repair','repair_verified','reply_pending','replied','resolved','superseded')), bound_repair_head TEXT NOT NULL DEFAULT '', reply_intent_key TEXT NOT NULL DEFAULT '', reply_database_id INTEGER NOT NULL DEFAULT 0, reply_node_id TEXT NOT NULL DEFAULT '', resolved INTEGER NOT NULL DEFAULT 0, outdated INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, UNIQUE(run_id,root_comment_node_id))`,
 	`CREATE TABLE trusted_review_feedback_conflicts (conflict_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), root_comment_node_id TEXT NOT NULL, observed_body_digest TEXT NOT NULL DEFAULT '', reason_code TEXT NOT NULL, observed_at TEXT NOT NULL)`,
 	`CREATE INDEX trusted_review_feedback_run_head ON trusted_review_feedback(run_id,original_review_head_sha)`,
+}
+
+var migrationV14 = []string{
+	`CREATE TABLE trusted_review_reply_evidence (reply_evidence_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), root_comment_node_id TEXT NOT NULL, pr_number INTEGER NOT NULL, root_comment_database_id INTEGER NOT NULL, repaired_head TEXT NOT NULL, marker_digest TEXT NOT NULL, reply_database_id INTEGER NOT NULL, reply_node_id TEXT NOT NULL, app_id INTEGER NOT NULL, observed_at TEXT NOT NULL, UNIQUE(run_id,root_comment_node_id), UNIQUE(run_id,reply_database_id), UNIQUE(run_id,reply_node_id))`,
 }
 
 func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput) (application.Run, bool, error) {
@@ -563,6 +569,37 @@ func (s *Store) SaveGitHubRequests(ctx context.Context, observations []applicati
 			return errors.New("GitHub request observation lacks run")
 		}
 		if _, err := tx.ExecContext(ctx, githubRequestInsert, githubRequestArgs(o)...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// SaveReviewReplyObservations preserves sanitized reply-list/write telemetry
+// when no immutable reply completion can be recorded. The lease check keeps a
+// stale worker from appending audit facts after another controller takes over.
+func (s *Store) SaveReviewReplyObservations(ctx context.Context, runID, leaseOwner string, observations []application.GitHubRequestObservation) error {
+	if strings.TrimSpace(runID) == "" || strings.TrimSpace(leaseOwner) == "" || len(observations) == 0 || len(observations) > 10021 {
+		return errors.New("review reply observation authority is incomplete")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var owner string
+	var expires int64
+	if err := tx.QueryRowContext(ctx, `SELECT lease_owner,lease_expires_unix FROM runs WHERE run_id=?`, runID).Scan(&owner, &expires); err != nil {
+		return err
+	}
+	if owner != leaseOwner || expires <= time.Now().UTC().UnixNano() {
+		return errors.New("review reply lease authority changed")
+	}
+	for _, observation := range observations {
+		if observation.RunID != runID || strings.TrimSpace(observation.Operation) == "" || strings.TrimSpace(observation.Category) == "" || observation.ObservedAt.IsZero() {
+			return errors.New("review reply request observation is incomplete")
+		}
+		if _, err := tx.ExecContext(ctx, githubRequestInsert, githubRequestArgs(observation)...); err != nil {
 			return err
 		}
 	}
@@ -872,7 +909,7 @@ func (s *Store) BeginSideEffect(ctx context.Context, record application.SideEffe
 		return record, false, err
 	}
 	record.CreatedAt, record.ObservedAt = parseTime(created), parseTime(observed)
-	if record.RunID != requested.RunID || record.Kind != requested.Kind || record.IdempotencyKey != requested.IdempotencyKey || record.IntentJSON != requested.IntentJSON || record.Attempt != requested.Attempt {
+	if record.RunID != requested.RunID || record.Kind != requested.Kind || record.IdempotencyKey != requested.IdempotencyKey || record.IntentJSON != requested.IntentJSON {
 		return record, false, errors.New("conflicting immutable side-effect intent")
 	}
 	return record, false, nil
@@ -883,6 +920,257 @@ func (s *Store) FinishSideEffect(ctx context.Context, record application.SideEff
 		return errors.New("side-effect result status must be observed or failed")
 	}
 	return execOne(ctx, s.db, `UPDATE side_effects SET status=?,result_json=?,stdout_path=?,stderr_path=?,observed_at=? WHERE side_effect_id=? AND status IN ('intent','failed')`, record.Status, record.ResultJSON, record.StdoutPath, record.StderrPath, formatTime(record.ObservedAt), record.ID)
+}
+
+func (s *Store) requireReviewReplyLease(ctx context.Context, runID, owner string) error {
+	var current string
+	var expires int64
+	if err := s.db.QueryRowContext(ctx, `SELECT lease_owner,lease_expires_unix FROM runs WHERE run_id=?`, runID).Scan(&current, &expires); err != nil {
+		return err
+	}
+	if current != owner || expires <= time.Now().UTC().UnixNano() {
+		return errors.New("review reply lease authority changed")
+	}
+	return nil
+}
+
+func (s *Store) BeginReviewReplySideEffect(ctx context.Context, owner string, record application.SideEffectRecord) (application.SideEffectRecord, bool, error) {
+	if strings.TrimSpace(record.IdempotencyKey) == "" || strings.TrimSpace(record.IntentJSON) == "" {
+		return record, false, errors.New("side-effect intent and idempotency key are required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return record, false, err
+	}
+	defer tx.Rollback()
+	var leaseOwner string
+	var expires int64
+	if err := tx.QueryRowContext(ctx, `SELECT lease_owner,lease_expires_unix FROM runs WHERE run_id=?`, record.RunID).Scan(&leaseOwner, &expires); err != nil {
+		return record, false, err
+	}
+	if leaseOwner != owner || expires <= time.Now().UTC().UnixNano() {
+		return record, false, errors.New("review reply lease authority changed")
+	}
+	result, err := tx.ExecContext(ctx, `INSERT INTO side_effects(run_id,kind,idempotency_key,intent_json,status,attempt,created_at) VALUES(?,?,?,?,?,?,?)`, record.RunID, record.Kind, record.IdempotencyKey, record.IntentJSON, "intent", record.Attempt, nowText())
+	if err == nil {
+		record.ID, _ = result.LastInsertId()
+		record.Status = "intent"
+		return record, true, tx.Commit()
+	}
+	requested := record
+	var created, observed string
+	if scanErr := tx.QueryRowContext(ctx, `SELECT side_effect_id,run_id,kind,idempotency_key,intent_json,status,result_json,stdout_path,stderr_path,attempt,created_at,observed_at FROM side_effects WHERE run_id=? AND kind=? AND idempotency_key=?`, record.RunID, record.Kind, record.IdempotencyKey).Scan(&record.ID, &record.RunID, &record.Kind, &record.IdempotencyKey, &record.IntentJSON, &record.Status, &record.ResultJSON, &record.StdoutPath, &record.StderrPath, &record.Attempt, &created, &observed); scanErr != nil {
+		return record, false, err
+	}
+	record.CreatedAt, record.ObservedAt = parseTime(created), parseTime(observed)
+	if record.RunID != requested.RunID || record.Kind != requested.Kind || record.IdempotencyKey != requested.IdempotencyKey || record.IntentJSON != requested.IntentJSON {
+		return record, false, errors.New("conflicting immutable side-effect intent")
+	}
+	return record, false, tx.Commit()
+}
+
+func (s *Store) FinishReviewReplySideEffect(ctx context.Context, owner string, record application.SideEffectRecord) error {
+	if record.Status != "observed" && record.Status != "failed" {
+		return errors.New("side-effect result status must be observed or failed")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET updated_at=updated_at WHERE run_id=? AND lease_owner=? AND lease_expires_unix>?`, record.RunID, owner, time.Now().UTC().UnixNano())
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return errors.New("review reply lease compare update lost")
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE side_effects SET status=?,result_json=?,stdout_path=?,stderr_path=?,observed_at=? WHERE side_effect_id=? AND run_id=? AND status IN ('intent','failed')`, record.Status, record.ResultJSON, record.StdoutPath, record.StderrPath, formatTime(record.ObservedAt), record.ID, record.RunID)
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return errors.New("review reply side effect compare update lost")
+	}
+	return tx.Commit()
+}
+
+// RetryReviewReplySideEffect turns only a persisted failed intent back into
+// intent, incrementing its durable attempt counter under the same lease CAS.
+func (s *Store) RetryReviewReplySideEffect(ctx context.Context, owner string, record application.SideEffectRecord, maximum int) (application.SideEffectRecord, bool, error) {
+	if maximum < 1 || record.ID < 1 || record.Attempt < 1 || record.RunID == "" {
+		return record, false, errors.New("review reply retry authority is incomplete")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return record, false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET updated_at=updated_at WHERE run_id=? AND lease_owner=? AND lease_expires_unix>?`, record.RunID, owner, time.Now().UTC().UnixNano())
+	if err != nil {
+		return record, false, err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return record, false, errors.New("review reply lease compare update lost")
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE side_effects SET status='intent',attempt=attempt+1,result_json='',observed_at='' WHERE side_effect_id=? AND run_id=? AND kind='reply_to_review_comment' AND idempotency_key=? AND status='failed' AND attempt<?`, record.ID, record.RunID, record.IdempotencyKey, maximum)
+	if err != nil {
+		return record, false, err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return record, false, nil
+	}
+	var created, observed string
+	if err := tx.QueryRowContext(ctx, `SELECT side_effect_id,run_id,kind,idempotency_key,intent_json,status,result_json,stdout_path,stderr_path,attempt,created_at,observed_at FROM side_effects WHERE side_effect_id=?`, record.ID).Scan(&record.ID, &record.RunID, &record.Kind, &record.IdempotencyKey, &record.IntentJSON, &record.Status, &record.ResultJSON, &record.StdoutPath, &record.StderrPath, &record.Attempt, &created, &observed); err != nil {
+		return record, false, err
+	}
+	record.CreatedAt, record.ObservedAt = parseTime(created), parseTime(observed)
+	return record, true, tx.Commit()
+}
+
+func (s *Store) TransitionReviewReplyFeedback(ctx context.Context, runID, owner, rootCommentNodeID string, expected, next domain.TrustedReviewFeedbackLifecycle, boundRepairHead, replyIntentKey string, replyDatabaseID int64, replyNodeID string, resolved, outdated bool) (application.TrustedReviewFeedbackRecord, bool, error) {
+	if strings.TrimSpace(runID) == "" || !validTrustedReviewFeedbackNodeID(rootCommentNodeID) || domain.ValidateTrustedReviewFeedbackTransition(expected, next) != nil {
+		return application.TrustedReviewFeedbackRecord{}, false, errors.New("invalid trusted review feedback lifecycle transition")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return application.TrustedReviewFeedbackRecord{}, false, err
+	}
+	defer tx.Rollback()
+	var leaseOwner string
+	var expires int64
+	if err := tx.QueryRowContext(ctx, `SELECT lease_owner,lease_expires_unix FROM runs WHERE run_id=?`, runID).Scan(&leaseOwner, &expires); err != nil {
+		return application.TrustedReviewFeedbackRecord{}, false, err
+	}
+	if leaseOwner != owner || expires <= time.Now().UTC().UnixNano() {
+		return application.TrustedReviewFeedbackRecord{}, false, errors.New("review reply lease authority changed")
+	}
+	current, found, err := trustedReviewFeedbackByRoot(ctx, tx, runID, rootCommentNodeID)
+	if err != nil || !found {
+		return current, false, err
+	}
+	if current.Lifecycle != expected {
+		return current, false, nil
+	}
+	if err := validateTrustedReviewFeedbackTransitionEvidence(current, next, boundRepairHead, replyIntentKey, replyDatabaseID, replyNodeID, resolved); err != nil {
+		return application.TrustedReviewFeedbackRecord{}, false, err
+	}
+	// The lease CAS is in the same write transaction as the lifecycle update;
+	// no stale owner can change a repair/reply lifecycle after takeover.
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET updated_at=updated_at WHERE run_id=? AND lease_owner=? AND lease_expires_unix>?`, runID, owner, time.Now().UTC().UnixNano())
+	if err != nil {
+		return application.TrustedReviewFeedbackRecord{}, false, err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return application.TrustedReviewFeedbackRecord{}, false, errors.New("review reply lease compare update lost")
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE trusted_review_feedback SET lifecycle=?,bound_repair_head=CASE WHEN ?='' THEN bound_repair_head ELSE ? END,reply_intent_key=CASE WHEN ?='' THEN reply_intent_key ELSE ? END,reply_database_id=CASE WHEN ?=0 THEN reply_database_id ELSE ? END,reply_node_id=CASE WHEN ?='' THEN reply_node_id ELSE ? END,resolved=?,outdated=?,updated_at=? WHERE run_id=? AND root_comment_node_id=? AND lifecycle=?`, next, boundRepairHead, boundRepairHead, replyIntentKey, replyIntentKey, replyDatabaseID, replyDatabaseID, replyNodeID, replyNodeID, resolved, outdated, nowText(), runID, rootCommentNodeID, expected)
+	if err != nil {
+		return application.TrustedReviewFeedbackRecord{}, false, err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return application.TrustedReviewFeedbackRecord{}, false, nil
+	}
+	record, found, err := trustedReviewFeedbackByRoot(ctx, tx, runID, rootCommentNodeID)
+	if err != nil || !found {
+		return record, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return application.TrustedReviewFeedbackRecord{}, false, err
+	}
+	return record, true, nil
+}
+
+// ResolveReviewReplyFeedback atomically records the authority reread telemetry
+// with the terminal resolved lifecycle; neither fact may survive alone.
+func (s *Store) ResolveReviewReplyFeedback(ctx context.Context, runID, owner string, feedback application.TrustedReviewFeedbackRecord, head string, outdated bool, observations []application.GitHubRequestObservation) (bool, error) {
+	if len(observations) > 10021 {
+		return false, errors.New("review reply request observations exceed bounded limit")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var leaseOwner string
+	var expires int64
+	if err := tx.QueryRowContext(ctx, `SELECT lease_owner,lease_expires_unix FROM runs WHERE run_id=?`, runID).Scan(&leaseOwner, &expires); err != nil {
+		return false, err
+	}
+	if leaseOwner != owner || expires <= time.Now().UTC().UnixNano() {
+		return false, errors.New("review reply lease authority changed")
+	}
+	current, found, err := trustedReviewFeedbackByRoot(ctx, tx, runID, feedback.RootCommentNodeID)
+	if err != nil || !found {
+		return false, err
+	}
+	if current.Lifecycle != feedback.Lifecycle || current.BoundRepairHead != head {
+		return false, nil
+	}
+	if err := validateTrustedReviewFeedbackTransitionEvidence(current, domain.TrustedReviewFeedbackResolved, head, current.ReplyIntentKey, 0, "", true); err != nil {
+		return false, err
+	}
+	for _, observation := range observations {
+		if observation.RunID != runID || observation.Operation == "" || observation.Category == "" || observation.ObservedAt.IsZero() {
+			return false, errors.New("review reply request observation is incomplete")
+		}
+		if _, err := tx.ExecContext(ctx, githubRequestInsert, githubRequestArgs(observation)...); err != nil {
+			return false, err
+		}
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET updated_at=updated_at WHERE run_id=? AND lease_owner=? AND lease_expires_unix>?`, runID, owner, time.Now().UTC().UnixNano())
+	if err != nil {
+		return false, err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return false, errors.New("review reply lease compare update lost")
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE trusted_review_feedback SET lifecycle=?,resolved=1,outdated=?,updated_at=? WHERE run_id=? AND root_comment_node_id=? AND lifecycle=?`, domain.TrustedReviewFeedbackResolved, outdated, nowText(), runID, current.RootCommentNodeID, feedback.Lifecycle)
+	if err != nil {
+		return false, err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return false, nil
+	}
+	return true, tx.Commit()
+}
+
+func (s *Store) TransitionReviewReplyRun(ctx context.Context, runID, owner string, expected, next domain.State, reason, evidence, head string) error {
+	if err := domain.ValidateTransition(expected, next); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var current, leaseOwner string
+	var expires int64
+	if err := tx.QueryRowContext(ctx, `SELECT current_state,lease_owner,lease_expires_unix FROM runs WHERE run_id=?`, runID).Scan(&current, &leaseOwner, &expires); err != nil {
+		return err
+	}
+	if domain.State(current) == next && leaseOwner == owner && expires > time.Now().UTC().UnixNano() {
+		return tx.Commit()
+	}
+	if domain.State(current) != expected || leaseOwner != owner || expires <= time.Now().UTC().UnixNano() {
+		return errors.New("review reply run authority changed")
+	}
+	var sequence int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM transitions WHERE run_id=?`, runID).Scan(&sequence); err != nil {
+		return err
+	}
+	now := nowText()
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET current_state=?,updated_at=?,last_error='' WHERE run_id=? AND current_state=? AND lease_owner=? AND lease_expires_unix>?`, next, now, runID, expected, owner, time.Now().UTC().UnixNano())
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return errors.New("review reply state compare update lost")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO transitions VALUES(?,?,?,?,?,?,?,?)`, runID, sequence, expected, next, reason, evidence, head, now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) SavePullRequest(ctx context.Context, runID string, pr domain.PullRequest) error {
@@ -1109,11 +1397,112 @@ func validateTrustedReviewFeedbackTransitionEvidence(current application.Trusted
 			return errors.New("reply observation requires prior immutable repair and reply intent evidence")
 		}
 	case domain.TrustedReviewFeedbackResolved:
-		if !resolved || !isFullSHA(current.BoundRepairHead) || strings.TrimSpace(current.ReplyIntentKey) == "" || current.ReplyDatabaseID < 1 || !validTrustedReviewFeedbackNodeID(current.ReplyNodeID) || boundRepairHead != "" || replyIntentKey != "" || !noReplyIdentity {
-			return errors.New("resolution requires consistent immutable replied evidence")
+		if !resolved || !isFullSHA(current.BoundRepairHead) || boundRepairHead != "" || replyIntentKey != "" || !noReplyIdentity {
+			return errors.New("resolution requires consistent repair evidence")
 		}
+		if current.Lifecycle == domain.TrustedReviewFeedbackReplied && strings.TrimSpace(current.ReplyIntentKey) != "" && current.ReplyDatabaseID > 0 && validTrustedReviewFeedbackNodeID(current.ReplyNodeID) {
+			break
+		}
+		if (current.Lifecycle == domain.TrustedReviewFeedbackRepairVerified || current.Lifecycle == domain.TrustedReviewFeedbackReplyPending) && current.ReplyDatabaseID == 0 && current.ReplyNodeID == "" {
+			break
+		}
+		return errors.New("resolution lifecycle evidence is inconsistent")
 	default:
 		return errors.New("unknown trusted review feedback lifecycle")
+	}
+	return nil
+}
+
+// SaveReviewReplyEvidence records immutable, sanitized reply authority. It
+// intentionally cannot store the public body or any GitHub token material.
+func (s *Store) SaveReviewReplyEvidence(ctx context.Context, value application.ReviewReplyEvidence) error {
+	if strings.TrimSpace(value.RunID) == "" || !validTrustedReviewFeedbackNodeID(value.RootCommentNodeID) || value.PullRequestNumber < 1 || value.RootCommentID < 1 || !isFullSHA(value.RepairedHead) || len(value.MarkerDigest) != 64 || value.ReplyDatabaseID < 1 || !validTrustedReviewFeedbackNodeID(value.ReplyNodeID) || value.AppID < 1 || value.ObservedAt.IsZero() {
+		return errors.New("review reply evidence is incomplete")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO trusted_review_reply_evidence(run_id,root_comment_node_id,pr_number,root_comment_database_id,repaired_head,marker_digest,reply_database_id,reply_node_id,app_id,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,root_comment_node_id) DO UPDATE SET root_comment_node_id=excluded.root_comment_node_id WHERE pr_number=excluded.pr_number AND root_comment_database_id=excluded.root_comment_database_id AND repaired_head=excluded.repaired_head AND marker_digest=excluded.marker_digest AND reply_database_id=excluded.reply_database_id AND reply_node_id=excluded.reply_node_id AND app_id=excluded.app_id`, value.RunID, value.RootCommentNodeID, value.PullRequestNumber, value.RootCommentID, value.RepairedHead, value.MarkerDigest, value.ReplyDatabaseID, value.ReplyNodeID, value.AppID, formatTime(value.ObservedAt))
+	return err
+}
+
+// FinalizeReviewReply is the one transaction that records a remote reply. A
+// restart can therefore observe either the still-pending intent or all three
+// completion facts; it can never skip an evidence-less replied lifecycle.
+func (s *Store) FinalizeReviewReply(ctx context.Context, value application.ReviewReplyCompletion) (bool, error) {
+	caller, reply, side := value.Feedback, value.Reply, value.Side
+	if strings.TrimSpace(value.Head) == "" || !isFullSHA(value.Head) || caller.RunID == "" || caller.RootCommentNodeID == "" || strings.TrimSpace(value.LeaseOwner) == "" || side.ID < 1 || side.RunID != caller.RunID || side.Kind != "reply_to_review_comment" || side.IdempotencyKey == "" || reply.DatabaseID < 1 || !validTrustedReviewFeedbackNodeID(reply.NodeID) || reply.Actor.AppID < 1 || reply.CreatedAt.IsZero() {
+		return false, errors.New("review reply completion authority is incomplete")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var owner string
+	var expires int64
+	if err := tx.QueryRowContext(ctx, `SELECT lease_owner,lease_expires_unix FROM runs WHERE run_id=?`, caller.RunID).Scan(&owner, &expires); err != nil {
+		return false, err
+	}
+	if owner != value.LeaseOwner || expires <= time.Now().UTC().UnixNano() {
+		return false, nil
+	}
+	current, found, err := trustedReviewFeedbackByRoot(ctx, tx, caller.RunID, caller.RootCommentNodeID)
+	if err != nil || !found {
+		return false, err
+	}
+	if caller.PRNumber != current.PRNumber || caller.PRDatabaseID != current.PRDatabaseID || caller.PRNodeID != current.PRNodeID || caller.RootCommentDatabaseID != current.RootCommentDatabaseID || caller.RootCommentNodeID != current.RootCommentNodeID || side.RunID != current.RunID || reply.ReplyToID != current.RootCommentDatabaseID {
+		return false, nil
+	}
+	if current.Lifecycle != domain.TrustedReviewFeedbackReplyPending || current.BoundRepairHead != value.Head || current.ReplyIntentKey != side.IdempotencyKey {
+		return false, nil
+	}
+	evidence := application.ReviewReplyEvidence{RunID: current.RunID, RootCommentNodeID: current.RootCommentNodeID, PullRequestNumber: current.PRNumber, RootCommentID: current.RootCommentDatabaseID, RepairedHead: current.BoundRepairHead, MarkerDigest: current.ReplyIntentKey, ReplyDatabaseID: reply.DatabaseID, ReplyNodeID: reply.NodeID, AppID: reply.Actor.AppID, ObservedAt: reply.CreatedAt}
+	if err := validateReviewReplyEvidence(evidence); err != nil {
+		return false, err
+	}
+	if len(value.Observations) > 10021 {
+		return false, errors.New("review reply request observations exceed bounded limit")
+	}
+	for _, observation := range value.Observations {
+		if observation.RunID != current.RunID || observation.Operation == "" || observation.Category == "" || observation.ObservedAt.IsZero() {
+			return false, errors.New("review reply request observation is incomplete")
+		}
+	}
+	// The remaining side-effect update is bound to the row just read, not the
+	// caller-provided snapshot used only to locate and compare authority.
+	feedback := current
+	if err := validateTrustedReviewFeedbackTransitionEvidence(current, domain.TrustedReviewFeedbackReplied, "", "", reply.DatabaseID, reply.NodeID, false); err != nil {
+		return false, err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE trusted_review_feedback SET lifecycle=?,reply_database_id=?,reply_node_id=?,updated_at=? WHERE run_id=? AND root_comment_node_id=? AND lifecycle=?`, domain.TrustedReviewFeedbackReplied, reply.DatabaseID, reply.NodeID, nowText(), current.RunID, current.RootCommentNodeID, domain.TrustedReviewFeedbackReplyPending)
+	if err != nil {
+		return false, err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO trusted_review_reply_evidence(run_id,root_comment_node_id,pr_number,root_comment_database_id,repaired_head,marker_digest,reply_database_id,reply_node_id,app_id,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, evidence.RunID, evidence.RootCommentNodeID, evidence.PullRequestNumber, evidence.RootCommentID, evidence.RepairedHead, evidence.MarkerDigest, evidence.ReplyDatabaseID, evidence.ReplyNodeID, evidence.AppID, formatTime(evidence.ObservedAt)); err != nil {
+		return false, err
+	}
+	for _, observation := range value.Observations {
+		if _, err := tx.ExecContext(ctx, githubRequestInsert, githubRequestArgs(observation)...); err != nil {
+			return false, err
+		}
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE side_effects SET status='observed',result_json='{\"reply_recorded\":true}',observed_at=? WHERE side_effect_id=? AND run_id=? AND kind='reply_to_review_comment' AND idempotency_key=? AND status IN ('intent','failed')`, formatTime(reply.CreatedAt), side.ID, feedback.RunID, side.IdempotencyKey)
+	if err != nil {
+		return false, err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func validateReviewReplyEvidence(value application.ReviewReplyEvidence) error {
+	if strings.TrimSpace(value.RunID) == "" || !validTrustedReviewFeedbackNodeID(value.RootCommentNodeID) || value.PullRequestNumber < 1 || value.RootCommentID < 1 || !isFullSHA(value.RepairedHead) || len(value.MarkerDigest) != 64 || value.ReplyDatabaseID < 1 || !validTrustedReviewFeedbackNodeID(value.ReplyNodeID) || value.AppID < 1 || value.ObservedAt.IsZero() {
+		return errors.New("review reply evidence is incomplete")
 	}
 	return nil
 }
@@ -1443,6 +1832,21 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 		record.SourceAt, record.ObservedAt, record.UpdatedAt = parseTime(sourceAt), parseTime(observedAt), parseTime(updatedAt)
 		record.Resolved, record.Outdated = resolved != 0, outdated != 0
 		inspection.TrustedFeedback = append(inspection.TrustedFeedback, record)
+	}
+	rows.Close()
+	rows, err = s.db.QueryContext(ctx, `SELECT run_id,root_comment_node_id,pr_number,root_comment_database_id,repaired_head,marker_digest,reply_database_id,reply_node_id,app_id,observed_at FROM trusted_review_reply_evidence WHERE run_id=? ORDER BY reply_evidence_id`, id)
+	if err != nil {
+		return inspection, err
+	}
+	for rows.Next() {
+		var reply application.ReviewReplyEvidence
+		var observed string
+		if err := rows.Scan(&reply.RunID, &reply.RootCommentNodeID, &reply.PullRequestNumber, &reply.RootCommentID, &reply.RepairedHead, &reply.MarkerDigest, &reply.ReplyDatabaseID, &reply.ReplyNodeID, &reply.AppID, &observed); err != nil {
+			rows.Close()
+			return inspection, err
+		}
+		reply.ObservedAt = parseTime(observed)
+		inspection.ReviewReplies = append(inspection.ReviewReplies, reply)
 	}
 	rows.Close()
 	rows, err = s.db.QueryContext(ctx, `SELECT conflict_id,run_id,root_comment_node_id,observed_body_digest,reason_code,observed_at FROM trusted_review_feedback_conflicts WHERE run_id=? ORDER BY conflict_id`, id)

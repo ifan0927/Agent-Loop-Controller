@@ -40,6 +40,10 @@ func (c *driverCoordinator) ReconcileGitHub(context.Context, ProductionReconcile
 	return ProductionResult{Action: action, Run: projectRunResult(c.runs.run)}, err
 }
 
+func (c *driverCoordinator) ReplyReviewFeedback(context.Context, ProductionReplyCommand, ApprovalValidator, GitHubReadPort, ReviewCommentReplyPort) (ProductionReplyResult, error) {
+	return ProductionReplyResult{Action: ProductionStop}, c.record(ProductionReplyReviewFeedback)
+}
+
 func (c *driverCoordinator) Push(_ context.Context, _ ProductionPushCommand, _ ApprovalValidator, publisher BranchPublisher) (ProductionPushResult, error) {
 	c.branchPublisher = publisher
 	return ProductionPushResult{}, c.record(ProductionPush)

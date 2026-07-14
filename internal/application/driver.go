@@ -22,6 +22,7 @@ type ProductionRunReader interface {
 type ProductionDriverCoordinator interface {
 	Continue(context.Context, ProductionContinueCommand) (ProductionResult, error)
 	ReconcileGitHub(context.Context, ProductionReconcileCommand, GitHubReadPort) (ProductionResult, error)
+	ReplyReviewFeedback(context.Context, ProductionReplyCommand, ApprovalValidator, GitHubReadPort, ReviewCommentReplyPort) (ProductionReplyResult, error)
 	Push(context.Context, ProductionPushCommand, ApprovalValidator, BranchPublisher) (ProductionPushResult, error)
 	OpenPullRequest(context.Context, ProductionOpenPullRequestCommand, ApprovalValidator, PullRequestOpener) (ProductionOpenPullRequestResult, error)
 	MergePullRequest(context.Context, ProductionMergeCommand, ApprovalValidator, GitHubReadPort, SquashMerger) (ProductionMergeResult, error)
@@ -34,13 +35,14 @@ var _ ProductionDriverCoordinator = (*ProductionCoordinator)(nil)
 // ProductionDriverPorts holds only the bounded, action-specific ports needed
 // once a run has reached delivery. No generic write capability is exposed.
 type ProductionDriverPorts struct {
-	GitHubReader      GitHubReadPort
-	ApprovalValidator ApprovalValidator
-	BranchPublisher   BranchPublisher
-	PullRequestOpener PullRequestOpener
-	SquashMerger      SquashMerger
-	CleanupPort       CleanupPort
-	SourceSyncPort    SourceSyncPort
+	GitHubReader       GitHubReadPort
+	ReviewCommentReply ReviewCommentReplyPort
+	ApprovalValidator  ApprovalValidator
+	BranchPublisher    BranchPublisher
+	PullRequestOpener  PullRequestOpener
+	SquashMerger       SquashMerger
+	CleanupPort        CleanupPort
+	SourceSyncPort     SourceSyncPort
 }
 
 // ProductionDriverPolicy bounds synchronous work between polls and prevents a
@@ -222,6 +224,12 @@ func (d *ProductionDriver) apply(ctx context.Context, command ProductionDriveCom
 		}
 		result, err := d.coordinator.ReconcileGitHub(ctx, ProductionReconcileCommand{Requester: command.Requester, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, d.ports.GitHubReader)
 		return err == nil && result.Action == ProductionReconcileGitHub, err
+	case ProductionReplyReviewFeedback:
+		if d.ports.ApprovalValidator == nil || d.ports.GitHubReader == nil || d.ports.ReviewCommentReply == nil {
+			return false, serviceError(ErrorInternal, "approval validator, GitHub reader, and review reply port are required for automatic review replies", nil)
+		}
+		_, err := d.coordinator.ReplyReviewFeedback(ctx, ProductionReplyCommand{Requester: command.Requester, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, d.ports.ApprovalValidator, d.ports.GitHubReader, d.ports.ReviewCommentReply)
+		return false, err
 	case ProductionPush:
 		if d.ports.ApprovalValidator == nil || d.ports.BranchPublisher == nil {
 			return false, serviceError(ErrorInternal, "approval validator and branch publisher are required for automatic push", nil)
