@@ -247,9 +247,10 @@ func mergePolicyPendingThreads(side SideEffectRecord, expectedHead string) ([]Me
 }
 
 // sameMergePolicyTopology accepts only the resolution bit changing between the
-// rejected merge observation and the retry read. A changed reply, follow-up,
-// identity, or outdated flag is authority drift and must not reach the retry
-// compare-and-swap.
+// rejected merge observation and a later read. A resolution change must have a
+// newer observation timestamp. A changed reply, follow-up, identity, or
+// outdated flag is authority drift and must not reach the retry compare-and-
+// swap.
 func sameMergePolicyTopology(persisted, fresh []MergePolicyThread) bool {
 	if len(persisted) == 0 || len(persisted) != len(fresh) {
 		return false
@@ -264,6 +265,12 @@ func sameMergePolicyTopology(persisted, fresh []MergePolicyThread) bool {
 	for _, thread := range fresh {
 		previous, exists := byThread[thread.ThreadNodeID]
 		if !exists || previous.RootCommentNodeID != thread.RootCommentNodeID || previous.RootCommentID != thread.RootCommentID || previous.ReplyNodeID != thread.ReplyNodeID || previous.ReplyID != thread.ReplyID || previous.TopologyDigest != thread.TopologyDigest || previous.Outdated != thread.Outdated {
+			return false
+		}
+		if previous.ObservedAt.IsZero() || thread.ObservedAt.IsZero() {
+			return false
+		}
+		if previous.Resolved != thread.Resolved && !thread.ObservedAt.After(previous.ObservedAt) {
 			return false
 		}
 	}
@@ -354,7 +361,8 @@ func (c *ProductionCoordinator) reconcileMergeability(ctx context.Context, comma
 		if !found || side.Status != "failed" {
 			return ReconcileResult{}, c.mergeabilityManual(leaseCtx, inspection.Run, "merge policy wait lacks a durable failed side effect")
 		}
-		if _, err := mergePolicyPendingThreads(side, inspection.Run.CandidateHead); err != nil {
+		persistedThreads, err := mergePolicyPendingThreads(side, inspection.Run.CandidateHead)
+		if err != nil {
 			return ReconcileResult{}, c.mergeabilityManual(leaseCtx, inspection.Run, "merge policy wait lacks durable topology evidence")
 		}
 		if err := validateReaderAuthority(inspection, reader.Authority()); err != nil {
@@ -413,6 +421,9 @@ func (c *ProductionCoordinator) reconcileMergeability(ctx context.Context, comma
 		threads, err := controllerRepliedMergeThreads(inspection, evidence, handoff)
 		if err != nil || len(threads) == 0 {
 			return ReconcileResult{}, c.mergeabilityManualAfterRead(leaseCtx, inspection.Run, owner, observations, metadata, evidence, "controller reply topology is ambiguous")
+		}
+		if !sameMergePolicyTopology(persistedThreads, threads) {
+			return ReconcileResult{}, c.mergeabilityManualAfterRead(leaseCtx, inspection.Run, owner, observations, metadata, evidence, "controller reply topology drifted while awaiting resolution")
 		}
 		next, reason := domain.StateAwaitingGitHubMergeability, "controller-replied thread remains unresolved"
 		if !hasUnresolvedMergeThread(threads) {

@@ -761,9 +761,117 @@ func TestProductionMergeabilityWaitPollsWithoutMergeAndRetriesOnlyAfterResolutio
 	}
 
 	reader.evidence.ReviewThreads[0].Resolved = true
+	reader.evidence.ObservedAt = reader.evidence.ObservedAt.Add(time.Minute)
 	result, err := coordinator.ReconcileGitHub(context.Background(), command, reader)
 	if err != nil || result.Action != ProductionMerge || store.run.State != domain.StateMerging || reader.calls != 3 {
 		t.Fatalf("result=%+v err=%v state=%s calls=%d", result, err, store.run.State, reader.calls)
+	}
+}
+
+func TestProductionMergePolicyResolutionWithAdvancedObservationRestartsAndRetriesOnce(t *testing.T) {
+	coordinator, store, run, reader, writer := newMergeCoordinator(t)
+	configureMergeabilityFixture(t, store, run, reader)
+	writer.err = &MergeRejectedError{HTTPStatus: 409, Operation: "squash_merge_pull_request", Cause: errors.New("merge protection rejected unresolved thread")}
+	if _, err := coordinator.MergePullRequest(context.Background(), mergeCommand(run), &pushValidator{}, reader, writer); err == nil || store.run.State != domain.StateAwaitingGitHubMergeability || writer.calls != 1 {
+		t.Fatalf("initial protected rejection err=%v state=%s writes=%d", err, store.run.State, writer.calls)
+	}
+
+	// A recovered process must only read while waiting. The later resolution
+	// observation is distinct from, and newer than, the rejected observation.
+	store.inspection.Run = store.run
+	restarted, err := NewProductionCoordinator(coordinator.admission, coordinator.controller, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader.evidence.ReviewThreads[0].Resolved = true
+	reader.evidence.ObservedAt = reader.evidence.ObservedAt.Add(time.Minute)
+	command := ProductionReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: store.run.State, IdempotencyKey: run.IdempotencyKey}
+	result, err := restarted.ReconcileGitHub(context.Background(), command, reader)
+	if err != nil || result.Action != ProductionMerge || store.run.State != domain.StateMerging || writer.calls != 1 {
+		t.Fatalf("resolution result=%+v err=%v state=%s writes=%d", result, err, store.run.State, writer.calls)
+	}
+
+	writer.err = nil
+	store.inspection.Run = store.run
+	merged, err := restarted.MergePullRequest(context.Background(), mergeCommand(store.run), &pushValidator{}, reader, writer)
+	if err != nil || merged.Action != ProductionStop || store.run.State != domain.StateAwaitingLinearCompletion || writer.calls != 2 || store.side.Attempt != 2 || store.side.Status != "observed" {
+		t.Fatalf("guarded retry result=%+v err=%v state=%s writes=%d side=%+v", merged, err, store.run.State, writer.calls, store.side)
+	}
+}
+
+func TestProductionMergeabilityResolutionDriftRemainsManual(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*mergeReader)
+	}{
+		{name: "topology", mutate: func(reader *mergeReader) {
+			followup := domain.GitHubReviewComment{DatabaseID: 12, NodeID: "FOLLOWUP", ReplyToDatabaseID: 10, ReplyToNodeID: "ROOT", BodyDigest: domain.TrustedReviewFeedbackDigest("untrusted follow-up"), CreatedAt: reader.evidence.ObservedAt, UpdatedAt: reader.evidence.ObservedAt}
+			reader.evidence.ReviewThreads[0].Comments = append(reader.evidence.ReviewThreads[0].Comments, followup)
+			reader.handoff.Comments = append(reader.handoff.Comments, domain.InlineReviewBody{ThreadNodeID: reader.evidence.ReviewThreads[0].NodeID, CommentNodeID: followup.NodeID, Body: "untrusted follow-up", BodyDigest: followup.BodyDigest})
+		}},
+		{name: "actor identity", mutate: func(reader *mergeReader) {
+			actor := *reader.evidence.ReviewThreads[0].Comments[0].Author
+			actor.NodeID = "LOOKALIKE"
+			reader.evidence.ReviewThreads[0].Comments[0].Author = &actor
+		}},
+		{name: "root identity", mutate: func(reader *mergeReader) {
+			reader.evidence.ReviewThreads[0].Comments[0].NodeID = "OTHER_ROOT"
+		}},
+		{name: "reply identity", mutate: func(reader *mergeReader) {
+			reader.evidence.ReviewThreads[0].Comments[1].NodeID = "OTHER_REPLY"
+		}},
+		{name: "reply body", mutate: func(reader *mergeReader) {
+			reader.handoff.Comments[1].Body = "changed reply body"
+			reader.handoff.Comments[1].BodyDigest = domain.TrustedReviewFeedbackDigest(reader.handoff.Comments[1].Body)
+			reader.evidence.ReviewThreads[0].Comments[1].BodyDigest = reader.handoff.Comments[1].BodyDigest
+		}},
+		{name: "outdated", mutate: func(reader *mergeReader) {
+			reader.evidence.ReviewThreads[0].Outdated = true
+		}},
+		{name: "head", mutate: func(reader *mergeReader) {
+			reader.evidence.PullRequest.HeadSHA = strings.Repeat("b", 40)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			coordinator, store, run, reader, writer := newMergeCoordinator(t)
+			store.run.State, run.State = domain.StateAwaitingGitHubMergeability, domain.StateAwaitingGitHubMergeability
+			configureMergeabilityFixture(t, store, run, reader)
+			setMergePolicyPendingSide(t, store, run, reader)
+			store.inspection.Run = store.run
+			reader.evidence.ReviewThreads[0].Resolved = true
+			reader.evidence.ObservedAt = reader.evidence.ObservedAt.Add(time.Minute)
+			tc.mutate(reader)
+
+			_, err := coordinator.ReconcileGitHub(context.Background(), ProductionReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: store.run.State, IdempotencyKey: run.IdempotencyKey}, reader)
+			if err == nil || store.run.State != domain.StateManualIntervention || writer.calls != 0 {
+				t.Fatalf("err=%v state=%s writes=%d", err, store.run.State, writer.calls)
+			}
+		})
+	}
+}
+
+func TestProductionMergeabilityResolutionRequiresNewerObservation(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		observe func(time.Time) time.Time
+	}{
+		{name: "same observation", observe: func(observed time.Time) time.Time { return observed }},
+		{name: "older observation", observe: func(observed time.Time) time.Time { return observed.Add(-time.Minute) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			coordinator, store, run, reader, writer := newMergeCoordinator(t)
+			store.run.State, run.State = domain.StateAwaitingGitHubMergeability, domain.StateAwaitingGitHubMergeability
+			configureMergeabilityFixture(t, store, run, reader)
+			setMergePolicyPendingSide(t, store, run, reader)
+			store.inspection.Run = store.run
+			reader.evidence.ReviewThreads[0].Resolved = true
+			reader.evidence.ObservedAt = tc.observe(reader.evidence.ObservedAt)
+
+			_, err := coordinator.ReconcileGitHub(context.Background(), ProductionReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: store.run.State, IdempotencyKey: run.IdempotencyKey}, reader)
+			if err == nil || store.run.State != domain.StateManualIntervention || writer.calls != 0 {
+				t.Fatalf("err=%v state=%s writes=%d", err, store.run.State, writer.calls)
+			}
+		})
 	}
 }
 
@@ -791,6 +899,7 @@ func TestProductionMergePolicyRetryReturnsToReadOnlyWaitWhenThreadReopens(t *tes
 		t.Fatalf("initial wait err=%v state=%s writes=%d", err, store.run.State, writer.calls)
 	}
 	reader.evidence.ReviewThreads[0].Resolved = true
+	reader.evidence.ObservedAt = reader.evidence.ObservedAt.Add(time.Minute)
 	store.inspection.Run = store.run
 	if result, err := coordinator.ReconcileGitHub(context.Background(), ProductionReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: store.run.State, IdempotencyKey: run.IdempotencyKey}, reader); err != nil || result.Action != ProductionMerge || store.run.State != domain.StateMerging {
 		t.Fatalf("resolution result=%+v err=%v state=%s", result, err, store.run.State)
@@ -813,6 +922,7 @@ func TestProductionMergePolicyRetryFailsClosedWhenFollowupChangesTopology(t *tes
 		t.Fatalf("initial wait err=%v state=%s writes=%d", err, store.run.State, writer.calls)
 	}
 	reader.evidence.ReviewThreads[0].Resolved = true
+	reader.evidence.ObservedAt = reader.evidence.ObservedAt.Add(time.Minute)
 	store.inspection.Run = store.run
 	if _, err := coordinator.ReconcileGitHub(context.Background(), ProductionReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: store.run.State, IdempotencyKey: run.IdempotencyKey}, reader); err != nil || store.run.State != domain.StateMerging {
 		t.Fatalf("resolution err=%v state=%s", err, store.run.State)
