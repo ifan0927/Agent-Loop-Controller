@@ -14,9 +14,27 @@ type sourceSyncStore struct {
 	deliveryMemoryStore
 	upserts      []CleanupRecord
 	failUpsertAt int
+	attention    []OperatorAttentionEvent
+}
+
+func (s *sourceSyncStore) AppendOperatorAttention(_ context.Context, event OperatorAttentionEvent) (bool, error) {
+	for _, existing := range s.attention {
+		if existing.EventKey != event.EventKey {
+			continue
+		}
+		if existing.PayloadDigest != event.PayloadDigest {
+			return false, errors.New("operator attention conflict")
+		}
+		return false, nil
+	}
+	s.attention = append(s.attention, event)
+	return true, nil
 }
 
 func (s *sourceSyncStore) UpsertCleanup(_ context.Context, value CleanupRecord) error {
+	if value.UpdatedAt.IsZero() {
+		value.UpdatedAt = time.Now().UTC()
+	}
 	s.upserts = append(s.upserts, value)
 	if s.failUpsertAt > 0 && len(s.upserts) == s.failUpsertAt {
 		return errors.New("cleanup persistence unavailable")
@@ -52,11 +70,11 @@ func (p *recordingSourceSync) Sync(_ context.Context, request SourceSyncRequest)
 
 func sourceSyncFixture(t *testing.T) (Run, MergeRecord) {
 	t.Helper()
-	repository, err := json.Marshal(LocalRepository{CanonicalRepository: "owner/repo", SourcePath: "/frozen/source", OriginPath: "/frozen/origin", BaseBranch: "main"})
+	repository, err := json.Marshal(LocalRepository{ProfileID: "repository-profile:owner/repo", CanonicalRepository: "owner/repo", SourcePath: "/frozen/source", OriginPath: "/frozen/origin", BaseBranch: "main"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := Run{ID: "run", Repository: "owner/repo", RepositoryConfigJSON: string(repository), BaseBranch: "main", CandidateHead: "candidate", State: domain.StateCleaning}
+	run := Run{ID: "run", Repository: "owner/repo", ProfileID: "repository-profile:owner/repo", RepositoryConfigJSON: string(repository), BaseBranch: "main", CandidateHead: "candidate", State: domain.StateCleaning}
 	return run, MergeRecord{RunID: run.ID, PreMergeSHA: run.CandidateHead, Method: "squash", MergeSHA: "exact-merge", MergedAt: time.Now().UTC()}
 }
 
@@ -90,6 +108,12 @@ func TestSyncSourceCheckoutRestartsIntentAndMapsAttentionAndRetryableResults(t *
 	}
 	if len(port.calls) != 1 || store.cleanup[0].Status != "skipped_attention" || store.cleanup[0].ErrorClass != string(SourceSyncReasonDirtySource) {
 		t.Fatalf("calls=%+v cleanup=%+v", port.calls, store.cleanup)
+	}
+	if len(store.attention) != 1 || store.attention[0].EventType != OperatorAttentionSourceCheckoutSkipped || store.attention[0].ReasonCode != string(SourceSyncReasonDirtySource) || store.attention[0].DeliveryStatus != OperatorAttentionDeliveryPendingLocal {
+		t.Fatalf("attention=%+v", store.attention)
+	}
+	if err := SyncSourceCheckout(context.Background(), store, port, run, merge); err != nil || len(port.calls) != 1 || len(store.attention) != 1 {
+		t.Fatalf("restart err=%v calls=%+v attention=%+v", err, port.calls, store.attention)
 	}
 
 	store = &sourceSyncStore{}

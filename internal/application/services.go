@@ -361,26 +361,27 @@ func authorizePersistedRequester(run Run, requester Requester) error {
 }
 
 type InspectionResult struct {
-	SchemaVersion     string                          `json:"schema_version"`
-	Run               RunResult                       `json:"run"`
-	RepositoryBinding *RepositoryBindingResult        `json:"repository_binding,omitempty"`
-	Timeline          []TransitionResult              `json:"state_timeline"`
-	Attempts          []AttemptResult                 `json:"attempts"`
-	Verifications     []VerificationResult            `json:"verifications"`
-	Reviews           []ReviewResult                  `json:"reviews"`
-	Resources         []ResourceResult                `json:"owned_resources"`
-	PullRequest       *PullRequestResult              `json:"pull_request,omitempty"`
-	Approval          *HumanApprovalResult            `json:"human_approval,omitempty"`
-	ApprovalStatus    *HumanApprovalStatusResult      `json:"human_approval_status,omitempty"`
-	Merge             *MergeRecord                    `json:"merge_result,omitempty"`
-	LinearCompletion  []LinearCompletionObservation   `json:"linear_completion_observations"`
-	Cleanup           []CleanupResult                 `json:"cleanup_progress"`
-	OperatorAttention []OperatorAttentionResult       `json:"operator_attention"`
-	Checks            []CheckResult                   `json:"checks"`
-	Findings          []FindingResult                 `json:"review_findings"`
-	TrustedFeedback   []TrustedFeedbackResult         `json:"trusted_review_feedback"`
-	FeedbackConflicts []TrustedFeedbackConflictResult `json:"trusted_review_feedback_conflicts"`
-	Telemetry         []TelemetryResult               `json:"unknown_telemetry"`
+	SchemaVersion           string                          `json:"schema_version"`
+	Run                     RunResult                       `json:"run"`
+	RepositoryBinding       *RepositoryBindingResult        `json:"repository_binding,omitempty"`
+	Timeline                []TransitionResult              `json:"state_timeline"`
+	Attempts                []AttemptResult                 `json:"attempts"`
+	Verifications           []VerificationResult            `json:"verifications"`
+	Reviews                 []ReviewResult                  `json:"reviews"`
+	Resources               []ResourceResult                `json:"owned_resources"`
+	PullRequest             *PullRequestResult              `json:"pull_request,omitempty"`
+	Approval                *HumanApprovalResult            `json:"human_approval,omitempty"`
+	ApprovalStatus          *HumanApprovalStatusResult      `json:"human_approval_status,omitempty"`
+	Merge                   *MergeRecord                    `json:"merge_result,omitempty"`
+	LinearCompletion        []LinearCompletionObservation   `json:"linear_completion_observations"`
+	Cleanup                 []CleanupResult                 `json:"cleanup_progress"`
+	OperatorAttention       []OperatorAttentionResult       `json:"operator_attention"`
+	OperatorAttentionOutbox []OperatorAttentionOutboxResult `json:"operator_attention_outbox"`
+	Checks                  []CheckResult                   `json:"checks"`
+	Findings                []FindingResult                 `json:"review_findings"`
+	TrustedFeedback         []TrustedFeedbackResult         `json:"trusted_review_feedback"`
+	FeedbackConflicts       []TrustedFeedbackConflictResult `json:"trusted_review_feedback_conflicts"`
+	Telemetry               []TelemetryResult               `json:"unknown_telemetry"`
 }
 type RunSummaryPage struct {
 	SchemaVersion string       `json:"schema_version"`
@@ -470,6 +471,24 @@ type OperatorAttentionResult struct {
 	Status     string    `json:"status"`
 	ReasonCode string    `json:"reason_code"`
 	ObservedAt time.Time `json:"observed_at"`
+}
+
+// OperatorAttentionOutboxResult is a bounded read-only projection of the
+// local delivery placeholder. It carries only the #34 allowlisted payload.
+type OperatorAttentionOutboxResult struct {
+	EventKey              string    `json:"event_key"`
+	EventType             string    `json:"event_type"`
+	RunID                 string    `json:"run_id,omitempty"`
+	LinearIdentifier      string    `json:"linear_identifier,omitempty"`
+	RepositoryProfileID   string    `json:"repository_profile_id"`
+	RepositoryProfileName string    `json:"repository_profile_name"`
+	ControllerState       string    `json:"controller_state"`
+	Severity              string    `json:"severity"`
+	ReasonCode            string    `json:"reason_code"`
+	EvidenceDigest        string    `json:"evidence_digest"`
+	OccurredAt            time.Time `json:"occurred_at"`
+	ObservedAt            time.Time `json:"observed_at"`
+	DeliveryStatus        string    `json:"delivery_status"`
 }
 type CheckResult struct {
 	Name        string    `json:"name"`
@@ -564,7 +583,7 @@ type PullRequestResult struct {
 
 func projectInspection(value RunInspection) InspectionResult {
 	result := InspectionResult{SchemaVersion: querySchemaVersion, Run: projectRunResult(value.Run), RepositoryBinding: projectRepositoryBinding(value.RepositoryBinding), Merge: value.Merge,
-		Timeline: []TransitionResult{}, Attempts: []AttemptResult{}, Verifications: []VerificationResult{}, Reviews: []ReviewResult{}, Resources: []ResourceResult{}, LinearCompletion: append([]LinearCompletionObservation(nil), value.LinearCompletion...), Cleanup: []CleanupResult{}, OperatorAttention: []OperatorAttentionResult{}, Checks: []CheckResult{}, Findings: []FindingResult{}, TrustedFeedback: []TrustedFeedbackResult{}, FeedbackConflicts: []TrustedFeedbackConflictResult{}, Telemetry: []TelemetryResult{}}
+		Timeline: []TransitionResult{}, Attempts: []AttemptResult{}, Verifications: []VerificationResult{}, Reviews: []ReviewResult{}, Resources: []ResourceResult{}, LinearCompletion: append([]LinearCompletionObservation(nil), value.LinearCompletion...), Cleanup: []CleanupResult{}, OperatorAttention: []OperatorAttentionResult{}, OperatorAttentionOutbox: []OperatorAttentionOutboxResult{}, Checks: []CheckResult{}, Findings: []FindingResult{}, TrustedFeedback: []TrustedFeedbackResult{}, FeedbackConflicts: []TrustedFeedbackConflictResult{}, Telemetry: []TelemetryResult{}}
 	if value.Approval != nil {
 		result.Approval = &HumanApprovalResult{Approver: sanitizeUntrustedContent(value.Approval.Approver), ApprovedSHA: value.Approval.ApprovedSHA, SourceAt: value.Approval.ApprovedAt, ObservedAt: value.Approval.ObservedAt}
 	}
@@ -594,6 +613,9 @@ func projectInspection(value RunInspection) InspectionResult {
 		result.Cleanup = append(result.Cleanup, CleanupResult{v.Kind, v.Status, sanitizedCleanupErrorClass(v), v.UpdatedAt})
 	}
 	result.OperatorAttention = projectOperatorAttention(value.Cleanup)
+	for _, event := range value.OperatorAttention {
+		result.OperatorAttentionOutbox = append(result.OperatorAttentionOutbox, OperatorAttentionOutboxResult{EventKey: event.EventKey, EventType: event.EventType, RunID: event.RunID, LinearIdentifier: event.LinearIdentifier, RepositoryProfileID: event.RepositoryProfileID, RepositoryProfileName: event.RepositoryProfileName, ControllerState: event.ControllerState, Severity: event.Severity, ReasonCode: event.ReasonCode, EvidenceDigest: event.EvidenceDigest, OccurredAt: event.OccurredAt, ObservedAt: event.ObservedAt, DeliveryStatus: event.DeliveryStatus})
+	}
 	for _, finding := range value.Findings {
 		result.Findings = append(result.Findings, FindingResult{Source: finding.Source, SourceID: finding.SourceID,
 			File: sanitizeRepositoryPath(finding.File), Line: finding.Line, Severity: finding.Severity, BodyDigest: finding.BodyDigest,

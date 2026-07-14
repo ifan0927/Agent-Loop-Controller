@@ -2,11 +2,14 @@ package application
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
@@ -47,8 +50,11 @@ func SyncSourceCheckout(ctx context.Context, store DeliveryStore, port SourceSyn
 		if record.Kind != "source_checkout" || record.Name != sourceCheckoutCleanupIdentity {
 			continue
 		}
-		if record.Status == "synced" || record.Status == "skipped_attention" {
+		if record.Status == "synced" {
 			return nil
+		}
+		if record.Status == "skipped_attention" {
+			return persistSourceCheckoutAttention(ctx, store, run, merge, record.ErrorClass, record.UpdatedAt)
 		}
 	}
 	intent := CleanupRecord{RunID: run.ID, Kind: "source_checkout", Name: sourceCheckoutCleanupIdentity, Status: "intent"}
@@ -66,10 +72,50 @@ func SyncSourceCheckout(ctx context.Context, store DeliveryStore, port SourceSyn
 	if err := store.UpsertCleanup(ctx, CleanupRecord{RunID: run.ID, Kind: "source_checkout", Name: sourceCheckoutCleanupIdentity, Status: status, ErrorClass: reason}); err != nil {
 		return err
 	}
+	if status == "skipped_attention" {
+		return persistSourceCheckoutAttention(ctx, store, run, merge, reason, time.Time{})
+	}
 	if status == "failed" {
 		return errSourceSyncRetryable
 	}
 	return nil
+}
+
+func persistSourceCheckoutAttention(ctx context.Context, store DeliveryStore, run Run, merge MergeRecord, reason string, observedAt time.Time) error {
+	if run.ProfileID == "" {
+		return nil
+	}
+	outbox, ok := store.(OperatorAttentionAppender)
+	if !ok {
+		return nil
+	}
+	if observedAt.IsZero() {
+		progress, err := store.CleanupProgress(ctx, run.ID)
+		if err != nil {
+			return err
+		}
+		for _, record := range progress {
+			if record.Kind == "source_checkout" && record.Name == sourceCheckoutCleanupIdentity && record.Status == "skipped_attention" {
+				observedAt = record.UpdatedAt
+				break
+			}
+		}
+	}
+	if observedAt.IsZero() {
+		return errors.New("persisted source checkout attention timestamp is required")
+	}
+	evidence := sourceCheckoutAttentionEvidenceDigest(run.ID, merge.MergeSHA, reason)
+	event, err := SourceCheckoutSkippedAttentionEvent(run, 0, reason, evidence, observedAt)
+	if err != nil {
+		return err
+	}
+	_, err = outbox.AppendOperatorAttention(ctx, event)
+	return err
+}
+
+func sourceCheckoutAttentionEvidenceDigest(runID, mergeSHA, reason string) string {
+	sum := sha256.Sum256([]byte(runID + "\x00" + mergeSHA + "\x00" + reason))
+	return hex.EncodeToString(sum[:])
 }
 
 func sourceSyncCleanupResult(result SourceSyncResult, mergeSHA string) (string, string, error) {

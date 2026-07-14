@@ -143,6 +143,7 @@ type RunInspection struct {
 	Merge               *MergeRecord                     `json:"merge_result,omitempty"`
 	LinearCompletion    []LinearCompletionObservation    `json:"linear_completion_observations"`
 	Cleanup             []CleanupRecord                  `json:"cleanup_progress"`
+	OperatorAttention   []OperatorAttentionEvent         `json:"operator_attention_outbox"`
 	GitHubInstallation  *GitHubInstallationMetadata      `json:"github_installation,omitempty"`
 	GitHubRequests      []GitHubRequestObservation       `json:"github_request_observations"`
 	GitHubEvidence      *domain.GitHubReadEvidence       `json:"github_read_evidence,omitempty"`

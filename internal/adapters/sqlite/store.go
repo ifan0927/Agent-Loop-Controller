@@ -20,7 +20,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 16
+const schemaVersion = 17
 
 type Store struct{ db *sql.DB }
 
@@ -121,6 +121,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV15
 		case 16:
 			statements = migrationV16
+		case 17:
+			statements = migrationV17
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -309,6 +311,31 @@ var migrationV16 = []string{
 		updated_at TEXT NOT NULL
 	)`,
 	`CREATE INDEX IF NOT EXISTS linear_todo_admission_journal_status ON linear_todo_admission_journal(status,updated_at)`,
+}
+
+// migrationV17 is a local, append-only operator-attention outbox. It has no
+// delivery attempt or acknowledgement fields because this controller does not
+// own a notification transport.
+var migrationV17 = []string{
+	`CREATE TABLE IF NOT EXISTS operator_attention_outbox (
+		event_key TEXT PRIMARY KEY,
+		payload_digest TEXT NOT NULL,
+		event_type TEXT NOT NULL,
+		run_id TEXT NOT NULL DEFAULT '',
+		linear_identifier TEXT NOT NULL DEFAULT '',
+		repository_profile_id TEXT NOT NULL,
+		repository_profile_name TEXT NOT NULL,
+		controller_state TEXT NOT NULL,
+		severity TEXT NOT NULL,
+		reason_code TEXT NOT NULL,
+		evidence_digest TEXT NOT NULL,
+		occurred_at TEXT NOT NULL,
+		observed_at TEXT NOT NULL,
+		delivery_status TEXT NOT NULL CHECK(delivery_status='pending_local'),
+		created_at TEXT NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS operator_attention_outbox_projection ON operator_attention_outbox(occurred_at,event_key)`,
+	`CREATE INDEX IF NOT EXISTS operator_attention_outbox_run ON operator_attention_outbox(run_id,occurred_at,event_key)`,
 }
 
 func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput) (application.Run, bool, error) {
@@ -2293,6 +2320,11 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 		inspection.Cleanup = append(inspection.Cleanup, v)
 	}
 	rows.Close()
+	attention, err := s.listOperatorAttention(ctx, id, 100)
+	if err != nil {
+		return inspection, err
+	}
+	inspection.OperatorAttention = attention
 	var installation application.GitHubInstallationMetadata
 	var tokenExpiry, installationObserved string
 	if err := s.db.QueryRowContext(ctx, `SELECT app_id,installation_id,repository_id,repository_node_id,repository_owner,repository_name,token_expires_at,permissions_digest,observed_at FROM github_installations WHERE run_id=? ORDER BY observation_id DESC LIMIT 1`, id).Scan(&installation.AppID, &installation.InstallationID, &installation.Repository.ID, &installation.Repository.NodeID, &installation.Repository.Owner, &installation.Repository.Name, &tokenExpiry, &installation.PermissionsDigest, &installationObserved); err == nil {
