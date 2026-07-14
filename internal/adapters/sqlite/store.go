@@ -20,7 +20,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 15
+const schemaVersion = 16
 
 type Store struct{ db *sql.DB }
 
@@ -119,6 +119,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV14
 		case 15:
 			statements = migrationV15
+		case 16:
+			statements = migrationV16
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -281,6 +283,32 @@ var migrationV14 = []string{
 // emitting duplicate writes; it is audit evidence, not a liveness lease.
 var migrationV15 = []string{
 	`ALTER TABLE side_effects ADD COLUMN claimed_at TEXT NOT NULL DEFAULT ''`,
+}
+
+// migrationV16 persists automatic-admission authority separately from per-run
+// controller leases. The journal stores immutable identifiers and digests only.
+var migrationV16 = []string{
+	`CREATE TABLE IF NOT EXISTS linear_todo_admission_lease (
+		namespace TEXT PRIMARY KEY CHECK(namespace='linear_todo_admission'),
+		owner_nonce TEXT NOT NULL,
+		version INTEGER NOT NULL CHECK(version > 0),
+		acquired_at TEXT NOT NULL,
+		renewed_at TEXT NOT NULL,
+		expires_at TEXT NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS linear_todo_admission_journal (
+		issue_uuid TEXT NOT NULL UNIQUE,
+		run_id TEXT NOT NULL PRIMARY KEY REFERENCES runs(run_id),
+		scan_digest TEXT NOT NULL,
+		task_digest TEXT NOT NULL,
+		profile_digest TEXT NOT NULL,
+		status TEXT NOT NULL CHECK(status IN ('reserved','mutation_intent','started','manual_intervention')),
+		mutation_intent_ref TEXT NOT NULL DEFAULT '',
+		reason_code TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS linear_todo_admission_journal_status ON linear_todo_admission_journal(status,updated_at)`,
 }
 
 func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput) (application.Run, bool, error) {

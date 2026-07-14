@@ -788,7 +788,7 @@ func TestMigratesLegacyCodeRabbitApprovalColumnWithoutLosingApproval(t *testing.
 	if _, err := store.db.ExecContext(ctx, `ALTER TABLE side_effects DROP COLUMN claimed_at`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (12,13,14,15)`); err != nil {
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (12,13,14,15,16)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE trusted_review_feedback_conflicts`); err != nil {

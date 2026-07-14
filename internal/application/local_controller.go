@@ -147,24 +147,11 @@ func (c *LocalController) StartAuthorized(ctx context.Context, input LocalStartI
 		return Run{}, errors.New("run and worktree roots must not overlap")
 	}
 	input.RunRoot, input.WorktreeRoot = canonicalRuns, canonicalWorktrees
-	if input.Task.Repository != input.Repository.CanonicalRepository || input.Task.BaseBranch != input.Repository.BaseBranch {
-		return Run{}, errors.New("task repository/base does not match the registry snapshot")
-	}
-	repositoryJSON, err := json.Marshal(input.Repository)
+	runInput, err := ReservedRunFromAdmissionSnapshot(input)
 	if err != nil {
 		return Run{}, err
 	}
-	artifactRoot := filepath.Join(input.RunRoot, input.Task.RunID)
-	run, created, err := c.store.CreateRun(ctx, CreateRunInput{Run: Run{ID: input.Task.RunID, IssueID: input.Task.IssueID,
-		IdempotencyKey: input.IdempotencyKey, SourceRevision: input.Task.SourceRevision, RawIssueJSON: string(input.RawIssueJSON),
-		RawIssueHash: input.RawIssueHash, NormalizedTaskJSON: string(input.NormalizedJSON), TaskHash: input.TaskHash,
-		Repository: input.Task.Repository, RepositoryConfigJSON: string(repositoryJSON), BaseBranch: input.Task.BaseBranch,
-		ProfileID: input.Repository.ProfileID, ProfileSnapshotVersion: input.Repository.ProfileSnapshotVersion, ProfileDigest: input.Repository.ProfileDigest,
-		ProfileSnapshotJSON: input.Repository.ProfileSnapshotJSON,
-		RegistryVersion:     input.Repository.RegistryVersion, RegistryDigest: input.Repository.RegistryDigest,
-		RepositoryBindingDigest: input.Repository.RepositoryBindingDigest,
-		WorkingBranch:           input.Task.WorkingBranch, WorktreePath: filepath.Join(input.WorktreeRoot, input.Task.RunID), ArtifactRoot: artifactRoot,
-		ImplementationModel: codex.ImplementationModel, ReviewModel: codex.ReviewModel}})
+	run, created, err := c.store.CreateRun(ctx, CreateRunInput{Run: runInput})
 	if err != nil {
 		return Run{}, err
 	}
