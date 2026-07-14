@@ -235,6 +235,23 @@ func TestConfigValidateAndInspectDoNotReadFileCredential(t *testing.T) {
 	}
 }
 
+func TestControllerWorkerOnceHonorsDisabledConfigurationBeforeCredentialPreflight(t *testing.T) {
+	root := resolvedTempDir(t)
+	path, _ := writeControllerStatusConfig(t, root)
+	output, err := captureConfigOutput(func() error { return controller([]string{"worker", "--once", "--config", path}) })
+	if err != nil || !strings.Contains(output, `"disabled": true`) || !strings.Contains(output, `"stopped": "disabled"`) {
+		t.Fatalf("output=%s err=%v", output, err)
+	}
+	for _, forbidden := range []string{root, "secret://", "IFAN_LOOP_LINEAR_TOKEN"} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("disabled worker leaked %q in %s", forbidden, output)
+		}
+	}
+	if err := controller([]string{"worker", "--once", "unexpected"}); err == nil || !strings.Contains(err.Error(), "does not accept positional") {
+		t.Fatalf("positional worker error=%v", err)
+	}
+}
+
 func TestConfigInitRefusesSymlinkedConfigurationDirectory(t *testing.T) {
 	root := resolvedTempDir(t)
 	configRoot := filepath.Join(root, "config-root")

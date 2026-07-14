@@ -52,7 +52,11 @@ func runtimeDoctor(args []string) error {
 // credentials. A file reference can never silently fall back to the process
 // environment.
 func linearCredentialSource(loaded bootstrap.Bootstrap) (linearadapter.CredentialSource, error) {
-	switch loaded.Linear.CredentialSourceRef {
+	return linearCredentialSourceForRef(loaded, loaded.Linear.CredentialSourceRef)
+}
+
+func linearCredentialSourceForRef(loaded bootstrap.Bootstrap, ref string) (linearadapter.CredentialSource, error) {
+	switch ref {
 	case linearadapter.EnvironmentCredentialSourceRef:
 		return linearadapter.EnvironmentCredentialSource{Variable: "IFAN_LOOP_LINEAR_TOKEN"}, nil
 	case linearadapter.FileCredentialSourceRef:

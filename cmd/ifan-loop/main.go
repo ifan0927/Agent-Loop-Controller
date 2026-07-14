@@ -68,7 +68,7 @@ func main() {
 
 func controller(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: ifan-loop controller <start|run|drive|status|inspect|continue|recover-owned-push|push|open-pr|reconcile|merge|reconcile-linear|cleanup> ...")
+		return errors.New("usage: ifan-loop controller <start|run|drive|worker|status|inspect|continue|recover-owned-push|push|open-pr|reconcile|merge|reconcile-linear|cleanup> ...")
 	}
 	switch args[0] {
 	case "start":
@@ -77,6 +77,8 @@ func controller(args []string) error {
 		return controllerRun(args[1:])
 	case "drive":
 		return controllerDrive(args[1:])
+	case "worker":
+		return controllerWorker(args[1:])
 	case "status", "inspect":
 		return controllerInspect(args[0], args[1:])
 	case "continue":

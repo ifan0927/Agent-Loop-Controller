@@ -79,6 +79,15 @@ loader and `config validate` / `config inspect` never read token bytes.
 only readiness or a generic warning, never a token, path, source ref, or
 filesystem detail.
 
+When `automation.linear_todo_admission.enabled` is true, run the local worker
+explicitly with `ifan-loop controller worker`. It has no listener, webhook, or
+service installation behavior. It uses the configured admission poll interval,
+one scheduler lease per dispatch cycle, and stops before another admission when
+the cycle emits operator attention. `--once` performs exactly one resume or
+scan/dispatch cycle; `--max-runtime` bounds the process and SIGINT/SIGTERM
+cancel the current wait or driver. The worker reports only its generated
+instance ID, configuration digest, cycle count, outcome, and stop reason.
+
 ## Future Web UI
 
 A Web UI should use the controller process as an authenticated backend and

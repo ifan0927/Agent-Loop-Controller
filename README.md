@@ -167,6 +167,17 @@ Start the normal durable delivery loop with one explicit trigger. The process
 continues through every safe transition; do not run one manual delivery command
 per state during normal operation:
 
+For disabled-by-default automatic Linear Todo admission, start the local-only
+bounded worker explicitly after enabling its configuration authority:
+
+```sh
+go run ./cmd/ifan-loop controller worker --once
+go run ./cmd/ifan-loop controller worker --max-runtime 24h
+```
+
+It exposes no HTTP listener, webhook, daemon, or service installation. A
+worker stops on operator attention and never admits another issue in that run.
+
 ```sh
 go run ./cmd/ifan-loop controller run IFAN-42 \
   --config /absolute/path/controller.json \
