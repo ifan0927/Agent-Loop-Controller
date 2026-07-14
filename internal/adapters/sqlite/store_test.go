@@ -112,6 +112,157 @@ func TestRetryMergeSideEffectClaimsOnePolicyRetry(t *testing.T) {
 	}
 }
 
+func TestRetryLinearIssueStartSideEffectClaimsOnlySecondAttempt(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run := application.Run{ID: "linear-start-retry", IssueID: "IFAN-START", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: "/tmp/linear-start-retry", ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}
+	if _, _, err := store.CreateRun(context.Background(), application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	side, _, err := store.BeginSideEffect(context.Background(), application.SideEffectRecord{RunID: run.ID, Kind: "linear_move_to_started", IdempotencyKey: strings.Repeat("b", 64), IntentJSON: `{"issue_id":"123e4567-e89b-42d3-a456-426614174103"}`, Attempt: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	side.Status, side.ResultJSON, side.ObservedAt = "failed", `{"category":"todo_after_mutation"}`, time.Now().UTC()
+	if err := store.FinishSideEffect(context.Background(), side); err != nil {
+		t.Fatal(err)
+	}
+	claimed, changed, err := store.RetryLinearIssueStartSideEffect(context.Background(), side)
+	if err != nil || !changed || claimed.Status != "intent" || claimed.Attempt != 2 || claimed.ResultJSON != "" || !claimed.ObservedAt.IsZero() {
+		t.Fatalf("claimed=%+v changed=%v err=%v", claimed, changed, err)
+	}
+	if _, changed, err := store.RetryLinearIssueStartSideEffect(context.Background(), side); err != nil || changed {
+		t.Fatalf("second retry changed=%v err=%v", changed, err)
+	}
+}
+
+func TestLinearIssueStartExecutionClaimIsSingleOwner(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	run := application.Run{ID: "linear-start-claim", IssueID: "IFAN-CLAIM", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: "/tmp/linear-start-claim", ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}
+	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	side, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{RunID: run.ID, Kind: "linear_move_to_started", IdempotencyKey: strings.Repeat("c", 64), IntentJSON: `{"issue_id":"123e4567-e89b-42d3-a456-426614174103"}`, Attempt: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := make(chan bool, 2)
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() {
+			_, claimed, claimErr := store.ClaimLinearIssueStartSideEffect(ctx, side, time.Now().UTC())
+			claims <- claimed
+			errs <- claimErr
+		}()
+	}
+	claimed := 0
+	for range 2 {
+		if claimErr := <-errs; claimErr != nil {
+			t.Fatal(claimErr)
+		}
+		if <-claims {
+			claimed++
+		}
+	}
+	if claimed != 1 {
+		t.Fatalf("claimed=%d", claimed)
+	}
+	claimedSide, found, err := linearIssueStartSideEffectByID(ctx, store.db, side.ID)
+	if err != nil || !found || claimedSide.Status != "in_flight" || claimedSide.Attempt != 1 || claimedSide.ClaimedAt.IsZero() {
+		t.Fatalf("side=%+v found=%v err=%v", claimedSide, found, err)
+	}
+	finished := claimedSide
+	finished.Status, finished.ResultJSON, finished.ObservedAt = "failed", `{"category":"todo_after_mutation"}`, time.Now().UTC()
+	if err := store.FinishLinearIssueStartSideEffect(ctx, finished, "in_flight", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishLinearIssueStartSideEffect(ctx, finished, "in_flight", 1); err == nil {
+		t.Fatal("stale claimer rewrote the finished effect")
+	}
+}
+
+func TestRetryLinearIssueStartSideEffectHasOneWinner(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	run := application.Run{ID: "linear-start-retry-race", IssueID: "IFAN-RETRY", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: "/tmp/linear-start-retry-race", ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}
+	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	side, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{RunID: run.ID, Kind: "linear_move_to_started", IdempotencyKey: strings.Repeat("d", 64), IntentJSON: `{"issue_id":"123e4567-e89b-42d3-a456-426614174103"}`, Attempt: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	side.Status, side.ResultJSON, side.ObservedAt = "failed", `{"category":"todo_after_mutation"}`, time.Now().UTC()
+	if err := store.FinishSideEffect(ctx, side); err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan bool, 2)
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() {
+			_, retried, retryErr := store.RetryLinearIssueStartSideEffect(ctx, side)
+			results <- retried
+			errs <- retryErr
+		}()
+	}
+	retried := 0
+	for range 2 {
+		if retryErr := <-errs; retryErr != nil {
+			t.Fatal(retryErr)
+		}
+		if <-results {
+			retried++
+		}
+	}
+	if retried != 1 {
+		t.Fatalf("retried=%d", retried)
+	}
+	current, found, err := linearIssueStartSideEffectByID(ctx, store.db, side.ID)
+	if err != nil || !found || current.Status != "intent" || current.Attempt != 2 {
+		t.Fatalf("current=%+v found=%v err=%v", current, found, err)
+	}
+}
+
+func TestRetryLinearIssueStartSideEffectRequiresExactConclusiveTodoResult(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	run := application.Run{ID: "linear-start-non-retry", IssueID: "IFAN-NO-RETRY", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: "/tmp/linear-start-non-retry", ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}
+	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	side, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{RunID: run.ID, Kind: "linear_move_to_started", IdempotencyKey: strings.Repeat("e", 64), IntentJSON: `{"issue_id":"123e4567-e89b-42d3-a456-426614174103"}`, Attempt: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	side.Status, side.ResultJSON, side.ObservedAt = "failed", `{"category":"forbidden"}`, time.Now().UTC()
+	if err := store.FinishSideEffect(ctx, side); err != nil {
+		t.Fatal(err)
+	}
+	if _, changed, err := store.RetryLinearIssueStartSideEffect(ctx, side); err == nil || changed {
+		t.Fatalf("non-conclusive failed effect retried: changed=%v err=%v", changed, err)
+	}
+	current, found, err := linearIssueStartSideEffectByID(ctx, store.db, side.ID)
+	if err != nil || !found || current.Status != "failed" || current.Attempt != 1 || current.ResultJSON != side.ResultJSON {
+		t.Fatalf("current=%+v found=%v err=%v", current, found, err)
+	}
+}
+
 func TestRecordMergePolicyPendingAtomicallyPersistsWaitAndTopology(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
@@ -634,7 +785,10 @@ func TestMigratesLegacyCodeRabbitApprovalColumnWithoutLosingApproval(t *testing.
 	if _, err := store.db.ExecContext(ctx, `ALTER TABLE human_approvals ADD COLUMN coderabbit_status TEXT NOT NULL DEFAULT 'legacy'`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (12,13,14)`); err != nil {
+	if _, err := store.db.ExecContext(ctx, `ALTER TABLE side_effects DROP COLUMN claimed_at`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (12,13,14,15)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE trusted_review_feedback_conflicts`); err != nil {

@@ -20,7 +20,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 14
+const schemaVersion = 15
 
 type Store struct{ db *sql.DB }
 
@@ -117,6 +117,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV13
 		case 14:
 			statements = migrationV14
+		case 15:
+			statements = migrationV15
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -272,6 +274,13 @@ var migrationV13 = []string{
 
 var migrationV14 = []string{
 	`CREATE TABLE trusted_review_reply_evidence (reply_evidence_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), root_comment_node_id TEXT NOT NULL, pr_number INTEGER NOT NULL, root_comment_database_id INTEGER NOT NULL, repaired_head TEXT NOT NULL, marker_digest TEXT NOT NULL, reply_database_id INTEGER NOT NULL, reply_node_id TEXT NOT NULL, app_id INTEGER NOT NULL, observed_at TEXT NOT NULL, UNIQUE(run_id,root_comment_node_id), UNIQUE(run_id,reply_database_id), UNIQUE(run_id,reply_node_id))`,
+}
+
+// migrationV15 records a durable execution claim for the one Linear status
+// mutation. It prevents concurrent callers from sharing an intent and
+// emitting duplicate writes; it is audit evidence, not a liveness lease.
+var migrationV15 = []string{
+	`ALTER TABLE side_effects ADD COLUMN claimed_at TEXT NOT NULL DEFAULT ''`,
 }
 
 func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput) (application.Run, bool, error) {
@@ -1067,12 +1076,12 @@ func (s *Store) BeginSideEffect(ctx context.Context, record application.SideEffe
 		return record, true, nil
 	}
 	requested := record
-	row := s.db.QueryRowContext(ctx, `SELECT side_effect_id,run_id,kind,idempotency_key,intent_json,status,result_json,stdout_path,stderr_path,attempt,created_at,observed_at FROM side_effects WHERE run_id=? AND kind=? AND idempotency_key=?`, record.RunID, record.Kind, record.IdempotencyKey)
-	var created, observed string
-	if scanErr := row.Scan(&record.ID, &record.RunID, &record.Kind, &record.IdempotencyKey, &record.IntentJSON, &record.Status, &record.ResultJSON, &record.StdoutPath, &record.StderrPath, &record.Attempt, &created, &observed); scanErr != nil {
+	row := s.db.QueryRowContext(ctx, `SELECT side_effect_id,run_id,kind,idempotency_key,intent_json,status,result_json,stdout_path,stderr_path,attempt,created_at,claimed_at,observed_at FROM side_effects WHERE run_id=? AND kind=? AND idempotency_key=?`, record.RunID, record.Kind, record.IdempotencyKey)
+	var created, claimed, observed string
+	if scanErr := row.Scan(&record.ID, &record.RunID, &record.Kind, &record.IdempotencyKey, &record.IntentJSON, &record.Status, &record.ResultJSON, &record.StdoutPath, &record.StderrPath, &record.Attempt, &created, &claimed, &observed); scanErr != nil {
 		return record, false, err
 	}
-	record.CreatedAt, record.ObservedAt = parseTime(created), parseTime(observed)
+	record.CreatedAt, record.ClaimedAt, record.ObservedAt = parseTime(created), parseTime(claimed), parseTime(observed)
 	if record.RunID != requested.RunID || record.Kind != requested.Kind || record.IdempotencyKey != requested.IdempotencyKey || record.IntentJSON != requested.IntentJSON {
 		return record, false, errors.New("conflicting immutable side-effect intent")
 	}
@@ -1083,7 +1092,75 @@ func (s *Store) FinishSideEffect(ctx context.Context, record application.SideEff
 	if record.Status != "observed" && record.Status != "failed" {
 		return errors.New("side-effect result status must be observed or failed")
 	}
-	return execOne(ctx, s.db, `UPDATE side_effects SET status=?,result_json=?,stdout_path=?,stderr_path=?,observed_at=? WHERE side_effect_id=? AND status IN ('intent','failed')`, record.Status, record.ResultJSON, record.StdoutPath, record.StderrPath, formatTime(record.ObservedAt), record.ID)
+	return execOne(ctx, s.db, `UPDATE side_effects SET status=?,result_json=?,stdout_path=?,stderr_path=?,claimed_at='',observed_at=? WHERE side_effect_id=? AND status IN ('intent','in_flight','failed')`, record.Status, record.ResultJSON, record.StdoutPath, record.StderrPath, formatTime(record.ObservedAt), record.ID)
+}
+
+// RetryLinearIssueStartSideEffect grants the one bounded reconciliation retry
+// for the dedicated Todo-to-In Progress intent. It cannot revive any other
+// side effect or a completed/failed second attempt.
+func (s *Store) RetryLinearIssueStartSideEffect(ctx context.Context, record application.SideEffectRecord) (application.SideEffectRecord, bool, error) {
+	if record.ID < 1 || record.Kind != "linear_move_to_started" || record.Attempt != 1 || record.Status != "failed" {
+		return record, false, errors.New("invalid Linear issue start retry authority")
+	}
+	if record.ResultJSON != application.LinearIssueStartTodoRetryResult {
+		return record, false, errors.New("Linear issue start retry result is not conclusive Todo evidence")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE side_effects SET status='intent',result_json='',claimed_at='',observed_at='',attempt=2 WHERE side_effect_id=? AND run_id=? AND kind='linear_move_to_started' AND idempotency_key=? AND status='failed' AND attempt=1 AND result_json=?`, record.ID, record.RunID, record.IdempotencyKey, application.LinearIssueStartTodoRetryResult)
+	if err != nil {
+		return record, false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed != 1 {
+		return record, false, err
+	}
+	record.Status, record.ResultJSON, record.ClaimedAt, record.ObservedAt, record.Attempt = "intent", "", time.Time{}, time.Time{}, 2
+	return record, true, nil
+}
+
+// FinishLinearIssueStartSideEffect completes only the exact claimed (or
+// adoption-only intent) attempt. A losing caller cannot overwrite a newer
+// retry claim because both prior status and attempt are compared.
+func (s *Store) FinishLinearIssueStartSideEffect(ctx context.Context, record application.SideEffectRecord, expectedStatus string, expectedAttempt int) error {
+	if record.ID < 1 || record.Kind != "linear_move_to_started" || (record.Status != "observed" && record.Status != "failed") || (expectedStatus != "intent" && expectedStatus != "in_flight" && expectedStatus != "failed") || (expectedAttempt != 1 && expectedAttempt != 2) || record.Attempt != expectedAttempt {
+		return errors.New("invalid Linear issue start finish authority")
+	}
+	return execOne(ctx, s.db, `UPDATE side_effects SET status=?,result_json=?,stdout_path=?,stderr_path=?,claimed_at='',observed_at=? WHERE side_effect_id=? AND run_id=? AND kind='linear_move_to_started' AND idempotency_key=? AND status=? AND attempt=?`, record.Status, record.ResultJSON, record.StdoutPath, record.StderrPath, formatTime(record.ObservedAt), record.ID, record.RunID, record.IdempotencyKey, expectedStatus, expectedAttempt)
+}
+
+// ClaimLinearIssueStartSideEffect is an execution compare-and-swap. The
+// caller owns the single remote mutation only when this returns claimed=true.
+func (s *Store) ClaimLinearIssueStartSideEffect(ctx context.Context, record application.SideEffectRecord, claimedAt time.Time) (application.SideEffectRecord, bool, error) {
+	if record.ID < 1 || record.Kind != "linear_move_to_started" || record.Status != "intent" || (record.Attempt != 1 && record.Attempt != 2) || claimedAt.IsZero() {
+		return record, false, errors.New("invalid Linear issue start claim authority")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE side_effects SET status='in_flight',claimed_at=? WHERE side_effect_id=? AND run_id=? AND kind='linear_move_to_started' AND idempotency_key=? AND status='intent' AND attempt=?`, formatTime(claimedAt), record.ID, record.RunID, record.IdempotencyKey, record.Attempt)
+	if err != nil {
+		return record, false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return record, false, err
+	}
+	if changed == 1 {
+		record.Status, record.ClaimedAt = "in_flight", claimedAt.UTC()
+		return record, true, nil
+	}
+	current, _, getErr := linearIssueStartSideEffectByID(ctx, s.db, record.ID)
+	return current, false, getErr
+}
+
+func linearIssueStartSideEffectByID(ctx context.Context, db *sql.DB, id int64) (application.SideEffectRecord, bool, error) {
+	var record application.SideEffectRecord
+	var created, claimed, observed string
+	err := db.QueryRowContext(ctx, `SELECT side_effect_id,run_id,kind,idempotency_key,intent_json,status,result_json,stdout_path,stderr_path,attempt,created_at,claimed_at,observed_at FROM side_effects WHERE side_effect_id=?`, id).Scan(&record.ID, &record.RunID, &record.Kind, &record.IdempotencyKey, &record.IntentJSON, &record.Status, &record.ResultJSON, &record.StdoutPath, &record.StderrPath, &record.Attempt, &created, &claimed, &observed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return record, false, nil
+	}
+	if err != nil {
+		return record, false, err
+	}
+	record.CreatedAt, record.ClaimedAt, record.ObservedAt = parseTime(created), parseTime(claimed), parseTime(observed)
+	return record, true, nil
 }
 
 // RecordMergePolicyPending atomically records the rejected merge-policy

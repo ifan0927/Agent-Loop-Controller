@@ -25,6 +25,7 @@ type SideEffectRecord struct {
 	StderrPath     string    `json:"stderr_path"`
 	Attempt        int       `json:"attempt"`
 	CreatedAt      time.Time `json:"created_at"`
+	ClaimedAt      time.Time `json:"-"`
 	ObservedAt     time.Time `json:"observed_at,omitempty"`
 }
 

@@ -12,6 +12,43 @@ type LinearIssueReader interface {
 	ReadIssue(context.Context, string) (LinearTaskSource, []LinearRequestObservation, error)
 }
 
+// LinearReservedIssueStarter is the only mutation boundary used before local
+// delivery begins. It intentionally cannot select an issue or update any
+// Linear field other than the configured workflow state.
+type LinearReservedIssueStarter interface {
+	MoveReservedIssueToStarted(context.Context, LinearIssueStartMutation) (LinearIssueStartMutationResult, []LinearRequestObservation, error)
+}
+
+// LinearIssueStartMutation is controller-owned authority for one exact
+// issueUpdate. Neither issue text nor arbitrary mutation fields cross this
+// boundary.
+type LinearIssueStartMutation struct {
+	IssueID       string
+	TargetStateID string
+}
+
+// LinearIssueStartMutationResult is the minimal response proof required
+// before the application performs its mandatory authoritative re-read.
+type LinearIssueStartMutationResult struct {
+	IssueID string
+	State   LinearState
+}
+
+// LinearIssueStartMutationError classifies a sanitized adapter outcome. The
+// application uses Ambiguous only to decide whether a re-read may reconcile a
+// lost response; the underlying HTTP body and credential are never retained.
+type LinearIssueStartMutationError struct {
+	Class     string
+	Ambiguous bool
+}
+
+func (e *LinearIssueStartMutationError) Error() string {
+	if e == nil || e.Class == "" {
+		return "Linear issue start mutation failed"
+	}
+	return "Linear issue start mutation failed: " + e.Class
+}
+
 // LinearTodoCandidateScanner performs a bounded, read-only pre-admission scan.
 // Its output is deliberately insufficient to admit or start an issue: callers
 // must later use LinearIssueReader and the full admission contract.
