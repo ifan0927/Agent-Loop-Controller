@@ -24,8 +24,28 @@ func TestDecodeConfigRejectsUnsafeOrIncompleteValuesWithoutLeakingReference(t *t
 }
 
 func TestDecodeConfigAcceptsFixtureEndpoint(t *testing.T) {
-	config, err := DecodeConfig(strings.NewReader(`{"api_url":"http://127.0.0.1:8080/graphql","credential_source_ref":"secret://controller/linear-read","authorization_scheme":"bearer","team_key":"IFAN","http_timeout":"10s","max_response_bytes":4096,"label_page_size":10,"max_label_pages":2}`))
+	config, err := DecodeConfig(strings.NewReader(`{"api_url":"http://127.0.0.1:8080/graphql","credential_source_ref":"secret://env/IFAN_LOOP_LINEAR_TOKEN","authorization_scheme":"bearer","team_key":"IFAN","http_timeout":"10s","max_response_bytes":4096,"label_page_size":10,"max_label_pages":2}`))
 	if err != nil || config.TeamKey != "IFAN" {
 		t.Fatalf("config=%+v error=%v", config, err)
+	}
+}
+
+func TestValidCredentialSourceRefIsAnExactAllowlist(t *testing.T) {
+	for _, ref := range []string{EnvironmentCredentialSourceRef, FileCredentialSourceRef} {
+		if !ValidCredentialSourceRef(ref) {
+			t.Fatalf("allowed ref rejected: %q", ref)
+		}
+	}
+	for _, ref := range []string{
+		"secret://file/linear-token/extra",
+		"secret://file/../linear-token",
+		"secret://file/linear-token?path=/tmp/token",
+		"secret://env/OTHER_TOKEN",
+		"secret://controller/linear-read",
+		"/tmp/linear-token",
+	} {
+		if ValidCredentialSourceRef(ref) {
+			t.Fatalf("unsafe ref accepted: %q", ref)
+		}
 	}
 }

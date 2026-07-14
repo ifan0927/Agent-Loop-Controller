@@ -9,6 +9,11 @@ import (
 	"time"
 )
 
+const (
+	EnvironmentCredentialSourceRef = "secret://env/IFAN_LOOP_LINEAR_TOKEN"
+	FileCredentialSourceRef        = "secret://file/linear-token"
+)
+
 type Config struct {
 	APIURL              string        `json:"api_url"`
 	CredentialSourceRef string        `json:"credential_source_ref"`
@@ -90,26 +95,20 @@ func (c Config) Validate() error {
 // ValidCredentialSourceRef validates a secret reference without resolving it.
 // It is shared by offline configuration authority validation.
 func ValidCredentialSourceRef(value string) bool {
-	if strings.TrimSpace(value) != value || len(value) > 256 {
-		return false
+	return value == EnvironmentCredentialSourceRef || value == FileCredentialSourceRef
+}
+
+// CredentialSourceType is the only credential metadata safe for offline
+// readiness output. It never returns a reference, path, or credential value.
+func CredentialSourceType(value string) string {
+	switch value {
+	case FileCredentialSourceRef:
+		return "file"
+	case EnvironmentCredentialSourceRef:
+		return "environment"
+	default:
+		return ""
 	}
-	u, err := url.Parse(value)
-	if err != nil || u.Scheme != "secret" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
-		return false
-	}
-	if !validReferenceComponent(u.Host) {
-		return false
-	}
-	path := strings.TrimPrefix(u.Path, "/")
-	if path == "" || strings.HasPrefix(path, "/") {
-		return false
-	}
-	for _, component := range strings.Split(path, "/") {
-		if !validReferenceComponent(component) {
-			return false
-		}
-	}
-	return true
 }
 
 func validReferenceComponent(value string) bool {

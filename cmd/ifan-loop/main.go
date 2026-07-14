@@ -143,7 +143,11 @@ func linearStart(args []string) error {
 		return err
 	}
 	defer store.Close()
-	reader, err := linearadapter.New(loaded.Linear, linearadapter.EnvironmentCredentialSource{Variable: "IFAN_LOOP_LINEAR_TOKEN"}, nil)
+	credentials, err := linearCredentialSource(loaded)
+	if err != nil {
+		return err
+	}
+	reader, err := linearadapter.New(loaded.Linear, credentials, nil)
 	if err != nil {
 		return err
 	}
@@ -198,7 +202,11 @@ func controllerRun(args []string) error {
 		return err
 	}
 	defer store.Close()
-	reader, err := linearadapter.New(loaded.Linear, linearadapter.EnvironmentCredentialSource{Variable: "IFAN_LOOP_LINEAR_TOKEN"}, nil)
+	credentials, err := linearCredentialSource(loaded)
+	if err != nil {
+		return err
+	}
+	reader, err := linearadapter.New(loaded.Linear, credentials, nil)
 	if err != nil {
 		return err
 	}
@@ -720,7 +728,11 @@ func productionCommand(args []string, name string) (productionCLICommand, bootst
 }
 
 func newProductionCoordinator(loaded bootstrap.Bootstrap, store *sqlitestore.Store, worktreeRoot string) (*application.ProductionCoordinator, error) {
-	reader, err := linearadapter.New(loaded.Linear, linearadapter.EnvironmentCredentialSource{Variable: "IFAN_LOOP_LINEAR_TOKEN"}, nil)
+	credentials, err := linearCredentialSource(loaded)
+	if err != nil {
+		return nil, err
+	}
+	reader, err := linearadapter.New(loaded.Linear, credentials, nil)
 	if err != nil {
 		return nil, err
 	}

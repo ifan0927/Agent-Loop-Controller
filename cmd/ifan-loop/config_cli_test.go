@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -57,6 +58,16 @@ func TestConfigInitCreatesExclusiveSecretFreeV3Template(t *testing.T) {
 	if directory.Mode().Perm() != 0o700 {
 		t.Fatalf("directory mode=%#o want=0700", directory.Mode().Perm())
 	}
+	secrets, err := os.Stat(filepath.Join(filepath.Dir(path), "secrets"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !secrets.IsDir() || secrets.Mode().Perm() != 0o700 {
+		t.Fatalf("secrets=%+v", secrets.Mode())
+	}
+	if _, err := os.Lstat(filepath.Join(filepath.Dir(path), "secrets", "linear-token")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("init created or touched token, err=%v", err)
+	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -92,6 +103,135 @@ func TestConfigInitCreatesExclusiveSecretFreeV3Template(t *testing.T) {
 	}
 	if string(after) != before {
 		t.Fatal("exclusive init changed existing configuration")
+	}
+}
+
+func TestConfigInitNeverRepairsOrOverwritesExistingCredentialLeaf(t *testing.T) {
+	root := resolvedTempDir(t)
+	path := filepath.Join(root, "controller.json")
+	secrets := filepath.Join(root, "secrets")
+	if err := os.Mkdir(secrets, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tokenPath := filepath.Join(secrets, "linear-token")
+	if err := os.WriteFile(tokenPath, []byte("operator-token"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(tokenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeInfo, err := os.Lstat(tokenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureConfigOutput(func() error { return configCommand([]string{"init", "--config", path}) }); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(tokenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterInfo, err := os.Lstat(tokenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) || afterInfo.Mode().Perm() != beforeInfo.Mode().Perm() {
+		t.Fatalf("init changed existing credential leaf before=%#o after=%#o", beforeInfo.Mode().Perm(), afterInfo.Mode().Perm())
+	}
+}
+
+func TestConfigInitRefusesUnsafeExistingCredentialDirectoryWithoutRepairingIt(t *testing.T) {
+	root := resolvedTempDir(t)
+	path := filepath.Join(root, "controller.json")
+	secrets := filepath.Join(root, "secrets")
+	if err := os.Mkdir(secrets, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(secrets, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureConfigOutput(func() error { return configCommand([]string{"init", "--config", path}) }); err == nil || !strings.Contains(err.Error(), "credential directory") {
+		t.Fatalf("error=%v", err)
+	}
+	info, err := os.Lstat(secrets)
+	if err != nil || info.Mode().Perm() != 0o755 {
+		t.Fatalf("init repaired secrets info=%+v err=%v", info, err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("init created config with unsafe credential directory err=%v", err)
+	}
+}
+
+func TestConfigDoctorReportsCredentialReadinessWithoutLeakingSourceOrToken(t *testing.T) {
+	root := resolvedTempDir(t)
+	path, _ := writeControllerStatusConfig(t, root)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config map[string]any
+	if err := json.Unmarshal(raw, &config); err != nil {
+		t.Fatal(err)
+	}
+	config["linear"].(map[string]any)["credential_source_ref"] = "secret://file/linear-token"
+	rewritten, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, rewritten, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	secrets := filepath.Join(root, "secrets")
+	if err := os.Mkdir(secrets, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tokenPath := filepath.Join(secrets, "linear-token")
+	if err := os.WriteFile(tokenPath, []byte("doctor-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := captureConfigOutput(func() error { return configCommand([]string{"doctor", "--config", path}) })
+	if err != nil || !strings.Contains(output, `"linear_credential_ready": true`) {
+		t.Fatalf("output=%s err=%v", output, err)
+	}
+	for _, forbidden := range []string{root, tokenPath, "doctor-token", "secret://"} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("doctor leaked %q in %s", forbidden, output)
+		}
+	}
+	if err := os.Remove(tokenPath); err != nil {
+		t.Fatal(err)
+	}
+	output, err = captureConfigOutput(func() error { return configCommand([]string{"doctor", "--config", path}) })
+	if err != nil || !strings.Contains(output, `"warning": "Linear credential source is unavailable"`) || strings.Contains(output, root) || strings.Contains(output, "secret://") {
+		t.Fatalf("warning output=%s err=%v", output, err)
+	}
+}
+
+func TestConfigValidateAndInspectDoNotReadFileCredential(t *testing.T) {
+	root := resolvedTempDir(t)
+	path, _ := writeControllerStatusConfig(t, root)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config map[string]any
+	if err := json.Unmarshal(raw, &config); err != nil {
+		t.Fatal(err)
+	}
+	config["linear"].(map[string]any)["credential_source_ref"] = "secret://file/linear-token"
+	rewritten, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, rewritten, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range []string{"validate", "inspect"} {
+		output, err := captureConfigOutput(func() error { return configCommand([]string{command, "--config", path}) })
+		if err != nil || !strings.Contains(output, `"offline": true`) || !strings.Contains(output, `"credential_source_type": "file"`) || strings.Contains(output, "secret://") {
+			t.Fatalf("command=%s output=%s err=%v", command, output, err)
+		}
 	}
 }
 

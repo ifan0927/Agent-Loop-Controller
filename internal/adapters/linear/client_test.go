@@ -347,7 +347,7 @@ func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 }
 
 func testConfig(serverURL string) Config {
-	return Config{APIURL: serverURL + "/graphql", CredentialSourceRef: "secret://controller/linear-read", AuthorizationScheme: "bearer", TeamKey: "IFAN", HTTPTimeout: time.Second, MaxResponseBytes: 4096, LabelPageSize: 1, MaxLabelPages: 2}
+	return Config{APIURL: serverURL + "/graphql", CredentialSourceRef: EnvironmentCredentialSourceRef, AuthorizationScheme: "bearer", TeamKey: "IFAN", HTTPTimeout: time.Second, MaxResponseBytes: 4096, LabelPageSize: 1, MaxLabelPages: 2}
 }
 
 func fmtObservation(value any) string {

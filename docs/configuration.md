@@ -15,6 +15,7 @@ The following files are separate from the configuration document:
 ~/Library/Application Support/agent-loop-controller/
   controller.json
   controller.db
+  secrets/linear-token
   secrets/github-app.pem
 ```
 
@@ -38,7 +39,10 @@ version 3.
 The configuration contains non-secret references only:
 
 - controller database location and Codex runtime policy;
-- Linear endpoint, team, limits, and credential-source reference;
+- Linear endpoint, team, limits, and one exact credential-source reference:
+  `secret://file/linear-token` for the controller-owned
+  `secrets/linear-token` leaf, or the legacy explicit
+  `secret://env/IFAN_LOOP_LINEAR_TOKEN` environment source;
 - GitHub App IDs, selected-repository identity, permission switches, and the
   absolute path of an external PEM file;
 - repository origin binding, local checkout/run/worktree roots, verifier IDs,
@@ -51,18 +55,29 @@ and In Progress (`In Progress`, `started`) workflow states, bounded scheduler
 timing and candidate/page limits, one active run, a fixed GitHub `User`
 requester trusted by every configured repository profile, `local_outbox`
 notification mode, and a credential-source reference. The credential reference
-uses the same `secret://...` grammar as the Linear profile and is never
+uses the same exact allowlist as the Linear profile and is never
 resolved by `config validate` or `config inspect`.
 
 `config inspect` emits only the enabled flag, configured limits, fixed
 non-secret requester identity, and the existing stable repository/profile
-digests. It never emits the automatic-admission credential reference, workflow
+digests plus the Linear credential source type (`file` or `environment`). It
+never emits the automatic-admission credential reference, workflow
 state IDs, configuration paths, or credential contents.
 
 An empty starter document is deliberately not runnable. Add at least one
 matching GitHub App profile and repository entry, then run `config validate`.
 This prevents a placeholder profile or repository from becoming an implicit
 delivery target.
+
+`config init` creates `secrets/` with mode `0700`, but never creates, repairs,
+chmods, or overwrites `secrets/linear-token`. Create that leaf separately as a
+regular, single-link file owned by the controller user with mode `0600`; it may
+contain one non-empty token line with at most one trailing LF. File credentials
+are re-read for every Linear request, so an operator can rotate the leaf. The
+loader and `config validate` / `config inspect` never read token bytes.
+`ifan-loop config doctor` performs the runtime credential check and returns
+only readiness or a generic warning, never a token, path, source ref, or
+filesystem detail.
 
 ## Future Web UI
 

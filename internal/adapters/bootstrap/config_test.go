@@ -25,7 +25,7 @@ func TestLoadBuildsOfflineSanitizedReadiness(t *testing.T) {
 		t.Fatal(err)
 	}
 	output := string(raw)
-	if !strings.Contains(output, `"offline":true`) || !strings.Contains(output, `"profile_id":"repository-profile:owner/repo"`) {
+	if !strings.Contains(output, `"offline":true`) || !strings.Contains(output, `"profile_id":"repository-profile:owner/repo"`) || !strings.Contains(output, `"credential_source_type":"environment"`) {
 		t.Fatalf("readiness=%s", output)
 	}
 	if strings.Contains(output, secretPath) || strings.Contains(output, "Authorization") || strings.Contains(output, "not-for-output") || strings.Contains(output, root) {
@@ -210,7 +210,7 @@ func TestLoadVersionThreeEnabledAutomationValidatesAuthorityAndSanitizesInspect(
 			t.Fatalf("inspect leaked %q: %s", forbidden, first)
 		}
 	}
-	for _, required := range []string{`"enabled":true`, `"max_active_runs":1`, `"login":"ifan0927"`, `"profile_digest"`} {
+	for _, required := range []string{`"enabled":true`, `"max_active_runs":1`, `"login":"ifan0927"`, `"profile_digest"`, `"credential_source_type":"environment"`} {
 		if !strings.Contains(string(first), required) {
 			t.Fatalf("inspect omitted %q: %s", required, first)
 		}
@@ -336,7 +336,7 @@ func validAdmissionFixture() map[string]any {
 		"poll_interval":     "5m", "scheduler_lease_ttl": "1m", "scheduler_lease_renewal_interval": "20s",
 		"max_candidates": 20, "max_pages": 5, "max_active_runs": 1,
 		"requester":         map[string]any{"database_id": 1, "node_id": "node", "login": "ifan0927", "type": "User"},
-		"notification_mode": "local_outbox", "credential_source_ref": "secret://env/ADMISSION_TOKEN",
+		"notification_mode": "local_outbox", "credential_source_ref": "secret://env/IFAN_LOOP_LINEAR_TOKEN",
 	}
 }
 

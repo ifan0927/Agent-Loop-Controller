@@ -156,6 +156,13 @@ and they do not write files. They validate canonical non-symlink paths and the
 registry-to-GitHub identity bindings, then emit only stable profile IDs and
 digests. Linear admission and GitHub reconciliation use the same loader.
 
+The default starter uses `secret://file/linear-token`, which maps only to the
+fixed `secrets/linear-token` leaf beside `controller.json`. `config init`
+creates `secrets/` at `0700` but never creates or changes that token file.
+Create it separately, owned by the controller user and mode `0600`, with one
+token line. Run `go run ./cmd/ifan-loop config doctor` for a sanitized runtime
+credential readiness warning; it never prints the token, source ref, or path.
+
 Start the normal durable delivery loop with one explicit trigger. The process
 continues through every safe transition; do not run one manual delivery command
 per state during normal operation:

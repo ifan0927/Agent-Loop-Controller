@@ -47,7 +47,7 @@ func resolveConfigPath(override string) (string, error) {
 
 func configCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: ifan-loop config <init|path|validate|inspect> [--config <controller.json>]")
+		return errors.New("usage: ifan-loop config <init|path|validate|inspect|doctor> [--config <controller.json>]")
 	}
 	switch args[0] {
 	case "init":
@@ -56,8 +56,10 @@ func configCommand(args []string) error {
 		return configPath(args[1:])
 	case "validate", "inspect":
 		return configReadiness(args[0], args[1:])
+	case "doctor":
+		return runtimeDoctor(args[1:])
 	default:
-		return errors.New("usage: ifan-loop config <init|path|validate|inspect> [--config <controller.json>]")
+		return errors.New("usage: ifan-loop config <init|path|validate|inspect|doctor> [--config <controller.json>]")
 	}
 }
 
@@ -170,6 +172,9 @@ func configInit(args []string) error {
 	if err := createConfigDirectory(filepath.Dir(path)); err != nil {
 		return err
 	}
+	if err := createCredentialDirectory(filepath.Join(filepath.Dir(path), "secrets")); err != nil {
+		return err
+	}
 	content, err := json.MarshalIndent(newConfigTemplate(filepath.Dir(path)), "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode configuration template: %w", err)
@@ -216,6 +221,27 @@ func createConfigDirectory(path string) error {
 	return nil
 }
 
+// createCredentialDirectory may create the dedicated secret directory, but it
+// never repairs an existing directory or touches a credential leaf. An
+// operator must correct unsafe existing state explicitly.
+func createCredentialDirectory(path string) error {
+	if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+		return fmt.Errorf("create credential directory: %w", err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect credential directory: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm() != 0o700 {
+		return errors.New("credential directory must be an existing private real directory")
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil || resolved != path {
+		return errors.New("credential directory must not include symbolic links")
+	}
+	return nil
+}
+
 func newConfigTemplate(root string) configTemplate {
 	return configTemplate{
 		Version: 3,
@@ -226,7 +252,7 @@ func newConfigTemplate(root string) configTemplate {
 		},
 		Linear: configTemplateLinear{
 			APIURL:              "https://api.linear.app/graphql",
-			CredentialSourceRef: "secret://env/IFAN_LOOP_LINEAR_TOKEN",
+			CredentialSourceRef: "secret://file/linear-token",
 			AuthorizationScheme: "bearer",
 			TeamKey:             "IFAN",
 			HTTPTimeout:         "30s",

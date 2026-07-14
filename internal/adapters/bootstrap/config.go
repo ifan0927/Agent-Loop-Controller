@@ -55,14 +55,15 @@ type GitHubProfile struct {
 }
 
 type Bootstrap struct {
-	Version        int
-	Digest         string
-	Controller     Controller
-	Linear         linearadapter.Config
-	Registry       localregistry.Registry
-	GitHubProfiles map[string]GitHubProfile
-	RegistryPath   string
-	Automation     Automation
+	Version             int
+	Digest              string
+	Controller          Controller
+	Linear              linearadapter.Config
+	Registry            localregistry.Registry
+	GitHubProfiles      map[string]GitHubProfile
+	RegistryPath        string
+	CredentialDirectory string
+	Automation          Automation
 }
 
 // Automation contains only validated local admission authority. It does not
@@ -111,7 +112,8 @@ type readinessController struct {
 }
 
 type readinessLinear struct {
-	TeamKey string `json:"team_key"`
+	TeamKey              string `json:"team_key"`
+	CredentialSourceType string `json:"credential_source_type"`
 }
 
 type readinessRepository struct {
@@ -179,7 +181,7 @@ func (b Bootstrap) Readiness() any {
 	}
 	return readinessFile{Version: b.Version, ConfigurationDigest: b.Digest, Offline: true,
 		Controller: readinessController{DatabaseConfigured: b.Controller.DatabasePath != "", CodexConfigured: b.Controller.CodexBinary != ""},
-		Linear:     readinessLinear{TeamKey: b.Linear.TeamKey}, Repositories: repositories, GitHubProfiles: profiles,
+		Linear:     readinessLinear{TeamKey: b.Linear.TeamKey, CredentialSourceType: linearadapter.CredentialSourceType(b.Linear.CredentialSourceRef)}, Repositories: repositories, GitHubProfiles: profiles,
 		Automation: readinessAutomation{LinearTodoAdmission: admission}}
 }
 
@@ -254,7 +256,7 @@ type profileFile struct {
 // Load performs strict, offline composition validation. Credential files are
 // inspected only as filesystem objects; their contents are never read.
 func Load(path string) (Bootstrap, error) {
-	data, _, err := readRegularConfig(path)
+	data, canonicalPath, err := readRegularConfig(path)
 	if err != nil {
 		return Bootstrap{}, err
 	}
@@ -297,7 +299,7 @@ func Load(path string) (Bootstrap, error) {
 		return Bootstrap{}, conflict("automatic admission team does not match the Linear profile")
 	}
 	digest := sha256.Sum256(data)
-	return Bootstrap{Version: raw.Version, Digest: hex.EncodeToString(digest[:]), Controller: controller, Linear: linear, Registry: registry, GitHubProfiles: profiles, RegistryPath: registryPath, Automation: automation}, nil
+	return Bootstrap{Version: raw.Version, Digest: hex.EncodeToString(digest[:]), Controller: controller, Linear: linear, Registry: registry, GitHubProfiles: profiles, RegistryPath: registryPath, CredentialDirectory: filepath.Join(filepath.Dir(canonicalPath), "secrets"), Automation: automation}, nil
 }
 
 func decodeRegistry(raw configFile) (localregistry.Registry, string, error) {
