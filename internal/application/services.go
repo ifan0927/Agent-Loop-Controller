@@ -882,7 +882,7 @@ func (s CommandService) ReconcileFromGitHub(ctx context.Context, command GitHubR
 		if err := validateReaderAuthority(inspection, reader.Authority()); err != nil {
 			return ReconcileResult{}, err
 		}
-		evidence, observations, metadata, err := reader.Read(leaseCtx, command.PullRequest, command.ExpectedHead)
+		evidence, handoff, observations, metadata, err := reader.Read(leaseCtx, command.PullRequest, command.ExpectedHead)
 		if err != nil {
 			persister, ok := s.store.(interface {
 				SaveGitHubReadFailure(context.Context, string, string, domain.State, string, []GitHubRequestObservation) error
@@ -896,6 +896,9 @@ func (s CommandService) ReconcileFromGitHub(ctx context.Context, command GitHubR
 				return ReconcileResult{}, classifyServiceError(saveErr)
 			}
 			return ReconcileResult{}, classifyServiceError(err)
+		}
+		if err := handoff.Validate(); err != nil {
+			return ReconcileResult{}, serviceError(ErrorUnavailable, "inline review body handoff is incomplete", err)
 		}
 		full := ReconcileCommand{Requester: command.Requester, RunID: command.RunID, Repository: command.Repository, ExpectedState: command.ExpectedState,
 			IdempotencyKey: command.IdempotencyKey, Evidence: evidence, Observations: observations, Metadata: metadata}

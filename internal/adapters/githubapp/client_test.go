@@ -3,6 +3,7 @@ package githubapp
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
@@ -359,6 +360,17 @@ func TestReviewConnectionPaginates(t *testing.T) {
 	}
 }
 
+func TestReviewReadRejectsMissingPageMetadata(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"data":{"repository":{"pullRequest":{"reviews":{"nodes":[]}}}}}`)
+	}))
+	defer srv.Close()
+	c := &Client{cfg: Config{GraphQLURL: srv.URL, APIVersion: "2022-11-28"}, http: srv.Client(), clock: fixedClock{time.Now()}, token: "token"}
+	if _, _, err := c.readReviews(context.Background(), 1); err == nil || !strings.Contains(err.Error(), "metadata") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestReviewReadIncludesImmutableUserIdentity(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request struct {
@@ -380,6 +392,233 @@ func TestReviewReadIncludesImmutableUserIdentity(t *testing.T) {
 	if err != nil || len(reviews) != 1 || reviews[0].Actor.DatabaseID != 33 || reviews[0].Actor.NodeID != "USER_33" || reviews[0].Actor.Type != "User" {
 		t.Fatalf("reviews=%+v err=%v", reviews, err)
 	}
+}
+
+func TestReviewThreadReadCollectsCompleteTopologyWithoutSerializingBodies(t *testing.T) {
+	const body = "Authorization: Bearer inline-body-secret \u00e9"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Query string `json:"query"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			return
+		}
+		if !strings.Contains(request.Query, "reviewThreads(first:100") || !strings.Contains(request.Query, "comments(first:100)") || !strings.Contains(request.Query, "originalCommit{oid}") {
+			http.Error(w, "review thread selection is incomplete", http.StatusBadRequest)
+			return
+		}
+		fmt.Fprintf(w, `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"THREAD_1","isResolved":false,"isOutdated":false,"path":"internal/a.go","line":7,"originalCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"comments":{"nodes":[{"id":"COMMENT_1","databaseId":1,"replyTo":null,"author":{"login":"trusted","__typename":"User","id":"USER_1","databaseId":11},"pullRequestReview":{"id":"REVIEW_1","databaseId":21,"state":"CHANGES_REQUESTED","commit":{"oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"submittedAt":"2026-07-14T01:00:00Z","author":{"login":"trusted","__typename":"User","id":"USER_1","databaseId":11}},"body":%q,"createdAt":"2026-07-14T01:01:00Z","updatedAt":"2026-07-14T01:02:00Z"},{"id":"COMMENT_2","databaseId":2,"replyTo":{"id":"COMMENT_1","databaseId":1},"author":{"login":"lookalike","__typename":"Bot","id":"BOT_2","databaseId":12},"pullRequestReview":{"id":"REVIEW_1","databaseId":21,"state":"CHANGES_REQUESTED","commit":{"oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"submittedAt":"2026-07-14T01:00:00Z","author":{"login":"trusted","__typename":"User","id":"USER_1","databaseId":11}},"body":"reply","createdAt":"2026-07-14T01:03:00Z","updatedAt":"2026-07-14T01:04:00Z"}],"pageInfo":{"hasNextPage":false,"endCursor":""}}},{"id":"THREAD_2","isResolved":true,"isOutdated":true,"path":"","line":null,"originalCommit":{"oid":"cccccccccccccccccccccccccccccccccccccccc"},"comments":{"nodes":[{"id":"COMMENT_3","databaseId":3,"replyTo":null,"author":null,"pullRequestReview":{"id":"REVIEW_2","databaseId":22,"state":"COMMENTED","commit":{"oid":"dddddddddddddddddddddddddddddddddddddddd"},"submittedAt":"2026-07-14T01:05:00Z","author":{"login":"app","__typename":"App","id":"APP_3","databaseId":13}},"body":"deleted author","createdAt":"2026-07-14T01:06:00Z","updatedAt":"2026-07-14T01:07:00Z"}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`, body)
+	}))
+	defer srv.Close()
+	var observations []application.GitHubRequestObservation
+	c := &Client{cfg: Config{GraphQLURL: srv.URL, APIVersion: "2022-11-28"}, http: srv.Client(), clock: fixedClock{time.Now()}, token: "fixture-installation-token", observe: func(observation application.GitHubRequestObservation) {
+		observations = append(observations, observation)
+	}}
+	threads, handoff, err := c.readReviewThreads(context.Background(), 1)
+	if err != nil || len(threads) != 2 {
+		t.Fatalf("unexpected thread count or error: %d %v", len(threads), err)
+	}
+	root, reply := threads[0].Comments[0], threads[0].Comments[1]
+	sum := sha256.Sum256([]byte(body))
+	if len(handoff.Comments) != 3 || handoff.Comments[0].Body != body || root.BodyDigest != fmt.Sprintf("%x", sum) || reply.ReplyToNodeID != root.NodeID || reply.ReplyToDatabaseID != root.DatabaseID || reply.Author == nil || reply.Author.Type != "Bot" || threads[1].Comments[0].Author != nil || threads[1].Comments[0].Review.Actor.Type != "App" || !threads[1].Resolved || !threads[1].Outdated || threads[1].Line != nil {
+		t.Fatalf("unexpected topology: %+v", threads)
+	}
+	raw, err := json.Marshal(domain.GitHubReadEvidence{ReviewThreads: threads})
+	if err != nil || strings.Contains(string(raw), body) || strings.Contains(string(raw), "inline-body-secret") {
+		t.Fatalf("raw inline body leaked into evidence: %s err=%v", raw, err)
+	}
+	combined := fmt.Sprint(err, observations, string(raw))
+	for _, forbidden := range []string{"inline-body-secret", "Authorization: Bearer", "fixture-installation-token", "BEGIN PRIVATE KEY"} {
+		if strings.Contains(combined, forbidden) {
+			t.Fatalf("sensitive value leaked from a GitHub read observation: %q", forbidden)
+		}
+	}
+}
+
+func TestReviewThreadReadPaginationAndFailureBounds(t *testing.T) {
+	t.Run("zero threads complete", func(t *testing.T) {
+		srv := reviewThreadServer(t, func(int, map[string]any) string {
+			return `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`
+		})
+		defer srv.Close()
+		c := &Client{cfg: Config{GraphQLURL: srv.URL, APIVersion: "2022-11-28"}, http: srv.Client(), clock: fixedClock{time.Now()}, token: "token"}
+		threads, _, err := c.readReviewThreads(context.Background(), 1)
+		if err != nil || len(threads) != 0 {
+			t.Fatalf("threads=%+v err=%v", threads, err)
+		}
+	})
+	t.Run("thread pagination", func(t *testing.T) {
+		srv := reviewThreadServer(t, func(call int, variables map[string]any) string {
+			if call == 1 {
+				return `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"thread-1"}}}}}}`
+			}
+			if variables["threadCursor"] != "thread-1" {
+				t.Errorf("threadCursor=%v", variables["threadCursor"])
+			}
+			return `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`
+		})
+		defer srv.Close()
+		c := &Client{cfg: Config{GraphQLURL: srv.URL, APIVersion: "2022-11-28"}, http: srv.Client(), clock: fixedClock{time.Now()}, token: "token"}
+		if _, _, err := c.readReviewThreads(context.Background(), 1); err != nil {
+			t.Fatal(err)
+		}
+	})
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"missing outer page metadata", `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}`},
+		{"null outer page metadata", `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":null}}}}}`},
+		{"missing outer cursor", `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":""}}}}}}`},
+		{"partial GraphQL error", `{"data":{"repository":{"pullRequest":null}},"errors":[{"message":"partial"}]}`},
+		{"missing thread ID", `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"","isResolved":false,"isOutdated":false,"originalCommit":{"oid":"original"},"comments":{"nodes":[{"id":"COMMENT","databaseId":1,"pullRequestReview":{"id":"REVIEW","databaseId":2,"state":"COMMENTED","commit":{"oid":"commit"},"submittedAt":"2026-07-14T01:00:00Z"},"body":"x","createdAt":"2026-07-14T01:00:00Z","updatedAt":"2026-07-14T01:00:00Z"}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`},
+		{"missing nested page metadata", `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"THREAD","isResolved":false,"isOutdated":false,"originalCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"comments":{"nodes":[]}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`},
+		{"null nested page metadata", `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"THREAD","isResolved":false,"isOutdated":false,"originalCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"comments":{"nodes":[],"pageInfo":null}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`},
+		{"nested pagination continuation", `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"THREAD","isResolved":false,"isOutdated":false,"originalCommit":{"oid":"original"},"comments":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"nested-1"}}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			srv := reviewThreadServer(t, func(int, map[string]any) string { return tc.body })
+			defer srv.Close()
+			c := &Client{cfg: Config{GraphQLURL: srv.URL, APIVersion: "2022-11-28"}, http: srv.Client(), clock: fixedClock{time.Now()}, token: "token"}
+			if _, _, err := c.readReviewThreads(context.Background(), 1); err == nil {
+				t.Fatal("incomplete review-thread response was accepted")
+			}
+		})
+	}
+	t.Run("outer pagination overflow", func(t *testing.T) {
+		srv := reviewThreadServer(t, func(call int, _ map[string]any) string {
+			return fmt.Sprintf(`{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"thread-%d"}}}}}}`, call)
+		})
+		defer srv.Close()
+		c := &Client{cfg: Config{GraphQLURL: srv.URL, APIVersion: "2022-11-28"}, http: srv.Client(), clock: fixedClock{time.Now()}, token: "token"}
+		if _, _, err := c.readReviewThreads(context.Background(), 1); err == nil || !strings.Contains(err.Error(), "exceeded") {
+			t.Fatalf("err=%v", err)
+		}
+	})
+}
+
+func TestReviewTopologyDigestChangesWhenCommentBodyChanges(t *testing.T) {
+	first := domain.GitHubReviewThread{NodeID: "THREAD", Comments: []domain.GitHubReviewComment{{NodeID: "COMMENT", BodyDigest: domain.TrustedReviewFeedbackDigest("before")}}}
+	edited := first
+	edited.Comments = append([]domain.GitHubReviewComment(nil), first.Comments...)
+	edited.Comments[0].BodyDigest = domain.TrustedReviewFeedbackDigest("after")
+	if reviewTopologyDigest(nil, []domain.GitHubReviewThread{first}, nil) == reviewTopologyDigest(nil, []domain.GitHubReviewThread{edited}, nil) {
+		t.Fatal("comment body edit did not change topology digest")
+	}
+}
+
+func TestReviewThreadReadRejectsIncompleteImmutableReviewEvidence(t *testing.T) {
+	valid := reviewThreadResponse("body")
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{"short original commit", strings.Replace(valid, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "short", 1), "original commit"},
+		{"short review commit", strings.Replace(valid, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "short", 1), "review identity"},
+		{"unknown review state", strings.Replace(valid, "\"COMMENTED\"", "\"FUTURE\"", 1), "review identity"},
+		{"unknown comment author type", strings.Replace(valid, "\"__typename\":\"User\"", "\"__typename\":\"UnknownActor\"", 1), "author identity"},
+		{"unknown review author type", strings.Replace(valid, "\"__typename\":\"User\"", "\"__typename\":\"UnknownActor\"", 2), "author identity"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			srv := reviewThreadServer(t, func(int, map[string]any) string { return tc.body })
+			defer srv.Close()
+			c := &Client{cfg: Config{GraphQLURL: srv.URL, APIVersion: "2022-11-28"}, http: srv.Client(), clock: fixedClock{time.Now()}, token: "token"}
+			if _, _, err := c.readReviewThreads(context.Background(), 1); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+	t.Run("null review author remains explicit deleted-author evidence", func(t *testing.T) {
+		body := strings.Replace(valid, `"submittedAt":"2026-07-14T01:00:00Z","author":{"login":"author","__typename":"User","id":"USER","databaseId":2}`, `"submittedAt":"2026-07-14T01:00:00Z","author":null`, 1)
+		srv := reviewThreadServer(t, func(int, map[string]any) string { return body })
+		defer srv.Close()
+		c := &Client{cfg: Config{GraphQLURL: srv.URL, APIVersion: "2022-11-28"}, http: srv.Client(), clock: fixedClock{time.Now()}, token: "token"}
+		threads, _, err := c.readReviewThreads(context.Background(), 1)
+		if err != nil || len(threads) != 1 || threads[0].Comments[0].Review.Actor.Type != "" {
+			t.Fatalf("thread=%+v err=%v", threads, err)
+		}
+	})
+}
+
+func TestReadRejectsReviewThreadTopologyDrift(t *testing.T) {
+	_, key := testKey(t)
+	var threadReads atomic.Int32
+	mux := http.NewServeMux()
+	write := func(w http.ResponseWriter, body string) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, body)
+	}
+	mux.HandleFunc("/app/installations/2/access_tokens", func(w http.ResponseWriter, r *http.Request) {
+		write(w, `{"token":"fixture-installation-secret","expires_at":"2026-07-11T01:00:00Z","permissions":{"metadata":"read","contents":"read","pull_requests":"read","checks":"read","statuses":"read","administration":"read"},"repositories":[{"id":99,"name":"repo","owner":{"login":"owner"}}]}`)
+	})
+	mux.HandleFunc("/repos/owner/repo", func(w http.ResponseWriter, r *http.Request) {
+		write(w, `{"id":99,"node_id":"REPO","name":"repo","owner":{"login":"owner"}}`)
+	})
+	mux.HandleFunc("/repos/owner/repo/pulls/1", func(w http.ResponseWriter, r *http.Request) {
+		write(w, `{"id":101,"number":1,"html_url":"https://example.invalid/pr/1","node_id":"PR","state":"open","merged":false,"body":"body","head":{"ref":"feature","sha":"headsha","repo":{"id":99}},"base":{"ref":"main","sha":"basesha","repo":{"id":99}}}`)
+	})
+	mux.HandleFunc("/repos/owner/repo/branches/main/protection/required_status_checks", func(w http.ResponseWriter, r *http.Request) {
+		write(w, `{"contexts":["test"],"checks":[]}`)
+	})
+	mux.HandleFunc("/repos/owner/repo/commits/headsha/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		write(w, `{"check_runs":[{"id":1,"name":"test","status":"completed","conclusion":"success","completed_at":"2026-07-11T00:00:00Z","app":{"id":8}}]}`)
+	})
+	mux.HandleFunc("/repos/owner/repo/commits/headsha/status", func(w http.ResponseWriter, r *http.Request) {
+		write(w, `{"statuses":[]}`)
+	})
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Query string `json:"query"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, "invalid GraphQL request", http.StatusBadRequest)
+			return
+		}
+		if strings.Contains(request.Query, "reviewThreads") {
+			body := "first body"
+			if threadReads.Add(1) > 1 {
+				body = "edited body"
+			}
+			write(w, reviewThreadResponse(body))
+			return
+		}
+		write(w, `{"data":{"repository":{"pullRequest":{"reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	cfg := validConfig(key)
+	cfg.APIBaseURL, cfg.GraphQLURL, cfg.RepositoryID = server.URL, server.URL+"/graphql", 99
+	client, err := New(cfg, fixedClock{time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Read(context.Background(), 1, "headsha"); err == nil || !strings.Contains(err.Error(), "review topology drifted") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func reviewThreadResponse(body string) string {
+	return fmt.Sprintf(`{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"THREAD","isResolved":false,"isOutdated":false,"path":"internal/a.go","line":7,"originalCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"comments":{"nodes":[{"id":"COMMENT","databaseId":1,"replyTo":null,"author":{"login":"author","__typename":"User","id":"USER","databaseId":2},"pullRequestReview":{"id":"REVIEW","databaseId":3,"state":"COMMENTED","commit":{"oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"submittedAt":"2026-07-14T01:00:00Z","author":{"login":"author","__typename":"User","id":"USER","databaseId":2}},"body":%q,"createdAt":"2026-07-14T01:00:00Z","updatedAt":"2026-07-14T01:00:00Z"}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`, body)
+}
+
+func reviewThreadServer(t *testing.T, reply func(int, map[string]any) string) *httptest.Server {
+	t.Helper()
+	var calls atomic.Int32
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Variables map[string]any `json:"variables"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, reply(int(calls.Add(1)), request.Variables))
+	}))
 }
 
 func TestHTTPFailureClassificationAndBounds(t *testing.T) {
@@ -511,8 +750,12 @@ func fixtureServer(t *testing.T, mint *atomic.Int32, always401 bool) *httptest.S
 			http.Error(w, "invalid GraphQL request", http.StatusBadRequest)
 			return
 		}
-		if !strings.Contains(request.Query, "... on User{id databaseId}") || strings.Contains(request.Query, "reviewThreads") {
+		if !strings.Contains(request.Query, "... on User{id databaseId}") {
 			http.Error(w, "invalid review selection", http.StatusBadRequest)
+			return
+		}
+		if strings.Contains(request.Query, "reviewThreads") {
+			write(w, `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`)
 			return
 		}
 		write(w, `{"data":{"repository":{"pullRequest":{"reviewDecision":"REVIEW_REQUIRED","reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`)

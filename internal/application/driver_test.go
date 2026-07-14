@@ -70,8 +70,8 @@ func (c *driverCoordinator) Cleanup(_ context.Context, _ ProductionCleanupComman
 type driverGitHubReader struct{}
 
 func (driverGitHubReader) Authority() GitHubInstallationMetadata { return GitHubInstallationMetadata{} }
-func (driverGitHubReader) Read(context.Context, int64, string) (domain.GitHubReadEvidence, []GitHubRequestObservation, GitHubInstallationMetadata, error) {
-	return domain.GitHubReadEvidence{}, nil, GitHubInstallationMetadata{}, nil
+func (driverGitHubReader) Read(context.Context, int64, string) (domain.GitHubReadEvidence, domain.InlineReviewBodyHandoff, []GitHubRequestObservation, GitHubInstallationMetadata, error) {
+	return domain.GitHubReadEvidence{}, domain.InlineReviewBodyHandoff{}, nil, GitHubInstallationMetadata{}, nil
 }
 
 type driverApprovalValidator struct{}

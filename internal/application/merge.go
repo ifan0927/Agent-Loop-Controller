@@ -106,7 +106,10 @@ func (c *ProductionCoordinator) MergePullRequest(ctx context.Context, command Pr
 	if err := request.Validate(); err != nil {
 		return ProductionMergeResult{}, serviceError(ErrorInternal, "build immutable squash merge intent", err)
 	}
-	evidence, observations, metadata, readErr := reader.Read(ctx, request.PullRequest, request.ExpectedHeadSHA)
+	evidence, handoff, observations, metadata, readErr := reader.Read(ctx, request.PullRequest, request.ExpectedHeadSHA)
+	if handoffErr := handoff.Validate(); handoffErr != nil {
+		return ProductionMergeResult{}, serviceError(ErrorUnavailable, "inline review body handoff is incomplete", handoffErr)
+	}
 	if err := persistMergeRead(ctx, stores, run.ID, observations, metadata, evidence); err != nil {
 		return ProductionMergeResult{}, classifyServiceError(err)
 	}

@@ -79,6 +79,76 @@ type GitHubReview struct {
 	SourceAt   time.Time     `json:"source_timestamp"`
 }
 
+// GitHubReviewThread is the sanitized topology of one inline review thread.
+type GitHubReviewThread struct {
+	NodeID            string                `json:"node_id"`
+	Resolved          bool                  `json:"resolved"`
+	Outdated          bool                  `json:"outdated"`
+	OriginalCommitSHA string                `json:"original_commit_sha"`
+	Path              string                `json:"path,omitempty"`
+	Line              *int                  `json:"line,omitempty"`
+	Comments          []GitHubReviewComment `json:"comments"`
+}
+
+// GitHubReviewComment preserves the immutable remote identities and the
+// root/reply relationship without interpreting its untrusted body.
+type GitHubReviewComment struct {
+	DatabaseID        int64          `json:"database_id"`
+	NodeID            string         `json:"node_id"`
+	ReplyToDatabaseID int64          `json:"reply_to_database_id,omitempty"`
+	ReplyToNodeID     string         `json:"reply_to_node_id,omitempty"`
+	Author            *ActorIdentity `json:"author,omitempty"`
+	Review            GitHubReview   `json:"review"`
+	BodyDigest        string         `json:"body_digest"`
+	CreatedAt         time.Time      `json:"created_at"`
+	UpdatedAt         time.Time      `json:"updated_at"`
+}
+
+// InlineReviewBodyHandoff is the only in-memory carrier for raw inline review
+// bodies. It is deliberately separate from GitHubReadEvidence, which may be
+// serialized by generic evidence stores.
+type InlineReviewBodyHandoff struct {
+	Comments []InlineReviewBody `json:"-"`
+}
+
+type InlineReviewBody struct {
+	ThreadNodeID  string `json:"-"`
+	CommentNodeID string `json:"-"`
+	Body          string `json:"-"`
+	BodyDigest    string `json:"-"`
+}
+
+// Validate enforces the same raw-text limits as the dedicated trusted-feedback
+// store before any caller can consider persisting a body.
+func (h InlineReviewBodyHandoff) Validate() error {
+	if len(h.Comments) > MaxTrustedReviewFeedbackPerHead {
+		return fmt.Errorf("inline review body count exceeds bounded limit")
+	}
+	total := 0
+	seen := make(map[string]struct{}, len(h.Comments))
+	for _, comment := range h.Comments {
+		if strings.TrimSpace(comment.ThreadNodeID) == "" || strings.TrimSpace(comment.CommentNodeID) == "" || strings.ContainsRune(comment.ThreadNodeID, '\x00') || strings.ContainsRune(comment.CommentNodeID, '\x00') {
+			return fmt.Errorf("inline review body identity is incomplete")
+		}
+		if _, exists := seen[comment.CommentNodeID]; exists {
+			return fmt.Errorf("duplicate inline review body identity")
+		}
+		seen[comment.CommentNodeID] = struct{}{}
+		bytes := len([]byte(comment.Body))
+		if bytes == 0 || bytes > MaxTrustedReviewFeedbackBodyBytes || strings.ContainsRune(comment.Body, '\x00') {
+			return fmt.Errorf("inline review body exceeds bounded limit")
+		}
+		if TrustedReviewFeedbackDigest(comment.Body) != comment.BodyDigest {
+			return fmt.Errorf("inline review body digest does not match body")
+		}
+		total += bytes
+		if total > MaxTrustedReviewFeedbackTextBytes {
+			return fmt.Errorf("inline review body aggregate exceeds bounded limit")
+		}
+	}
+	return nil
+}
+
 type HumanApprovalStatus string
 
 const (
@@ -208,13 +278,14 @@ func NormalizeHumanApproval(pr PullRequest, reviews []GitHubReview, trusted []Ac
 }
 
 type GitHubReadEvidence struct {
-	Repository    RepositoryIdentity  `json:"repository"`
-	PullRequest   PullRequest         `json:"pull_request"`
-	Checks        []GitHubCheck       `json:"checks"`
-	Findings      []NormalizedFinding `json:"findings"`
-	Reviews       []GitHubReview      `json:"reviews"`
-	UnknownEvents []string            `json:"unknown_telemetry"`
-	ObservedAt    time.Time           `json:"observed_at"`
+	Repository    RepositoryIdentity   `json:"repository"`
+	PullRequest   PullRequest          `json:"pull_request"`
+	Checks        []GitHubCheck        `json:"checks"`
+	Findings      []NormalizedFinding  `json:"findings"`
+	Reviews       []GitHubReview       `json:"reviews"`
+	ReviewThreads []GitHubReviewThread `json:"review_threads"`
+	UnknownEvents []string             `json:"unknown_telemetry"`
+	ObservedAt    time.Time            `json:"observed_at"`
 }
 
 func (e GitHubReadEvidence) RequiredChecksStatus() ReconciliationStatus {

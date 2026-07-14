@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -99,5 +100,43 @@ func TestNormalizeHumanApprovalUsesLatestTrustedReview(t *testing.T) {
 	observation, approval, err := NormalizeHumanApproval(pr, reviews, trusted, now.Add(2*time.Minute))
 	if err != nil || observation.Status != HumanApprovalApproved || approval == nil || approval.ReviewDatabaseID != 45 {
 		t.Fatalf("observation=%+v approval=%+v err=%v", observation, approval, err)
+	}
+}
+
+func TestInlineReviewBodyHandoffBoundsAndGenericEvidenceSeparation(t *testing.T) {
+	body := "bounded body"
+	valid := InlineReviewBodyHandoff{Comments: []InlineReviewBody{{ThreadNodeID: "THREAD", CommentNodeID: "COMMENT", Body: body, BodyDigest: TrustedReviewFeedbackDigest(body)}}}
+	if err := valid.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*InlineReviewBodyHandoff){
+		func(value *InlineReviewBodyHandoff) {
+			value.Comments[0].Body = strings.Repeat("x", MaxTrustedReviewFeedbackBodyBytes+1)
+		},
+		func(value *InlineReviewBodyHandoff) { value.Comments[0].BodyDigest = "wrong" },
+		func(value *InlineReviewBodyHandoff) { value.Comments[0].Body = "x\x00y" },
+	} {
+		candidate := valid
+		candidate.Comments = append([]InlineReviewBody(nil), valid.Comments...)
+		mutate(&candidate)
+		if err := candidate.Validate(); err == nil {
+			t.Fatal("invalid bounded handoff was accepted")
+		}
+	}
+	count := InlineReviewBodyHandoff{}
+	for index := 0; index < MaxTrustedReviewFeedbackPerHead+1; index++ {
+		value := "x"
+		count.Comments = append(count.Comments, InlineReviewBody{ThreadNodeID: "THREAD", CommentNodeID: string(rune('a' + index)), Body: value, BodyDigest: TrustedReviewFeedbackDigest(value)})
+	}
+	if err := count.Validate(); err == nil {
+		t.Fatal("over-count handoff was accepted")
+	}
+	aggregate := InlineReviewBodyHandoff{}
+	for index := 0; index < 5; index++ {
+		value := strings.Repeat("x", MaxTrustedReviewFeedbackBodyBytes)
+		aggregate.Comments = append(aggregate.Comments, InlineReviewBody{ThreadNodeID: "THREAD", CommentNodeID: string(rune('a' + index)), Body: value, BodyDigest: TrustedReviewFeedbackDigest(value)})
+	}
+	if err := aggregate.Validate(); err == nil {
+		t.Fatal("over-aggregate handoff was accepted")
 	}
 }

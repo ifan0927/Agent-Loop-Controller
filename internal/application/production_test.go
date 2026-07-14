@@ -365,9 +365,9 @@ type mergeReader struct {
 }
 
 func (r *mergeReader) Authority() GitHubInstallationMetadata { return r.authority }
-func (r *mergeReader) Read(_ context.Context, _ int64, _ string) (domain.GitHubReadEvidence, []GitHubRequestObservation, GitHubInstallationMetadata, error) {
+func (r *mergeReader) Read(_ context.Context, _ int64, _ string) (domain.GitHubReadEvidence, domain.InlineReviewBodyHandoff, []GitHubRequestObservation, GitHubInstallationMetadata, error) {
 	r.calls++
-	return r.evidence, append([]GitHubRequestObservation(nil), r.observations...), r.authority, nil
+	return r.evidence, domain.InlineReviewBodyHandoff{}, append([]GitHubRequestObservation(nil), r.observations...), r.authority, nil
 }
 
 type mergeWriter struct {

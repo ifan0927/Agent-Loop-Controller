@@ -100,9 +100,9 @@ type serviceGitHubReader struct {
 
 func (r *serviceGitHubReader) Authority() GitHubInstallationMetadata { return r.authority }
 
-func (r *serviceGitHubReader) Read(context.Context, int64, string) (domain.GitHubReadEvidence, []GitHubRequestObservation, GitHubInstallationMetadata, error) {
+func (r *serviceGitHubReader) Read(context.Context, int64, string) (domain.GitHubReadEvidence, domain.InlineReviewBodyHandoff, []GitHubRequestObservation, GitHubInstallationMetadata, error) {
 	r.calls++
-	return domain.GitHubReadEvidence{}, r.observations, GitHubInstallationMetadata{}, r.err
+	return domain.GitHubReadEvidence{}, domain.InlineReviewBodyHandoff{}, r.observations, GitHubInstallationMetadata{}, r.err
 }
 
 func (c *serviceController) StartAuthorized(_ context.Context, _ LocalStartInput, _ func(Run) error) (Run, error) {
@@ -418,9 +418,9 @@ func (blockingGitHubReader) Authority() GitHubInstallationMetadata {
 	return GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: domain.RepositoryIdentity{ID: 99, Owner: "owner", Name: "repo"}}
 }
 
-func (blockingGitHubReader) Read(ctx context.Context, _ int64, _ string) (domain.GitHubReadEvidence, []GitHubRequestObservation, GitHubInstallationMetadata, error) {
+func (blockingGitHubReader) Read(ctx context.Context, _ int64, _ string) (domain.GitHubReadEvidence, domain.InlineReviewBodyHandoff, []GitHubRequestObservation, GitHubInstallationMetadata, error) {
 	<-ctx.Done()
-	return domain.GitHubReadEvidence{}, nil, GitHubInstallationMetadata{}, context.Cause(ctx)
+	return domain.GitHubReadEvidence{}, domain.InlineReviewBodyHandoff{}, nil, GitHubInstallationMetadata{}, context.Cause(ctx)
 }
 
 func TestGitHubReconcilePersistsPartialFailureObservations(t *testing.T) {

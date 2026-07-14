@@ -49,6 +49,18 @@ func New(cfg Config, clock Clock, observer Observer) (*Client, error) {
 	return &Client{cfg: cfg, http: &http.Client{Timeout: cfg.HTTPTimeout}, clock: clock, observe: observer, repo: domain.RepositoryIdentity{ID: cfg.RepositoryID, Owner: cfg.RepositoryOwner, Name: cfg.RepositoryName}}, nil
 }
 func (c *Client) Read(ctx context.Context, pr int64, expectedHead string) (domain.GitHubReadEvidence, error) {
+	return c.read(ctx, pr, expectedHead, nil)
+}
+
+// ReadWithInlineReviewBodies keeps raw inline bodies in a separate bounded
+// handoff. Callers must never serialize this value as general GitHub evidence.
+func (c *Client) ReadWithInlineReviewBodies(ctx context.Context, pr int64, expectedHead string) (domain.GitHubReadEvidence, domain.InlineReviewBodyHandoff, error) {
+	var handoff domain.InlineReviewBodyHandoff
+	evidence, err := c.read(ctx, pr, expectedHead, &handoff)
+	return evidence, handoff, err
+}
+
+func (c *Client) read(ctx context.Context, pr int64, expectedHead string, handoff *domain.InlineReviewBodyHandoff) (domain.GitHubReadEvidence, error) {
 	c.opMu.Lock()
 	defer c.opMu.Unlock()
 	c.budgetMu.Lock()
@@ -100,14 +112,22 @@ func (c *Client) Read(ctx context.Context, pr int64, expectedHead string) (domai
 	if err != nil {
 		return e, err
 	}
+	threads, _, err := c.readReviewThreads(ctx, pr)
+	if err != nil {
+		return e, err
+	}
 	reviews2, unknown3, err := c.readReviews(ctx, pr)
 	if err != nil {
 		return e, err
 	}
-	if reviewTopologyDigest(reviews, unknown2) != reviewTopologyDigest(reviews2, unknown3) {
+	threads2, _, err := c.readReviewThreads(ctx, pr)
+	if err != nil {
+		return e, err
+	}
+	if reviewTopologyDigest(reviews, threads, unknown2) != reviewTopologyDigest(reviews2, threads2, unknown3) {
 		return e, errors.New("review topology drifted while collecting GitHub evidence")
 	}
-	reviews, unknown2 = reviews2, unknown3
+	reviews, threads, unknown2 = reviews2, threads2, unknown3
 	checks2, unknownChecks2, err := c.readChecks(ctx, expectedHead, e.PullRequest.BaseBranch)
 	if err != nil {
 		return e, err
@@ -122,11 +142,16 @@ func (c *Client) Read(ctx context.Context, pr int64, expectedHead string) (domai
 	if err != nil {
 		return e, err
 	}
-	if reviewTopologyDigest(reviews2, unknown3) != reviewTopologyDigest(reviews3, unknown4) {
+	threads3, bodies3, err := c.readReviewThreads(ctx, pr)
+	if err != nil {
+		return e, err
+	}
+	if reviewTopologyDigest(reviews2, threads2, unknown3) != reviewTopologyDigest(reviews3, threads3, unknown4) {
 		return e, errors.New("review topology drifted after final check collection")
 	}
-	reviews, unknown2 = reviews3, unknown4
+	reviews, threads, unknown2 = reviews3, threads3, unknown4
 	e.Reviews = reviews
+	e.ReviewThreads = threads
 	e.UnknownEvents = append(unknown, unknown2...)
 	var final rawPR
 	if err := c.rest(ctx, "pull_request_final", "GET", fmt.Sprintf("/repos/%s/%s/pulls/%d", c.cfg.RepositoryOwner, c.cfg.RepositoryName, pr), nil, &final, true); err != nil {
@@ -136,14 +161,30 @@ func (c *Client) Read(ctx context.Context, pr int64, expectedHead string) (domai
 	if final.Head.Repo.ID != c.cfg.RepositoryID || final.Base.Repo.ID != c.cfg.RepositoryID || finalPR.Number != e.PullRequest.Number || finalPR.DatabaseID != e.PullRequest.DatabaseID || finalPR.NodeID != e.PullRequest.NodeID || finalPR.HeadSHA != e.PullRequest.HeadSHA || finalPR.BaseSHA != e.PullRequest.BaseSHA || finalPR.HeadBranch != e.PullRequest.HeadBranch || finalPR.BaseBranch != e.PullRequest.BaseBranch || finalPR.BodyDigest != e.PullRequest.BodyDigest {
 		return e, errors.New("pull request drifted while collecting GitHub evidence")
 	}
+	if handoff != nil {
+		*handoff = bodies3
+	}
 	return e, nil
 }
 
-func reviewTopologyDigest(reviews []domain.GitHubReview, unknown []string) string {
+func reviewTopologyDigest(reviews []domain.GitHubReview, threads []domain.GitHubReviewThread, unknown []string) string {
+	reviewCopies := append([]domain.GitHubReview(nil), reviews...)
+	threadCopies := append([]domain.GitHubReviewThread(nil), threads...)
+	for i := range threadCopies {
+		threadCopies[i].Comments = append([]domain.GitHubReviewComment(nil), threadCopies[i].Comments...)
+		sort.Slice(threadCopies[i].Comments, func(left, right int) bool {
+			return threadCopies[i].Comments[left].NodeID < threadCopies[i].Comments[right].NodeID
+		})
+	}
+	sort.Slice(reviewCopies, func(left, right int) bool { return reviewCopies[left].NodeID < reviewCopies[right].NodeID })
+	sort.Slice(threadCopies, func(left, right int) bool { return threadCopies[left].NodeID < threadCopies[right].NodeID })
+	unknownCopies := append([]string(nil), unknown...)
+	sort.Strings(unknownCopies)
 	raw, _ := json.Marshal(struct {
 		Reviews []domain.GitHubReview
+		Threads []domain.GitHubReviewThread
 		Unknown []string
-	}{reviews, unknown})
+	}{reviewCopies, threadCopies, unknownCopies})
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }
@@ -623,6 +664,8 @@ type graphPageInfo struct {
 
 const reviewQuery = `query ReadPullRequestReviews($owner:String!,$name:String!,$number:Int!,$reviewCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviews(first:100,after:$reviewCursor){nodes{id databaseId state commit{oid} submittedAt author{login __typename ... on User{id databaseId} ... on Bot{id databaseId}}} pageInfo{hasNextPage endCursor}}}}}`
 
+const reviewThreadQuery = `query ReadPullRequestReviewThreads($owner:String!,$name:String!,$number:Int!,$threadCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$threadCursor){nodes{id isResolved isOutdated path line originalCommit{oid} comments(first:100){nodes{id databaseId replyTo{id databaseId} author{login __typename ... on User{id databaseId} ... on Bot{id databaseId}} pullRequestReview{id databaseId state commit{oid} submittedAt author{login __typename ... on User{id databaseId} ... on Bot{id databaseId}}} body createdAt updatedAt} pageInfo{hasNextPage endCursor}} pageInfo{hasNextPage endCursor}}}}}`
+
 func (c *Client) readReviews(ctx context.Context, pr int64) ([]domain.GitHubReview, []string, error) {
 	reviewCursor := ""
 	var reviews []domain.GitHubReview
@@ -647,7 +690,7 @@ func (c *Client) readReviews(ctx context.Context, pr int64) ([]domain.GitHubRevi
 									DatabaseID int64  `json:"databaseId"`
 								} `json:"author"`
 							} `json:"nodes"`
-							PageInfo graphPageInfo `json:"pageInfo"`
+							PageInfo *graphPageInfo `json:"pageInfo"`
 						} `json:"reviews"`
 					} `json:"pullRequest"`
 				} `json:"repository"`
@@ -669,6 +712,9 @@ func (c *Client) readReviews(ctx context.Context, pr int64) ([]domain.GitHubRevi
 		for _, r := range p.Reviews.Nodes {
 			reviews = append(reviews, domain.GitHubReview{DatabaseID: r.DatabaseID, NodeID: r.ID, State: r.State, CommitSHA: r.Commit.OID, SourceAt: r.SubmittedAt, Actor: domain.ActorIdentity{DatabaseID: r.Author.DatabaseID, NodeID: r.Author.ID, Login: r.Author.Login, Type: r.Author.Typename}})
 		}
+		if p.Reviews.PageInfo == nil {
+			return nil, nil, errors.New("review pagination metadata is missing")
+		}
 		if !p.Reviews.PageInfo.HasNextPage {
 			return reviews, nil, nil
 		}
@@ -678,6 +724,234 @@ func (c *Client) readReviews(ctx context.Context, pr int64) ([]domain.GitHubRevi
 		reviewCursor = p.Reviews.PageInfo.EndCursor
 	}
 	return nil, nil, errors.New("review pagination exceeded bounded limit")
+}
+
+func (c *Client) readReviewThreads(ctx context.Context, pr int64) ([]domain.GitHubReviewThread, domain.InlineReviewBodyHandoff, error) {
+	threadCursor := ""
+	var threads []domain.GitHubReviewThread
+	var handoff domain.InlineReviewBodyHandoff
+	for pages := 0; pages < 20; pages++ {
+		var env struct {
+			Data struct {
+				Repository *struct {
+					PullRequest *struct {
+						ReviewThreads struct {
+							Nodes    []rawReviewThread `json:"nodes"`
+							PageInfo *graphPageInfo    `json:"pageInfo"`
+						} `json:"reviewThreads"`
+					} `json:"pullRequest"`
+				} `json:"repository"`
+			} `json:"data"`
+			Errors []struct {
+				Message string `json:"message"`
+			} `json:"errors"`
+		}
+		if err := c.graphql(ctx, "ReadPullRequestReviewThreads", reviewThreadQuery, map[string]any{"owner": c.cfg.RepositoryOwner, "name": c.cfg.RepositoryName, "number": pr, "threadCursor": nullable(threadCursor)}, &env); err != nil {
+			return nil, domain.InlineReviewBodyHandoff{}, err
+		}
+		if len(env.Errors) > 0 {
+			return nil, domain.InlineReviewBodyHandoff{}, errors.New("GitHub GraphQL returned partial data with errors")
+		}
+		if env.Data.Repository == nil || env.Data.Repository.PullRequest == nil {
+			return nil, domain.InlineReviewBodyHandoff{}, errors.New("GitHub GraphQL response missing pull request")
+		}
+		page := env.Data.Repository.PullRequest.ReviewThreads
+		if page.PageInfo == nil {
+			return nil, domain.InlineReviewBodyHandoff{}, errors.New("review-thread pagination metadata is missing")
+		}
+		if len(page.Nodes) > 100 {
+			return nil, domain.InlineReviewBodyHandoff{}, errors.New("review-thread page exceeds bounded limit")
+		}
+		for _, raw := range page.Nodes {
+			thread, bodies, err := raw.normalized()
+			if err != nil {
+				return nil, domain.InlineReviewBodyHandoff{}, err
+			}
+			threads = append(threads, thread)
+			handoff.Comments = append(handoff.Comments, bodies...)
+			if err := handoff.Validate(); err != nil {
+				return nil, domain.InlineReviewBodyHandoff{}, err
+			}
+		}
+		if !page.PageInfo.HasNextPage {
+			return threads, handoff, nil
+		}
+		if page.PageInfo.EndCursor == "" {
+			return nil, domain.InlineReviewBodyHandoff{}, errors.New("review-thread pagination cursor missing")
+		}
+		threadCursor = page.PageInfo.EndCursor
+	}
+	return nil, domain.InlineReviewBodyHandoff{}, errors.New("review-thread pagination exceeded bounded limit")
+}
+
+type rawReviewThread struct {
+	ID             string `json:"id"`
+	Resolved       bool   `json:"isResolved"`
+	Outdated       bool   `json:"isOutdated"`
+	Path           string `json:"path"`
+	Line           *int   `json:"line"`
+	OriginalCommit *struct {
+		OID string `json:"oid"`
+	} `json:"originalCommit"`
+	Comments struct {
+		Nodes    []rawReviewComment `json:"nodes"`
+		PageInfo *graphPageInfo     `json:"pageInfo"`
+	} `json:"comments"`
+}
+
+type rawReviewComment struct {
+	ID         string `json:"id"`
+	DatabaseID int64  `json:"databaseId"`
+	ReplyTo    *struct {
+		ID         string `json:"id"`
+		DatabaseID int64  `json:"databaseId"`
+	} `json:"replyTo"`
+	Author *struct {
+		Login      string `json:"login"`
+		Typename   string `json:"__typename"`
+		ID         string `json:"id"`
+		DatabaseID int64  `json:"databaseId"`
+	} `json:"author"`
+	Review *struct {
+		ID         string `json:"id"`
+		DatabaseID int64  `json:"databaseId"`
+		State      string `json:"state"`
+		Commit     *struct {
+			OID string `json:"oid"`
+		} `json:"commit"`
+		SubmittedAt time.Time `json:"submittedAt"`
+		Author      *struct {
+			Login      string `json:"login"`
+			Typename   string `json:"__typename"`
+			ID         string `json:"id"`
+			DatabaseID int64  `json:"databaseId"`
+		} `json:"author"`
+	} `json:"pullRequestReview"`
+	Body      string    `json:"body"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+func (raw rawReviewThread) normalized() (domain.GitHubReviewThread, []domain.InlineReviewBody, error) {
+	if strings.TrimSpace(raw.ID) == "" {
+		return domain.GitHubReviewThread{}, nil, errors.New("review thread ID is missing")
+	}
+	if raw.OriginalCommit == nil || !validFullSHA(raw.OriginalCommit.OID) {
+		return domain.GitHubReviewThread{}, nil, errors.New("review thread original commit is incomplete")
+	}
+	if raw.Comments.PageInfo == nil {
+		return domain.GitHubReviewThread{}, nil, errors.New("review-thread comment pagination metadata is missing")
+	}
+	if raw.Comments.PageInfo.HasNextPage {
+		return domain.GitHubReviewThread{}, nil, errors.New("review-thread comment pagination exceeds supported bound")
+	}
+	if len(raw.Comments.Nodes) > 100 {
+		return domain.GitHubReviewThread{}, nil, errors.New("review-thread comment page exceeds bounded limit")
+	}
+	if len(raw.Comments.Nodes) == 0 {
+		return domain.GitHubReviewThread{}, nil, errors.New("review thread has no comments")
+	}
+	thread := domain.GitHubReviewThread{NodeID: raw.ID, Resolved: raw.Resolved, Outdated: raw.Outdated, OriginalCommitSHA: raw.OriginalCommit.OID, Path: raw.Path, Line: raw.Line, Comments: make([]domain.GitHubReviewComment, 0, len(raw.Comments.Nodes))}
+	bodies := make([]domain.InlineReviewBody, 0, len(raw.Comments.Nodes))
+	rootID := ""
+	rootDatabaseID := int64(0)
+	for _, comment := range raw.Comments.Nodes {
+		normalized, body, err := comment.normalized(raw.ID)
+		if err != nil {
+			return domain.GitHubReviewThread{}, nil, err
+		}
+		if normalized.ReplyToNodeID == "" {
+			if rootID != "" {
+				return domain.GitHubReviewThread{}, nil, errors.New("review thread has multiple root comments")
+			}
+			rootID, rootDatabaseID = normalized.NodeID, normalized.DatabaseID
+		}
+		thread.Comments = append(thread.Comments, normalized)
+		bodies = append(bodies, body)
+	}
+	if rootID == "" {
+		return domain.GitHubReviewThread{}, nil, errors.New("review thread root comment is missing")
+	}
+	for _, comment := range thread.Comments {
+		if comment.ReplyToNodeID != "" && (comment.ReplyToNodeID != rootID || comment.ReplyToDatabaseID != rootDatabaseID) {
+			return domain.GitHubReviewThread{}, nil, errors.New("review thread reply topology is incomplete")
+		}
+	}
+	return thread, bodies, nil
+}
+
+func (raw rawReviewComment) normalized(threadNodeID string) (domain.GitHubReviewComment, domain.InlineReviewBody, error) {
+	if raw.DatabaseID < 1 || strings.TrimSpace(raw.ID) == "" {
+		return domain.GitHubReviewComment{}, domain.InlineReviewBody{}, errors.New("review comment identity is missing")
+	}
+	if raw.ReplyTo != nil && (raw.ReplyTo.DatabaseID < 1 || strings.TrimSpace(raw.ReplyTo.ID) == "") {
+		return domain.GitHubReviewComment{}, domain.InlineReviewBody{}, errors.New("review comment reply identity is missing")
+	}
+	if raw.Author != nil && !validReviewActor(*raw.Author) {
+		return domain.GitHubReviewComment{}, domain.InlineReviewBody{}, errors.New("review comment author identity is incomplete")
+	}
+	if raw.Review == nil || raw.Review.DatabaseID < 1 || strings.TrimSpace(raw.Review.ID) == "" || !validReviewState(raw.Review.State) || raw.Review.Commit == nil || !validFullSHA(raw.Review.Commit.OID) || raw.Review.SubmittedAt.IsZero() {
+		return domain.GitHubReviewComment{}, domain.InlineReviewBody{}, errors.New("review comment review identity is incomplete")
+	}
+	if raw.Review.Author != nil && !validReviewActor(*raw.Review.Author) {
+		return domain.GitHubReviewComment{}, domain.InlineReviewBody{}, errors.New("review comment review author identity is incomplete")
+	}
+	if raw.CreatedAt.IsZero() || raw.UpdatedAt.IsZero() {
+		return domain.GitHubReviewComment{}, domain.InlineReviewBody{}, errors.New("review comment timestamps are missing")
+	}
+	result := domain.GitHubReviewComment{DatabaseID: raw.DatabaseID, NodeID: raw.ID, Review: domain.GitHubReview{DatabaseID: raw.Review.DatabaseID, NodeID: raw.Review.ID, State: raw.Review.State, CommitSHA: raw.Review.Commit.OID, SourceAt: raw.Review.SubmittedAt}}
+	if raw.ReplyTo != nil {
+		result.ReplyToDatabaseID, result.ReplyToNodeID = raw.ReplyTo.DatabaseID, raw.ReplyTo.ID
+	}
+	if raw.Author != nil {
+		result.Author = &domain.ActorIdentity{DatabaseID: raw.Author.DatabaseID, NodeID: raw.Author.ID, Login: raw.Author.Login, Type: raw.Author.Typename}
+	}
+	if raw.Review.Author != nil {
+		result.Review.Actor = domain.ActorIdentity{DatabaseID: raw.Review.Author.DatabaseID, NodeID: raw.Review.Author.ID, Login: raw.Review.Author.Login, Type: raw.Review.Author.Typename}
+	}
+	bodyDigest := sha256.Sum256([]byte(raw.Body))
+	result.BodyDigest = hex.EncodeToString(bodyDigest[:])
+	result.CreatedAt, result.UpdatedAt = raw.CreatedAt.UTC(), raw.UpdatedAt.UTC()
+	body := domain.InlineReviewBody{ThreadNodeID: threadNodeID, CommentNodeID: raw.ID, Body: raw.Body, BodyDigest: result.BodyDigest}
+	return result, body, nil
+}
+
+func validFullSHA(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for _, character := range value {
+		if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func validReviewState(value string) bool {
+	switch value {
+	case "APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING":
+		return true
+	default:
+		return false
+	}
+}
+
+func validReviewActor(actor struct {
+	Login      string `json:"login"`
+	Typename   string `json:"__typename"`
+	ID         string `json:"id"`
+	DatabaseID int64  `json:"databaseId"`
+}) bool {
+	if actor.DatabaseID < 1 || strings.TrimSpace(actor.ID) == "" || strings.TrimSpace(actor.Login) == "" {
+		return false
+	}
+	switch actor.Typename {
+	case "User", "Bot", "App":
+		return true
+	default:
+		return false
+	}
 }
 
 func nullable(s string) any {

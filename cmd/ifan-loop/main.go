@@ -823,15 +823,15 @@ func (a githubReadAdapter) Authority() application.GitHubInstallationMetadata {
 	return a.client.InstallationMetadata()
 }
 
-func (a githubReadAdapter) Read(ctx context.Context, pr int64, head string) (domain.GitHubReadEvidence, []application.GitHubRequestObservation, application.GitHubInstallationMetadata, error) {
+func (a githubReadAdapter) Read(ctx context.Context, pr int64, head string) (domain.GitHubReadEvidence, domain.InlineReviewBodyHandoff, []application.GitHubRequestObservation, application.GitHubInstallationMetadata, error) {
 	start := len(*a.observations)
-	evidence, err := a.client.Read(ctx, pr, head)
+	evidence, handoff, err := a.client.ReadWithInlineReviewBodies(ctx, pr, head)
 	produced := append([]application.GitHubRequestObservation(nil), (*a.observations)[start:]...)
 	// A long-lived automatic driver can poll for hours. Observations are copied
 	// into the application result above, so retain only reusable backing storage
 	// instead of accumulating every completed poll in process memory.
 	*a.observations = (*a.observations)[:0]
-	return evidence, produced, a.client.InstallationMetadata(), err
+	return evidence, handoff, produced, a.client.InstallationMetadata(), err
 }
 
 func (a githubReadAdapter) SquashMerge(ctx context.Context, request application.SquashMergeRequest) (domain.PullRequest, []application.GitHubRequestObservation, application.GitHubInstallationMetadata, error) {
