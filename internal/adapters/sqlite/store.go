@@ -20,7 +20,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 12
+const schemaVersion = 13
 
 type Store struct{ db *sql.DB }
 
@@ -113,6 +113,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV11
 		case 12:
 			statements = migrationV12
+		case 13:
+			statements = migrationV13
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -255,6 +257,15 @@ var migrationV12 = []string{
 	`CREATE TABLE human_approvals (approval_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), pr_number INTEGER NOT NULL, approver TEXT NOT NULL, source TEXT NOT NULL, approved_sha TEXT NOT NULL, ci_status TEXT NOT NULL, internal_review_sha TEXT NOT NULL, approved_at TEXT NOT NULL, actor_database_id INTEGER NOT NULL DEFAULT 0, actor_node_id TEXT NOT NULL DEFAULT '', actor_login TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', review_database_id INTEGER NOT NULL DEFAULT 0, review_node_id TEXT NOT NULL DEFAULT '', observed_at TEXT NOT NULL DEFAULT '', UNIQUE(run_id,approved_sha))`,
 	`INSERT INTO human_approvals(approval_id,run_id,pr_number,approver,source,approved_sha,ci_status,internal_review_sha,approved_at,actor_database_id,actor_node_id,actor_login,actor_type,review_database_id,review_node_id,observed_at) SELECT approval_id,run_id,pr_number,approver,source,approved_sha,ci_status,internal_review_sha,approved_at,actor_database_id,actor_node_id,actor_login,actor_type,review_database_id,review_node_id,observed_at FROM human_approvals_v12`,
 	`DROP TABLE human_approvals_v12`,
+}
+
+// migrationV13 adds a separate authority store for trusted inline feedback.
+// It intentionally does not reuse review_findings, whose mutable prompt input
+// cannot authorize a future GitHub side effect.
+var migrationV13 = []string{
+	`CREATE TABLE trusted_review_feedback (feedback_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), root_comment_node_id TEXT NOT NULL, pr_number INTEGER NOT NULL, pr_database_id INTEGER NOT NULL, pr_node_id TEXT NOT NULL, review_database_id INTEGER NOT NULL, review_node_id TEXT NOT NULL, thread_node_id TEXT NOT NULL, root_comment_database_id INTEGER NOT NULL, author_database_id INTEGER NOT NULL, author_node_id TEXT NOT NULL, author_login TEXT NOT NULL, author_type TEXT NOT NULL, original_review_head_sha TEXT NOT NULL, path TEXT NOT NULL DEFAULT '', line INTEGER, body_text TEXT NOT NULL, body_digest TEXT NOT NULL, source_at TEXT NOT NULL, observed_at TEXT NOT NULL, lifecycle TEXT NOT NULL CHECK(lifecycle IN ('observed','selected_for_repair','repair_verified','reply_pending','replied','resolved','superseded')), bound_repair_head TEXT NOT NULL DEFAULT '', reply_intent_key TEXT NOT NULL DEFAULT '', reply_database_id INTEGER NOT NULL DEFAULT 0, reply_node_id TEXT NOT NULL DEFAULT '', resolved INTEGER NOT NULL DEFAULT 0, outdated INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, UNIQUE(run_id,root_comment_node_id))`,
+	`CREATE TABLE trusted_review_feedback_conflicts (conflict_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), root_comment_node_id TEXT NOT NULL, observed_body_digest TEXT NOT NULL DEFAULT '', reason_code TEXT NOT NULL, observed_at TEXT NOT NULL)`,
+	`CREATE INDEX trusted_review_feedback_run_head ON trusted_review_feedback(run_id,original_review_head_sha)`,
 }
 
 func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput) (application.Run, bool, error) {
@@ -832,6 +843,179 @@ func (s *Store) SaveFinding(ctx context.Context, record application.FindingRecor
 	return err
 }
 
+// SaveTrustedReviewFeedback accepts a bounded observation once. A duplicate
+// must be exactly identical in authority fields and first accepted body. Drift
+// is retained only as a sanitized conflict row and cannot replace authority.
+func (s *Store) SaveTrustedReviewFeedback(ctx context.Context, record application.TrustedReviewFeedbackRecord) (application.TrustedReviewFeedbackRecord, bool, error) {
+	if record.BodyDigest == "" {
+		record.BodyDigest = domain.TrustedReviewFeedbackDigest(record.Body)
+	}
+	if err := record.ValidateObservation(); err != nil {
+		return application.TrustedReviewFeedbackRecord{}, false, err
+	}
+	if record.Lifecycle == "" {
+		record.Lifecycle = domain.TrustedReviewFeedbackObserved
+	}
+	if record.UpdatedAt.IsZero() {
+		record.UpdatedAt = record.ObservedAt.UTC()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return application.TrustedReviewFeedbackRecord{}, false, err
+	}
+	defer tx.Rollback()
+	var count, bytes int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(length(CAST(body_text AS BLOB))),0) FROM trusted_review_feedback WHERE run_id=? AND original_review_head_sha=?`, record.RunID, record.OriginalReviewHeadSHA).Scan(&count, &bytes); err != nil {
+		return application.TrustedReviewFeedbackRecord{}, false, err
+	}
+	existing, found, err := trustedReviewFeedbackByRoot(ctx, tx, record.RunID, record.RootCommentNodeID)
+	if err != nil {
+		return application.TrustedReviewFeedbackRecord{}, false, err
+	}
+	if found {
+		if !existing.ImmutableEqual(record.TrustedReviewFeedback) {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO trusted_review_feedback_conflicts(run_id,root_comment_node_id,observed_body_digest,reason_code,observed_at) VALUES(?,?,?,?,?)`, record.RunID, record.RootCommentNodeID, record.BodyDigest, "immutable_authority_conflict", formatTime(record.ObservedAt)); err != nil {
+				return application.TrustedReviewFeedbackRecord{}, false, err
+			}
+			if err := tx.Commit(); err != nil {
+				return application.TrustedReviewFeedbackRecord{}, false, err
+			}
+			return existing, false, errors.New("trusted review feedback immutable authority conflict")
+		}
+		if err := tx.Commit(); err != nil {
+			return application.TrustedReviewFeedbackRecord{}, false, err
+		}
+		return existing, false, nil
+	}
+	if count >= domain.MaxTrustedReviewFeedbackPerHead || bytes+len([]byte(record.Body)) > domain.MaxTrustedReviewFeedbackTextBytes {
+		return application.TrustedReviewFeedbackRecord{}, false, errors.New("trusted review feedback head bound exceeded")
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO trusted_review_feedback(run_id,root_comment_node_id,pr_number,pr_database_id,pr_node_id,review_database_id,review_node_id,thread_node_id,root_comment_database_id,author_database_id,author_node_id,author_login,author_type,original_review_head_sha,path,line,body_text,body_digest,source_at,observed_at,lifecycle,bound_repair_head,reply_intent_key,reply_database_id,reply_node_id,resolved,outdated,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, record.RunID, record.RootCommentNodeID, record.PRNumber, record.PRDatabaseID, record.PRNodeID, record.ReviewDatabaseID, record.ReviewNodeID, record.ThreadNodeID, record.RootCommentDatabaseID, record.Author.DatabaseID, record.Author.NodeID, record.Author.Login, record.Author.Type, record.OriginalReviewHeadSHA, record.Path, record.Line, record.Body, record.BodyDigest, formatTime(record.SourceAt), formatTime(record.ObservedAt), record.Lifecycle, "", "", 0, "", record.Resolved, record.Outdated, formatTime(record.UpdatedAt))
+	if err != nil {
+		return application.TrustedReviewFeedbackRecord{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return application.TrustedReviewFeedbackRecord{}, false, err
+	}
+	return record, true, nil
+}
+
+// TransitionTrustedReviewFeedback is the only lifecycle mutation. It uses an
+// explicit expected lifecycle in its UPDATE predicate, so stale callers cannot
+// advance a comment after another controller attempt has changed it.
+func (s *Store) TransitionTrustedReviewFeedback(ctx context.Context, runID, rootCommentNodeID string, expected, next domain.TrustedReviewFeedbackLifecycle, boundRepairHead, replyIntentKey string, replyDatabaseID int64, replyNodeID string, resolved, outdated bool) (application.TrustedReviewFeedbackRecord, bool, error) {
+	if strings.TrimSpace(runID) == "" || !validTrustedReviewFeedbackNodeID(rootCommentNodeID) || domain.ValidateTrustedReviewFeedbackTransition(expected, next) != nil {
+		return application.TrustedReviewFeedbackRecord{}, false, errors.New("invalid trusted review feedback lifecycle transition")
+	}
+	if boundRepairHead != "" && !isFullSHA(boundRepairHead) {
+		return application.TrustedReviewFeedbackRecord{}, false, errors.New("bound repair head must be a full SHA")
+	}
+	if replyDatabaseID < 0 || (replyDatabaseID == 0 && replyNodeID != "") || (replyDatabaseID > 0 && !validTrustedReviewFeedbackNodeID(replyNodeID)) {
+		return application.TrustedReviewFeedbackRecord{}, false, errors.New("reply identity is incomplete")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return application.TrustedReviewFeedbackRecord{}, false, err
+	}
+	defer tx.Rollback()
+	current, found, err := trustedReviewFeedbackByRoot(ctx, tx, runID, rootCommentNodeID)
+	if err != nil || !found {
+		return current, false, err
+	}
+	if current.Lifecycle != expected {
+		return current, false, nil
+	}
+	if err := validateTrustedReviewFeedbackTransitionEvidence(current, next, boundRepairHead, replyIntentKey, replyDatabaseID, replyNodeID, resolved); err != nil {
+		return application.TrustedReviewFeedbackRecord{}, false, err
+	}
+	now := nowText()
+	result, err := tx.ExecContext(ctx, `UPDATE trusted_review_feedback SET lifecycle=?,bound_repair_head=CASE WHEN ?='' THEN bound_repair_head ELSE ? END,reply_intent_key=CASE WHEN ?='' THEN reply_intent_key ELSE ? END,reply_database_id=CASE WHEN ?=0 THEN reply_database_id ELSE ? END,reply_node_id=CASE WHEN ?='' THEN reply_node_id ELSE ? END,resolved=?,outdated=?,updated_at=? WHERE run_id=? AND root_comment_node_id=? AND lifecycle=?`, next, boundRepairHead, boundRepairHead, replyIntentKey, replyIntentKey, replyDatabaseID, replyDatabaseID, replyNodeID, replyNodeID, resolved, outdated, now, runID, rootCommentNodeID, expected)
+	if err != nil {
+		return application.TrustedReviewFeedbackRecord{}, false, err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return application.TrustedReviewFeedbackRecord{}, false, nil
+	}
+	record, found, err := trustedReviewFeedbackByRoot(ctx, tx, runID, rootCommentNodeID)
+	if err != nil || !found {
+		return record, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return application.TrustedReviewFeedbackRecord{}, false, err
+	}
+	return record, true, nil
+}
+
+func validateTrustedReviewFeedbackTransitionEvidence(current application.TrustedReviewFeedbackRecord, next domain.TrustedReviewFeedbackLifecycle, boundRepairHead, replyIntentKey string, replyDatabaseID int64, replyNodeID string, resolved bool) error {
+	noReplyIdentity := replyDatabaseID == 0 && replyNodeID == ""
+	switch next {
+	case domain.TrustedReviewFeedbackSelectedForRepair, domain.TrustedReviewFeedbackSuperseded:
+		if boundRepairHead != "" || replyIntentKey != "" || !noReplyIdentity || resolved {
+			return errors.New("feedback transition includes evidence before its lifecycle stage")
+		}
+	case domain.TrustedReviewFeedbackRepairVerified:
+		if !isFullSHA(boundRepairHead) || replyIntentKey != "" || !noReplyIdentity || resolved || current.BoundRepairHead != "" {
+			return errors.New("repair verification requires one new bound repair head only")
+		}
+	case domain.TrustedReviewFeedbackReplyPending:
+		if !isFullSHA(current.BoundRepairHead) || strings.TrimSpace(replyIntentKey) == "" || !noReplyIdentity || resolved || current.ReplyIntentKey != "" {
+			return errors.New("reply pending requires prior repair verification and one reply intent key")
+		}
+	case domain.TrustedReviewFeedbackReplied:
+		if !isFullSHA(current.BoundRepairHead) || strings.TrimSpace(current.ReplyIntentKey) == "" || replyDatabaseID < 1 || !validTrustedReviewFeedbackNodeID(replyNodeID) || resolved || current.ReplyDatabaseID != 0 || current.ReplyNodeID != "" || boundRepairHead != "" || replyIntentKey != "" {
+			return errors.New("reply observation requires prior immutable repair and reply intent evidence")
+		}
+	case domain.TrustedReviewFeedbackResolved:
+		if !resolved || !isFullSHA(current.BoundRepairHead) || strings.TrimSpace(current.ReplyIntentKey) == "" || current.ReplyDatabaseID < 1 || !validTrustedReviewFeedbackNodeID(current.ReplyNodeID) || boundRepairHead != "" || replyIntentKey != "" || !noReplyIdentity {
+			return errors.New("resolution requires consistent immutable replied evidence")
+		}
+	default:
+		return errors.New("unknown trusted review feedback lifecycle")
+	}
+	return nil
+}
+
+type trustedReviewFeedbackQuery interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func trustedReviewFeedbackByRoot(ctx context.Context, query trustedReviewFeedbackQuery, runID, rootCommentNodeID string) (application.TrustedReviewFeedbackRecord, bool, error) {
+	var record application.TrustedReviewFeedbackRecord
+	var sourceAt, observedAt, updatedAt string
+	var line sql.NullInt64
+	var resolved, outdated int
+	err := query.QueryRowContext(ctx, `SELECT run_id,pr_number,pr_database_id,pr_node_id,review_database_id,review_node_id,thread_node_id,root_comment_database_id,root_comment_node_id,author_database_id,author_node_id,author_login,author_type,original_review_head_sha,path,line,body_text,body_digest,source_at,observed_at,lifecycle,bound_repair_head,reply_intent_key,reply_database_id,reply_node_id,resolved,outdated,updated_at FROM trusted_review_feedback WHERE run_id=? AND root_comment_node_id=?`, runID, rootCommentNodeID).Scan(&record.RunID, &record.PRNumber, &record.PRDatabaseID, &record.PRNodeID, &record.ReviewDatabaseID, &record.ReviewNodeID, &record.ThreadNodeID, &record.RootCommentDatabaseID, &record.RootCommentNodeID, &record.Author.DatabaseID, &record.Author.NodeID, &record.Author.Login, &record.Author.Type, &record.OriginalReviewHeadSHA, &record.Path, &line, &record.Body, &record.BodyDigest, &sourceAt, &observedAt, &record.Lifecycle, &record.BoundRepairHead, &record.ReplyIntentKey, &record.ReplyDatabaseID, &record.ReplyNodeID, &resolved, &outdated, &updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return application.TrustedReviewFeedbackRecord{}, false, nil
+	}
+	if err != nil {
+		return application.TrustedReviewFeedbackRecord{}, false, err
+	}
+	if line.Valid {
+		value := int(line.Int64)
+		record.Line = &value
+	}
+	record.SourceAt, record.ObservedAt, record.UpdatedAt = parseTime(sourceAt), parseTime(observedAt), parseTime(updatedAt)
+	record.Resolved, record.Outdated = resolved != 0, outdated != 0
+	return record, true, nil
+}
+
+func isFullSHA(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for _, character := range value {
+		if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func validTrustedReviewFeedbackNodeID(value string) bool {
+	return strings.TrimSpace(value) != "" && !strings.ContainsRune(value, '\x00')
+}
+
 func (s *Store) SaveHumanApproval(ctx context.Context, runID string, approval domain.HumanApproval) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1094,6 +1278,43 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 		v.Outdated = outdated != 0
 		v.ObservedAt = parseTime(observed)
 		inspection.Findings = append(inspection.Findings, v)
+	}
+	rows.Close()
+	rows, err = s.db.QueryContext(ctx, `SELECT run_id,pr_number,pr_database_id,pr_node_id,review_database_id,review_node_id,thread_node_id,root_comment_database_id,root_comment_node_id,author_database_id,author_node_id,author_login,author_type,original_review_head_sha,path,line,body_text,body_digest,source_at,observed_at,lifecycle,bound_repair_head,reply_intent_key,reply_database_id,reply_node_id,resolved,outdated,updated_at FROM trusted_review_feedback WHERE run_id=? ORDER BY feedback_id`, id)
+	if err != nil {
+		return inspection, err
+	}
+	for rows.Next() {
+		var record application.TrustedReviewFeedbackRecord
+		var sourceAt, observedAt, updatedAt string
+		var line sql.NullInt64
+		var resolved, outdated int
+		if err := rows.Scan(&record.RunID, &record.PRNumber, &record.PRDatabaseID, &record.PRNodeID, &record.ReviewDatabaseID, &record.ReviewNodeID, &record.ThreadNodeID, &record.RootCommentDatabaseID, &record.RootCommentNodeID, &record.Author.DatabaseID, &record.Author.NodeID, &record.Author.Login, &record.Author.Type, &record.OriginalReviewHeadSHA, &record.Path, &line, &record.Body, &record.BodyDigest, &sourceAt, &observedAt, &record.Lifecycle, &record.BoundRepairHead, &record.ReplyIntentKey, &record.ReplyDatabaseID, &record.ReplyNodeID, &resolved, &outdated, &updatedAt); err != nil {
+			rows.Close()
+			return inspection, err
+		}
+		if line.Valid {
+			value := int(line.Int64)
+			record.Line = &value
+		}
+		record.SourceAt, record.ObservedAt, record.UpdatedAt = parseTime(sourceAt), parseTime(observedAt), parseTime(updatedAt)
+		record.Resolved, record.Outdated = resolved != 0, outdated != 0
+		inspection.TrustedFeedback = append(inspection.TrustedFeedback, record)
+	}
+	rows.Close()
+	rows, err = s.db.QueryContext(ctx, `SELECT conflict_id,run_id,root_comment_node_id,observed_body_digest,reason_code,observed_at FROM trusted_review_feedback_conflicts WHERE run_id=? ORDER BY conflict_id`, id)
+	if err != nil {
+		return inspection, err
+	}
+	for rows.Next() {
+		var conflict application.TrustedReviewFeedbackConflict
+		var observed string
+		if err := rows.Scan(&conflict.ID, &conflict.RunID, &conflict.RootCommentNodeID, &conflict.ObservedDigest, &conflict.ReasonCode, &observed); err != nil {
+			rows.Close()
+			return inspection, err
+		}
+		conflict.ObservedAt = parseTime(observed)
+		inspection.FeedbackConflicts = append(inspection.FeedbackConflicts, conflict)
 	}
 	rows.Close()
 	var approval domain.HumanApproval

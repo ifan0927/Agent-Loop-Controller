@@ -135,6 +135,8 @@ type RunInspection struct {
 	PullRequest         *domain.PullRequest              `json:"pull_request,omitempty"`
 	Polls               []PollObservation                `json:"poll_observations"`
 	Findings            []FindingRecord                  `json:"normalized_review_findings"`
+	TrustedFeedback     []TrustedReviewFeedbackRecord    `json:"trusted_review_feedback"`
+	FeedbackConflicts   []TrustedReviewFeedbackConflict  `json:"trusted_review_feedback_conflicts"`
 	ApprovalObservation *domain.HumanApprovalObservation `json:"human_approval_observation,omitempty"`
 	Approval            *domain.HumanApproval            `json:"human_approval,omitempty"`
 	Merge               *MergeRecord                     `json:"merge_result,omitempty"`

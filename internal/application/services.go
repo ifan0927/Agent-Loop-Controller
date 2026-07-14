@@ -361,24 +361,26 @@ func authorizePersistedRequester(run Run, requester Requester) error {
 }
 
 type InspectionResult struct {
-	SchemaVersion     string                        `json:"schema_version"`
-	Run               RunResult                     `json:"run"`
-	RepositoryBinding *RepositoryBindingResult      `json:"repository_binding,omitempty"`
-	Timeline          []TransitionResult            `json:"state_timeline"`
-	Attempts          []AttemptResult               `json:"attempts"`
-	Verifications     []VerificationResult          `json:"verifications"`
-	Reviews           []ReviewResult                `json:"reviews"`
-	Resources         []ResourceResult              `json:"owned_resources"`
-	PullRequest       *PullRequestResult            `json:"pull_request,omitempty"`
-	Approval          *HumanApprovalResult          `json:"human_approval,omitempty"`
-	ApprovalStatus    *HumanApprovalStatusResult    `json:"human_approval_status,omitempty"`
-	Merge             *MergeRecord                  `json:"merge_result,omitempty"`
-	LinearCompletion  []LinearCompletionObservation `json:"linear_completion_observations"`
-	Cleanup           []CleanupResult               `json:"cleanup_progress"`
-	OperatorAttention []OperatorAttentionResult     `json:"operator_attention"`
-	Checks            []CheckResult                 `json:"checks"`
-	Findings          []FindingResult               `json:"review_findings"`
-	Telemetry         []TelemetryResult             `json:"unknown_telemetry"`
+	SchemaVersion     string                          `json:"schema_version"`
+	Run               RunResult                       `json:"run"`
+	RepositoryBinding *RepositoryBindingResult        `json:"repository_binding,omitempty"`
+	Timeline          []TransitionResult              `json:"state_timeline"`
+	Attempts          []AttemptResult                 `json:"attempts"`
+	Verifications     []VerificationResult            `json:"verifications"`
+	Reviews           []ReviewResult                  `json:"reviews"`
+	Resources         []ResourceResult                `json:"owned_resources"`
+	PullRequest       *PullRequestResult              `json:"pull_request,omitempty"`
+	Approval          *HumanApprovalResult            `json:"human_approval,omitempty"`
+	ApprovalStatus    *HumanApprovalStatusResult      `json:"human_approval_status,omitempty"`
+	Merge             *MergeRecord                    `json:"merge_result,omitempty"`
+	LinearCompletion  []LinearCompletionObservation   `json:"linear_completion_observations"`
+	Cleanup           []CleanupResult                 `json:"cleanup_progress"`
+	OperatorAttention []OperatorAttentionResult       `json:"operator_attention"`
+	Checks            []CheckResult                   `json:"checks"`
+	Findings          []FindingResult                 `json:"review_findings"`
+	TrustedFeedback   []TrustedFeedbackResult         `json:"trusted_review_feedback"`
+	FeedbackConflicts []TrustedFeedbackConflictResult `json:"trusted_review_feedback_conflicts"`
+	Telemetry         []TelemetryResult               `json:"unknown_telemetry"`
 }
 type RunSummaryPage struct {
 	SchemaVersion string       `json:"schema_version"`
@@ -504,6 +506,44 @@ type FindingResult struct {
 	HeadSHA      string    `json:"observed_head_sha"`
 	ObservedAt   time.Time `json:"observed_at"`
 }
+
+// TrustedFeedbackResult exposes durable authority markers only. The raw human
+// comment remains in the dedicated bounded store and is never an inspect value.
+type TrustedFeedbackResult struct {
+	PRNumber              int64     `json:"pr_number"`
+	PRDatabaseID          int64     `json:"pr_database_id"`
+	PRNodeID              string    `json:"pr_node_id"`
+	ReviewDatabaseID      int64     `json:"review_database_id"`
+	ReviewNodeID          string    `json:"review_node_id"`
+	ThreadNodeID          string    `json:"thread_node_id"`
+	RootCommentDatabaseID int64     `json:"root_comment_database_id"`
+	RootCommentNodeID     string    `json:"root_comment_node_id"`
+	AuthorDatabaseID      int64     `json:"author_database_id"`
+	AuthorNodeID          string    `json:"author_node_id"`
+	AuthorLogin           string    `json:"author_login"`
+	TrustedAuthor         bool      `json:"trusted_author"`
+	OriginalHeadSHA       string    `json:"original_review_head_sha"`
+	Path                  string    `json:"path,omitempty"`
+	Line                  *int      `json:"line,omitempty"`
+	BodyDigest            string    `json:"body_digest"`
+	Lifecycle             string    `json:"lifecycle"`
+	BoundRepairHead       string    `json:"bound_repair_head,omitempty"`
+	ReplyIntentKey        string    `json:"reply_intent_key,omitempty"`
+	ReplyDatabaseID       int64     `json:"reply_database_id,omitempty"`
+	ReplyNodeID           string    `json:"reply_node_id,omitempty"`
+	Resolved              bool      `json:"resolved"`
+	Outdated              bool      `json:"outdated"`
+	SourceAt              time.Time `json:"source_timestamp"`
+	ObservedAt            time.Time `json:"observation_timestamp"`
+	UpdatedAt             time.Time `json:"updated_at"`
+}
+type TrustedFeedbackConflictResult struct {
+	RootCommentNodeID string    `json:"root_comment_node_id"`
+	ObservedDigest    string    `json:"observed_body_digest"`
+	ReasonCode        string    `json:"reason_code"`
+	ObservedAt        time.Time `json:"observed_at"`
+	OperatorAttention bool      `json:"operator_attention"`
+}
 type TelemetryResult struct {
 	Kind       string    `json:"kind"`
 	Value      string    `json:"value"`
@@ -524,7 +564,7 @@ type PullRequestResult struct {
 
 func projectInspection(value RunInspection) InspectionResult {
 	result := InspectionResult{SchemaVersion: querySchemaVersion, Run: projectRunResult(value.Run), RepositoryBinding: projectRepositoryBinding(value.RepositoryBinding), Merge: value.Merge,
-		Timeline: []TransitionResult{}, Attempts: []AttemptResult{}, Verifications: []VerificationResult{}, Reviews: []ReviewResult{}, Resources: []ResourceResult{}, LinearCompletion: append([]LinearCompletionObservation(nil), value.LinearCompletion...), Cleanup: []CleanupResult{}, OperatorAttention: []OperatorAttentionResult{}, Checks: []CheckResult{}, Findings: []FindingResult{}, Telemetry: []TelemetryResult{}}
+		Timeline: []TransitionResult{}, Attempts: []AttemptResult{}, Verifications: []VerificationResult{}, Reviews: []ReviewResult{}, Resources: []ResourceResult{}, LinearCompletion: append([]LinearCompletionObservation(nil), value.LinearCompletion...), Cleanup: []CleanupResult{}, OperatorAttention: []OperatorAttentionResult{}, Checks: []CheckResult{}, Findings: []FindingResult{}, TrustedFeedback: []TrustedFeedbackResult{}, FeedbackConflicts: []TrustedFeedbackConflictResult{}, Telemetry: []TelemetryResult{}}
 	if value.Approval != nil {
 		result.Approval = &HumanApprovalResult{Approver: sanitizeUntrustedContent(value.Approval.Approver), ApprovedSHA: value.Approval.ApprovedSHA, SourceAt: value.Approval.ApprovedAt, ObservedAt: value.Approval.ObservedAt}
 	}
@@ -559,6 +599,12 @@ func projectInspection(value RunInspection) InspectionResult {
 			File: sanitizeRepositoryPath(finding.File), Line: finding.Line, Severity: finding.Severity, BodyDigest: finding.BodyDigest,
 			Content: sanitizeUntrustedContent(finding.Body), ContentTrust: "untrusted", Resolved: finding.Resolved,
 			Outdated: finding.Outdated, HeadSHA: finding.HeadSHA, ObservedAt: finding.ObservedAt})
+	}
+	for _, feedback := range value.TrustedFeedback {
+		result.TrustedFeedback = append(result.TrustedFeedback, TrustedFeedbackResult{PRNumber: feedback.PRNumber, PRDatabaseID: feedback.PRDatabaseID, PRNodeID: feedback.PRNodeID, ReviewDatabaseID: feedback.ReviewDatabaseID, ReviewNodeID: feedback.ReviewNodeID, ThreadNodeID: feedback.ThreadNodeID, RootCommentDatabaseID: feedback.RootCommentDatabaseID, RootCommentNodeID: feedback.RootCommentNodeID, AuthorDatabaseID: feedback.Author.DatabaseID, AuthorNodeID: feedback.Author.NodeID, AuthorLogin: sanitizeUntrustedContent(feedback.Author.Login), TrustedAuthor: feedback.Author.Type == "User", OriginalHeadSHA: feedback.OriginalReviewHeadSHA, Path: sanitizeRepositoryPath(feedback.Path), Line: feedback.Line, BodyDigest: feedback.BodyDigest, Lifecycle: string(feedback.Lifecycle), BoundRepairHead: feedback.BoundRepairHead, ReplyIntentKey: sanitizeUntrustedContent(feedback.ReplyIntentKey), ReplyDatabaseID: feedback.ReplyDatabaseID, ReplyNodeID: feedback.ReplyNodeID, Resolved: feedback.Resolved, Outdated: feedback.Outdated, SourceAt: feedback.SourceAt, ObservedAt: feedback.ObservedAt, UpdatedAt: feedback.UpdatedAt})
+	}
+	for _, conflict := range value.FeedbackConflicts {
+		result.FeedbackConflicts = append(result.FeedbackConflicts, TrustedFeedbackConflictResult{RootCommentNodeID: conflict.RootCommentNodeID, ObservedDigest: conflict.ObservedDigest, ReasonCode: conflict.ReasonCode, ObservedAt: conflict.ObservedAt, OperatorAttention: true})
 	}
 	appendUnknownTelemetry(&result, value)
 	return result
@@ -713,8 +759,7 @@ func sanitizeTelemetryValue(value string) string {
 }
 
 func sanitizeRepositoryPath(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" || strings.HasPrefix(value, "/") || strings.Contains(value, "\\\\") || strings.HasPrefix(value, "~") || path.Clean(value) != value || strings.HasPrefix(value, "../") {
+	if value == "" || value == "." || value == ".." || strings.TrimSpace(value) != value || strings.ContainsRune(value, '\x00') || strings.HasPrefix(value, "/") || strings.Contains(value, "\\") || strings.HasPrefix(value, "~") || path.Clean(value) != value || strings.HasPrefix(value, "../") {
 		return ""
 	}
 	return value
