@@ -12,8 +12,13 @@
   `pull_requests_write` to `true` only for the isolated fixture repository and
   only after the App's Pull requests permission is changed to **Read and write**.
   This enables exactly one controller operation: create-or-adopt a PR with a
-  persisted ownership marker. It does not authorize comments, reviews, merge,
-  close, branch deletion, or any generic GitHub write client.
+  persisted ownership marker. It does not authorize reviews, close, branch
+  deletion, or any generic GitHub write client.
+- A review-reply-capable isolated fixture profile must additionally set
+  `review_comments_write` to `true`. It enables only the controller's fixed,
+  marker-bound reply to an already admitted inline root review comment. It does
+  not authorize a generic comment writer, review submission, approval, thread
+  resolution, or arbitrary follow-up replies.
 - A merge-capable isolated fixture profile must additionally set
   `squash_merge_write` to `true` and change only the App's **Contents**
   repository permission to **Read and write**. GitHub requires Contents write
@@ -57,7 +62,8 @@ remains a separate protected file.
   "token_refresh_skew": "5m",
   "api_version": "2022-11-28",
   "pull_requests_write": false,
-  "squash_merge_write": false
+  "squash_merge_write": false,
+  "review_comments_write": false
 }
 ```
 
@@ -139,3 +145,20 @@ date, require the configured CI, dismiss stale approvals after new commits,
 and do not allow bypass. A GitHub rejection or conflicting evidence is persisted as
 `manual_intervention` for an operator to resolve; it is not a controller repair
 action.
+
+## Human review role
+
+I-Fan is the only human authority in the review lifecycle. After the controller
+posts its fixed exact-head reply, I-Fan reviews the repair, resolves the review
+conversation when satisfied, and submits an exact-head approval when ready to
+merge. The controller never resolves or reopens a conversation, approves a
+review, bypasses branch protection, or treats resolution as approval.
+
+If protected merge is rejected while a controller-replied conversation remains
+unresolved, the controller records a durable read-only wait. Restarts continue
+to observe the same immutable thread topology and issue no additional merge
+write until GitHub reports the conversation resolved and all exact-head gates
+are still valid. It then performs at most one normal guarded retry; I-Fan still
+owns both the resolution and approval decisions. A changed head, base,
+authority, reply topology, or approval requires the normal repair, approval, or
+manual-intervention path instead of an automatic override.

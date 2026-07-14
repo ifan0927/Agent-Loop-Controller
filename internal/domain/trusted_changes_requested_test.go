@@ -72,6 +72,57 @@ func TestNormalizeTrustedChangesRequestedRequiresRootForEveryTrustedReview(t *te
 	}
 }
 
+func TestNormalizeTrustedChangesRequestedSortsMultipleAdmissibleRoots(t *testing.T) {
+	pr, threads, handoff, trusted := trustedChangesFixture()
+	first := threads[0]
+	first.Comments = append([]GitHubReviewComment(nil), threads[0].Comments...)
+	first.NodeID, first.Comments[0].NodeID, first.Comments[0].DatabaseID = "THREAD_A", "COMMENT_A", 8
+	first.Comments[0].Review.NodeID, first.Comments[0].Review.DatabaseID = "REVIEW_A", 9
+	first.Comments[0].BodyDigest = TrustedReviewFeedbackDigest("first trusted root")
+	second := threads[0]
+	second.Comments = append([]GitHubReviewComment(nil), threads[0].Comments...)
+	second.NodeID, second.Comments[0].NodeID, second.Comments[0].DatabaseID = "THREAD_B", "COMMENT_B", 7
+	second.Comments[0].Review.NodeID, second.Comments[0].Review.DatabaseID = "REVIEW_B", 10
+	second.Comments[0].BodyDigest = TrustedReviewFeedbackDigest("second trusted root")
+	handoff = InlineReviewBodyHandoff{Comments: []InlineReviewBody{
+		{ThreadNodeID: second.NodeID, CommentNodeID: second.Comments[0].NodeID, Body: "second trusted root", BodyDigest: second.Comments[0].BodyDigest},
+		{ThreadNodeID: first.NodeID, CommentNodeID: first.Comments[0].NodeID, Body: "first trusted root", BodyDigest: first.Comments[0].BodyDigest},
+	}}
+
+	result, err := NormalizeTrustedChangesRequested(pr, []GitHubReview{second.Comments[0].Review, first.Comments[0].Review}, []GitHubReviewThread{second, first}, handoff, trusted, time.Now().UTC())
+	if err != nil || result.Unsupported || len(result.Feedback) != 2 || result.Feedback[0].RootCommentNodeID != "COMMENT_A" || result.Feedback[1].RootCommentNodeID != "COMMENT_B" {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+func TestNormalizeTrustedChangesRequestedTreatsNonHumanAndStaleRootsAsInert(t *testing.T) {
+	pr, threads, handoff, trusted := trustedChangesFixture()
+	for _, tc := range []struct {
+		name   string
+		mutate func(*GitHubReviewThread)
+	}{
+		{"bot", func(thread *GitHubReviewThread) {
+			thread.Comments[0].Author.Type, thread.Comments[0].Review.Actor.Type = "Bot", "Bot"
+		}},
+		{"app", func(thread *GitHubReviewThread) {
+			thread.Comments[0].Author.Type, thread.Comments[0].Review.Actor.Type = "App", "App"
+		}},
+		{"stale head", func(thread *GitHubReviewThread) {
+			thread.OriginalCommitSHA, thread.Comments[0].Review.CommitSHA = strings.Repeat("b", 40), strings.Repeat("b", 40)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			copyThread := threads[0]
+			copyThread.Comments = append([]GitHubReviewComment(nil), threads[0].Comments...)
+			tc.mutate(&copyThread)
+			result, err := NormalizeTrustedChangesRequested(pr, []GitHubReview{copyThread.Comments[0].Review}, []GitHubReviewThread{copyThread}, handoff, trusted, time.Now().UTC())
+			if err != nil || len(result.Feedback) != 0 || len(result.Findings) != 0 {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+		})
+	}
+}
+
 func TestTrustedFeedbackDriftFailsClosedAfterAdmission(t *testing.T) {
 	pr, threads, handoff, trusted := trustedChangesFixture()
 	normalized, err := NormalizeTrustedChangesRequested(pr, []GitHubReview{threads[0].Comments[0].Review}, threads, handoff, trusted, time.Now().UTC())

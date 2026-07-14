@@ -109,21 +109,25 @@ func TestSquashMergeClassifiesForbiddenAsRejected(t *testing.T) {
 }
 
 func TestSquashMergePreservesPolicyEligibleHTTPStatus(t *testing.T) {
-	_, key := testKey(t)
-	request := application.SquashMergeRequest{PullRequest: 7, HeadBranch: "ifan/one", BaseBranch: "main", ExpectedHeadSHA: "head", ExpectedBaseSHA: "base", OwnershipKey: "key"}
-	mux := http.NewServeMux()
-	installMergeToken(t, mux)
-	mux.HandleFunc("/repos/owner/repo", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"id":99,"node_id":"REPO","name":"repo","owner":{"login":"owner"}}`)
-	})
-	mux.HandleFunc("/repos/owner/repo/pulls/7", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, mergePullRequestJSON(false)) })
-	mux.HandleFunc("/repos/owner/repo/pulls/7/merge", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusConflict) })
-	server := httptest.NewServer(mux)
-	defer server.Close()
-	_, err := mergeClient(t, key, server).SquashMerge(context.Background(), request)
-	var rejected *application.MergeRejectedError
-	if !errors.As(err, &rejected) || rejected.HTTPStatus != http.StatusConflict || rejected.Operation != "squash_merge_pull_request" {
-		t.Fatalf("err=%v rejected=%+v", err, rejected)
+	for _, status := range []int{http.StatusMethodNotAllowed, http.StatusConflict, http.StatusUnprocessableEntity} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			_, key := testKey(t)
+			request := application.SquashMergeRequest{PullRequest: 7, HeadBranch: "ifan/one", BaseBranch: "main", ExpectedHeadSHA: "head", ExpectedBaseSHA: "base", OwnershipKey: "key"}
+			mux := http.NewServeMux()
+			installMergeToken(t, mux)
+			mux.HandleFunc("/repos/owner/repo", func(w http.ResponseWriter, r *http.Request) {
+				fmt.Fprint(w, `{"id":99,"node_id":"REPO","name":"repo","owner":{"login":"owner"}}`)
+			})
+			mux.HandleFunc("/repos/owner/repo/pulls/7", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, mergePullRequestJSON(false)) })
+			mux.HandleFunc("/repos/owner/repo/pulls/7/merge", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(status) })
+			server := httptest.NewServer(mux)
+			defer server.Close()
+			_, err := mergeClient(t, key, server).SquashMerge(context.Background(), request)
+			var rejected *application.MergeRejectedError
+			if !errors.As(err, &rejected) || rejected.HTTPStatus != status || rejected.Operation != "squash_merge_pull_request" {
+				t.Fatalf("err=%v rejected=%+v", err, rejected)
+			}
+		})
 	}
 }
 

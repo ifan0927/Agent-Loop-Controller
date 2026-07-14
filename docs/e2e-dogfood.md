@@ -31,8 +31,9 @@ origin only.
 - Branch protection on the fixture repository requiring current CI,
   stale-approval dismissal, and no bypass.
 - Explicit operator authorization before launching the long-lived delivery
-  driver, which may push, create a PR, squash merge after I-Fan's approval, and
-  delete a controller-owned fixture branch.
+  driver, which may push, create a PR, squash merge only after I-Fan has
+  reviewed, resolved the satisfied GitHub conversation, and approved the exact
+  current head, and delete a controller-owned fixture branch.
 
 Configure that repository with `origin_url` in the inline controller
 configuration, for example
@@ -86,15 +87,17 @@ legal action from freshly read persisted state, and remains alive while CI,
 GitHub approval, or Linear completion is pending. It automatically
 performs safe progression through
 implementation, verification, fresh review, branch push, PR creation, review
-reconciliation, merge after an exact-head I-Fan approval, completion
-observation, and owned cleanup.
+reconciliation, guarded merge after the required human review sequence,
+completion observation, and owned cleanup.
 
-When the owned PR reaches `awaiting_human_approval`, I-Fan performs the one
-human action: review and approve the exact current head in GitHub. No CLI
-command may approve on I-Fan's behalf. The still-running driver observes that
-approval and resumes merge through cleanup. Use `controller status` or
-`controller inspect` only to observe the sanitized run and evidence during this
-wait.
+When the owned PR reaches `awaiting_human_approval`, I-Fan performs the human
+review sequence in GitHub: review the repair, resolve each controller-replied
+conversation that is satisfied, then approve the exact current head. No CLI
+command may resolve or approve on I-Fan's behalf. The still-running driver only
+observes the resolution and approval; if GitHub previously rejected a protected
+merge, it re-reads the exact-head gates and makes at most one guarded retry.
+Use `controller status` or `controller inspect` only to observe the sanitized
+run and evidence during this wait.
 
 If the controller process or host is intentionally restarted, resume the same
 run with the long-lived driver:
@@ -134,7 +137,7 @@ must still pass its normal exact-HEAD, remote, and fast-forward-lease checks.
 
 | Case | Injection point | Expected result |
 |---|---|---|
-| Normal delivery | None | One long-lived driver creates one owned PR and reaches `completed` after exact-head approval, squash merge, Linear completion, and cleanup. |
+| Normal delivery | None | One long-lived driver creates one owned PR and reaches `completed` after I-Fan reviews, resolves satisfied controller-replied conversations, approves the exact head, and GitHub accepts the guarded squash merge. |
 | Push restart | Push intent recorded, result unavailable | Restart the driver with `drive`; it observes the exact remote SHA or safely stops, with no force push or duplicate branch write. |
 | PR restart | PR intent recorded, response unavailable | Restart the driver with `drive`; it adopts only the exact ownership marker/body digest PR and never creates a second PR. |
 | Required-CI repair | A required CI check fails for the exact candidate head | The implementation session repairs the controller-generated check finding, then re-verifies, obtains a new fresh review, and fast-forwards the same owned PR branch to the new HEAD. |
@@ -144,6 +147,40 @@ must still pass its normal exact-HEAD, remote, and fast-forward-lease checks.
 | Clean source synchronization | Completion observed after merge; configured source checkout is clean and its base HEAD equals the persisted squash merge SHA | The driver reaches `completed`, the source checkout remains at that exact merge SHA, and `operator_attention` is `[]`. |
 | Dirty source synchronization | Completion observed after merge; configured source checkout has a dirty sentinel | The dirty source checkout and sentinel remain untouched; owned fixture resources are cleaned; the run reaches `completed` with one sanitized pending `source_checkout_sync_required` attention record. |
 | Authority conflict | Remote, repository, installation, head, approval, or ownership mismatch | The run fails closed to documented operator intervention; it performs no speculative repair or write. |
+
+## Deterministic review-lifecycle fixture matrix
+
+This is an offline acceptance matrix for the trusted human feedback lifecycle.
+`TestDurableReviewLifecycleFixtureDriver` uses the production coordinator and a
+temporary real SQLite database with deterministic in-process fake Linear and
+GitHub ports. It opens no network connection, credential source, subprocess,
+or Git worktree. The fixture's fake repair controller records the normal
+repair, verification, and fresh-review state edges without invoking Codex.
+Its durable coverage is limited to the explicitly named driver scenarios below;
+it does not claim to cover every restart boundary in this matrix.
+
+| Fixture group | Required proof | Focused tests |
+|---|---|---|
+| Admission and repair | Only configured immutable `User` identities with an exact-head `CHANGES_REQUESTED` inline root become quoted repair input. Roots are sorted deterministically; lookalikes, Apps, Bots, replies, summaries, stale, resolved, outdated, and incomplete topology are inert. Identity/body/topology/head drift fails closed. | `TestNormalizeTrustedChangesRequested*`, `TestTrustedFeedbackDriftFailsClosedAfterAdmission` |
+| Reply lifecycle | A verified repair records one intent before its fixed marker-bound root reply. Multiple roots are processed in stable order, one action at a time, with durable independent SQLite side effects across a new coordinator restart. A resolved root writes nothing. | `TestDurableReviewLifecycleFixtureDriver/multiple_roots_persist_independent_reply_intents_across_restart`, `TestProductionReplyReviewFeedbackResolvedAndInvalidEvidenceNeverPost` |
+| Reply restart and ambiguity | Restart before POST, lost POST response, and persistence loss adopt exactly one matching configured-App marker. Wrong-App or multiple markers, inconclusive pagination, authority drift, and exhausted retries stop safely without a blind duplicate. | `TestProductionReplyReviewFeedbackRestartBeforePostAdoptsPersistedIntent`, `TestProductionReplyReviewFeedbackAdoptsRemoteSuccessAfterPersistenceInterruption`, `TestReplyAdoptionRejectsWrongAppAndMultipleMatches`, `TestProductionReplyReviewFeedbackInconclusiveReconciliationRequiresManualIntervention` |
+| Merge protection wait | Actual adapter HTTP 405/409/422 rejections preserve their operation/status mapping. A durable 409 scenario enters `awaiting_github_mergeability`; a new coordinator observes it read-only, then a resolved thread with a newer observation timestamp permits one guarded retry. An unprotected scenario merges on its first request. SQLite preserves the immutable approval identity while recording its newer observation time. | `TestSquashMergePreservesPolicyEligibleHTTPStatus`, `TestDurableReviewLifecycleFixtureDriver/trusted_root_repair_reply_protected_merge_wait_restart_resolution_retry`, `TestDurableReviewLifecycleFixtureDriver/unprotected_merge_succeeds_on_first_authorized_request`, `TestApprovalAndMergeEvidenceAreImmutable` |
+| Merge drift and recovery | Approval dismissal, a new exact-head change request, head drift, and base drift leave the wait state through normal approval, repair, or manual paths and never issue a second merge. | `TestDurableReviewLifecycleFixtureDriver/wait_rollback_*`, `TestProductionMergePolicyRetryFailsClosedWhenFollowupChangesTopology`, `TestProductionMergePolicyPendingPersistenceFailureCannotBypassOnRestart` |
+| Reply error mapping | Actual reply endpoint fixtures classify 403/404 as authoritative no-retry rejection and preserve 429/network failures for reconciliation rather than treating them as success. | `TestReplyToReviewCommentMapsAuthoritativeAndRetryableFailures` |
+| Sensitive-data boundary | Untrusted review bodies are prompt data only. Public reply text, side-effect intent/completion, inspect projections, idempotency markers, and request telemetry retain fixed prose or digests, never the body. | `TestProductionReplyReviewFeedbackKeepsUntrustedBodyOutOfPublicReplyAndIntent`, `TestInspectionProjectsTrustedFeedbackWithoutRawBody`, `TestInspectionNeverProjectsRawInlineFindingBody`, `TestReviewReplyMarkerAndFixedBodyAreDeterministic` |
+
+Run this matrix without a live GitHub profile:
+
+```sh
+go test ./internal/adapters/sqlite -run 'Test(DurableReviewLifecycleFixtureDriver|ApprovalAndMergeEvidenceAreImmutable)' -count=1
+go test ./internal/adapters/githubapp -run 'Test(ReplyToReviewCommentMapsAuthoritativeAndRetryableFailures|SquashMergePreservesPolicyEligibleHTTPStatus)' -count=1
+```
+
+The GitHub App adapter fixture suite also classifies bounded pagination, partial
+GraphQL, rate limit, network-style unavailable responses, and 403/404 reply
+rejection without exposing transport bodies. The production fixture tests bind
+the named multi-root reply restart and protected-merge wait restart scenarios
+to durable intent/evidence and assert no duplicate reply or merge side effect.
 
 ## Disposable source-sync acceptance
 
