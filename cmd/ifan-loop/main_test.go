@@ -162,6 +162,36 @@ func TestLinearStartAcceptsIssueBeforeFlags(t *testing.T) {
 	}
 }
 
+func TestControllerRunRequiresExplicitIssueAndRequesterIdentity(t *testing.T) {
+	err := controller([]string{"run", "IFAN-42"})
+	if err == nil || !strings.Contains(err.Error(), "complete requester identity") {
+		t.Fatalf("missing controller run requester identity error=%v", err)
+	}
+}
+
+func TestControllerDriveRequiresRunAndRequesterIdentity(t *testing.T) {
+	err := controller([]string{"drive"})
+	if err == nil || !strings.Contains(err.Error(), "run ID and complete requester identity") {
+		t.Fatalf("missing controller drive argument error=%v", err)
+	}
+}
+
+func TestControllerDriveRejectsUnsafeAutomaticDriverOptionsBeforeConfigLoad(t *testing.T) {
+	identity := []string{"--requester", "ifan0927", "--requester-database-id", "33", "--requester-node-id", "MDQ6VXNlcjMz", "--requester-type", "User"}
+	err := controller(append([]string{"drive", "run-42", "--poll-interval", "0s"}, identity...))
+	if err == nil || !strings.Contains(err.Error(), "--poll-interval must be positive") {
+		t.Fatalf("poll interval error=%v", err)
+	}
+	err = controller(append([]string{"drive", "run-42", "--max-immediate-actions", "0"}, identity...))
+	if err == nil || !strings.Contains(err.Error(), "--max-immediate-actions must be positive") {
+		t.Fatalf("immediate action error=%v", err)
+	}
+	err = controller(append([]string{"drive", "run-42", "--max-runtime", "169h"}, identity...))
+	if err == nil || !strings.Contains(err.Error(), "--max-runtime") {
+		t.Fatalf("runtime error=%v", err)
+	}
+}
+
 func TestLocalContinueAuthorizesBeforeRegistryRead(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
 	store, err := sqlitestore.Open(path)
@@ -242,11 +272,97 @@ func TestLocalStatusOutputsDurableInspection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"current_state": "received"`, `"implementation_model": "gpt-5.6-terra"`, `"review_model": "gpt-5.6-sol"`, `"state_timeline"`, `"task_snapshot_hash": "task-hash"`, `"attempts"`, `"verifications"`, `"reviews"`, `"owned_resources"`} {
+	for _, want := range []string{`"current_state": "received"`, `"idempotency_key": "key"`, `"implementation_model": "gpt-5.6-terra"`, `"review_model": "gpt-5.6-sol"`, `"state_timeline"`, `"task_snapshot_hash": "task-hash"`, `"attempts"`, `"verifications"`, `"reviews"`, `"owned_resources"`} {
 		if !strings.Contains(string(output), want) {
 			t.Fatalf("status output missing %s: %s", want, output)
 		}
 	}
+}
+
+func TestControllerStatusProjectsIdempotencyKeyOnlyToAuthorizedOperator(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath, dbPath := writeControllerStatusConfig(t, root)
+	store, err := sqlitestore.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, _ := json.Marshal(application.LocalRepository{AllowedOperatorLogins: []string{"ifan0927"}, TrustedOperatorActors: []application.TrustedActorIdentity{{DatabaseID: 33, NodeID: "MDQ6VXNlcjMz", Login: "ifan0927", Type: "User"}}})
+	run := application.Run{ID: "run-status", IssueID: "IFAN-18", IdempotencyKey: "resume-key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: string(authority), BaseBranch: "main", WorkingBranch: "ifan/ifan-18"}
+	if _, _, err := store.CreateRun(context.Background(), application.CreateRunInput{Run: run}); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := os.Stdout
+	os.Stdout = write
+	callErr := controller([]string{"status", "run-status", "--config", configPath, "--requester", "ifan0927", "--requester-database-id", "33", "--requester-node-id", "MDQ6VXNlcjMz", "--requester-type", "User"})
+	write.Close()
+	os.Stdout = original
+	if callErr != nil {
+		t.Fatal(callErr)
+	}
+	output, err := io.ReadAll(read)
+	read.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(output), `"idempotency_key": "resume-key"`) || strings.Contains(string(output), "private-key-material") {
+		t.Fatalf("controller status output=%s", output)
+	}
+
+	if err := controller([]string{"inspect", "run-status", "--config", configPath, "--requester", "intruder", "--requester-database-id", "44", "--requester-node-id", "intruder-node", "--requester-type", "User"}); err == nil || !strings.Contains(err.Error(), "not authorized") {
+		t.Fatalf("unauthorized controller inspect error=%v", err)
+	}
+}
+
+func writeControllerStatusConfig(t *testing.T, root string) (configPath, dbPath string) {
+	t.Helper()
+	paths := []string{filepath.Join(root, "origin"), filepath.Join(root, "source"), filepath.Join(root, "runs"), filepath.Join(root, "worktrees")}
+	for _, path := range paths {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dbPath = filepath.Join(root, "controller.db")
+	privateKeyPath := filepath.Join(root, "app.pem")
+	if err := os.WriteFile(privateKeyPath, []byte("private-key-material"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	registry := localregistry.File{Version: 1, Repositories: []localregistry.Repository{{
+		Owner: "owner", Name: "repo", OriginPath: paths[0], SourcePath: paths[1], RunRoot: paths[2], WorktreeRoot: paths[3],
+		BaseBranch: "main", VerifierRegistryRef: "builtin:v1", VerifierIDs: []string{"fixture-go-test"},
+		GitHubAppProfileRef: "github-app-profile:fixture", GitHubAppID: 1, GitHubInstallationID: 2, ExpectedRepositoryID: 3,
+		OperatorIdentityPolicy: localregistry.OperatorIdentityPolicy{AllowedLogins: []string{"ifan0927"}, TrustedActors: []localregistry.TrustedActorIdentity{{DatabaseID: 33, NodeID: "MDQ6VXNlcjMz", Login: "ifan0927", Type: "User"}}},
+	}}}
+	registryRaw, err := json.Marshal(registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registryPath := filepath.Join(root, "registry.json")
+	if err := os.WriteFile(registryPath, registryRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	githubConfig := map[string]any{"api_base_url": "https://api.github.com", "graphql_url": "https://api.github.com/graphql", "app_id": 1, "installation_id": 2, "repository_owner": "owner", "repository_name": "repo", "repository_id": 3, "private_key_file": privateKeyPath, "http_timeout": "2s", "token_refresh_skew": "5m", "api_version": "2022-11-28"}
+	config := map[string]any{"version": 1, "controller": map[string]any{"database_path": dbPath, "codex_binary": "codex", "run_timeout": "30m"}, "linear": map[string]any{"api_url": "https://api.linear.app/graphql", "credential_source_ref": "secret://env/IFAN_LOOP_LINEAR_TOKEN", "authorization_scheme": "bearer", "team_key": "IFAN", "http_timeout": "2s", "max_response_bytes": 4096, "label_page_size": 10, "max_label_pages": 1}, "repository_registry_file": registryPath, "github_app_profiles": []map[string]any{{"id": "github-app-profile:fixture", "config": githubConfig}}}
+	configRaw, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath = filepath.Join(root, "controller.json")
+	if err := os.WriteFile(configPath, configRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return configPath, dbPath
 }
 
 func TestLocalStatusRejectsUnauthorizedRequester(t *testing.T) {

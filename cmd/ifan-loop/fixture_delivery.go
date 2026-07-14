@@ -240,7 +240,11 @@ func localFixtureDeliver(args []string) error {
 					}
 				}
 			}
-			if err := store.Transition(ctx, runID, run.State, domain.StateCleaning, "fixture squash merge observed", mergeSHA, run.CandidateHead); err != nil {
+			if err := store.Transition(ctx, runID, run.State, domain.StateAwaitingLinearCompletion, "fixture squash merge observed; awaiting simulated Linear completion", mergeSHA, run.CandidateHead); err != nil {
+				return err
+			}
+		case domain.StateAwaitingLinearCompletion:
+			if err := advanceFixtureLinearCompletion(ctx, store, run); err != nil {
 				return err
 			}
 		case domain.StateCleaning:
@@ -251,23 +255,13 @@ func localFixtureDeliver(args []string) error {
 			if inspection.Merge == nil {
 				return errors.New("cleanup lacks merge evidence")
 			}
+			if err := validateFixtureLinearCompletionGate(run, *inspection.Merge, inspection.LinearCompletion); err != nil {
+				return err
+			}
 			if err := fixtureCleanup(ctx, store, repo, run); err != nil {
 				return err
 			}
-			intent, _ := json.Marshal(map[string]string{"issue_id": run.IssueID, "merge_sha": inspection.Merge.MergeSHA, "expected_state": "Done via GitHub automation"})
-			linear, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{RunID: runID, Kind: "linear_completion_reconciliation", IdempotencyKey: inspection.Merge.MergeSHA, IntentJSON: string(intent), Attempt: 1})
-			if err != nil {
-				return err
-			}
-			if linear.Status != "observed" {
-				linear.Status = "observed"
-				linear.ResultJSON = `{"status":"pending_automation","controller_write":false}`
-				linear.ObservedAt = time.Now().UTC()
-				if err := store.FinishSideEffect(ctx, linear); err != nil {
-					return err
-				}
-			}
-			if err := store.Transition(ctx, runID, run.State, domain.StateCompleted, "owned resources cleaned; Linear automation observation persisted", linear.ResultJSON, inspection.Merge.MergeSHA); err != nil {
+			if err := store.Transition(ctx, runID, run.State, domain.StateCompleted, "owned resources cleaned after simulated Linear completion", inspection.Merge.MergeSHA, inspection.Merge.MergeSHA); err != nil {
 				return err
 			}
 		case domain.StateCompleted:
@@ -280,6 +274,76 @@ func localFixtureDeliver(args []string) error {
 			return fmt.Errorf("fixture delivery cannot resume state %s", run.State)
 		}
 	}
+}
+
+// fixtureObserveLinearCompletion is deliberately limited to the disposable
+// local fixture. It records an explicit simulated completed observation after
+// the locally observed merge, then lets the ordinary state-machine gate decide
+// whether cleanup may begin. It never performs a Linear write.
+func fixtureObserveLinearCompletion(ctx context.Context, store *sqlitestore.Store, run application.Run, merge application.MergeRecord) error {
+	inspection, err := store.Inspect(ctx, run.ID)
+	if err != nil {
+		return err
+	}
+	if err := validateFixtureLinearCompletionGate(run, merge, inspection.LinearCompletion); err == nil {
+		return nil
+	}
+	if len(inspection.LinearCompletion) > 0 {
+		return errors.New("fixture Linear completion evidence conflicts with the merged run")
+	}
+	observedAt := time.Now().UTC()
+	if !observedAt.After(merge.MergedAt) {
+		observedAt = merge.MergedAt.Add(time.Nanosecond)
+	}
+	return store.SaveLinearCompletionObservation(ctx, application.LinearCompletionObservation{
+		RunID:          run.ID,
+		MergeSHA:       merge.MergeSHA,
+		Identifier:     run.IssueID,
+		SourceRevision: run.SourceRevision,
+		StateID:        "fixture-completed",
+		StateName:      "Done",
+		StateType:      "completed",
+		Status:         application.LinearCompletionCompleted,
+		ObservedAt:     observedAt,
+	})
+}
+
+func advanceFixtureLinearCompletion(ctx context.Context, store *sqlitestore.Store, run application.Run) error {
+	if run.State != domain.StateAwaitingLinearCompletion {
+		return fmt.Errorf("fixture Linear completion requires awaiting state, got %s", run.State)
+	}
+	inspection, err := store.Inspect(ctx, run.ID)
+	if err != nil {
+		return err
+	}
+	if inspection.Merge == nil {
+		return errors.New("fixture Linear completion lacks merge evidence")
+	}
+	if err := fixtureObserveLinearCompletion(ctx, store, run, *inspection.Merge); err != nil {
+		return err
+	}
+	inspection, err = store.Inspect(ctx, run.ID)
+	if err != nil {
+		return err
+	}
+	if err := validateFixtureLinearCompletionGate(run, *inspection.Merge, inspection.LinearCompletion); err != nil {
+		return err
+	}
+	return store.Transition(ctx, run.ID, run.State, domain.StateCleaning, "simulated Linear completion observed after fixture merge", inspection.Merge.MergeSHA, run.CandidateHead)
+}
+
+func validateFixtureLinearCompletionGate(run application.Run, merge application.MergeRecord, observations []application.LinearCompletionObservation) error {
+	if merge.RunID != run.ID || merge.PreMergeSHA != run.CandidateHead || merge.BaseSHA != run.BaseSHA || merge.Method != "squash" || merge.MergeSHA == "" || merge.MergedAt.IsZero() {
+		return errors.New("fixture Linear completion requires exact persisted merge evidence")
+	}
+	if len(observations) == 0 {
+		return errors.New("fixture cleanup requires completed Linear completion evidence")
+	}
+	last := observations[len(observations)-1]
+	if last.RunID != run.ID || last.MergeSHA != merge.MergeSHA || last.Identifier != run.IssueID || last.Status != application.LinearCompletionCompleted || last.StateType != "completed" || last.ObservedAt.IsZero() || !last.ObservedAt.After(merge.MergedAt) {
+		return errors.New("fixture completed Linear evidence does not authorize cleanup")
+	}
+	return nil
 }
 
 func validateDisposableFixture(repo fixtureRepository) error {
@@ -422,7 +486,7 @@ func fixtureOpenPR(ctx context.Context, store *sqlitestore.Store, run applicatio
 }
 
 func fixturePassingSnapshot(head string) domain.ReviewSnapshot {
-	return domain.ReviewSnapshot{HeadSHA: head, RequiredChecks: []string{"fixture-go-test"}, Checks: []domain.Check{{ID: "check-1", Name: "fixture-go-test", Required: true, Status: "completed", Conclusion: "success", ObservedSHA: head}}, CodeRabbitStatus: "pass", ObservedAt: time.Now().UTC()}
+	return domain.ReviewSnapshot{HeadSHA: head, RequiredChecks: []string{"fixture-go-test"}, Checks: []domain.Check{{ID: "check-1", Name: "fixture-go-test", Required: true, Status: "completed", Conclusion: "success", ObservedSHA: head}}, ObservedAt: time.Now().UTC()}
 }
 
 func latestPersistedPassingSnapshot(inspection application.RunInspection, head string) (domain.ReviewSnapshot, error) {
@@ -440,12 +504,12 @@ func latestPersistedPassingSnapshot(inspection application.RunInspection, head s
 		}
 		return snapshot, nil
 	}
-	return domain.ReviewSnapshot{}, errors.New("missing persisted passing checks and CodeRabbit observation")
+	return domain.ReviewSnapshot{}, errors.New("missing persisted passing checks observation")
 }
 
 func fixtureReconcile(ctx context.Context, store *sqlitestore.Store, run application.Run) error {
 	now := time.Now().UTC()
-	pending := domain.ReviewSnapshot{HeadSHA: run.CandidateHead, RequiredChecks: []string{"fixture-go-test"}, Checks: []domain.Check{{ID: "check-1", Name: "fixture-go-test", Required: true, Status: "in_progress", ObservedSHA: run.CandidateHead}}, CodeRabbitStatus: "pending", ObservedAt: now}
+	pending := domain.ReviewSnapshot{HeadSHA: run.CandidateHead, RequiredChecks: []string{"fixture-go-test"}, Checks: []domain.Check{{ID: "check-1", Name: "fixture-go-test", Required: true, Status: "in_progress", ObservedSHA: run.CandidateHead}}, ObservedAt: now}
 	passing := fixturePassingSnapshot(run.CandidateHead)
 	progress, err := store.PollProgress(ctx, run.ID, 1, run.CandidateHead)
 	if err != nil {
@@ -466,7 +530,7 @@ func fixtureReconcile(ctx context.Context, store *sqlitestore.Store, run applica
 	if status != domain.ReconciliationPass {
 		return fmt.Errorf("fixture reconciliation ended as %s", status)
 	}
-	return store.Transition(ctx, run.ID, domain.StateReconcilingReviews, domain.StateAwaitingHumanApproval, "checks and CodeRabbit pass", "fixture observations", run.CandidateHead)
+	return store.Transition(ctx, run.ID, domain.StateReconcilingReviews, domain.StateAwaitingHumanApproval, "required checks pass", "fixture observations", run.CandidateHead)
 }
 
 type fixtureGitHub struct {

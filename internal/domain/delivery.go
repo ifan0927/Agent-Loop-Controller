@@ -79,13 +79,12 @@ func (f ExternalFinding) Validate() error {
 }
 
 type ReviewSnapshot struct {
-	HeadSHA          string            `json:"head_sha"`
-	RequiredChecks   []string          `json:"required_checks"`
-	Checks           []Check           `json:"checks"`
-	CodeRabbitStatus string            `json:"coderabbit_status"`
-	Findings         []ExternalFinding `json:"findings"`
-	ObservedAt       time.Time         `json:"observed_at"`
-	UnknownEvents    []string          `json:"unknown_events,omitempty"`
+	HeadSHA        string            `json:"head_sha"`
+	RequiredChecks []string          `json:"required_checks"`
+	Checks         []Check           `json:"checks"`
+	Findings       []ExternalFinding `json:"findings"`
+	ObservedAt     time.Time         `json:"observed_at"`
+	UnknownEvents  []string          `json:"unknown_events,omitempty"`
 }
 
 func (s ReviewSnapshot) Classify() ReconciliationStatus {
@@ -134,16 +133,7 @@ func (s ReviewSnapshot) Classify() ReconciliationStatus {
 			return ReconciliationActionable
 		}
 	}
-	switch s.CodeRabbitStatus {
-	case "pass":
-		return ReconciliationPass
-	case "pending", "":
-		return ReconciliationPending
-	case "failure":
-		return ReconciliationActionable
-	default:
-		return ReconciliationPending
-	}
+	return ReconciliationPass
 }
 
 type HumanApproval struct {
@@ -155,7 +145,6 @@ type HumanApproval struct {
 	Source           string        `json:"source"`
 	ApprovedSHA      string        `json:"approved_sha"`
 	CIStatus         string        `json:"ci_status"`
-	CodeRabbit       string        `json:"coderabbit_status"`
 	ReviewSHA        string        `json:"internal_review_sha"`
 	ApprovedAt       time.Time     `json:"source_timestamp"`
 	ObservedAt       time.Time     `json:"observation_timestamp"`
@@ -168,7 +157,7 @@ func (a HumanApproval) Authorizes(pr PullRequest, head string) error {
 	if !strings.EqualFold(a.Approver, a.Actor.Login) || a.PRNumber != pr.Number || a.ApprovedSHA != head || a.ReviewSHA != head || a.ApprovedAt.IsZero() || a.ObservedAt.IsZero() {
 		return errors.New("human approval is not bound to the exact PR head")
 	}
-	if a.CIStatus != "pass" || a.CodeRabbit != "pass" {
+	if a.CIStatus != "pass" {
 		return errors.New("human approval lacks passing automated evidence")
 	}
 	return nil

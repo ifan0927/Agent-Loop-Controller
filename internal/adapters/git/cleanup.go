@@ -118,7 +118,7 @@ func (c Cleanup) DeleteRemoteBranch(ctx context.Context, repository, branch, exp
 }
 
 func (c Cleanup) validateRepository(repository string) error {
-	if strings.TrimSpace(repository) == "" || !filepath.IsAbs(c.SourcePath) || !filepath.IsAbs(c.OriginPath) {
+	if strings.TrimSpace(repository) == "" || !filepath.IsAbs(c.SourcePath) || !validOriginBinding(c.OriginPath) {
 		return errors.New("cleanup repository authority is incomplete")
 	}
 	return nil
@@ -128,14 +128,11 @@ func (c Cleanup) validateSourceOrigin(ctx context.Context) error {
 	if _, err := canonicalPath(c.SourcePath); err != nil {
 		return fmt.Errorf("resolve cleanup source: %w", err)
 	}
-	if _, err := canonicalPath(c.OriginPath); err != nil {
-		return fmt.Errorf("resolve cleanup origin: %w", err)
-	}
 	remote, err := c.run(ctx, c.SourcePath, "remote", "get-url", "origin")
 	if err != nil {
 		return err
 	}
-	if !sameLocalPath(strings.TrimSpace(remote), c.OriginPath) {
+	if !sameOriginBinding(strings.TrimSpace(remote), c.OriginPath) {
 		return errors.New("source origin ownership mismatch")
 	}
 	return nil

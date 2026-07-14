@@ -895,21 +895,29 @@ func (c *LocalController) verifyCandidate(ctx context.Context, run Run) error {
 	if run.CandidateHead == "" {
 		repairBase := latestRepairBase(inspection.Timeline)
 		if strings.TrimSpace(status) == "" {
-			if head == run.BaseSHA || head == repairBase {
+			if head == run.BaseSHA {
 				return errors.New("completed implementation produced no candidate changes")
 			}
-			parent, subject, metaErr := c.git.CommitMetadata(ctx, run.WorktreePath, head)
-			if metaErr != nil {
-				return metaErr
+			if repairBase != "" && head == repairBase {
+				// A bounded repair may correctly conclude that its persisted finding
+				// no longer needs a source change. Reuse only the exact repair base;
+				// the verification and fresh-review gates revalidate exact-HEAD
+				// evidence before any delivery action can resume.
+				run.CandidateHead = repairBase
+			} else {
+				parent, subject, metaErr := c.git.CommitMetadata(ctx, run.WorktreePath, head)
+				if metaErr != nil {
+					return metaErr
+				}
+				expectedParent := run.BaseSHA
+				if repairBase != "" {
+					expectedParent = repairBase
+				}
+				if parent != expectedParent || subject != candidateCommitSubject {
+					return errors.New("unpersisted HEAD is not a recoverable controller candidate")
+				}
+				run.CandidateHead = head
 			}
-			expectedParent := run.BaseSHA
-			if repairBase != "" {
-				expectedParent = repairBase
-			}
-			if parent != expectedParent || subject != candidateCommitSubject {
-				return errors.New("unpersisted HEAD is not a recoverable controller candidate")
-			}
-			run.CandidateHead = head
 		} else {
 			expectedHead := run.BaseSHA
 			if repairBase != "" {

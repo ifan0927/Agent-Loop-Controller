@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -38,8 +39,12 @@ type TrustedActorIdentity struct {
 }
 
 type Repository struct {
-	Owner                  string                 `json:"owner"`
-	Name                   string                 `json:"name"`
+	Owner string `json:"owner"`
+	Name  string `json:"name"`
+	// OriginURL is the preferred explicit GitHub remote binding. OriginPath is
+	// retained for existing local bare-repository fixtures and is also accepted
+	// as a legacy spelling of an HTTPS or SSH GitHub remote.
+	OriginURL              string                 `json:"origin_url,omitempty"`
 	OriginPath             string                 `json:"origin_path"`
 	SourcePath             string                 `json:"source_path"`
 	RunRoot                string                 `json:"run_root"`
@@ -163,6 +168,20 @@ func Load(path string) (Registry, error) {
 	if file.Version != CurrentVersion {
 		return Registry{}, fmt.Errorf("unsupported repository registry version %d", file.Version)
 	}
+	return build(file)
+}
+
+// New validates an inline repository collection using the same authority and
+// local-ownership rules as a file-backed registry. It is intended for a
+// controller configuration that owns the registry data directly.
+func New(repositories []Repository) (Registry, error) {
+	return build(File{Version: CurrentVersion, Repositories: repositories})
+}
+
+func build(file File) (Registry, error) {
+	if file.Version != CurrentVersion {
+		return Registry{}, fmt.Errorf("unsupported repository registry version %d", file.Version)
+	}
 	if len(file.Repositories) == 0 {
 		return Registry{}, errors.New("repository registry must not be empty")
 	}
@@ -182,7 +201,11 @@ func Load(path string) (Registry, error) {
 		if _, exists := registry.repositories[binding.CanonicalRepository]; exists {
 			return Registry{}, fmt.Errorf("duplicate canonical repository: %s", binding.CanonicalRepository)
 		}
-		for _, path := range []string{binding.OriginPath, binding.SourcePath, binding.RunRoot, binding.WorktreeRoot} {
+		paths := []string{binding.SourcePath, binding.RunRoot, binding.WorktreeRoot}
+		if filepath.IsAbs(binding.OriginPath) {
+			paths = append(paths, binding.OriginPath)
+		}
+		for _, path := range paths {
 			for _, seen := range seenPaths {
 				if overlaps(path, seen.path) {
 					return Registry{}, fmt.Errorf("ambiguous repository paths shared by %s and %s", seen.repository, binding.CanonicalRepository)
@@ -200,7 +223,26 @@ func validateRepository(version int, registryDigest string, repo Repository) (Bi
 	if !validGitHubOwner(repo.Owner) || !validGitHubRepository(repo.Name) || strings.Count(canonical, "/") != 1 {
 		return Binding{}, errors.New("repository entry has invalid canonical owner/name")
 	}
-	paths := []*string{&repo.OriginPath, &repo.SourcePath, &repo.RunRoot, &repo.WorktreeRoot}
+	if strings.TrimSpace(repo.OriginURL) != "" && strings.TrimSpace(repo.OriginPath) != "" {
+		return Binding{}, fmt.Errorf("repository %s configures both origin_url and origin_path", canonical)
+	}
+	origin := repo.OriginPath
+	if strings.TrimSpace(repo.OriginURL) != "" {
+		origin = repo.OriginURL
+	}
+	canonicalOrigin, localOrigin, err := canonicalOriginBinding(origin)
+	if err != nil {
+		return Binding{}, fmt.Errorf("repository %s has invalid origin binding: %w", canonical, err)
+	}
+	if !localOrigin {
+		remoteOwner, remoteName, err := githubRemoteOwnerName(canonicalOrigin)
+		if err != nil || !strings.EqualFold(remoteOwner, repo.Owner) || !strings.EqualFold(remoteName, repo.Name) {
+			return Binding{}, fmt.Errorf("repository %s origin binding targets a different GitHub repository", canonical)
+		}
+	}
+	repo.OriginPath = canonicalOrigin
+	repo.OriginURL = ""
+	paths := []*string{&repo.SourcePath, &repo.RunRoot, &repo.WorktreeRoot}
 	for _, value := range paths {
 		resolved, err := canonicalDirectory(*value)
 		if err != nil {
@@ -208,7 +250,10 @@ func validateRepository(version int, registryDigest string, repo Repository) (Bi
 		}
 		*value = resolved
 	}
-	localPaths := []string{repo.OriginPath, repo.SourcePath, repo.RunRoot, repo.WorktreeRoot}
+	localPaths := []string{repo.SourcePath, repo.RunRoot, repo.WorktreeRoot}
+	if localOrigin {
+		localPaths = append(localPaths, repo.OriginPath)
+	}
 	for i := range localPaths {
 		for j := i + 1; j < len(localPaths); j++ {
 			if overlaps(localPaths[i], localPaths[j]) {
@@ -306,6 +351,78 @@ func canonicalDirectory(path string) (string, error) {
 		return "", errors.New("path must not traverse a symlink")
 	}
 	return path, nil
+}
+
+// canonicalOriginBinding accepts either an existing local, non-symlink
+// directory (the fixture-compatible form) or an explicit GitHub SSH/HTTPS
+// remote. Remote bindings are normalized without carrying credentials.
+func canonicalOriginBinding(value string) (canonical string, local bool, err error) {
+	value = strings.TrimSpace(value)
+	if filepath.IsAbs(value) {
+		canonical, err := canonicalDirectory(value)
+		return canonical, true, err
+	}
+	canonical, err = canonicalGitHubRemoteURL(value)
+	return canonical, false, err
+}
+
+func canonicalGitHubRemoteURL(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(value, "git@github.com:") {
+		owner, name, err := githubRemotePath(strings.TrimPrefix(value, "git@github.com:"))
+		if err != nil {
+			return "", err
+		}
+		return "git@github.com:" + strings.ToLower(owner) + "/" + strings.ToLower(name) + ".git", nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return "", errors.New("remote URL is malformed")
+	}
+	if (parsed.Scheme != "https" && parsed.Scheme != "ssh") || !strings.EqualFold(parsed.Host, "github.com") || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.ForceQuery {
+		return "", errors.New("remote URL must be a credential-free github.com HTTPS or SSH URL")
+	}
+	if parsed.Scheme == "https" && parsed.User != nil {
+		return "", errors.New("HTTPS remote URL must not contain credentials")
+	}
+	if parsed.Scheme == "ssh" {
+		if parsed.User == nil || parsed.User.Username() != "git" {
+			return "", errors.New("SSH remote URL must use the git user")
+		}
+		if _, hasPassword := parsed.User.Password(); hasPassword {
+			return "", errors.New("SSH remote URL must not contain credentials")
+		}
+	}
+	owner, name, err := githubRemotePath(strings.TrimPrefix(parsed.EscapedPath(), "/"))
+	if err != nil {
+		return "", err
+	}
+	if parsed.Scheme == "https" {
+		return "https://github.com/" + strings.ToLower(owner) + "/" + strings.ToLower(name) + ".git", nil
+	}
+	return "ssh://git@github.com/" + strings.ToLower(owner) + "/" + strings.ToLower(name) + ".git", nil
+}
+
+func githubRemoteOwnerName(value string) (string, string, error) {
+	if strings.HasPrefix(value, "git@github.com:") {
+		return githubRemotePath(strings.TrimPrefix(value, "git@github.com:"))
+	}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return "", "", err
+	}
+	return githubRemotePath(strings.TrimPrefix(parsed.EscapedPath(), "/"))
+}
+
+func githubRemotePath(value string) (string, string, error) {
+	if !strings.HasSuffix(value, ".git") {
+		return "", "", errors.New("remote URL path must end in .git")
+	}
+	parts := strings.Split(strings.TrimSuffix(value, ".git"), "/")
+	if len(parts) != 2 || !validGitHubOwner(parts[0]) || !validGitHubRepository(parts[1]) {
+		return "", "", errors.New("remote URL path must contain one valid owner and repository")
+	}
+	return parts[0], parts[1], nil
 }
 
 func overlaps(a, b string) bool {

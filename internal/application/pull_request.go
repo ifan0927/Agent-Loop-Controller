@@ -116,7 +116,7 @@ func (c *ProductionCoordinator) OpenPullRequest(ctx context.Context, command Pro
 		return ProductionOpenPullRequestResult{}, classifyServiceError(err)
 	}
 	if inspection.PullRequest != nil {
-		if err := validateOpenedPullRequest(*inspection.PullRequest, request); err != nil {
+		if err := validateRetainedOwnedPullRequest(*inspection.PullRequest, run); err != nil {
 			return ProductionOpenPullRequestResult{}, c.rejectPullRequestConflict(ctx, run, effects, side, "persisted_pull_request_mismatch", err)
 		}
 		return c.completePullRequest(ctx, run, effects, side, *inspection.PullRequest, true)
@@ -129,6 +129,19 @@ func (c *ProductionCoordinator) OpenPullRequest(ctx context.Context, command Pro
 		return ProductionOpenPullRequestResult{}, c.rejectPullRequestConflict(ctx, run, effects, side, "pull_request_mismatch", err)
 	}
 	return c.completePullRequest(ctx, run, effects, side, pr, false)
+}
+
+func validateRetainedOwnedPullRequest(pr domain.PullRequest, run Run) error {
+	if pr.DatabaseID < 1 || strings.TrimSpace(pr.URL) == "" || !strings.EqualFold(pr.State, "open") || pr.Merged {
+		return errors.New("persisted pull request is incomplete or not open")
+	}
+	if err := pr.ValidateOwnership(run.WorkingBranch, run.BaseBranch, run.CandidateHead, run.IdempotencyKey); err != nil {
+		return err
+	}
+	if pr.BaseSHA != run.BaseSHA {
+		return errors.New("persisted pull request base SHA does not match the run")
+	}
+	return nil
 }
 
 func pullRequestIntent(run Run) (PullRequestOpenRequest, error) {

@@ -90,46 +90,43 @@ func (c *Client) Read(ctx context.Context, pr int64, expectedHead string) (domai
 	if e.PullRequest.HeadSHA != expectedHead {
 		return e, errors.New("pull request head SHA mismatch")
 	}
-	checks, coderabbitCheck, unknown, err := c.readChecks(ctx, expectedHead, e.PullRequest.BaseBranch)
+	checks, unknown, err := c.readChecks(ctx, expectedHead, e.PullRequest.BaseBranch)
 	if err != nil {
 		return e, err
 	}
 	e.Checks = checks
 	e.UnknownEvents = unknown
-	decision, reviews, findings, cr, unknown2, err := c.readReviews(ctx, pr, expectedHead, coderabbitCheck)
+	reviews, unknown2, err := c.readReviews(ctx, pr)
 	if err != nil {
 		return e, err
 	}
-	decision2, reviews2, findings2, cr2, unknown3, err := c.readReviews(ctx, pr, expectedHead, coderabbitCheck)
+	reviews2, unknown3, err := c.readReviews(ctx, pr)
 	if err != nil {
 		return e, err
 	}
-	if reviewTopologyDigest(decision, reviews, findings, cr, unknown2) != reviewTopologyDigest(decision2, reviews2, findings2, cr2, unknown3) {
+	if reviewTopologyDigest(reviews, unknown2) != reviewTopologyDigest(reviews2, unknown3) {
 		return e, errors.New("review topology drifted while collecting GitHub evidence")
 	}
-	decision, reviews, findings, cr, unknown2 = decision2, reviews2, findings2, cr2, unknown3
-	checks2, coderabbitCheck2, unknownChecks2, err := c.readChecks(ctx, expectedHead, e.PullRequest.BaseBranch)
+	reviews, unknown2 = reviews2, unknown3
+	checks2, unknownChecks2, err := c.readChecks(ctx, expectedHead, e.PullRequest.BaseBranch)
 	if err != nil {
 		return e, err
 	}
-	if checkTopologyDigest(checks, coderabbitCheck, unknown) != checkTopologyDigest(checks2, coderabbitCheck2, unknownChecks2) {
+	if checkTopologyDigest(checks, unknown) != checkTopologyDigest(checks2, unknownChecks2) {
 		return e, errors.New("check topology drifted while collecting GitHub evidence")
 	}
 	checks, unknown = checks2, unknownChecks2
 	e.Checks = checks
 	e.UnknownEvents = unknown
-	decision3, reviews3, findings3, cr3, unknown4, err := c.readReviews(ctx, pr, expectedHead, coderabbitCheck2)
+	reviews3, unknown4, err := c.readReviews(ctx, pr)
 	if err != nil {
 		return e, err
 	}
-	if reviewTopologyDigest(decision2, reviews2, findings2, cr2, unknown3) != reviewTopologyDigest(decision3, reviews3, findings3, cr3, unknown4) {
+	if reviewTopologyDigest(reviews2, unknown3) != reviewTopologyDigest(reviews3, unknown4) {
 		return e, errors.New("review topology drifted after final check collection")
 	}
-	decision, reviews, findings, cr, unknown2 = decision3, reviews3, findings3, cr3, unknown4
-	e.ReviewDecision = decision
+	reviews, unknown2 = reviews3, unknown4
 	e.Reviews = reviews
-	e.Findings = findings
-	e.CodeRabbit = cr
 	e.UnknownEvents = append(unknown, unknown2...)
 	var final rawPR
 	if err := c.rest(ctx, "pull_request_final", "GET", fmt.Sprintf("/repos/%s/%s/pulls/%d", c.cfg.RepositoryOwner, c.cfg.RepositoryName, pr), nil, &final, true); err != nil {
@@ -142,23 +139,16 @@ func (c *Client) Read(ctx context.Context, pr int64, expectedHead string) (domai
 	return e, nil
 }
 
-func reviewTopologyDigest(decision string, reviews []domain.GitHubReview, findings []domain.NormalizedFinding, cr domain.CodeRabbitState, unknown []string) string {
-	copies := append([]domain.NormalizedFinding(nil), findings...)
-	for i := range copies {
-		copies[i].ObservedAt = time.Time{}
-	}
+func reviewTopologyDigest(reviews []domain.GitHubReview, unknown []string) string {
 	raw, _ := json.Marshal(struct {
-		Decision   string
-		Reviews    []domain.GitHubReview
-		Findings   []domain.NormalizedFinding
-		CodeRabbit domain.CodeRabbitState
-		Unknown    []string
-	}{decision, reviews, copies, cr, unknown})
+		Reviews []domain.GitHubReview
+		Unknown []string
+	}{reviews, unknown})
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }
 
-func checkTopologyDigest(checks []domain.GitHubCheck, cr domain.CodeRabbitState, unknown []string) string {
+func checkTopologyDigest(checks []domain.GitHubCheck, unknown []string) string {
 	copies := append([]domain.GitHubCheck(nil), checks...)
 	for i := range copies {
 		copies[i].ObservedAt = time.Time{}
@@ -167,10 +157,9 @@ func checkTopologyDigest(checks []domain.GitHubCheck, cr domain.CodeRabbitState,
 	events := append([]string(nil), unknown...)
 	sort.Strings(events)
 	raw, _ := json.Marshal(struct {
-		Checks     []domain.GitHubCheck
-		CodeRabbit domain.CodeRabbitState
-		Unknown    []string
-	}{copies, cr, events})
+		Checks  []domain.GitHubCheck
+		Unknown []string
+	}{copies, events})
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }
@@ -435,7 +424,7 @@ func ownershipMarker(body string) string {
 	return strings.TrimSpace(rest[:end])
 }
 
-func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.GitHubCheck, domain.CodeRabbitState, []string, error) {
+func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.GitHubCheck, []string, error) {
 	var all []domain.GitHubCheck
 	var unknown []string
 	var protection struct {
@@ -446,7 +435,7 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 		} `json:"checks"`
 	}
 	if err := c.rest(ctx, "required_checks", "GET", fmt.Sprintf("/repos/%s/%s/branches/%s/protection/required_status_checks", c.cfg.RepositoryOwner, c.cfg.RepositoryName, url.PathEscape(base)), nil, &protection, true); err != nil {
-		return nil, domain.CodeRabbitUnknown, nil, err
+		return nil, nil, err
 	}
 	required := map[string]int64{}
 	for _, name := range protection.Contexts {
@@ -455,7 +444,6 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 	for _, check := range protection.Checks {
 		required[check.Context] = check.AppID
 	}
-	coderabbitCheck := domain.CodeRabbitAbsent
 	type checkRun struct {
 		ID          int64     `json:"id"`
 		Name        string    `json:"name"`
@@ -475,7 +463,7 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 		}
 		path := fmt.Sprintf("/repos/%s/%s/commits/%s/check-runs?per_page=100&page=%d", c.cfg.RepositoryOwner, c.cfg.RepositoryName, sha, page)
 		if err := c.rest(ctx, "check_runs", "GET", path, nil, &raw, true); err != nil {
-			return nil, domain.CodeRabbitUnknown, nil, err
+			return nil, nil, err
 		}
 		for _, r := range raw.CheckRuns {
 			key := fmt.Sprintf("%s\x00%d", r.Name, r.App.ID)
@@ -490,7 +478,7 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 		page++
 	}
 	if page > 20 {
-		return nil, domain.CodeRabbitUnknown, nil, errors.New("check-run pagination exceeded bounded limit")
+		return nil, nil, errors.New("check-run pagination exceeded bounded limit")
 	}
 	for _, r := range latestRuns {
 		state := mapCheck(r.Status, r.Conclusion)
@@ -498,20 +486,6 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 			unknown = append(unknown, "unknown_check_state:"+r.Status+":"+r.Conclusion)
 		}
 		requiredApp, requiredName := required[r.Name]
-		if c.cfg.CodeRabbitAppID > 0 && r.App.ID == c.cfg.CodeRabbitAppID {
-			candidate := domain.CodeRabbitUnknown
-			switch state {
-			case domain.CheckSuccess, domain.CheckNeutral, domain.CheckSkipped:
-				candidate = domain.CodeRabbitPass
-			case domain.CheckQueued, domain.CheckInProgress, domain.CheckPending, domain.CheckRequested, domain.CheckWaiting:
-				candidate = domain.CodeRabbitPending
-			case domain.CheckFailure, domain.CheckActionRequired:
-				candidate = domain.CodeRabbitActionable
-			case domain.CheckCancelled, domain.CheckTimedOut, domain.CheckStale:
-				candidate = domain.CodeRabbitInfrastructure
-			}
-			coderabbitCheck = mergeCodeRabbitState(coderabbitCheck, candidate)
-		}
 		sourceAt := r.CompletedAt
 		if sourceAt.IsZero() {
 			sourceAt = r.StartedAt
@@ -531,7 +505,7 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 	for page := 1; page <= 20; page++ {
 		var current statusPage
 		if err := c.rest(ctx, "commit_statuses", "GET", fmt.Sprintf("/repos/%s/%s/commits/%s/status?per_page=100&page=%d", c.cfg.RepositoryOwner, c.cfg.RepositoryName, sha, page), nil, &current, true); err != nil {
-			return nil, domain.CodeRabbitUnknown, nil, err
+			return nil, nil, err
 		}
 		if page == 1 {
 			statuses.TotalCount = current.TotalCount
@@ -541,11 +515,11 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 			break
 		}
 		if page == 20 {
-			return nil, domain.CodeRabbitUnknown, nil, errors.New("commit-status pagination exceeded bounded limit")
+			return nil, nil, errors.New("commit-status pagination exceeded bounded limit")
 		}
 	}
 	if len(statuses.Statuses) < statuses.TotalCount {
-		return nil, domain.CodeRabbitUnknown, nil, errors.New("commit-status pagination was incomplete")
+		return nil, nil, errors.New("commit-status pagination was incomplete")
 	}
 	latestStatuses := map[string]struct {
 		ID             int64
@@ -601,15 +575,7 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 			unknown = append(unknown, "missing_required_check:"+name)
 		}
 	}
-	return all, coderabbitCheck, unknown, nil
-}
-
-func mergeCodeRabbitState(current, next domain.CodeRabbitState) domain.CodeRabbitState {
-	priority := map[domain.CodeRabbitState]int{domain.CodeRabbitAbsent: 0, domain.CodeRabbitPass: 1, domain.CodeRabbitPending: 2, domain.CodeRabbitUnknown: 3, domain.CodeRabbitInfrastructure: 4, domain.CodeRabbitActionable: 5, domain.CodeRabbitUntrusted: 6}
-	if priority[next] > priority[current] {
-		return next
-	}
-	return current
+	return all, unknown, nil
 }
 func mapCheck(status, conclusion string) domain.CheckState {
 	if status != "completed" {
@@ -650,54 +616,22 @@ func mapCheck(status, conclusion string) domain.CheckState {
 	}
 }
 
-type rawReviewComment struct {
-	ID         string    `json:"id"`
-	DatabaseID int64     `json:"databaseId"`
-	Body       string    `json:"body"`
-	Path       string    `json:"path"`
-	Line       int       `json:"line"`
-	Outdated   bool      `json:"outdated"`
-	CreatedAt  time.Time `json:"createdAt"`
-	Commit     struct {
-		OID string `json:"oid"`
-	} `json:"commit"`
-	OriginalCommit struct {
-		OID string `json:"oid"`
-	} `json:"originalCommit"`
-	Author struct {
-		Login      string `json:"login"`
-		Typename   string `json:"__typename"`
-		ID         string `json:"id"`
-		DatabaseID int64  `json:"databaseId"`
-	} `json:"author"`
-}
 type graphPageInfo struct {
 	HasNextPage bool   `json:"hasNextPage"`
 	EndCursor   string `json:"endCursor"`
 }
 
-const reviewQuery = `query ReadPullRequestReviews($owner:String!,$name:String!,$number:Int!,$cursor:String,$reviewCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewDecision reviews(first:100,after:$reviewCursor){nodes{id databaseId state commit{oid} submittedAt author{login __typename ... on User{id databaseId} ... on Bot{id databaseId}}} pageInfo{hasNextPage endCursor}} reviewThreads(first:100,after:$cursor){nodes{id isResolved isOutdated comments(first:100){totalCount nodes{id databaseId body path line outdated createdAt commit{oid} originalCommit{oid} author{login __typename ... on User{id databaseId} ... on Bot{id databaseId}} authorAssociation} pageInfo{hasNextPage endCursor}}}pageInfo{hasNextPage endCursor}}}}}`
-const threadCommentsQuery = `query ReadReviewThreadComments($id:ID!,$cursor:String){node(id:$id){... on PullRequestReviewThread{comments(first:100,after:$cursor){nodes{id databaseId body path line outdated createdAt commit{oid} originalCommit{oid} author{login __typename ... on User{id databaseId} ... on Bot{id databaseId}} authorAssociation} pageInfo{hasNextPage endCursor}}}}}`
+const reviewQuery = `query ReadPullRequestReviews($owner:String!,$name:String!,$number:Int!,$reviewCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviews(first:100,after:$reviewCursor){nodes{id databaseId state commit{oid} submittedAt author{login __typename ... on User{id databaseId} ... on Bot{id databaseId}}} pageInfo{hasNextPage endCursor}}}}}`
 
-func (c *Client) readReviews(ctx context.Context, pr int64, head string, coderabbitCheck domain.CodeRabbitState) (string, []domain.GitHubReview, []domain.NormalizedFinding, domain.CodeRabbitState, []string, error) {
-	cursor := ""
+func (c *Client) readReviews(ctx context.Context, pr int64) ([]domain.GitHubReview, []string, error) {
 	reviewCursor := ""
-	var findings []domain.NormalizedFinding
 	var reviews []domain.GitHubReview
-	unknown := []string{}
-	cr := coderabbitCheck
-	decision := ""
-	seen := map[string]bool{}
-	reviewsDone := false
-	threadsDone := false
-	completedPages := false
 	for pages := 0; pages < 20; pages++ {
 		var env struct {
 			Data struct {
 				Repository *struct {
 					PullRequest *struct {
-						ReviewDecision string `json:"reviewDecision"`
-						Reviews        struct {
+						Reviews struct {
 							Nodes []struct {
 								ID         string `json:"id"`
 								DatabaseID int64  `json:"databaseId"`
@@ -715,22 +649,6 @@ func (c *Client) readReviews(ctx context.Context, pr int64, head string, coderab
 							} `json:"nodes"`
 							PageInfo graphPageInfo `json:"pageInfo"`
 						} `json:"reviews"`
-						ReviewThreads struct {
-							Nodes []struct {
-								ID         string `json:"id"`
-								IsResolved bool   `json:"isResolved"`
-								IsOutdated bool   `json:"isOutdated"`
-								Comments   struct {
-									TotalCount int                `json:"totalCount"`
-									Nodes      []rawReviewComment `json:"nodes"`
-									PageInfo   graphPageInfo      `json:"pageInfo"`
-								} `json:"comments"`
-							} `json:"nodes"`
-							PageInfo struct {
-								HasNextPage bool   `json:"hasNextPage"`
-								EndCursor   string `json:"endCursor"`
-							} `json:"pageInfo"`
-						} `json:"reviewThreads"`
 					} `json:"pullRequest"`
 				} `json:"repository"`
 			} `json:"data"`
@@ -738,134 +656,28 @@ func (c *Client) readReviews(ctx context.Context, pr int64, head string, coderab
 				Message string `json:"message"`
 			} `json:"errors"`
 		}
-		if err := c.graphql(ctx, "ReadPullRequestReviews", reviewQuery, map[string]any{"owner": c.cfg.RepositoryOwner, "name": c.cfg.RepositoryName, "number": pr, "cursor": nullable(cursor), "reviewCursor": nullable(reviewCursor)}, &env); err != nil {
-			return "", nil, nil, "", nil, err
+		if err := c.graphql(ctx, "ReadPullRequestReviews", reviewQuery, map[string]any{"owner": c.cfg.RepositoryOwner, "name": c.cfg.RepositoryName, "number": pr, "reviewCursor": nullable(reviewCursor)}, &env); err != nil {
+			return nil, nil, err
 		}
 		if len(env.Errors) > 0 {
-			return "", nil, nil, "", nil, errors.New("GitHub GraphQL returned partial data with errors")
+			return nil, nil, errors.New("GitHub GraphQL returned partial data with errors")
 		}
 		if env.Data.Repository == nil || env.Data.Repository.PullRequest == nil {
-			return "", nil, nil, "", nil, errors.New("GitHub GraphQL response missing pull request")
+			return nil, nil, errors.New("GitHub GraphQL response missing pull request")
 		}
 		p := env.Data.Repository.PullRequest
-		if !reviewsDone {
-			for _, r := range p.Reviews.Nodes {
-				reviews = append(reviews, domain.GitHubReview{DatabaseID: r.DatabaseID, NodeID: r.ID, State: r.State, CommitSHA: r.Commit.OID, SourceAt: r.SubmittedAt, Actor: domain.ActorIdentity{DatabaseID: r.Author.DatabaseID, NodeID: r.Author.ID, Login: r.Author.Login, Type: r.Author.Typename}})
-			}
-			if p.Reviews.PageInfo.HasNextPage {
-				if p.Reviews.PageInfo.EndCursor == "" {
-					return "", nil, nil, "", nil, errors.New("review pagination cursor missing")
-				}
-				reviewCursor = p.Reviews.PageInfo.EndCursor
-			} else {
-				reviewsDone = true
-			}
+		for _, r := range p.Reviews.Nodes {
+			reviews = append(reviews, domain.GitHubReview{DatabaseID: r.DatabaseID, NodeID: r.ID, State: r.State, CommitSHA: r.Commit.OID, SourceAt: r.SubmittedAt, Actor: domain.ActorIdentity{DatabaseID: r.Author.DatabaseID, NodeID: r.Author.ID, Login: r.Author.Login, Type: r.Author.Typename}})
 		}
-		decision = p.ReviewDecision
-		if !threadsDone {
-			for _, t := range p.ReviewThreads.Nodes {
-				comments, err := c.completeThreadComments(ctx, t.ID, t.Comments.Nodes, t.Comments.PageInfo)
-				if err != nil {
-					return "", nil, nil, "", nil, err
-				}
-				for _, m := range comments {
-					if len([]byte(m.Body)) > application.MaxNormalizedFindingBodyBytes || strings.ContainsRune(m.Body, '\x00') {
-						return "", nil, nil, "", nil, errors.New("review finding body exceeds controller bounds")
-					}
-					id := strconv.FormatInt(m.DatabaseID, 10)
-					if id == "0" {
-						id = m.ID
-					}
-					if seen[id] {
-						continue
-					}
-					seen[id] = true
-					dig := sha256.Sum256([]byte(m.Body))
-					trusted := coderabbitCheck != domain.CodeRabbitAbsent && coderabbitCheck != domain.CodeRabbitUnknown && c.cfg.CodeRabbitAppID > 0 && m.Author.DatabaseID == c.cfg.CodeRabbitActorID && m.Author.ID == c.cfg.CodeRabbitNodeID && m.Author.Typename == "Bot"
-					if trusted && m.Commit.OID != head {
-						unknown = append(unknown, "coderabbit_comment_head_binding_unavailable:"+id)
-						cr = mergeCodeRabbitState(cr, domain.CodeRabbitUnknown)
-						trusted = false
-					}
-					if strings.Contains(strings.ToLower(m.Author.Login), "coderabbit") && !trusted {
-						unknown = append(unknown, "coderabbit_comment_app_provenance_unavailable:"+id)
-						cr = mergeCodeRabbitState(cr, domain.CodeRabbitUntrusted)
-					}
-					if trusted {
-						if t.IsResolved || t.IsOutdated || m.Outdated {
-							if cr == domain.CodeRabbitAbsent {
-								cr = domain.CodeRabbitPass
-							}
-						} else {
-							cr = domain.CodeRabbitActionable
-						}
-					}
-					if trusted {
-						findings = append(findings, domain.NormalizedFinding{Source: "coderabbit_review_comment", SourceID: id, ThreadID: t.ID, File: m.Path, Line: m.Line, Classification: "source_unspecified", BodyDigest: hex.EncodeToString(dig[:]), Body: m.Body, Resolved: t.IsResolved, Outdated: t.IsOutdated || m.Outdated, HeadSHA: m.Commit.OID, SourceAt: m.CreatedAt, ObservedAt: c.clock.Now().UTC()})
-						if len(findings) > application.MaxNormalizedFindings {
-							return "", nil, nil, "", nil, errors.New("review finding count exceeds controller bounds")
-						}
-					} else {
-						unknown = append(unknown, "untrusted_review_comment:"+id)
-					}
-				}
-			}
+		if !p.Reviews.PageInfo.HasNextPage {
+			return reviews, nil, nil
 		}
-		if !p.ReviewThreads.PageInfo.HasNextPage {
-			threadsDone = true
+		if p.Reviews.PageInfo.EndCursor == "" {
+			return nil, nil, errors.New("review pagination cursor missing")
 		}
-		if threadsDone && reviewsDone {
-			completedPages = true
-			break
-		}
-		if !threadsDone && p.ReviewThreads.PageInfo.EndCursor == "" {
-			return "", nil, nil, "", nil, errors.New("GraphQL pagination cursor missing")
-		}
-		if !threadsDone {
-			cursor = p.ReviewThreads.PageInfo.EndCursor
-		}
+		reviewCursor = p.Reviews.PageInfo.EndCursor
 	}
-	if !completedPages {
-		return "", nil, nil, "", nil, errors.New("review-thread pagination exceeded bounded limit")
-	}
-	return decision, reviews, findings, cr, unknown, nil
-}
-
-func (c *Client) completeThreadComments(ctx context.Context, threadID string, initial []rawReviewComment, pageInfo graphPageInfo) ([]rawReviewComment, error) {
-	comments := append([]rawReviewComment(nil), initial...)
-	cursor := pageInfo.EndCursor
-	for page := 1; pageInfo.HasNextPage && page <= 20; page++ {
-		if cursor == "" {
-			return nil, errors.New("review-comment pagination cursor missing")
-		}
-		var env struct {
-			Data struct {
-				Node *struct {
-					Comments struct {
-						Nodes    []rawReviewComment `json:"nodes"`
-						PageInfo graphPageInfo      `json:"pageInfo"`
-					} `json:"comments"`
-				} `json:"node"`
-			} `json:"data"`
-			Errors []json.RawMessage `json:"errors"`
-		}
-		if err := c.graphql(ctx, "ReadReviewThreadComments", threadCommentsQuery, map[string]any{"id": threadID, "cursor": cursor}, &env); err != nil {
-			return nil, err
-		}
-		if len(env.Errors) > 0 {
-			return nil, errors.New("GitHub GraphQL returned comment pagination errors")
-		}
-		if env.Data.Node == nil {
-			return nil, errors.New("GitHub GraphQL response missing review thread")
-		}
-		comments = append(comments, env.Data.Node.Comments.Nodes...)
-		pageInfo = env.Data.Node.Comments.PageInfo
-		cursor = pageInfo.EndCursor
-	}
-	if pageInfo.HasNextPage {
-		return nil, errors.New("review-comment pagination exceeded bounded limit")
-	}
-	return comments, nil
+	return nil, nil, errors.New("review pagination exceeded bounded limit")
 }
 
 func nullable(s string) any {

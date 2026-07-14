@@ -37,7 +37,11 @@ key. Installation tokens are minted at runtime and must never be stored.
 
 ## Local configuration
 
-Create a configuration file outside the repository:
+Add each profile to the `github_app_profiles` array in the single controller
+configuration outside the repository. The default macOS file is
+`~/Library/Application Support/agent-loop-controller/controller.json`; use
+`ifan-loop config init` to create its secret-free skeleton. The private key
+remains a separate protected file.
 
 ```json
 {
@@ -53,31 +57,52 @@ Create a configuration file outside the repository:
   "token_refresh_skew": "5m",
   "api_version": "2022-11-28",
   "pull_requests_write": false,
-  "squash_merge_write": false,
-  "coderabbit_actor_id": 0,
-  "coderabbit_node_id": "",
-  "coderabbit_app_id": 0
+  "squash_merge_write": false
 }
 ```
-
-Use zero/empty CodeRabbit identity until its numeric actor, node, and App
-identity are confirmed from authoritative GitHub API evidence. This fails closed
-for CodeRabbit trust rather than trusting a login or comment body.
 
 Run the opt-in read-only smoke only against the selected fixture repository:
 
 ```sh
 go run ./cmd/ifan-loop github-read \
-  --config /absolute/protected/path/github-app.json \
-  --db /absolute/path/controller.db \
+  --config /absolute/protected/path/controller.json \
   --run-id '<persisted-run-id>' \
+  --requester ifan0927 --requester-database-id '<id>' \
+  --requester-node-id '<node-id>' --requester-type User \
+  --repository owner/isolated-fixture \
+  --expected-state '<persisted-state>' \
+  --idempotency-key '<persisted-key>' \
   --pr 1 \
   --expected-head '<exact-head-sha>'
 ```
 
-To open the single controller-owned PR after the exact candidate branch is
-pushed, change only the isolated fixture profile and App permission as described
-above, then invoke:
+`controller run` starts the normal long-lived delivery driver, and `controller
+drive` resumes it after a restart. They derive and perform the legal GitHub
+operations from the persisted run; an operator does not normally copy a state
+and idempotency key between `push`, `open-pr`, `reconcile`, and `merge` commands.
+Requester-authorized `controller status` and `controller inspect` may expose the
+run-scoped idempotency key for an audited recovery procedure. It is not a GitHub
+App private key, installation token, or Linear credential; requester
+authorization and the expected state remain mandatory for every low-level
+recovery operation.
+
+`controller recover-owned-push` is reserved for a halted repair fast-forward on
+an existing controller-owned open PR. It accepts only `manual_intervention` and
+proves stable Linear source plus persisted PR ownership before returning the run
+to the guarded push gate. It has no GitHub App write and no Git write of its
+own; the resumed driver performs the normal exact-HEAD and lease checks.
+
+The driver polls pending GitHub and Linear evidence every 30 seconds by default
+and exits after 24 hours. An operator may deliberately set `--poll-interval`,
+`--max-immediate-actions`, or `--max-runtime` (no more than seven days) for an
+isolated E2E observation. A stopped or runtime-limited process is resumed with
+`controller drive`; it does not broaden the controller's write authority.
+
+The following `open-pr` command is a recovery/debug adapter exercise only. Do
+not use it as a normal delivery step: after the exact candidate branch is ready,
+the driver opens or adopts the single controller-owned PR itself. To deliberately
+exercise recovery against an isolated fixture, change only the fixture profile
+and App permission as described above, then invoke:
 
 ```sh
 go run ./cmd/ifan-loop controller open-pr '<persisted-run-id>' \
@@ -94,22 +119,23 @@ transport interruption leaves immutable intent in SQLite; a later invocation
 adopts only that exact PR and never adopts a merely matching branch or title.
 
 To exercise the guarded merge path, use a separate selected-repository
-installation with the two write switches described above. The controller
-re-reads the PR, exact head/base, required checks, CodeRabbit, fresh local Sol
-evidence, and I-Fan's immutable-identity approval immediately before recording
-the merge intent. It sends only `merge_method: squash` with the expected head
-SHA, then re-reads the PR to persist its merge SHA and timestamp. If the
-process loses a successful response, a restart observes the merged PR and does
-not send another merge request; a closed-but-unmerged PR fails closed.
+installation with the two write switches described above. During normal
+operation, the driver re-reads the PR, exact head/base, required checks, fresh
+local Sol evidence, and I-Fan's immutable-identity approval immediately before
+recording the merge intent. It sends only `merge_method:
+squash` with the expected head SHA, then re-reads the PR to persist its merge SHA
+and timestamp. If the process loses a successful response, `controller drive`
+observes the merged PR and does not send another merge request; a closed-but-
+unmerged PR fails closed.
 
 ## Base freshness boundary
 
 GitHub's direct merge endpoint conditions the write on the PR head SHA, not an
 expected base SHA. The controller therefore records and re-reads the current
-base immediately before the conditional squash request, but does not rebase,
-update a branch, or retry a rejected merge. The selected repository must make
-GitHub branch protection the final base-freshness authority: require branches
-to be up to date, require the configured CI and CodeRabbit checks, dismiss
-stale approvals after new commits, and do not allow bypass. A GitHub rejection
-or any conflicting evidence is persisted as `manual_intervention` for an
-operator to resolve; it is not a controller repair action.
+base immediately before the conditional squash request, but does not rebase or
+retry a rejected merge. The selected repository must make GitHub branch
+protection the final base-freshness authority: require branches to be up to
+date, require the configured CI, dismiss stale approvals after new commits,
+and do not allow bypass. A GitHub rejection or conflicting evidence is persisted as
+`manual_intervention` for an operator to resolve; it is not a controller repair
+action.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
@@ -48,6 +49,7 @@ type ProductionPushResult struct {
 type pushStore interface {
 	BeginSideEffect(context.Context, SideEffectRecord) (SideEffectRecord, bool, error)
 	FinishSideEffect(context.Context, SideEffectRecord) error
+	SavePullRequest(context.Context, string, domain.PullRequest) error
 }
 
 // Push publishes only a revalidated, exact-HEAD candidate. Its durable intent
@@ -90,22 +92,32 @@ func (c *ProductionCoordinator) Push(ctx context.Context, command ProductionPush
 		return ProductionPushResult{}, classifyServiceError(err)
 	}
 
+	inspection, err := c.store.Inspect(ctx, run.ID)
+	if err != nil {
+		return ProductionPushResult{}, classifyServiceError(err)
+	}
+	existingPR, err := retainedOwnedPullRequest(inspection, run)
+	if err != nil {
+		return ProductionPushResult{}, c.rejectDivergentPush(ctx, run, effects, side, "")
+	}
 	remote, err := publisher.RemoteSHA(ctx, run.WorktreePath, run.WorkingBranch)
 	if err != nil {
 		return ProductionPushResult{}, c.recordPushFailure(ctx, run, effects, side, PushEvidence{}, "remote_lookup_failed", err)
 	}
 	if remote == run.CandidateHead {
-		return c.completePush(ctx, run, effects, side, PushEvidence{RemoteRef: "refs/heads/" + run.WorkingBranch, SHA: run.CandidateHead}, true)
+		return c.completePush(ctx, run, effects, side, existingPR, PushEvidence{RemoteRef: "refs/heads/" + run.WorkingBranch, SHA: run.CandidateHead}, true)
 	}
 	if remote != "" {
-		return ProductionPushResult{}, c.rejectDivergentPush(ctx, run, effects, side, remote)
+		if existingPR == nil || existingPR.HeadSHA != remote {
+			return ProductionPushResult{}, c.rejectDivergentPush(ctx, run, effects, side, remote)
+		}
 	}
 
-	evidence, pushErr := publisher.Push(ctx, run.WorktreePath, run.WorkingBranch, run.CandidateHead, "", run.ArtifactRoot)
+	evidence, pushErr := publisher.Push(ctx, run.WorktreePath, run.WorkingBranch, run.CandidateHead, remote, run.ArtifactRoot)
 	if pushErr != nil {
 		remote, reconcileErr := publisher.RemoteSHA(ctx, run.WorktreePath, run.WorkingBranch)
 		if reconcileErr == nil && remote == run.CandidateHead {
-			return c.completePush(ctx, run, effects, side, evidence, true)
+			return c.completePush(ctx, run, effects, side, existingPR, evidence, true)
 		}
 		if reconcileErr == nil && remote != "" {
 			return ProductionPushResult{}, c.rejectDivergentPush(ctx, run, effects, side, remote)
@@ -122,15 +134,33 @@ func (c *ProductionCoordinator) Push(ctx context.Context, command ProductionPush
 		}
 		return ProductionPushResult{}, c.recordPushFailure(ctx, run, effects, side, evidence, "post_push_remote_missing", errors.New("remote branch is absent after push"))
 	}
-	return c.completePush(ctx, run, effects, side, evidence, false)
+	return c.completePush(ctx, run, effects, side, existingPR, evidence, false)
 }
 
-func (c *ProductionCoordinator) completePush(ctx context.Context, run Run, effects pushStore, side SideEffectRecord, evidence PushEvidence, idempotent bool) (ProductionPushResult, error) {
+func retainedOwnedPullRequest(inspection RunInspection, run Run) (*domain.PullRequest, error) {
+	if inspection.PullRequest == nil {
+		return nil, nil
+	}
+	pr := *inspection.PullRequest
+	if pr.DatabaseID < 1 || strings.TrimSpace(pr.URL) == "" || !strings.EqualFold(pr.State, "open") || pr.Merged || pr.HeadBranch != run.WorkingBranch || pr.BaseBranch != run.BaseBranch || pr.BaseSHA != run.BaseSHA || pr.OwnershipKey != run.IdempotencyKey || strings.TrimSpace(pr.BodyDigest) == "" {
+		return nil, errors.New("persisted pull request is not an owned open update target")
+	}
+	return &pr, nil
+}
+
+func (c *ProductionCoordinator) completePush(ctx context.Context, run Run, effects pushStore, side SideEffectRecord, existingPR *domain.PullRequest, evidence PushEvidence, idempotent bool) (ProductionPushResult, error) {
 	if evidence.SHA == "" {
 		evidence.SHA = run.CandidateHead
 	}
 	if evidence.SHA != run.CandidateHead || evidence.RemoteRef != "refs/heads/"+run.WorkingBranch {
 		return ProductionPushResult{}, c.recordPushFailure(ctx, run, effects, side, evidence, "invalid_push_evidence", errors.New("publisher returned mismatched evidence"))
+	}
+	if existingPR != nil && existingPR.HeadSHA != run.CandidateHead {
+		updated := *existingPR
+		updated.HeadSHA = run.CandidateHead
+		if err := effects.SavePullRequest(ctx, run.ID, updated); err != nil {
+			return ProductionPushResult{}, c.recordPushFailure(ctx, run, effects, side, evidence, "persist_repaired_pull_request_head_failed", err)
+		}
 	}
 	result, err := json.Marshal(map[string]any{"remote_ref": evidence.RemoteRef, "pushed_sha": evidence.SHA, "exit_code": evidence.ExitCode})
 	if err != nil {

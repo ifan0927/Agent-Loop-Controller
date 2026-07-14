@@ -31,28 +31,34 @@
   `approval_ready` state.
 - Disposable fake-process integration plus opt-in real happy-path and resume
   smoke scripts.
-- Direct read-only Linear issue normalization is implemented as a fixture-first
-  adapter, but it is not yet composed into admission or durable run state. Push,
-  pull request, CodeRabbit, merge, and cleanup remain outside this phase.
+- The direct read-only Linear adapter is composed into durable admission and
+  post-merge completion observation. The deterministic local trial remains the
+  default verification path.
 
 ### Phase 1C: Post-approval GitHub delivery
 
 - Explicit side-effect states and SQLite v5 evidence.
+- One long-lived durable delivery driver that derives and executes the next
+  legal action from persisted state, from explicit trigger through cleanup.
 - Fast-forward working-branch publisher and one-PR ownership contract.
-- Bounded GitHub checks and CodeRabbit reconciliation.
-- Review-finding normalization, Terra repair, verification, and fresh Sol review.
+- Bounded required-CI reconciliation.
+- Required-CI finding normalization, Terra repair, verification, and fresh Sol review.
 - Exact-head I-Fan approval, squash merge, and restart-safe owned cleanup.
 - Fake GitHub and disposable bare-origin integration by default.
 
-Deferred production integration includes Linear admission/completion composition,
-CodeRabbit-specific production API compatibility, and opt-in isolated real
-GitHub dogfooding.
+External delivery requires configured fixture identities, credentials, and one
+explicit trigger. Thereafter the driver advances automatically, remaining alive
+while CI, final GitHub approval, or Linear completion is pending. It
+stops only for terminal state, structured human decision, or fail-closed manual
+intervention. The opt-in isolated GitHub E2E matrix is never replaced by the
+local fake integration suite.
 
 ## Phase 2: External trigger adapters
 
 - Hermes explicit start command.
 - Linear webhook admission.
-- Cron polling as a reconciliation and optional admission source.
+- Cron polling as an optional admission source. Delivery reconciliation is
+  already owned by the durable driver after a run is admitted.
 - Structured decision questions routed to Linear and Hermes.
 - Notifications for blocked, approval-ready, and failed runs.
 

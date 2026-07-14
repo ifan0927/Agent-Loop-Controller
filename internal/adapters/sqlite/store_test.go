@@ -110,9 +110,9 @@ func TestGitHubReadSuccessPersistsEvidenceAndGateTransitionAtomically(t *testing
 		t.Fatalf("lease acquired=%v err=%v", acquired, err)
 	}
 	repo := domain.RepositoryIdentity{ID: 99, NodeID: "REPO", Owner: "owner", Name: "repo"}
-	body := "untrusted CodeRabbit finding retained only for repair"
+	body := "controller-generated required check finding retained only for repair"
 	sum := sha256.Sum256([]byte(body))
-	evidence := domain.GitHubReadEvidence{Repository: repo, PullRequest: pr, Checks: []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: "head", State: domain.CheckSuccess}}, CodeRabbit: domain.CodeRabbitPass, Findings: []domain.NormalizedFinding{{Source: "coderabbit_review_comment", SourceID: "finding-1", BodyDigest: hex.EncodeToString(sum[:]), Body: body, HeadSHA: "head", ObservedAt: time.Now().UTC()}}, ObservedAt: time.Now().UTC()}
+	evidence := domain.GitHubReadEvidence{Repository: repo, PullRequest: pr, Checks: []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: "head", State: domain.CheckSuccess}}, Findings: []domain.NormalizedFinding{{Source: "github_required_check", SourceID: "finding-1", BodyDigest: hex.EncodeToString(sum[:]), Body: body, HeadSHA: "head", ObservedAt: time.Now().UTC()}}, ObservedAt: time.Now().UTC()}
 	metadata := application.GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: repo, TokenExpiresAt: time.Now().Add(time.Hour), PermissionsDigest: "permissions", ObservedAt: time.Now().UTC()}
 	if err := store.SaveGitHubReadSuccess(ctx, run.ID, owner, domain.StatePROpen, run.IdempotencyKey, []application.GitHubRequestObservation{{RunID: run.ID, Operation: "read", Category: "REST", HTTPStatus: 200, ResponseDigest: "response", InstallationID: 2, Repository: repo, ObservedAt: time.Now().UTC()}}, pr, metadata, evidence, nil, nil, domain.StateReconcilingReviews, "GitHub evidence collection started"); err != nil {
 		t.Fatal(err)
@@ -268,6 +268,48 @@ func TestDatabaseIsPrivateAndMigrationIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestMigratesLegacyCodeRabbitApprovalColumnWithoutLosingApproval(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "controller.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	run := application.Run{ID: "run", IssueID: "IFAN-1", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "ifan/ifan-1", ArtifactRoot: "/tmp/run"}
+	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 14, 0, 0, 0, 0, time.UTC)
+	approval := domain.HumanApproval{PRNumber: 1, Approver: "ifan0927", Actor: domain.ActorIdentity{DatabaseID: 33, NodeID: "USER_33", Login: "ifan0927", Type: "User"}, ReviewDatabaseID: 55, ReviewNodeID: "PRR_55", Source: "github_pull_request_review", ApprovedSHA: "head", CIStatus: "pass", ReviewSHA: "head", ApprovedAt: now, ObservedAt: now}
+	if err := store.SaveHumanApproval(ctx, run.ID, approval); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `ALTER TABLE human_approvals ADD COLUMN coderabbit_status TEXT NOT NULL DEFAULT 'legacy'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version=12`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var removed, preserved int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('human_approvals') WHERE name='coderabbit_status'`).Scan(&removed); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM human_approvals WHERE run_id=? AND approved_sha=? AND approver=?`, run.ID, "head", "ifan0927").Scan(&preserved); err != nil {
+		t.Fatal(err)
+	}
+	if removed != 0 || preserved != 1 {
+		t.Fatalf("removed=%d preserved=%d", removed, preserved)
+	}
+}
+
 func TestMigratesVersionOneDatabaseToVersionTwo(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
 	db, err := sql.Open("sqlite", sqliteDSN(path))
@@ -381,7 +423,7 @@ func TestApprovalAndMergeEvidenceAreImmutable(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC().Truncate(time.Nanosecond)
-	approval := domain.HumanApproval{PRNumber: 1, Approver: "ifan0927", Actor: domain.ActorIdentity{DatabaseID: 33, NodeID: "USER_33", Login: "ifan0927", Type: "User"}, ReviewDatabaseID: 55, ReviewNodeID: "PRR_55", Source: "github_pull_request_review", ApprovedSHA: "h1", CIStatus: "pass", CodeRabbit: "pass", ReviewSHA: "h1", ApprovedAt: now, ObservedAt: now}
+	approval := domain.HumanApproval{PRNumber: 1, Approver: "ifan0927", Actor: domain.ActorIdentity{DatabaseID: 33, NodeID: "USER_33", Login: "ifan0927", Type: "User"}, ReviewDatabaseID: 55, ReviewNodeID: "PRR_55", Source: "github_pull_request_review", ApprovedSHA: "h1", CIStatus: "pass", ReviewSHA: "h1", ApprovedAt: now, ObservedAt: now}
 	if err := store.SaveHumanApproval(ctx, "run-1", approval); err != nil {
 		t.Fatal(err)
 	}
@@ -482,9 +524,9 @@ func TestGitHubApprovalObservationSurvivesRestartWithSourceAndObservationTimes(t
 	sourceAt := time.Date(2026, 7, 13, 1, 0, 0, 0, time.UTC)
 	observedAt := sourceAt.Add(time.Minute)
 	repo := domain.RepositoryIdentity{ID: 99, NodeID: "REPO", Owner: "owner", Name: "repo"}
-	evidence := domain.GitHubReadEvidence{Repository: repo, PullRequest: pr, Checks: []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: "head", State: domain.CheckSuccess}}, ReviewDecision: "APPROVED", CodeRabbit: domain.CodeRabbitPass, ObservedAt: observedAt}
+	evidence := domain.GitHubReadEvidence{Repository: repo, PullRequest: pr, Checks: []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: "head", State: domain.CheckSuccess}}, ObservedAt: observedAt}
 	approvalObservation := &domain.HumanApprovalObservation{PRNumber: pr.Number, CandidateHead: "head", Status: domain.HumanApprovalApproved, ReviewDatabaseID: 55, ReviewNodeID: "PRR_55", Actor: domain.ActorIdentity{DatabaseID: 33, NodeID: "USER_33", Login: "ifan0927", Type: "User"}, ReviewHeadSHA: "head", SourceAt: sourceAt, ObservedAt: observedAt}
-	approval := &domain.HumanApproval{PRNumber: pr.Number, Approver: "ifan0927", Actor: approvalObservation.Actor, ReviewDatabaseID: 55, ReviewNodeID: "PRR_55", Source: "github_pull_request_review", ApprovedSHA: "head", CIStatus: "pass", CodeRabbit: "pass", ReviewSHA: "head", ApprovedAt: sourceAt, ObservedAt: observedAt}
+	approval := &domain.HumanApproval{PRNumber: pr.Number, Approver: "ifan0927", Actor: approvalObservation.Actor, ReviewDatabaseID: 55, ReviewNodeID: "PRR_55", Source: "github_pull_request_review", ApprovedSHA: "head", CIStatus: "pass", ReviewSHA: "head", ApprovedAt: sourceAt, ObservedAt: observedAt}
 	metadata := application.GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: repo, TokenExpiresAt: observedAt.Add(time.Hour), PermissionsDigest: "permissions", ObservedAt: observedAt}
 	if err := store.SaveGitHubReadSuccess(ctx, run.ID, owner, domain.StateAwaitingHumanApproval, run.IdempotencyKey, nil, pr, metadata, evidence, approvalObservation, approval, domain.StateMerging, "trusted human approval is bound to the exact final head"); err != nil {
 		t.Fatal(err)

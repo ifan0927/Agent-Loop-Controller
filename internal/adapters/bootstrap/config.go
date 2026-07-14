@@ -18,7 +18,10 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/localregistry"
 )
 
-const CurrentVersion = 1
+const (
+	LegacyVersion  = 1
+	CurrentVersion = 2
+)
 
 // Error is safe to display to an operator. It deliberately excludes file
 // paths, credential references, and underlying parser details.
@@ -128,7 +131,8 @@ type configFile struct {
 	Version                int             `json:"version"`
 	Controller             controllerFile  `json:"controller"`
 	Linear                 json.RawMessage `json:"linear"`
-	RepositoryRegistryFile string          `json:"repository_registry_file"`
+	RepositoryRegistryFile json.RawMessage `json:"repository_registry_file"`
+	Repositories           json.RawMessage `json:"repositories"`
 	GitHubAppProfiles      []profileFile   `json:"github_app_profiles"`
 }
 
@@ -159,7 +163,7 @@ func Load(path string) (Bootstrap, error) {
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return Bootstrap{}, invalid("controller configuration must contain one strict JSON value")
 	}
-	if raw.Version != CurrentVersion {
+	if raw.Version != LegacyVersion && raw.Version != CurrentVersion {
 		return Bootstrap{}, invalid("unsupported controller configuration version")
 	}
 	controller, err := decodeController(raw.Controller)
@@ -170,13 +174,9 @@ func Load(path string) (Bootstrap, error) {
 	if err != nil {
 		return Bootstrap{}, invalid("Linear profile is invalid")
 	}
-	registryPath, err := canonicalRegularPath(raw.RepositoryRegistryFile)
+	registry, registryPath, err := decodeRegistry(raw)
 	if err != nil {
 		return Bootstrap{}, err
-	}
-	registry, err := localregistry.Load(registryPath)
-	if err != nil {
-		return Bootstrap{}, invalid("repository registry is invalid")
 	}
 	profiles, err := decodeProfiles(raw.GitHubAppProfiles)
 	if err != nil {
@@ -187,6 +187,54 @@ func Load(path string) (Bootstrap, error) {
 	}
 	digest := sha256.Sum256(data)
 	return Bootstrap{Version: raw.Version, Digest: hex.EncodeToString(digest[:]), Controller: controller, Linear: linear, Registry: registry, GitHubProfiles: profiles, RegistryPath: registryPath}, nil
+}
+
+func decodeRegistry(raw configFile) (localregistry.Registry, string, error) {
+	switch raw.Version {
+	case LegacyVersion:
+		if len(raw.Repositories) != 0 {
+			return localregistry.Registry{}, "", invalid("controller configuration version 1 must use repository_registry_file")
+		}
+		if len(raw.RepositoryRegistryFile) == 0 {
+			return localregistry.Registry{}, "", missing("repository registry file is required")
+		}
+		var registryFile string
+		if err := json.Unmarshal(raw.RepositoryRegistryFile, &registryFile); err != nil || strings.TrimSpace(registryFile) == "" {
+			return localregistry.Registry{}, "", invalid("repository registry file is invalid")
+		}
+		registryPath, err := canonicalRegularPath(registryFile)
+		if err != nil {
+			return localregistry.Registry{}, "", err
+		}
+		registry, err := localregistry.Load(registryPath)
+		if err != nil {
+			return localregistry.Registry{}, "", invalid("repository registry is invalid")
+		}
+		return registry, registryPath, nil
+	case CurrentVersion:
+		if len(raw.RepositoryRegistryFile) != 0 {
+			return localregistry.Registry{}, "", invalid("controller configuration version 2 must use inline repositories")
+		}
+		if len(raw.Repositories) == 0 {
+			return localregistry.Registry{}, "", missing("inline repositories are required")
+		}
+		decoder := json.NewDecoder(bytes.NewReader(raw.Repositories))
+		decoder.DisallowUnknownFields()
+		var repositories []localregistry.Repository
+		if err := decoder.Decode(&repositories); err != nil {
+			return localregistry.Registry{}, "", invalid("inline repositories are invalid")
+		}
+		if err := decoder.Decode(&struct{}{}); err != io.EOF || len(repositories) == 0 {
+			return localregistry.Registry{}, "", invalid("inline repositories are invalid")
+		}
+		registry, err := localregistry.New(repositories)
+		if err != nil {
+			return localregistry.Registry{}, "", invalid("inline repositories are invalid")
+		}
+		return registry, "", nil
+	default:
+		return localregistry.Registry{}, "", invalid("unsupported controller configuration version")
+	}
 }
 
 func decodeController(raw controllerFile) (Controller, error) {

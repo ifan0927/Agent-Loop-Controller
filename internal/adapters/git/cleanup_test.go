@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -72,6 +73,36 @@ func TestCleanupRefusesWorktreeWithUnexpectedHead(t *testing.T) {
 	}
 	if _, err := os.Stat(worktree); err != nil {
 		t.Fatalf("worktree was removed: %v", err)
+	}
+}
+
+func TestCleanupBindsCanonicalGitHubRemoteIdentity(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.Mkdir(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	gitBinary, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapper := filepath.Join(root, "git-wrapper")
+	script := "#!/bin/sh\nif [ \"$1\" = remote ] && [ \"$2\" = get-url ] && [ \"$3\" = origin ]; then\n  printf '%s\\n' 'git@github.com:owner/repo.git'\n  exit 0\nfi\nexec \"" + gitBinary + "\" \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanup := Cleanup{Workspace: Workspace{Binary: wrapper}, SourcePath: source, OriginPath: "https://github.com/OWNER/REPO.git"}
+	if err := cleanup.validateRepository("owner/repo"); err != nil {
+		t.Fatalf("canonical GitHub binding rejected: %v", err)
+	}
+	if err := cleanup.validateSourceOrigin(context.Background()); err != nil {
+		t.Fatalf("equivalent checkout transport rejected: %v", err)
+	}
+
+	cleanup.OriginPath = "https://github.com/owner/other.git"
+	if err := cleanup.validateSourceOrigin(context.Background()); err == nil || !strings.Contains(err.Error(), "ownership mismatch") {
+		t.Fatalf("mismatched GitHub remote accepted: %v", err)
 	}
 }
 

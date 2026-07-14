@@ -105,6 +105,17 @@ func (s *LinearAdmissionService) Start(ctx context.Context, command LinearStartC
 }
 
 func (s *LinearAdmissionService) Revalidate(ctx context.Context, command LinearRevalidateCommand) (Run, error) {
+	return s.revalidate(ctx, command, false)
+}
+
+// RevalidateOwnedPushRecovery is deliberately narrower than ordinary
+// revalidation. It is used only by the explicit operator recovery that may
+// return a halted owned-PR fast-forward to its already-verified push gate.
+func (s *LinearAdmissionService) RevalidateOwnedPushRecovery(ctx context.Context, command LinearRevalidateCommand) (Run, error) {
+	return s.revalidate(ctx, command, true)
+}
+
+func (s *LinearAdmissionService) revalidate(ctx context.Context, command LinearRevalidateCommand, allowManualRecovery bool) (Run, error) {
 	if command.RunID == "" || command.Repository == "" || command.ExpectedState == "" || command.IdempotencyKey == "" {
 		return Run{}, serviceError(ErrorInvalidInput, "run, expected state, repository, and idempotency key are required", nil)
 	}
@@ -122,7 +133,7 @@ func (s *LinearAdmissionService) Revalidate(ctx context.Context, command LinearR
 	if err != nil {
 		return Run{}, classifyServiceError(err)
 	}
-	snapshot, repository, err := admitLinearTask(source, s.resolver)
+	snapshot, repository, err := revalidateLinearTask(source, s.resolver)
 	if err != nil {
 		return Run{}, classifyServiceError(err)
 	}
@@ -132,18 +143,28 @@ func (s *LinearAdmissionService) Revalidate(ctx context.Context, command LinearR
 	if snapshot.Task.IssueID != run.IssueID {
 		return Run{}, serviceError(ErrorConflict, "Linear source does not match the persisted run", nil)
 	}
-	if err := s.requireStableLinearSource(ctx, run, snapshot, repository); err != nil {
+	if err := s.requireStableLinearSourceForRecovery(ctx, run, snapshot, repository, allowManualRecovery); err != nil {
 		return Run{}, err
 	}
 	return run, nil
 }
 
 func (s *LinearAdmissionService) requireStableLinearSource(ctx context.Context, existing Run, snapshot linearAdmissionSnapshot, repository LocalRepository) error {
-	if existing.State == domain.StateManualIntervention {
+	return s.requireStableLinearSourceForRecovery(ctx, existing, snapshot, repository, false)
+}
+
+func (s *LinearAdmissionService) requireStableLinearSourceForRecovery(ctx context.Context, existing Run, snapshot linearAdmissionSnapshot, repository LocalRepository, allowManualRecovery bool) error {
+	if existing.State == domain.StateManualIntervention && !allowManualRecovery {
 		return serviceError(ErrorConflict, "existing run requires a human decision", nil)
 	}
 	if existing.SourceRevision == snapshot.Task.SourceRevision && existing.Repository == repository.CanonicalRepository && existing.WorkingBranch == snapshot.Task.WorkingBranch && existing.TaskHash == snapshot.TaskHash {
 		return nil
+	}
+	if allowsAutomatedLinearProgress(existing, snapshot, repository) {
+		return nil
+	}
+	if existing.State == domain.StateManualIntervention && allowManualRecovery {
+		return serviceError(ErrorConflict, "owned push recovery requires an unchanged Linear source", nil)
 	}
 	evidence := "linear-source-drift:" + snapshot.RawHash
 	marked, err := s.store.MarkLinearSourceDrift(ctx, existing.ID, existing.State, existing.SourceRevision, evidence)
@@ -158,6 +179,7 @@ func (s *LinearAdmissionService) requireStableLinearSource(ctx context.Context, 
 
 type linearAdmissionSnapshot struct {
 	Task           domain.CodingTask
+	State          LinearState
 	RawJSON        []byte
 	RawHash        string
 	NormalizedJSON []byte
@@ -166,10 +188,18 @@ type linearAdmissionSnapshot struct {
 }
 
 func admitLinearTask(source LinearTaskSource, resolver LinearAdmissionRepositoryResolver) (linearAdmissionSnapshot, LocalRepository, error) {
+	return normalizeLinearTask(source, resolver, false)
+}
+
+func revalidateLinearTask(source LinearTaskSource, resolver LinearAdmissionRepositoryResolver) (linearAdmissionSnapshot, LocalRepository, error) {
+	return normalizeLinearTask(source, resolver, true)
+}
+
+func normalizeLinearTask(source LinearTaskSource, resolver LinearAdmissionRepositoryResolver, allowStarted bool) (linearAdmissionSnapshot, LocalRepository, error) {
 	if source.Provider != "linear" || source.Team.Key != "IFAN" || source.Identifier == "" || source.IssueID == "" || source.URL == "" || strings.TrimSpace(source.Title) == "" || strings.TrimSpace(source.Description) == "" || strings.TrimSpace(source.SourceRevision) == "" {
 		return linearAdmissionSnapshot{}, LocalRepository{}, errors.New("Linear issue source is incomplete")
 	}
-	if source.State.Name != "Todo" || !source.Cycle.IsActive || source.Cycle.ID == "" {
+	if !linearStateIsCodingReady(source.State, allowStarted) || !source.Cycle.IsActive || source.Cycle.ID == "" {
 		return linearAdmissionSnapshot{}, LocalRepository{}, errors.New("Linear issue is not coding-ready for admission")
 	}
 	labels := make([]string, 0, len(source.Labels))
@@ -220,7 +250,43 @@ func admitLinearTask(source LinearTaskSource, resolver LinearAdmissionRepository
 	if err != nil {
 		return linearAdmissionSnapshot{}, LocalRepository{}, errors.New("encode normalized Linear task")
 	}
-	return linearAdmissionSnapshot{Task: task, RawJSON: raw, RawHash: digestLinear(raw), NormalizedJSON: normalized, TaskHash: digestLinear(normalized), IdempotencyKey: idempotencyKey}, repository, nil
+	return linearAdmissionSnapshot{Task: task, State: source.State, RawJSON: raw, RawHash: digestLinear(raw), NormalizedJSON: normalized, TaskHash: digestLinear(normalized), IdempotencyKey: idempotencyKey}, repository, nil
+}
+
+func linearStateIsCodingReady(state LinearState, allowStarted bool) bool {
+	if state.Name == "Todo" {
+		return true
+	}
+	return allowStarted && strings.EqualFold(strings.TrimSpace(state.Type), "started")
+}
+
+// allowsAutomatedLinearProgress permits a started-state workflow update only
+// when the immutable task contract still matches exactly after removing
+// source-revision identifiers that change when Linear updates a status.
+func allowsAutomatedLinearProgress(existing Run, snapshot linearAdmissionSnapshot, repository LocalRepository) bool {
+	if !strings.EqualFold(strings.TrimSpace(snapshot.State.Type), "started") || existing.Repository != repository.CanonicalRepository || existing.WorkingBranch != snapshot.Task.WorkingBranch {
+		return false
+	}
+	existingDigest := stableTaskDigest(existing.NormalizedTaskJSON)
+	return existingDigest != "" && existingDigest == stableTaskDigestFromTask(snapshot.Task)
+}
+
+func stableTaskDigest(raw string) string {
+	var task domain.CodingTask
+	if json.Unmarshal([]byte(raw), &task) != nil {
+		return ""
+	}
+	return stableTaskDigestFromTask(task)
+}
+
+func stableTaskDigestFromTask(task domain.CodingTask) string {
+	task.RunID = ""
+	task.SourceRevision = ""
+	raw, err := json.Marshal(task)
+	if err != nil {
+		return ""
+	}
+	return digestLinear(raw)
 }
 
 func resolveLinearRepository(labels []string, resolver LinearAdmissionRepositoryResolver) (LocalRepository, error) {

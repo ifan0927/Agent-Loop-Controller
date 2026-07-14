@@ -48,6 +48,9 @@ var allowedTransitions = map[State]map[State]struct{}{
 	StateMerging:                  set(StateAwaitingLinearCompletion, StateFailed, StateManualIntervention),
 	StateAwaitingLinearCompletion: set(StateCleaning, StateFailed, StateManualIntervention),
 	StateCleaning:                 set(StateCompleted, StateFailed, StateManualIntervention),
+	// This is a narrow application-level recovery edge. It is reachable only
+	// after stable Linear revalidation and retained controller-owned PR proof.
+	StateManualIntervention: set(StateApprovalReady),
 }
 
 func CanTransition(from, to State) bool {

@@ -103,7 +103,7 @@ func TestGitHubReadCLIEndToEndPersistsAndRestarts(t *testing.T) {
 	if err := os.WriteFile(registryPath, registryRaw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	githubConfig := map[string]any{"api_base_url": server.URL, "graphql_url": server.URL + "/graphql", "app_id": 1, "installation_id": 2, "repository_owner": "owner", "repository_name": "repo", "repository_id": 99, "private_key_file": keyPath, "http_timeout": "2s", "token_refresh_skew": "5m", "api_version": "2022-11-28", "coderabbit_actor_id": 0, "coderabbit_node_id": "", "coderabbit_app_id": 0}
+	githubConfig := map[string]any{"api_base_url": server.URL, "graphql_url": server.URL + "/graphql", "app_id": 1, "installation_id": 2, "repository_owner": "owner", "repository_name": "repo", "repository_id": 99, "private_key_file": keyPath, "http_timeout": "2s", "token_refresh_skew": "5m", "api_version": "2022-11-28"}
 	config := map[string]any{"version": 1, "controller": map[string]any{"database_path": dbPath, "codex_binary": "codex", "run_timeout": "30m"}, "linear": map[string]any{"api_url": "https://api.linear.app/graphql", "credential_source_ref": "secret://env/IFAN_LOOP_LINEAR_TOKEN", "authorization_scheme": "bearer", "team_key": "IFAN", "http_timeout": "2s", "max_response_bytes": 4096, "label_page_size": 10, "max_label_pages": 1}, "repository_registry_file": registryPath, "github_app_profiles": []map[string]any{{"id": "github-app-profile:fixture", "config": githubConfig}}}
 	raw, _ := json.Marshal(config)
 	configPath := filepath.Join(dir, "controller.json")
@@ -131,7 +131,7 @@ func TestGitHubReadCLIEndToEndPersistsAndRestarts(t *testing.T) {
 	if err := json.Unmarshal(output, &rendered); err != nil {
 		t.Fatal(err)
 	}
-	if len(rendered) != 3 || rendered["reconciled_head"] != "head" || rendered["reconciliation_status"] != "pending" || rendered["current_state"] != "received" {
+	if len(rendered) != 3 || rendered["reconciled_head"] != "head" || rendered["reconciliation_status"] != "pass" || rendered["current_state"] != "received" {
 		t.Fatalf("GitHub CLI leaked non-contract fields: %s", output)
 	}
 	baseline := requests.Load()

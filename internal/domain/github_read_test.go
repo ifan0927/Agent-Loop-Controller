@@ -20,12 +20,10 @@ func TestRequiredChecksFailClosed(t *testing.T) {
 	}
 }
 
-func TestDeliveryStatusRequiresOpenPRTrustedCodeRabbitAndExactFindings(t *testing.T) {
+func TestDeliveryStatusRequiresOpenPRAndExactRequiredChecks(t *testing.T) {
 	base := GitHubReadEvidence{
-		PullRequest:    PullRequest{State: "open", HeadSHA: "head"},
-		Checks:         []GitHubCheck{{Name: "test", Required: true, ObservedSHA: "head", State: CheckSuccess}},
-		ReviewDecision: "REVIEW_REQUIRED",
-		CodeRabbit:     CodeRabbitPass,
+		PullRequest: PullRequest{State: "open", HeadSHA: "head"},
+		Checks:      []GitHubCheck{{Name: "test", Required: true, ObservedSHA: "head", State: CheckSuccess}},
 	}
 	if got := base.DeliveryStatus(); got != ReconciliationPass {
 		t.Fatalf("status=%s", got)
@@ -40,28 +38,6 @@ func TestDeliveryStatusRequiresOpenPRTrustedCodeRabbitAndExactFindings(t *testin
 		t.Fatalf("unknown telemetry status=%s", got)
 	}
 	base.UnknownEvents = nil
-	base.Findings = []NormalizedFinding{{Source: "coderabbit_review_comment", SourceID: "1", BodyDigest: "digest", HeadSHA: "head"}}
-	if got := base.DeliveryStatus(); got != ReconciliationActionable {
-		t.Fatalf("active finding status=%s", got)
-	}
-	base.Findings[0].Resolved = true
-	base.CodeRabbit = CodeRabbitPending
-	if got := base.DeliveryStatus(); got != ReconciliationPending {
-		t.Fatalf("pending CodeRabbit status=%s", got)
-	}
-	base.CodeRabbit = CodeRabbitPass
-	base.ReviewDecision = ""
-	if got := base.DeliveryStatus(); got != ReconciliationPending {
-		t.Fatalf("missing review decision status=%s", got)
-	}
-	base.ReviewDecision = "REVIEW_REQUIRED"
-	if got := base.DeliveryStatus(); got != ReconciliationPass {
-		t.Fatalf("review required status=%s", got)
-	}
-	base.ReviewDecision = "UNRECOGNIZED"
-	if got := base.DeliveryStatus(); got != ReconciliationInfrastructure {
-		t.Fatalf("unknown review decision status=%s", got)
-	}
 }
 
 func TestNormalizeHumanApprovalRequiresConfiguredImmutableUserAtExactHead(t *testing.T) {

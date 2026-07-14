@@ -214,11 +214,12 @@ func (v *failingPushValidator) ValidateApprovalReady(context.Context, string) er
 }
 
 type pushPublisher struct {
-	remotes  []string
-	reads    int
-	pushes   int
-	pushErr  error
-	evidence PushEvidence
+	remotes        []string
+	reads          int
+	pushes         int
+	expectedRemote string
+	pushErr        error
+	evidence       PushEvidence
 }
 
 func (p *pushPublisher) RemoteSHA(context.Context, string, string) (string, error) {
@@ -229,8 +230,9 @@ func (p *pushPublisher) RemoteSHA(context.Context, string, string) (string, erro
 	p.reads++
 	return value, nil
 }
-func (p *pushPublisher) Push(context.Context, string, string, string, string, string) (PushEvidence, error) {
+func (p *pushPublisher) Push(_ context.Context, _ string, _ string, _ string, expectedRemote string, _ string) (PushEvidence, error) {
 	p.pushes++
+	p.expectedRemote = expectedRemote
 	return p.evidence, p.pushErr
 }
 
@@ -313,6 +315,17 @@ func TestProductionOpenPullRequestRecoversPersistedPRWithoutSecondWrite(t *testi
 	}
 }
 
+func TestProductionOpenPullRequestReusesOwnedPullRequestAfterRepair(t *testing.T) {
+	coordinator, store, run := newPushCoordinator(t, domain.StateBranchPushed)
+	pr := ownedPullRequest(PullRequestOpenRequest{HeadBranch: run.WorkingBranch, BaseBranch: run.BaseBranch, CandidateSHA: run.CandidateHead, BaseSHA: run.BaseSHA, BodyDigest: "initial-body", OwnershipKey: run.IdempotencyKey})
+	store.pr = &pr
+	opener := &pullRequestOpener{}
+	result, err := coordinator.OpenPullRequest(context.Background(), ProductionOpenPullRequestCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, &pushValidator{}, opener)
+	if err != nil || !result.Idempotent || len(opener.requests) != 0 || store.run.State != domain.StatePROpen || store.pr == nil || store.pr.BodyDigest != "initial-body" {
+		t.Fatalf("result=%+v err=%v requests=%d state=%s pr=%+v", result, err, len(opener.requests), store.run.State, store.pr)
+	}
+}
+
 func TestProductionOpenPullRequestRejectsMismatchedResponseAndPreservesRetryEvidence(t *testing.T) {
 	coordinator, store, run := newPushCoordinator(t, domain.StateBranchPushed)
 	request, err := pullRequestIntent(run)
@@ -367,9 +380,9 @@ func newMergeCoordinator(t *testing.T) (*ProductionCoordinator, *pushTestStore, 
 	pr := domain.PullRequest{Number: 7, DatabaseID: 70, URL: "https://example.invalid/pull/7", NodeID: "PR_7", HeadBranch: run.WorkingBranch, BaseBranch: run.BaseBranch, HeadSHA: run.CandidateHead, BaseSHA: run.BaseSHA, BodyDigest: "body", OwnershipKey: run.IdempotencyKey, State: "open"}
 	now := time.Date(2026, 7, 13, 2, 0, 0, 0, time.UTC)
 	actor := domain.ActorIdentity{DatabaseID: 33, NodeID: "USER_33", Login: "ifan0927", Type: "User"}
-	approval := domain.HumanApproval{PRNumber: pr.Number, Approver: actor.Login, Actor: actor, ReviewDatabaseID: 9, ReviewNodeID: "PRR_9", Source: "github_pull_request_review", ApprovedSHA: run.CandidateHead, CIStatus: "pass", CodeRabbit: "pass", ReviewSHA: run.CandidateHead, ApprovedAt: now, ObservedAt: now}
+	approval := domain.HumanApproval{PRNumber: pr.Number, Approver: actor.Login, Actor: actor, ReviewDatabaseID: 9, ReviewNodeID: "PRR_9", Source: "github_pull_request_review", ApprovedSHA: run.CandidateHead, CIStatus: "pass", ReviewSHA: run.CandidateHead, ApprovedAt: now, ObservedAt: now}
 	binding := &SanitizedRepositoryBinding{CanonicalRepository: "owner/repo", ExpectedRepositoryID: 99, GitHubAppID: 1, GitHubInstallationID: 2, TrustedOperatorActors: []TrustedActorIdentity{{DatabaseID: actor.DatabaseID, NodeID: actor.NodeID, Login: actor.Login, Type: actor.Type}}}
-	evidence := domain.GitHubReadEvidence{Repository: domain.RepositoryIdentity{ID: 99, NodeID: "REPO", Owner: "owner", Name: "repo"}, PullRequest: pr, Checks: []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: run.CandidateHead, State: domain.CheckSuccess}}, ReviewDecision: "APPROVED", CodeRabbit: domain.CodeRabbitPass, Reviews: []domain.GitHubReview{{DatabaseID: 9, NodeID: "PRR_9", State: "APPROVED", CommitSHA: run.CandidateHead, SourceAt: now, Actor: actor}}, ObservedAt: now}
+	evidence := domain.GitHubReadEvidence{Repository: domain.RepositoryIdentity{ID: 99, NodeID: "REPO", Owner: "owner", Name: "repo"}, PullRequest: pr, Checks: []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: run.CandidateHead, State: domain.CheckSuccess}}, Reviews: []domain.GitHubReview{{DatabaseID: 9, NodeID: "PRR_9", State: "APPROVED", CommitSHA: run.CandidateHead, SourceAt: now, Actor: actor}}, ObservedAt: now}
 	store.pr = &pr
 	store.inspection = RunInspection{Run: run, RepositoryBinding: binding, PullRequest: &pr, Approval: &approval}
 	reader := &mergeReader{authority: GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: evidence.Repository}, evidence: evidence, observations: []GitHubRequestObservation{{Operation: "merge_preflight", Category: "pull_request", ResponseDigest: "digest", ObservedAt: time.Now().UTC()}}}
@@ -545,6 +558,42 @@ func TestProductionPushReconcilesSameRemoteSHAWithoutInvokingGit(t *testing.T) {
 	}
 	if store.side.Status != "observed" || len(store.transitions) != 2 || len(store.resources) != 2 || store.resources[1].CreationEvidence != store.resources[0].CreationEvidence {
 		t.Fatalf("side=%+v transitions=%+v resources=%+v", store.side, store.transitions, store.resources)
+	}
+}
+
+func TestProductionPushFastForwardsAnOwnedPullRequestBranch(t *testing.T) {
+	coordinator, store, run := newPushCoordinator(t, domain.StateApprovalReady)
+	oldHead := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	pr := domain.PullRequest{Number: 7, DatabaseID: 70, URL: "https://example.invalid/pull/7", NodeID: "PR_7", HeadBranch: run.WorkingBranch, BaseBranch: run.BaseBranch, HeadSHA: oldHead, BaseSHA: run.BaseSHA, BodyDigest: "initial-body", OwnershipKey: run.IdempotencyKey, State: "open"}
+	store.pr = &pr
+	publisher := &pushPublisher{remotes: []string{oldHead, run.CandidateHead}, evidence: PushEvidence{RemoteRef: "refs/heads/" + run.WorkingBranch, SHA: run.CandidateHead}}
+	result, err := coordinator.Push(context.Background(), ProductionPushCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, &pushValidator{}, publisher)
+	if err != nil || result.Idempotent || publisher.pushes != 1 || publisher.expectedRemote != oldHead || store.run.State != domain.StateBranchPushed || store.pr == nil || store.pr.HeadSHA != run.CandidateHead {
+		t.Fatalf("result=%+v err=%v pushes=%d expected=%s state=%s pr=%+v", result, err, publisher.pushes, publisher.expectedRemote, store.run.State, store.pr)
+	}
+}
+
+func TestProductionRecoverOwnedPushRestoresOnlyOwnedPRPushGate(t *testing.T) {
+	coordinator, store, run := newPushCoordinator(t, domain.StateManualIntervention)
+	oldHead := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	pr := domain.PullRequest{Number: 7, DatabaseID: 70, URL: "https://example.invalid/pull/7", NodeID: "PR_7", HeadBranch: run.WorkingBranch, BaseBranch: run.BaseBranch, HeadSHA: oldHead, BaseSHA: run.BaseSHA, BodyDigest: "initial-body", OwnershipKey: run.IdempotencyKey, State: "open"}
+	store.pr = &pr
+
+	result, err := coordinator.RecoverOwnedPush(context.Background(), ProductionRecoverOwnedPushCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: domain.StateManualIntervention, IdempotencyKey: run.IdempotencyKey})
+	if err != nil || result.Action != ProductionPush || store.run.State != domain.StateApprovalReady || len(store.transitions) != 1 {
+		t.Fatalf("result=%+v err=%v state=%s transitions=%+v", result, err, store.run.State, store.transitions)
+	}
+	transition := store.transitions[0]
+	if transition.From != domain.StateManualIntervention || transition.To != domain.StateApprovalReady || transition.EvidenceReference != "recover_owned_push:7" || transition.BoundHead != run.CandidateHead {
+		t.Fatalf("transition=%+v", transition)
+	}
+}
+
+func TestProductionRecoverOwnedPushRejectsMissingOwnedPR(t *testing.T) {
+	coordinator, store, run := newPushCoordinator(t, domain.StateManualIntervention)
+	_, err := coordinator.RecoverOwnedPush(context.Background(), ProductionRecoverOwnedPushCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: domain.StateManualIntervention, IdempotencyKey: run.IdempotencyKey})
+	if err == nil || store.run.State != domain.StateManualIntervention || len(store.transitions) != 0 {
+		t.Fatalf("err=%v state=%s transitions=%+v", err, store.run.State, store.transitions)
 	}
 }
 

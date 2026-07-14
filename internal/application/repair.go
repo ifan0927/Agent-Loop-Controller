@@ -35,10 +35,9 @@ type repairEvidence struct {
 	Findings []repairFindingReference `json:"findings,omitempty"`
 }
 
-// RepairableFindings selects only current, unresolved CodeRabbit findings.
-// The GitHub adapter establishes CodeRabbit's immutable identity; this
-// application boundary accepts only that normalized source and rechecks every
-// persisted body before it can reach a Terra resume prompt.
+// RepairableFindings selects only current, unresolved controller-generated
+// required-check findings and rechecks every persisted body before it can
+// reach a Terra resume prompt.
 func RepairableFindings(findings []FindingRecord, head string) ([]FindingRecord, error) {
 	if strings.TrimSpace(head) == "" {
 		return nil, errors.New("repair head must not be blank")
@@ -50,7 +49,7 @@ func RepairableFindings(findings []FindingRecord, head string) ([]FindingRecord,
 		if finding.HeadSHA != head || finding.Resolved || finding.Outdated {
 			continue
 		}
-		if finding.Source != "coderabbit_review_comment" && finding.Source != "github_required_check" {
+		if finding.Source != "github_required_check" {
 			return nil, fmt.Errorf("unsupported actionable finding source %q", finding.Source)
 		}
 		if strings.TrimSpace(finding.SourceID) == "" || strings.TrimSpace(finding.Body) == "" {
@@ -90,7 +89,7 @@ func RepairableFindings(findings []FindingRecord, head string) ([]FindingRecord,
 }
 
 func repairableEvidenceFindings(evidence domain.GitHubReadEvidence, head string) ([]domain.NormalizedFinding, []FindingRecord, error) {
-	findings := append([]domain.NormalizedFinding(nil), evidence.Findings...)
+	findings := make([]domain.NormalizedFinding, 0)
 	for _, check := range evidence.Checks {
 		if !check.Required || check.ObservedSHA != head || (check.State != domain.CheckFailure && check.State != domain.CheckActionRequired) {
 			continue

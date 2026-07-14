@@ -3,8 +3,8 @@
 Agent Loop Controller is I-Fan's deterministic control plane for turning a
 coding-ready Linear issue into a Codex-driven, human-gated pull request.
 
-The controller does not replace Codex, Linear, GitHub, Hermes, Hindsight, or
-CodeRabbit. It coordinates them through explicit contracts and durable state.
+The controller does not replace Codex, Linear, GitHub, Hermes, or Hindsight.
+It coordinates them through explicit contracts and durable state.
 
 ## Intended delivery loop
 
@@ -17,8 +17,8 @@ Trigger
   -> fresh independent Codex review
   -> repair and re-review when needed
   -> pull request
-  -> CodeRabbit review
-  -> repair, verification, and fresh internal re-review when needed
+  -> required CI reconciliation
+  -> repair, verification, and fresh internal re-review when required CI fails
   -> I-Fan final approval
   -> squash merge and cleanup
 ```
@@ -60,7 +60,7 @@ persists both run policy values and each attempt's requested model; legacy runs
 without this evidence are not resumed.
 
 The post-approval delivery slice adds SQLite v5 evidence and explicit states for
-branch push, one-PR publication, bounded CI/CodeRabbit reconciliation, repair,
+branch push, one-PR publication, bounded required-CI reconciliation, repair,
 I-Fan approval, squash merge, Linear completion observation, and owned cleanup.
 Default integration uses fake GitHub plus a disposable local bare origin.
 
@@ -75,112 +75,139 @@ exact-HEAD `APPROVED` pull-request review from a configured immutable GitHub
 approval, dismissal, changes-requested, stale-head, and rejected lookalike
 evidence; it never treats a login or App/Bot identity as human approval.
 
-The `controller start` command composes the direct Linear reader with durable
-admission. It accepts one explicit IFAN identifier and complete requester
-identity, re-fetches the authoritative source, enforces coding-ready eligibility,
-matches exactly one controller-configured repository label, freezes the task and
-repository policy, and creates or resumes one durable run. A changed source,
-repository binding, or Linear branch never mutates an existing run: the run is
-halted for a human decision instead.
+`controller run` is the normal production entrypoint. It accepts one explicit
+IFAN identifier and complete requester identity, re-fetches the authoritative
+source, enforces coding-ready eligibility, matches exactly one
+controller-configured repository label, freezes the task and repository policy,
+and creates or resumes one durable run. It then drives the run through Codex,
+verification, fresh review, push, PR creation, required-CI reconciliation,
+squash merge, Linear completion observation, and owned cleanup.
 
-`controller continue`, `controller open-pr`, `controller reconcile`, and `controller reconcile-linear` are the matching manual
-restart entrypoints. All require the persisted run ID, requester identity,
-repository, expected state, and idempotency key. They re-read Linear before
-acting, reject source drift, and derive one action from durable state. The
-post-merge `reconcile-linear` exception deliberately accepts the bounded
-revision update made by completion automation, while still validating the exact
-issue, team, and source-revision ordering against the persisted merge. Local
-execution uses the existing controller; GitHub reconciliation is read-only and
-requires persisted PR identity and exact candidate HEAD. States whose next step
-would write a branch, PR, or merge stop explicitly until their later lifecycle
-issue is implemented.
+The durable driver, rather than an operator command sequence, owns normal
+delivery progression. It may safely restart from persisted intent and evidence
+at any external boundary. It pauses only for an unresolved human decision,
+`manual_intervention`, a terminal outcome, or I-Fan's final approval for the
+exact PR head. While awaiting final approval it observes GitHub; a valid approval
+causes the same driver to continue with merge, Linear reconciliation, and
+cleanup. A changed source, repository binding, or Linear branch never mutates an
+existing run: it becomes a human decision point instead.
+
+`controller drive <run-id>` resumes an already admitted run after a controller
+process restart. `controller status` and `controller inspect` are read-only
+observation tools. The lower-level `continue`, `recover-owned-push`, `push`, `open-pr`, `reconcile`,
+`merge`, `reconcile-linear`, and `cleanup` commands remain intentional
+recovery/debug interfaces for an incident or a bounded E2E fault injection;
+they are not the normal operator workflow. Those recovery commands require the
+persisted run ID, requester identity, repository, expected state, and
+idempotency key. The key is a run-scoped compare-and-swap value, not a credential
+and cannot authorize a requester by itself.
+
+`recover-owned-push` is the one narrow exception for a repair that halted while
+updating an already open controller-owned PR. It accepts only
+`manual_intervention`, requires an unchanged Linear task and retained owned PR,
+then returns to `approval_ready` without a Git or GitHub write. The resumed
+driver still revalidates exact-HEAD evidence, the remote SHA, and its
+fast-forward lease before it can update that branch.
 
 ## Controller configuration
 
-Production commands use one versioned controller composition file. It contains
-the controller database and Codex settings, an inline Linear read profile, a
-strict repository registry reference, and one GitHub App profile for each
-registered repository. Credentials remain external: the Linear profile names a
-credential source and a GitHub profile names a private-key file; neither value
-is emitted by inspection output.
+Production commands use one versioned controller composition file. On macOS the
+default location is `~/Library/Application Support/agent-loop-controller/controller.json`;
+`--config /absolute/path/controller.json` remains an explicit test, CI, or
+multi-environment override. Version 2 keeps the controller database and Codex
+settings, an inline Linear read profile, inline repository entries, and one
+GitHub App profile for each repository in that one document. Credentials remain
+external: the Linear profile names a credential source and a GitHub profile
+names a private-key file; neither value is emitted by inspection output.
+
+Create the secret-free starter document once, then add the actual fixture App
+and repository identities before validation:
+
+```sh
+go run ./cmd/ifan-loop config path
+go run ./cmd/ifan-loop config init
+```
+
+`config init` creates the file exclusively with mode `0600` and its final
+directory with mode `0700`; it never overwrites a configuration. The starter is
+intentionally not runnable until an operator supplies a repository and GitHub
+App profile. See [configuration](docs/configuration.md).
 
 Validate or inspect this composition before starting a run:
 
 ```sh
-go run ./cmd/ifan-loop config validate --config /absolute/path/controller.json
-go run ./cmd/ifan-loop config inspect --config /absolute/path/controller.json
+go run ./cmd/ifan-loop config validate
+go run ./cmd/ifan-loop config inspect
 ```
 
 Both commands are offline. They do not read GitHub CLI authentication, user
 tokens, environment credentials, database contents, or private-key contents,
 and they do not write files. They validate canonical non-symlink paths and the
 registry-to-GitHub identity bindings, then emit only stable profile IDs and
-digests. Linear admission and GitHub reconciliation use the same loader:
+digests. Linear admission and GitHub reconciliation use the same loader.
+
+Start the normal durable delivery loop with one explicit trigger. The process
+continues through every safe transition; do not run one manual delivery command
+per state during normal operation:
 
 ```sh
-go run ./cmd/ifan-loop controller start IFAN-42 \
+go run ./cmd/ifan-loop controller run IFAN-42 \
   --config /absolute/path/controller.json \
   --requester ifan0927 --requester-database-id 123 \
   --requester-node-id <github-node-id> --requester-type User
 ```
 
-After reading the previous sanitized status result, an operator may resume or
-perform the read-only external reconciliation with the same compare-and-swap
-evidence:
+The default driver process runs for up to 24 hours (adjust deliberately with
+`--max-runtime`, at most seven days). It writes the restart-safe run ID to
+sanitized stderr before delivery polling begins. If its process is deliberately
+stopped, reaches that runtime limit, or the host restarts, use `drive` to resume
+the persisted run; it derives the allowed next action from SQLite rather than
+accepting a hand-written state transition:
 
 ```sh
-go run ./cmd/ifan-loop controller continue <run-id> \
+go run ./cmd/ifan-loop controller drive <run-id> \
   --config /absolute/path/controller.json \
   --requester ifan0927 --requester-database-id 123 \
-  --requester-node-id <github-node-id> --requester-type User \
-  --repository owner/repo --expected-state executing --idempotency-key <key>
-
-go run ./cmd/ifan-loop controller reconcile <run-id> \
-  --config /absolute/path/controller.json \
-  --requester ifan0927 --requester-database-id 123 \
-  --requester-node-id <github-node-id> --requester-type User \
-  --repository owner/repo --expected-state pr_open --idempotency-key <key>
-
-go run ./cmd/ifan-loop controller reconcile-linear <run-id> \
-  --config /absolute/path/controller.json \
-  --requester ifan0927 --requester-database-id 123 \
-  --requester-node-id <github-node-id> --requester-type User \
-  --repository owner/repo --expected-state awaiting_linear_completion --idempotency-key <key>
-
-go run ./cmd/ifan-loop controller cleanup <run-id> \
-  --config /absolute/path/controller.json \
-  --requester ifan0927 --requester-database-id 123 \
-  --requester-node-id <github-node-id> --requester-type User \
-  --repository owner/repo --expected-state cleaning --idempotency-key <key>
+  --requester-node-id <github-node-id> --requester-type User
 ```
 
-After an authoritative squash merge, `reconcile-linear` performs one read-only
-Linear observation per invocation. It records the immutable merge binding plus
-sanitized request metadata and the observed Linear completion state. A completed
-issue advances to owned cleanup. Canceled, ambiguous, or unreadable completion
-evidence fails closed for an operator; ten pending observations also time out to
-the same explicit intervention state.
+Use `status` or `inspect` to observe a paused run, retain its evidence, and
+identify an operator decision or a conflict. Only then should an operator use a
+specific recovery command with its compare-and-swap evidence:
 
-`cleanup` consumes the persisted merge and completed Linear evidence. It
-revalidates each owned resource before deleting the dedicated worktree and
-owned local and remote branches; artifact directories are retained. Any
-mismatch, dirty worktree, or partial failure remains auditable and leaves the
-run in `cleaning` for an idempotent retry.
+```sh
+go run ./cmd/ifan-loop controller status <run-id> \
+  --config /absolute/path/controller.json \
+  --requester ifan0927 --requester-database-id 123 \
+  --requester-node-id <github-node-id> --requester-type User
+```
 
-The controller configuration is strict JSON with this shape:
+After an authoritative squash merge, the driver performs read-only Linear
+completion observations. It records the immutable merge binding plus sanitized
+request metadata and the observed completion state. A completed issue advances
+to owned cleanup. Canceled, ambiguous, unreadable, or bounded-timeout evidence
+fails closed for an operator. Cleanup revalidates each owned resource before
+deleting the dedicated worktree and owned local and remote branches; artifact
+directories are retained. Any mismatch, dirty worktree, or partial failure
+remains auditable and can be resumed idempotently by the driver.
+
+The version 2 controller configuration is strict JSON with this shape. The
+repository policy that used to live in a separate registry file is now inline:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "controller": {
     "database_path": "/absolute/path/controller.db",
     "codex_binary": "codex",
     "run_timeout": "30m"
   },
-  "linear": { "...": "the existing strict Linear read profile fields" },
-  "repository_registry_file": "/absolute/path/repository-registry.json",
+  "linear": { "...": "the strict Linear read profile fields" },
   "github_app_profiles": [
-    { "id": "github-app-profile:example", "config": { "...": "the existing GitHub App profile fields" } }
+    { "id": "github-app-profile:example", "config": { "...": "the strict GitHub App profile fields" } }
+  ],
+  "repositories": [
+    { "owner": "example-owner", "name": "isolated-fixture", "origin_url": "git@github.com:example-owner/isolated-fixture.git", "...": "the existing repository policy fields" }
   ]
 }
 ```
@@ -260,11 +287,13 @@ labs for inspection:
 The versioned local repository registry binds canonical owner/name, local roots,
 base branch, verifier registry and allowed verifier IDs, immutable GitHub App and
 installation identity, immutable repository ID, and trusted operator identities.
-It contains references and non-secret identity only; executable verifier
-commands remain compiled controller policy. A run freezes canonical sanitized
-profile evidence for the selected repository; `local continue` rejects material
-profile or local-ownership drift without treating unrelated registry edits or
-credential rotation with unchanged identity as authority changes.
+Its origin binding is either a local bare fixture path or a credential-free
+GitHub `origin_url`; the latter must name the same `owner/name` and may use SSH
+or HTTPS. It contains references and non-secret identity only; executable
+verifier commands remain compiled controller policy. A run freezes canonical
+sanitized profile evidence for the selected repository; `local continue` rejects
+material profile or local-ownership drift without treating unrelated registry
+edits or credential rotation with unchanged identity as authority changes.
 
 Post-approval destructive smoke must use a disposable local bare origin and fake
 GitHub service, or an explicitly authorized isolated GitHub test repository.
@@ -283,5 +312,7 @@ uses a bare origin plus fake GitHub evidence through merge and cleanup:
 - [Architecture](docs/architecture.md)
 - [MVP scope](docs/mvp.md)
 - [Roadmap](docs/roadmap.md)
+- [Isolated external E2E dogfood](docs/e2e-dogfood.md)
+- [Configuration and future UI boundary](docs/configuration.md)
 - [Architecture decision](docs/decisions/0001-controller-and-executor-boundary.md)
 - [Hermes handoff](docs/handoff/hermes.md)
