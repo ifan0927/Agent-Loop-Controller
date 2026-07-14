@@ -17,6 +17,96 @@ type CleanupPort interface {
 	DeleteRemoteBranch(context.Context, string, string, string) error
 }
 
+const sourceCheckoutCleanupIdentity = "configured_source_checkout"
+
+var errSourceSyncRetryable = errors.New("source checkout synchronization is retryable")
+
+// SyncSourceCheckout persists a source-sync intent before the narrow Git port
+// is invoked. Source checkout state is deliberately separate from owned
+// resources: it is an operator checkout, never a controller-owned deletion
+// target.
+func SyncSourceCheckout(ctx context.Context, store DeliveryStore, port SourceSyncPort, run Run, merge MergeRecord) error {
+	if port == nil {
+		return errors.New("source synchronization port is required")
+	}
+	if merge.RunID != run.ID || merge.PreMergeSHA != run.CandidateHead || merge.Method != "squash" || merge.MergeSHA == "" || merge.MergedAt.IsZero() {
+		return errors.New("source synchronization requires persisted squash-merge evidence for the exact candidate")
+	}
+	if run.State != domain.StateCleaning {
+		return errors.New("source synchronization requires cleaning state")
+	}
+	var repository LocalRepository
+	if err := json.Unmarshal([]byte(run.RepositoryConfigJSON), &repository); err != nil || repository.CanonicalRepository != run.Repository || repository.BaseBranch != run.BaseBranch || strings.TrimSpace(repository.SourcePath) == "" || strings.TrimSpace(repository.OriginPath) == "" {
+		return errors.New("persisted source synchronization authority is invalid")
+	}
+	progress, err := store.CleanupProgress(ctx, run.ID)
+	if err != nil {
+		return err
+	}
+	for _, record := range progress {
+		if record.Kind != "source_checkout" || record.Name != sourceCheckoutCleanupIdentity {
+			continue
+		}
+		if record.Status == "synced" || record.Status == "skipped_attention" {
+			return nil
+		}
+	}
+	intent := CleanupRecord{RunID: run.ID, Kind: "source_checkout", Name: sourceCheckoutCleanupIdentity, Status: "intent"}
+	if err := store.UpsertCleanup(ctx, intent); err != nil {
+		return err
+	}
+	result, err := port.Sync(ctx, SourceSyncRequest{Repository: run.Repository, SourcePath: repository.SourcePath, OriginPath: repository.OriginPath, BaseBranch: run.BaseBranch, MergeSHA: merge.MergeSHA})
+	if err != nil {
+		return fmt.Errorf("source synchronization adapter: %w", err)
+	}
+	status, reason, err := sourceSyncCleanupResult(result, merge.MergeSHA)
+	if err != nil {
+		return err
+	}
+	if err := store.UpsertCleanup(ctx, CleanupRecord{RunID: run.ID, Kind: "source_checkout", Name: sourceCheckoutCleanupIdentity, Status: status, ErrorClass: reason}); err != nil {
+		return err
+	}
+	if status == "failed" {
+		return errSourceSyncRetryable
+	}
+	return nil
+}
+
+func sourceSyncCleanupResult(result SourceSyncResult, mergeSHA string) (string, string, error) {
+	if result.MergeSHA != mergeSHA {
+		return "", "", errors.New("source synchronization result is not bound to the persisted merge")
+	}
+	switch result.Status {
+	case SourceSyncSynced:
+		if result.Reason != SourceSyncReasonNone || (result.Outcome != SourceSyncFastForwarded && result.Outcome != SourceSyncAlreadyAtTarget && result.Outcome != SourceSyncAlreadyContainsTarget) {
+			return "", "", errors.New("source synchronization result is invalid")
+		}
+		return "synced", "", nil
+	case SourceSyncSkippedAttention:
+		if result.Outcome != SourceSyncNotApplied {
+			return "", "", errors.New("source synchronization result is invalid")
+		}
+		switch result.Reason {
+		case SourceSyncReasonDirtySource, SourceSyncReasonWrongBranch, SourceSyncReasonDetachedHead, SourceSyncReasonSourceDiverged, SourceSyncReasonStateDrift:
+			return "skipped_attention", string(result.Reason), nil
+		default:
+			return "", "", errors.New("source synchronization result is invalid")
+		}
+	case SourceSyncRetryableFailure:
+		if result.Outcome != SourceSyncNotApplied {
+			return "", "", errors.New("source synchronization result is invalid")
+		}
+		switch result.Reason {
+		case SourceSyncReasonFetchFailed, SourceSyncReasonGitUncertain:
+			return "failed", string(result.Reason), nil
+		default:
+			return "", "", errors.New("source synchronization result is invalid")
+		}
+	default:
+		return "", "", errors.New("source synchronization result is invalid")
+	}
+}
+
 func CleanupOwned(ctx context.Context, store DeliveryStore, port CleanupPort, run Run, merge MergeRecord, resources []OwnedResource) error {
 	if merge.RunID != run.ID || merge.PreMergeSHA != run.CandidateHead || merge.Method != "squash" || merge.MergeSHA == "" || merge.MergedAt.IsZero() {
 		return errors.New("cleanup requires persisted squash-merge evidence for the exact candidate")
@@ -244,8 +334,8 @@ type ProductionCleanupResult struct {
 // Cleanup performs no Linear re-read. Linear completion is the preceding,
 // separately persisted gate and its expected automation revision would make a
 // normal admission revalidation reject a legitimate completed run.
-func (c *ProductionCoordinator) Cleanup(ctx context.Context, command ProductionCleanupCommand, port CleanupPort) (ProductionCleanupResult, error) {
-	if port == nil || command.RunID == "" || command.Repository == "" || command.ExpectedState == "" || command.IdempotencyKey == "" {
+func (c *ProductionCoordinator) Cleanup(ctx context.Context, command ProductionCleanupCommand, port CleanupPort, sourceSync SourceSyncPort) (ProductionCleanupResult, error) {
+	if port == nil || sourceSync == nil || command.RunID == "" || command.Repository == "" || command.ExpectedState == "" || command.IdempotencyKey == "" {
 		return ProductionCleanupResult{}, serviceError(ErrorInvalidInput, "cleanup command and adapter are required", nil)
 	}
 	run, err := c.store.GetRun(ctx, command.RunID)
@@ -271,6 +361,12 @@ func (c *ProductionCoordinator) Cleanup(ctx context.Context, command ProductionC
 	}
 	if err := validateCleanupGate(run, inspection); err != nil {
 		return ProductionCleanupResult{}, serviceError(ErrorConflict, "cleanup gate evidence is incomplete", err)
+	}
+	if err := SyncSourceCheckout(ctx, delivery, sourceSync, run, *inspection.Merge); err != nil {
+		if errors.Is(err, errSourceSyncRetryable) {
+			return ProductionCleanupResult{}, serviceError(ErrorUnavailable, "source checkout synchronization is incomplete; retry only the pending source step", err)
+		}
+		return ProductionCleanupResult{}, serviceError(ErrorConflict, "source checkout synchronization could not be authorized", err)
 	}
 	if err := CleanupOwned(ctx, delivery, port, run, *inspection.Merge, inspection.Resources); err != nil {
 		return ProductionCleanupResult{}, serviceError(ErrorUnavailable, "owned cleanup is incomplete; retry only records still pending", err)

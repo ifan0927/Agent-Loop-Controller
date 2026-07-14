@@ -346,6 +346,7 @@ func driveProductionRun(ctx context.Context, loaded bootstrap.Bootstrap, store *
 		PullRequestOpener: writeClient,
 		SquashMerger:      github,
 		CleanupPort:       gitadapter.Cleanup{Workspace: gitadapter.Workspace{}, SourcePath: repository.SourcePath, OriginPath: repository.OriginPath},
+		SourceSyncPort:    sourceSyncAdapter{sync: gitadapter.SourceSynchronizer{}},
 	}, policy, nil)
 	if err != nil {
 		return application.ProductionDriveResult{}, err
@@ -616,7 +617,7 @@ func controllerCleanup(args []string) error {
 	adapter := gitadapter.Cleanup{Workspace: gitadapter.Workspace{}, SourcePath: repository.SourcePath, OriginPath: repository.OriginPath}
 	ctx, cancel := localContext(loaded.Controller.RunTimeout)
 	defer cancel()
-	result, err := coordinator.Cleanup(ctx, application.ProductionCleanupCommand{Requester: command.requester, RunID: command.run.ID, Repository: command.repository, ExpectedState: command.expectedState, IdempotencyKey: command.idempotencyKey}, adapter)
+	result, err := coordinator.Cleanup(ctx, application.ProductionCleanupCommand{Requester: command.requester, RunID: command.run.ID, Repository: command.repository, ExpectedState: command.expectedState, IdempotencyKey: command.idempotencyKey}, adapter, sourceSyncAdapter{sync: gitadapter.SourceSynchronizer{}})
 	if err != nil {
 		return err
 	}
@@ -624,6 +625,15 @@ func controllerCleanup(args []string) error {
 }
 
 type productionPushAdapter struct{ publisher gitadapter.Publisher }
+
+// sourceSyncAdapter is the composition boundary between the application port
+// and the independently tested guarded Git primitive from issue #22.
+type sourceSyncAdapter struct{ sync gitadapter.SourceSynchronizer }
+
+func (a sourceSyncAdapter) Sync(ctx context.Context, request application.SourceSyncRequest) (application.SourceSyncResult, error) {
+	result, err := a.sync.Sync(ctx, gitadapter.SourceSyncRequest{Repository: request.Repository, SourcePath: request.SourcePath, OriginPath: request.OriginPath, BaseBranch: request.BaseBranch, MergeSHA: request.MergeSHA})
+	return application.SourceSyncResult{Status: application.SourceSyncStatus(result.Status), Outcome: application.SourceSyncOutcome(result.Outcome), Reason: application.SourceSyncReason(result.Reason), BeforeSHA: result.BeforeSHA, AfterSHA: result.AfterSHA, MergeSHA: result.MergeSHA}, err
+}
 
 func (a productionPushAdapter) RemoteSHA(ctx context.Context, workspace, branch string) (string, error) {
 	return a.publisher.RemoteSHA(ctx, workspace, branch)

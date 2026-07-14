@@ -26,7 +26,7 @@ type ProductionDriverCoordinator interface {
 	OpenPullRequest(context.Context, ProductionOpenPullRequestCommand, ApprovalValidator, PullRequestOpener) (ProductionOpenPullRequestResult, error)
 	MergePullRequest(context.Context, ProductionMergeCommand, ApprovalValidator, GitHubReadPort, SquashMerger) (ProductionMergeResult, error)
 	ReconcileLinearCompletion(context.Context, ProductionLinearCompletionCommand) (ProductionLinearCompletionResult, error)
-	Cleanup(context.Context, ProductionCleanupCommand, CleanupPort) (ProductionCleanupResult, error)
+	Cleanup(context.Context, ProductionCleanupCommand, CleanupPort, SourceSyncPort) (ProductionCleanupResult, error)
 }
 
 var _ ProductionDriverCoordinator = (*ProductionCoordinator)(nil)
@@ -40,6 +40,7 @@ type ProductionDriverPorts struct {
 	PullRequestOpener PullRequestOpener
 	SquashMerger      SquashMerger
 	CleanupPort       CleanupPort
+	SourceSyncPort    SourceSyncPort
 }
 
 // ProductionDriverPolicy bounds synchronous work between polls and prevents a
@@ -243,10 +244,10 @@ func (d *ProductionDriver) apply(ctx context.Context, command ProductionDriveCom
 		result, err := d.coordinator.ReconcileLinearCompletion(ctx, ProductionLinearCompletionCommand{Requester: command.Requester, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey})
 		return err == nil && result.Action == ProductionReconcileLinear, err
 	case ProductionCleanup:
-		if d.ports.CleanupPort == nil {
-			return false, serviceError(ErrorInternal, "cleanup port is required for automatic cleanup", nil)
+		if d.ports.CleanupPort == nil || d.ports.SourceSyncPort == nil {
+			return false, serviceError(ErrorInternal, "cleanup and source synchronization ports are required for automatic cleanup", nil)
 		}
-		_, err := d.coordinator.Cleanup(ctx, ProductionCleanupCommand{Requester: command.Requester, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, d.ports.CleanupPort)
+		_, err := d.coordinator.Cleanup(ctx, ProductionCleanupCommand{Requester: command.Requester, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, d.ports.CleanupPort, d.ports.SourceSyncPort)
 		return false, err
 	default:
 		return false, serviceError(ErrorInternal, "production action is unsupported by automatic driver", nil)

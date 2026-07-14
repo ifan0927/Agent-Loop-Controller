@@ -19,6 +19,7 @@ type driverCoordinator struct {
 	apply           func(ProductionAction) error
 	branchPublisher BranchPublisher
 	pullRequestOpen PullRequestOpener
+	sourceSync      SourceSyncPort
 }
 
 func (c *driverCoordinator) record(action ProductionAction) error {
@@ -59,7 +60,8 @@ func (c *driverCoordinator) ReconcileLinearCompletion(context.Context, Productio
 	return ProductionLinearCompletionResult{Action: action, Run: projectRunResult(c.runs.run)}, err
 }
 
-func (c *driverCoordinator) Cleanup(context.Context, ProductionCleanupCommand, CleanupPort) (ProductionCleanupResult, error) {
+func (c *driverCoordinator) Cleanup(_ context.Context, _ ProductionCleanupCommand, _ CleanupPort, sourceSync SourceSyncPort) (ProductionCleanupResult, error) {
+	c.sourceSync = sourceSync
 	err := c.record(ProductionCleanup)
 	action, _ := productionNextAction(c.runs.run.State)
 	return ProductionCleanupResult{Action: action, Run: projectRunResult(c.runs.run)}, err
@@ -107,6 +109,12 @@ func (driverCleanupPort) DeleteRemoteBranch(context.Context, string, string, str
 	return nil
 }
 
+type driverSourceSyncPort struct{}
+
+func (driverSourceSyncPort) Sync(context.Context, SourceSyncRequest) (SourceSyncResult, error) {
+	return SourceSyncResult{}, nil
+}
+
 func driverRun(state domain.State) Run {
 	return authorizeTestRun(Run{ID: "run", Repository: "owner/repo", IdempotencyKey: "key", State: state})
 }
@@ -118,6 +126,7 @@ func newDriverForTest(t *testing.T, reader *driverRunReader, coordinator *driver
 		ApprovalValidator: driverApprovalValidator{},
 		SquashMerger:      driverMerger{},
 		CleanupPort:       driverCleanupPort{},
+		SourceSyncPort:    driverSourceSyncPort{},
 	}, ProductionDriverPolicy{PollInterval: time.Second, MaxImmediateAction: 8}, wait)
 	if err != nil {
 		t.Fatal(err)
@@ -187,6 +196,9 @@ func TestProductionDriverPollsForApprovalThenContinuesThroughCleanup(t *testing.
 		if coordinator.calls[index] != action {
 			t.Fatalf("call %d=%s want=%s", index, coordinator.calls[index], action)
 		}
+	}
+	if coordinator.sourceSync == nil {
+		t.Fatal("driver did not compose the source synchronization port")
 	}
 }
 

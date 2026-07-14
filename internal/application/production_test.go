@@ -69,6 +69,8 @@ type pushTestStore struct {
 	linearRequests   []LinearRequestObservation
 	metadata         []GitHubInstallationMetadata
 	cleanup          []CleanupRecord
+	cleanupWrites    int
+	cleanupFailAt    int
 	requestErr       error
 }
 
@@ -179,6 +181,10 @@ func (s *pushTestStore) SaveLinearRequestObservation(_ context.Context, _ string
 }
 
 func (s *pushTestStore) UpsertCleanup(_ context.Context, value CleanupRecord) error {
+	s.cleanupWrites++
+	if s.cleanupFailAt > 0 && s.cleanupWrites == s.cleanupFailAt {
+		return errors.New("cleanup persistence unavailable")
+	}
 	for index := range s.cleanup {
 		if s.cleanup[index].RunID == value.RunID && s.cleanup[index].Kind == value.Kind && s.cleanup[index].Name == value.Name {
 			s.cleanup[index] = value
@@ -238,13 +244,14 @@ func (p *pushPublisher) Push(_ context.Context, _ string, _ string, _ string, ex
 
 func newPushCoordinator(t *testing.T, state domain.State) (*ProductionCoordinator, *pushTestStore, Run) {
 	t.Helper()
-	repository := LocalRepository{CanonicalRepository: "owner/repo", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
+	repository := LocalRepository{CanonicalRepository: "owner/repo", SourcePath: "/owned/source", OriginPath: "/owned/origin", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
 	reader := &admissionReader{source: validLinearSource()}
 	snapshot, _, err := admitLinearTask(reader.source, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, BaseBranch: "main", BaseSHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", NormalizedTaskJSON: mustJSON(t, snapshot.Task), TaskHash: snapshot.TaskHash, State: state, CandidateHead: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", WorktreePath: "/owned/worktree", ArtifactRoot: "/owned/artifacts"})
+	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), Repository: snapshot.Task.Repository, RepositoryConfigJSON: mustJSON(t, repository), WorkingBranch: snapshot.Task.WorkingBranch, BaseBranch: "main", BaseSHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", NormalizedTaskJSON: mustJSON(t, snapshot.Task), TaskHash: snapshot.TaskHash, State: state, CandidateHead: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", WorktreePath: "/owned/worktree", ArtifactRoot: "/owned/artifacts"})
+	run.RepositoryConfigJSON = mustJSON(t, repository)
 	store := &pushTestStore{run: run}
 	branchEvidence := `{"source_path":"/owned/source","origin_path":"/owned/origin","path":"` + run.WorktreePath + `","branch":"` + run.WorkingBranch + `","base_branch":"` + run.BaseBranch + `","base_sha":"` + run.BaseSHA + `","nonce":"nonce"}`
 	store.resources = []OwnedResource{{RunID: run.ID, Kind: "branch", Name: run.WorkingBranch, CreationEvidence: branchEvidence, Status: "owned"}}
@@ -449,12 +456,18 @@ func TestProductionCleanupRequiresCompletedLinearEvidenceAndFinishesOwnedResourc
 	store.resources = []OwnedResource{{RunID: run.ID, Kind: "artifact_root", Name: run.ArtifactRoot, Status: "owned", CreationEvidence: artifact}, {RunID: run.ID, Kind: "worktree", Name: run.WorktreePath, Status: "owned", CreationEvidence: evidence}, {RunID: run.ID, Kind: "branch", Name: run.WorkingBranch, Status: "owned", CreationEvidence: evidence}, {RunID: run.ID, Kind: "remote_branch", Name: run.WorkingBranch, Status: "owned", CreationEvidence: evidence}}
 	store.linearCompletion = []LinearCompletionObservation{{RunID: run.ID, MergeSHA: "merge", Status: LinearCompletionCompleted, ObservedAt: mergedAt.Add(time.Minute)}}
 	port := &fakeCleanup{}
-	result, err := coordinator.Cleanup(context.Background(), ProductionCleanupCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, port)
+	source := &fakeSourceSync{result: SourceSyncResult{Status: SourceSyncSynced, Outcome: SourceSyncAlreadyAtTarget, MergeSHA: "merge"}}
+	result, err := coordinator.Cleanup(context.Background(), ProductionCleanupCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, port, source)
 	if err != nil || result.Action != ProductionStop || store.run.State != domain.StateCompleted || len(port.calls) != 3 {
 		t.Fatalf("result=%+v err=%v state=%s calls=%v", result, err, store.run.State, port.calls)
 	}
-	if len(store.cleanup) != 4 || store.cleanup[0].Status != "retained" {
+	if len(store.cleanup) != 5 || store.cleanup[0].Kind != "source_checkout" || store.cleanup[0].Status != "synced" || store.cleanup[1].Status != "retained" {
 		t.Fatalf("cleanup=%+v", store.cleanup)
+	}
+	for _, resource := range store.resources {
+		if resource.Kind == "source_checkout" {
+			t.Fatalf("source checkout must not become an owned resource: %+v", store.resources)
+		}
 	}
 }
 
@@ -462,10 +475,39 @@ func TestProductionCleanupRejectsMissingLinearCompletionWithoutCallingAdapter(t 
 	coordinator, store, run := newPushCoordinator(t, domain.StateCleaning)
 	store.merge = &MergeRecord{RunID: run.ID, PreMergeSHA: run.CandidateHead, Method: "squash", MergeSHA: "merge", MergedAt: time.Now().UTC()}
 	port := &fakeCleanup{}
-	_, err := coordinator.Cleanup(context.Background(), ProductionCleanupCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, port)
-	if err == nil || len(port.calls) != 0 || store.run.State != domain.StateCleaning {
-		t.Fatalf("err=%v calls=%v state=%s", err, port.calls, store.run.State)
+	source := &fakeSourceSync{result: SourceSyncResult{Status: SourceSyncSynced, Outcome: SourceSyncAlreadyAtTarget, MergeSHA: "merge"}}
+	_, err := coordinator.Cleanup(context.Background(), ProductionCleanupCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, port, source)
+	if err == nil || len(port.calls) != 0 || len(source.calls) != 0 || store.run.State != domain.StateCleaning {
+		t.Fatalf("err=%v cleanup=%v source=%v state=%s", err, port.calls, source.calls, store.run.State)
 	}
+}
+
+func TestProductionCleanupStopsBeforeOwnedDeletesWhenSourceResultPersistenceFails(t *testing.T) {
+	coordinator, store, run := newPushCoordinator(t, domain.StateCleaning)
+	mergedAt := time.Date(2026, 7, 13, 3, 0, 0, 0, time.UTC)
+	store.merge = &MergeRecord{RunID: run.ID, PreMergeSHA: run.CandidateHead, Method: "squash", MergeSHA: "merge", MergedAt: mergedAt}
+	evidence := `{"source_path":"/owned/source","origin_path":"/owned/origin","path":"` + run.WorktreePath + `","branch":"` + run.WorkingBranch + `","base_branch":"` + run.BaseBranch + `","base_sha":"` + run.BaseSHA + `","nonce":"nonce"}`
+	artifact := `{"path":"/owned/artifacts","attempts_path":"/owned/artifacts/attempts","run_root":"/owned","nonce":"artifact-nonce","task_hash":"` + run.TaskHash + `"}`
+	store.resources = []OwnedResource{{RunID: run.ID, Kind: "artifact_root", Name: run.ArtifactRoot, Status: "owned", CreationEvidence: artifact}, {RunID: run.ID, Kind: "worktree", Name: run.WorktreePath, Status: "owned", CreationEvidence: evidence}, {RunID: run.ID, Kind: "branch", Name: run.WorkingBranch, Status: "owned", CreationEvidence: evidence}, {RunID: run.ID, Kind: "remote_branch", Name: run.WorkingBranch, Status: "owned", CreationEvidence: evidence}}
+	store.linearCompletion = []LinearCompletionObservation{{RunID: run.ID, MergeSHA: "merge", Status: LinearCompletionCompleted, ObservedAt: mergedAt.Add(time.Minute)}}
+	store.cleanupFailAt = 2
+	cleanup := &fakeCleanup{}
+	source := &fakeSourceSync{result: SourceSyncResult{Status: SourceSyncSynced, Outcome: SourceSyncFastForwarded, MergeSHA: "merge"}}
+	_, err := coordinator.Cleanup(context.Background(), ProductionCleanupCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, cleanup, source)
+	if err == nil || len(source.calls) != 1 || len(cleanup.calls) != 0 || len(store.cleanup) != 1 || store.cleanup[0].Status != "intent" {
+		t.Fatalf("err=%v source=%+v owned=%+v cleanup=%+v", err, source.calls, cleanup.calls, store.cleanup)
+	}
+}
+
+type fakeSourceSync struct {
+	result SourceSyncResult
+	err    error
+	calls  []SourceSyncRequest
+}
+
+func (f *fakeSourceSync) Sync(_ context.Context, request SourceSyncRequest) (SourceSyncResult, error) {
+	f.calls = append(f.calls, request)
+	return f.result, f.err
 }
 
 func TestProductionLinearCompletionTimesOutWithoutFabricatingSuccess(t *testing.T) {
