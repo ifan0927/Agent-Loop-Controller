@@ -30,3 +30,22 @@ func TestReconcileGitHubReadAcceptsCaseInsensitiveRepositoryCoordinates(t *testi
 		t.Fatal(err)
 	}
 }
+
+func TestPullRequestTargetDriftRequiresStableIdentityAndBody(t *testing.T) {
+	persisted := domain.PullRequest{Number: 2, DatabaseID: 3, NodeID: "P", URL: "u", HeadBranch: "feature", BaseBranch: "main", HeadSHA: "head", BaseSHA: "base", BodyDigest: "body", OwnershipKey: "key"}
+	target := persisted
+	target.BaseBranch = "release"
+	if !pullRequestTargetDrift(persisted, target) {
+		t.Fatal("target-only drift must use the manual conflict path")
+	}
+	for _, mutate := range []func(*domain.PullRequest){
+		func(pr *domain.PullRequest) { pr.BodyDigest = "other" },
+		func(pr *domain.PullRequest) { pr.URL = "other" },
+	} {
+		candidate := target
+		mutate(&candidate)
+		if pullRequestTargetDrift(persisted, candidate) {
+			t.Fatal("immutable identity or body drift must not use the manual target conflict path")
+		}
+	}
+}

@@ -625,6 +625,9 @@ func (s *Store) SaveGitHubReadSuccess(ctx context.Context, runID, leaseOwner str
 		return err
 	}
 	defer tx.Rollback()
+	if err := validatePersistedGitHubReadAuthority(ctx, tx, runID, m, e, observations, false); err != nil {
+		return err
+	}
 	// Admission, immutable feedback persistence, selection, and the repairing
 	// state edge share this transaction. A crash can therefore never leave a
 	// prompt-authorizing feedback row detached from its repair transition.
@@ -712,7 +715,7 @@ func (s *Store) SaveGitHubReadSuccess(ctx context.Context, runID, leaseOwner str
 			return err
 		}
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE pull_requests SET database_id=?,url=?,head_sha=?,body_digest=?,state=?,merged=?,merge_sha=?,merged_at=? WHERE run_id=? AND number=? AND node_id=? AND head_branch=? AND base_branch=? AND base_sha=? AND ownership_key=? AND database_id IN (0,?)`, pr.DatabaseID, pr.URL, pr.HeadSHA, pr.BodyDigest, pr.State, pr.Merged, pr.MergeSHA, formatTime(pr.MergedAt), runID, pr.Number, pr.NodeID, pr.HeadBranch, pr.BaseBranch, pr.BaseSHA, pr.OwnershipKey, pr.DatabaseID)
+	result, err := tx.ExecContext(ctx, `UPDATE pull_requests SET database_id=?,state=?,merged=?,merge_sha=?,merged_at=? WHERE run_id=? AND number=? AND node_id=? AND url=? AND head_branch=? AND base_branch=? AND head_sha=? AND base_sha=? AND body_digest=? AND ownership_key=? AND database_id IN (0,?)`, pr.DatabaseID, pr.State, pr.Merged, pr.MergeSHA, formatTime(pr.MergedAt), runID, pr.Number, pr.NodeID, pr.URL, pr.HeadBranch, pr.BaseBranch, pr.HeadSHA, pr.BaseSHA, pr.BodyDigest, pr.OwnershipKey, pr.DatabaseID)
 	if err != nil {
 		return err
 	}
@@ -774,6 +777,9 @@ func (s *Store) SaveGitHubReadFailure(ctx context.Context, runID, leaseOwner str
 		return err
 	}
 	defer tx.Rollback()
+	if err := validatePersistedGitHubRequestAuthority(ctx, tx, runID, observations); err != nil {
+		return err
+	}
 	var state, key, owner string
 	var leaseExpires int64
 	if err := tx.QueryRowContext(ctx, `SELECT current_state,idempotency_key,lease_owner,lease_expires_unix FROM runs WHERE run_id=?`, runID).Scan(&state, &key, &owner, &leaseExpires); err != nil {
@@ -791,6 +797,164 @@ func (s *Store) SaveGitHubReadFailure(ctx context.Context, runID, leaseOwner str
 		}
 	}
 	return tx.Commit()
+}
+
+// SaveGitHubManualPRTargetDrift commits a read-only conflict record and the
+// manual state edge together. It never updates pull_requests: the observed
+// target is untrusted conflict evidence, not a new controller binding.
+func (s *Store) SaveGitHubManualPRTargetDrift(ctx context.Context, runID, leaseOwner string, expectedState domain.State, idempotencyKey string, expectedRepository domain.RepositoryIdentity, persisted domain.PullRequest, observations []application.GitHubRequestObservation, metadata application.GitHubInstallationMetadata, evidence domain.GitHubReadEvidence, reason string) error {
+	if expectedState != domain.StateAwaitingGitHubMergeability || !samePullRequestIdentity(persisted, evidence.PullRequest) || !pullRequestTargetDrift(persisted, evidence.PullRequest) || strings.TrimSpace(reason) == "" {
+		return errors.New("manual GitHub target-drift evidence is incomplete")
+	}
+	raw, err := json.Marshal(evidence)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(raw)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := validatePersistedGitHubReadAuthority(ctx, tx, runID, metadata, evidence, observations, true); err != nil {
+		return err
+	}
+	if !sameRepositoryIdentity(expectedRepository, evidence.Repository) || !sameRepositoryIdentity(expectedRepository, metadata.Repository) {
+		return errors.New("manual GitHub target-drift repository authority changed")
+	}
+	durable, err := loadPullRequestBindingTx(ctx, tx, runID)
+	if err != nil {
+		return err
+	}
+	if !sameImmutablePullRequestBinding(persisted, durable) || !sameExactPullRequestIdentity(durable, evidence.PullRequest) || !pullRequestTargetDrift(durable, evidence.PullRequest) {
+		return errors.New("manual GitHub target-drift pull request binding changed")
+	}
+	var state, key, owner string
+	var leaseExpires int64
+	if err := tx.QueryRowContext(ctx, `SELECT current_state,idempotency_key,lease_owner,lease_expires_unix FROM runs WHERE run_id=?`, runID).Scan(&state, &key, &owner, &leaseExpires); err != nil {
+		return err
+	}
+	if domain.State(state) != expectedState || key != idempotencyKey || owner != leaseOwner || leaseExpires <= time.Now().UTC().UnixNano() {
+		return errors.New("GitHub reconciliation run authority changed")
+	}
+	for _, observation := range observations {
+		if observation.RunID != runID {
+			return errors.New("GitHub observation run mismatch")
+		}
+		if _, err := tx.ExecContext(ctx, githubRequestInsert, githubRequestArgs(observation)...); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO github_installations(run_id,app_id,installation_id,repository_id,repository_node_id,repository_owner,repository_name,token_expires_at,permissions_digest,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,app_id,installation_id,repository_id,token_expires_at,permissions_digest) DO NOTHING`, runID, metadata.AppID, metadata.InstallationID, metadata.Repository.ID, metadata.Repository.NodeID, metadata.Repository.Owner, metadata.Repository.Name, formatTime(metadata.TokenExpiresAt), metadata.PermissionsDigest, formatTime(metadata.ObservedAt)); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO github_read_evidence(run_id,head_sha,repository_id,evidence_json,evidence_digest,observed_at) VALUES(?,?,?,?,?,?) ON CONFLICT(run_id,head_sha,evidence_digest) DO NOTHING`, runID, evidence.PullRequest.HeadSHA, evidence.Repository.ID, string(raw), hex.EncodeToString(sum[:]), formatTime(evidence.ObservedAt)); err != nil {
+		return err
+	}
+	var sequence int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM transitions WHERE run_id=?`, runID).Scan(&sequence); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET current_state=?,last_error=?,updated_at=? WHERE run_id=? AND current_state=? AND idempotency_key=? AND lease_owner=? AND lease_expires_unix>?`, domain.StateManualIntervention, reason, nowText(), runID, expectedState, idempotencyKey, leaseOwner, time.Now().UTC().UnixNano())
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return errors.New("atomic GitHub target-drift state update mismatch")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO transitions(run_id,sequence,from_state,to_state,reason,evidence_reference,bound_head,created_at) VALUES(?,?,?,?,?,?,?,?)`, runID, sequence, expectedState, domain.StateManualIntervention, reason, "github_read_evidence:"+hex.EncodeToString(sum[:]), persisted.HeadSHA, nowText()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func sameRepositoryIdentity(expected, observed domain.RepositoryIdentity) bool {
+	return expected.ID == observed.ID && (expected.NodeID == "" || expected.NodeID == observed.NodeID) && strings.EqualFold(expected.Owner, observed.Owner) && strings.EqualFold(expected.Name, observed.Name)
+}
+
+func samePullRequestIdentity(expected, observed domain.PullRequest) bool {
+	return expected.Number == observed.Number && expected.NodeID == observed.NodeID && expected.URL == observed.URL && (expected.DatabaseID == 0 || expected.DatabaseID == observed.DatabaseID)
+}
+
+func pullRequestTargetDrift(expected, observed domain.PullRequest) bool {
+	return expected.BodyDigest == observed.BodyDigest && (expected.HeadBranch != observed.HeadBranch || expected.BaseBranch != observed.BaseBranch || expected.HeadSHA != observed.HeadSHA || expected.BaseSHA != observed.BaseSHA || expected.OwnershipKey != observed.OwnershipKey)
+}
+
+func loadPullRequestBindingTx(ctx context.Context, tx *sql.Tx, runID string) (domain.PullRequest, error) {
+	var pr domain.PullRequest
+	var merged int
+	var mergedAt string
+	err := tx.QueryRowContext(ctx, `SELECT number,database_id,url,node_id,head_branch,base_branch,head_sha,base_sha,body_digest,ownership_key,state,merged,merge_sha,merged_at FROM pull_requests WHERE run_id=?`, runID).Scan(&pr.Number, &pr.DatabaseID, &pr.URL, &pr.NodeID, &pr.HeadBranch, &pr.BaseBranch, &pr.HeadSHA, &pr.BaseSHA, &pr.BodyDigest, &pr.OwnershipKey, &pr.State, &merged, &pr.MergeSHA, &mergedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.PullRequest{}, errors.New("persisted pull request binding is required")
+		}
+		return domain.PullRequest{}, err
+	}
+	pr.Merged = merged != 0
+	pr.MergedAt = parseTime(mergedAt)
+	return pr, nil
+}
+
+func sameImmutablePullRequestBinding(left, right domain.PullRequest) bool {
+	return left.Number == right.Number && left.DatabaseID == right.DatabaseID && left.URL == right.URL && left.NodeID == right.NodeID && left.HeadBranch == right.HeadBranch && left.BaseBranch == right.BaseBranch && left.HeadSHA == right.HeadSHA && left.BaseSHA == right.BaseSHA && left.BodyDigest == right.BodyDigest && left.OwnershipKey == right.OwnershipKey
+}
+
+func sameExactPullRequestIdentity(left, right domain.PullRequest) bool {
+	return left.Number == right.Number && left.DatabaseID == right.DatabaseID && left.URL == right.URL && left.NodeID == right.NodeID
+}
+
+// validatePersistedGitHubReadAuthority rejects a changed GitHub authority
+// before a transaction writes any observation. Older local-only fixtures have
+// no GitHub binding; production manual target-drift handling requires one.
+func validatePersistedGitHubReadAuthority(ctx context.Context, tx *sql.Tx, runID string, metadata application.GitHubInstallationMetadata, evidence domain.GitHubReadEvidence, observations []application.GitHubRequestObservation, required bool) error {
+	appID, installationID, expected, configured, err := persistedGitHubAuthorityTx(ctx, tx, runID, required)
+	if err != nil || !configured {
+		return err
+	}
+	if metadata.AppID != appID || metadata.InstallationID != installationID || !sameRepositoryIdentity(expected, metadata.Repository) || !sameRepositoryIdentity(expected, evidence.Repository) {
+		return errors.New("GitHub repository or installation authority mismatch")
+	}
+	for _, observation := range observations {
+		if observation.RunID != runID || observation.InstallationID != installationID || !sameRepositoryIdentity(expected, observation.Repository) {
+			return errors.New("GitHub request observation authority mismatch")
+		}
+	}
+	return nil
+}
+
+func validatePersistedGitHubRequestAuthority(ctx context.Context, tx *sql.Tx, runID string, observations []application.GitHubRequestObservation) error {
+	_, installationID, expected, configured, err := persistedGitHubAuthorityTx(ctx, tx, runID, false)
+	if err != nil || !configured {
+		return err
+	}
+	for _, observation := range observations {
+		if observation.RunID != runID || observation.InstallationID != installationID || !sameRepositoryIdentity(expected, observation.Repository) {
+			return errors.New("GitHub request observation authority mismatch")
+		}
+	}
+	return nil
+}
+
+func persistedGitHubAuthorityTx(ctx context.Context, tx *sql.Tx, runID string, required bool) (int64, int64, domain.RepositoryIdentity, bool, error) {
+	var raw string
+	if err := tx.QueryRowContext(ctx, `SELECT repository_config_json FROM runs WHERE run_id=?`, runID).Scan(&raw); err != nil {
+		return 0, 0, domain.RepositoryIdentity{}, false, err
+	}
+	var binding application.LocalRepository
+	if err := json.Unmarshal([]byte(raw), &binding); err != nil {
+		return 0, 0, domain.RepositoryIdentity{}, false, errors.New("persisted GitHub repository authority is invalid")
+	}
+	configured := binding.GitHubAppID != 0 || binding.GitHubInstallationID != 0 || binding.ExpectedRepositoryID != 0 || binding.CanonicalRepository != ""
+	if !configured && !required {
+		return 0, 0, domain.RepositoryIdentity{}, false, nil
+	}
+	parts := strings.Split(binding.CanonicalRepository, "/")
+	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" || binding.GitHubAppID < 1 || binding.GitHubInstallationID < 1 || binding.ExpectedRepositoryID < 1 {
+		return 0, 0, domain.RepositoryIdentity{}, false, errors.New("persisted GitHub repository authority is incomplete")
+	}
+	expected := domain.RepositoryIdentity{ID: binding.ExpectedRepositoryID, Owner: parts[0], Name: parts[1]}
+	return binding.GitHubAppID, binding.GitHubInstallationID, expected, true, nil
 }
 
 func (s *Store) SaveGitHubEvidence(ctx context.Context, runID string, e domain.GitHubReadEvidence) error {

@@ -213,6 +213,235 @@ func TestGitHubReadSuccessPersistsEvidenceAndGateTransitionAtomically(t *testing
 	}
 }
 
+func TestManualPRTargetDriftPersistsSanitizedConflictWithoutRewritingBinding(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "controller.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	head := strings.Repeat("a", 40)
+	run := application.Run{ID: "target-drift", IssueID: "IFAN-44", IdempotencyKey: "target-key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: `{"canonical_repository":"owner/repo","github_app_id":1,"github_installation_id":2,"expected_repository_id":99}`, BaseBranch: "main", WorkingBranch: "feature", BaseSHA: "base", ArtifactRoot: "/tmp/target-drift", ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}
+	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCandidateHead(ctx, run.ID, head); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE runs SET current_state=? WHERE run_id=?`, domain.StateAwaitingGitHubMergeability, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	persisted := domain.PullRequest{Number: 44, DatabaseID: 144, URL: "https://example.invalid/pr/44", NodeID: "PR_44", HeadBranch: "feature", BaseBranch: "main", HeadSHA: head, BaseSHA: "base", BodyDigest: "body", OwnershipKey: run.IdempotencyKey, State: "open"}
+	if err := store.SavePullRequest(ctx, run.ID, persisted); err != nil {
+		t.Fatal(err)
+	}
+	owner := "target-drift-owner"
+	if acquired, err := store.AcquireLease(ctx, run.ID, owner, time.Now().Add(time.Minute)); err != nil || !acquired {
+		t.Fatalf("lease acquired=%v err=%v", acquired, err)
+	}
+	repo := domain.RepositoryIdentity{ID: 99, NodeID: "REPO", Owner: "owner", Name: "repo"}
+	now := time.Date(2026, 7, 14, 6, 0, 0, 0, time.UTC)
+	for _, mutate := range []struct {
+		name        string
+		apply       func(*domain.PullRequest, *domain.RepositoryIdentity, *application.GitHubInstallationMetadata, *application.GitHubRequestObservation)
+		caller      func(*domain.PullRequest)
+		wantPersist bool
+	}{
+		{name: "body only", apply: func(pr *domain.PullRequest, _ *domain.RepositoryIdentity, _ *application.GitHubInstallationMetadata, _ *application.GitHubRequestObservation) {
+			pr.BodyDigest = "other-body"
+		}},
+		{name: "target and body", apply: func(pr *domain.PullRequest, _ *domain.RepositoryIdentity, _ *application.GitHubInstallationMetadata, _ *application.GitHubRequestObservation) {
+			pr.BaseBranch, pr.BodyDigest = "release", "other-body"
+		}},
+		{name: "url only", apply: func(pr *domain.PullRequest, _ *domain.RepositoryIdentity, _ *application.GitHubInstallationMetadata, _ *application.GitHubRequestObservation) {
+			pr.URL = "https://example.invalid/pr/other"
+		}},
+		{name: "repository mismatch", apply: func(pr *domain.PullRequest, repo *domain.RepositoryIdentity, _ *application.GitHubInstallationMetadata, _ *application.GitHubRequestObservation) {
+			pr.BaseBranch = "release"
+			repo.ID = 100
+		}},
+		{name: "metadata mismatch", apply: func(pr *domain.PullRequest, _ *domain.RepositoryIdentity, metadata *application.GitHubInstallationMetadata, _ *application.GitHubRequestObservation) {
+			pr.BaseBranch = "release"
+			metadata.InstallationID = 3
+		}},
+		{name: "tampered caller binding", apply: func(pr *domain.PullRequest, _ *domain.RepositoryIdentity, _ *application.GitHubInstallationMetadata, _ *application.GitHubRequestObservation) {
+			pr.HeadBranch = "other-feature"
+		}, caller: func(pr *domain.PullRequest) { pr.BaseBranch = "caller-release" }},
+		{name: "base", apply: func(pr *domain.PullRequest, _ *domain.RepositoryIdentity, _ *application.GitHubInstallationMetadata, _ *application.GitHubRequestObservation) {
+			pr.BaseBranch, pr.BaseSHA = "release", "other-base"
+		}, wantPersist: true},
+		{name: "head", apply: func(pr *domain.PullRequest, _ *domain.RepositoryIdentity, _ *application.GitHubInstallationMetadata, _ *application.GitHubRequestObservation) {
+			pr.HeadBranch, pr.HeadSHA = "other-feature", strings.Repeat("b", 40)
+		}, wantPersist: true},
+		{name: "ownership", apply: func(pr *domain.PullRequest, _ *domain.RepositoryIdentity, _ *application.GitHubInstallationMetadata, _ *application.GitHubRequestObservation) {
+			pr.OwnershipKey = "other-owner"
+		}, wantPersist: true},
+	} {
+		t.Run(mutate.name, func(t *testing.T) {
+			if _, err := store.db.ExecContext(ctx, `UPDATE runs SET current_state=?,last_error='' WHERE run_id=?`, domain.StateAwaitingGitHubMergeability, run.ID); err != nil {
+				t.Fatal(err)
+			}
+			before := githubReadRowCounts(t, store, ctx, run.ID)
+			observed, evidenceRepo := persisted, repo
+			caller := persisted
+			metadata := application.GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: repo, TokenExpiresAt: now.Add(time.Hour), PermissionsDigest: "permissions", ObservedAt: now}
+			observation := application.GitHubRequestObservation{RunID: run.ID, Operation: "read_pull_request", Category: "GraphQL", HTTPStatus: 200, ResponseDigest: mutate.name, InstallationID: 2, Repository: repo, ObservedAt: now}
+			mutate.apply(&observed, &evidenceRepo, &metadata, &observation)
+			if mutate.caller != nil {
+				mutate.caller(&caller)
+			}
+			body := "untrusted external finding must never enter generic evidence"
+			digest := domain.TrustedReviewFeedbackDigest(body)
+			evidence := domain.GitHubReadEvidence{Repository: evidenceRepo, PullRequest: observed, Findings: []domain.NormalizedFinding{{Source: "github_required_check", SourceID: mutate.name, Body: body, BodyDigest: digest, HeadSHA: observed.HeadSHA, ObservedAt: now}}, ObservedAt: now}
+			err := store.SaveGitHubManualPRTargetDrift(ctx, run.ID, owner, domain.StateAwaitingGitHubMergeability, run.IdempotencyKey, repo, caller, []application.GitHubRequestObservation{observation}, metadata, evidence, "GitHub pull request target drifted while awaiting thread resolution")
+			inspection, inspectErr := store.Inspect(ctx, run.ID)
+			after := githubReadRowCounts(t, store, ctx, run.ID)
+			if mutate.wantPersist {
+				wantInstallations := before.installations
+				if wantInstallations == 0 {
+					wantInstallations = 1
+				}
+				if err != nil || inspectErr != nil || inspection.Run.State != domain.StateManualIntervention || inspection.PullRequest == nil || *inspection.PullRequest != persisted || inspection.GitHubEvidence == nil || inspection.GitHubEvidence.PullRequest != observed || after.requests != before.requests+1 || after.installations != wantInstallations || after.evidence != before.evidence+1 || after.transitions != before.transitions+1 {
+					t.Fatalf("inspection=%+v err=%v inspectErr=%v before=%+v after=%+v", inspection, err, inspectErr, before, after)
+				}
+				var evidenceJSON string
+				if err := store.db.QueryRowContext(ctx, `SELECT evidence_json FROM github_read_evidence WHERE run_id=? ORDER BY evidence_id DESC LIMIT 1`, run.ID).Scan(&evidenceJSON); err != nil || bytes.Contains([]byte(evidenceJSON), []byte(body)) {
+					t.Fatalf("conflict evidence leaked body or is absent: err=%v evidence=%q", err, evidenceJSON)
+				}
+				return
+			}
+			if err == nil || inspectErr != nil || inspection.Run.State != domain.StateAwaitingGitHubMergeability || inspection.PullRequest == nil || *inspection.PullRequest != persisted || after != before {
+				t.Fatalf("manual conflict was partially persisted: inspection=%+v err=%v inspectErr=%v before=%+v after=%+v", inspection, err, inspectErr, before, after)
+			}
+		})
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	inspection, err := store.Inspect(ctx, run.ID)
+	if err != nil || inspection.PullRequest == nil || *inspection.PullRequest != persisted || inspection.Run.State != domain.StateManualIntervention || inspection.GitHubEvidence == nil {
+		t.Fatalf("restart inspection=%+v err=%v", inspection, err)
+	}
+}
+
+type githubReadRows struct{ requests, installations, evidence, transitions int }
+
+func githubReadRowCounts(t *testing.T, store *Store, ctx context.Context, runID string) githubReadRows {
+	t.Helper()
+	var counts githubReadRows
+	for _, query := range []struct {
+		name string
+		to   *int
+	}{
+		{name: "github_request_observations", to: &counts.requests},
+		{name: "github_installations", to: &counts.installations},
+		{name: "github_read_evidence", to: &counts.evidence},
+		{name: "transitions", to: &counts.transitions},
+	} {
+		if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+query.name+` WHERE run_id=?`, runID).Scan(query.to); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return counts
+}
+
+func TestGitHubReadSuccessRejectsTargetMismatchWithoutPartialWrites(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	run := application.Run{ID: "non-manual-drift", IssueID: "IFAN-44-FAIL", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: `{"canonical_repository":"owner/repo","github_app_id":1,"github_installation_id":2,"expected_repository_id":99}`, BaseBranch: "main", WorkingBranch: "feature", BaseSHA: "base", ArtifactRoot: "/tmp/non-manual-drift", ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}
+	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCandidateHead(ctx, run.ID, "head"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE runs SET current_state=? WHERE run_id=?`, domain.StateAwaitingGitHubMergeability, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	persisted := domain.PullRequest{Number: 1, DatabaseID: 1, URL: "https://example.invalid/pr/1", NodeID: "PR_1", HeadBranch: "feature", BaseBranch: "main", HeadSHA: "head", BaseSHA: "base", BodyDigest: "body", OwnershipKey: "key", State: "open"}
+	if err := store.SavePullRequest(ctx, run.ID, persisted); err != nil {
+		t.Fatal(err)
+	}
+	owner := "non-manual-owner"
+	if ok, err := store.AcquireLease(ctx, run.ID, owner, time.Now().Add(time.Minute)); err != nil || !ok {
+		t.Fatalf("lease ok=%v err=%v", ok, err)
+	}
+	repo := domain.RepositoryIdentity{ID: 99, NodeID: "REPO", Owner: "owner", Name: "repo"}
+	now := time.Now().UTC()
+	metadata := application.GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: repo, TokenExpiresAt: now.Add(time.Hour), PermissionsDigest: "permissions", ObservedAt: now}
+	for _, tc := range []struct {
+		name  string
+		apply func(*domain.PullRequest)
+	}{
+		{name: "body only", apply: func(pr *domain.PullRequest) { pr.BodyDigest = "other-body" }},
+		{name: "target and body", apply: func(pr *domain.PullRequest) { pr.BaseBranch, pr.BodyDigest = "release", "other-body" }},
+		{name: "url only", apply: func(pr *domain.PullRequest) { pr.URL = "https://example.invalid/pr/other" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			drifted := persisted
+			tc.apply(&drifted)
+			before := githubReadRowCounts(t, store, ctx, run.ID)
+			evidence := domain.GitHubReadEvidence{Repository: repo, PullRequest: drifted, ObservedAt: now}
+			err := store.SaveGitHubReadSuccess(ctx, run.ID, owner, domain.StateAwaitingGitHubMergeability, run.IdempotencyKey, []application.GitHubRequestObservation{{RunID: run.ID, Operation: "read", Category: "REST", HTTPStatus: 200, ResponseDigest: tc.name, InstallationID: 2, Repository: repo, ObservedAt: now}}, drifted, metadata, evidence, nil, nil, nil, domain.StateManualIntervention, "must fail")
+			inspection, inspectErr := store.Inspect(ctx, run.ID)
+			after := githubReadRowCounts(t, store, ctx, run.ID)
+			if err == nil || inspectErr != nil || inspection.Run.State != domain.StateAwaitingGitHubMergeability || inspection.PullRequest == nil || *inspection.PullRequest != persisted || after != before {
+				t.Fatalf("non-manual mismatch partially persisted: inspection=%+v err=%v inspectErr=%v before=%+v after=%+v", inspection, err, inspectErr, before, after)
+			}
+		})
+	}
+}
+
+func TestGitHubReadFailureRejectsMismatchedAuthorityWithoutWrites(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	run := application.Run{ID: "read-failure-authority", IssueID: "IFAN-44-READ", IdempotencyKey: "read-key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: `{"canonical_repository":"owner/repo","github_app_id":1,"github_installation_id":2,"expected_repository_id":99}`, BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: "/tmp/read-failure-authority", ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}
+	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE runs SET current_state=? WHERE run_id=?`, domain.StateAwaitingGitHubMergeability, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	persisted := domain.PullRequest{Number: 1, DatabaseID: 1, URL: "https://example.invalid/pr/1", NodeID: "PR_1", HeadBranch: "feature", BaseBranch: "main", HeadSHA: "head", BaseSHA: "base", BodyDigest: "body", OwnershipKey: run.IdempotencyKey, State: "open"}
+	if err := store.SavePullRequest(ctx, run.ID, persisted); err != nil {
+		t.Fatal(err)
+	}
+	owner := "failure-owner"
+	if ok, err := store.AcquireLease(ctx, run.ID, owner, time.Now().Add(time.Minute)); err != nil || !ok {
+		t.Fatalf("lease ok=%v err=%v", ok, err)
+	}
+	for _, tc := range []struct {
+		name string
+		obs  application.GitHubRequestObservation
+	}{
+		{name: "repository", obs: application.GitHubRequestObservation{RunID: run.ID, Operation: "read", Category: "REST", HTTPStatus: 404, ResponseDigest: "repo", InstallationID: 2, Repository: domain.RepositoryIdentity{ID: 100, Owner: "owner", Name: "repo"}, ObservedAt: time.Now().UTC()}},
+		{name: "installation", obs: application.GitHubRequestObservation{RunID: run.ID, Operation: "read", Category: "REST", HTTPStatus: 401, ResponseDigest: "installation", InstallationID: 3, Repository: domain.RepositoryIdentity{ID: 99, Owner: "owner", Name: "repo"}, ObservedAt: time.Now().UTC()}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := githubReadRowCounts(t, store, ctx, run.ID)
+			err := store.SaveGitHubReadFailure(ctx, run.ID, owner, domain.StateAwaitingGitHubMergeability, run.IdempotencyKey, []application.GitHubRequestObservation{tc.obs})
+			inspection, inspectErr := store.Inspect(ctx, run.ID)
+			after := githubReadRowCounts(t, store, ctx, run.ID)
+			if err == nil || inspectErr != nil || inspection.Run.State != domain.StateAwaitingGitHubMergeability || inspection.PullRequest == nil || *inspection.PullRequest != persisted || after != before {
+				t.Fatalf("failure telemetry was partially persisted: inspection=%+v err=%v inspectErr=%v before=%+v after=%+v", inspection, err, inspectErr, before, after)
+			}
+		})
+	}
+}
+
 func TestGitHubReadAtomicallySelectsTrustedFeedbackWithRepairTransition(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
