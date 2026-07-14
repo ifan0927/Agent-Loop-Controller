@@ -64,8 +64,8 @@ non-secret GitHub App profile reference; installation and immutable repository
 IDs; and allowed operator logins. Duplicate identities, shared or overlapping
 paths, unsupported verifiers, and incomplete legacy entries fail closed.
 
-Controller configuration version 2 stores these repository entries inline in
-the one operator configuration document. Version 1 configurations retain the
+Controller configuration versions 2 and 3 store these repository entries inline
+in the one operator configuration document. Version 1 configurations retain the
 separate registry-file reference only for compatibility; the registry validator
 and per-run authority evidence are the same in both forms.
 

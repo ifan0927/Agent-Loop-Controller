@@ -124,7 +124,7 @@ fast-forward lease before it can update that branch.
 Production commands use one versioned controller composition file. On macOS the
 default location is `~/Library/Application Support/agent-loop-controller/controller.json`;
 `--config /absolute/path/controller.json` remains an explicit test, CI, or
-multi-environment override. Version 2 keeps the controller database and Codex
+multi-environment override. Version 3 keeps the controller database and Codex
 settings, an inline Linear read profile, inline repository entries, and one
 GitHub App profile for each repository in that one document. Credentials remain
 external: the Linear profile names a credential source and a GitHub profile
@@ -201,18 +201,19 @@ deleting the dedicated worktree and owned local and remote branches; artifact
 directories are retained. Any mismatch, dirty worktree, or partial failure
 remains auditable and can be resumed idempotently by the driver.
 
-The version 2 controller configuration is strict JSON with this shape. The
+The version 3 controller configuration is strict JSON with this shape. The
 repository policy that used to live in a separate registry file is now inline:
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "controller": {
     "database_path": "/absolute/path/controller.db",
     "codex_binary": "codex",
     "run_timeout": "30m"
   },
   "linear": { "...": "the strict Linear read profile fields" },
+  "automation": { "linear_todo_admission": { "enabled": false } },
   "github_app_profiles": [
     { "id": "github-app-profile:example", "config": { "...": "the strict GitHub App profile fields" } }
   ],

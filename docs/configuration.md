@@ -5,7 +5,7 @@
 On macOS, production commands read
 `~/Library/Application Support/agent-loop-controller/controller.json` when
 `--config` is omitted. `ifan-loop config path` reports this path, and
-`ifan-loop config init` creates a secret-free version 2 starter file using
+`ifan-loop config init` creates a secret-free version 3 starter file using
 exclusive creation. The final directory is mode `0700` and the configuration
 file is mode `0600`.
 
@@ -22,13 +22,18 @@ The following files are separate from the configuration document:
 The PEM and Linear token are credentials and must never be included in
 `controller.json`, SQLite, artifacts, logs, or UI responses.
 
-## Version 2 document
+## Version 3 document
 
-Version 2 replaces the production `repository_registry_file` reference with an
+Version 3 adds a disabled-by-default, local-only automatic Linear Todo
+admission authority. It does not start polling, contact Linear, open a
+credential source, create runs, or start a worker. Version 2 replaces the
+production `repository_registry_file` reference with an
 inline `repositories` array. The validation, canonicalization, profile digest,
 path isolation, and GitHub authority checks are identical to the legacy
-registry. A version 1 document remains readable for existing tests and isolated
-legacy configurations, but new operator configurations should use version 2.
+registry. Version 1 and version 2 documents remain readable for existing tests
+and isolated legacy configurations; a version 2 document is equivalent to
+automatic admission being disabled. New operator configurations should use
+version 3.
 
 The configuration contains non-secret references only:
 
@@ -38,6 +43,21 @@ The configuration contains non-secret references only:
   absolute path of an external PEM file;
 - repository origin binding, local checkout/run/worktree roots, verifier IDs,
   and trusted operator identities.
+
+The optional `automation.linear_todo_admission` object is an authority record,
+not an execution switch. `enabled: false` may omit the remaining fields. When
+enabled, it must pin the IFAN team UUID/key, exact Todo (`Todo`, `unstarted`)
+and In Progress (`In Progress`, `started`) workflow states, bounded scheduler
+timing and candidate/page limits, one active run, a fixed GitHub `User`
+requester trusted by every configured repository profile, `local_outbox`
+notification mode, and a credential-source reference. The credential reference
+uses the same `secret://...` grammar as the Linear profile and is never
+resolved by `config validate` or `config inspect`.
+
+`config inspect` emits only the enabled flag, configured limits, fixed
+non-secret requester identity, and the existing stable repository/profile
+digests. It never emits the automatic-admission credential reference, workflow
+state IDs, configuration paths, or credential contents.
 
 An empty starter document is deliberately not runnable. Add at least one
 matching GitHub App profile and repository entry, then run `config validate`.

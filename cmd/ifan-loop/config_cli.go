@@ -107,14 +107,30 @@ type configInitOutput struct {
 }
 
 // configTemplate intentionally contains no credentials or private-key paths.
-// It remains a strict v2 JSON document, but has no repository or GitHub App
+// It remains a strict v3 JSON document, but has no repository or GitHub App
 // profiles; an operator must add those before validation and execution.
 type configTemplate struct {
-	Version           int                   `json:"version"`
-	Controller        configTemplateControl `json:"controller"`
-	Linear            configTemplateLinear  `json:"linear"`
-	GitHubAppProfiles []json.RawMessage     `json:"github_app_profiles"`
-	Repositories      []json.RawMessage     `json:"repositories"`
+	Version           int                      `json:"version"`
+	Controller        configTemplateControl    `json:"controller"`
+	Linear            configTemplateLinear     `json:"linear"`
+	GitHubAppProfiles []json.RawMessage        `json:"github_app_profiles"`
+	Repositories      []json.RawMessage        `json:"repositories"`
+	Automation        configTemplateAutomation `json:"automation"`
+}
+
+type configTemplateAutomation struct {
+	LinearTodoAdmission configTemplateLinearTodoAdmission `json:"linear_todo_admission"`
+}
+
+type configTemplateLinearTodoAdmission struct {
+	Enabled                       bool   `json:"enabled"`
+	PollInterval                  string `json:"poll_interval"`
+	SchedulerLeaseTTL             string `json:"scheduler_lease_ttl"`
+	SchedulerLeaseRenewalInterval string `json:"scheduler_lease_renewal_interval"`
+	MaxCandidates                 int    `json:"max_candidates"`
+	MaxPages                      int    `json:"max_pages"`
+	MaxActiveRuns                 int    `json:"max_active_runs"`
+	NotificationMode              string `json:"notification_mode"`
 }
 
 type configTemplateControl struct {
@@ -202,7 +218,7 @@ func createConfigDirectory(path string) error {
 
 func newConfigTemplate(root string) configTemplate {
 	return configTemplate{
-		Version: 2,
+		Version: 3,
 		Controller: configTemplateControl{
 			DatabasePath: filepath.Join(root, "controller.db"),
 			CodexBinary:  "codex",
@@ -220,5 +236,9 @@ func newConfigTemplate(root string) configTemplate {
 		},
 		GitHubAppProfiles: []json.RawMessage{},
 		Repositories:      []json.RawMessage{},
+		Automation: configTemplateAutomation{LinearTodoAdmission: configTemplateLinearTodoAdmission{
+			Enabled: false, PollInterval: "5m", SchedulerLeaseTTL: "1m", SchedulerLeaseRenewalInterval: "20s",
+			MaxCandidates: 20, MaxPages: 5, MaxActiveRuns: 1, NotificationMode: "local_outbox",
+		}},
 	}
 }

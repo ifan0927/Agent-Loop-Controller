@@ -62,7 +62,7 @@ func (c Config) Validate() error {
 	if c.APIURL == "" || c.CredentialSourceRef == "" || c.AuthorizationScheme == "" || c.TeamKey == "" {
 		return errors.New("incomplete Linear configuration")
 	}
-	if !validCredentialSourceRef(c.CredentialSourceRef) {
+	if !ValidCredentialSourceRef(c.CredentialSourceRef) {
 		return errors.New("invalid Linear credential source reference")
 	}
 	if c.AuthorizationScheme != "bearer" && c.AuthorizationScheme != "api_key" {
@@ -87,7 +87,9 @@ func (c Config) Validate() error {
 	return nil
 }
 
-func validCredentialSourceRef(value string) bool {
+// ValidCredentialSourceRef validates a secret reference without resolving it.
+// It is shared by offline configuration authority validation.
+func ValidCredentialSourceRef(value string) bool {
 	if strings.TrimSpace(value) != value || len(value) > 256 {
 		return false
 	}
