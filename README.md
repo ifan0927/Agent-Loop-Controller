@@ -177,6 +177,9 @@ go run ./cmd/ifan-loop controller worker --max-runtime 24h
 
 It exposes no HTTP listener, webhook, daemon, or service installation. A
 worker stops on operator attention and never admits another issue in that run.
+For a logged-in macOS user's optional restart-after-failure supervision, see
+the read-only render and LaunchAgent procedure in
+[the LaunchAgent worker runbook](docs/launchagent-worker.md).
 
 ```sh
 go run ./cmd/ifan-loop controller run IFAN-42 \
