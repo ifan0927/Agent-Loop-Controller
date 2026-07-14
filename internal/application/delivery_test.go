@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -223,6 +224,55 @@ func TestCleanupRestartSkipsPersistedDeletedResource(t *testing.T) {
 	if len(port.calls) != 2 {
 		t.Fatalf("deleted worktree retried or remaining resources skipped: %v", port.calls)
 	}
+}
+
+func TestCleanupRetryTouchesOnlyTheFailedOwnedDeleteBoundary(t *testing.T) {
+	for _, kind := range []string{"worktree", "remote_branch", "local_branch"} {
+		t.Run(kind, func(t *testing.T) {
+			store := &deliveryMemoryStore{}
+			first := &boundaryCleanup{fail: kind}
+			run, merge, resources := ownedCleanupFixture()
+			if err := CleanupOwned(context.Background(), store, first, run, merge, resources); err == nil {
+				t.Fatal("expected owned delete failure")
+			}
+			second := &boundaryCleanup{}
+			if err := CleanupOwned(context.Background(), store, second, run, merge, resources); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(second.calls, []string{kind}) {
+				t.Fatalf("restart calls=%v, want only %s", second.calls, kind)
+			}
+		})
+	}
+}
+
+type boundaryCleanup struct {
+	fail  string
+	calls []string
+}
+
+func (f *boundaryCleanup) RemoveWorktree(context.Context, string, string, string, string) error {
+	f.calls = append(f.calls, "worktree")
+	if f.fail == "worktree" {
+		return errors.New("temporary worktree failure")
+	}
+	return nil
+}
+
+func (f *boundaryCleanup) DeleteLocalBranch(context.Context, string, string, string) error {
+	f.calls = append(f.calls, "local_branch")
+	if f.fail == "local_branch" {
+		return errors.New("temporary local branch failure")
+	}
+	return nil
+}
+
+func (f *boundaryCleanup) DeleteRemoteBranch(context.Context, string, string, string) error {
+	f.calls = append(f.calls, "remote_branch")
+	if f.fail == "remote_branch" {
+		return errors.New("temporary remote branch failure")
+	}
+	return nil
 }
 
 func TestCleanupSupportsPreNonceOwnedResources(t *testing.T) {

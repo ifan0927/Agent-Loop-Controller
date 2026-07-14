@@ -123,3 +123,15 @@ func TestSyncSourceCheckoutRejectsInvalidResultsAndStopsOnPersistenceFailure(t *
 		t.Fatalf("err=%v cleanup=%+v", err, store.cleanup)
 	}
 }
+
+func TestSyncSourceCheckoutDoesNotInvokeGitWhenIntentPersistenceFails(t *testing.T) {
+	run, merge := sourceSyncFixture(t)
+	store := &sourceSyncStore{failUpsertAt: 1}
+	port := &recordingSourceSync{store: store, result: SourceSyncResult{Status: SourceSyncSynced, Outcome: SourceSyncFastForwarded, MergeSHA: merge.MergeSHA}}
+	if err := SyncSourceCheckout(context.Background(), store, port, run, merge); err == nil {
+		t.Fatal("expected intent persistence failure")
+	}
+	if len(port.calls) != 0 || len(store.cleanup) != 0 {
+		t.Fatalf("source adapter crossed an unpersisted intent boundary: calls=%+v cleanup=%+v", port.calls, store.cleanup)
+	}
+}

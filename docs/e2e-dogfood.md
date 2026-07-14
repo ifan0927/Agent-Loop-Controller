@@ -145,6 +145,34 @@ must still pass its normal exact-HEAD, remote, and fast-forward-lease checks.
 | Dirty source synchronization | Completion observed after merge; configured source checkout has a dirty sentinel | The dirty source checkout and sentinel remain untouched; owned fixture resources are cleaned; the run reaches `completed` with one sanitized pending `source_checkout_sync_required` attention record. |
 | Authority conflict | Remote, repository, installation, head, approval, or ownership mismatch | The run fails closed to documented operator intervention; it performs no speculative repair or write. |
 
+## Disposable source-sync acceptance
+
+The source-synchronization matrix is a deterministic offline acceptance suite.
+Each invocation creates its own temporary bare origin, source checkout,
+controller worktree evidence, and SQLite database; it does not read or write a
+configured operator checkout, GitHub, or Linear.
+
+Run the clean exact-merge, restart-adoption, and no-attention case:
+
+```sh
+go test -race ./internal/adapters/sqlite -run 'TestDisposableSourceSyncFixtureMatrix/clean.*exact.*merge' -count=1
+```
+
+Run the dirty, wrong-branch, detached, and diverged source cases. They prove
+the source HEAD and sentinel remain untouched while owned cleanup completes and
+the sanitized attention projection is present:
+
+```sh
+go test -race ./internal/adapters/sqlite -run 'TestDisposableSourceSyncFixtureMatrix/unsafe.*source.*variants' -count=1
+```
+
+Run the complete offline matrix, including ahead/no-rewind and retryable
+boundary cases:
+
+```sh
+go test -race ./internal/adapters/sqlite -run TestDisposableSourceSyncFixtureMatrix -count=1
+```
+
 ## Evidence handoff
 
 Retain the controller's sanitized inspection, transition history, verification
