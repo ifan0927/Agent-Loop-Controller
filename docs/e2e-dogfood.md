@@ -116,6 +116,13 @@ state commands are reserved for a documented recovery procedure or one of the
 fault injections below; they are not required to complete the normal delivery
 path.
 
+A completed run can still expose a pending `operator_attention` record when
+the configured source checkout was intentionally left untouched because it was
+unsafe to synchronize. The current operator action is manual inspection and
+synchronization of that checkout. This stable, sanitized read projection is for
+future Hermes or UI consumers only: it has no notification transport,
+acknowledgement, retry, or automatic remediation behavior.
+
 For the specific case where a review repair creates a new verified candidate but
 the existing owned PR branch update halted, an operator may use
 `recover-owned-push` from `manual_intervention`. The command revalidates the
@@ -134,7 +141,8 @@ must still pass its normal exact-HEAD, remote, and fast-forward-lease checks.
 | Owned PR push recovery | A repair update halted at `manual_intervention` | An explicit `recover-owned-push` may restore the push gate only after unchanged Linear and retained owned-PR proof; the driver revalidates before the eventual write. |
 | Merge restart | Merge intent recorded, response unavailable | Restart the driver with `drive`; it re-reads GitHub and records the one authoritative squash merge, without a second merge write. |
 | Linear pending | Merge observed, completion automation delayed | The running driver remains in `awaiting_linear_completion`; cleanup is prohibited. |
-| Linear completed | Completion observed after merge | The driver enters `cleaning`, deletes only owned fixture resources, and reaches `completed`. |
+| Clean source synchronization | Completion observed after merge; configured source checkout is clean and its base HEAD equals the persisted squash merge SHA | The driver reaches `completed`, the source checkout remains at that exact merge SHA, and `operator_attention` is `[]`. |
+| Dirty source synchronization | Completion observed after merge; configured source checkout has a dirty sentinel | The dirty source checkout and sentinel remain untouched; owned fixture resources are cleaned; the run reaches `completed` with one sanitized pending `source_checkout_sync_required` attention record. |
 | Authority conflict | Remote, repository, installation, head, approval, or ownership mismatch | The run fails closed to documented operator intervention; it performs no speculative repair or write. |
 
 ## Evidence handoff

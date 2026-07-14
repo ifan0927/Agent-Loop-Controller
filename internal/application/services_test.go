@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -200,6 +201,64 @@ func TestQueryServiceSanitizesInspectionAndProjectsIdempotencyKey(t *testing.T) 
 	raw, _ := json.Marshal(got)
 	if got.Run.IdempotencyKey != "resume-key" || !strings.Contains(string(raw), `"idempotency_key":"resume-key"`) || strings.Contains(string(raw), "super-secret-token") || strings.Contains(string(raw), "secret-holder") || strings.Contains(string(raw), "not-for-output") || strings.Contains(string(raw), "/secret/") || !strings.Contains(string(raw), `"content_trust":"untrusted"`) {
 		t.Fatalf("inspection was not sanitized: %s", raw)
+	}
+}
+
+func TestQueryServiceProjectsDeterministicSourceCheckoutOperatorAttention(t *testing.T) {
+	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateCompleted})
+	observed := time.Date(2026, 7, 14, 0, 0, 0, 0, time.UTC)
+	inspection := RunInspection{Run: run, Cleanup: []CleanupRecord{
+		{Kind: "source_checkout", Name: "/private/source", Status: "skipped_attention", ErrorClass: string(SourceSyncReasonWrongBranch), LastError: "token=not-for-output", UpdatedAt: observed},
+		{Kind: "source_checkout", Name: "/private/source", Status: "skipped_attention", ErrorClass: string(SourceSyncReasonDirtySource), LastError: "Authorization: Bearer not-for-output", UpdatedAt: observed},
+		{Kind: "worktree", Name: "/private/worktree", Status: "deleted", UpdatedAt: observed},
+	}}
+	service := NewQueryService(serviceStore{run: run, inspection: inspection})
+	status, err := service.Status(context.Background(), QueryInput{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspect, err := service.Inspect(context.Background(), QueryInput{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(status.OperatorAttention, inspect.OperatorAttention) {
+		t.Fatalf("status/inspect attention mismatch: status=%+v inspect=%+v", status.OperatorAttention, inspect.OperatorAttention)
+	}
+	if status.Run.State != domain.StateCompleted || len(status.OperatorAttention) != 1 {
+		t.Fatalf("state=%s attention=%+v", status.Run.State, status.OperatorAttention)
+	}
+	attention := status.OperatorAttention[0]
+	if attention.Code != sourceCheckoutAttentionCode || attention.Component != sourceCheckoutAttentionComponent || attention.Severity != "warning" || attention.Status != "pending" || attention.ReasonCode != string(SourceSyncReasonDirtySource) || !attention.ObservedAt.Equal(observed) {
+		t.Fatalf("attention=%+v", attention)
+	}
+	raw, _ := json.Marshal(status)
+	if strings.Contains(string(raw), "/private/") || strings.Contains(string(raw), "not-for-output") {
+		t.Fatalf("operator attention leaked sensitive cleanup evidence: %s", raw)
+	}
+}
+
+func TestQueryServiceSourceCheckoutAttentionUsesEmptyArrayAndGenericUnknownReason(t *testing.T) {
+	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo"})
+	service := NewQueryService(serviceStore{run: run, inspection: RunInspection{Run: run}})
+	withoutAttention, err := service.Inspect(context.Background(), QueryInput{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withoutAttention.OperatorAttention == nil || len(withoutAttention.OperatorAttention) != 0 {
+		t.Fatalf("missing empty operator attention array: %+v", withoutAttention.OperatorAttention)
+	}
+
+	inspection := RunInspection{Run: run, Cleanup: []CleanupRecord{{Kind: "source_checkout", Name: "/secret/checkout", Status: "skipped_attention", ErrorClass: "unexpected /secret/path token=not-for-output", UpdatedAt: time.Now().UTC()}}}
+	withUnknownReason, err := NewQueryService(serviceStore{run: run, inspection: inspection}).Inspect(context.Background(), QueryInput{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(withUnknownReason.OperatorAttention) != 1 || withUnknownReason.OperatorAttention[0].ReasonCode != sourceCheckoutAttentionReason || withUnknownReason.Cleanup[0].ErrorClass != sourceCheckoutAttentionReason {
+		t.Fatalf("unknown source reason was not sanitized: attention=%+v cleanup=%+v", withUnknownReason.OperatorAttention, withUnknownReason.Cleanup)
+	}
+	raw, _ := json.Marshal(withUnknownReason)
+	if strings.Contains(string(raw), "/secret/") || strings.Contains(string(raw), "not-for-output") {
+		t.Fatalf("unknown source reason leaked: %s", raw)
 	}
 }
 

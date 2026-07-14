@@ -375,6 +375,7 @@ type InspectionResult struct {
 	Merge             *MergeRecord                  `json:"merge_result,omitempty"`
 	LinearCompletion  []LinearCompletionObservation `json:"linear_completion_observations"`
 	Cleanup           []CleanupResult               `json:"cleanup_progress"`
+	OperatorAttention []OperatorAttentionResult     `json:"operator_attention"`
 	Checks            []CheckResult                 `json:"checks"`
 	Findings          []FindingResult               `json:"review_findings"`
 	Telemetry         []TelemetryResult             `json:"unknown_telemetry"`
@@ -456,6 +457,18 @@ type CleanupResult struct {
 	ErrorClass string    `json:"error_class,omitempty"`
 	UpdatedAt  time.Time `json:"updated_at"`
 }
+
+// OperatorAttentionResult is an advisory, read-only projection of durable
+// cleanup evidence. It neither changes a run's lifecycle nor authorizes a
+// source checkout write.
+type OperatorAttentionResult struct {
+	Code       string    `json:"code"`
+	Component  string    `json:"component"`
+	Severity   string    `json:"severity"`
+	Status     string    `json:"status"`
+	ReasonCode string    `json:"reason_code"`
+	ObservedAt time.Time `json:"observed_at"`
+}
 type CheckResult struct {
 	Name        string    `json:"name"`
 	Required    bool      `json:"required"`
@@ -511,7 +524,7 @@ type PullRequestResult struct {
 
 func projectInspection(value RunInspection) InspectionResult {
 	result := InspectionResult{SchemaVersion: querySchemaVersion, Run: projectRunResult(value.Run), RepositoryBinding: projectRepositoryBinding(value.RepositoryBinding), Merge: value.Merge,
-		Timeline: []TransitionResult{}, Attempts: []AttemptResult{}, Verifications: []VerificationResult{}, Reviews: []ReviewResult{}, Resources: []ResourceResult{}, LinearCompletion: append([]LinearCompletionObservation(nil), value.LinearCompletion...), Cleanup: []CleanupResult{}, Checks: []CheckResult{}, Findings: []FindingResult{}, Telemetry: []TelemetryResult{}}
+		Timeline: []TransitionResult{}, Attempts: []AttemptResult{}, Verifications: []VerificationResult{}, Reviews: []ReviewResult{}, Resources: []ResourceResult{}, LinearCompletion: append([]LinearCompletionObservation(nil), value.LinearCompletion...), Cleanup: []CleanupResult{}, OperatorAttention: []OperatorAttentionResult{}, Checks: []CheckResult{}, Findings: []FindingResult{}, Telemetry: []TelemetryResult{}}
 	if value.Approval != nil {
 		result.Approval = &HumanApprovalResult{Approver: sanitizeUntrustedContent(value.Approval.Approver), ApprovedSHA: value.Approval.ApprovedSHA, SourceAt: value.Approval.ApprovedAt, ObservedAt: value.Approval.ObservedAt}
 	}
@@ -538,8 +551,9 @@ func projectInspection(value RunInspection) InspectionResult {
 		result.Resources = append(result.Resources, ResourceResult{v.Kind, v.Status, v.CreatedAt})
 	}
 	for _, v := range value.Cleanup {
-		result.Cleanup = append(result.Cleanup, CleanupResult{v.Kind, v.Status, v.ErrorClass, v.UpdatedAt})
+		result.Cleanup = append(result.Cleanup, CleanupResult{v.Kind, v.Status, sanitizedCleanupErrorClass(v), v.UpdatedAt})
 	}
+	result.OperatorAttention = projectOperatorAttention(value.Cleanup)
 	for _, finding := range value.Findings {
 		result.Findings = append(result.Findings, FindingResult{Source: finding.Source, SourceID: finding.SourceID,
 			File: sanitizeRepositoryPath(finding.File), Line: finding.Line, Severity: finding.Severity, BodyDigest: finding.BodyDigest,
@@ -548,6 +562,63 @@ func projectInspection(value RunInspection) InspectionResult {
 	}
 	appendUnknownTelemetry(&result, value)
 	return result
+}
+
+const (
+	sourceCheckoutAttentionCode      = "source_checkout_sync_required"
+	sourceCheckoutAttentionComponent = "source_checkout"
+	sourceCheckoutAttentionReason    = "source_checkout_requires_manual_sync"
+)
+
+// projectOperatorAttention intentionally recognizes only terminal source-sync
+// attention evidence. A cleanup row is an implementation record, so its name,
+// raw error, and arbitrary persisted reason are never projected here.
+func projectOperatorAttention(cleanup []CleanupRecord) []OperatorAttentionResult {
+	var selected *OperatorAttentionResult
+	for _, record := range cleanup {
+		if record.Kind != "source_checkout" || record.Status != "skipped_attention" {
+			continue
+		}
+		candidate := OperatorAttentionResult{
+			Code:       sourceCheckoutAttentionCode,
+			Component:  sourceCheckoutAttentionComponent,
+			Severity:   "warning",
+			Status:     "pending",
+			ReasonCode: sourceCheckoutAttentionReasonCode(record.ErrorClass),
+			ObservedAt: record.UpdatedAt,
+		}
+		if selected == nil || candidate.ObservedAt.After(selected.ObservedAt) || (candidate.ObservedAt.Equal(selected.ObservedAt) && candidate.ReasonCode < selected.ReasonCode) {
+			selected = &candidate
+		}
+	}
+	if selected == nil {
+		return []OperatorAttentionResult{}
+	}
+	return []OperatorAttentionResult{*selected}
+}
+
+func sanitizedCleanupErrorClass(record CleanupRecord) string {
+	if record.Kind == "source_checkout" && record.Status == "skipped_attention" {
+		return sourceCheckoutAttentionReasonCode(record.ErrorClass)
+	}
+	if record.Kind == "source_checkout" && record.Status == "failed" {
+		switch record.ErrorClass {
+		case string(SourceSyncReasonFetchFailed), string(SourceSyncReasonGitUncertain):
+			return record.ErrorClass
+		default:
+			return "source_checkout_retryable_failure"
+		}
+	}
+	return record.ErrorClass
+}
+
+func sourceCheckoutAttentionReasonCode(reason string) string {
+	switch reason {
+	case string(SourceSyncReasonDirtySource), string(SourceSyncReasonWrongBranch), string(SourceSyncReasonDetachedHead), string(SourceSyncReasonSourceDiverged), string(SourceSyncReasonStateDrift):
+		return reason
+	default:
+		return sourceCheckoutAttentionReason
+	}
 }
 
 func projectRunSummary(run Run) RunSummary {
