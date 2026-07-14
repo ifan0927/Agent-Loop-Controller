@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -315,19 +316,34 @@ func TestLatestRepairBaseUsesNewestRollover(t *testing.T) {
 	}
 }
 
-func TestPersistedRepairPromptSurvivesRestartAndRejectsTampering(t *testing.T) {
-	prompt := "repair normalized finding"
-	data, _ := json.Marshal(struct {
-		Prompt string `json:"normalized_prompt"`
-		Hash   string `json:"prompt_hash"`
-	}{prompt, bytesHash([]byte(prompt))})
+func TestPersistedRepairEvidenceHasNoRawPromptAndRejectsTampering(t *testing.T) {
+	evidence := repairEvidence{Prompt: "repair normalized finding", Hash: bytesHash([]byte("repair normalized finding")), Findings: []repairFindingReference{{Source: "github_human_review_comment", SourceID: "COMMENT", BodyDigest: "digest", HeadSHA: "head"}}}
+	data, _ := json.Marshal(evidence)
+	if strings.Contains(string(data), evidence.Prompt) {
+		t.Fatal("raw repair prompt entered transition evidence")
+	}
 	timeline := []Transition{{From: domain.StateRepairing, To: domain.StateExecuting, EvidenceReference: string(data)}}
 	got, found, err := findPersistedRepair(timeline)
-	if err != nil || !found || got != prompt {
+	if err != nil || !found || got != "" {
 		t.Fatalf("got=%q found=%v err=%v", got, found, err)
 	}
-	timeline[0].EvidenceReference = `{"normalized_prompt":"changed","prompt_hash":"wrong"}`
+	timeline[0].EvidenceReference = `{"prompt_hash":"","findings":[]}`
 	if _, _, err := findPersistedRepair(timeline); err == nil {
 		t.Fatal("tampered repair prompt accepted")
+	}
+}
+
+func TestLegacyRepairCrashAfterBeginReconstructsBoundedStoredInput(t *testing.T) {
+	prompt := "legacy bounded repair input"
+	digest := bytesHash([]byte(prompt))
+	ref := repairFindingReference{Source: "controller_legacy_repair", SourceID: "legacy-repair:" + digest, BodyDigest: digest, HeadSHA: "head"}
+	evidence, _ := json.Marshal(repairEvidence{Prompt: prompt, Hash: digest, Findings: []repairFindingReference{ref}})
+	inspection := RunInspection{Timeline: []Transition{{From: domain.StateRepairing, To: domain.StateExecuting, BoundHead: "head", EvidenceReference: string(evidence)}}, Findings: []FindingRecord{{Source: ref.Source, SourceID: ref.SourceID, BodyDigest: ref.BodyDigest, Body: prompt, HeadSHA: ref.HeadSHA}}}
+	if strings.Contains(string(evidence), prompt) {
+		t.Fatal("legacy prompt leaked into transition evidence")
+	}
+	got, err := repairPromptForPersistedFindings(inspection)
+	if err != nil || got != prompt {
+		t.Fatalf("prompt=%q err=%v", got, err)
 	}
 }

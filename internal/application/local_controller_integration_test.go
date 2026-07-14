@@ -574,7 +574,7 @@ func TestNoChangeRepairReusesExactRepairBaseAndExactHeadEvidence(t *testing.T) {
 	if err != nil || run.State != domain.StateApprovalReady || run.CandidateHead != base {
 		t.Fatalf("run=%+v err=%v", run, err)
 	}
-	if process.resumeCalls != 1 || process.reviewCalls != 1 {
+	if process.resumeCalls != 1 || process.reviewCalls != 2 {
 		t.Fatalf("resumes=%d reviews=%d", process.resumeCalls, process.reviewCalls)
 	}
 }

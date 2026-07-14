@@ -54,6 +54,23 @@ func TestRepairableFindingsFailClosedOnUnsupportedOrTamperedBodies(t *testing.T)
 	}
 }
 
+func TestRepairableInlineFindingRequiresSelectedImmutableFeedback(t *testing.T) {
+	body := "quoted review body"
+	sum := sha256.Sum256([]byte(body))
+	finding := FindingRecord{Source: "github_human_review_comment", SourceID: "COMMENT", ThreadID: "THREAD", Body: body, BodyDigest: hex.EncodeToString(sum[:]), HeadSHA: "head"}
+	if _, err := RepairableFindings([]FindingRecord{finding}, "head"); err == nil {
+		t.Fatal("fabricated inline finding entered repair")
+	}
+	feedback := TrustedReviewFeedbackRecord{TrustedReviewFeedback: domain.TrustedReviewFeedback{RootCommentNodeID: "COMMENT", ThreadNodeID: "THREAD", OriginalReviewHeadSHA: "head", Body: body, BodyDigest: finding.BodyDigest, Lifecycle: domain.TrustedReviewFeedbackSelectedForRepair}}
+	if selected, err := RepairableFindings([]FindingRecord{finding}, "head", []TrustedReviewFeedbackRecord{feedback}); err != nil || len(selected) != 1 {
+		t.Fatalf("selected=%+v err=%v", selected, err)
+	}
+	feedback.Lifecycle = domain.TrustedReviewFeedbackObserved
+	if _, err := RepairableFindings([]FindingRecord{finding}, "head", []TrustedReviewFeedbackRecord{feedback}); err == nil {
+		t.Fatal("unselected feedback entered repair")
+	}
+}
+
 func TestRepairableEvidenceSynthesizesTrustedRequiredCheckFinding(t *testing.T) {
 	evidence := domain.GitHubReadEvidence{Checks: []domain.GitHubCheck{{ID: "check-1", Name: "go test", Required: true, Source: "check_run", State: domain.CheckFailure, ObservedSHA: "head"}}}
 	findings, selected, err := repairableEvidenceFindings(evidence, "head")
@@ -78,5 +95,28 @@ func TestLatestRepairStartedAtUsesNewestRepairTransition(t *testing.T) {
 	timeline := []Transition{{From: domain.StateRepairing, To: domain.StateExecuting, CreatedAt: first}, {From: domain.StateRepairing, To: domain.StateExecuting, CreatedAt: second}}
 	if got := latestRepairStartedAt(timeline); !got.Equal(second) {
 		t.Fatalf("repair start=%s want=%s", got, second)
+	}
+}
+
+func TestPostRepairEvidenceCannotReuseSameHeadVerificationOrReview(t *testing.T) {
+	started := time.Now().UTC()
+	head := "head"
+	oldVerification := VerificationRecord{VerifierID: "verify", Phase: "candidate", VerifiedHead: head, ExitCode: 0, EvidencePath: "old.json", CreatedAt: started.Add(-time.Second)}
+	if _, ok := successfulVerificationBatchAfter([]VerificationRecord{oldVerification}, head, []string{"verify"}, started); ok {
+		t.Fatal("pre-repair verification was reused")
+	}
+	newVerification := oldVerification
+	newVerification.EvidencePath, newVerification.CreatedAt = "new.json", started
+	if _, ok := successfulVerificationBatchAfter([]VerificationRecord{oldVerification, newVerification}, head, []string{"verify"}, started); !ok {
+		t.Fatal("post-repair verification was not accepted")
+	}
+	oldReview := ReviewRecord{ID: 1, ReviewedHead: head, CreatedAt: started.Add(-time.Second)}
+	if _, ok := latestReviewForHeadAfter([]ReviewRecord{oldReview}, head, started); ok {
+		t.Fatal("pre-repair review was reused")
+	}
+	newReview := oldReview
+	newReview.ID, newReview.CreatedAt = 2, started
+	if got, ok := latestReviewForHeadAfter([]ReviewRecord{oldReview, newReview}, head, started); !ok || got.ID != newReview.ID {
+		t.Fatalf("post-repair review=%+v ok=%t", got, ok)
 	}
 }

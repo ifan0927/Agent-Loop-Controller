@@ -597,7 +597,7 @@ func projectInspection(value RunInspection) InspectionResult {
 	for _, finding := range value.Findings {
 		result.Findings = append(result.Findings, FindingResult{Source: finding.Source, SourceID: finding.SourceID,
 			File: sanitizeRepositoryPath(finding.File), Line: finding.Line, Severity: finding.Severity, BodyDigest: finding.BodyDigest,
-			Content: sanitizeUntrustedContent(finding.Body), ContentTrust: "untrusted", Resolved: finding.Resolved,
+			ContentTrust: "untrusted", Resolved: finding.Resolved,
 			Outdated: finding.Outdated, HeadSHA: finding.HeadSHA, ObservedAt: finding.ObservedAt})
 	}
 	for _, feedback := range value.TrustedFeedback {
@@ -841,14 +841,17 @@ func projectRunResult(run Run) RunResult {
 }
 
 type ReconcileCommand struct {
-	Requester      Requester                  `json:"requester"`
-	RunID          string                     `json:"run_id"`
-	Repository     string                     `json:"repository"`
-	ExpectedState  domain.State               `json:"expected_state"`
-	IdempotencyKey string                     `json:"idempotency_key"`
-	Evidence       domain.GitHubReadEvidence  `json:"evidence"`
-	Observations   []GitHubRequestObservation `json:"-"`
-	Metadata       GitHubInstallationMetadata `json:"-"`
+	Requester           Requester                     `json:"requester"`
+	RunID               string                        `json:"run_id"`
+	Repository          string                        `json:"repository"`
+	ExpectedState       domain.State                  `json:"expected_state"`
+	IdempotencyKey      string                        `json:"idempotency_key"`
+	Evidence            domain.GitHubReadEvidence     `json:"evidence"`
+	Observations        []GitHubRequestObservation    `json:"-"`
+	Metadata            GitHubInstallationMetadata    `json:"-"`
+	TrustedFeedback     []TrustedReviewFeedbackRecord `json:"-"`
+	FeedbackUnsupported bool                          `json:"-"`
+	FeedbackDrift       bool                          `json:"-"`
 }
 
 type ReconcileResult struct {
@@ -897,13 +900,72 @@ func (s CommandService) ReconcileFromGitHub(ctx context.Context, command GitHubR
 			}
 			return ReconcileResult{}, classifyServiceError(err)
 		}
+		existingFeedback := make([]domain.TrustedReviewFeedback, len(inspection.TrustedFeedback))
+		for index, item := range inspection.TrustedFeedback {
+			existingFeedback[index] = item.TrustedReviewFeedback
+		}
+		if domain.TrustedFeedbackDrift(existingFeedback, evidence.PullRequest, evidence.Reviews, evidence.ReviewThreads, handoff) {
+			root, digest := trustedFeedbackDriftReference(inspection.TrustedFeedback, handoff)
+			persister, ok := s.store.(TrustedReviewFeedbackDriftStore)
+			if !ok {
+				return ReconcileResult{}, serviceError(ErrorInternal, "trusted feedback drift persistence is unavailable", nil)
+			}
+			if transitionErr := persister.RequireManualInterventionForTrustedFeedbackDrift(leaseCtx, command.RunID, owner, command.ExpectedState, command.IdempotencyKey, observations, evidence.PullRequest, metadata, evidence, root, digest); transitionErr != nil {
+				return ReconcileResult{}, classifyServiceError(transitionErr)
+			}
+			return ReconcileResult{Head: inspection.Run.CandidateHead, Status: domain.ReconciliationInfrastructure, State: domain.StateManualIntervention}, nil
+		}
 		if err := handoff.Validate(); err != nil {
 			return ReconcileResult{}, serviceError(ErrorUnavailable, "inline review body handoff is incomplete", err)
 		}
+		var trusted []domain.ActorIdentity
+		hasChangesRequested := false
+		for _, review := range evidence.Reviews {
+			if review.State == "CHANGES_REQUESTED" {
+				hasChangesRequested = true
+				var trustErr error
+				trusted, trustErr = trustedHumanActors(inspection)
+				if trustErr != nil {
+					return ReconcileResult{}, serviceError(ErrorConflict, "trusted human feedback identity is unavailable", trustErr)
+				}
+				break
+			}
+		}
+		normalized := domain.TrustedChangesRequested{}
+		if hasChangesRequested {
+			var normalizeErr error
+			normalized, normalizeErr = domain.NormalizeTrustedChangesRequested(evidence.PullRequest, evidence.Reviews, evidence.ReviewThreads, handoff, trusted, evidence.ObservedAt)
+			if normalizeErr != nil {
+				return ReconcileResult{}, serviceError(ErrorUnavailable, "inline review evidence is incomplete", normalizeErr)
+			}
+		}
+		feedback := make([]TrustedReviewFeedbackRecord, len(normalized.Feedback))
+		for index, item := range normalized.Feedback {
+			feedback[index] = TrustedReviewFeedbackRecord{RunID: command.RunID, TrustedReviewFeedback: item}
+		}
+		drift := domain.TrustedFeedbackDrift(existingFeedback, evidence.PullRequest, evidence.Reviews, evidence.ReviewThreads, handoff)
 		full := ReconcileCommand{Requester: command.Requester, RunID: command.RunID, Repository: command.Repository, ExpectedState: command.ExpectedState,
-			IdempotencyKey: command.IdempotencyKey, Evidence: evidence, Observations: observations, Metadata: metadata}
+			IdempotencyKey: command.IdempotencyKey, Evidence: evidence, Observations: observations, Metadata: metadata, TrustedFeedback: feedback, FeedbackUnsupported: normalized.Unsupported, FeedbackDrift: drift}
+		full.Evidence.Findings = normalized.Findings
 		return s.reconcileLocked(leaseCtx, full, inspection, owner)
 	})
+}
+
+func trustedFeedbackDriftReference(existing []TrustedReviewFeedbackRecord, handoff domain.InlineReviewBodyHandoff) (string, string) {
+	bodies := make(map[string]string, len(handoff.Comments))
+	for _, body := range handoff.Comments {
+		bodies[body.CommentNodeID] = body.BodyDigest
+	}
+	for _, feedback := range existing {
+		if feedback.Lifecycle != domain.TrustedReviewFeedbackObserved && feedback.Lifecycle != domain.TrustedReviewFeedbackSelectedForRepair {
+			continue
+		}
+		if observed := bodies[feedback.RootCommentNodeID]; observed != "" {
+			return feedback.RootCommentNodeID, observed
+		}
+		return feedback.RootCommentNodeID, feedback.BodyDigest
+	}
+	return "", ""
 }
 
 func validateReaderAuthority(inspection RunInspection, authority GitHubInstallationMetadata) error {
@@ -1045,14 +1107,20 @@ func (s CommandService) reconcileLocked(ctx context.Context, command ReconcileCo
 		approvalObservation, approval = &observed, normalized
 	}
 	if status == domain.ReconciliationActionable {
-		findings, _, err := repairableEvidenceFindings(command.Evidence, run.CandidateHead)
+		findings, _, err := repairableEvidenceFindings(command.Evidence, run.CandidateHead, selectedFeedbackForAdmission(command.TrustedFeedback))
 		if err == nil {
 			command.Evidence.Findings = findings
 		}
 	}
 	next, reason := nextGitHubReconciliationState(run.State, command.Evidence, status)
+	if command.FeedbackUnsupported || command.FeedbackDrift || trustedFeedbackConflicts(inspection.TrustedFeedback, command.TrustedFeedback) {
+		next, reason = domain.StateManualIntervention, "trusted inline change request requires manual intervention"
+	}
+	if len(command.TrustedFeedback) > 0 && next != domain.StateManualIntervention && (run.State == domain.StateReconcilingReviews || run.State == domain.StateAwaitingHumanApproval) {
+		next, reason = domain.StateRepairing, "trusted exact-head inline change request requires repair"
+	}
 	if status == domain.ReconciliationActionable && next == domain.StateRepairing {
-		if _, _, err := repairableEvidenceFindings(command.Evidence, run.CandidateHead); err != nil {
+		if _, _, err := repairableEvidenceFindings(command.Evidence, run.CandidateHead, selectedFeedbackForAdmission(command.TrustedFeedback)); err != nil {
 			next = domain.StateManualIntervention
 			reason = "GitHub evidence has unsupported actionable findings"
 		}
@@ -1064,15 +1132,36 @@ func (s CommandService) reconcileLocked(ctx context.Context, command ReconcileCo
 		next, reason = domain.StateMerging, "trusted human approval is bound to the exact final head"
 	}
 	persister, ok := s.store.(interface {
-		SaveGitHubReadSuccess(context.Context, string, string, domain.State, string, []GitHubRequestObservation, domain.PullRequest, GitHubInstallationMetadata, domain.GitHubReadEvidence, *domain.HumanApprovalObservation, *domain.HumanApproval, domain.State, string) error
+		SaveGitHubReadSuccess(context.Context, string, string, domain.State, string, []GitHubRequestObservation, domain.PullRequest, GitHubInstallationMetadata, domain.GitHubReadEvidence, []TrustedReviewFeedbackRecord, *domain.HumanApprovalObservation, *domain.HumanApproval, domain.State, string) error
 	})
 	if !ok {
 		return ReconcileResult{}, serviceError(ErrorInternal, "reconciliation persistence is unavailable", nil)
 	}
-	if err := persister.SaveGitHubReadSuccess(ctx, run.ID, owner, command.ExpectedState, command.IdempotencyKey, command.Observations, command.Evidence.PullRequest, command.Metadata, command.Evidence, approvalObservation, approval, next, reason); err != nil {
+	if err := persister.SaveGitHubReadSuccess(ctx, run.ID, owner, command.ExpectedState, command.IdempotencyKey, command.Observations, command.Evidence.PullRequest, command.Metadata, command.Evidence, command.TrustedFeedback, approvalObservation, approval, next, reason); err != nil {
 		return ReconcileResult{}, classifyServiceError(err)
 	}
 	return ReconcileResult{Head: run.CandidateHead, Status: status, State: next}, nil
+}
+
+func trustedFeedbackConflicts(existing, observed []TrustedReviewFeedbackRecord) bool {
+	byRoot := make(map[string]TrustedReviewFeedbackRecord, len(existing))
+	for _, item := range existing {
+		byRoot[item.RootCommentNodeID] = item
+	}
+	for _, item := range observed {
+		if prior, found := byRoot[item.RootCommentNodeID]; found && !prior.ImmutableEqual(item.TrustedReviewFeedback) {
+			return true
+		}
+	}
+	return false
+}
+
+func selectedFeedbackForAdmission(observed []TrustedReviewFeedbackRecord) []TrustedReviewFeedbackRecord {
+	result := append([]TrustedReviewFeedbackRecord(nil), observed...)
+	for index := range result {
+		result[index].Lifecycle = domain.TrustedReviewFeedbackSelectedForRepair
+	}
+	return result
 }
 
 func trustedHumanActors(inspection RunInspection) ([]domain.ActorIdentity, error) {

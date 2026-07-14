@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -114,7 +115,7 @@ func TestGitHubReadSuccessPersistsEvidenceAndGateTransitionAtomically(t *testing
 	sum := sha256.Sum256([]byte(body))
 	evidence := domain.GitHubReadEvidence{Repository: repo, PullRequest: pr, Checks: []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: "head", State: domain.CheckSuccess}}, Findings: []domain.NormalizedFinding{{Source: "github_required_check", SourceID: "finding-1", BodyDigest: hex.EncodeToString(sum[:]), Body: body, HeadSHA: "head", ObservedAt: time.Now().UTC()}}, ObservedAt: time.Now().UTC()}
 	metadata := application.GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: repo, TokenExpiresAt: time.Now().Add(time.Hour), PermissionsDigest: "permissions", ObservedAt: time.Now().UTC()}
-	if err := store.SaveGitHubReadSuccess(ctx, run.ID, owner, domain.StatePROpen, run.IdempotencyKey, []application.GitHubRequestObservation{{RunID: run.ID, Operation: "read", Category: "REST", HTTPStatus: 200, ResponseDigest: "response", InstallationID: 2, Repository: repo, ObservedAt: time.Now().UTC()}}, pr, metadata, evidence, nil, nil, domain.StateReconcilingReviews, "GitHub evidence collection started"); err != nil {
+	if err := store.SaveGitHubReadSuccess(ctx, run.ID, owner, domain.StatePROpen, run.IdempotencyKey, []application.GitHubRequestObservation{{RunID: run.ID, Operation: "read", Category: "REST", HTTPStatus: 200, ResponseDigest: "response", InstallationID: 2, Repository: repo, ObservedAt: time.Now().UTC()}}, pr, metadata, evidence, nil, nil, nil, domain.StateReconcilingReviews, "GitHub evidence collection started"); err != nil {
 		t.Fatal(err)
 	}
 	inspection, err := store.Inspect(ctx, run.ID)
@@ -128,12 +129,54 @@ func TestGitHubReadSuccessPersistsEvidenceAndGateTransitionAtomically(t *testing
 	if err := store.db.QueryRowContext(ctx, `SELECT evidence_json FROM github_read_evidence WHERE run_id=?`, run.ID).Scan(&evidenceJSON); err != nil || bytes.Contains([]byte(evidenceJSON), []byte(body)) {
 		t.Fatalf("finding body leaked into public GitHub evidence: err=%v evidence=%q", err, evidenceJSON)
 	}
-	if err := store.SaveGitHubReadSuccess(ctx, run.ID, owner, domain.StateReconcilingReviews, run.IdempotencyKey, nil, pr, metadata, evidence, nil, nil, domain.StateCleaning, "invalid transition"); err == nil {
+	if err := store.SaveGitHubReadSuccess(ctx, run.ID, owner, domain.StateReconcilingReviews, run.IdempotencyKey, nil, pr, metadata, evidence, nil, nil, nil, domain.StateCleaning, "invalid transition"); err == nil {
 		t.Fatal("invalid gate transition was accepted")
 	}
 	var evidenceCount int
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM github_read_evidence WHERE run_id=?`, run.ID).Scan(&evidenceCount); err != nil || evidenceCount != 1 {
 		t.Fatalf("rollback evidence count=%d err=%v", evidenceCount, err)
+	}
+}
+
+func TestGitHubReadAtomicallySelectsTrustedFeedbackWithRepairTransition(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	head := strings.Repeat("a", 40)
+	run := application.Run{ID: "trusted-repair", IssueID: "IFAN-TR", IdempotencyKey: "trusted-key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "feature", BaseSHA: "base", ArtifactRoot: "/tmp/trusted-repair"}
+	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCandidateHead(ctx, run.ID, head); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE runs SET current_state=? WHERE run_id=?`, domain.StateReconcilingReviews, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	pr := domain.PullRequest{Number: 1, DatabaseID: 101, URL: "https://example.invalid/pr/1", NodeID: "PR_101", HeadBranch: "feature", BaseBranch: "main", HeadSHA: head, BaseSHA: "base", BodyDigest: "body", OwnershipKey: run.IdempotencyKey, State: "open"}
+	if err := store.SavePullRequest(ctx, run.ID, pr); err != nil {
+		t.Fatal(err)
+	}
+	owner := "lease-owner"
+	if ok, err := store.AcquireLease(ctx, run.ID, owner, time.Now().Add(time.Minute)); err != nil || !ok {
+		t.Fatalf("lease ok=%t err=%v", ok, err)
+	}
+	repo := domain.RepositoryIdentity{ID: 99, NodeID: "REPO", Owner: "owner", Name: "repo"}
+	now := time.Now().UTC()
+	body := "quoted human review body"
+	line := 7
+	feedback := application.TrustedReviewFeedbackRecord{RunID: run.ID, TrustedReviewFeedback: domain.TrustedReviewFeedback{PRNumber: pr.Number, PRDatabaseID: pr.DatabaseID, PRNodeID: pr.NodeID, ReviewDatabaseID: 3, ReviewNodeID: "REVIEW_3", ThreadNodeID: "THREAD_4", RootCommentDatabaseID: 5, RootCommentNodeID: "COMMENT_5", Author: domain.ActorIdentity{DatabaseID: 6, NodeID: "USER_6", Login: "ifan0927", Type: "User"}, OriginalReviewHeadSHA: head, Path: "internal/example.go", Line: &line, Body: body, BodyDigest: domain.TrustedReviewFeedbackDigest(body), SourceAt: now, ObservedAt: now}}
+	evidence := domain.GitHubReadEvidence{Repository: repo, PullRequest: pr, Findings: []domain.NormalizedFinding{{Source: "github_human_review_comment", SourceID: feedback.RootCommentNodeID, ThreadID: feedback.ThreadNodeID, File: feedback.Path, Classification: "trusted_changes_requested", Body: body, BodyDigest: feedback.BodyDigest, HeadSHA: head, SourceAt: now, ObservedAt: now}}, ObservedAt: now}
+	metadata := application.GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: repo, TokenExpiresAt: now.Add(time.Hour), PermissionsDigest: "permissions", ObservedAt: now}
+	if err := store.SaveGitHubReadSuccess(ctx, run.ID, owner, domain.StateReconcilingReviews, run.IdempotencyKey, nil, pr, metadata, evidence, []application.TrustedReviewFeedbackRecord{feedback}, nil, nil, domain.StateRepairing, "trusted exact-head inline change request requires repair"); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := store.Inspect(ctx, run.ID)
+	if err != nil || inspection.Run.State != domain.StateRepairing || len(inspection.TrustedFeedback) != 1 || inspection.TrustedFeedback[0].Lifecycle != domain.TrustedReviewFeedbackSelectedForRepair || len(inspection.Findings) != 1 {
+		t.Fatalf("inspection=%+v err=%v", inspection, err)
 	}
 }
 
@@ -534,7 +577,7 @@ func TestGitHubApprovalObservationSurvivesRestartWithSourceAndObservationTimes(t
 	approvalObservation := &domain.HumanApprovalObservation{PRNumber: pr.Number, CandidateHead: "head", Status: domain.HumanApprovalApproved, ReviewDatabaseID: 55, ReviewNodeID: "PRR_55", Actor: domain.ActorIdentity{DatabaseID: 33, NodeID: "USER_33", Login: "ifan0927", Type: "User"}, ReviewHeadSHA: "head", SourceAt: sourceAt, ObservedAt: observedAt}
 	approval := &domain.HumanApproval{PRNumber: pr.Number, Approver: "ifan0927", Actor: approvalObservation.Actor, ReviewDatabaseID: 55, ReviewNodeID: "PRR_55", Source: "github_pull_request_review", ApprovedSHA: "head", CIStatus: "pass", ReviewSHA: "head", ApprovedAt: sourceAt, ObservedAt: observedAt}
 	metadata := application.GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: repo, TokenExpiresAt: observedAt.Add(time.Hour), PermissionsDigest: "permissions", ObservedAt: observedAt}
-	if err := store.SaveGitHubReadSuccess(ctx, run.ID, owner, domain.StateAwaitingHumanApproval, run.IdempotencyKey, nil, pr, metadata, evidence, approvalObservation, approval, domain.StateMerging, "trusted human approval is bound to the exact final head"); err != nil {
+	if err := store.SaveGitHubReadSuccess(ctx, run.ID, owner, domain.StateAwaitingHumanApproval, run.IdempotencyKey, nil, pr, metadata, evidence, nil, approvalObservation, approval, domain.StateMerging, "trusted human approval is bound to the exact final head"); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {

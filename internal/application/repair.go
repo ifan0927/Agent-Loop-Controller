@@ -30,27 +30,41 @@ type repairFindingReference struct {
 }
 
 type repairEvidence struct {
-	Prompt   string                   `json:"normalized_prompt"`
+	// Prompt is in-memory only. Raw untrusted bodies belong exclusively in the
+	// bounded finding/feedback stores, never in a transition evidence payload.
+	Prompt   string                   `json:"-"`
 	Hash     string                   `json:"prompt_hash"`
 	Findings []repairFindingReference `json:"findings,omitempty"`
 }
 
-// RepairableFindings selects only current, unresolved controller-generated
-// required-check findings and rechecks every persisted body before it can
-// reach a Terra resume prompt.
-func RepairableFindings(findings []FindingRecord, head string) ([]FindingRecord, error) {
+// RepairableFindings selects only current controller-generated check findings
+// and trusted inline findings backed by a selected immutable feedback record.
+// The variadic argument preserves the narrow legacy check-only caller contract.
+func RepairableFindings(findings []FindingRecord, head string, feedback ...[]TrustedReviewFeedbackRecord) ([]FindingRecord, error) {
 	if strings.TrimSpace(head) == "" {
 		return nil, errors.New("repair head must not be blank")
 	}
 	selected := make([]FindingRecord, 0, len(findings))
+	trusted := make(map[string]TrustedReviewFeedbackRecord)
+	if len(feedback) > 0 {
+		for _, item := range feedback[0] {
+			trusted[item.RootCommentNodeID] = item
+		}
+	}
 	seen := make(map[string]struct{}, len(findings))
 	bodyBytes := 0
 	for _, finding := range findings {
 		if finding.HeadSHA != head || finding.Resolved || finding.Outdated {
 			continue
 		}
-		if finding.Source != "github_required_check" {
+		if finding.Source != "github_required_check" && finding.Source != "github_human_review_comment" {
 			return nil, fmt.Errorf("unsupported actionable finding source %q", finding.Source)
+		}
+		if finding.Source == "github_human_review_comment" {
+			item, found := trusted[finding.SourceID]
+			if !found || item.Lifecycle != domain.TrustedReviewFeedbackSelectedForRepair || item.OriginalReviewHeadSHA != head || item.Resolved || item.Outdated || item.ThreadNodeID != finding.ThreadID || item.BodyDigest != finding.BodyDigest || item.Body != finding.Body {
+				return nil, errors.New("inline finding lacks matching selected trusted feedback")
+			}
 		}
 		if strings.TrimSpace(finding.SourceID) == "" || strings.TrimSpace(finding.Body) == "" {
 			return nil, errors.New("actionable finding identity or body is incomplete")
@@ -88,8 +102,8 @@ func RepairableFindings(findings []FindingRecord, head string) ([]FindingRecord,
 	return selected, nil
 }
 
-func repairableEvidenceFindings(evidence domain.GitHubReadEvidence, head string) ([]domain.NormalizedFinding, []FindingRecord, error) {
-	findings := make([]domain.NormalizedFinding, 0)
+func repairableEvidenceFindings(evidence domain.GitHubReadEvidence, head string, feedback ...[]TrustedReviewFeedbackRecord) ([]domain.NormalizedFinding, []FindingRecord, error) {
+	findings := append([]domain.NormalizedFinding(nil), evidence.Findings...)
 	for _, check := range evidence.Checks {
 		if !check.Required || check.ObservedSHA != head || (check.State != domain.CheckFailure && check.State != domain.CheckActionRequired) {
 			continue
@@ -107,7 +121,7 @@ func repairableEvidenceFindings(evidence domain.GitHubReadEvidence, head string)
 			File: finding.File, Line: finding.Line, Severity: finding.Classification, BodyDigest: finding.BodyDigest, Body: finding.Body,
 			Resolved: finding.Resolved, Outdated: finding.Outdated, HeadSHA: finding.HeadSHA, ObservedAt: finding.ObservedAt})
 	}
-	selected, err := RepairableFindings(records, head)
+	selected, err := RepairableFindings(records, head, feedback...)
 	if err != nil {
 		return nil, nil, err
 	}

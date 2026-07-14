@@ -672,11 +672,15 @@ func (c *LocalController) execute(ctx context.Context, run Run, decision *Decisi
 			decision = &persisted
 		}
 		if decision == nil {
-			repair, repairFound, repairErr := findPersistedRepair(inspection.Timeline)
+			_, repairFound, repairErr := findPersistedRepair(inspection.Timeline)
 			if repairErr != nil {
 				return repairErr
 			}
 			if repairFound {
+				repair, promptErr := repairPromptForPersistedFindings(inspection)
+				if promptErr != nil {
+					return promptErr
+				}
 				decision = &Decision{ChoiceID: "controller-normalized-review-findings", Instructions: repair}
 			}
 		}
@@ -962,7 +966,8 @@ func (c *LocalController) verifyCandidate(ctx context.Context, run Run) error {
 		}
 		return errors.New("candidate worktree is not clean")
 	}
-	if batch, ok := successfulVerificationBatch(inspection.Verifications, run.CandidateHead, taskVerifierIDs(run.NormalizedTaskJSON)); ok {
+	postRepairStarted := latestRepairStartedAt(inspection.Timeline)
+	if batch, ok := successfulVerificationBatchAfter(inspection.Verifications, run.CandidateHead, taskVerifierIDs(run.NormalizedTaskJSON), postRepairStarted); ok && postRepairStarted.IsZero() {
 		if err := validateVerificationBatch(batch, run.CandidateHead); err != nil {
 			return err
 		}
@@ -1014,7 +1019,7 @@ func (c *LocalController) freshReview(ctx context.Context, run Run) error {
 	if err != nil {
 		return err
 	}
-	if record, ok := latestReviewForHead(inspection.Reviews, run.CandidateHead); ok {
+	if record, ok := latestReviewForHeadAfter(inspection.Reviews, run.CandidateHead, latestRepairStartedAt(inspection.Timeline)); ok {
 		outcome, err := readOutcome[domain.ReviewOutcome](record.OutcomePath, record.OutcomeHash)
 		if err != nil {
 			return err
@@ -1091,7 +1096,7 @@ func (c *LocalController) authorizeReview(ctx context.Context, run Run, outcome 
 	if outcome.Verdict != domain.ReviewPass {
 		return fmt.Errorf("fresh review stopped with verdict %s", outcome.Verdict)
 	}
-	batch, ok := successfulVerificationBatch(inspection.Verifications, run.CandidateHead, taskVerifierIDs(run.NormalizedTaskJSON))
+	batch, ok := successfulVerificationBatchAfter(inspection.Verifications, run.CandidateHead, taskVerifierIDs(run.NormalizedTaskJSON), latestRepairStartedAt(inspection.Timeline))
 	if !ok {
 		return errors.New("candidate verification evidence is incomplete")
 	}
@@ -1120,6 +1125,32 @@ func (c *LocalController) authorizeReview(ctx context.Context, run Run, outcome 
 	if err := c.validateWorkspace(ctx, run, true); err != nil {
 		return err
 	}
+	if repairBase := latestRepairBase(inspection.Timeline); repairBase != "" {
+		needsBinding := false
+		for _, feedback := range inspection.TrustedFeedback {
+			needsBinding = needsBinding || (feedback.Lifecycle == domain.TrustedReviewFeedbackSelectedForRepair && feedback.OriginalReviewHeadSHA == repairBase)
+		}
+		if !needsBinding {
+			return c.store.Transition(ctx, run.ID, domain.StateFreshReview, domain.StateApprovalReady, "fresh structured review passed guarded authorization", evidence, run.CandidateHead)
+		}
+		transitions, ok := c.store.(interface {
+			TransitionTrustedReviewFeedback(context.Context, string, string, domain.TrustedReviewFeedbackLifecycle, domain.TrustedReviewFeedbackLifecycle, string, string, int64, string, bool, bool) (TrustedReviewFeedbackRecord, bool, error)
+		})
+		if !ok {
+			return errors.New("trusted feedback lifecycle persistence is unavailable")
+		}
+		for _, feedback := range inspection.TrustedFeedback {
+			if feedback.Lifecycle != domain.TrustedReviewFeedbackSelectedForRepair || feedback.OriginalReviewHeadSHA != repairBase {
+				continue
+			}
+			if _, changed, err := transitions.TransitionTrustedReviewFeedback(ctx, run.ID, feedback.RootCommentNodeID, domain.TrustedReviewFeedbackSelectedForRepair, domain.TrustedReviewFeedbackRepairVerified, run.CandidateHead, "", 0, "", false, false); err != nil || !changed {
+				if err != nil {
+					return err
+				}
+				return errors.New("trusted feedback repair verification compare failed")
+			}
+		}
+	}
 	return c.store.Transition(ctx, run.ID, domain.StateFreshReview, domain.StateApprovalReady, "fresh structured review passed guarded authorization", evidence, run.CandidateHead)
 }
 
@@ -1134,14 +1165,14 @@ func (c *LocalController) validateApproval(ctx context.Context, run Run) error {
 	if err := c.validateWorkspace(ctx, run, true); err != nil {
 		return err
 	}
-	batch, ok := successfulVerificationBatch(inspection.Verifications, run.CandidateHead, taskVerifierIDs(run.NormalizedTaskJSON))
+	batch, ok := successfulVerificationBatchAfter(inspection.Verifications, run.CandidateHead, taskVerifierIDs(run.NormalizedTaskJSON), latestRepairStartedAt(inspection.Timeline))
 	if !ok {
 		return errors.New("candidate verification evidence is incomplete")
 	}
 	if err := validateVerificationBatch(batch, run.CandidateHead); err != nil {
 		return err
 	}
-	if review, ok := latestReviewForHead(inspection.Reviews, run.CandidateHead); ok {
+	if review, ok := latestReviewForHeadAfter(inspection.Reviews, run.CandidateHead, latestRepairStartedAt(inspection.Timeline)); ok {
 		if review.Verdict == string(domain.ReviewPass) {
 			if err := validateReviewAttempt(inspection.Attempts, review, run.ReviewModel); err != nil {
 				return err
@@ -1185,7 +1216,11 @@ func (c *LocalController) RepairFindings(ctx context.Context, runID string, find
 	if err != nil {
 		return Run{}, err
 	}
-	selected, err := RepairableFindings(findings, run.CandidateHead)
+	inspection, inspectErr := c.store.Inspect(ctx, runID)
+	if inspectErr != nil {
+		return run, inspectErr
+	}
+	selected, err := RepairableFindings(findings, run.CandidateHead, inspection.TrustedFeedback)
 	if err != nil {
 		if run.State == domain.StateRepairing {
 			_ = c.store.Transition(ctx, runID, domain.StateRepairing, domain.StateManualIntervention, "unsupported actionable review findings", "repair finding selection failed", run.CandidateHead)
@@ -1251,7 +1286,10 @@ func (c *LocalController) repair(ctx context.Context, runID, normalizedPrompt st
 		return updated, err
 	}
 	if persisted == nil {
-		fallback := repairEvidence{Prompt: normalizedPrompt, Hash: bytesHash([]byte(normalizedPrompt))}
+		fallback, persistErr := c.persistLegacyRepairInput(ctx, run, normalizedPrompt)
+		if persistErr != nil {
+			return run, persistErr
+		}
 		persisted = &fallback
 	}
 	evidenceData, _ := json.Marshal(persisted)
@@ -1279,25 +1317,93 @@ func (c *LocalController) repair(ctx context.Context, runID, normalizedPrompt st
 	return updated, continueErr
 }
 
+// persistLegacyRepairInput keeps the deprecated direct Repair path resumable
+// without putting raw prompt text in transition evidence. New GitHub feedback
+// repairs use RepairFindings; this bounded record exists solely for the
+// fixture-compatible direct path.
+func (c *LocalController) persistLegacyRepairInput(ctx context.Context, run Run, prompt string) (repairEvidence, error) {
+	if len([]byte(prompt)) > MaxRepairPromptBytes || strings.ContainsRune(prompt, '\x00') {
+		return repairEvidence{}, errors.New("legacy repair prompt exceeds controller bounds")
+	}
+	digest := bytesHash([]byte(prompt))
+	record := FindingRecord{RunID: run.ID, Source: "controller_legacy_repair", SourceID: "legacy-repair:" + digest, Body: prompt, BodyDigest: digest, HeadSHA: run.CandidateHead, ObservedAt: time.Now().UTC()}
+	persister, ok := c.store.(interface {
+		SaveFinding(context.Context, FindingRecord) error
+	})
+	if !ok {
+		return repairEvidence{}, errors.New("legacy repair input persistence is unavailable")
+	}
+	if err := persister.SaveFinding(ctx, record); err != nil {
+		return repairEvidence{}, err
+	}
+	return repairEvidence{Prompt: prompt, Hash: digest, Findings: []repairFindingReference{{Source: record.Source, SourceID: record.SourceID, BodyDigest: record.BodyDigest, HeadSHA: record.HeadSHA}}}, nil
+}
+
 func findPersistedRepair(timeline []Transition) (string, bool, error) {
 	for index := len(timeline) - 1; index >= 0; index-- {
 		item := timeline[index]
 		if item.From != domain.StateRepairing || item.To != domain.StateExecuting {
 			continue
 		}
-		var evidence struct {
-			Prompt string `json:"normalized_prompt"`
-			Hash   string `json:"prompt_hash"`
-		}
+		var evidence repairEvidence
 		if err := json.Unmarshal([]byte(item.EvidenceReference), &evidence); err != nil {
 			return "", false, err
 		}
-		if strings.TrimSpace(evidence.Prompt) == "" || evidence.Hash != bytesHash([]byte(evidence.Prompt)) {
+		if strings.TrimSpace(evidence.Hash) == "" {
 			return "", false, errors.New("persisted repair prompt evidence is invalid")
 		}
-		return evidence.Prompt, true, nil
+		return "", true, nil
 	}
 	return "", false, nil
+}
+
+func repairPromptForPersistedFindings(inspection RunInspection) (string, error) {
+	var expected repairEvidence
+	found := false
+	for index := len(inspection.Timeline) - 1; index >= 0; index-- {
+		item := inspection.Timeline[index]
+		if item.From != domain.StateRepairing || item.To != domain.StateExecuting {
+			continue
+		}
+		if err := json.Unmarshal([]byte(item.EvidenceReference), &expected); err != nil {
+			return "", err
+		}
+		found = true
+		break
+	}
+	if !found || len(expected.Findings) == 0 {
+		return "", errors.New("persisted repair evidence is incomplete")
+	}
+	if len(expected.Findings) == 1 && expected.Findings[0].Source == "controller_legacy_repair" {
+		ref := expected.Findings[0]
+		for _, finding := range inspection.Findings {
+			if finding.Source == ref.Source && finding.SourceID == ref.SourceID && finding.HeadSHA == ref.HeadSHA && finding.BodyDigest == ref.BodyDigest && bytesHash([]byte(finding.Body)) == ref.BodyDigest {
+				return finding.Body, nil
+			}
+		}
+		return "", errors.New("persisted legacy repair input is unavailable")
+	}
+	selected, err := RepairableFindings(inspection.Findings, latestRepairBase(inspection.Timeline), inspection.TrustedFeedback)
+	if err != nil {
+		return "", err
+	}
+	actual := repairEvidenceFor(selected)
+	if actual.Hash != expected.Hash || !sameRepairFindingReferences(actual.Findings, expected.Findings) {
+		return "", errors.New("persisted repair finding authority changed")
+	}
+	return actual.Prompt, nil
+}
+
+func sameRepairFindingReferences(a, b []repairFindingReference) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for index := range a {
+		if a[index] != b[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func latestRepairBase(timeline []Transition) string {
@@ -1338,6 +1444,18 @@ func latestReviewForHead(records []ReviewRecord, head string) (ReviewRecord, boo
 			latest = record
 			found = true
 		}
+	}
+	return latest, found
+}
+
+func latestReviewForHeadAfter(records []ReviewRecord, head string, notBefore time.Time) (ReviewRecord, bool) {
+	var latest ReviewRecord
+	found := false
+	for _, record := range records {
+		if record.ReviewedHead != head || (!notBefore.IsZero() && record.CreatedAt.Before(notBefore)) || (found && record.ID <= latest.ID) {
+			continue
+		}
+		latest, found = record, true
 	}
 	return latest, found
 }
@@ -1635,6 +1753,19 @@ func successfulVerificationBatch(records []VerificationRecord, head string, ids 
 		}
 	}
 	return selected, len(selected) > 0
+}
+
+func successfulVerificationBatchAfter(records []VerificationRecord, head string, ids []string, notBefore time.Time) ([]VerificationRecord, bool) {
+	if notBefore.IsZero() {
+		return successfulVerificationBatch(records, head, ids)
+	}
+	filtered := make([]VerificationRecord, 0, len(records))
+	for _, record := range records {
+		if !record.CreatedAt.Before(notBefore) {
+			filtered = append(filtered, record)
+		}
+	}
+	return successfulVerificationBatch(filtered, head, ids)
 }
 func validateVerificationBatch(records []VerificationRecord, head string) error {
 	if len(records) == 0 {

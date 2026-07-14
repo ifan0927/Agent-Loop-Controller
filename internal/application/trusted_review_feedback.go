@@ -38,3 +38,9 @@ type TrustedReviewFeedbackStore interface {
 	SaveTrustedReviewFeedback(context.Context, TrustedReviewFeedbackRecord) (TrustedReviewFeedbackRecord, bool, error)
 	TransitionTrustedReviewFeedback(context.Context, string, string, domain.TrustedReviewFeedbackLifecycle, domain.TrustedReviewFeedbackLifecycle, string, string, int64, string, bool, bool) (TrustedReviewFeedbackRecord, bool, error)
 }
+
+// TrustedReviewFeedbackDriftStore atomically records sanitized authority drift
+// and halts the exact leased run. It never accepts raw review text.
+type TrustedReviewFeedbackDriftStore interface {
+	RequireManualInterventionForTrustedFeedbackDrift(context.Context, string, string, domain.State, string, []GitHubRequestObservation, domain.PullRequest, GitHubInstallationMetadata, domain.GitHubReadEvidence, string, string) error
+}

@@ -125,6 +125,57 @@ func TestTrustedReviewFeedbackInitialSaveRejectsFutureEvidence(t *testing.T) {
 	}
 }
 
+func TestTrustedFeedbackDriftPersistsConflictAndManualTransitionAtomically(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	createFeedbackRun(t, store, "drift-run")
+	record := feedbackRecord("drift-run")
+	if _, _, err := store.SaveTrustedReviewFeedback(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	owner := "drift-lease"
+	if ok, err := store.AcquireLease(ctx, record.RunID, owner, time.Now().Add(time.Minute)); err != nil || !ok {
+		t.Fatalf("lease ok=%t err=%v", ok, err)
+	}
+	pr := domain.PullRequest{Number: 1, DatabaseID: 2, URL: "https://example.invalid/pr/1", NodeID: record.PRNodeID, HeadBranch: "feature", BaseBranch: "main", HeadSHA: record.OriginalReviewHeadSHA, BaseSHA: "base", BodyDigest: "body", OwnershipKey: record.RunID, State: "open"}
+	if err := store.SavePullRequest(ctx, record.RunID, pr); err != nil {
+		t.Fatal(err)
+	}
+	repo := domain.RepositoryIdentity{ID: 9, NodeID: "REPO", Owner: "owner", Name: "repo"}
+	now := time.Now().UTC()
+	metadata := application.GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: repo, TokenExpiresAt: now.Add(time.Hour), PermissionsDigest: "permissions", ObservedAt: now}
+	evidence := domain.GitHubReadEvidence{Repository: repo, PullRequest: pr, ObservedAt: now}
+	observations := []application.GitHubRequestObservation{{RunID: record.RunID, Operation: "review_threads", Category: "graphql", HTTPStatus: 200, ResponseDigest: "read", InstallationID: 2, Repository: repo, ObservedAt: now}}
+	observed := domain.TrustedReviewFeedbackDigest("edited body")
+	badObservations := append([]application.GitHubRequestObservation(nil), observations...)
+	badObservations = append(badObservations, application.GitHubRequestObservation{RunID: "other-run"})
+	if err := store.RequireManualInterventionForTrustedFeedbackDrift(ctx, record.RunID, owner, domain.StateReceived, record.RunID, badObservations, pr, metadata, evidence, record.RootCommentNodeID, observed); err == nil {
+		t.Fatal("fault-injected observation was accepted")
+	}
+	before, err := store.Inspect(ctx, record.RunID)
+	if err != nil || before.Run.State != domain.StateReceived || before.GitHubEvidence != nil || len(before.GitHubRequests) != 0 || len(before.FeedbackConflicts) != 0 {
+		t.Fatalf("partial drift persistence: %+v err=%v", before, err)
+	}
+	if err := store.RequireManualInterventionForTrustedFeedbackDrift(ctx, record.RunID, owner, domain.StateReceived, record.RunID, observations, pr, metadata, evidence, record.RootCommentNodeID, observed); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := store.Inspect(ctx, record.RunID)
+	if err != nil || inspection.Run.State != domain.StateManualIntervention || inspection.GitHubEvidence == nil || len(inspection.GitHubRequests) != 1 || len(inspection.FeedbackConflicts) != 1 || inspection.FeedbackConflicts[0].RootCommentNodeID != record.RootCommentNodeID || inspection.FeedbackConflicts[0].ObservedDigest != observed {
+		t.Fatalf("inspection=%+v err=%v", inspection, err)
+	}
+	if err := store.RequireManualInterventionForTrustedFeedbackDrift(ctx, record.RunID, owner, domain.StateReceived, record.RunID, observations, pr, metadata, evidence, record.RootCommentNodeID, domain.TrustedReviewFeedbackDigest("second edit")); err == nil {
+		t.Fatal("stale drift write was accepted")
+	}
+	inspection, err = store.Inspect(ctx, record.RunID)
+	if err != nil || len(inspection.FeedbackConflicts) != 1 {
+		t.Fatalf("non-atomic stale write: %+v err=%v", inspection, err)
+	}
+}
+
 func TestTrustedReviewFeedbackAggregateTextBound(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {

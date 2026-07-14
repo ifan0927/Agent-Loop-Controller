@@ -45,7 +45,7 @@ func (s serviceStore) ListRuns(_ context.Context, _ string, before time.Time, be
 	}
 	return s.runs, nil
 }
-func (s serviceStore) SaveGitHubReadSuccess(_ context.Context, _ string, _ string, _ domain.State, _ string, _ []GitHubRequestObservation, _ domain.PullRequest, _ GitHubInstallationMetadata, _ domain.GitHubReadEvidence, observed *domain.HumanApprovalObservation, approval *domain.HumanApproval, next domain.State, _ string) error {
+func (s serviceStore) SaveGitHubReadSuccess(_ context.Context, _ string, _ string, _ domain.State, _ string, _ []GitHubRequestObservation, _ domain.PullRequest, _ GitHubInstallationMetadata, _ domain.GitHubReadEvidence, _ []TrustedReviewFeedbackRecord, observed *domain.HumanApprovalObservation, approval *domain.HumanApproval, next domain.State, _ string) error {
 	if s.approvalSaved != nil {
 		*s.approvalSaved = approval
 	}

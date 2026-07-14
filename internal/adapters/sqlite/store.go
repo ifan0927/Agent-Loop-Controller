@@ -569,7 +569,7 @@ func (s *Store) SaveGitHubRequests(ctx context.Context, observations []applicati
 	return tx.Commit()
 }
 
-func (s *Store) SaveGitHubReadSuccess(ctx context.Context, runID, leaseOwner string, expectedState domain.State, idempotencyKey string, observations []application.GitHubRequestObservation, pr domain.PullRequest, m application.GitHubInstallationMetadata, e domain.GitHubReadEvidence, approvalObservation *domain.HumanApprovalObservation, approval *domain.HumanApproval, nextState domain.State, transitionReason string) error {
+func (s *Store) SaveGitHubReadSuccess(ctx context.Context, runID, leaseOwner string, expectedState domain.State, idempotencyKey string, observations []application.GitHubRequestObservation, pr domain.PullRequest, m application.GitHubInstallationMetadata, e domain.GitHubReadEvidence, feedback []application.TrustedReviewFeedbackRecord, approvalObservation *domain.HumanApprovalObservation, approval *domain.HumanApproval, nextState domain.State, transitionReason string) error {
 	if len(e.Findings) > application.MaxNormalizedFindings {
 		return errors.New("GitHub finding count exceeds controller bounds")
 	}
@@ -588,6 +588,77 @@ func (s *Store) SaveGitHubReadSuccess(ctx context.Context, runID, leaseOwner str
 		return err
 	}
 	defer tx.Rollback()
+	// Admission, immutable feedback persistence, selection, and the repairing
+	// state edge share this transaction. A crash can therefore never leave a
+	// prompt-authorizing feedback row detached from its repair transition.
+	if len(feedback) > 0 || nextState == domain.StateRepairing {
+		hasHumanFinding := false
+		for _, finding := range e.Findings {
+			hasHumanFinding = hasHumanFinding || finding.Source == "github_human_review_comment"
+		}
+		if hasHumanFinding && len(feedback) == 0 {
+			return errors.New("repair transition lacks trusted inline feedback")
+		}
+		for _, item := range feedback {
+			if item.RunID != runID {
+				return errors.New("trusted feedback run mismatch")
+			}
+			if item.BodyDigest == "" {
+				item.BodyDigest = domain.TrustedReviewFeedbackDigest(item.Body)
+			}
+			if err := item.ValidateObservation(); err != nil {
+				return err
+			}
+			if item.OriginalReviewHeadSHA != pr.HeadSHA || item.PRNumber != pr.Number || item.PRDatabaseID != pr.DatabaseID || item.PRNodeID != pr.NodeID {
+				return errors.New("trusted feedback is not bound to observed pull request")
+			}
+			if item.Lifecycle == "" {
+				item.Lifecycle = domain.TrustedReviewFeedbackObserved
+			}
+			if item.UpdatedAt.IsZero() {
+				item.UpdatedAt = item.ObservedAt.UTC()
+			}
+			current, found, err := trustedReviewFeedbackByRoot(ctx, tx, runID, item.RootCommentNodeID)
+			if err != nil {
+				return err
+			}
+			if found {
+				if !current.ImmutableEqual(item.TrustedReviewFeedback) {
+					if _, err := tx.ExecContext(ctx, `INSERT INTO trusted_review_feedback_conflicts(run_id,root_comment_node_id,observed_body_digest,reason_code,observed_at) VALUES(?,?,?,?,?)`, runID, item.RootCommentNodeID, item.BodyDigest, "immutable_authority_conflict", formatTime(item.ObservedAt)); err != nil {
+						return err
+					}
+					if nextState == domain.StateManualIntervention {
+						continue
+					}
+					return errors.New("trusted review feedback immutable authority conflict")
+				}
+				if nextState == domain.StateRepairing && current.Lifecycle == domain.TrustedReviewFeedbackObserved {
+					result, err := tx.ExecContext(ctx, `UPDATE trusted_review_feedback SET lifecycle=?,updated_at=? WHERE run_id=? AND root_comment_node_id=? AND lifecycle=?`, domain.TrustedReviewFeedbackSelectedForRepair, nowText(), runID, item.RootCommentNodeID, domain.TrustedReviewFeedbackObserved)
+					if err != nil {
+						return err
+					}
+					if count, _ := result.RowsAffected(); count != 1 {
+						return errors.New("trusted feedback selection compare failed")
+					}
+				}
+				continue
+			}
+			var count, bytes int
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(length(CAST(body_text AS BLOB))),0) FROM trusted_review_feedback WHERE run_id=? AND original_review_head_sha=?`, runID, item.OriginalReviewHeadSHA).Scan(&count, &bytes); err != nil {
+				return err
+			}
+			if count >= domain.MaxTrustedReviewFeedbackPerHead || bytes+len([]byte(item.Body)) > domain.MaxTrustedReviewFeedbackTextBytes {
+				return errors.New("trusted review feedback head bound exceeded")
+			}
+			lifecycle := domain.TrustedReviewFeedbackObserved
+			if nextState == domain.StateRepairing {
+				lifecycle = domain.TrustedReviewFeedbackSelectedForRepair
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO trusted_review_feedback(run_id,root_comment_node_id,pr_number,pr_database_id,pr_node_id,review_database_id,review_node_id,thread_node_id,root_comment_database_id,author_database_id,author_node_id,author_login,author_type,original_review_head_sha,path,line,body_text,body_digest,source_at,observed_at,lifecycle,bound_repair_head,reply_intent_key,reply_database_id,reply_node_id,resolved,outdated,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, runID, item.RootCommentNodeID, item.PRNumber, item.PRDatabaseID, item.PRNodeID, item.ReviewDatabaseID, item.ReviewNodeID, item.ThreadNodeID, item.RootCommentDatabaseID, item.Author.DatabaseID, item.Author.NodeID, item.Author.Login, item.Author.Type, item.OriginalReviewHeadSHA, item.Path, item.Line, item.Body, item.BodyDigest, formatTime(item.SourceAt), formatTime(item.ObservedAt), lifecycle, "", "", 0, "", false, false, formatTime(item.UpdatedAt)); err != nil {
+				return err
+			}
+		}
+	}
 	var state, key, owner string
 	var leaseExpires int64
 	if err := tx.QueryRowContext(ctx, `SELECT current_state,idempotency_key,lease_owner,lease_expires_unix FROM runs WHERE run_id=?`, runID).Scan(&state, &key, &owner, &leaseExpires); err != nil {
@@ -944,6 +1015,78 @@ func (s *Store) TransitionTrustedReviewFeedback(ctx context.Context, runID, root
 		return application.TrustedReviewFeedbackRecord{}, false, err
 	}
 	return record, true, nil
+}
+
+// RequireManualInterventionForTrustedFeedbackDrift records only digest/identity
+// evidence and the terminal operator stop in one transaction. Raw GitHub body
+// text remains exclusively in the bounded feedback/finding rows.
+func (s *Store) RequireManualInterventionForTrustedFeedbackDrift(ctx context.Context, runID, leaseOwner string, expectedState domain.State, idempotencyKey string, observations []application.GitHubRequestObservation, pr domain.PullRequest, metadata application.GitHubInstallationMetadata, evidence domain.GitHubReadEvidence, rootCommentNodeID, observedDigest string) error {
+	if strings.TrimSpace(runID) == "" || !validTrustedReviewFeedbackNodeID(rootCommentNodeID) || strings.TrimSpace(observedDigest) == "" {
+		return errors.New("trusted feedback drift identity is incomplete")
+	}
+	raw, err := json.Marshal(evidence)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(raw)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var state, key, owner string
+	var expires int64
+	if err := tx.QueryRowContext(ctx, `SELECT current_state,idempotency_key,lease_owner,lease_expires_unix FROM runs WHERE run_id=?`, runID).Scan(&state, &key, &owner, &expires); err != nil {
+		return err
+	}
+	if domain.State(state) != expectedState || key != idempotencyKey || owner != leaseOwner || expires <= time.Now().UTC().UnixNano() {
+		return errors.New("trusted feedback drift run authority changed")
+	}
+	for _, observation := range observations {
+		if observation.RunID != runID {
+			return errors.New("GitHub observation run mismatch")
+		}
+		if _, err := tx.ExecContext(ctx, githubRequestInsert, githubRequestArgs(observation)...); err != nil {
+			return err
+		}
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE pull_requests SET database_id=?,url=?,head_sha=?,body_digest=?,state=?,merged=?,merge_sha=?,merged_at=? WHERE run_id=? AND number=? AND node_id=? AND head_branch=? AND base_branch=? AND base_sha=? AND ownership_key=? AND database_id IN (0,?)`, pr.DatabaseID, pr.URL, pr.HeadSHA, pr.BodyDigest, pr.State, pr.Merged, pr.MergeSHA, formatTime(pr.MergedAt), runID, pr.Number, pr.NodeID, pr.HeadBranch, pr.BaseBranch, pr.BaseSHA, pr.OwnershipKey, pr.DatabaseID)
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return errors.New("atomic GitHub PR identity update mismatch")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO github_installations(run_id,app_id,installation_id,repository_id,repository_node_id,repository_owner,repository_name,token_expires_at,permissions_digest,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,app_id,installation_id,repository_id,token_expires_at,permissions_digest) DO NOTHING`, runID, metadata.AppID, metadata.InstallationID, metadata.Repository.ID, metadata.Repository.NodeID, metadata.Repository.Owner, metadata.Repository.Name, formatTime(metadata.TokenExpiresAt), metadata.PermissionsDigest, formatTime(metadata.ObservedAt)); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO github_read_evidence(run_id,head_sha,repository_id,evidence_json,evidence_digest,observed_at) VALUES(?,?,?,?,?,?) ON CONFLICT(run_id,head_sha,evidence_digest) DO NOTHING`, runID, evidence.PullRequest.HeadSHA, evidence.Repository.ID, string(raw), hex.EncodeToString(sum[:]), formatTime(evidence.ObservedAt)); err != nil {
+		return err
+	}
+	if _, found, err := trustedReviewFeedbackByRoot(ctx, tx, runID, rootCommentNodeID); err != nil || !found {
+		if err != nil {
+			return err
+		}
+		return errors.New("trusted feedback drift root is not persisted")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO trusted_review_feedback_conflicts(run_id,root_comment_node_id,observed_body_digest,reason_code,observed_at) VALUES(?,?,?,?,?)`, runID, rootCommentNodeID, observedDigest, "immutable_authority_conflict", nowText()); err != nil {
+		return err
+	}
+	var sequence int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM transitions WHERE run_id=?`, runID).Scan(&sequence); err != nil {
+		return err
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE runs SET current_state=?,updated_at=? WHERE run_id=? AND current_state=? AND idempotency_key=? AND lease_owner=? AND lease_expires_unix>?`, domain.StateManualIntervention, nowText(), runID, expectedState, idempotencyKey, leaseOwner, time.Now().UTC().UnixNano())
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return errors.New("trusted feedback drift state update lost")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO transitions(run_id,sequence,from_state,to_state,reason,evidence_reference,bound_head,created_at) VALUES(?,?,?,?,?,?,?,?)`, runID, sequence, expectedState, domain.StateManualIntervention, "trusted inline feedback authority drift", "trusted_feedback_conflict:"+observedDigest, "", nowText()); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func validateTrustedReviewFeedbackTransitionEvidence(current application.TrustedReviewFeedbackRecord, next domain.TrustedReviewFeedbackLifecycle, boundRepairHead, replyIntentKey string, replyDatabaseID int64, replyNodeID string, resolved bool) error {
