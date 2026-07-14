@@ -1652,10 +1652,36 @@ func saveHumanApprovalTx(ctx context.Context, tx *sql.Tx, runID string, approval
 	}
 	existing.ApprovedAt = parseTime(approvedAt)
 	existing.ObservedAt = parseTime(observedAt)
-	if existing != approval {
+	if !sameHumanApprovalAuthority(existing, approval) {
 		return errors.New("conflicting immutable human approval evidence")
 	}
+	if approval.ObservedAt.Equal(existing.ObservedAt) {
+		return nil
+	}
+	if !approval.ObservedAt.After(existing.ObservedAt) {
+		return errors.New("human approval observation is not newer")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE human_approvals SET observed_at=? WHERE run_id=? AND approved_sha=? AND observed_at=?`, formatTime(approval.ObservedAt), runID, approval.ApprovedSHA, observedAt)
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return errors.New("human approval observation update lost")
+	}
 	return nil
+}
+
+func sameHumanApprovalAuthority(left, right domain.HumanApproval) bool {
+	return left.PRNumber == right.PRNumber &&
+		left.Approver == right.Approver &&
+		left.Actor == right.Actor &&
+		left.ReviewDatabaseID == right.ReviewDatabaseID &&
+		left.ReviewNodeID == right.ReviewNodeID &&
+		left.Source == right.Source &&
+		left.ApprovedSHA == right.ApprovedSHA &&
+		left.CIStatus == right.CIStatus &&
+		left.ReviewSHA == right.ReviewSHA &&
+		left.ApprovedAt.Equal(right.ApprovedAt)
 }
 
 func (s *Store) SaveMerge(ctx context.Context, record application.MergeRecord) error {

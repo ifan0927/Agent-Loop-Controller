@@ -589,6 +589,71 @@ func TestApprovalAndMergeEvidenceAreImmutable(t *testing.T) {
 	}
 }
 
+func TestHumanApprovalAcceptsOnlyNewerCompatibleObservation(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	head := strings.Repeat("a", 40)
+	run := application.Run{ID: "approval-observation", IssueID: "IFAN-APPROVAL", IdempotencyKey: "approval-key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: "/tmp/approval-observation", ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}
+	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCandidateHead(ctx, run.ID, head); err != nil {
+		t.Fatal(err)
+	}
+	sourceAt := time.Date(2026, 7, 14, 1, 0, 0, 0, time.UTC)
+	approval := domain.HumanApproval{PRNumber: 1, Approver: "ifan0927", Actor: domain.ActorIdentity{DatabaseID: 33, NodeID: "USER_33", Login: "ifan0927", Type: "User"}, ReviewDatabaseID: 55, ReviewNodeID: "PRR_55", Source: "github_pull_request_review", ApprovedSHA: head, CIStatus: "pass", ReviewSHA: head, ApprovedAt: sourceAt, ObservedAt: sourceAt.Add(time.Minute)}
+	if err := store.SaveHumanApproval(ctx, run.ID, approval); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveHumanApproval(ctx, run.ID, approval); err != nil {
+		t.Fatalf("equal observation must be idempotent: %v", err)
+	}
+	newer := approval
+	newer.ObservedAt = newer.ObservedAt.Add(time.Minute)
+	if err := store.SaveHumanApproval(ctx, run.ID, newer); err != nil {
+		t.Fatalf("newer compatible observation: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*domain.HumanApproval)
+	}{
+		{name: "older observation", mutate: func(value *domain.HumanApproval) { value.ObservedAt = approval.ObservedAt }},
+		{name: "pull request", mutate: func(value *domain.HumanApproval) { value.PRNumber++ }},
+		{name: "approver", mutate: func(value *domain.HumanApproval) { value.Approver = "mallory" }},
+		{name: "actor database identity", mutate: func(value *domain.HumanApproval) { value.Actor.DatabaseID++ }},
+		{name: "actor identity", mutate: func(value *domain.HumanApproval) { value.Actor.NodeID = "USER_OTHER" }},
+		{name: "actor login", mutate: func(value *domain.HumanApproval) { value.Actor.Login = "mallory" }},
+		{name: "actor type", mutate: func(value *domain.HumanApproval) { value.Actor.Type = "Bot" }},
+		{name: "source", mutate: func(value *domain.HumanApproval) { value.Source = "other_source" }},
+		{name: "review database identity", mutate: func(value *domain.HumanApproval) { value.ReviewDatabaseID++ }},
+		{name: "review identity", mutate: func(value *domain.HumanApproval) { value.ReviewNodeID = "PRR_OTHER" }},
+		{name: "review head", mutate: func(value *domain.HumanApproval) { value.ReviewSHA = strings.Repeat("b", 40) }},
+		{name: "CI status", mutate: func(value *domain.HumanApproval) { value.CIStatus = "failed" }},
+		{name: "approved at", mutate: func(value *domain.HumanApproval) { value.ApprovedAt = value.ApprovedAt.Add(time.Second) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conflict := newer
+			conflict.ObservedAt = conflict.ObservedAt.Add(time.Minute)
+			tc.mutate(&conflict)
+			if err := store.SaveHumanApproval(ctx, run.ID, conflict); err == nil {
+				t.Fatal("conflicting approval observation was accepted")
+			}
+		})
+	}
+	inspection, err := store.Inspect(ctx, run.ID)
+	if err != nil || inspection.Approval == nil || inspection.Approval.ObservedAt != newer.ObservedAt {
+		t.Fatalf("inspection=%+v err=%v", inspection, err)
+	}
+	var count int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM human_approvals WHERE run_id=?`, run.ID).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("approval rows=%d err=%v", count, err)
+	}
+}
+
 func TestLinearCompletionEvidenceSurvivesRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
 	store, err := Open(path)
@@ -669,6 +734,76 @@ func TestGitHubApprovalObservationSurvivesRestartWithSourceAndObservationTimes(t
 	inspection, err := store.Inspect(ctx, run.ID)
 	if err != nil || inspection.Run.State != domain.StateMerging || inspection.Approval == nil || inspection.ApprovalObservation == nil || inspection.Approval.ObservedAt != observedAt || inspection.ApprovalObservation.SourceAt != sourceAt || inspection.ApprovalObservation.Status != domain.HumanApprovalApproved {
 		t.Fatalf("inspection=%+v err=%v", inspection, err)
+	}
+}
+
+func TestResolvedAdvancedApprovalObservationSurvivesSQLiteRestartAndClaimsOneGuardedRetry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "controller.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	head := strings.Repeat("a", 40)
+	run := application.Run{ID: "resolved-approval", IssueID: "IFAN-43", IdempotencyKey: "resolved-key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "feature", BaseSHA: "base", ArtifactRoot: "/tmp/resolved-approval", ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}
+	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCandidateHead(ctx, run.ID, head); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE runs SET current_state=? WHERE run_id=?`, domain.StateMerging, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	pr := domain.PullRequest{Number: 43, DatabaseID: 143, URL: "https://example.invalid/pr/43", NodeID: "PR_43", HeadBranch: "feature", BaseBranch: "main", HeadSHA: head, BaseSHA: "base", BodyDigest: "body", OwnershipKey: run.IdempotencyKey, State: "open"}
+	if err := store.SavePullRequest(ctx, run.ID, pr); err != nil {
+		t.Fatal(err)
+	}
+	sourceAt := time.Date(2026, 7, 14, 2, 0, 0, 0, time.UTC)
+	approval := domain.HumanApproval{PRNumber: pr.Number, Approver: "ifan0927", Actor: domain.ActorIdentity{DatabaseID: 33, NodeID: "USER_33", Login: "ifan0927", Type: "User"}, ReviewDatabaseID: 55, ReviewNodeID: "PRR_55", Source: "github_pull_request_review", ApprovedSHA: head, CIStatus: "pass", ReviewSHA: head, ApprovedAt: sourceAt, ObservedAt: sourceAt.Add(time.Minute)}
+	if err := store.SaveHumanApproval(ctx, run.ID, approval); err != nil {
+		t.Fatal(err)
+	}
+	side, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{RunID: run.ID, Kind: "squash_merge", IdempotencyKey: head, IntentJSON: `{"pull_request":43}`, Attempt: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	side.Status, side.ResultJSON, side.ObservedAt = "failed", `{"category":"merge_policy_pending"}`, approval.ObservedAt
+	if err := store.RecordMergePolicyPending(ctx, run.ID, side, head); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	owner := "restart-owner"
+	if acquired, err := store.AcquireLease(ctx, run.ID, owner, time.Now().Add(time.Minute)); err != nil || !acquired {
+		t.Fatalf("lease acquired=%v err=%v", acquired, err)
+	}
+	resolvedAt := approval.ObservedAt.Add(time.Minute)
+	resolvedApproval := approval
+	resolvedApproval.ObservedAt = resolvedAt
+	repo := domain.RepositoryIdentity{ID: 99, NodeID: "REPO", Owner: "owner", Name: "repo"}
+	evidence := domain.GitHubReadEvidence{Repository: repo, PullRequest: pr, Checks: []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: head, State: domain.CheckSuccess}}, ReviewThreads: []domain.GitHubReviewThread{{NodeID: "THREAD_43", Resolved: true}}, ObservedAt: resolvedAt}
+	approvalObservation := &domain.HumanApprovalObservation{PRNumber: pr.Number, CandidateHead: head, Status: domain.HumanApprovalApproved, ReviewDatabaseID: resolvedApproval.ReviewDatabaseID, ReviewNodeID: resolvedApproval.ReviewNodeID, Actor: resolvedApproval.Actor, ReviewHeadSHA: head, SourceAt: sourceAt, ObservedAt: resolvedAt}
+	metadata := application.GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: repo, TokenExpiresAt: resolvedAt.Add(time.Hour), PermissionsDigest: "permissions", ObservedAt: resolvedAt}
+	if err := store.SaveGitHubReadSuccess(ctx, run.ID, owner, domain.StateAwaitingGitHubMergeability, run.IdempotencyKey, nil, pr, metadata, evidence, nil, approvalObservation, &resolvedApproval, domain.StateMerging, "controller-replied threads resolved; guarded merge may be retried"); err != nil {
+		t.Fatalf("resolved advanced observation: %v", err)
+	}
+	inspection, err := store.Inspect(ctx, run.ID)
+	if err != nil || inspection.Run.State != domain.StateMerging || inspection.Approval == nil || inspection.Approval.ObservedAt != resolvedAt {
+		t.Fatalf("inspection=%+v err=%v", inspection, err)
+	}
+	claimed, changed, err := store.RetryMergeSideEffect(ctx, side)
+	if err != nil || !changed || claimed.Status != "intent" || claimed.Attempt != 2 {
+		t.Fatalf("claimed=%+v changed=%v err=%v", claimed, changed, err)
+	}
+	if _, changed, err := store.RetryMergeSideEffect(ctx, side); err != nil || changed {
+		t.Fatalf("duplicate guarded retry changed=%v err=%v", changed, err)
 	}
 }
 
