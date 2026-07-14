@@ -11,7 +11,7 @@ Phase 1B proves the durable local subset with simulated issue input and stops at
 
 ## In scope
 
-- Manual `start IFAN-xxx` admission signal.
+- One explicit `run IFAN-xxx` admission signal.
 - Linear issue fetch, eligibility validation, and immutable snapshot.
 - Repository mapping and Linear-provided branch name.
 - Dedicated Git worktree per run.
@@ -23,10 +23,13 @@ Phase 1B proves the durable local subset with simulated issue input and stops at
 - Fresh independent Codex review of the complete branch delta.
 - Repair, re-verification, and fresh re-review loop.
 - PR creation only after internal review passes.
-- CodeRabbit as the second automated reviewer.
 - Human approval bound to the final PR head SHA.
 - Squash merge and owned branch/worktree cleanup.
-- Crash recovery and manual reconciliation command.
+- A durable delivery driver that automatically advances one admitted run through
+  cleanup, including bounded CI, GitHub-approval, and Linear
+  completion polling.
+- Crash recovery through driver restart; lower-level reconciliation commands are
+  recovery/debug interfaces rather than the normal delivery path.
 
 ## Required safety properties
 
@@ -59,7 +62,10 @@ Phase 1B proves the durable local subset with simulated issue input and stops at
 5. It can pause for a human decision and resume the same session safely.
 6. It independently verifies the candidate and records head-bound evidence.
 7. A fresh Codex review passes before PR creation.
-8. Findings from either Codex review or CodeRabbit enter the repair loop.
-9. I-Fan approves the final head before squash merge.
-10. Merge, Linear completion reconciliation, and owned cleanup succeed after a
-    controller restart as well as during a normal run.
+8. A required CI failure enters the repair loop.
+9. The driver pauses only for I-Fan's final approval, a structured human
+   decision, or fail-closed intervention; an exact final-head GitHub approval
+   automatically resumes merge.
+10. Merge, Linear completion reconciliation, and owned cleanup succeed without
+    per-state operator commands after a controller restart as well as during a
+    normal run.

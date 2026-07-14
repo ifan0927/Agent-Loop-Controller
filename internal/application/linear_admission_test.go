@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -117,6 +118,118 @@ func TestLinearAdmissionSourceDriftRequiresManualDecision(t *testing.T) {
 	_, _, err = service.Start(context.Background(), LinearStartCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, Identifier: "IFAN-42"})
 	if err == nil || !strings.Contains(err.Error(), "human decision") || !store.marked || store.markedRunID != "run-existing" || store.markedState != domain.StateExecuting || store.markedSource != "2026-07-12T00:00:00Z" || controller.started != 0 {
 		t.Fatalf("err=%v marked=%t run=%s state=%s source=%s started=%d", err, store.marked, store.markedRunID, store.markedState, store.markedSource, controller.started)
+	}
+}
+
+func TestLinearRevalidateAllowsAutomatedStartedStateWithUnchangedTask(t *testing.T) {
+	repository := LocalRepository{CanonicalRepository: "owner/repo", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
+	original := validLinearSource()
+	snapshot, _, err := admitLinearTask(original, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedTask, err := json.Marshal(snapshot.Task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositoryJSON, err := json.Marshal(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	progressed := original
+	progressed.State = LinearState{ID: "started", Name: "In Progress", Type: "started"}
+	progressed.SourceRevision = "2026-07-13T00:00:00Z"
+	existing := Run{ID: "run-existing", IssueID: original.Identifier, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: repository.CanonicalRepository, RepositoryConfigJSON: string(repositoryJSON), WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: string(storedTask), CandidateHead: "candidate", State: domain.StatePROpen}
+	store := &admissionStore{serviceStore: serviceStore{run: existing}}
+	service, err := NewLinearAdmissionService(&admissionReader{source: progressed}, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, store, &admissionController{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := service.Revalidate(context.Background(), LinearRevalidateCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: existing.ID, Repository: existing.Repository, ExpectedState: existing.State, IdempotencyKey: existing.IdempotencyKey})
+	if err != nil || got.ID != existing.ID || store.marked {
+		t.Fatalf("run=%+v err=%v marked=%t", got, err, store.marked)
+	}
+}
+
+func TestLinearRevalidateManualInterventionRequiresExplicitOwnedPushRecovery(t *testing.T) {
+	repository := LocalRepository{CanonicalRepository: "owner/repo", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
+	source := validLinearSource()
+	snapshot, _, err := admitLinearTask(source, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: mustJSON(t, snapshot.Task), CandidateHead: "candidate", State: domain.StateManualIntervention})
+	store := &admissionStore{serviceStore: serviceStore{run: run}}
+	service, err := NewLinearAdmissionService(&admissionReader{source: source}, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, store, &admissionController{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := LinearRevalidateCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}
+	if _, err := service.Revalidate(context.Background(), command); err == nil || !strings.Contains(err.Error(), "human decision") {
+		t.Fatalf("ordinary manual revalidation err=%v", err)
+	}
+	if got, err := service.RevalidateOwnedPushRecovery(context.Background(), command); err != nil || got.ID != run.ID {
+		t.Fatalf("owned recovery run=%+v err=%v", got, err)
+	}
+}
+
+func TestLinearRevalidateAllowsUnchangedStartedStateDuringRepairExecution(t *testing.T) {
+	repository := LocalRepository{CanonicalRepository: "owner/repo", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
+	original := validLinearSource()
+	snapshot, _, err := admitLinearTask(original, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedTask, err := json.Marshal(snapshot.Task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositoryJSON, err := json.Marshal(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	progressed := original
+	progressed.State = LinearState{ID: "started", Name: "In Progress", Type: "started"}
+	progressed.SourceRevision = "2026-07-13T00:00:00Z"
+	existing := Run{ID: "run-existing", IssueID: original.Identifier, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: repository.CanonicalRepository, RepositoryConfigJSON: string(repositoryJSON), WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: string(storedTask), State: domain.StateExecuting}
+	store := &admissionStore{serviceStore: serviceStore{run: existing}}
+	service, err := NewLinearAdmissionService(&admissionReader{source: progressed}, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, store, &admissionController{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Revalidate(context.Background(), LinearRevalidateCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: existing.ID, Repository: existing.Repository, ExpectedState: existing.State, IdempotencyKey: existing.IdempotencyKey}); err != nil || store.marked {
+		t.Fatalf("err=%v marked=%t", err, store.marked)
+	}
+}
+
+func TestLinearRevalidateRejectsStartedStateWithTaskChange(t *testing.T) {
+	repository := LocalRepository{CanonicalRepository: "owner/repo", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
+	original := validLinearSource()
+	snapshot, _, err := admitLinearTask(original, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedTask, err := json.Marshal(snapshot.Task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositoryJSON, err := json.Marshal(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := original
+	changed.State = LinearState{ID: "started", Name: "In Progress", Type: "started"}
+	changed.SourceRevision = "2026-07-13T00:00:00Z"
+	changed.Description += "\n\n- Changed after admission."
+	existing := Run{ID: "run-existing", IssueID: original.Identifier, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: repository.CanonicalRepository, RepositoryConfigJSON: string(repositoryJSON), WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: string(storedTask), CandidateHead: "candidate", State: domain.StatePROpen}
+	store := &admissionStore{serviceStore: serviceStore{run: existing}}
+	service, err := NewLinearAdmissionService(&admissionReader{source: changed}, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, store, &admissionController{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Revalidate(context.Background(), LinearRevalidateCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: existing.ID, Repository: existing.Repository, ExpectedState: existing.State, IdempotencyKey: existing.IdempotencyKey})
+	if err == nil || !store.marked {
+		t.Fatalf("err=%v marked=%t", err, store.marked)
 	}
 }
 

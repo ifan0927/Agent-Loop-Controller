@@ -25,9 +25,6 @@ type Config struct {
 	APIVersion        string        `json:"api_version"`
 	PullRequestsWrite bool          `json:"pull_requests_write"`
 	SquashMergeWrite  bool          `json:"squash_merge_write"`
-	CodeRabbitActorID int64         `json:"coderabbit_actor_id"`
-	CodeRabbitNodeID  string        `json:"coderabbit_node_id"`
-	CodeRabbitAppID   int64         `json:"coderabbit_app_id"`
 }
 
 type configFile struct {
@@ -44,9 +41,6 @@ type configFile struct {
 	APIVersion        string `json:"api_version"`
 	PullRequestsWrite bool   `json:"pull_requests_write"`
 	SquashMergeWrite  bool   `json:"squash_merge_write"`
-	CodeRabbitActorID int64  `json:"coderabbit_actor_id"`
-	CodeRabbitNodeID  string `json:"coderabbit_node_id"`
-	CodeRabbitAppID   int64  `json:"coderabbit_app_id"`
 }
 
 func DecodeConfig(r io.Reader) (Config, error) {
@@ -80,7 +74,7 @@ func DecodeConfigWithoutPrivateKey(r io.Reader) (Config, error) {
 	if err != nil {
 		return Config{}, errors.New("invalid token_refresh_skew")
 	}
-	c := Config{APIBaseURL: f.APIBaseURL, GraphQLURL: f.GraphQLURL, AppID: f.AppID, InstallationID: f.InstallationID, RepositoryOwner: f.RepositoryOwner, RepositoryName: f.RepositoryName, RepositoryID: f.RepositoryID, PrivateKeyFile: f.PrivateKeyFile, HTTPTimeout: timeout, TokenRefreshSkew: skew, APIVersion: f.APIVersion, PullRequestsWrite: f.PullRequestsWrite, SquashMergeWrite: f.SquashMergeWrite, CodeRabbitActorID: f.CodeRabbitActorID, CodeRabbitNodeID: f.CodeRabbitNodeID, CodeRabbitAppID: f.CodeRabbitAppID}
+	c := Config{APIBaseURL: f.APIBaseURL, GraphQLURL: f.GraphQLURL, AppID: f.AppID, InstallationID: f.InstallationID, RepositoryOwner: f.RepositoryOwner, RepositoryName: f.RepositoryName, RepositoryID: f.RepositoryID, PrivateKeyFile: f.PrivateKeyFile, HTTPTimeout: timeout, TokenRefreshSkew: skew, APIVersion: f.APIVersion, PullRequestsWrite: f.PullRequestsWrite, SquashMergeWrite: f.SquashMergeWrite}
 	return c, c.ValidateWithoutPrivateKey()
 }
 
@@ -99,10 +93,6 @@ func (c Config) ValidateWithoutPrivateKey() error {
 	}
 	if c.HTTPTimeout <= 0 || c.HTTPTimeout > 2*time.Minute || c.TokenRefreshSkew < 0 || c.TokenRefreshSkew >= time.Hour {
 		return errors.New("invalid GitHub timeout or refresh skew")
-	}
-	configuredCodeRabbit := c.CodeRabbitActorID > 0 || c.CodeRabbitNodeID != "" || c.CodeRabbitAppID > 0
-	if configuredCodeRabbit && (c.CodeRabbitActorID < 1 || c.CodeRabbitNodeID == "" || c.CodeRabbitAppID < 1) {
-		return errors.New("CodeRabbit identity must include actor, node, and App IDs")
 	}
 	apiURL, err := url.Parse(c.APIBaseURL)
 	if err != nil {

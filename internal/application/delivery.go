@@ -192,7 +192,7 @@ func authorizeMergeEvidence(run Run, pr domain.PullRequest, snapshot domain.Revi
 		return err
 	}
 	if snapshot.Classify() != domain.ReconciliationPass {
-		return errors.New("merge requires passing required checks and CodeRabbit")
+		return errors.New("merge requires passing required checks")
 	}
 	if fixture {
 		if approval.Approver != "ifan0927" || approval.Source != "fixture_explicit_approval" {

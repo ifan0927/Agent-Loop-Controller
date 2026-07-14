@@ -52,18 +52,6 @@ type GitHubCheck struct {
 	ObservedAt  time.Time  `json:"observation_timestamp"`
 }
 
-type CodeRabbitState string
-
-const (
-	CodeRabbitAbsent         CodeRabbitState = "absent"
-	CodeRabbitPending        CodeRabbitState = "pending"
-	CodeRabbitPass           CodeRabbitState = "pass"
-	CodeRabbitActionable     CodeRabbitState = "actionable_findings"
-	CodeRabbitInfrastructure CodeRabbitState = "infrastructure_failure"
-	CodeRabbitUntrusted      CodeRabbitState = "untrusted_lookalike"
-	CodeRabbitUnknown        CodeRabbitState = "unknown"
-)
-
 type NormalizedFinding struct {
 	Source         string `json:"source"`
 	SourceID       string `json:"source_id"`
@@ -211,7 +199,7 @@ func NormalizeHumanApproval(pr PullRequest, reviews []GitHubReview, trusted []Ac
 		return selected(HumanApprovalUntrustedActor, untrusted), nil, nil
 	case approval != nil:
 		observation := selected(HumanApprovalApproved, approval)
-		return observation, &HumanApproval{PRNumber: pr.Number, Approver: approval.Actor.Login, Actor: approval.Actor, ReviewDatabaseID: approval.DatabaseID, ReviewNodeID: approval.NodeID, Source: "github_pull_request_review", ApprovedSHA: pr.HeadSHA, CIStatus: "pass", CodeRabbit: "pass", ReviewSHA: pr.HeadSHA, ApprovedAt: approval.SourceAt.UTC(), ObservedAt: observedAt.UTC()}, nil
+		return observation, &HumanApproval{PRNumber: pr.Number, Approver: approval.Actor.Login, Actor: approval.Actor, ReviewDatabaseID: approval.DatabaseID, ReviewNodeID: approval.NodeID, Source: "github_pull_request_review", ApprovedSHA: pr.HeadSHA, CIStatus: "pass", ReviewSHA: pr.HeadSHA, ApprovedAt: approval.SourceAt.UTC(), ObservedAt: observedAt.UTC()}, nil
 	case stale != nil:
 		return selected(HumanApprovalStaleHead, stale), nil, nil
 	default:
@@ -220,15 +208,13 @@ func NormalizeHumanApproval(pr PullRequest, reviews []GitHubReview, trusted []Ac
 }
 
 type GitHubReadEvidence struct {
-	Repository     RepositoryIdentity  `json:"repository"`
-	PullRequest    PullRequest         `json:"pull_request"`
-	Checks         []GitHubCheck       `json:"checks"`
-	ReviewDecision string              `json:"review_decision"`
-	CodeRabbit     CodeRabbitState     `json:"coderabbit_status"`
-	Findings       []NormalizedFinding `json:"findings"`
-	Reviews        []GitHubReview      `json:"reviews"`
-	UnknownEvents  []string            `json:"unknown_telemetry"`
-	ObservedAt     time.Time           `json:"observed_at"`
+	Repository    RepositoryIdentity  `json:"repository"`
+	PullRequest   PullRequest         `json:"pull_request"`
+	Checks        []GitHubCheck       `json:"checks"`
+	Findings      []NormalizedFinding `json:"findings"`
+	Reviews       []GitHubReview      `json:"reviews"`
+	UnknownEvents []string            `json:"unknown_telemetry"`
+	ObservedAt    time.Time           `json:"observed_at"`
 }
 
 func (e GitHubReadEvidence) RequiredChecksStatus() ReconciliationStatus {
@@ -277,33 +263,5 @@ func (e GitHubReadEvidence) DeliveryStatus() ReconciliationStatus {
 	if len(e.UnknownEvents) > 0 {
 		return ReconciliationInfrastructure
 	}
-	for _, finding := range e.Findings {
-		if finding.Source == "" || finding.SourceID == "" || finding.BodyDigest == "" || finding.HeadSHA != e.PullRequest.HeadSHA {
-			return ReconciliationInfrastructure
-		}
-		if !finding.Resolved && !finding.Outdated {
-			return ReconciliationActionable
-		}
-	}
-	switch e.ReviewDecision {
-	case "APPROVED", "REVIEW_REQUIRED":
-	case "CHANGES_REQUESTED":
-		return ReconciliationActionable
-	case "":
-		return ReconciliationPending
-	default:
-		return ReconciliationInfrastructure
-	}
-	switch e.CodeRabbit {
-	case CodeRabbitPass:
-		return ReconciliationPass
-	case CodeRabbitAbsent, CodeRabbitPending:
-		return ReconciliationPending
-	case CodeRabbitActionable:
-		return ReconciliationActionable
-	case CodeRabbitInfrastructure, CodeRabbitUntrusted, CodeRabbitUnknown:
-		return ReconciliationInfrastructure
-	default:
-		return ReconciliationInfrastructure
-	}
+	return ReconciliationPass
 }

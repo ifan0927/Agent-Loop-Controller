@@ -12,8 +12,8 @@ must not assume access to I-Fan's Mac filesystem.
 
 This repository contains I-Fan's deterministic coding workflow controller. It
 will translate a coding-ready Linear issue into a Mac Codex implementation,
-verification, fresh independent Codex review, PR, CodeRabbit review, and final
-human approval loop.
+verification, fresh independent Codex review, PR, required CI, and final human
+approval loop.
 
 ## Canonical documents
 
@@ -39,7 +39,7 @@ policy remains authoritative.
 
 1. Codex implementation and repository verification.
 2. Fresh independent Codex review before the PR exists.
-3. CodeRabbit as the second automated review after PR creation.
+3. Required CI as the post-PR automated gate.
 4. I-Fan as the final approval gate.
 5. Any code-changing feedback invalidates the previous review and requires
    verification plus another fresh Codex review.

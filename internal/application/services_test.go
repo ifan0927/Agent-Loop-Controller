@@ -162,7 +162,7 @@ func TestCommandServiceRestartRejectsProfileDrift(t *testing.T) {
 	}
 }
 
-func TestCommandServicePassesAuthorityAndSanitizesContinueResult(t *testing.T) {
+func TestCommandServicePassesAuthorityAndProjectsContinueIdempotencyKey(t *testing.T) {
 	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateExecuting, IdempotencyKey: "key", WorktreePath: "/secret/worktree", ArtifactRoot: "/secret/artifacts", ImplementationSession: "secret-session", LastError: "secret-error"})
 	controller := &serviceController{run: run}
 	result, err := NewCommandService(controller, serviceStore{run: run}).Continue(context.Background(), ContinueCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: "run", Repository: "owner/repo", ExpectedState: domain.StateExecuting, IdempotencyKey: "key"})
@@ -170,7 +170,7 @@ func TestCommandServicePassesAuthorityAndSanitizesContinueResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw, _ := json.Marshal(result)
-	if controller.expected != domain.StateExecuting || controller.key != "key" || strings.Contains(string(raw), "key") || strings.Contains(string(raw), "secret") {
+	if controller.expected != domain.StateExecuting || controller.key != "key" || result.Run.IdempotencyKey != "key" || !strings.Contains(string(raw), `"idempotency_key":"key"`) || strings.Contains(string(raw), "secret") {
 		t.Fatalf("authority or sanitization mismatch: controller=%+v result=%+v", controller, result)
 	}
 }
@@ -186,8 +186,8 @@ func TestCommandServiceContinueUsesExpectedStateAndRepository(t *testing.T) {
 	}
 }
 
-func TestQueryServiceSanitizesInspection(t *testing.T) {
-	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", WorktreePath: "/secret/worktree", LastError: "secret"})
+func TestQueryServiceSanitizesInspectionAndProjectsIdempotencyKey(t *testing.T) {
+	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", IdempotencyKey: "resume-key", WorktreePath: "/secret/worktree", LastError: "secret"})
 	store := serviceStore{run: run, inspection: RunInspection{Run: run,
 		RepositoryBinding: &SanitizedRepositoryBinding{CanonicalRepository: "owner/repo", GitHubAppProfileRef: "github-app-profile:secret-holder"},
 		PullRequest:       &domain.PullRequest{URL: "https://github.example/owner/repo/pull/1?access_token=not-for-output"},
@@ -198,7 +198,7 @@ func TestQueryServiceSanitizesInspection(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw, _ := json.Marshal(got)
-	if strings.Contains(string(raw), "super-secret-token") || strings.Contains(string(raw), "secret-holder") || strings.Contains(string(raw), "not-for-output") || strings.Contains(string(raw), "/secret/") || !strings.Contains(string(raw), `"content_trust":"untrusted"`) {
+	if got.Run.IdempotencyKey != "resume-key" || !strings.Contains(string(raw), `"idempotency_key":"resume-key"`) || strings.Contains(string(raw), "super-secret-token") || strings.Contains(string(raw), "secret-holder") || strings.Contains(string(raw), "not-for-output") || strings.Contains(string(raw), "/secret/") || !strings.Contains(string(raw), `"content_trust":"untrusted"`) {
 		t.Fatalf("inspection was not sanitized: %s", raw)
 	}
 }
@@ -238,7 +238,7 @@ func TestGetRunDetailKeepsLegacyAndUnknownEvidenceSafe(t *testing.T) {
 		Attempts:       []Attempt{{SessionID: "session", ArtifactDir: "/private/artifacts", RequestedModel: "model", OutcomeHash: "hash"}},
 		Timeline:       []Transition{{To: domain.State("future_state"), Reason: "token=not-for-output"}},
 		Findings:       []FindingRecord{{Body: `{"client_secret":"do-not-output"}`, File: "../private/file", BodyDigest: "digest"}},
-		GitHubEvidence: &domain.GitHubReadEvidence{CodeRabbit: domain.CodeRabbitState("future_coderabbit"), UnknownEvents: []string{`{"secret":"do-not-output"}`}, Checks: []domain.GitHubCheck{{Name: "Authorization: Bearer do-not-output", State: domain.CheckState("token=do-not-output")}}},
+		GitHubEvidence: &domain.GitHubReadEvidence{UnknownEvents: []string{`{"secret":"do-not-output"}`}, Checks: []domain.GitHubCheck{{Name: "Authorization: Bearer do-not-output", State: domain.CheckState("token=do-not-output")}}},
 	}
 	store := serviceStore{run: run, inspection: inspection}
 	got, err := NewQueryService(store).GetRunDetail(context.Background(), RunDetailQuery{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: "run"})
@@ -246,7 +246,7 @@ func TestGetRunDetailKeepsLegacyAndUnknownEvidenceSafe(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw, _ := json.Marshal(got)
-	if !got.Attempts[0].SessionRecorded || !got.Attempts[0].ArtifactRecorded || len(got.Telemetry) != 4 || got.Telemetry[3].Value != "[untrusted structured value omitted]" || got.Findings[0].Content != "" || got.Findings[0].File != "" || strings.Contains(string(raw), "do-not-output") || strings.Contains(string(raw), "not-for-output") || strings.Contains(string(raw), "/private/") {
+	if !got.Attempts[0].SessionRecorded || !got.Attempts[0].ArtifactRecorded || len(got.Telemetry) != 3 || got.Telemetry[2].Value != "[untrusted structured value omitted]" || got.Findings[0].Content != "" || got.Findings[0].File != "" || strings.Contains(string(raw), "do-not-output") || strings.Contains(string(raw), "not-for-output") || strings.Contains(string(raw), "/private/") {
 		t.Fatalf("unsafe or incomplete detail projection: %s", raw)
 	}
 }
@@ -378,9 +378,9 @@ func TestGitHubReconcilePersistsPartialFailureObservations(t *testing.T) {
 }
 
 func TestNextGitHubReconciliationStateUsesOnlyLegalFailClosedGates(t *testing.T) {
-	passing := domain.GitHubReadEvidence{PullRequest: domain.PullRequest{State: "open", HeadSHA: "head"}, Checks: []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: "head", State: domain.CheckSuccess}}, CodeRabbit: domain.CodeRabbitPass}
+	passing := domain.GitHubReadEvidence{PullRequest: domain.PullRequest{State: "open", HeadSHA: "head"}, Checks: []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: "head", State: domain.CheckSuccess}}}
 	actionable := passing
-	actionable.Findings = []domain.NormalizedFinding{{Source: "coderabbit_review_comment", SourceID: "finding", BodyDigest: "digest", HeadSHA: "head"}}
+	actionable.Checks[0].State = domain.CheckFailure
 	closed := passing
 	closed.PullRequest.State = "closed"
 	cases := []struct {
@@ -417,7 +417,7 @@ func TestGitHubReconcileRecordsOnlyTrustedExactHeadHumanApproval(t *testing.T) {
 	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateAwaitingHumanApproval, IdempotencyKey: "key", WorkingBranch: "feature", BaseBranch: "main", CandidateHead: "head", BaseSHA: "base"})
 	trusted := TrustedActorIdentity{DatabaseID: 33, NodeID: "USER_33", Login: "ifan0927", Type: "User"}
 	binding := &SanitizedRepositoryBinding{CanonicalRepository: "owner/repo", ExpectedRepositoryID: 99, GitHubAppID: 1, GitHubInstallationID: 2, TrustedOperatorActors: []TrustedActorIdentity{trusted}}
-	evidence := domain.GitHubReadEvidence{Repository: domain.RepositoryIdentity{ID: 99, NodeID: "REPO", Owner: "owner", Name: "repo"}, PullRequest: pr, Checks: []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: "head", State: domain.CheckSuccess}}, ReviewDecision: "APPROVED", CodeRabbit: domain.CodeRabbitPass, Reviews: []domain.GitHubReview{{DatabaseID: 9, NodeID: "PRR", State: "APPROVED", CommitSHA: "head", SourceAt: now, Actor: domain.ActorIdentity{DatabaseID: 33, NodeID: "USER_33", Login: "ifan0927", Type: "User"}}}, ObservedAt: now}
+	evidence := domain.GitHubReadEvidence{Repository: domain.RepositoryIdentity{ID: 99, NodeID: "REPO", Owner: "owner", Name: "repo"}, PullRequest: pr, Checks: []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: "head", State: domain.CheckSuccess}}, Reviews: []domain.GitHubReview{{DatabaseID: 9, NodeID: "PRR", State: "APPROVED", CommitSHA: "head", SourceAt: now, Actor: domain.ActorIdentity{DatabaseID: 33, NodeID: "USER_33", Login: "ifan0927", Type: "User"}}}, ObservedAt: now}
 	metadata := GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: evidence.Repository}
 	var approval *domain.HumanApproval
 	var observed *domain.HumanApprovalObservation

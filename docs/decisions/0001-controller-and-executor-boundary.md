@@ -7,7 +7,7 @@ Accepted for the MVP.
 ## Context
 
 I-Fan needs a reusable coding delivery loop spanning Linear, Hermes, Mac Codex,
-GitHub, CodeRabbit, and a final human approval. Official Codex integrations can
+GitHub, and a final human approval. Official Codex integrations can
 run coding tasks, but do not define all I-Fan-specific admission, review,
 decision, merge, and cleanup policies.
 
@@ -23,8 +23,8 @@ built-in review subcommand. Controller-owned evidence and exact Git head SHAs
 govern progression.
 
 Linear remains task source of truth, GitHub remains code/CI/merge source of truth,
-Hermes remains planning and notification interface, CodeRabbit is the second
-automated PR reviewer, and I-Fan remains the final approval gate.
+Hermes remains planning and notification interface, and I-Fan remains the final
+approval gate.
 
 ## Consequences
 

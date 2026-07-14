@@ -234,6 +234,64 @@ func TestRegistryRejectsInvalidGitHubIdentities(t *testing.T) {
 	}
 }
 
+func TestRegistryAcceptsExplicitGitHubRemoteBindingAndRejectsWrongOrUnsafeRemote(t *testing.T) {
+	root := t.TempDir()
+	base := fixtureRepository(t, root, "owner", "repo", 101)
+	remote := base
+	remote.OriginPath = ""
+	remote.OriginURL = "https://github.com/OWNER/REPO.git"
+	registry := loadFixture(t, root, File{Version: CurrentVersion, Repositories: []Repository{remote}})
+	binding, err := registry.Resolve("owner/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding.OriginPath != "https://github.com/owner/repo.git" {
+		t.Fatalf("remote origin was not canonically bound: %q", binding.OriginPath)
+	}
+	legacy := base
+	legacy.OriginPath = "git@github.com:OWNER/REPO.git"
+	legacyRegistry := loadFixtureAt(t, filepath.Join(root, "legacy-remote.json"), File{Version: CurrentVersion, Repositories: []Repository{legacy}})
+	legacyBinding, err := legacyRegistry.Resolve("owner/repo")
+	if err != nil || legacyBinding.OriginPath != "git@github.com:owner/repo.git" {
+		t.Fatalf("legacy remote origin was not canonically bound: binding=%q err=%v", legacyBinding.OriginPath, err)
+	}
+
+	tests := []struct {
+		name string
+		repo Repository
+	}{
+		{"wrong repository", func() Repository { value := remote; value.OriginURL = "git@github.com:owner/other.git"; return value }()},
+		{"unsafe host", func() Repository {
+			value := remote
+			value.OriginURL = "https://github.example.invalid/owner/repo.git"
+			return value
+		}()},
+		{"HTTPS credential", func() Repository {
+			value := remote
+			value.OriginURL = "https://token@github.com/owner/repo.git"
+			return value
+		}()},
+		{"SSH credential", func() Repository {
+			value := remote
+			value.OriginURL = "ssh://git:token@github.com/owner/repo.git"
+			return value
+		}()},
+		{"both spellings", func() Repository { value := remote; value.OriginPath = base.OriginPath; return value }()},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(root, strings.ReplaceAll(test.name, " ", "-")+".json")
+			raw, _ := json.Marshal(File{Version: CurrentVersion, Repositories: []Repository{test.repo}})
+			if err := os.WriteFile(path, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatal("unsafe or mismatched remote binding accepted")
+			}
+		})
+	}
+}
+
 func TestRegistryErrorsDoNotEchoSecretValues(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "registry.json")

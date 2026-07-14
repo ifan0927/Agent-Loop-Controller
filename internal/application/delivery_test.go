@@ -82,7 +82,7 @@ func (*fakeGitHub) SquashMerge(context.Context, int64, string) (domain.PullReque
 
 func TestBoundedReconciliationPersistsPendingAndPass(t *testing.T) {
 	now := time.Now()
-	gh := &fakeGitHub{snapshots: []domain.ReviewSnapshot{{HeadSHA: "h1", RequiredChecks: []string{"test"}, CodeRabbitStatus: "pending", Checks: []domain.Check{{Name: "test", Required: true, Status: "in_progress", ObservedSHA: "h1"}}, ObservedAt: now}, {HeadSHA: "h1", RequiredChecks: []string{"test"}, CodeRabbitStatus: "pass", Checks: []domain.Check{{Name: "test", Required: true, Status: "completed", Conclusion: "success", ObservedSHA: "h1"}}, ObservedAt: now}}}
+	gh := &fakeGitHub{snapshots: []domain.ReviewSnapshot{{HeadSHA: "h1", RequiredChecks: []string{"test"}, Checks: []domain.Check{{Name: "test", Required: true, Status: "in_progress", ObservedSHA: "h1"}}, ObservedAt: now}, {HeadSHA: "h1", RequiredChecks: []string{"test"}, Checks: []domain.Check{{Name: "test", Required: true, Status: "completed", Conclusion: "success", ObservedSHA: "h1"}}, ObservedAt: now}}}
 	store := &deliveryMemoryStore{}
 	status, err := ReconcileReviews(context.Background(), gh, store, "run", 3, "h1", PollPolicy{MaxAttempts: 2, Interval: 0, Deadline: time.Second}, func(context.Context, time.Duration) error { return nil })
 	if err != nil || status != domain.ReconciliationPass || len(store.polls) != 2 {
@@ -92,7 +92,7 @@ func TestBoundedReconciliationPersistsPendingAndPass(t *testing.T) {
 
 func TestReconciliationTimesOutAtBound(t *testing.T) {
 	now := time.Now()
-	pending := domain.ReviewSnapshot{HeadSHA: "h1", RequiredChecks: []string{"test"}, CodeRabbitStatus: "pending", Checks: []domain.Check{{Name: "test", Required: true, Status: "in_progress", ObservedSHA: "h1"}}, ObservedAt: now}
+	pending := domain.ReviewSnapshot{HeadSHA: "h1", RequiredChecks: []string{"test"}, Checks: []domain.Check{{Name: "test", Required: true, Status: "in_progress", ObservedSHA: "h1"}}, ObservedAt: now}
 	gh := &fakeGitHub{snapshots: []domain.ReviewSnapshot{pending, pending}}
 	store := &deliveryMemoryStore{}
 	status, err := ReconcileReviews(context.Background(), gh, store, "run", 3, "h1", PollPolicy{MaxAttempts: 2, Interval: 0, Deadline: time.Second}, func(context.Context, time.Duration) error { return nil })
@@ -103,8 +103,8 @@ func TestReconciliationTimesOutAtBound(t *testing.T) {
 
 func TestReconciliationRestartUsesRemainingAttemptBudget(t *testing.T) {
 	now := time.Now()
-	pending := domain.ReviewSnapshot{HeadSHA: "h1", RequiredChecks: []string{"test"}, CodeRabbitStatus: "pending", Checks: []domain.Check{{Name: "test", Required: true, Status: "in_progress", ObservedSHA: "h1"}}, ObservedAt: now}
-	passing := domain.ReviewSnapshot{HeadSHA: "h1", RequiredChecks: []string{"test"}, CodeRabbitStatus: "pass", Checks: []domain.Check{{Name: "test", Required: true, Status: "completed", Conclusion: "success", ObservedSHA: "h1"}}, ObservedAt: now}
+	pending := domain.ReviewSnapshot{HeadSHA: "h1", RequiredChecks: []string{"test"}, Checks: []domain.Check{{Name: "test", Required: true, Status: "in_progress", ObservedSHA: "h1"}}, ObservedAt: now}
+	passing := domain.ReviewSnapshot{HeadSHA: "h1", RequiredChecks: []string{"test"}, Checks: []domain.Check{{Name: "test", Required: true, Status: "completed", Conclusion: "success", ObservedSHA: "h1"}}, ObservedAt: now}
 	store := &deliveryMemoryStore{}
 	first := &fakeGitHub{snapshots: []domain.ReviewSnapshot{pending}}
 	status, err := ReconcileReviews(context.Background(), first, store, "run", 3, "h1", PollPolicy{MaxAttempts: 1, Deadline: time.Second}, func(context.Context, time.Duration) error { return nil })
@@ -123,26 +123,12 @@ func TestReconciliationRestartUsesRemainingAttemptBudget(t *testing.T) {
 	}
 }
 
-func TestCodeRabbitFindingIsNormalizedWithoutBodyExecution(t *testing.T) {
-	body := "$(touch /tmp/controller-must-not-run)"
-	now := time.Now()
-	gh := &fakeGitHub{snapshots: []domain.ReviewSnapshot{{HeadSHA: "h1", RequiredChecks: []string{"test"}, CodeRabbitStatus: "failure", Checks: []domain.Check{{Name: "test", Required: true, Status: "completed", Conclusion: "success", ObservedSHA: "h1"}}, Findings: []domain.ExternalFinding{{SourceID: "c1", ThreadID: "t1", Source: "coderabbit", File: "a.go", Line: 3, Severity: "high", Body: body}}, ObservedAt: now}}}
-	store := &deliveryMemoryStore{}
-	status, err := ReconcileReviews(context.Background(), gh, store, "run", 3, "h1", PollPolicy{MaxAttempts: 1, Deadline: time.Second}, func(context.Context, time.Duration) error { return nil })
-	if err != nil || status != domain.ReconciliationActionable || len(store.findings) != 1 || store.findings[0].BodyDigest == body {
-		t.Fatalf("status=%s findings=%+v err=%v", status, store.findings, err)
-	}
-	if prompt := BuildRepairPrompt(store.findings); prompt == "" || !contains(prompt, body) || !contains(prompt, "untrusted_body=") {
-		t.Fatalf("normalized untrusted body missing from repair prompt: %q", prompt)
-	}
-}
-
 func TestHumanApprovalAndMergeBindExactSHA(t *testing.T) {
 	run := Run{State: domain.StateAwaitingHumanApproval, CandidateHead: "h1", WorkingBranch: "ifan/one", BaseBranch: "main", BaseSHA: "b1", IdempotencyKey: "key"}
 	pr := domain.PullRequest{Number: 4, NodeID: "node-4", HeadBranch: "ifan/one", BaseBranch: "main", BaseSHA: "b1", HeadSHA: "h1", BodyDigest: "digest", OwnershipKey: "key"}
-	snap := domain.ReviewSnapshot{HeadSHA: "h1", RequiredChecks: []string{"test"}, CodeRabbitStatus: "pass", Checks: []domain.Check{{Name: "test", Required: true, Status: "completed", Conclusion: "success", ObservedSHA: "h1"}}}
+	snap := domain.ReviewSnapshot{HeadSHA: "h1", RequiredChecks: []string{"test"}, Checks: []domain.Check{{Name: "test", Required: true, Status: "completed", Conclusion: "success", ObservedSHA: "h1"}}}
 	now := time.Now().UTC()
-	approval := domain.HumanApproval{PRNumber: 4, Approver: "ifan0927", Actor: domain.ActorIdentity{DatabaseID: 33, NodeID: "USER_33", Login: "ifan0927", Type: "User"}, ReviewDatabaseID: 55, ReviewNodeID: "PRR_55", Source: "github_pull_request_review", ApprovedSHA: "h1", CIStatus: "pass", CodeRabbit: "pass", ReviewSHA: "h1", ApprovedAt: now, ObservedAt: now}
+	approval := domain.HumanApproval{PRNumber: 4, Approver: "ifan0927", Actor: domain.ActorIdentity{DatabaseID: 33, NodeID: "USER_33", Login: "ifan0927", Type: "User"}, ReviewDatabaseID: 55, ReviewNodeID: "PRR_55", Source: "github_pull_request_review", ApprovedSHA: "h1", CIStatus: "pass", ReviewSHA: "h1", ApprovedAt: now, ObservedAt: now}
 	if err := AuthorizeMerge(run, pr, snap, approval, "h1", "h1"); err != nil {
 		t.Fatal(err)
 	}

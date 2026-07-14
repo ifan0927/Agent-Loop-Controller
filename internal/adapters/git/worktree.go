@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,10 +33,13 @@ type WorktreeEvidence struct {
 type WorktreeManager struct{ Workspace }
 
 func (m WorktreeManager) Provision(ctx context.Context, request WorktreeRequest) (WorktreeEvidence, error) {
-	for name, path := range map[string]string{"source": request.SourcePath, "origin": request.OriginPath, "worktree": request.Path} {
+	for name, path := range map[string]string{"source": request.SourcePath, "worktree": request.Path} {
 		if !filepath.IsAbs(path) {
 			return WorktreeEvidence{}, fmt.Errorf("%s path must be absolute", name)
 		}
+	}
+	if !validOriginBinding(request.OriginPath) {
+		return WorktreeEvidence{}, errors.New("origin must be an absolute local path or credential-free canonical GitHub remote URL")
 	}
 	if strings.TrimSpace(request.Nonce) == "" {
 		return WorktreeEvidence{}, errors.New("worktree ownership nonce is required")
@@ -49,7 +53,7 @@ func (m WorktreeManager) Provision(ctx context.Context, request WorktreeRequest)
 	if err != nil {
 		return WorktreeEvidence{}, fmt.Errorf("resolve source origin: %w", err)
 	}
-	if !sameLocalPath(strings.TrimSpace(remote), request.OriginPath) {
+	if !sameOriginBinding(strings.TrimSpace(remote), request.OriginPath) {
 		return WorktreeEvidence{}, fmt.Errorf("source origin does not match registry origin")
 	}
 	ref := "refs/remotes/origin/" + request.BaseBranch
@@ -100,7 +104,7 @@ func (m WorktreeManager) ValidateOwned(ctx context.Context, evidence WorktreeEvi
 	if err != nil {
 		return err
 	}
-	if !sameLocalPath(strings.TrimSpace(remote), evidence.OriginPath) {
+	if !sameOriginBinding(strings.TrimSpace(remote), evidence.OriginPath) {
 		return errors.New("owned source origin no longer matches registry evidence")
 	}
 	base, err := m.run(ctx, evidence.Path, "rev-parse", "--verify", "refs/remotes/origin/"+evidence.BaseBranch+"^{commit}")
@@ -129,6 +133,110 @@ func sameLocalPath(first, second string) bool {
 	a, errA := filepath.EvalSymlinks(first)
 	b, errB := filepath.EvalSymlinks(second)
 	return errA == nil && errB == nil && a == b
+}
+
+// sameOriginBinding compares a legacy local bare origin by resolved path, or a
+// credential-free GitHub remote by its canonical repository identity. The
+// latter deliberately allows the configured SSH/HTTPS transport to differ
+// from the checkout transport while refusing every other host and repository.
+func sameOriginBinding(first, second string) bool {
+	if sameLocalPath(first, second) {
+		return true
+	}
+	firstCanonical, errFirst := canonicalGitHubRemoteURL(first)
+	secondCanonical, errSecond := canonicalGitHubRemoteURL(second)
+	return errFirst == nil && errSecond == nil && githubRemoteIdentity(firstCanonical) == githubRemoteIdentity(secondCanonical)
+}
+
+func validOriginBinding(value string) bool {
+	if filepath.IsAbs(value) {
+		return sameLocalPath(value, value)
+	}
+	_, err := canonicalGitHubRemoteURL(value)
+	return err == nil
+}
+
+func canonicalGitHubRemoteURL(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(value, "git@github.com:") {
+		owner, name, err := githubRemotePath(strings.TrimPrefix(value, "git@github.com:"))
+		if err != nil {
+			return "", err
+		}
+		return "git@github.com:" + strings.ToLower(owner) + "/" + strings.ToLower(name) + ".git", nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return "", errors.New("remote URL is malformed")
+	}
+	if (parsed.Scheme != "https" && parsed.Scheme != "ssh") || !strings.EqualFold(parsed.Host, "github.com") || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.ForceQuery {
+		return "", errors.New("remote URL must be a github.com HTTPS or SSH URL")
+	}
+	if parsed.Scheme == "https" && parsed.User != nil {
+		return "", errors.New("HTTPS remote URL must not contain credentials")
+	}
+	if parsed.Scheme == "ssh" {
+		if parsed.User == nil || parsed.User.Username() != "git" {
+			return "", errors.New("SSH remote URL must use the git user")
+		}
+		if _, hasPassword := parsed.User.Password(); hasPassword {
+			return "", errors.New("SSH remote URL must not contain credentials")
+		}
+	}
+	owner, name, err := githubRemotePath(strings.TrimPrefix(parsed.EscapedPath(), "/"))
+	if err != nil {
+		return "", err
+	}
+	if parsed.Scheme == "https" {
+		return "https://github.com/" + strings.ToLower(owner) + "/" + strings.ToLower(name) + ".git", nil
+	}
+	return "ssh://git@github.com/" + strings.ToLower(owner) + "/" + strings.ToLower(name) + ".git", nil
+}
+
+func githubRemoteIdentity(canonicalURL string) string {
+	if strings.HasPrefix(canonicalURL, "git@github.com:") {
+		return strings.TrimPrefix(strings.TrimSuffix(canonicalURL, ".git"), "git@github.com:")
+	}
+	parsed, err := url.Parse(canonicalURL)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimPrefix(strings.TrimSuffix(parsed.Path, ".git"), "/")
+}
+
+func githubRemotePath(value string) (string, string, error) {
+	if !strings.HasSuffix(value, ".git") {
+		return "", "", errors.New("remote URL path must end in .git")
+	}
+	parts := strings.Split(strings.TrimSuffix(value, ".git"), "/")
+	if len(parts) != 2 || !validGitHubOwner(parts[0]) || !validGitHubRepository(parts[1]) {
+		return "", "", errors.New("remote URL path must contain one valid owner and repository")
+	}
+	return parts[0], parts[1], nil
+}
+
+func validGitHubOwner(value string) bool {
+	if len(value) == 0 || len(value) > 39 || value[0] == '-' || value[len(value)-1] == '-' || strings.Contains(value, "--") {
+		return false
+	}
+	for _, char := range value {
+		if char != '-' && !(char >= 'a' && char <= 'z') && !(char >= 'A' && char <= 'Z') && !(char >= '0' && char <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func validGitHubRepository(value string) bool {
+	if len(value) == 0 || len(value) > 100 || value == "." || value == ".." {
+		return false
+	}
+	for _, char := range value {
+		if char != '.' && char != '_' && char != '-' && !(char >= 'a' && char <= 'z') && !(char >= 'A' && char <= 'Z') && !(char >= '0' && char <= '9') {
+			return false
+		}
+	}
+	return true
 }
 
 func worktreeListContains(list, path, branch string) bool {

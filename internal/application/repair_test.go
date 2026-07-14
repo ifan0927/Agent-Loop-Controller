@@ -11,7 +11,7 @@ import (
 
 func repairFinding(id, body string) FindingRecord {
 	sum := sha256.Sum256([]byte(body))
-	return FindingRecord{Source: "coderabbit_review_comment", SourceID: id, Body: body, BodyDigest: hex.EncodeToString(sum[:]), HeadSHA: "head"}
+	return FindingRecord{Source: "github_required_check", SourceID: id, Body: body, BodyDigest: hex.EncodeToString(sum[:]), HeadSHA: "head"}
 }
 
 func TestRepairableFindingsAreBoundedDeterministicAndIdempotent(t *testing.T) {

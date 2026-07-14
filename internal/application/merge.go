@@ -157,7 +157,7 @@ func authorizeProductionMerge(run Run, inspection RunInspection, request SquashM
 		return err
 	}
 	if evidence.DeliveryStatus() != domain.ReconciliationPass {
-		return errors.New("required checks or CodeRabbit are not passing for the exact head")
+		return errors.New("required checks are not passing for the exact head")
 	}
 	trusted, err := trustedHumanActors(inspection)
 	if err != nil {

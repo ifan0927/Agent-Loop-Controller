@@ -94,7 +94,11 @@ type CommandResult struct {
 }
 
 type RunResult struct {
-	RunID                   string       `json:"run_id"`
+	RunID string `json:"run_id"`
+	// IdempotencyKey is an operational compare-and-swap value, not an
+	// authentication credential. It is projected only after requester
+	// authorization so an operator can safely resume a persisted run.
+	IdempotencyKey          string       `json:"idempotency_key"`
 	IssueID                 string       `json:"issue_id"`
 	Repository              string       `json:"repository"`
 	ProfileID               string       `json:"profile_id"`
@@ -372,7 +376,6 @@ type InspectionResult struct {
 	LinearCompletion  []LinearCompletionObservation `json:"linear_completion_observations"`
 	Cleanup           []CleanupResult               `json:"cleanup_progress"`
 	Checks            []CheckResult                 `json:"checks"`
-	CodeRabbit        *CodeRabbitResult             `json:"coderabbit,omitempty"`
 	Findings          []FindingResult               `json:"review_findings"`
 	Telemetry         []TelemetryResult             `json:"unknown_telemetry"`
 }
@@ -460,10 +463,6 @@ type CheckResult struct {
 	State       string    `json:"state"`
 	ObservedSHA string    `json:"observed_sha"`
 	ObservedAt  time.Time `json:"observed_at"`
-}
-type CodeRabbitResult struct {
-	State      string    `json:"state"`
-	ObservedAt time.Time `json:"observed_at"`
 }
 type HumanApprovalResult struct {
 	Approver    string    `json:"approver"`
@@ -594,14 +593,6 @@ func appendUnknownTelemetry(result *InspectionResult, value RunInspection) {
 			result.Telemetry = append(result.Telemetry, TelemetryResult{Kind: "check_state", Value: sanitizeTelemetryValue(string(check.State)), ObservedAt: check.ObservedAt})
 		}
 	}
-	codeRabbitState := string(evidence.CodeRabbit)
-	if !knownCodeRabbitState(evidence.CodeRabbit) {
-		codeRabbitState = sanitizeTelemetryValue(codeRabbitState)
-	}
-	result.CodeRabbit = &CodeRabbitResult{State: codeRabbitState, ObservedAt: evidence.ObservedAt}
-	if evidence.CodeRabbit != "" && !knownCodeRabbitState(evidence.CodeRabbit) {
-		result.Telemetry = append(result.Telemetry, TelemetryResult{Kind: "coderabbit_state", Value: sanitizeTelemetryValue(string(evidence.CodeRabbit)), ObservedAt: evidence.ObservedAt})
-	}
 	for _, event := range evidence.UnknownEvents {
 		result.Telemetry = append(result.Telemetry, TelemetryResult{Kind: "github_event", Value: sanitizeTelemetryValue(event), ObservedAt: evidence.ObservedAt})
 	}
@@ -619,15 +610,6 @@ func knownState(value domain.State) bool {
 func knownCheckState(value domain.CheckState) bool {
 	switch value {
 	case domain.CheckQueued, domain.CheckInProgress, domain.CheckPending, domain.CheckRequested, domain.CheckWaiting, domain.CheckSuccess, domain.CheckNeutral, domain.CheckSkipped, domain.CheckFailure, domain.CheckActionRequired, domain.CheckCancelled, domain.CheckTimedOut, domain.CheckStale, domain.CheckUnknown:
-		return true
-	default:
-		return false
-	}
-}
-
-func knownCodeRabbitState(value domain.CodeRabbitState) bool {
-	switch value {
-	case domain.CodeRabbitAbsent, domain.CodeRabbitPending, domain.CodeRabbitPass, domain.CodeRabbitActionable, domain.CodeRabbitInfrastructure, domain.CodeRabbitUntrusted, domain.CodeRabbitUnknown:
 		return true
 	default:
 		return false
@@ -735,7 +717,7 @@ func sanitizedRun(run Run) Run {
 }
 
 func projectRunResult(run Run) RunResult {
-	return RunResult{RunID: run.ID, IssueID: run.IssueID, Repository: run.Repository, ProfileID: run.ProfileID,
+	return RunResult{RunID: run.ID, IdempotencyKey: run.IdempotencyKey, IssueID: run.IssueID, Repository: run.Repository, ProfileID: run.ProfileID,
 		ProfileSnapshotVersion: run.ProfileSnapshotVersion, ProfileDigest: run.ProfileDigest, RegistryVersion: run.RegistryVersion,
 		RegistryDigest: run.RegistryDigest, RepositoryBindingDigest: run.RepositoryBindingDigest, BaseBranch: run.BaseBranch,
 		WorkingBranch: run.WorkingBranch, BaseSHA: run.BaseSHA, State: run.State, CandidateHead: run.CandidateHead,
@@ -997,7 +979,7 @@ func nextGitHubReconciliationState(current domain.State, evidence domain.GitHubR
 	}
 	switch status {
 	case domain.ReconciliationPass:
-		return domain.StateAwaitingHumanApproval, "required checks and trusted CodeRabbit evidence passed"
+		return domain.StateAwaitingHumanApproval, "required checks passed"
 	case domain.ReconciliationActionable:
 		return domain.StateRepairing, "GitHub evidence has actionable review or check findings"
 	case domain.ReconciliationPending, domain.ReconciliationInfrastructure:

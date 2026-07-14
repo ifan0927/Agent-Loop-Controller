@@ -1,6 +1,7 @@
 package githubapp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -28,7 +29,7 @@ func TestVersionedFixtureScenarioIndex(t *testing.T) {
 	if err := json.Unmarshal(raw, &index); err != nil {
 		t.Fatal(err)
 	}
-	if index.Version != 1 || !index.Sanitized || len(index.Scenarios) < 30 {
+	if index.Version != 1 || !index.Sanitized || len(index.Scenarios) < 18 {
 		t.Fatalf("invalid fixture index: %+v", index)
 	}
 	seen := map[string]bool{}
@@ -38,6 +39,34 @@ func TestVersionedFixtureScenarioIndex(t *testing.T) {
 		}
 		seen[name] = true
 		t.Run(name, func(t *testing.T) { replayDeclaredScenario(t, name) })
+	}
+}
+
+func TestConfigRejectsRemovedCodeRabbitFields(t *testing.T) {
+	_, key := testKey(t)
+	cfg := validConfig(key)
+	raw := map[string]any{
+		"api_base_url":        cfg.APIBaseURL,
+		"graphql_url":         cfg.GraphQLURL,
+		"app_id":              cfg.AppID,
+		"installation_id":     cfg.InstallationID,
+		"repository_owner":    cfg.RepositoryOwner,
+		"repository_name":     cfg.RepositoryName,
+		"repository_id":       cfg.RepositoryID,
+		"private_key_file":    cfg.PrivateKeyFile,
+		"http_timeout":        cfg.HTTPTimeout.String(),
+		"token_refresh_skew":  cfg.TokenRefreshSkew.String(),
+		"api_version":         cfg.APIVersion,
+		"pull_requests_write": cfg.PullRequestsWrite,
+		"squash_merge_write":  cfg.SquashMergeWrite,
+	}
+	raw["coderabbit_actor_id"] = 1
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeConfigWithoutPrivateKey(bytes.NewReader(encoded)); err == nil {
+		t.Fatal("deprecated CodeRabbit configuration was accepted")
 	}
 }
 
@@ -54,10 +83,6 @@ func replayDeclaredScenario(t *testing.T, name string) {
 		replayPRScenario(t, name)
 	case "required_checks_pass", "required_checks_pending", "actionable_check_failure", "missing_required_check", "unknown_check_state":
 		replayCheckScenario(t, name)
-	case "coderabbit_pass", "coderabbit_actionable", "coderabbit_absent", "coderabbit_untrusted_lookalike":
-		replayCodeRabbitScenario(t, name)
-	case "resolved_thread", "outdated_comment", "duplicate_finding", "unknown_review_event":
-		replayFindingScenario(t, name)
 	default:
 		t.Fatalf("declared scenario has no replay assertion: %s", name)
 	}
@@ -201,7 +226,7 @@ func replayPaginationScenario(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 	c := &Client{cfg: Config{APIBaseURL: srv.URL, RepositoryOwner: "owner", RepositoryName: "repo", APIVersion: "2022-11-28"}, http: srv.Client(), clock: fixedClock{time.Now()}, token: "token"}
-	if _, _, _, err := c.readChecks(context.Background(), "head", "main"); err != nil {
+	if _, _, err := c.readChecks(context.Background(), "head", "main"); err != nil {
 		t.Fatal(err)
 	}
 	if pages.Load() != 2 {
@@ -252,69 +277,6 @@ func replayCheckScenario(t *testing.T, name string) {
 	}
 }
 
-func replayCodeRabbitScenario(t *testing.T, name string) { assertReviewVariant(t, name) }
-
-func replayFindingScenario(t *testing.T, name string) { assertReviewVariant(t, name) }
-
-func assertReviewVariant(t *testing.T, name string) {
-	t.Helper()
-	thread := ""
-	checkApp := int64(8)
-	want := domain.CodeRabbitPass
-	findingCount := 0
-	unknown := false
-	switch name {
-	case "coderabbit_pass":
-	case "coderabbit_actionable":
-		thread = reviewThreadJSON(false, false, 7, "BOT", "coderabbitai[bot]", false)
-		want = domain.CodeRabbitActionable
-		findingCount = 1
-	case "coderabbit_absent":
-		checkApp = 9
-		want = domain.CodeRabbitAbsent
-	case "coderabbit_untrusted_lookalike":
-		thread = reviewThreadJSON(false, false, 99, "LOOK", "coderabbit-lookalike", false)
-		want = domain.CodeRabbitUntrusted
-		unknown = true
-	case "resolved_thread":
-		thread = reviewThreadJSON(true, false, 7, "BOT", "coderabbitai[bot]", false)
-		findingCount = 1
-	case "outdated_comment":
-		thread = reviewThreadJSON(false, true, 7, "BOT", "coderabbitai[bot]", true)
-		findingCount = 1
-	case "duplicate_finding":
-		thread = reviewThreadJSON(false, false, 7, "BOT", "coderabbitai[bot]", false) + "," + reviewThreadJSON(false, false, 7, "BOT", "coderabbitai[bot]", false)
-		want = domain.CodeRabbitActionable
-		findingCount = 1
-	case "unknown_review_event":
-		thread = reviewThreadJSON(false, false, 22, "OTHER", "human", false)
-		checkApp = 9
-		want = domain.CodeRabbitAbsent
-		unknown = true
-	}
-	_, key := testKey(t)
-	server := reviewVariantServer(t, thread, checkApp)
-	defer server.Close()
-	cfg := validConfig(key)
-	cfg.APIBaseURL = server.URL
-	cfg.GraphQLURL = server.URL + "/graphql"
-	cfg.RepositoryID = 99
-	cfg.CodeRabbitActorID = 7
-	cfg.CodeRabbitNodeID = "BOT"
-	cfg.CodeRabbitAppID = 8
-	client, err := New(cfg, fixedClock{time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC)}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := client.Read(context.Background(), 1, "headsha")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.CodeRabbit != want || len(got.Findings) != findingCount || (len(got.UnknownEvents) > 0) != unknown {
-		t.Fatalf("status=%s findings=%d unknown=%v", got.CodeRabbit, len(got.Findings), got.UnknownEvents)
-	}
-}
-
 func TestCheckStateMapping(t *testing.T) {
 	cases := []struct {
 		status, conclusion string
@@ -357,35 +319,17 @@ func TestLatestCheckRunWinsDeterministically(t *testing.T) {
 	mux.HandleFunc("/repos/owner/repo/commits/head/status", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `{"total_count":0,"statuses":[]}`) })
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
-	c := &Client{cfg: Config{APIBaseURL: srv.URL, RepositoryOwner: "owner", RepositoryName: "repo", APIVersion: "2022-11-28", CodeRabbitAppID: 8, InstallationID: 2}, http: srv.Client(), clock: fixedClock{time.Date(2026, 7, 11, 1, 0, 0, 0, time.UTC)}, token: "token"}
-	checks, cr, _, err := c.readChecks(context.Background(), "head", "main")
+	c := &Client{cfg: Config{APIBaseURL: srv.URL, RepositoryOwner: "owner", RepositoryName: "repo", APIVersion: "2022-11-28", InstallationID: 2}, http: srv.Client(), clock: fixedClock{time.Date(2026, 7, 11, 1, 0, 0, 0, time.UTC)}, token: "token"}
+	checks, _, err := c.readChecks(context.Background(), "head", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(checks) != 1 || checks[0].State != domain.CheckInProgress || cr != domain.CodeRabbitPending {
-		t.Fatalf("checks=%+v coderabbit=%s", checks, cr)
+	if len(checks) != 1 || checks[0].State != domain.CheckInProgress {
+		t.Fatalf("checks=%+v", checks)
 	}
 }
 
-func TestCodeRabbitStateAggregationIsConservative(t *testing.T) {
-	states := []domain.CodeRabbitState{domain.CodeRabbitPass, domain.CodeRabbitPending, domain.CodeRabbitInfrastructure, domain.CodeRabbitActionable}
-	got := domain.CodeRabbitAbsent
-	for _, state := range states {
-		got = mergeCodeRabbitState(got, state)
-	}
-	if got != domain.CodeRabbitActionable {
-		t.Fatalf("got %s", got)
-	}
-	got = domain.CodeRabbitAbsent
-	for i := len(states) - 1; i >= 0; i-- {
-		got = mergeCodeRabbitState(got, states[i])
-	}
-	if got != domain.CodeRabbitActionable {
-		t.Fatalf("reverse got %s", got)
-	}
-}
-
-func TestReviewAndThreadConnectionsPaginateIndependently(t *testing.T) {
+func TestReviewConnectionPaginates(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request struct {
@@ -397,17 +341,17 @@ func TestReviewAndThreadConnectionsPaginateIndependently(t *testing.T) {
 		}
 		call := calls.Add(1)
 		if call == 1 {
-			fmt.Fprint(w, `{"data":{"repository":{"pullRequest":{"reviewDecision":"REVIEW_REQUIRED","reviews":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"review-1"}},"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`)
+			fmt.Fprint(w, `{"data":{"repository":{"pullRequest":{"reviewDecision":"REVIEW_REQUIRED","reviews":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"review-1"}}}}}}`)
 			return
 		}
 		if request.Variables["reviewCursor"] != "review-1" {
 			t.Errorf("reviewCursor=%v", request.Variables["reviewCursor"])
 		}
-		fmt.Fprint(w, `{"data":{"repository":{"pullRequest":{"reviewDecision":"REVIEW_REQUIRED","reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}},"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`)
+		fmt.Fprint(w, `{"data":{"repository":{"pullRequest":{"reviewDecision":"REVIEW_REQUIRED","reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`)
 	}))
 	defer srv.Close()
 	c := &Client{cfg: Config{GraphQLURL: srv.URL, APIVersion: "2022-11-28"}, http: srv.Client(), clock: fixedClock{time.Now()}, token: "token"}
-	if _, _, _, _, _, err := c.readReviews(context.Background(), 1, "head", domain.CodeRabbitAbsent); err != nil {
+	if _, _, err := c.readReviews(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 	if calls.Load() != 2 {
@@ -428,11 +372,11 @@ func TestReviewReadIncludesImmutableUserIdentity(t *testing.T) {
 			http.Error(w, "user identity fields missing", http.StatusBadRequest)
 			return
 		}
-		fmt.Fprint(w, `{"data":{"repository":{"pullRequest":{"reviewDecision":"APPROVED","reviews":{"nodes":[{"id":"PRR_55","databaseId":55,"state":"APPROVED","commit":{"oid":"head"},"submittedAt":"2026-07-13T01:00:00Z","author":{"login":"ifan0927","__typename":"User","id":"USER_33","databaseId":33}}],"pageInfo":{"hasNextPage":false,"endCursor":""}},"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`)
+		fmt.Fprint(w, `{"data":{"repository":{"pullRequest":{"reviewDecision":"APPROVED","reviews":{"nodes":[{"id":"PRR_55","databaseId":55,"state":"APPROVED","commit":{"oid":"head"},"submittedAt":"2026-07-13T01:00:00Z","author":{"login":"ifan0927","__typename":"User","id":"USER_33","databaseId":33}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`)
 	}))
 	defer srv.Close()
 	c := &Client{cfg: Config{GraphQLURL: srv.URL, APIVersion: "2022-11-28"}, http: srv.Client(), clock: fixedClock{time.Now()}, token: "token"}
-	_, reviews, _, _, _, err := c.readReviews(context.Background(), 1, "head", domain.CodeRabbitAbsent)
+	reviews, _, err := c.readReviews(context.Background(), 1)
 	if err != nil || len(reviews) != 1 || reviews[0].Actor.DatabaseID != 33 || reviews[0].Actor.NodeID != "USER_33" || reviews[0].Actor.Type != "User" {
 		t.Fatalf("reviews=%+v err=%v", reviews, err)
 	}
@@ -476,9 +420,6 @@ func TestFixtureReplayAndRestartMint(t *testing.T) {
 	cfg.APIBaseURL = server.URL
 	cfg.GraphQLURL = server.URL + "/graphql"
 	cfg.RepositoryID = 99
-	cfg.CodeRabbitActorID = 7
-	cfg.CodeRabbitNodeID = "BOT"
-	cfg.CodeRabbitAppID = 8
 	clock := fixedClock{time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC)}
 	for i := 0; i < 2; i++ {
 		client, err := New(cfg, clock, nil)
@@ -489,79 +430,13 @@ func TestFixtureReplayAndRestartMint(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got.Repository.ID != 99 || got.PullRequest.HeadSHA != "headsha" || got.CodeRabbit != domain.CodeRabbitActionable || len(got.Findings) != 1 {
+		if got.Repository.ID != 99 || got.PullRequest.HeadSHA != "headsha" || len(got.Reviews) != 0 || len(got.Findings) != 0 {
 			t.Fatalf("unexpected replay: %+v", got)
 		}
 	}
 	if mint.Load() != 2 {
 		t.Fatalf("restart mint count=%d", mint.Load())
 	}
-}
-
-func TestReviewVariantsReplayThroughClientRead(t *testing.T) {
-	variants := []struct {
-		name, thread string
-		checkApp     int64
-		want         domain.CodeRabbitState
-		findings     int
-		unknown      bool
-	}{{"pass", "", 8, domain.CodeRabbitPass, 0, false}, {"actionable", reviewThreadJSON(false, false, 7, "BOT", "coderabbitai[bot]", false), 8, domain.CodeRabbitActionable, 1, false}, {"absent", "", 9, domain.CodeRabbitAbsent, 0, false}, {"lookalike", reviewThreadJSON(false, false, 99, "LOOK", "coderabbit-lookalike", false), 8, domain.CodeRabbitUntrusted, 0, true}, {"resolved", reviewThreadJSON(true, false, 7, "BOT", "coderabbitai[bot]", false), 8, domain.CodeRabbitPass, 1, false}, {"outdated", reviewThreadJSON(false, true, 7, "BOT", "coderabbitai[bot]", true), 8, domain.CodeRabbitPass, 1, false}, {"duplicate", reviewThreadJSON(false, false, 7, "BOT", "coderabbitai[bot]", false) + "," + reviewThreadJSON(false, false, 7, "BOT", "coderabbitai[bot]", false), 8, domain.CodeRabbitActionable, 1, false}, {"unknown", reviewThreadJSON(false, false, 22, "OTHER", "human", false), 9, domain.CodeRabbitAbsent, 0, true}}
-	for _, tc := range variants {
-		t.Run(tc.name, func(t *testing.T) {
-			_, key := testKey(t)
-			server := reviewVariantServer(t, tc.thread, tc.checkApp)
-			defer server.Close()
-			cfg := validConfig(key)
-			cfg.APIBaseURL = server.URL
-			cfg.GraphQLURL = server.URL + "/graphql"
-			cfg.RepositoryID = 99
-			cfg.CodeRabbitActorID = 7
-			cfg.CodeRabbitNodeID = "BOT"
-			cfg.CodeRabbitAppID = 8
-			client, err := New(cfg, fixedClock{time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC)}, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			got, err := client.Read(context.Background(), 1, "headsha")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got.CodeRabbit != tc.want || len(got.Findings) != tc.findings || (len(got.UnknownEvents) > 0) != tc.unknown {
-				t.Fatalf("status=%s findings=%d unknown=%v", got.CodeRabbit, len(got.Findings), got.UnknownEvents)
-			}
-		})
-	}
-}
-
-func reviewThreadJSON(resolved, outdated bool, actorID int64, nodeID, login string, commentOutdated bool) string {
-	return fmt.Sprintf(`{"id":"THREAD","isResolved":%t,"isOutdated":%t,"comments":{"totalCount":1,"nodes":[{"id":"COMMENT","databaseId":10,"body":"finding","path":"x.go","line":2,"outdated":%t,"createdAt":"2026-07-11T00:00:00Z","commit":{"oid":"headsha"},"originalCommit":{"oid":"headsha"},"author":{"login":%q,"__typename":"Bot","id":%q,"databaseId":%d}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}`, resolved, outdated, commentOutdated, login, nodeID, actorID)
-}
-
-func reviewVariantServer(t *testing.T, threads string, checkApp int64) *httptest.Server {
-	t.Helper()
-	mux := http.NewServeMux()
-	write := func(w http.ResponseWriter, s string) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, s)
-	}
-	mux.HandleFunc("/app/installations/2/access_tokens", func(w http.ResponseWriter, r *http.Request) {
-		write(w, `{"token":"fixture-token","expires_at":"2026-07-11T01:00:00Z","permissions":{"metadata":"read","contents":"read","pull_requests":"read","checks":"read","statuses":"read","administration":"read"},"repositories":[{"id":99,"name":"repo","owner":{"login":"owner"}}]}`)
-	})
-	mux.HandleFunc("/repos/owner/repo", func(w http.ResponseWriter, r *http.Request) {
-		write(w, `{"id":99,"node_id":"REPO","name":"repo","owner":{"login":"owner"}}`)
-	})
-	mux.HandleFunc("/repos/owner/repo/pulls/1", func(w http.ResponseWriter, r *http.Request) {
-		write(w, `{"id":101,"number":1,"html_url":"https://example.invalid/pr/1","node_id":"PR","state":"open","merged":false,"body":"body","head":{"ref":"feature","sha":"headsha","repo":{"id":99}},"base":{"ref":"main","sha":"basesha","repo":{"id":99}}}`)
-	})
-	mux.HandleFunc("/repos/owner/repo/branches/main/protection/required_status_checks", func(w http.ResponseWriter, r *http.Request) { write(w, `{"contexts":["test"],"checks":[]}`) })
-	mux.HandleFunc("/repos/owner/repo/commits/headsha/check-runs", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `{"check_runs":[{"id":1,"name":"test","status":"completed","conclusion":"success","completed_at":"2026-07-11T00:00:00Z","app":{"id":%d}}]}`, checkApp)
-	})
-	mux.HandleFunc("/repos/owner/repo/commits/headsha/status", func(w http.ResponseWriter, r *http.Request) { write(w, `{"total_count":0,"statuses":[]}`) })
-	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `{"data":{"repository":{"pullRequest":{"reviewDecision":"REVIEW_REQUIRED","reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}},"reviewThreads":{"nodes":[%s],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`, threads)
-	})
-	return httptest.NewServer(mux)
 }
 
 func Test401RefreshOnceAndRepeatedFailure(t *testing.T) {
@@ -636,11 +511,11 @@ func fixtureServer(t *testing.T, mint *atomic.Int32, always401 bool) *httptest.S
 			http.Error(w, "invalid GraphQL request", http.StatusBadRequest)
 			return
 		}
-		if !strings.Contains(request.Query, "authorAssociation} pageInfo{hasNextPage endCursor}") {
-			http.Error(w, "invalid comments connection selection", http.StatusBadRequest)
+		if !strings.Contains(request.Query, "... on User{id databaseId}") || strings.Contains(request.Query, "reviewThreads") {
+			http.Error(w, "invalid review selection", http.StatusBadRequest)
 			return
 		}
-		write(w, `{"data":{"repository":{"pullRequest":{"reviewDecision":"REVIEW_REQUIRED","reviewThreads":{"nodes":[{"id":"THREAD","isResolved":false,"isOutdated":false,"comments":{"totalCount":1,"nodes":[{"id":"COMMENT","databaseId":10,"body":"finding","path":"x.go","line":2,"outdated":false,"createdAt":"2026-07-11T00:00:00Z","commit":{"oid":"headsha"},"originalCommit":{"oid":"headsha"},"author":{"login":"coderabbitai[bot]","__typename":"Bot","id":"BOT","databaseId":7}}]}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`)
+		write(w, `{"data":{"repository":{"pullRequest":{"reviewDecision":"REVIEW_REQUIRED","reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`)
 	})
 	return httptest.NewServer(mux)
 }

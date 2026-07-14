@@ -17,7 +17,6 @@ workflow state and evidence. Codex owns code reasoning and implementation.
 - Every run uses a dedicated worktree and the Linear-provided branch name.
 - Implementation uses a resumable `codex exec` session.
 - A fresh, independent Codex Exec review run must pass before a PR is opened.
-- CodeRabbit is the second automated review after the PR is opened.
 - I-Fan is the final approval gate. Agents never approve their own work.
 - Any code change after a review invalidates that review and requires a new one.
 - Controller policy, Git state, tests, CI, and GitHub state are authoritative;

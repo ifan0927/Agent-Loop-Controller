@@ -23,9 +23,9 @@ func TestFreshReviewCanReachApprovalReadyButNotPROpen(t *testing.T) {
 	}
 }
 
-func TestCodeRabbitChangeReturnsToRepair(t *testing.T) {
+func TestActionableRequiredCheckReturnsToRepair(t *testing.T) {
 	if !CanTransition(StateReconcilingReviews, StateRepairing) {
-		t.Fatal("CodeRabbit findings must return the run to repair")
+		t.Fatal("actionable required checks must return the run to repair")
 	}
 	if CanTransition(StateRepairing, StateAwaitingHumanApproval) {
 		t.Fatal("a repair must be reimplemented, verified, and freshly reviewed")
@@ -41,5 +41,14 @@ func TestMergedRunRequiresLinearCompletionBeforeCleanup(t *testing.T) {
 	}
 	if !CanTransition(StateAwaitingLinearCompletion, StateCleaning) || !CanTransition(StateAwaitingLinearCompletion, StateManualIntervention) {
 		t.Fatal("Linear completion must either authorize cleanup or require an operator")
+	}
+}
+
+func TestManualInterventionHasOnlyTheNarrowOwnedPushRecoveryEdge(t *testing.T) {
+	if !CanTransition(StateManualIntervention, StateApprovalReady) {
+		t.Fatal("owned push recovery must be able to restore the guarded push gate")
+	}
+	if CanTransition(StateManualIntervention, StatePushingBranch) || CanTransition(StateManualIntervention, StatePROpen) {
+		t.Fatal("manual intervention must not resume an external write state directly")
 	}
 }

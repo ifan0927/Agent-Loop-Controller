@@ -2,6 +2,8 @@ package application_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -99,6 +101,7 @@ type durableFakeProcess struct {
 	needsDecision                                 bool
 	failFirstReview                               bool
 	reviewFindings                                bool
+	noChangeOnResume                              bool
 	implementationCalls, resumeCalls, reviewCalls int
 	resumeArgs                                    []string
 }
@@ -118,8 +121,10 @@ func (p *durableFakeProcess) Run(_ context.Context, s processadapter.Spec) (proc
 		if s.Args[1] == "resume" {
 			p.resumeCalls++
 			p.resumeArgs = append([]string(nil), s.Args...)
-			mustWriteFile(filepath.Join(s.WorkingDir, "mathutil", "clamp.go"), "package mathutil\n\nfunc Clamp(value, min, max int) int { if value < min { return min }; if value > max { return max }; return value }\n")
-			mustWriteFile(filepath.Join(s.WorkingDir, "mathutil", "clamp_test.go"), "package mathutil\n\nimport \"testing\"\n\nfunc TestClamp(t *testing.T) { tests := []struct{ v, min, max, want int }{{-1,0,5,0},{3,0,5,3},{9,0,5,5}}; for _, tt := range tests { if got := Clamp(tt.v,tt.min,tt.max); got != tt.want { t.Fatalf(\"got %d want %d\",got,tt.want) } } }\n")
+			if !p.noChangeOnResume {
+				mustWriteFile(filepath.Join(s.WorkingDir, "mathutil", "clamp.go"), "package mathutil\n\nfunc Clamp(value, min, max int) int { if value < min { return min }; if value > max { return max }; return value }\n")
+				mustWriteFile(filepath.Join(s.WorkingDir, "mathutil", "clamp_test.go"), "package mathutil\n\nimport \"testing\"\n\nfunc TestClamp(t *testing.T) { tests := []struct{ v, min, max, want int }{{-1,0,5,0},{3,0,5,3},{9,0,5,5}}; for _, tt := range tests { if got := Clamp(tt.v,tt.min,tt.max); got != tt.want { t.Fatalf(\"got %d want %d\",got,tt.want) } } }\n")
+			}
 			writeLastMessage(s.Args, completedOutcome)
 			sessionID := "implementation-session"
 			if slices.Contains(s.Args, "recovered-session") {
@@ -528,6 +533,49 @@ func TestTransientFailedReviewCanRetrySameHead(t *testing.T) {
 	inspection, _ := store.Inspect(context.Background(), run.ID)
 	if len(inspection.Reviews) != 2 || inspection.Reviews[0].Verdict != "failed" || inspection.Reviews[1].Verdict != "pass" {
 		t.Fatalf("reviews=%+v", inspection.Reviews)
+	}
+}
+
+func TestNoChangeRepairReusesExactRepairBaseAndExactHeadEvidence(t *testing.T) {
+	lab := newLocalLab(t)
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	process := &durableFakeProcess{noChangeOnResume: true}
+	controller := newController(t, store, lab, process, gitadapter.Workspace{})
+	input := startInput(lab)
+	input.Task.Policy.MaxRepairAttempts = domain.DefaultMaxRepairAttempts
+	input.NormalizedJSON, err = json.Marshal(input.Task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(input.NormalizedJSON)
+	input.TaskHash = hex.EncodeToString(digest[:])
+	run, err := controller.Start(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := run.CandidateHead
+	for _, transition := range []struct{ from, to domain.State }{
+		{domain.StateApprovalReady, domain.StatePushingBranch},
+		{domain.StatePushingBranch, domain.StateBranchPushed},
+		{domain.StateBranchPushed, domain.StateOpeningPR},
+		{domain.StateOpeningPR, domain.StatePROpen},
+		{domain.StatePROpen, domain.StateReconcilingReviews},
+		{domain.StateReconcilingReviews, domain.StateRepairing},
+	} {
+		if err := store.Transition(context.Background(), run.ID, transition.from, transition.to, "fixture transition", "fixture", base); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run, err = controller.Repair(context.Background(), run.ID, "the normalized finding no longer requires a source change")
+	if err != nil || run.State != domain.StateApprovalReady || run.CandidateHead != base {
+		t.Fatalf("run=%+v err=%v", run, err)
+	}
+	if process.resumeCalls != 1 || process.reviewCalls != 1 {
+		t.Fatalf("resumes=%d reviews=%d", process.resumeCalls, process.reviewCalls)
 	}
 }
 

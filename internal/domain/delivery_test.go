@@ -20,14 +20,14 @@ func TestPRBodyContainsLinearMagicWordAndOwnership(t *testing.T) {
 
 func TestEveryCodeChangeInvalidatesApproval(t *testing.T) {
 	pr := PullRequest{Number: 2, HeadSHA: "new"}
-	approval := HumanApproval{PRNumber: 2, Approver: "I-Fan", Source: "github_review", ApprovedSHA: "old", CIStatus: "pass", CodeRabbit: "pass", ReviewSHA: "old"}
+	approval := HumanApproval{PRNumber: 2, Approver: "I-Fan", Source: "github_review", ApprovedSHA: "old", CIStatus: "pass", ReviewSHA: "old"}
 	if err := approval.Authorizes(pr, "new"); err == nil {
 		t.Fatal("approval for old head authorized new code")
 	}
 }
 
 func TestChecksMustBeCompleteAndBoundToExactSHA(t *testing.T) {
-	snapshot := ReviewSnapshot{HeadSHA: "h1", RequiredChecks: []string{"test"}, CodeRabbitStatus: "pass", Checks: []Check{{Name: "test", Required: true, Status: "completed", Conclusion: "success", ObservedSHA: "old"}}}
+	snapshot := ReviewSnapshot{HeadSHA: "h1", RequiredChecks: []string{"test"}, Checks: []Check{{Name: "test", Required: true, Status: "completed", Conclusion: "success", ObservedSHA: "old"}}}
 	if snapshot.Classify() != ReconciliationInfrastructure {
 		t.Fatal("check for another SHA must fail closed")
 	}
@@ -42,7 +42,7 @@ func TestChecksMustBeCompleteAndBoundToExactSHA(t *testing.T) {
 }
 
 func TestCheckFailuresDistinguishActionableFromInfrastructure(t *testing.T) {
-	base := ReviewSnapshot{HeadSHA: "h1", RequiredChecks: []string{"test"}, CodeRabbitStatus: "pass", Checks: []Check{{Name: "test", Required: true, Status: "completed", ObservedSHA: "h1"}}}
+	base := ReviewSnapshot{HeadSHA: "h1", RequiredChecks: []string{"test"}, Checks: []Check{{Name: "test", Required: true, Status: "completed", ObservedSHA: "h1"}}}
 	base.Checks[0].Conclusion = "failure"
 	if base.Classify() != ReconciliationActionable {
 		t.Fatal("test failure should be actionable")

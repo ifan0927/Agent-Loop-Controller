@@ -13,18 +13,15 @@ Manual CLI / future Cron / Linear webhook / Hermes
                     TriggerSignal
                          |
                          v
-                 Agent Loop Controller
-           admission | state | evidence | gates
-              /          |           \
-         Linear       Codex Exec      GitHub
-                          |
-                implementation session
-                          |
-                  controller verification
-                          |
-                 fresh Codex review session
-                          |
-                  PR -> CodeRabbit -> human
+              admission and durable run state
+                         |
+                         v
+                long-lived delivery driver
+             next action | evidence | gates
+              /          |            \
+         Linear       Codex Exec       GitHub
+                          |               |
+                implementation/review   PR -> required CI -> I-Fan approval
 ```
 
 ## Canonical contracts
@@ -43,8 +40,8 @@ name, repository-owned verifier IDs, policy, and source revision. Linear never
 carries executable verification commands. A material Linear edit
 after admission creates a human decision point; it never silently changes a run.
 
-`linear start IFAN-xxx` is the explicit trigger adapter. Its only task input is
-the identifier; it fetches the issue through the configured read-only adapter.
+`controller run IFAN-xxx` is the explicit trigger adapter. Its only task input
+is the identifier; it fetches the issue through the configured read-only adapter.
 The issue must be in `Todo`, an active current cycle, team `IFAN`, labelled
 `agent:codex` (and not `agent:hermes`), and contain exactly one label that maps
 to a controller-owned repository profile. The issue description must have a
@@ -58,11 +55,19 @@ decision rather than creating another active run or rewriting its snapshot.
 ### Repository registry
 
 Registry version 1 selects one repository by case-insensitive canonical
-`owner/name`. Each concrete entry binds non-symlink local checkout, origin,
-artifact, and worktree roots; `builtin:v1` verifier policy; base branch; a
+`owner/name`. Each concrete entry binds a non-symlink local checkout, artifact,
+and worktree roots plus either a local bare fixture origin or a credential-free
+canonical GitHub origin URL. The GitHub URL must name the same `owner/name` as
+the registry entry; checkout transport may be SSH or HTTPS without changing
+that identity. The entry also binds `builtin:v1` verifier policy; base branch; a
 non-secret GitHub App profile reference; installation and immutable repository
 IDs; and allowed operator logins. Duplicate identities, shared or overlapping
 paths, unsupported verifiers, and incomplete legacy entries fail closed.
+
+Controller configuration version 2 stores these repository entries inline in
+the one operator configuration document. Version 1 configurations retain the
+separate registry-file reference only for compatibility; the registry validator
+and per-run authority evidence are the same in both forms.
 
 SQLite schema version 8 freezes a stable `repository-profile:<owner>/<repo>` ID,
 the profile snapshot schema version, canonical credential-free JSON, and its
@@ -73,9 +78,9 @@ canonical digest. Full local paths remain in the private binding needed to
 reproduce and protect controller-owned resources; status and inspect expose only
 the sanitized profile identity, policy references, and digests.
 
-Restart rejects any change to the selected profile snapshot or its local
-ownership paths, while unrelated repository entries may change without
-invalidating the run. GitHub App private-key or installation-token rotation does
+Restart rejects any change to the selected profile snapshot or its source,
+artifact, worktree, or origin authority binding, while unrelated repository
+entries may change without invalidating the run. GitHub App private-key or installation-token rotation does
 not change the profile when the configured App identity, installation, and
 repository identities are unchanged. Rows created before schema version 8 keep
 empty profile-evidence columns and fail closed because migration cannot prove
@@ -174,8 +179,8 @@ for that same head.
 2. Controller runs repository verification.
 3. A fresh Codex reviewer evaluates the entire branch delta.
 4. Only a passing internal review allows PR creation.
-5. CodeRabbit reviews the PR as the second automated reviewer.
-6. Any CodeRabbit-driven code change repeats verification and fresh Codex review.
+5. Required CI evaluates the PR at its exact head.
+6. Any code change repeats verification and fresh Codex review.
 7. I-Fan approves the exact final head as the final gate.
 
 ## Ownership
@@ -184,6 +189,33 @@ The controller owns worktrees, branches, commits, pushes, PR creation, retries,
 timeouts, state transitions, evidence, merge, and cleanup. Codex edits and tests
 inside the assigned worktree and returns structured semantic outcomes. Codex does
 not write Linear or GitHub state during implementation.
+
+## Delivery driver and human gates
+
+`controller run IFAN-xxx` is the normal explicit trigger. It admits or resumes
+the durable run and starts a long-lived delivery driver. `controller drive
+<run-id>` starts the same driver for an already admitted run after a process or
+host restart. The driver reads the authoritative SQLite state, takes the one
+legal next action, persists its intent before any external write, observes the
+result, and repeats. It does not accept an action order from a CLI caller, issue
+body, web UI, or external response.
+
+After admission, normal progression is automatic: Codex implementation,
+verification, fresh review, push, PR creation, required-CI reconciliation,
+repair when a required check fails, squash merge, Linear completion observation,
+and cleanup. The driver stays alive and polls while CI, I-Fan approval, or
+Linear completion is pending. A valid exact-head
+I-Fan approval is evidence, not a controller command; once observed, it lets the
+same driver continue to merge and cleanup.
+
+The CLI driver has a bounded process lifetime (24 hours by default; a deliberate
+`--max-runtime` may be set up to seven days). It exits without speculative
+repair for terminal states, `awaiting_human_decision`, `manual_intervention`,
+process cancellation, or expiry of that process lifetime. Human decision and
+conflict resolution are structured operator work that can be followed by a
+restart-safe `drive`; I-Fan alone grants the final GitHub approval. The
+lower-level state-specific CLI commands are kept for incident recovery and
+deliberate E2E fault injection, not routine operation.
 
 ## Persistence direction
 
@@ -278,8 +310,17 @@ Push uses the persisted branch in an explicit
 `refs/heads/<branch>:refs/heads/<branch>` refspec and never force-pushes. The
 controller revalidates the owned worktree, origin, clean status, candidate HEAD,
 exact-HEAD verification, and latest passing fresh review. A matching remote SHA
-is idempotent; a different SHA fails closed. Repairs create a new controller
-commit and use an ordinary fast-forward update.
+is idempotent. A different SHA fails closed unless it is the persisted head of
+the same open controller-owned PR; a repair may then use an ordinary
+fast-forward, `--force-with-lease` update to the new verified candidate. The
+persisted PR head is advanced before the next read-only GitHub reconciliation.
+
+If that owned-PR repair update halts in `manual_intervention`, the explicit
+`recover-owned-push` operator action can return only that run to
+`approval_ready`. It proves unchanged Linear source and retained open PR
+ownership, but performs no external write. The next driver push repeats local
+exact-HEAD validation, remote observation, and the fast-forward lease before
+updating the branch.
 
 One run owns at most one pull request. Adoption requires durable ownership
 metadata plus matching head, base, candidate SHA, PR identity, and body digest.
@@ -287,18 +328,22 @@ A same-named branch or matching head/base alone is insufficient. PR bodies carry
 summary, rationale, validation, fresh-review, out-of-scope, and Linear magic-word
 evidence.
 
-Checks and review threads use bounded polling attempts, intervals, and an overall
-deadline. Observations are pending, pass, actionable failure, infrastructure
-failure, or timeout. Unknown events remain telemetry. CodeRabbit is only the
-second automated reviewer and cannot replace the ephemeral Sol review.
+Required checks and human-review status use bounded polling attempts, intervals,
+and an overall deadline under the delivery driver. Observations are pending,
+pass, actionable failure, infrastructure failure, or timeout. Pending CI,
+exact-head approval,
+and Linear completion leave the driver waiting and polling; a timeout
+or conflicting result becomes auditable fail-closed intervention rather than a
+manual sequence of normal-state commands. Unknown events remain telemetry.
+The ephemeral Sol review remains the independent implementation-review gate.
 
-Findings are normalized to source/thread IDs, location, classification, body
-digest, and resolved/outdated state. Repair resumes only the persisted Terra
+Required-CI failures are normalized to a controller-generated finding with a
+stable check identity and body digest. Repair resumes only the persisted Terra
 session with controller-normalized stdin. Every new HEAD invalidates all older
-verification, review, push, check, CodeRabbit, and human-approval authorization.
+verification, review, push, check, and human-approval authorization.
 
-Only verifiable I-Fan approval for the exact PR HEAD, passing checks, reconciled
-CodeRabbit state, and latest passing internal review authorizes merge. The
+Only verifiable I-Fan approval for the exact PR HEAD, passing checks, and the
+latest passing internal review authorizes merge. The
 controller never approves its own PR. Merge is squash-only and records the
 pre-merge head, base SHA, result SHA, and timestamp after re-reading GitHub.
 
@@ -306,16 +351,20 @@ Cleanup is a separate restart-safe state. Each owned resource has its own intent
 and result. Base branches, user-created resources, changed refs, dirty worktrees,
 and resources owned elsewhere are rejected. Partial failures preserve evidence
 and retry only unfinished resources. Linear completion is observed but not
-forced; production Linear writes remain deferred.
+forced; production Linear writes remain deferred. Once a completion observation
+is valid, cleanup is automatically driven rather than requiring an operator to
+invoke a cleanup command.
 
 ## Fixture-first dogfooding
 
-Destructive integration is restricted to disposable repositories, local bare
-origins, and fake GitHub services. The normal SQLite state and public CLI are
-used across a simulated restart, and artifacts remain inspectable. This
-repository's production remote is never a PR, merge, or cleanup fixture. Real
-GitHub and CodeRabbit smoke is opt-in and requires an explicitly authorized test
-repository and valid credentials.
+The deterministic integration suite is restricted to disposable repositories,
+local bare origins, and fake GitHub services. The normal SQLite state and public
+CLI are used across a simulated restart, and artifacts remain inspectable. A
+separate external E2E run may use a credential-free GitHub origin binding only
+for an explicitly authorized isolated test repository. This repository's
+production remote is never a PR, merge, or cleanup fixture. See
+[`docs/e2e-dogfood.md`](e2e-dogfood.md) for the operator-owned acceptance
+matrix.
 
 ## Direct read-only GitHub App adapter
 
@@ -326,9 +375,9 @@ persisted. The adapter uses RS256 App JWTs and memory-only installation tokens,
 refreshes before expiry, and permits one refresh/retry after HTTP 401.
 
 REST owns installation token minting, repository and pull-request identity,
-check runs, and commit status evidence. GraphQL owns review decision and review
-thread/comment topology. Both transports are read-only, bounded, paginated, and
-fail closed on missing required identity. CodeRabbit trust requires configured
-numeric/node/App identity evidence; display names, login similarity, and body
-claims are insufficient. Production use is explicit through `github-read` and
-does not consult `gh` configuration or user credentials.
+check runs, and commit status evidence. GraphQL owns human-review identity
+topology. Both transports are read-only, bounded, and
+paginated. A final approval requires the configured User's immutable GitHub
+identity and exact candidate head; display names and login similarity are
+insufficient. Production use is explicit through `github-read` and does not
+consult `gh` configuration or user credentials.

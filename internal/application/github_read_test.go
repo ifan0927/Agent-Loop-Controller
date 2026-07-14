@@ -21,3 +21,12 @@ func TestReconcileGitHubReadOwnershipAndSHAs(t *testing.T) {
 		}
 	}
 }
+
+func TestReconcileGitHubReadAcceptsCaseInsensitiveRepositoryCoordinates(t *testing.T) {
+	expectedRepository := domain.RepositoryIdentity{ID: 1, NodeID: "R", Owner: "ifan0927", Name: "looptest"}
+	gotRepository := domain.RepositoryIdentity{ID: 1, NodeID: "R", Owner: "IFAN0927", Name: "LoopTest"}
+	pr := domain.PullRequest{Number: 2, DatabaseID: 3, NodeID: "P", URL: "u", HeadBranch: "feature", BaseBranch: "main", HeadSHA: "head", BaseSHA: "base", OwnershipKey: "key", BodyDigest: "body"}
+	if err := ReconcileGitHubRead(expectedRepository, pr, "feature", "main", "head", "base", "key", "body", domain.GitHubReadEvidence{Repository: gotRepository, PullRequest: pr}); err != nil {
+		t.Fatal(err)
+	}
+}
