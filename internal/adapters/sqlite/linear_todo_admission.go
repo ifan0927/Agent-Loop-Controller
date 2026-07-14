@@ -37,9 +37,9 @@ func (s *Store) AcquireLinearTodoAdmissionLease(ctx context.Context, owner strin
 	}
 	next := automaticAdmissionLease(owner, ttl, now, current.Version+1)
 	if !found {
-		_, err = tx.ExecContext(ctx, `INSERT INTO linear_todo_admission_lease(namespace,owner_nonce,version,acquired_at,renewed_at,expires_at) VALUES(?,?,?,?,?,?)`, next.Namespace, next.OwnerNonce, next.Version, formatTime(next.AcquiredAt), formatTime(next.RenewedAt), formatTime(next.ExpiresAt))
+		_, err = tx.ExecContext(ctx, `INSERT INTO linear_todo_admission_lease(namespace,owner_nonce,version,acquired_at,renewed_at,expires_at,expires_at_unix_ns) VALUES(?,?,?,?,?,?,?)`, next.Namespace, next.OwnerNonce, next.Version, formatTime(next.AcquiredAt), formatTime(next.RenewedAt), formatTime(next.ExpiresAt), leaseUnixNano(next.ExpiresAt))
 	} else {
-		result, updateErr := tx.ExecContext(ctx, `UPDATE linear_todo_admission_lease SET owner_nonce=?,version=?,acquired_at=?,renewed_at=?,expires_at=? WHERE namespace=? AND version=? AND expires_at<=?`, next.OwnerNonce, next.Version, formatTime(next.AcquiredAt), formatTime(next.RenewedAt), formatTime(next.ExpiresAt), next.Namespace, current.Version, formatTime(now))
+		result, updateErr := tx.ExecContext(ctx, `UPDATE linear_todo_admission_lease SET owner_nonce=?,version=?,acquired_at=?,renewed_at=?,expires_at=?,expires_at_unix_ns=? WHERE namespace=? AND version=? AND expires_at_unix_ns<=?`, next.OwnerNonce, next.Version, formatTime(next.AcquiredAt), formatTime(next.RenewedAt), formatTime(next.ExpiresAt), leaseUnixNano(next.ExpiresAt), next.Namespace, current.Version, leaseUnixNano(now))
 		err = updateErr
 		if err == nil {
 			count, _ := result.RowsAffected()
@@ -62,7 +62,7 @@ func (s *Store) RenewLinearTodoAdmissionLease(ctx context.Context, lease applica
 		return application.LinearTodoAdmissionLease{}, false, errors.New("automatic admission lease renewal is invalid")
 	}
 	next := automaticAdmissionLease(lease.OwnerNonce, ttl, now, lease.Version+1)
-	result, err := s.db.ExecContext(ctx, `UPDATE linear_todo_admission_lease SET version=?,renewed_at=?,expires_at=? WHERE namespace=? AND owner_nonce=? AND version=? AND expires_at>?`, next.Version, formatTime(next.RenewedAt), formatTime(next.ExpiresAt), lease.Namespace, lease.OwnerNonce, lease.Version, formatTime(now))
+	result, err := s.db.ExecContext(ctx, `UPDATE linear_todo_admission_lease SET version=?,renewed_at=?,expires_at=?,expires_at_unix_ns=? WHERE namespace=? AND owner_nonce=? AND version=? AND expires_at_unix_ns>?`, next.Version, formatTime(next.RenewedAt), formatTime(next.ExpiresAt), leaseUnixNano(next.ExpiresAt), lease.Namespace, lease.OwnerNonce, lease.Version, leaseUnixNano(now))
 	if err != nil {
 		return application.LinearTodoAdmissionLease{}, false, err
 	}
@@ -91,7 +91,7 @@ func (s *Store) LinearTodoAdmissionLeaseHeld(ctx context.Context, lease applicat
 		return false, errors.New("automatic admission lease check is invalid")
 	}
 	var count int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM linear_todo_admission_lease WHERE namespace=? AND owner_nonce=? AND version=? AND expires_at>?`, lease.Namespace, lease.OwnerNonce, lease.Version, formatTime(now)).Scan(&count)
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM linear_todo_admission_lease WHERE namespace=? AND owner_nonce=? AND version=? AND expires_at_unix_ns>?`, lease.Namespace, lease.OwnerNonce, lease.Version, leaseUnixNano(now)).Scan(&count)
 	return count == 1, err
 }
 
@@ -110,6 +110,27 @@ func (s *Store) ListNonterminalRuns(ctx context.Context) ([]application.Run, err
 		runs = append(runs, run)
 	}
 	return runs, rows.Err()
+}
+
+// GetLinearTodoAdmissionJournal returns the immutable reservation evidence for
+// one persisted run. It deliberately has no selector for issue IDs or status,
+// so automatic recovery can only adopt a known nonterminal run.
+func (s *Store) GetLinearTodoAdmissionJournal(ctx context.Context, runID string) (application.LinearTodoAdmissionJournal, bool, error) {
+	if strings.TrimSpace(runID) == "" {
+		return application.LinearTodoAdmissionJournal{}, false, errors.New("automatic admission journal run ID is required")
+	}
+	journal, found, err := automaticAdmissionJournal(s.db, ctx, runID)
+	if err != nil || !found {
+		return journal, found, err
+	}
+	run, err := s.GetRun(ctx, runID)
+	if err != nil {
+		return application.LinearTodoAdmissionJournal{}, false, err
+	}
+	if !validAutomaticAdmissionJournal(journal, run) {
+		return application.LinearTodoAdmissionJournal{}, false, errors.New("automatic admission journal is corrupt")
+	}
+	return journal, true, nil
 }
 
 func (s *Store) ReserveLinearTodoAdmission(ctx context.Context, reservation application.LinearTodoAdmissionReservation) (application.Run, application.LinearTodoAdmissionJournal, bool, error) {
@@ -257,7 +278,8 @@ func automaticAdmissionLease(owner string, ttl time.Duration, now time.Time, ver
 func automaticAdmissionLeaseTx(ctx context.Context, tx *sql.Tx) (application.LinearTodoAdmissionLease, bool, error) {
 	var lease application.LinearTodoAdmissionLease
 	var acquired, renewed, expires string
-	err := tx.QueryRowContext(ctx, `SELECT namespace,owner_nonce,version,acquired_at,renewed_at,expires_at FROM linear_todo_admission_lease WHERE namespace=?`, application.LinearTodoAdmissionLeaseNamespace).Scan(&lease.Namespace, &lease.OwnerNonce, &lease.Version, &acquired, &renewed, &expires)
+	var expiresUnixNS int64
+	err := tx.QueryRowContext(ctx, `SELECT namespace,owner_nonce,version,acquired_at,renewed_at,expires_at,expires_at_unix_ns FROM linear_todo_admission_lease WHERE namespace=?`, application.LinearTodoAdmissionLeaseNamespace).Scan(&lease.Namespace, &lease.OwnerNonce, &lease.Version, &acquired, &renewed, &expires, &expiresUnixNS)
 	if errors.Is(err, sql.ErrNoRows) {
 		return application.LinearTodoAdmissionLease{}, false, nil
 	}
@@ -265,7 +287,7 @@ func automaticAdmissionLeaseTx(ctx context.Context, tx *sql.Tx) (application.Lin
 		return application.LinearTodoAdmissionLease{}, false, err
 	}
 	lease.AcquiredAt, lease.RenewedAt, lease.ExpiresAt = parseTime(acquired), parseTime(renewed), parseTime(expires)
-	if lease.Namespace != application.LinearTodoAdmissionLeaseNamespace || strings.TrimSpace(lease.OwnerNonce) == "" || lease.Version < 1 || lease.AcquiredAt.IsZero() || lease.RenewedAt.IsZero() || lease.ExpiresAt.IsZero() || lease.RenewedAt.Before(lease.AcquiredAt) {
+	if lease.Namespace != application.LinearTodoAdmissionLeaseNamespace || strings.TrimSpace(lease.OwnerNonce) == "" || lease.Version < 1 || lease.AcquiredAt.IsZero() || lease.RenewedAt.IsZero() || lease.ExpiresAt.IsZero() || lease.RenewedAt.Before(lease.AcquiredAt) || expiresUnixNS != leaseUnixNano(lease.ExpiresAt) {
 		return application.LinearTodoAdmissionLease{}, false, errors.New("automatic admission lease is corrupt")
 	}
 	return lease, true, nil
@@ -281,6 +303,46 @@ func requireAutomaticAdmissionLeaseTx(ctx context.Context, tx *sql.Tx, lease app
 	}
 	if !found || current.OwnerNonce != lease.OwnerNonce || current.Version != lease.Version || !current.ExpiresAt.After(now.UTC()) {
 		return errors.New("automatic admission lease was lost")
+	}
+	return nil
+}
+
+func leaseUnixNano(value time.Time) int64 {
+	if value.IsZero() {
+		return 0
+	}
+	return value.UTC().UnixNano()
+}
+
+// backfillAutomaticAdmissionLeaseExpiryTx preserves valid v16/v17 lease
+// rows during the v18 migration while making an unparsable legacy expiry fail
+// closed as expired (zero).
+func backfillAutomaticAdmissionLeaseExpiryTx(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `SELECT namespace,expires_at FROM linear_todo_admission_lease WHERE expires_at_unix_ns=0`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type row struct {
+		namespace string
+		expiry    int64
+	}
+	var values []row
+	for rows.Next() {
+		var namespace, expires string
+		if err := rows.Scan(&namespace, &expires); err != nil {
+			return err
+		}
+		parsed := parseTime(expires)
+		values = append(values, row{namespace: namespace, expiry: leaseUnixNano(parsed)})
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, value := range values {
+		if _, err := tx.ExecContext(ctx, `UPDATE linear_todo_admission_lease SET expires_at_unix_ns=? WHERE namespace=? AND expires_at_unix_ns=0`, value.expiry, value.namespace); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -392,7 +454,15 @@ func requireNoAdmissionJournalCorruption(ctx context.Context, tx *sql.Tx) error 
 }
 
 func automaticAdmissionJournalTx(ctx context.Context, tx *sql.Tx, runID string) (application.LinearTodoAdmissionJournal, bool, error) {
-	journal, err := scanAutomaticAdmissionJournal(tx.QueryRowContext(ctx, `SELECT issue_uuid,run_id,scan_digest,task_digest,profile_digest,status,mutation_intent_ref,reason_code,created_at,updated_at FROM linear_todo_admission_journal WHERE run_id=?`, runID))
+	return automaticAdmissionJournal(tx, ctx, runID)
+}
+
+type automaticAdmissionJournalReader interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func automaticAdmissionJournal(db automaticAdmissionJournalReader, ctx context.Context, runID string) (application.LinearTodoAdmissionJournal, bool, error) {
+	journal, err := scanAutomaticAdmissionJournal(db.QueryRowContext(ctx, `SELECT issue_uuid,run_id,scan_digest,task_digest,profile_digest,status,mutation_intent_ref,reason_code,created_at,updated_at FROM linear_todo_admission_journal WHERE run_id=?`, runID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return application.LinearTodoAdmissionJournal{}, false, nil
 	}
@@ -422,7 +492,30 @@ func validAutomaticAdmissionJournal(journal application.LinearTodoAdmissionJourn
 	}
 	var source application.LinearTaskSource
 	var task domain.CodingTask
-	return json.Unmarshal([]byte(run.RawIssueJSON), &source) == nil && json.Unmarshal([]byte(run.NormalizedTaskJSON), &task) == nil && source.Provider == "linear" && source.IssueID == journal.IssueUUID && source.Identifier == run.IssueID && source.SourceRevision == run.SourceRevision && task.Validate() == nil && task.RunID == run.ID && task.IssueID == run.IssueID && task.SourceRevision == run.SourceRevision
+	return automaticAdmissionJournalStateMatchesRun(journal.Status, run.State) && json.Unmarshal([]byte(run.RawIssueJSON), &source) == nil && json.Unmarshal([]byte(run.NormalizedTaskJSON), &task) == nil && source.Provider == "linear" && source.IssueID == journal.IssueUUID && source.Identifier == run.IssueID && source.SourceRevision == run.SourceRevision && task.Validate() == nil && task.RunID == run.ID && task.IssueID == run.IssueID && task.SourceRevision == run.SourceRevision
+}
+
+// Journal status is a narrow pre-delivery witness, not a second state
+// machine. In particular, an unstarted reservation may never coexist with an
+// executing (or later) run; that would permit recovery to infer a mutation.
+func automaticAdmissionJournalStateMatchesRun(status string, state domain.State) bool {
+	switch status {
+	case application.LinearTodoAdmissionJournalReserved:
+		return state == domain.StateReceived
+	case "mutation_intent":
+		// The Linear start service can durably halt the run before this caller
+		// records the final journal manual status.
+		return state == domain.StateReceived || state == domain.StateManualIntervention
+	case "started":
+		// This is the durable proof that the remote start mutation completed.
+		// A normal delivery lifecycle can subsequently reach any terminal state
+		// without another journal transition, so terminal states remain valid.
+		return true
+	case "manual_intervention":
+		return state == domain.StateManualIntervention
+	default:
+		return false
+	}
 }
 
 func sameReservedRun(actual, expected application.Run) bool {

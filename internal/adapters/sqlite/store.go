@@ -20,7 +20,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 17
+const schemaVersion = 18
 
 type Store struct{ db *sql.DB }
 
@@ -123,12 +123,19 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV16
 		case 17:
 			statements = migrationV17
+		case 18:
+			statements = migrationV18
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
 		for _, statement := range statements {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
 				return fmt.Errorf("migrate schema to version %d: %w", version, err)
+			}
+		}
+		if version == 18 {
+			if err := backfillAutomaticAdmissionLeaseExpiryTx(ctx, tx); err != nil {
+				return err
 			}
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES(?,?)`, version, nowText()); err != nil {
@@ -336,6 +343,13 @@ var migrationV17 = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS operator_attention_outbox_projection ON operator_attention_outbox(occurred_at,event_key)`,
 	`CREATE INDEX IF NOT EXISTS operator_attention_outbox_run ON operator_attention_outbox(run_id,occurred_at,event_key)`,
+}
+
+// migrationV18 adds an integer lease expiry authority. RFC3339Nano strings
+// omit trailing fractional zeroes, so lexical TEXT comparisons are not a safe
+// temporal compare-and-swap primitive.
+var migrationV18 = []string{
+	`ALTER TABLE linear_todo_admission_lease ADD COLUMN expires_at_unix_ns INTEGER NOT NULL DEFAULT 0`,
 }
 
 func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput) (application.Run, bool, error) {

@@ -111,6 +111,13 @@ func TestReserveAutomaticAdmissionIsAtomicAndAdoptable(t *testing.T) {
 	if err != nil || !reserved || run.ID != reservation.Input.Task.RunID || journal.IssueUUID != reservation.IssueUUID || journal.Status != application.LinearTodoAdmissionJournalReserved {
 		t.Fatalf("run=%+v journal=%+v reserved=%v err=%v", run, journal, reserved, err)
 	}
+	loaded, found, err := store.GetLinearTodoAdmissionJournal(ctx, run.ID)
+	if err != nil || !found || loaded.RunID != run.ID || loaded.IssueUUID != journal.IssueUUID || loaded.ScanDigest != journal.ScanDigest || loaded.Status != application.LinearTodoAdmissionJournalReserved {
+		t.Fatalf("loaded=%+v found=%v err=%v", loaded, found, err)
+	}
+	if missing, found, err := store.GetLinearTodoAdmissionJournal(ctx, "missing-run"); err != nil || found || missing != (application.LinearTodoAdmissionJournal{}) {
+		t.Fatalf("missing=%+v found=%v err=%v", missing, found, err)
+	}
 	adopted, adoptedJournal, found, err := store.AdoptLinearTodoAdmissionReservation(ctx, reservation)
 	if err != nil || !found || adopted.ID != run.ID || adoptedJournal.ScanDigest != journal.ScanDigest {
 		t.Fatalf("adopted=%+v journal=%+v found=%v err=%v", adopted, adoptedJournal, found, err)
@@ -354,6 +361,119 @@ func TestAutomaticAdmissionRejectsEveryCorruptUnrelatedJournalRow(t *testing.T) 
 			}
 			if _, _, _, err := store.ReserveLinearTodoAdmission(ctx, automaticAdmissionReservation("123e4567-e89b-42d3-a456-426614174014", "run-corrupt-new", "IFAN-14", lease)); err == nil {
 				t.Fatal("corrupt unrelated journal was accepted")
+			}
+		})
+	}
+}
+
+func TestAutomaticAdmissionLeaseExpiryUsesNumericTimeComparison(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	base := time.Date(2026, 7, 15, 2, 0, 0, 0, time.UTC)
+	lease, acquired, err := store.AcquireLinearTodoAdmissionLease(ctx, "first", 30*time.Second, base.Add(-30*time.Second))
+	if err != nil || !acquired || !lease.ExpiresAt.Equal(base) {
+		t.Fatalf("lease=%+v acquired=%t err=%v", lease, acquired, err)
+	}
+	// RFC3339Nano formats the first expiry without a fraction while this time
+	// includes .5. Lexical TEXT comparison would incorrectly keep first alive.
+	whenExpired := base.Add(500 * time.Millisecond)
+	if _, renewed, err := store.RenewLinearTodoAdmissionLease(ctx, lease, time.Minute, whenExpired); err != nil || renewed {
+		t.Fatalf("expired renewal renewed=%t err=%v", renewed, err)
+	}
+	replacement, acquired, err := store.AcquireLinearTodoAdmissionLease(ctx, "second", time.Minute, whenExpired)
+	if err != nil || !acquired || replacement.OwnerNonce != "second" {
+		t.Fatalf("replacement=%+v acquired=%t err=%v", replacement, acquired, err)
+	}
+	var numericExpiry int64
+	if err := store.db.QueryRowContext(ctx, `SELECT expires_at_unix_ns FROM linear_todo_admission_lease WHERE namespace=?`, application.LinearTodoAdmissionLeaseNamespace).Scan(&numericExpiry); err != nil {
+		t.Fatal(err)
+	}
+	if numericExpiry != replacement.ExpiresAt.UnixNano() {
+		t.Fatalf("numeric expiry=%d want=%d", numericExpiry, replacement.ExpiresAt.UnixNano())
+	}
+}
+
+func TestMigrationV18BackfillsLegacyAutomaticAdmissionLeaseExpiry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "controller.db")
+	db, err := sql.Open("sqlite", sqliteDSN(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	migrations := [][]string{migrationV1, migrationV2, migrationV3, migrationV4, migrationV5, migrationV6, migrationV7, migrationV8, migrationV9, migrationV10, migrationV11, migrationV12, migrationV13, migrationV14, migrationV15, migrationV16, migrationV17}
+	for index, migration := range migrations {
+		for _, statement := range migration {
+			if _, err := db.Exec(statement); err != nil {
+				t.Fatalf("migration=%d err=%v", index+1, err)
+			}
+		}
+		if _, err := db.Exec(`INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)`, index+1, "legacy"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	expires := time.Date(2026, 7, 15, 2, 0, 0, 0, time.UTC)
+	if _, err := db.Exec(`INSERT INTO linear_todo_admission_lease(namespace,owner_nonce,version,acquired_at,renewed_at,expires_at) VALUES(?,?,?,?,?,?)`, application.LinearTodoAdmissionLeaseNamespace, "legacy-owner", 7, formatTime(expires.Add(-time.Minute)), formatTime(expires.Add(-30*time.Second)), formatTime(expires)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var got int64
+	if err := store.db.QueryRowContext(context.Background(), `SELECT expires_at_unix_ns FROM linear_todo_admission_lease WHERE namespace=?`, application.LinearTodoAdmissionLeaseNamespace).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != expires.UnixNano() {
+		t.Fatalf("backfilled expiry=%d want=%d", got, expires.UnixNano())
+	}
+}
+
+func TestAutomaticAdmissionJournalRejectsStatusAndRunStateContradictions(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		status string
+	}{
+		{name: "reserved executing", status: application.LinearTodoAdmissionJournalReserved},
+		{name: "mutation intent executing", status: "mutation_intent"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			lease, acquired, err := store.AcquireLinearTodoAdmissionLease(ctx, "scheduler", time.Minute, time.Now().UTC())
+			if err != nil || !acquired {
+				t.Fatal(err)
+			}
+			reservation := automaticAdmissionReservation("123e4567-e89b-42d3-a456-426614174020", "run-state-mismatch", "IFAN-20", lease)
+			if _, _, reserved, err := store.ReserveLinearTodoAdmission(ctx, reservation); err != nil || !reserved {
+				t.Fatalf("reserved=%t err=%v", reserved, err)
+			}
+			if test.status == "mutation_intent" {
+				if _, err := store.db.ExecContext(ctx, `UPDATE linear_todo_admission_journal SET status=?,mutation_intent_ref=? WHERE run_id=?`, test.status, digestBytes([]byte("intent")), reservation.Input.Task.RunID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := store.db.ExecContext(ctx, `UPDATE runs SET current_state='executing' WHERE run_id=?`, reservation.Input.Task.RunID); err != nil {
+				t.Fatal(err)
+			}
+			if _, found, err := store.GetLinearTodoAdmissionJournal(ctx, reservation.Input.Task.RunID); err == nil || found {
+				t.Fatalf("contradictory journal found=%t err=%v", found, err)
+			}
+			if _, _, _, err := store.ReserveLinearTodoAdmission(ctx, automaticAdmissionReservation("123e4567-e89b-42d3-a456-426614174021", "run-state-mismatch-next", "IFAN-21", lease)); err == nil {
+				t.Fatal("global journal corruption check accepted contradictory state")
 			}
 		})
 	}

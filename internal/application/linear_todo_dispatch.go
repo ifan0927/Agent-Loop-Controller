@@ -1,0 +1,526 @@
+package application
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"path/filepath"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
+)
+
+const (
+	LinearTodoDispatchNoCandidate = "no_candidate"
+	LinearTodoDispatchDriven      = "driven"
+	LinearTodoDispatchAttention   = "attention_required"
+)
+
+// LinearTodoDispatchDriver is deliberately the existing exact-run driver
+// boundary. A dispatch cycle cannot choose a different run through this port.
+type LinearTodoDispatchDriver interface {
+	Drive(context.Context, ProductionDriveCommand) (ProductionDriveResult, error)
+}
+
+type linearTodoDispatchStore interface {
+	LinearTodoAdmissionStore
+	linearIssueStartStore
+	OperatorAttentionStore
+}
+
+// LinearTodoDispatchPolicy contains controller-owned authority for one
+// bounded dispatch cycle. It neither schedules a subsequent invocation nor
+// contains any Linear mutation authority beyond the configured state change.
+type LinearTodoDispatchPolicy struct {
+	CandidateAuthority LinearTodoCandidateAuthority
+	StartAuthority     LinearIssueStartAuthority
+	LeaseTTL           time.Duration
+	OwnerNonce         string
+	Requester          Requester
+	AttentionProfile   OperatorAttentionProfile
+}
+
+// LinearTodoDispatchResult contains sanitized control-flow evidence. The
+// selected task snapshot and Linear prose are deliberately not projected.
+type LinearTodoDispatchResult struct {
+	Outcome    string                 `json:"outcome"`
+	Run        RunResult              `json:"run,omitempty"`
+	ScanDigest string                 `json:"scan_digest,omitempty"`
+	Drive      *ProductionDriveResult `json:"drive,omitempty"`
+}
+
+// LinearTodoDispatcher advances at most one persisted run. It is intentionally
+// a single cycle: it has no poll, CLI, or transport concern. During one
+// potentially long Drive call it may renew its already-held lease solely to
+// fence that call; a later caller owns trigger cadence and process lifetime.
+type LinearTodoDispatcher struct {
+	scanner    LinearTodoCandidateScanner
+	reader     LinearIssueReader
+	resolver   LinearAdmissionRepositoryResolver
+	starter    LinearReservedIssueStarter
+	store      linearTodoDispatchStore
+	controller LocalRunController
+	driver     LinearTodoDispatchDriver
+	policy     LinearTodoDispatchPolicy
+	now        func() time.Time
+	leaseTicks func(time.Duration) (<-chan time.Time, func())
+}
+
+func NewLinearTodoDispatcher(scanner LinearTodoCandidateScanner, reader LinearIssueReader, resolver LinearAdmissionRepositoryResolver, starter LinearReservedIssueStarter, store linearTodoDispatchStore, controller LocalRunController, driver LinearTodoDispatchDriver, policy LinearTodoDispatchPolicy) (*LinearTodoDispatcher, error) {
+	if scanner == nil || reader == nil || resolver == nil || starter == nil || store == nil || controller == nil || driver == nil {
+		return nil, errors.New("Linear Todo dispatcher dependencies are required")
+	}
+	if err := validateLinearTodoDispatchPolicy(policy); err != nil {
+		return nil, err
+	}
+	return &LinearTodoDispatcher{scanner: scanner, reader: reader, resolver: resolver, starter: starter, store: store, controller: controller, driver: driver, policy: policy, now: func() time.Time { return time.Now().UTC() }, leaseTicks: newDispatchLeaseTicker}, nil
+}
+
+func validateLinearTodoDispatchPolicy(policy LinearTodoDispatchPolicy) error {
+	if err := (LinearIssueStartAuthority{TeamID: policy.CandidateAuthority.TeamID, TeamKey: policy.CandidateAuthority.TeamKey, TodoState: policy.CandidateAuthority.TodoState, InProgressState: policy.CandidateAuthority.InProgressState}).validate(); err != nil {
+		return errors.New("Linear Todo dispatch candidate authority is invalid")
+	}
+	if err := policy.StartAuthority.validate(); err != nil || policy.CandidateAuthority.TeamID != policy.StartAuthority.TeamID || policy.CandidateAuthority.TeamKey != policy.StartAuthority.TeamKey || !stateMatches(policy.CandidateAuthority.TodoState, policy.StartAuthority.TodoState) || !stateMatches(policy.CandidateAuthority.InProgressState, policy.StartAuthority.InProgressState) || policy.CandidateAuthority.MaxCandidates < 1 || policy.CandidateAuthority.MaxCandidates > 100 || policy.CandidateAuthority.MaxPages < 1 || policy.CandidateAuthority.MaxPages > 20 {
+		return errors.New("Linear Todo dispatch workflow authority is invalid")
+	}
+	if policy.LeaseTTL < 30*time.Second || policy.LeaseTTL > MaxLinearTodoAdmissionLeaseTTL || strings.TrimSpace(policy.OwnerNonce) == "" || policy.Requester.ID == "" || policy.Requester.Kind != "github_login" {
+		return errors.New("Linear Todo dispatch lease or requester authority is invalid")
+	}
+	if _, err := CandidateScanIncompleteAttentionEvent(dispatchEvidence("policy"), policy.AttentionProfile, "incomplete_authority", dispatchEvidence("profile"), time.Unix(1, 0).UTC()); err != nil {
+		return errors.New("Linear Todo dispatch operator attention profile is invalid")
+	}
+	return nil
+}
+
+// Dispatch performs one durable admission/recovery decision under the
+// singleton lease. It never retries a scan or looks for another candidate
+// after ambiguity, a failed reservation, a mutation conflict, or a driver
+// conflict.
+func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatchResult, error) {
+	now := d.clock()
+	lease, acquired, err := d.store.AcquireLinearTodoAdmissionLease(ctx, d.policy.OwnerNonce, d.policy.LeaseTTL, now)
+	if err != nil {
+		return LinearTodoDispatchResult{}, classifyServiceError(err)
+	}
+	if !acquired {
+		return d.schedulerAttention(ctx, d.policy.AttentionProfile, "lease_conflict", dispatchEvidence("lease_conflict"))
+	}
+	defer func() {
+		_, _ = d.store.ReleaseLinearTodoAdmissionLease(context.Background(), lease)
+	}()
+
+	runs, err := d.store.ListNonterminalRuns(ctx)
+	if err != nil {
+		return LinearTodoDispatchResult{}, classifyServiceError(err)
+	}
+	if len(runs) > 1 {
+		return d.runsAttention(ctx, runs, "admission_authority_conflict", dispatchEvidence("multiple_nonterminal_runs"))
+	}
+	if len(runs) == 1 {
+		return d.resume(ctx, &lease, runs[0])
+	}
+
+	if !d.renewLease(ctx, &lease) {
+		return d.schedulerAttention(ctx, d.policy.AttentionProfile, "lease_lost", dispatchEvidence("lease_lost_before_scan"))
+	}
+	scan, _, err := d.scanner.ListTodoCandidates(ctx, d.policy.CandidateAuthority)
+	if err != nil || !validLinearTodoCandidateScan(scan, d.policy.CandidateAuthority) {
+		return d.scanAttention(ctx, "incomplete_authority", dispatchEvidence("candidate_scan_incomplete"))
+	}
+	if len(scan.Candidates) == 0 {
+		return LinearTodoDispatchResult{Outcome: LinearTodoDispatchNoCandidate, ScanDigest: scan.Digest}, nil
+	}
+
+	selected, tie, found, leaseLost := d.readAndSelect(ctx, &lease, scan)
+	if leaseLost {
+		return d.schedulerAttention(ctx, d.policy.AttentionProfile, "lease_lost", dispatchEvidence("lease_lost_before_candidate_read", scan.Digest))
+	}
+	if !found {
+		return d.scanAttention(ctx, "incomplete_authority", dispatchEvidence("no_authoritatively_valid_candidate", scan.Digest))
+	}
+	if tie {
+		return d.candidateTieAttention(ctx, selected.candidate.Identifier, selected.repository, scan.Digest)
+	}
+	return d.reserveStartAndDrive(ctx, &lease, selected, scan.Digest)
+}
+
+type linearTodoDispatchCandidate struct {
+	candidate  LinearTodoCandidate
+	snapshot   linearAdmissionSnapshot
+	repository LocalRepository
+}
+
+func (d *LinearTodoDispatcher) readAndSelect(ctx context.Context, lease *LinearTodoAdmissionLease, scan LinearTodoCandidateScan) (linearTodoDispatchCandidate, bool, bool, bool) {
+	var selected linearTodoDispatchCandidate
+	selectedSet, tie := false, false
+	for _, candidate := range scan.Candidates {
+		if !d.renewLease(ctx, lease) {
+			return linearTodoDispatchCandidate{}, false, false, true
+		}
+		source, _, err := d.reader.ReadIssue(ctx, candidate.Identifier)
+		if err != nil || !sameLinearTodoCandidateSource(candidate, source, d.policy.CandidateAuthority) {
+			// A scan is complete, but a later per-issue read can legitimately be
+			// stale, removed, or invalid. It excludes only this candidate; it
+			// must not prevent a separately revalidated unique best candidate.
+			continue
+		}
+		snapshot, repository, err := admitLinearTask(source, d.resolver)
+		if err != nil {
+			continue
+		}
+		current := linearTodoDispatchCandidate{candidate: candidate, snapshot: snapshot, repository: repository}
+		if !selectedSet || linearTodoPriorityRank(candidate.Priority) < linearTodoPriorityRank(selected.candidate.Priority) {
+			selected, selectedSet, tie = current, true, false
+			continue
+		}
+		if linearTodoPriorityRank(candidate.Priority) == linearTodoPriorityRank(selected.candidate.Priority) {
+			tie = true
+		}
+	}
+	if !selectedSet {
+		return linearTodoDispatchCandidate{}, false, false, false
+	}
+	return selected, tie, true, false
+}
+
+// Linear represents unprioritized work as zero; it is lower than all explicit
+// priorities. The remaining values retain Linear's ascending priority order.
+func linearTodoPriorityRank(priority int) int {
+	if priority == 0 {
+		return 5
+	}
+	return priority
+}
+
+func (d *LinearTodoDispatcher) reserveStartAndDrive(ctx context.Context, lease *LinearTodoAdmissionLease, candidate linearTodoDispatchCandidate, scanDigest string) (LinearTodoDispatchResult, error) {
+	if !d.renewLease(ctx, lease) {
+		return d.schedulerAttention(ctx, dispatcherProfile(candidate.repository, d.policy.AttentionProfile), "lease_lost", dispatchEvidence("lease_lost", scanDigest))
+	}
+	input := linearTodoDispatchInput(candidate.snapshot, candidate.repository)
+	reserved, journal, created, err := d.store.ReserveLinearTodoAdmission(ctx, LinearTodoAdmissionReservation{Lease: *lease, ScanDigest: scanDigest, IssueUUID: candidate.candidate.IssueID, Input: input})
+	if err != nil || !created {
+		if leaseErr := d.requireLease(ctx, *lease); leaseErr != nil {
+			return d.schedulerAttention(ctx, dispatcherProfile(candidate.repository, d.policy.AttentionProfile), "lease_lost", dispatchEvidence("lease_lost_during_reservation", scanDigest))
+		}
+		return d.runAttention(ctx, mustReservedRun(candidate.snapshot, candidate.repository), "admission_authority_conflict", dispatchEvidence("reservation_conflict", scanDigest))
+	}
+	return d.startAndDrive(ctx, lease, reserved, journal, input)
+}
+
+func (d *LinearTodoDispatcher) resume(ctx context.Context, lease *LinearTodoAdmissionLease, run Run) (LinearTodoDispatchResult, error) {
+	if run.State == domain.StateManualIntervention || run.State == domain.StateAwaitingHumanDecision || run.State == domain.StateAwaitingHumanApproval {
+		return d.runAttention(ctx, run, "admission_authority_conflict", dispatchEvidence("manual_or_human_run", run.ID))
+	}
+	journal, found, err := d.store.GetLinearTodoAdmissionJournal(ctx, run.ID)
+	if err != nil {
+		return d.runAttention(ctx, run, "admission_authority_conflict", dispatchEvidence("journal_conflict", run.ID))
+	}
+	if !found {
+		if run.State == domain.StateReceived {
+			return d.runAttention(ctx, run, "admission_authority_conflict", dispatchEvidence("missing_reservation", run.ID))
+		}
+		return d.drive(ctx, lease, run)
+	}
+	if journal.Status == "manual_intervention" {
+		return d.runAttention(ctx, run, "admission_authority_conflict", dispatchEvidence("journal_manual", run.ID, journal.ScanDigest))
+	}
+	if run.State != domain.StateReceived {
+		return d.drive(ctx, lease, run)
+	}
+	if !d.renewLease(ctx, lease) {
+		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_before_adoption", run.ID))
+	}
+	input, err := linearTodoDispatchInputFromRun(run)
+	if err != nil {
+		return d.runAttention(ctx, run, "admission_authority_conflict", dispatchEvidence("persisted_reservation_invalid", run.ID))
+	}
+	adopted, adoptedJournal, adoptedOK, err := d.store.AdoptLinearTodoAdmissionReservation(ctx, LinearTodoAdmissionReservation{Lease: *lease, ScanDigest: journal.ScanDigest, IssueUUID: journal.IssueUUID, Input: input})
+	if err != nil || !adoptedOK || adopted.ID != run.ID {
+		if leaseErr := d.requireLease(ctx, *lease); leaseErr != nil {
+			return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_during_adoption", run.ID))
+		}
+		return d.runAttention(ctx, run, "admission_authority_conflict", dispatchEvidence("reservation_adoption_conflict", run.ID, journal.ScanDigest))
+	}
+	return d.startAndDrive(ctx, lease, adopted, adoptedJournal, input)
+}
+
+func (d *LinearTodoDispatcher) startAndDrive(ctx context.Context, lease *LinearTodoAdmissionLease, run Run, journal LinearTodoAdmissionJournal, input LocalStartInput) (LinearTodoDispatchResult, error) {
+	if journal.RunID != run.ID || journal.IssueUUID == "" || journal.ScanDigest == "" || journal.TaskDigest != run.TaskHash || journal.ProfileDigest != run.ProfileDigest {
+		return d.runAttention(ctx, run, "admission_authority_conflict", dispatchEvidence("journal_run_conflict", run.ID))
+	}
+	if !d.renewLease(ctx, lease) {
+		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_before_start", run.ID))
+	}
+	if journal.Status == LinearTodoAdmissionJournalReserved {
+		intent, err := linearIssueStartIntent(run, mustLinearSource(input.RawIssueJSON), d.policy.StartAuthority)
+		if err != nil {
+			return d.runAttention(ctx, run, "admission_authority_conflict", dispatchEvidence("mutation_intent_conflict", run.ID))
+		}
+		if !d.advanceJournal(ctx, *lease, run.ID, LinearTodoAdmissionJournalReserved, "mutation_intent", intent.IdempotencyDigest, "") {
+			if leaseErr := d.requireLease(ctx, *lease); leaseErr != nil {
+				return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_during_mutation_intent", run.ID))
+			}
+			return d.runAttention(ctx, run, "admission_authority_conflict", dispatchEvidence("mutation_intent_conflict", run.ID))
+		}
+		journal.Status, journal.MutationIntentRef = "mutation_intent", intent.IdempotencyDigest
+	}
+	if journal.Status != "mutation_intent" && journal.Status != "started" {
+		return d.runAttention(ctx, run, "admission_authority_conflict", dispatchEvidence("journal_status_conflict", run.ID))
+	}
+
+	starter, err := NewLinearReservedIssueStartService(d.reader, d.starter, d.resolver, d.store, d.policy.StartAuthority)
+	if err != nil {
+		return LinearTodoDispatchResult{}, serviceError(ErrorInternal, "Linear issue start service is unavailable", err)
+	}
+	if !d.renewLease(ctx, lease) {
+		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_before_mutation", run.ID))
+	}
+	started, startErr := starter.MoveReservedIssueToStarted(ctx, MoveReservedIssueToStartedCommand{RunID: run.ID})
+	if startErr != nil || started.Status != "started" {
+		_ = d.advanceJournal(ctx, *lease, run.ID, "mutation_intent", "manual_intervention", "", "mutation_conflict")
+		updated, getErr := d.store.GetRun(ctx, run.ID)
+		if getErr == nil {
+			run = updated
+		}
+		return d.runAttention(ctx, run, "mutation_authority_conflict", dispatchEvidence("start_mutation_conflict", run.ID))
+	}
+	if !d.renewLease(ctx, lease) {
+		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_after_mutation", run.ID))
+	}
+	if journal.Status == "mutation_intent" && !d.advanceJournal(ctx, *lease, run.ID, "mutation_intent", "started", journal.MutationIntentRef, "") {
+		if leaseErr := d.requireLease(ctx, *lease); leaseErr != nil {
+			return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_during_started_journal", run.ID))
+		}
+		return d.runAttention(ctx, run, "admission_authority_conflict", dispatchEvidence("start_journal_conflict", run.ID))
+	}
+	command := NewCommandService(d.controller, d.store)
+	if !d.renewLease(ctx, lease) {
+		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_before_local_start", run.ID))
+	}
+	startedRun, err := command.Start(ctx, StartCommand{Requester: d.policy.Requester, RepositorySelection: input.Task.Repository, IdempotencyKey: input.IdempotencyKey, Input: input})
+	if err != nil {
+		return d.runAttention(ctx, run, "admission_authority_conflict", dispatchEvidence("local_start_conflict", run.ID))
+	}
+	persisted, err := d.store.GetRun(ctx, run.ID)
+	if err != nil || persisted.ID != run.ID || persisted.Repository != run.Repository || persisted.IdempotencyKey != run.IdempotencyKey || startedRun.Run.RunID != run.ID {
+		return d.runAttention(ctx, run, "admission_authority_conflict", dispatchEvidence("post_start_proof_conflict", run.ID))
+	}
+	return d.drive(ctx, lease, persisted)
+}
+
+func (d *LinearTodoDispatcher) drive(ctx context.Context, lease *LinearTodoAdmissionLease, run Run) (LinearTodoDispatchResult, error) {
+	if !d.renewLease(ctx, lease) {
+		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_before_driver", run.ID))
+	}
+	driveCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	ticks, stopTicks := d.leaseTicks(d.policy.LeaseTTL / 2)
+	defer stopTicks()
+	driveDone := make(chan struct{})
+	renewerDone := make(chan struct{})
+	leaseLost := make(chan struct{}, 1)
+	go func() {
+		defer close(renewerDone)
+		for {
+			select {
+			case <-driveDone:
+				return
+			case <-driveCtx.Done():
+				return
+			case <-ticks:
+				if !d.renewLease(driveCtx, lease) {
+					select {
+					case leaseLost <- struct{}{}:
+					default:
+					}
+					cancel(errors.New("automatic admission lease renewal was lost"))
+					return
+				}
+			}
+		}
+	}()
+	result, err := d.driver.Drive(driveCtx, ProductionDriveCommand{Requester: d.policy.Requester, RunID: run.ID, Repository: run.Repository, IdempotencyKey: run.IdempotencyKey})
+	close(driveDone)
+	<-renewerDone
+	select {
+	case <-leaseLost:
+		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_during_driver", run.ID))
+	default:
+	}
+	if err != nil {
+		var service *ServiceError
+		if errors.As(err, &service) && service.Category == ErrorConflict {
+			return d.runAttention(ctx, run, "admission_authority_conflict", dispatchEvidence("driver_conflict", run.ID))
+		}
+		return LinearTodoDispatchResult{}, err
+	}
+	return LinearTodoDispatchResult{Outcome: LinearTodoDispatchDriven, Run: projectRunResult(run), Drive: &result}, nil
+}
+
+func newDispatchLeaseTicker(interval time.Duration) (<-chan time.Time, func()) {
+	ticker := time.NewTicker(interval)
+	return ticker.C, ticker.Stop
+}
+
+func (d *LinearTodoDispatcher) requireLease(ctx context.Context, lease LinearTodoAdmissionLease) error {
+	held, err := d.store.LinearTodoAdmissionLeaseHeld(ctx, lease, d.clock())
+	if err != nil {
+		return err
+	}
+	if !held {
+		return errors.New("automatic admission lease was lost")
+	}
+	return nil
+}
+
+// renewLease obtains a fresh versioned capability before each potentially long
+// operation. It fails closed: an unavailable or lost compare-and-swap never
+// leaves a stale worker authorized to continue.
+func (d *LinearTodoDispatcher) renewLease(ctx context.Context, lease *LinearTodoAdmissionLease) bool {
+	if lease == nil {
+		return false
+	}
+	next, renewed, err := d.store.RenewLinearTodoAdmissionLease(ctx, *lease, d.policy.LeaseTTL, d.clock())
+	if err != nil || !renewed || next.Namespace != LinearTodoAdmissionLeaseNamespace || next.OwnerNonce != lease.OwnerNonce || next.Version <= lease.Version {
+		return false
+	}
+	*lease = next
+	return true
+}
+
+func (d *LinearTodoDispatcher) advanceJournal(ctx context.Context, lease LinearTodoAdmissionLease, runID, from, to, intent, reason string) bool {
+	advanced, err := d.store.AdvanceLinearTodoAdmissionJournal(ctx, LinearTodoAdmissionJournalTransition{Lease: lease, RunID: runID, ExpectedStatus: from, NextStatus: to, MutationIntentRef: intent, ReasonCode: reason})
+	return err == nil && advanced
+}
+
+func (d *LinearTodoDispatcher) candidateTieAttention(ctx context.Context, identifier string, repository LocalRepository, scanDigest string) (LinearTodoDispatchResult, error) {
+	profile := dispatcherProfile(repository, d.policy.AttentionProfile)
+	event, err := CandidatePriorityTieAttentionEvent(scanDigest, identifier, profile, dispatchEvidence("priority_tie", scanDigest), d.clock())
+	if err != nil {
+		return LinearTodoDispatchResult{}, serviceError(ErrorInternal, "candidate tie attention is invalid", err)
+	}
+	return d.appendAttention(ctx, event, scanDigest)
+}
+
+func (d *LinearTodoDispatcher) scanAttention(ctx context.Context, reason, evidence string) (LinearTodoDispatchResult, error) {
+	event, err := CandidateScanIncompleteAttentionEvent(evidence, d.policy.AttentionProfile, reason, evidence, d.clock())
+	if err != nil {
+		return LinearTodoDispatchResult{}, serviceError(ErrorInternal, "candidate scan attention is invalid", err)
+	}
+	return d.appendAttention(ctx, event, "")
+}
+
+func (d *LinearTodoDispatcher) schedulerAttention(ctx context.Context, profile OperatorAttentionProfile, reason, evidence string) (LinearTodoDispatchResult, error) {
+	event, err := SchedulerLeaseAttentionEvent(evidence, profile, reason, evidence, d.clock())
+	if err != nil {
+		return LinearTodoDispatchResult{}, serviceError(ErrorInternal, "scheduler lease attention is invalid", err)
+	}
+	return d.appendAttention(ctx, event, "")
+}
+
+func (d *LinearTodoDispatcher) runsAttention(ctx context.Context, runs []Run, reason, evidence string) (LinearTodoDispatchResult, error) {
+	for _, run := range runs {
+		if _, err := d.runAttention(ctx, run, reason, dispatchEvidence(evidence, run.ID)); err != nil {
+			return LinearTodoDispatchResult{}, err
+		}
+	}
+	return LinearTodoDispatchResult{Outcome: LinearTodoDispatchAttention}, nil
+}
+
+func (d *LinearTodoDispatcher) runAttention(ctx context.Context, run Run, reason, evidence string) (LinearTodoDispatchResult, error) {
+	event, err := AdmissionAuthorityConflictAttentionEvent(run, reason, evidence, d.clock())
+	if err != nil {
+		return d.scanAttention(ctx, "incomplete_authority", evidence)
+	}
+	return d.appendAttention(ctx, event, "")
+}
+
+func (d *LinearTodoDispatcher) appendAttention(ctx context.Context, event OperatorAttentionEvent, scanDigest string) (LinearTodoDispatchResult, error) {
+	if _, err := d.store.AppendOperatorAttention(ctx, event); err != nil {
+		return LinearTodoDispatchResult{}, classifyServiceError(err)
+	}
+	return LinearTodoDispatchResult{Outcome: LinearTodoDispatchAttention, ScanDigest: scanDigest}, nil
+}
+
+func (d *LinearTodoDispatcher) clock() time.Time { return d.now().UTC() }
+
+func validLinearTodoCandidateScan(scan LinearTodoCandidateScan, authority LinearTodoCandidateAuthority) bool {
+	if !validOperatorAttentionDigest(scan.Digest) || scan.ObservedAt.IsZero() || len(scan.Candidates) > authority.MaxCandidates {
+		return false
+	}
+	seenIDs, seenIdentifiers := map[string]bool{}, map[string]bool{}
+	for _, candidate := range scan.Candidates {
+		if !validLinearUUID(candidate.IssueID) || strings.TrimSpace(candidate.Identifier) == "" || candidate.Priority < 0 || candidate.Priority > 4 || !stateMatches(candidate.State, authority.TodoState) || candidate.Cycle.ID == "" || !candidate.Cycle.IsActive || strings.TrimSpace(candidate.BranchName) == "" || candidate.SourceRevision == "" || !validOperatorAttentionDigest(candidate.SourceDigest) || candidate.CreatedAt.IsZero() || candidate.UpdatedAt.IsZero() || candidate.UpdatedAt.Before(candidate.CreatedAt) || seenIDs[candidate.IssueID] || seenIdentifiers[candidate.Identifier] {
+			return false
+		}
+		seenIDs[candidate.IssueID], seenIdentifiers[candidate.Identifier] = true, true
+	}
+	return true
+}
+
+func sameLinearTodoCandidateSource(candidate LinearTodoCandidate, source LinearTaskSource, authority LinearTodoCandidateAuthority) bool {
+	if source.Provider != "linear" || source.IssueID != candidate.IssueID || source.Identifier != candidate.Identifier || source.Team.ID != authority.TeamID || source.Team.Key != authority.TeamKey || !stateMatches(source.State, candidate.State) || source.Cycle != candidate.Cycle || source.BranchName != candidate.BranchName || !source.CreatedAt.Equal(candidate.CreatedAt) || !source.UpdatedAt.Equal(candidate.UpdatedAt) || source.SourceRevision != candidate.SourceRevision || source.SourceRevision != source.UpdatedAt.UTC().Format(time.RFC3339Nano) {
+		return false
+	}
+	if len(source.Labels) != len(candidate.Labels) {
+		return false
+	}
+	labels := append([]LinearLabel(nil), source.Labels...)
+	want := append([]LinearLabel(nil), candidate.Labels...)
+	slices.SortFunc(labels, func(left, right LinearLabel) int { return strings.Compare(left.ID, right.ID) })
+	slices.SortFunc(want, func(left, right LinearLabel) int { return strings.Compare(left.ID, right.ID) })
+	return slices.EqualFunc(labels, want, func(left, right LinearLabel) bool { return left == right })
+}
+
+func linearTodoDispatchInput(snapshot linearAdmissionSnapshot, repository LocalRepository) LocalStartInput {
+	return LocalStartInput{Task: snapshot.Task, RawIssueJSON: snapshot.RawJSON, RawIssueHash: snapshot.RawHash, NormalizedJSON: snapshot.NormalizedJSON, TaskHash: snapshot.TaskHash, IdempotencyKey: snapshot.IdempotencyKey, Repository: repository, RunRoot: repository.RunRoot, WorktreeRoot: repository.WorktreeRoot}
+}
+
+func linearTodoDispatchInputFromRun(run Run) (LocalStartInput, error) {
+	var source LinearTaskSource
+	var task domain.CodingTask
+	var repository LocalRepository
+	if json.Unmarshal([]byte(run.RawIssueJSON), &source) != nil || json.Unmarshal([]byte(run.NormalizedTaskJSON), &task) != nil || json.Unmarshal([]byte(run.RepositoryConfigJSON), &repository) != nil || source.IssueID == "" || task.RunID != run.ID || task.IssueID != run.IssueID || task.SourceRevision != run.SourceRevision || repository.CanonicalRepository != run.Repository || filepath.Dir(run.ArtifactRoot) == "." || filepath.Dir(run.WorktreePath) == "." {
+		return LocalStartInput{}, errors.New("persisted automatic admission snapshot is invalid")
+	}
+	// ProfileSnapshotJSON is intentionally omitted from RepositoryConfigJSON's
+	// public projection. Recovery restores it only from the same persisted run
+	// record so CommandService can prove the original profile snapshot exactly.
+	repository.ProfileSnapshotJSON = run.ProfileSnapshotJSON
+	return LocalStartInput{Task: task, RawIssueJSON: []byte(run.RawIssueJSON), RawIssueHash: run.RawIssueHash, NormalizedJSON: []byte(run.NormalizedTaskJSON), TaskHash: run.TaskHash, IdempotencyKey: run.IdempotencyKey, Repository: repository, RunRoot: filepath.Dir(run.ArtifactRoot), WorktreeRoot: filepath.Dir(run.WorktreePath)}, nil
+}
+
+func dispatcherProfile(repository LocalRepository, fallback OperatorAttentionProfile) OperatorAttentionProfile {
+	if repository.ProfileID != "" && repository.CanonicalRepository != "" {
+		return OperatorAttentionProfile{ID: repository.ProfileID, Name: repository.CanonicalRepository}
+	}
+	return fallback
+}
+
+func (d *LinearTodoDispatcher) profileForRun(run Run) OperatorAttentionProfile {
+	profile, err := operatorAttentionProfileForRun(run)
+	if err == nil {
+		return profile
+	}
+	return d.policy.AttentionProfile
+}
+
+func mustReservedRun(snapshot linearAdmissionSnapshot, repository LocalRepository) Run {
+	run, _ := ReservedRunFromAdmissionSnapshot(linearTodoDispatchInput(snapshot, repository))
+	return run
+}
+
+func mustLinearSource(raw []byte) LinearTaskSource {
+	var source LinearTaskSource
+	_ = json.Unmarshal(raw, &source)
+	return source
+}
+
+func dispatchEvidence(parts ...string) string {
+	value := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	return hex.EncodeToString(value[:])
+}

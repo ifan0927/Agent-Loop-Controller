@@ -78,6 +78,7 @@ type LinearTodoAdmissionStore interface {
 	ReleaseLinearTodoAdmissionLease(context.Context, LinearTodoAdmissionLease) (bool, error)
 	LinearTodoAdmissionLeaseHeld(context.Context, LinearTodoAdmissionLease, time.Time) (bool, error)
 	ListNonterminalRuns(context.Context) ([]Run, error)
+	GetLinearTodoAdmissionJournal(context.Context, string) (LinearTodoAdmissionJournal, bool, error)
 	ReserveLinearTodoAdmission(context.Context, LinearTodoAdmissionReservation) (Run, LinearTodoAdmissionJournal, bool, error)
 	AdoptLinearTodoAdmissionReservation(context.Context, LinearTodoAdmissionReservation) (Run, LinearTodoAdmissionJournal, bool, error)
 	AdvanceLinearTodoAdmissionJournal(context.Context, LinearTodoAdmissionJournalTransition) (bool, error)
