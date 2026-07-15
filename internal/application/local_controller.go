@@ -1154,6 +1154,9 @@ func (c *LocalController) HandoffFreshReviewFindings(ctx context.Context, runID 
 	if err != nil {
 		return run, err
 	}
+	if err := c.validateWorkspace(ctx, run, true); err != nil {
+		return run, err
+	}
 	persister, ok := c.store.(FreshReviewFindingStore)
 	if !ok {
 		return run, errors.New("fresh review finding persistence is unavailable")

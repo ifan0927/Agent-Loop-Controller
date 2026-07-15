@@ -924,6 +924,29 @@ func TestFreshReviewHandoffRejectsTamperedOutcomeBeforePersistence(t *testing.T)
 	}
 }
 
+func TestFreshReviewHandoffRejectsWorktreeHeadDriftBeforePersistence(t *testing.T) {
+	lab := newLocalLab(t)
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	process := &durableFakeProcess{reviewFindings: true}
+	controller := newController(t, store, lab, process, gitadapter.Workspace{})
+	run, err := controller.Start(context.Background(), startInput(lab))
+	if err != nil || run.State != domain.StateFreshReview {
+		t.Fatalf("run=%+v err=%v", run, err)
+	}
+	runGit(t, run.WorktreePath, "commit", "--allow-empty", "-m", "unexpected head drift")
+	if _, err := controller.HandoffFreshReviewFindings(context.Background(), run.ID); err == nil {
+		t.Fatal("worktree HEAD drift was accepted")
+	}
+	after, err := store.Inspect(context.Background(), run.ID)
+	if err != nil || after.Run.State != domain.StateFreshReview || len(after.Findings) != 0 {
+		t.Fatalf("worktree HEAD drift changed durable state: inspection=%+v err=%v", after, err)
+	}
+}
+
 func TestProductionDriverRoutesFreshReviewFindingsIntoBoundedSameSessionRepair(t *testing.T) {
 	lab := newLocalLab(t)
 	store, err := storeadapter.Open(lab.db)
