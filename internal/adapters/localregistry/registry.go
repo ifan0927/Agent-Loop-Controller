@@ -25,6 +25,7 @@ var referencePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$`
 var githubOwnerPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$`)
 var githubRepositoryPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
 var githubAppProfilePattern = regexp.MustCompile(`^github-app-profile:[a-z0-9][a-z0-9._-]{0,63}$`)
+var linearLabelPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 
 type OperatorIdentityPolicy struct {
 	AllowedLogins []string               `json:"allowed_logins"`
@@ -39,8 +40,9 @@ type TrustedActorIdentity struct {
 }
 
 type Repository struct {
-	Owner string `json:"owner"`
-	Name  string `json:"name"`
+	Owner       string `json:"owner"`
+	Name        string `json:"name"`
+	LinearLabel string `json:"linear_label,omitempty"`
 	// OriginURL is the preferred explicit GitHub remote binding. OriginPath is
 	// retained for existing local bare-repository fixtures and is also accepted
 	// as a legacy spelling of an HTTPS or SSH GitHub remote.
@@ -77,6 +79,7 @@ type Binding struct {
 	RegistryDigest          string                 `json:"registry_digest"`
 	RepositoryBindingDigest string                 `json:"repository_binding_digest"`
 	CanonicalRepository     string                 `json:"canonical_repository"`
+	LinearLabel             string                 `json:"linear_label"`
 	OriginPath              string                 `json:"origin_path"`
 	SourcePath              string                 `json:"source_path"`
 	RunRoot                 string                 `json:"run_root"`
@@ -98,6 +101,7 @@ type ProfileSnapshot struct {
 	Version                int                    `json:"version"`
 	ProfileID              string                 `json:"profile_id"`
 	CanonicalRepository    string                 `json:"canonical_repository"`
+	LinearLabel            string                 `json:"linear_label"`
 	BaseBranch             string                 `json:"base_branch"`
 	VerifierRegistryRef    string                 `json:"verifier_registry_ref"`
 	VerifierIDs            []string               `json:"verifier_ids"`
@@ -116,6 +120,7 @@ type SanitizedBinding struct {
 	RegistryDigest          string                 `json:"registry_digest"`
 	RepositoryBindingDigest string                 `json:"repository_binding_digest"`
 	CanonicalRepository     string                 `json:"canonical_repository"`
+	LinearLabel             string                 `json:"linear_label"`
 	BaseBranch              string                 `json:"base_branch"`
 	VerifierRegistryRef     string                 `json:"verifier_registry_ref"`
 	VerifierIDs             []string               `json:"verifier_ids"`
@@ -130,7 +135,7 @@ type SanitizedBinding struct {
 func (b Binding) Sanitized() SanitizedBinding {
 	return SanitizedBinding{ProfileID: b.ProfileID, ProfileSnapshotVersion: b.ProfileSnapshotVersion, ProfileDigest: b.ProfileDigest,
 		RegistryVersion: b.RegistryVersion, RegistryDigest: b.RegistryDigest,
-		RepositoryBindingDigest: b.RepositoryBindingDigest, CanonicalRepository: b.CanonicalRepository,
+		RepositoryBindingDigest: b.RepositoryBindingDigest, CanonicalRepository: b.CanonicalRepository, LinearLabel: b.LinearLabel,
 		BaseBranch: b.BaseBranch, VerifierRegistryRef: b.VerifierRegistryRef,
 		VerifierIDs: append([]string(nil), b.VerifierIDs...), GitHubAppProfileRef: b.GitHubAppProfileRef,
 		GitHubAppID: b.GitHubAppID, GitHubInstallationID: b.GitHubInstallationID, ExpectedRepositoryID: b.ExpectedRepositoryID,
@@ -142,6 +147,7 @@ type Registry struct {
 	version      int
 	digest       string
 	repositories map[string]Binding
+	linearLabels map[string]Binding
 }
 
 func Load(path string) (Registry, error) {
@@ -190,7 +196,7 @@ func build(file File) (Registry, error) {
 		return Registry{}, err
 	}
 	registryDigest := digest(canonical)
-	registry := Registry{version: file.Version, digest: registryDigest, repositories: make(map[string]Binding, len(file.Repositories))}
+	registry := Registry{version: file.Version, digest: registryDigest, repositories: make(map[string]Binding, len(file.Repositories)), linearLabels: make(map[string]Binding, len(file.Repositories))}
 	type ownedPath struct{ path, repository string }
 	var seenPaths []ownedPath
 	for _, repo := range file.Repositories {
@@ -200,6 +206,9 @@ func build(file File) (Registry, error) {
 		}
 		if _, exists := registry.repositories[binding.CanonicalRepository]; exists {
 			return Registry{}, fmt.Errorf("duplicate canonical repository: %s", binding.CanonicalRepository)
+		}
+		if _, exists := registry.linearLabels[binding.LinearLabel]; exists {
+			return Registry{}, fmt.Errorf("duplicate Linear repository label: %s", binding.LinearLabel)
 		}
 		paths := []string{binding.SourcePath, binding.RunRoot, binding.WorktreeRoot}
 		if filepath.IsAbs(binding.OriginPath) {
@@ -214,6 +223,7 @@ func build(file File) (Registry, error) {
 			seenPaths = append(seenPaths, ownedPath{path, binding.CanonicalRepository})
 		}
 		registry.repositories[binding.CanonicalRepository] = binding
+		registry.linearLabels[binding.LinearLabel] = binding
 	}
 	return registry, nil
 }
@@ -222,6 +232,12 @@ func validateRepository(version int, registryDigest string, repo Repository) (Bi
 	canonical := repo.CanonicalName()
 	if !validGitHubOwner(repo.Owner) || !validGitHubRepository(repo.Name) || strings.Count(canonical, "/") != 1 {
 		return Binding{}, errors.New("repository entry has invalid canonical owner/name")
+	}
+	linearLabel := repo.LinearLabel
+	if linearLabel == "" {
+		linearLabel = canonical
+	} else if !linearLabelPattern.MatchString(linearLabel) {
+		return Binding{}, fmt.Errorf("repository %s has invalid Linear repository label", canonical)
 	}
 	if strings.TrimSpace(repo.OriginURL) != "" && strings.TrimSpace(repo.OriginPath) != "" {
 		return Binding{}, fmt.Errorf("repository %s configures both origin_url and origin_path", canonical)
@@ -313,13 +329,13 @@ func validateRepository(version int, registryDigest string, repo Repository) (Bi
 	slices.Sort(repo.OperatorIdentityPolicy.AllowedLogins)
 	slices.SortFunc(repo.OperatorIdentityPolicy.TrustedActors, func(a, b TrustedActorIdentity) int { return strings.Compare(a.NodeID, b.NodeID) })
 	profileID := "repository-profile:" + canonical
-	profile := ProfileSnapshot{Version: ProfileSnapshotVersion, ProfileID: profileID, CanonicalRepository: canonical,
+	profile := ProfileSnapshot{Version: ProfileSnapshotVersion, ProfileID: profileID, CanonicalRepository: canonical, LinearLabel: linearLabel,
 		BaseBranch: repo.BaseBranch, VerifierRegistryRef: repo.VerifierRegistryRef, VerifierIDs: append([]string(nil), repo.VerifierIDs...),
 		GitHubAppProfileRef: repo.GitHubAppProfileRef, GitHubAppID: repo.GitHubAppID, GitHubInstallationID: repo.GitHubInstallationID,
 		ExpectedRepositoryID: repo.ExpectedRepositoryID, OperatorIdentityPolicy: repo.OperatorIdentityPolicy}
 	profileRaw, _ := json.Marshal(profile)
 	binding := Binding{ProfileID: profileID, ProfileSnapshotVersion: ProfileSnapshotVersion, ProfileDigest: digest(profileRaw), ProfileSnapshotJSON: string(profileRaw),
-		RegistryVersion: version, RegistryDigest: registryDigest, CanonicalRepository: canonical,
+		RegistryVersion: version, RegistryDigest: registryDigest, CanonicalRepository: canonical, LinearLabel: linearLabel,
 		OriginPath: repo.OriginPath, SourcePath: repo.SourcePath, RunRoot: repo.RunRoot, WorktreeRoot: repo.WorktreeRoot,
 		BaseBranch: repo.BaseBranch, VerifierRegistryRef: repo.VerifierRegistryRef, VerifierIDs: repo.VerifierIDs,
 		GitHubAppProfileRef: repo.GitHubAppProfileRef, GitHubAppID: repo.GitHubAppID, GitHubInstallationID: repo.GitHubInstallationID,
@@ -474,6 +490,16 @@ func (r Registry) Resolve(name string) (Binding, error) {
 	return repo, nil
 }
 
+// ResolveLinearLabel resolves the controller-configured short label from a
+// Linear issue. A missing linear_label retains the legacy canonical name.
+func (r Registry) ResolveLinearLabel(label string) (Binding, error) {
+	repo, ok := r.linearLabels[label]
+	if !ok {
+		return Binding{}, fmt.Errorf("unknown Linear repository label: %s", label)
+	}
+	return repo, nil
+}
+
 // Bindings returns a stable copy of every configured repository binding.
 func (r Registry) Bindings() []Binding {
 	keys := make([]string, 0, len(r.repositories))
@@ -510,7 +536,7 @@ func (r Registry) VerifyPersisted(binding Binding) error {
 
 func sameBinding(a, b Binding) bool {
 	return a.ProfileID == b.ProfileID && a.ProfileSnapshotVersion == b.ProfileSnapshotVersion && a.ProfileDigest == b.ProfileDigest && a.ProfileSnapshotJSON == b.ProfileSnapshotJSON &&
-		a.CanonicalRepository == b.CanonicalRepository && a.OriginPath == b.OriginPath && a.SourcePath == b.SourcePath &&
+		a.CanonicalRepository == b.CanonicalRepository && a.LinearLabel == b.LinearLabel && a.OriginPath == b.OriginPath && a.SourcePath == b.SourcePath &&
 		a.RunRoot == b.RunRoot && a.WorktreeRoot == b.WorktreeRoot && a.BaseBranch == b.BaseBranch &&
 		a.VerifierRegistryRef == b.VerifierRegistryRef && slices.Equal(a.VerifierIDs, b.VerifierIDs) &&
 		a.GitHubAppProfileRef == b.GitHubAppProfileRef && a.GitHubAppID == b.GitHubAppID && a.GitHubInstallationID == b.GitHubInstallationID &&

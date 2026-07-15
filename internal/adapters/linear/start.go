@@ -12,7 +12,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 )
 
-const moveReservedIssueToStartedMutation = `mutation ControllerMoveReservedIssueToStarted($issueID: ID!, $stateID: ID!) {
+const moveReservedIssueToStartedMutation = `mutation ControllerMoveReservedIssueToStarted($issueID: String!, $stateID: String!) {
   issueUpdate(id: $issueID, input: { stateId: $stateID }) {
     success
     issue { id state { id name type } }

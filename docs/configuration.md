@@ -38,7 +38,9 @@ version 3.
 
 The configuration contains non-secret references only:
 
-- controller database location and Codex runtime policy;
+- controller database location and Codex runtime policy. `codex_binary` may be
+  a simple executable name or a canonical absolute executable path, which is
+  required when a service manager uses a minimal PATH;
 - Linear endpoint, team, limits, and one exact credential-source reference:
   `secret://file/linear-token` for the controller-owned
   `secrets/linear-token` leaf, or the legacy explicit
@@ -46,7 +48,9 @@ The configuration contains non-secret references only:
 - GitHub App IDs, selected-repository identity, permission switches, and the
   absolute path of an external PEM file;
 - repository origin binding, local checkout/run/worktree roots, verifier IDs,
-  and trusted operator identities.
+  trusted operator identities, and a unique `linear_label`. Linear issues use
+  that value as `repo:<linear_label>`; the owner/name remain controller-only
+  GitHub authority.
 
 The optional `automation.linear_todo_admission` object is an authority record,
 not an execution switch. `enabled: false` may omit the remaining fields. When
@@ -98,16 +102,16 @@ write a new non-symlink file atomically, and preserve the existing per-run
 authority snapshot: changing a repository configuration must never change an
 active run's target or permissions.
 
-The UI's normal delivery action is a single explicit issue trigger backed by
-the same long-lived `controller run` / `controller drive` driver as the CLI. It
-should render a sanitized run timeline and the current human-facing gate, not a
-row of buttons for push, PR creation, reconciliation, merge, and cleanup. The
-controller derives those transitions from durable state and performs them
-automatically. At `awaiting_human_approval`, the UI may link to the exact
-GitHub PR and explain that I-Fan must approve there; it must not forge or submit
-an approval. At `awaiting_human_decision` or `manual_intervention`, the UI may
-collect a structured operator decision or direct the operator to a recovery
-workflow after showing the immutable evidence.
+The UI's normal delivery action is an explicitly authorized admission policy,
+not a per-issue shell trigger. It should render the same sanitized worker/run
+timeline and human-facing gate, not a row of buttons for push, PR creation,
+reconciliation, merge, and cleanup. The controller derives those transitions
+from durable state and performs them automatically. At
+`awaiting_human_approval`, the UI may link to the exact GitHub PR and explain
+that I-Fan must approve there; it must not forge or submit an approval. At
+`awaiting_human_decision` or `manual_intervention`, the UI may collect a
+structured operator decision or direct the operator to a recovery workflow
+after showing the immutable evidence.
 
 The UI must not return PEM contents, Linear credentials, authorization headers,
 absolute artifact paths, idempotency keys, or unsanitized SQLite evidence.

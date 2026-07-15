@@ -28,6 +28,40 @@ func TestDecodeTaskRejectsTrailingJSON(t *testing.T) {
 	}
 }
 
+func TestLinearRegistryResolverMapsRepositoryLabelToCanonicalRepository(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := []string{filepath.Join(root, "source"), filepath.Join(root, "runs"), filepath.Join(root, "worktrees")}
+	for _, path := range paths {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	registry, err := localregistry.New([]localregistry.Repository{{
+		Owner: "IFAN0927", Name: "LoopTest", LinearLabel: "looptest", OriginURL: "git@github.com:ifan0927/LoopTest.git",
+		SourcePath: paths[0], RunRoot: paths[1], WorktreeRoot: paths[2], BaseBranch: "main",
+		VerifierRegistryRef: "builtin:v1", VerifierIDs: []string{"fixture-go-test"},
+		GitHubAppProfileRef: "github-app-profile:fixture", GitHubAppID: 1, GitHubInstallationID: 2, ExpectedRepositoryID: 3,
+		OperatorIdentityPolicy: localregistry.OperatorIdentityPolicy{AllowedLogins: []string{"ifan0927"}, TrustedActors: []localregistry.TrustedActorIdentity{{DatabaseID: 1, NodeID: "actor", Login: "ifan0927", Type: "User"}}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resolver := linearRegistryResolver{registry: registry}
+	repository, ok := resolver.ResolveLinearAdmissionRepository("repo:looptest")
+	if !ok || repository.CanonicalRepository != "ifan0927/looptest" {
+		t.Fatalf("repository=%+v ok=%t", repository, ok)
+	}
+	for _, label := range []string{"ifan0927/looptest", "repo:", "repo:ifan0927/looptest", "repo:other"} {
+		if _, ok := resolver.ResolveLinearAdmissionRepository(label); ok {
+			t.Fatalf("unexpected resolution for %q", label)
+		}
+	}
+}
+
 func TestPersistedBindingRejectsCrossRepositorySwap(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {

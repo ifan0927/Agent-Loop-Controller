@@ -29,6 +29,31 @@ func TestRegistrySelectsTwoRepositoriesDeterministically(t *testing.T) {
 	if one.RegistryDigest == "" || one.RepositoryBindingDigest == "" {
 		t.Fatal("versioned digests were not frozen")
 	}
+	legacy, err := registry.ResolveLinearLabel("owner/one")
+	if err != nil || legacy.CanonicalRepository != "owner/one" {
+		t.Fatalf("legacy=%+v err=%v", legacy.Sanitized(), err)
+	}
+}
+
+func TestRegistryResolvesConfiguredLinearLabelAndRejectsDuplicates(t *testing.T) {
+	root := t.TempDir()
+	first := fixtureRepository(t, root, "owner", "one", 101)
+	first.LinearLabel = "service-one"
+	registry := loadFixture(t, root, File{Version: CurrentVersion, Repositories: []Repository{first}})
+
+	binding, err := registry.ResolveLinearLabel("service-one")
+	if err != nil || binding.CanonicalRepository != "owner/one" {
+		t.Fatalf("binding=%+v err=%v", binding.Sanitized(), err)
+	}
+	if _, err := registry.ResolveLinearLabel("owner/one"); err == nil {
+		t.Fatal("canonical repository resolved despite an explicit Linear label")
+	}
+
+	second := fixtureRepository(t, root, "owner", "two", 102)
+	second.LinearLabel = "service-one"
+	if _, err := New([]Repository{first, second}); err == nil || !strings.Contains(err.Error(), "duplicate Linear repository label") {
+		t.Fatalf("duplicate label err=%v", err)
+	}
 }
 
 func TestRegistryRejectsUnknownDuplicateIncompleteAndLegacyBindings(t *testing.T) {

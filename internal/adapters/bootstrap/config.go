@@ -464,14 +464,24 @@ func decodeController(raw controllerFile) (Controller, error) {
 	if err != nil {
 		return Controller{}, err
 	}
-	if strings.TrimSpace(raw.CodexBinary) == "" || strings.ContainsAny(raw.CodexBinary, "/\\") {
-		return Controller{}, invalid("Codex binary must be a simple executable name")
+	if !validCodexBinary(raw.CodexBinary) {
+		return Controller{}, invalid("Codex binary must be a simple executable name or canonical absolute path")
 	}
 	timeout, err := time.ParseDuration(raw.RunTimeout)
 	if err != nil || timeout <= 0 || timeout > 2*time.Hour {
 		return Controller{}, invalid("controller run timeout is invalid")
 	}
 	return Controller{DatabasePath: databasePath, CodexBinary: raw.CodexBinary, RunTimeout: timeout}, nil
+}
+
+func validCodexBinary(value string) bool {
+	if strings.TrimSpace(value) == "" || strings.Contains(value, "\\") {
+		return false
+	}
+	if !strings.Contains(value, "/") {
+		return true
+	}
+	return filepath.IsAbs(value) && filepath.Clean(value) == value
 }
 
 func decodeProfiles(raw []profileFile) (map[string]GitHubProfile, error) {

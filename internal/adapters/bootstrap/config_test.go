@@ -33,6 +33,28 @@ func TestLoadBuildsOfflineSanitizedReadiness(t *testing.T) {
 	}
 }
 
+func TestDecodeControllerAcceptsCanonicalAbsoluteCodexBinary(t *testing.T) {
+	databasePath := filepath.Join(canonicalTempDir(t), "controller.db")
+	for _, test := range []struct {
+		binary string
+		valid  bool
+	}{
+		{binary: "codex", valid: true},
+		{binary: "/opt/homebrew/bin/codex", valid: true},
+		{binary: "./codex"},
+		{binary: "/opt/homebrew/../bin/codex"},
+		{binary: "bin/codex"},
+		{binary: `C:\\codex.exe`},
+	} {
+		t.Run(test.binary, func(t *testing.T) {
+			_, err := decodeController(controllerFile{DatabasePath: databasePath, CodexBinary: test.binary, RunTimeout: "30m"})
+			if (err == nil) != test.valid {
+				t.Fatalf("binary=%q err=%v", test.binary, err)
+			}
+		})
+	}
+}
+
 func TestLoadVersionTwoBuildsInlineRepositoryRegistry(t *testing.T) {
 	root := canonicalTempDir(t)
 	configPath, secretPath := writeV2Fixture(t, root, "github-app-profile:fixture", 7)

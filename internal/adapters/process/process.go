@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -39,7 +40,13 @@ type OSRunner struct {
 	InterruptGrace time.Duration
 }
 
+const managedCommandPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
 func (r OSRunner) Run(ctx context.Context, spec Spec) (Result, error) {
+	return r.run(ctx, spec, os.Environ())
+}
+
+func (r OSRunner) run(ctx context.Context, spec Spec, environment []string) (Result, error) {
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
@@ -59,14 +66,17 @@ func (r OSRunner) Run(ctx context.Context, spec Spec) (Result, error) {
 	}
 	defer stderrFile.Close()
 
-	command := exec.Command(spec.Program, spec.Args...)
+	commandEnvironment := controllerEnvironment(environment, spec.ExcludedEnv)
+	program, err := resolveProgram(spec.Program, commandEnvironment)
+	if err != nil {
+		return Result{}, fmt.Errorf("resolve %s: %w", spec.Program, err)
+	}
+	command := exec.Command(program, spec.Args...)
 	command.Dir = spec.WorkingDir
 	command.Stdin = bytes.NewBufferString(spec.Stdin)
 	command.Stdout = stdoutFile
 	command.Stderr = stderrFile
-	if len(spec.ExcludedEnv) > 0 {
-		command.Env = withoutEnvironment(os.Environ(), spec.ExcludedEnv)
-	}
+	command.Env = commandEnvironment
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := command.Start(); err != nil {
 		return Result{}, fmt.Errorf("start %s: %w", spec.Program, err)
@@ -111,6 +121,69 @@ func withoutEnvironment(environment, excluded []string) []string {
 		filtered = append(filtered, value)
 	}
 	return filtered
+}
+
+// controllerEnvironment keeps controller-managed commands independent of the
+// sparse PATH supplied by launchd while preserving other required environment
+// values after controller-owned exclusions are applied.
+func controllerEnvironment(environment, excluded []string) []string {
+	filtered := withoutEnvironment(environment, excluded)
+	for index, value := range filtered {
+		if !strings.HasPrefix(value, "PATH=") {
+			continue
+		}
+		filtered[index] = "PATH=" + mergePath(managedCommandPath, strings.TrimPrefix(value, "PATH="))
+		return filtered
+	}
+	return append(filtered, "PATH="+managedCommandPath)
+}
+
+func mergePath(prefix, current string) string {
+	parts := strings.Split(prefix, ":")
+	for _, entry := range strings.Split(current, ":") {
+		found := false
+		for _, existing := range parts {
+			if entry == existing {
+				found = true
+				break
+			}
+		}
+		if !found && entry != "" {
+			parts = append(parts, entry)
+		}
+	}
+	return strings.Join(parts, ":")
+}
+
+// resolveProgram applies the command environment's PATH before exec.Command
+// captures its executable path from the controller process environment.
+func resolveProgram(program string, environment []string) (string, error) {
+	if strings.TrimSpace(program) == "" {
+		return "", errors.New("program must not be blank")
+	}
+	if strings.ContainsRune(program, os.PathSeparator) {
+		return program, nil
+	}
+	path := ""
+	for _, value := range environment {
+		name, current, found := strings.Cut(value, "=")
+		if found && name == "PATH" {
+			path = current
+			break
+		}
+	}
+	for _, directory := range filepath.SplitList(path) {
+		if directory == "" {
+			continue
+		}
+		candidate := filepath.Join(directory, program)
+		info, err := os.Stat(candidate)
+		if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
+			continue
+		}
+		return candidate, nil
+	}
+	return "", fmt.Errorf("%w: %s", exec.ErrNotFound, program)
 }
 
 func openExclusive(path string) (*os.File, error) {

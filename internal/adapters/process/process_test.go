@@ -102,6 +102,38 @@ func TestOSRunnerExcludesConfiguredEnvironment(t *testing.T) {
 	}
 }
 
+func TestControllerEnvironmentPrependsManagedCommandPath(t *testing.T) {
+	environment := controllerEnvironment([]string{"PATH=/custom/bin:/usr/bin", "RETAIN=1"}, nil)
+	if got, want := environment[0], "PATH="+managedCommandPath+":/custom/bin"; got != want {
+		t.Fatalf("PATH = %q, want %q", got, want)
+	}
+	if got := environment[1]; got != "RETAIN=1" {
+		t.Fatalf("retained environment = %q", got)
+	}
+}
+
+func TestOSRunnerResolvesSimpleProgramFromControllerEnvironment(t *testing.T) {
+	directory := t.TempDir()
+	program := "controller-managed-fixture"
+	if err := os.WriteFile(filepath.Join(directory, program), []byte("#!/bin/sh\nprintf 'managed\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	result, err := (OSRunner{}).run(context.Background(), Spec{
+		Program:     program,
+		StdoutPath:  filepath.Join(directory, "stdout"),
+		StderrPath:  filepath.Join(directory, "stderr"),
+		WorkingDir:  directory,
+		ExcludedEnv: []string{"IFAN_LOOP_LINEAR_TOKEN"},
+	}, []string{"PATH=" + directory, "IFAN_LOOP_LINEAR_TOKEN=secret"})
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	data, err := os.ReadFile(filepath.Join(directory, "stdout"))
+	if err != nil || string(data) != "managed\n" {
+		t.Fatalf("stdout=%q err=%v", data, err)
+	}
+}
+
 func TestProcessHelper(t *testing.T) {
 	for index, arg := range os.Args {
 		if arg != "--" || index+1 >= len(os.Args) {

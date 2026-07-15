@@ -29,7 +29,7 @@ func TestMoveReservedIssueToStartedUsesOnlyExactIssueUpdate(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(request.Query, "issueUpdate") || !strings.Contains(request.Query, "$issueID: ID!") || !strings.Contains(request.Query, "$stateID: ID!") || strings.Contains(request.Query, "priority") || strings.Contains(request.Query, "description") || request.Variables.IssueID != candidateTeamID || request.Variables.StateID != candidateStartStateID {
+		if !strings.Contains(request.Query, "issueUpdate") || !strings.Contains(request.Query, "$issueID: String!") || !strings.Contains(request.Query, "$stateID: String!") || strings.Contains(request.Query, "priority") || strings.Contains(request.Query, "description") || request.Variables.IssueID != candidateTeamID || request.Variables.StateID != candidateStartStateID {
 			t.Fatalf("unsafe or invalid mutation query: %+v", request)
 		}
 		writeStartMutation(t, w, candidateTeamID, candidateStartStateID, "In Progress", "started")

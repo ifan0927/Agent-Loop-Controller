@@ -758,7 +758,11 @@ func splitLinearStartIdentifier(args []string) (string, []string) {
 type linearRegistryResolver struct{ registry localregistry.Registry }
 
 func (r linearRegistryResolver) ResolveLinearAdmissionRepository(label string) (application.LocalRepository, bool) {
-	repository, err := r.registry.Resolve(label)
+	canonical, found := strings.CutPrefix(label, "repo:")
+	if !found || canonical == "" {
+		return application.LocalRepository{}, false
+	}
+	repository, err := r.registry.ResolveLinearLabel(canonical)
 	if err != nil {
 		return application.LocalRepository{}, false
 	}
@@ -1041,7 +1045,7 @@ func localRepository(repo localregistry.Binding) application.LocalRepository {
 	return application.LocalRepository{ProfileID: repo.ProfileID, ProfileSnapshotVersion: repo.ProfileSnapshotVersion, ProfileDigest: repo.ProfileDigest,
 		ProfileSnapshotJSON: repo.ProfileSnapshotJSON,
 		RegistryVersion:     repo.RegistryVersion, RegistryDigest: repo.RegistryDigest,
-		RepositoryBindingDigest: repo.RepositoryBindingDigest, CanonicalRepository: repo.CanonicalRepository,
+		RepositoryBindingDigest: repo.RepositoryBindingDigest, CanonicalRepository: repo.CanonicalRepository, LinearLabel: repo.LinearLabel,
 		OriginPath: repo.OriginPath, SourcePath: repo.SourcePath, RunRoot: repo.RunRoot, WorktreeRoot: repo.WorktreeRoot,
 		BaseBranch: repo.BaseBranch, VerifierRegistryRef: repo.VerifierRegistryRef, VerifierIDs: append([]string(nil), repo.VerifierIDs...),
 		GitHubAppProfileRef: repo.GitHubAppProfileRef, GitHubAppID: repo.GitHubAppID, GitHubInstallationID: repo.GitHubInstallationID,
@@ -1053,7 +1057,7 @@ func localBinding(repo application.LocalRepository) localregistry.Binding {
 	return localregistry.Binding{ProfileID: repo.ProfileID, ProfileSnapshotVersion: repo.ProfileSnapshotVersion, ProfileDigest: repo.ProfileDigest,
 		ProfileSnapshotJSON: repo.ProfileSnapshotJSON,
 		RegistryVersion:     repo.RegistryVersion, RegistryDigest: repo.RegistryDigest,
-		RepositoryBindingDigest: repo.RepositoryBindingDigest, CanonicalRepository: repo.CanonicalRepository,
+		RepositoryBindingDigest: repo.RepositoryBindingDigest, CanonicalRepository: repo.CanonicalRepository, LinearLabel: repo.LinearLabel,
 		OriginPath: repo.OriginPath, SourcePath: repo.SourcePath, RunRoot: repo.RunRoot, WorktreeRoot: repo.WorktreeRoot,
 		BaseBranch: repo.BaseBranch, VerifierRegistryRef: repo.VerifierRegistryRef, VerifierIDs: append([]string(nil), repo.VerifierIDs...),
 		GitHubAppProfileRef: repo.GitHubAppProfileRef, GitHubAppID: repo.GitHubAppID, GitHubInstallationID: repo.GitHubInstallationID,
