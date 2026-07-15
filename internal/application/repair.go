@@ -144,11 +144,93 @@ func repairDeadlineExceeded(timeline []Transition, now time.Time) bool {
 }
 
 func repairDeadlineAt(timeline []Transition, now time.Time) (time.Time, bool) {
+	deadline, found, err := persistedRepairDeadline(timeline)
+	if err != nil {
+		return time.Time{}, true
+	}
+	if !found {
+		return now.Add(repairDeadline), false
+	}
+	return deadline, !now.Before(deadline)
+}
+
+func persistedRepairDeadline(timeline []Transition) (time.Time, bool, error) {
 	for _, transition := range timeline {
 		if transition.From == domain.StateRepairing && transition.To == domain.StateExecuting {
-			deadline := transition.CreatedAt.Add(repairDeadline)
-			return deadline, !transition.CreatedAt.IsZero() && !now.Before(deadline)
+			if transition.CreatedAt.IsZero() {
+				return time.Time{}, true, errors.New("persisted repair deadline anchor has no timestamp")
+			}
+			return transition.CreatedAt.Add(repairDeadline), true, nil
 		}
 	}
-	return now.Add(repairDeadline), false
+	return time.Time{}, false, nil
+}
+
+func repairDeadlineAnchorIsValid(timeline []Transition) bool {
+	_, found, err := persistedRepairDeadline(timeline)
+	return found && err == nil
+}
+
+func repairDeadlineAnchorInvalid(timeline []Transition) bool {
+	_, found, err := persistedRepairDeadline(timeline)
+	return found && err != nil
+}
+
+func repairDeadlineAnchorRequired(state domain.State, timeline []Transition) bool {
+	switch state {
+	case domain.StateRepairing:
+		// A run may legitimately wait in repairing before its first
+		// repairing -> executing transition creates the global anchor.
+		return !hasTransitionToState(timeline, domain.StateRepairing)
+	case domain.StateExecuting, domain.StateVerifying, domain.StateFreshReview:
+		if hasRepairLifecycleTransition(timeline) {
+			return true
+		}
+		return !hasInitialRepairFreePath(state, timeline)
+	default:
+		return false
+	}
+}
+
+func hasRepairLifecycleTransition(timeline []Transition) bool {
+	for _, transition := range timeline {
+		if transition.From == domain.StateRepairing || transition.To == domain.StateRepairing {
+			return true
+		}
+	}
+	return false
+}
+
+func hasTransitionToState(timeline []Transition, state domain.State) bool {
+	for _, transition := range timeline {
+		if transition.To == state {
+			return true
+		}
+	}
+	return false
+}
+
+func hasInitialRepairFreePath(state domain.State, timeline []Transition) bool {
+	if !hasTransition(timeline, domain.StateProvisioning, domain.StateExecuting) {
+		return false
+	}
+	switch state {
+	case domain.StateExecuting:
+		return true
+	case domain.StateVerifying:
+		return hasTransition(timeline, domain.StateExecuting, domain.StateVerifying)
+	case domain.StateFreshReview:
+		return hasTransition(timeline, domain.StateExecuting, domain.StateVerifying) && hasTransition(timeline, domain.StateVerifying, domain.StateFreshReview)
+	default:
+		return false
+	}
+}
+
+func hasTransition(timeline []Transition, from, to domain.State) bool {
+	for _, transition := range timeline {
+		if transition.From == from && transition.To == to {
+			return true
+		}
+	}
+	return false
 }

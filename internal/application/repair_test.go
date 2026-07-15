@@ -95,6 +95,7 @@ type repairDeadlineTestStore struct {
 	RunStore
 	run                    Run
 	inspection             RunInspection
+	inspectContextError    bool
 	transitionCalls        int
 	transitionContextError error
 }
@@ -103,7 +104,10 @@ func (s *repairDeadlineTestStore) GetRun(context.Context, string) (Run, error) {
 	return s.run, nil
 }
 
-func (s *repairDeadlineTestStore) Inspect(context.Context, string) (RunInspection, error) {
+func (s *repairDeadlineTestStore) Inspect(ctx context.Context, _ string) (RunInspection, error) {
+	if s.inspectContextError && ctx.Err() != nil {
+		return RunInspection{}, ctx.Err()
+	}
 	return s.inspection, nil
 }
 
@@ -119,8 +123,9 @@ func (s *repairDeadlineTestStore) Transition(ctx context.Context, _ string, from
 
 func TestExpiredRepairDeadlineUsesDetachedPersistenceAndIsIdempotent(t *testing.T) {
 	store := &repairDeadlineTestStore{
-		run:        Run{ID: "run", State: domain.StateVerifying, CandidateHead: "head"},
-		inspection: RunInspection{Timeline: []Transition{{From: domain.StateRepairing, To: domain.StateExecuting, CreatedAt: time.Now().UTC().Add(-repairDeadline - time.Second)}}},
+		run:                 Run{ID: "run", State: domain.StateVerifying, CandidateHead: "head"},
+		inspection:          RunInspection{Timeline: []Transition{{From: domain.StateRepairing, To: domain.StateExecuting, CreatedAt: time.Now().UTC().Add(-repairDeadline - time.Second)}}},
+		inspectContextError: true,
 	}
 	controller := &LocalController{store: store}
 	callerCtx, cancel := context.WithCancel(context.Background())
@@ -137,6 +142,63 @@ func TestExpiredRepairDeadlineUsesDetachedPersistenceAndIsIdempotent(t *testing.
 	}
 	if store.transitionCalls != 1 {
 		t.Fatalf("expired deadline transition repeated: calls=%d", store.transitionCalls)
+	}
+}
+
+func TestCallerCancellationPreservesRepairStateBeforePolicyDeadline(t *testing.T) {
+	store := &repairDeadlineTestStore{
+		run:                 Run{ID: "run", State: domain.StateVerifying, CandidateHead: "head"},
+		inspection:          RunInspection{Timeline: []Transition{{From: domain.StateRepairing, To: domain.StateExecuting, CreatedAt: time.Now().UTC().Add(-repairDeadline + time.Minute)}}},
+		inspectContextError: true,
+	}
+	controller := &LocalController{store: store}
+	callerCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	updated, err := controller.enforceRepairDeadline(callerCtx, store.run)
+	if !errors.Is(err, context.Canceled) || updated.State != domain.StateVerifying {
+		t.Fatalf("updated=%+v err=%v", updated, err)
+	}
+	if store.transitionCalls != 0 {
+		t.Fatalf("caller cancellation changed repair state: calls=%d", store.transitionCalls)
+	}
+}
+
+func TestRepairDeadlineFailsClosedForMissingOrMalformedRepairAnchor(t *testing.T) {
+	tests := []struct {
+		name       string
+		inspection RunInspection
+	}{
+		{name: "missing", inspection: RunInspection{}},
+		{name: "malformed", inspection: RunInspection{Timeline: []Transition{{From: domain.StateRepairing, To: domain.StateExecuting}}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &repairDeadlineTestStore{
+				run:        Run{ID: "run", State: domain.StateVerifying, CandidateHead: "head"},
+				inspection: test.inspection,
+			}
+			controller := &LocalController{store: store}
+			updated, err := controller.enforceRepairDeadline(context.Background(), store.run)
+			if err == nil || updated.State != domain.StateManualIntervention || store.transitionCalls != 1 {
+				t.Fatalf("updated=%+v err=%v transitionCalls=%d", updated, err, store.transitionCalls)
+			}
+		})
+	}
+}
+
+func TestInitialRepairFreeFlowDoesNotRequireRepairDeadlineAnchor(t *testing.T) {
+	store := &repairDeadlineTestStore{
+		run: Run{ID: "run", State: domain.StateFreshReview, CandidateHead: "head"},
+		inspection: RunInspection{Timeline: []Transition{
+			{From: domain.StateProvisioning, To: domain.StateExecuting, CreatedAt: time.Now().UTC()},
+			{From: domain.StateExecuting, To: domain.StateVerifying, CreatedAt: time.Now().UTC()},
+			{From: domain.StateVerifying, To: domain.StateFreshReview, CreatedAt: time.Now().UTC()},
+		}},
+	}
+	controller := &LocalController{store: store}
+	updated, err := controller.enforceRepairDeadline(context.Background(), store.run)
+	if err != nil || updated.State != domain.StateFreshReview || store.transitionCalls != 0 {
+		t.Fatalf("updated=%+v err=%v transitionCalls=%d", updated, err, store.transitionCalls)
 	}
 }
 

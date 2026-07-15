@@ -187,8 +187,9 @@ The repair policy deadline is anchored at the first persisted
 including verification and fresh-review handoff. Before an action in an active
 repair state, the controller checks that durable deadline; true expiry moves
 the run to `manual_intervention` once with bounded, sanitized evidence through
-a short detached persistence context. Caller cancellation remains resumable
-when the durable policy deadline has not elapsed.
+a short detached persistence context. Missing or malformed repair-anchor
+evidence fails closed to the same human gate. Caller cancellation remains
+resumable when the durable policy deadline has not elapsed.
 
 `fresh_review -> pr_open` is deliberately absent from the generic state topology.
 The application gate authorizes it only when the review verdict is `pass`, the

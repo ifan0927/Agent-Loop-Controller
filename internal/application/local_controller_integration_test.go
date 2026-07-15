@@ -797,6 +797,18 @@ func TestExpiredRepairDeadlineStopsFreshReviewFindingsHandoff(t *testing.T) {
 	}
 }
 
+func TestCanceledCallerWithExpiredRepairDeadlinePersistsManualIntervention(t *testing.T) {
+	lab, store, process, run := beginInterruptedRepair(t)
+	defer store.Close()
+	expired := firstRepairDeadlineStore{RunStore: store, firstRepairAt: time.Now().UTC().Add(-31 * time.Minute)}
+	callerCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	updated, err := newController(t, expired, lab, process, gitadapter.Workspace{}).Continue(callerCtx, run.ID, nil)
+	if err == nil || updated.State != domain.StateManualIntervention {
+		t.Fatalf("updated=%+v err=%v", updated, err)
+	}
+}
+
 func beginInterruptedRepair(t *testing.T) (localLab, *storeadapter.Store, *durableFakeProcess, application.Run) {
 	t.Helper()
 	lab := newLocalLab(t)

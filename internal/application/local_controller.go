@@ -177,6 +177,23 @@ func (c *LocalController) Continue(ctx context.Context, runID string, decision *
 	return c.continueExpected(ctx, runID, "", "", decision)
 }
 
+func (c *LocalController) recoverCanceledContinuation(ctx context.Context, runID string) (Run, error) {
+	callerErr := ctx.Err()
+	if callerErr == nil {
+		return Run{}, errors.New("canceled continuation recovery requires a canceled context")
+	}
+	policyCtx, cancel := context.WithTimeout(context.Background(), repairDeadlinePersistenceTTL)
+	defer cancel()
+	run, err := c.store.GetRun(policyCtx, runID)
+	if err != nil {
+		return Run{}, errors.Join(callerErr, err)
+	}
+	if stopped, deadlineErr := c.enforceRepairDeadline(ctx, run); deadlineErr != nil {
+		return stopped, deadlineErr
+	}
+	return run, callerErr
+}
+
 func (c *LocalController) ContinueExpected(ctx context.Context, runID string, expectedState domain.State, idempotencyKey string, decision *Decision) (Run, error) {
 	if expectedState == "" || idempotencyKey == "" {
 		return Run{}, errors.New("expected state and idempotency key are required")
@@ -185,6 +202,9 @@ func (c *LocalController) ContinueExpected(ctx context.Context, runID string, ex
 }
 
 func (c *LocalController) continueExpected(ctx context.Context, runID string, expectedState domain.State, idempotencyKey string, decision *Decision) (Run, error) {
+	if ctx.Err() != nil {
+		return c.recoverCanceledContinuation(ctx, runID)
+	}
 	owner, err := randomIdentifier("controller-")
 	if err != nil {
 		return Run{}, err
@@ -234,6 +254,9 @@ func (c *LocalController) continueExpected(ctx context.Context, runID string, ex
 	if expectedState != "" {
 		run, err := c.store.GetRun(ctx, runID)
 		if err != nil {
+			if ctx.Err() != nil {
+				return c.recoverCanceledContinuation(ctx, runID)
+			}
 			return Run{}, err
 		}
 		if run.State != expectedState || run.IdempotencyKey != idempotencyKey {
@@ -243,6 +266,9 @@ func (c *LocalController) continueExpected(ctx context.Context, runID string, ex
 	for steps := 0; steps < 20; steps++ {
 		run, err := c.store.GetRun(ctx, runID)
 		if err != nil {
+			if ctx.Err() != nil {
+				return c.recoverCanceledContinuation(ctx, runID)
+			}
 			return Run{}, err
 		}
 		if stopped, deadlineErr := c.enforceRepairDeadline(ctx, run); deadlineErr != nil {
@@ -661,6 +687,10 @@ func (c *LocalController) execute(ctx context.Context, run Run, decision *Decisi
 		hasPersistedRepair = true
 		repairStartedAt = latestRepairStartedAt(inspection.Timeline)
 		deadline, expired := repairDeadlineAt(inspection.Timeline, time.Now().UTC())
+		if !repairDeadlineAnchorIsValid(inspection.Timeline) {
+			_, deadlineErr := c.persistInvalidRepairDeadline(run)
+			return deadlineErr
+		}
 		if expired {
 			_, deadlineErr := c.persistExpiredRepairDeadline(run)
 			return deadlineErr
@@ -1124,7 +1154,15 @@ func (c *LocalController) applyFreshReviewOutcome(ctx context.Context, run Run, 
 func (c *LocalController) HandoffFreshReviewFindings(ctx context.Context, runID string) (Run, error) {
 	run, err := c.store.GetRun(ctx, runID)
 	if err != nil {
-		return Run{}, err
+		if ctx.Err() == nil {
+			return Run{}, err
+		}
+		policyCtx, cancel := context.WithTimeout(context.Background(), repairDeadlinePersistenceTTL)
+		defer cancel()
+		run, err = c.store.GetRun(policyCtx, runID)
+		if err != nil {
+			return Run{}, errors.Join(ctx.Err(), err)
+		}
 	}
 	if run.State != domain.StateFreshReview {
 		return run, fmt.Errorf("fresh review findings handoff requires fresh_review state, got %s", run.State)
@@ -1391,7 +1429,13 @@ func (c *LocalController) Repair(ctx context.Context, runID, normalizedPrompt st
 func (c *LocalController) RepairFindings(ctx context.Context, runID string, findings []FindingRecord) (Run, error) {
 	run, err := c.store.GetRun(ctx, runID)
 	if err != nil {
+		if ctx.Err() != nil {
+			return c.recoverCanceledContinuation(ctx, runID)
+		}
 		return Run{}, err
+	}
+	if stopped, deadlineErr := c.enforceRepairDeadline(ctx, run); deadlineErr != nil {
+		return stopped, deadlineErr
 	}
 	inspection, inspectErr := c.store.Inspect(ctx, runID)
 	if inspectErr != nil {
@@ -1529,7 +1573,25 @@ func (c *LocalController) repair(ctx context.Context, runID, normalizedPrompt st
 	}
 	run, err := c.store.GetRun(ctx, runID)
 	if err != nil {
-		return Run{}, err
+		if ctx.Err() == nil {
+			return Run{}, err
+		}
+		policyCtx, cancel := context.WithTimeout(context.Background(), repairDeadlinePersistenceTTL)
+		defer cancel()
+		run, err = c.store.GetRun(policyCtx, runID)
+		if err != nil {
+			return Run{}, errors.Join(ctx.Err(), err)
+		}
+		if stopped, deadlineErr := c.enforceRepairDeadline(ctx, run); deadlineErr != nil {
+			return stopped, deadlineErr
+		}
+		return run, ctx.Err()
+	}
+	if stopped, deadlineErr := c.enforceRepairDeadline(ctx, run); deadlineErr != nil {
+		return stopped, deadlineErr
+	}
+	if ctx.Err() != nil {
+		return run, ctx.Err()
 	}
 	if run.State != domain.StateRepairing {
 		return run, fmt.Errorf("repair requires repairing state, got %s", run.State)
@@ -1540,6 +1602,9 @@ func (c *LocalController) repair(ctx context.Context, runID, normalizedPrompt st
 	inspection, err := c.store.Inspect(ctx, runID)
 	if err != nil {
 		return run, err
+	}
+	if repairDeadlineAnchorInvalid(inspection.Timeline) {
+		return c.persistInvalidRepairDeadline(run)
 	}
 	if repairDeadlineExceeded(inspection.Timeline, time.Now().UTC()) {
 		return c.persistExpiredRepairDeadline(run)
@@ -1592,12 +1657,21 @@ func (c *LocalController) repair(ctx context.Context, runID, normalizedPrompt st
 	if persistedRun, getErr := c.store.GetRun(recoveryCtx, runID); getErr == nil {
 		updated = persistedRun
 	}
-	if recoveredInspection, getErr := c.store.Inspect(recoveryCtx, runID); getErr == nil && repairDeadlineExceeded(recoveredInspection.Timeline, time.Now().UTC()) {
-		stopped, deadlineErr := c.persistExpiredRepairDeadline(updated)
-		if deadlineErr != nil {
-			return stopped, errors.Join(continueErr, deadlineErr)
+	if recoveredInspection, getErr := c.store.Inspect(recoveryCtx, runID); getErr == nil {
+		if repairDeadlineAnchorInvalid(recoveredInspection.Timeline) {
+			stopped, deadlineErr := c.persistInvalidRepairDeadline(updated)
+			if deadlineErr != nil {
+				return stopped, errors.Join(continueErr, deadlineErr)
+			}
+			return stopped, continueErr
 		}
-		return stopped, continueErr
+		if repairDeadlineExceeded(recoveredInspection.Timeline, time.Now().UTC()) {
+			stopped, deadlineErr := c.persistExpiredRepairDeadline(updated)
+			if deadlineErr != nil {
+				return stopped, errors.Join(continueErr, deadlineErr)
+			}
+			return stopped, continueErr
+		}
 	}
 	return updated, continueErr
 }
@@ -1608,29 +1682,55 @@ func (c *LocalController) enforceRepairDeadline(ctx context.Context, run Run) (R
 	}
 	inspection, err := c.store.Inspect(ctx, run.ID)
 	if err != nil {
-		return run, err
+		if ctx.Err() == nil {
+			return run, err
+		}
+		policyCtx, cancel := context.WithTimeout(context.Background(), repairDeadlinePersistenceTTL)
+		defer cancel()
+		inspection, err = c.store.Inspect(policyCtx, run.ID)
+		if err != nil {
+			return run, errors.Join(ctx.Err(), err)
+		}
+	}
+	if repairDeadlineAnchorInvalid(inspection.Timeline) || (repairDeadlineAnchorRequired(run.State, inspection.Timeline) && !repairDeadlineAnchorIsValid(inspection.Timeline)) {
+		return c.persistInvalidRepairDeadline(run)
 	}
 	if !repairDeadlineExceeded(inspection.Timeline, time.Now().UTC()) {
+		if ctx.Err() != nil {
+			return run, ctx.Err()
+		}
 		return run, nil
 	}
 	return c.persistExpiredRepairDeadline(run)
 }
 
+const (
+	repairPolicyDeadlineExceededReason = "repair policy deadline exceeded"
+	repairPolicyDeadlineInvalidReason  = "repair policy deadline evidence invalid"
+)
+
 func (c *LocalController) persistExpiredRepairDeadline(run Run) (Run, error) {
+	return c.persistRepairPolicyIntervention(run, repairPolicyDeadlineExceededReason, errors.New("bounded repair deadline exceeded; manual intervention required"))
+}
+
+func (c *LocalController) persistInvalidRepairDeadline(run Run) (Run, error) {
+	return c.persistRepairPolicyIntervention(run, repairPolicyDeadlineInvalidReason, errors.New("repair deadline evidence is invalid; manual intervention required"))
+}
+
+func (c *LocalController) persistRepairPolicyIntervention(run Run, reason string, policyErr error) (Run, error) {
 	if !domain.CanRequireRepairPolicyIntervention(run.State) {
 		return run, nil
 	}
-	err := errors.New("bounded repair deadline exceeded; manual intervention required")
 	ctx, cancel := context.WithTimeout(context.Background(), repairDeadlinePersistenceTTL)
 	defer cancel()
-	if transitionErr := c.store.Transition(ctx, run.ID, run.State, domain.StateManualIntervention, "repair policy deadline exceeded", "repair policy deadline exceeded", run.CandidateHead); transitionErr != nil {
-		return run, errors.Join(err, transitionErr)
+	if transitionErr := c.store.Transition(ctx, run.ID, run.State, domain.StateManualIntervention, reason, reason, run.CandidateHead); transitionErr != nil {
+		return run, errors.Join(policyErr, transitionErr)
 	}
 	updated, getErr := c.store.GetRun(ctx, run.ID)
 	if getErr != nil {
-		return run, errors.Join(err, getErr)
+		return run, errors.Join(policyErr, getErr)
 	}
-	return updated, err
+	return updated, policyErr
 }
 
 // persistLegacyRepairInput keeps the deprecated direct Repair path resumable
