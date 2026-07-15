@@ -31,6 +31,19 @@ func TestActiveRepairFlowCanRequireManualIntervention(t *testing.T) {
 	}
 }
 
+func TestRepairPolicyManualInterventionIsLimitedToActiveRepairStates(t *testing.T) {
+	for _, state := range []State{StateRepairing, StateExecuting, StateVerifying, StateFreshReview} {
+		if !CanRequireRepairPolicyIntervention(state) {
+			t.Fatalf("repair policy must be enforceable in %s", state)
+		}
+	}
+	for _, state := range []State{StateReceived, StateAdmitting, StateProvisioning, StateAwaitingHumanDecision, StateApprovalReady, StatePushingBranch, StateBranchPushed, StateOpeningPR, StatePROpen, StateReconcilingReviews, StateReplyingReviewFeedback, StateAwaitingHumanApproval, StateMerging, StateAwaitingGitHubMergeability, StateAwaitingLinearCompletion, StateCleaning, StateManualIntervention, StateFailed, StateCompleted, StateRejected} {
+		if CanRequireRepairPolicyIntervention(state) {
+			t.Fatalf("repair policy must not stop unrelated state %s", state)
+		}
+	}
+}
+
 func TestActionableRequiredCheckReturnsToRepair(t *testing.T) {
 	if !CanTransition(StateReconcilingReviews, StateRepairing) {
 		t.Fatal("actionable required checks must return the run to repair")

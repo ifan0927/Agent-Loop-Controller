@@ -662,10 +662,8 @@ func (c *LocalController) execute(ctx context.Context, run Run, decision *Decisi
 		repairStartedAt = latestRepairStartedAt(inspection.Timeline)
 		deadline, expired := repairDeadlineAt(inspection.Timeline, time.Now().UTC())
 		if expired {
-			if transitionErr := c.store.Transition(ctx, run.ID, domain.StateExecuting, domain.StateManualIntervention, "repair policy deadline exceeded", "repair resume exceeded controller deadline", latestRepairBase(inspection.Timeline)); transitionErr != nil {
-				return errors.Join(errors.New("bounded repair deadline exceeded; manual intervention required"), transitionErr)
-			}
-			return errors.New("bounded repair deadline exceeded; manual intervention required")
+			_, deadlineErr := c.persistExpiredRepairDeadline(run)
+			return deadlineErr
 		}
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithDeadline(ctx, deadline)
@@ -1131,6 +1129,9 @@ func (c *LocalController) HandoffFreshReviewFindings(ctx context.Context, runID 
 	if run.State != domain.StateFreshReview {
 		return run, fmt.Errorf("fresh review findings handoff requires fresh_review state, got %s", run.State)
 	}
+	if stopped, deadlineErr := c.enforceRepairDeadline(ctx, run); deadlineErr != nil {
+		return stopped, deadlineErr
+	}
 	inspection, err := c.store.Inspect(ctx, runID)
 	if err != nil {
 		return run, err
@@ -1541,15 +1542,7 @@ func (c *LocalController) repair(ctx context.Context, runID, normalizedPrompt st
 		return run, err
 	}
 	if repairDeadlineExceeded(inspection.Timeline, time.Now().UTC()) {
-		err := errors.New("bounded repair deadline exceeded; manual intervention required")
-		if transitionErr := c.store.Transition(ctx, runID, domain.StateRepairing, domain.StateManualIntervention, "repair policy deadline exceeded", err.Error(), run.CandidateHead); transitionErr != nil {
-			return run, errors.Join(err, transitionErr)
-		}
-		updated, getErr := c.store.GetRun(ctx, runID)
-		if getErr != nil {
-			return run, errors.Join(err, getErr)
-		}
-		return updated, err
+		return c.persistExpiredRepairDeadline(run)
 	}
 	task, err := decodeTaskSnapshot(run.NormalizedTaskJSON)
 	if err != nil {
@@ -1600,7 +1593,7 @@ func (c *LocalController) repair(ctx context.Context, runID, normalizedPrompt st
 		updated = persistedRun
 	}
 	if recoveredInspection, getErr := c.store.Inspect(recoveryCtx, runID); getErr == nil && repairDeadlineExceeded(recoveredInspection.Timeline, time.Now().UTC()) {
-		stopped, deadlineErr := c.persistExpiredRepairDeadline(recoveryCtx, updated, "repair execution exceeded controller deadline")
+		stopped, deadlineErr := c.persistExpiredRepairDeadline(updated)
 		if deadlineErr != nil {
 			return stopped, errors.Join(continueErr, deadlineErr)
 		}
@@ -1610,7 +1603,7 @@ func (c *LocalController) repair(ctx context.Context, runID, normalizedPrompt st
 }
 
 func (c *LocalController) enforceRepairDeadline(ctx context.Context, run Run) (Run, error) {
-	if !domain.CanRequireManualIntervention(run.State) {
+	if !domain.CanRequireRepairPolicyIntervention(run.State) {
 		return run, nil
 	}
 	inspection, err := c.store.Inspect(ctx, run.ID)
@@ -1620,15 +1613,17 @@ func (c *LocalController) enforceRepairDeadline(ctx context.Context, run Run) (R
 	if !repairDeadlineExceeded(inspection.Timeline, time.Now().UTC()) {
 		return run, nil
 	}
-	return c.persistExpiredRepairDeadline(ctx, run, "repair workflow exceeded controller deadline")
+	return c.persistExpiredRepairDeadline(run)
 }
 
-func (c *LocalController) persistExpiredRepairDeadline(ctx context.Context, run Run, evidence string) (Run, error) {
-	if !domain.CanRequireManualIntervention(run.State) {
+func (c *LocalController) persistExpiredRepairDeadline(run Run) (Run, error) {
+	if !domain.CanRequireRepairPolicyIntervention(run.State) {
 		return run, nil
 	}
 	err := errors.New("bounded repair deadline exceeded; manual intervention required")
-	if transitionErr := c.store.Transition(ctx, run.ID, run.State, domain.StateManualIntervention, "repair policy deadline exceeded", evidence, run.CandidateHead); transitionErr != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), repairDeadlinePersistenceTTL)
+	defer cancel()
+	if transitionErr := c.store.Transition(ctx, run.ID, run.State, domain.StateManualIntervention, "repair policy deadline exceeded", "repair policy deadline exceeded", run.CandidateHead); transitionErr != nil {
 		return run, errors.Join(err, transitionErr)
 	}
 	updated, getErr := c.store.GetRun(ctx, run.ID)

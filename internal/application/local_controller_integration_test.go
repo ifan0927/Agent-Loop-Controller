@@ -740,15 +740,22 @@ func TestCallerDeadlineDoesNotBecomeRepairPolicyManualIntervention(t *testing.T)
 }
 
 func TestExpiredRepairDeadlineStopsVerificationAndFreshReview(t *testing.T) {
-	for _, state := range []domain.State{domain.StateVerifying, domain.StateFreshReview} {
+	for _, state := range []domain.State{domain.StateRepairing, domain.StateExecuting, domain.StateVerifying, domain.StateFreshReview} {
 		t.Run(string(state), func(t *testing.T) {
 			lab, store, process, run := beginInterruptedRepair(t)
 			defer store.Close()
-			if err := store.Transition(context.Background(), run.ID, domain.StateExecuting, domain.StateVerifying, "fixture repair progression", "fixture", run.CandidateHead); err != nil {
-				t.Fatal(err)
+			if state == domain.StateRepairing || state == domain.StateVerifying || state == domain.StateFreshReview {
+				if err := store.Transition(context.Background(), run.ID, domain.StateExecuting, domain.StateVerifying, "fixture repair progression", "fixture", run.CandidateHead); err != nil {
+					t.Fatal(err)
+				}
 			}
-			if state == domain.StateFreshReview {
+			if state == domain.StateRepairing || state == domain.StateFreshReview {
 				if err := store.Transition(context.Background(), run.ID, domain.StateVerifying, domain.StateFreshReview, "fixture repair progression", "fixture", run.CandidateHead); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if state == domain.StateRepairing {
+				if err := store.Transition(context.Background(), run.ID, domain.StateFreshReview, domain.StateRepairing, "fixture repair progression", "fixture", run.CandidateHead); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -758,6 +765,35 @@ func TestExpiredRepairDeadlineStopsVerificationAndFreshReview(t *testing.T) {
 				t.Fatalf("state=%s updated=%+v err=%v", state, updated, err)
 			}
 		})
+	}
+}
+
+func TestExpiredRepairDeadlineStopsFreshReviewFindingsHandoff(t *testing.T) {
+	lab, store, process, run := beginInterruptedRepair(t)
+	defer store.Close()
+	if err := store.Transition(context.Background(), run.ID, domain.StateExecuting, domain.StateVerifying, "fixture repair progression", "fixture", run.CandidateHead); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Transition(context.Background(), run.ID, domain.StateVerifying, domain.StateFreshReview, "fixture repair progression", "fixture", run.CandidateHead); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.Inspect(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expired := firstRepairDeadlineStore{RunStore: store, firstRepairAt: time.Now().UTC().Add(-31 * time.Minute)}
+	updated, err := newController(t, expired, lab, process, gitadapter.Workspace{}).HandoffFreshReviewFindings(context.Background(), run.ID)
+	if err == nil || updated.State != domain.StateManualIntervention {
+		t.Fatalf("updated=%+v err=%v", updated, err)
+	}
+	inspection, inspectErr := store.Inspect(context.Background(), run.ID)
+	if inspectErr != nil || inspection.Run.State != domain.StateManualIntervention || len(inspection.Findings) != len(before.Findings) {
+		t.Fatalf("inspection=%+v err=%v", inspection, inspectErr)
+	}
+	for _, finding := range inspection.Findings {
+		if finding.Source == "controller_fresh_review" {
+			t.Fatalf("expired handoff persisted fresh-review finding: %+v", finding)
+		}
 	}
 }
 

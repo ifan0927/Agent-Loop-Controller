@@ -182,6 +182,14 @@ Repair resumes only from that persisted authority and must produce new
 exact-head verification and fresh-review evidence before delivery can
 continue.
 
+The repair policy deadline is anchored at the first persisted
+`repairing -> executing` transition and is reused by every later repair cycle,
+including verification and fresh-review handoff. Before an action in an active
+repair state, the controller checks that durable deadline; true expiry moves
+the run to `manual_intervention` once with bounded, sanitized evidence through
+a short detached persistence context. Caller cancellation remains resumable
+when the durable policy deadline has not elapsed.
+
 `fresh_review -> pr_open` is deliberately absent from the generic state topology.
 The application gate authorizes it only when the review verdict is `pass`, the
 reviewed head equals current Git HEAD, and controller verification was recorded

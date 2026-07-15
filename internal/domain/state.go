@@ -83,6 +83,19 @@ func CanRequireManualIntervention(from State) bool {
 	}
 }
 
+// CanRequireRepairPolicyIntervention limits the controller's bounded repair
+// deadline to states that are part of the active repair flow. Other manual
+// intervention edges represent independent authority conflicts and must not be
+// triggered by an old repair deadline.
+func CanRequireRepairPolicyIntervention(from State) bool {
+	switch from {
+	case StateRepairing, StateExecuting, StateVerifying, StateFreshReview:
+		return true
+	default:
+		return false
+	}
+}
+
 func set(states ...State) map[State]struct{} {
 	result := make(map[State]struct{}, len(states))
 	for _, state := range states {

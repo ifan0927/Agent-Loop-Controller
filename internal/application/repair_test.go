@@ -1,8 +1,10 @@
 package application
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"testing"
 	"time"
 
@@ -86,6 +88,55 @@ func TestRepairDeadlineUsesFirstPersistedRepairAttempt(t *testing.T) {
 	}
 	if repairDeadlineExceeded([]Transition{{From: domain.StateRepairing, To: domain.StateExecuting, CreatedAt: now.Add(-repairDeadline + time.Second)}}, now) {
 		t.Fatal("repair before deadline was rejected")
+	}
+}
+
+type repairDeadlineTestStore struct {
+	RunStore
+	run                    Run
+	inspection             RunInspection
+	transitionCalls        int
+	transitionContextError error
+}
+
+func (s *repairDeadlineTestStore) GetRun(context.Context, string) (Run, error) {
+	return s.run, nil
+}
+
+func (s *repairDeadlineTestStore) Inspect(context.Context, string) (RunInspection, error) {
+	return s.inspection, nil
+}
+
+func (s *repairDeadlineTestStore) Transition(ctx context.Context, _ string, from, to domain.State, _, _, _ string) error {
+	s.transitionCalls++
+	s.transitionContextError = ctx.Err()
+	if s.run.State != from {
+		return errors.New("unexpected repair deadline test state")
+	}
+	s.run.State = to
+	return nil
+}
+
+func TestExpiredRepairDeadlineUsesDetachedPersistenceAndIsIdempotent(t *testing.T) {
+	store := &repairDeadlineTestStore{
+		run:        Run{ID: "run", State: domain.StateVerifying, CandidateHead: "head"},
+		inspection: RunInspection{Timeline: []Transition{{From: domain.StateRepairing, To: domain.StateExecuting, CreatedAt: time.Now().UTC().Add(-repairDeadline - time.Second)}}},
+	}
+	controller := &LocalController{store: store}
+	callerCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	updated, err := controller.enforceRepairDeadline(callerCtx, store.run)
+	if err == nil || updated.State != domain.StateManualIntervention {
+		t.Fatalf("updated=%+v err=%v", updated, err)
+	}
+	if store.transitionCalls != 1 || store.transitionContextError != nil {
+		t.Fatalf("transitionCalls=%d transitionContextError=%v", store.transitionCalls, store.transitionContextError)
+	}
+	if _, err := controller.enforceRepairDeadline(context.Background(), updated); err != nil {
+		t.Fatal(err)
+	}
+	if store.transitionCalls != 1 {
+		t.Fatalf("expired deadline transition repeated: calls=%d", store.transitionCalls)
 	}
 }
 

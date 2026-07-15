@@ -20,6 +20,7 @@ const (
 	MaxNormalizedFindings         = 50
 	MaxRepairPromptBytes          = 64 << 10
 	repairDeadline                = 30 * time.Minute
+	repairDeadlinePersistenceTTL  = 5 * time.Second
 )
 
 type repairFindingReference struct {
