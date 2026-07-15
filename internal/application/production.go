@@ -62,6 +62,10 @@ type findingRepairController interface {
 	RepairFindings(context.Context, string, []FindingRecord) (Run, error)
 }
 
+type freshReviewFindingHandoff interface {
+	HandoffFreshReviewFindings(context.Context, string) (Run, error)
+}
+
 func NewProductionCoordinator(admission *LinearAdmissionService, controller LocalRunController, store RunStore) (*ProductionCoordinator, error) {
 	if admission == nil || controller == nil || store == nil {
 		return nil, errors.New("production coordinator dependencies are required")
@@ -97,6 +101,18 @@ func (c *ProductionCoordinator) Continue(ctx context.Context, command Production
 	result, err := c.commands.Continue(ctx, ContinueCommand{Requester: command.Requester, RunID: command.RunID, Repository: command.Repository, ExpectedState: command.ExpectedState, IdempotencyKey: command.IdempotencyKey, Decision: command.Decision})
 	if err != nil {
 		return ProductionResult{}, err
+	}
+	if result.Run.State == domain.StateFreshReview {
+		handoff, ok := c.controller.(freshReviewFindingHandoff)
+		if !ok {
+			return ProductionResult{}, serviceError(ErrorInternal, "fresh review finding handoff capability is unavailable", nil)
+		}
+		handedOff, handoffErr := handoff.HandoffFreshReviewFindings(ctx, result.Run.RunID)
+		if handoffErr != nil {
+			return ProductionResult{}, handoffErr
+		}
+		next, nextReason := productionNextAction(handedOff.State)
+		return ProductionResult{Action: next, Run: projectRunResult(handedOff), Reason: nextReason}, nil
 	}
 	next, reason := productionNextAction(result.Run.State)
 	return ProductionResult{Action: next, Run: result.Run, Reason: reason}, nil

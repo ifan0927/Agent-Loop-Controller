@@ -275,6 +275,18 @@ func (c *LocalController) continueExpected(ctx context.Context, runID string, ex
 			err = c.verifyCandidate(ctx, run)
 		case domain.StateFreshReview:
 			err = c.freshReview(ctx, run)
+			if err == nil {
+				persisted, getErr := c.store.GetRun(ctx, run.ID)
+				if getErr != nil {
+					return Run{}, getErr
+				}
+				if persisted.State == domain.StateFreshReview {
+					// Findings are handed off by ProductionCoordinator. Returning
+					// here keeps a direct local continuation from advancing the
+					// production repair state on its own.
+					return persisted, nil
+				}
+			}
 		case domain.StateRepairing:
 			// Repair selection is owned by ProductionCoordinator: it revalidates the
 			// persisted Linear source before passing only persisted normalized findings
@@ -1089,42 +1101,17 @@ func (c *LocalController) freshReview(ctx context.Context, run Run) error {
 }
 
 func (c *LocalController) applyFreshReviewOutcome(ctx context.Context, run Run, outcome domain.ReviewOutcome, evidence string, inspection RunInspection) error {
+	_, persistedOutcome, err := persistedFreshReviewOutcome(run, outcome, evidence, inspection)
+	if err != nil {
+		return err
+	}
+	outcome = persistedOutcome
 	switch outcome.Verdict {
 	case domain.ReviewPass:
 		return c.authorizeReview(ctx, run, outcome, evidence, inspection)
 	case domain.ReviewFindings:
-		if outcome.ReviewedHeadSHA != run.CandidateHead {
-			return errors.New("fresh review findings do not match the candidate HEAD")
-		}
-		reviewValidated := false
-		for _, record := range inspection.Reviews {
-			if record.ReviewedHead != run.CandidateHead || record.OutcomePath != evidence {
-				continue
-			}
-			if err := validateReviewAttempt(inspection.Attempts, record, run.ReviewModel); err != nil {
-				return err
-			}
-			reviewValidated = true
-		}
-		if !reviewValidated {
-			return errors.New("fresh review finding attempt evidence is missing")
-		}
-		findings, err := normalizeFreshReviewFindings(run, outcome)
-		if err != nil {
-			return err
-		}
-		persister, ok := c.store.(interface {
-			SaveFinding(context.Context, FindingRecord) error
-		})
-		if !ok {
-			return errors.New("fresh review finding persistence is unavailable")
-		}
-		for _, finding := range findings {
-			if err := persister.SaveFinding(ctx, finding); err != nil {
-				return err
-			}
-		}
-		return c.store.Transition(ctx, run.ID, domain.StateFreshReview, domain.StateRepairing, "fresh structured review findings persisted", evidence, run.CandidateHead)
+		_, err := normalizeFreshReviewFindings(run, outcome)
+		return err
 	case domain.ReviewFailed:
 		return fmt.Errorf("fresh review stopped with verdict %s", outcome.Verdict)
 	default:
@@ -1132,9 +1119,98 @@ func (c *LocalController) applyFreshReviewOutcome(ctx context.Context, run Run, 
 	}
 }
 
+// HandoffFreshReviewFindings is the production-coordinator-only bridge from a
+// persisted fresh-review findings verdict to the bounded repair state. It
+// re-reads the immutable review evidence instead of accepting a caller-supplied
+// prompt or finding list.
+func (c *LocalController) HandoffFreshReviewFindings(ctx context.Context, runID string) (Run, error) {
+	run, err := c.store.GetRun(ctx, runID)
+	if err != nil {
+		return Run{}, err
+	}
+	if run.State != domain.StateFreshReview {
+		return run, fmt.Errorf("fresh review findings handoff requires fresh_review state, got %s", run.State)
+	}
+	inspection, err := c.store.Inspect(ctx, runID)
+	if err != nil {
+		return run, err
+	}
+	review, found := latestReviewForHeadAfter(inspection.Reviews, run.CandidateHead, latestRepairStartedAt(inspection.Timeline))
+	if !found {
+		return run, errors.New("fresh review findings handoff lacks a persisted review")
+	}
+	outcome, err := readOutcome[domain.ReviewOutcome](review.OutcomePath, review.OutcomeHash)
+	if err != nil {
+		return run, err
+	}
+	matched, persisted, err := persistedFreshReviewOutcome(run, outcome, review.OutcomePath, inspection)
+	if err != nil {
+		return run, err
+	}
+	if persisted.Verdict != domain.ReviewFindings {
+		return run, errors.New("fresh review findings handoff requires a findings verdict")
+	}
+	findings, err := normalizeFreshReviewFindings(run, persisted)
+	if err != nil {
+		return run, err
+	}
+	persister, ok := c.store.(FreshReviewFindingStore)
+	if !ok {
+		return run, errors.New("fresh review finding persistence is unavailable")
+	}
+	if _, err := persister.PersistFreshReviewFindings(ctx, FreshReviewRepairEvidence{
+		RunID: run.ID, AttemptID: matched.AttemptID, ReviewedHead: run.CandidateHead,
+		OutcomePath: matched.OutcomePath, OutcomeHash: matched.OutcomeHash, Findings: findings,
+	}); err != nil {
+		return run, err
+	}
+	return c.store.GetRun(ctx, runID)
+}
+
+func persistedFreshReviewOutcome(run Run, supplied domain.ReviewOutcome, evidence string, inspection RunInspection) (ReviewRecord, domain.ReviewOutcome, error) {
+	if strings.TrimSpace(evidence) == "" {
+		return ReviewRecord{}, domain.ReviewOutcome{}, errors.New("fresh review outcome evidence path is required")
+	}
+	var matched ReviewRecord
+	count := 0
+	for _, record := range inspection.Reviews {
+		if record.RunID != run.ID || record.ReviewedHead != run.CandidateHead || record.OutcomePath != evidence || record.Verdict != string(supplied.Verdict) {
+			continue
+		}
+		matched = record
+		count++
+	}
+	if count != 1 {
+		return ReviewRecord{}, domain.ReviewOutcome{}, errors.New("fresh review outcome authority is missing or conflicting")
+	}
+	if err := validateReviewAttempt(inspection.Attempts, matched, run.ReviewModel); err != nil {
+		return ReviewRecord{}, domain.ReviewOutcome{}, err
+	}
+	persisted, err := readOutcome[domain.ReviewOutcome](matched.OutcomePath, matched.OutcomeHash)
+	if err != nil {
+		return ReviewRecord{}, domain.ReviewOutcome{}, err
+	}
+	if persisted.Verdict != supplied.Verdict || persisted.ReviewedHeadSHA != matched.ReviewedHead || persisted.Verdict != domain.ReviewVerdict(matched.Verdict) {
+		return ReviewRecord{}, domain.ReviewOutcome{}, errors.New("persisted fresh review outcome authority changed")
+	}
+	suppliedJSON, suppliedErr := json.Marshal(supplied)
+	persistedJSON, persistedErr := json.Marshal(persisted)
+	if suppliedErr != nil || persistedErr != nil || !bytes.Equal(suppliedJSON, persistedJSON) {
+		return ReviewRecord{}, domain.ReviewOutcome{}, errors.New("fresh review outcome does not match persisted evidence")
+	}
+	return matched, persisted, nil
+}
+
 const freshReviewFindingSource = "controller_fresh_review"
 
+// FreshReviewFindingSource is the only source label accepted for findings
+// produced by the controller's independent fresh review.
+const FreshReviewFindingSource = freshReviewFindingSource
+
 func normalizeFreshReviewFindings(run Run, outcome domain.ReviewOutcome) ([]FindingRecord, error) {
+	if err := outcome.Validate(); err != nil {
+		return nil, errors.New("invalid fresh review findings")
+	}
 	if outcome.Verdict != domain.ReviewFindings || outcome.ReviewedHeadSHA != run.CandidateHead {
 		return nil, errors.New("fresh review finding authority is incomplete")
 	}
@@ -1144,6 +1220,9 @@ func normalizeFreshReviewFindings(run Run, outcome domain.ReviewOutcome) ([]Find
 	findings := make([]FindingRecord, 0, len(outcome.Findings))
 	seen := make(map[string]struct{}, len(outcome.Findings))
 	for _, finding := range outcome.Findings {
+		if err := finding.Validate(); err != nil {
+			return nil, errors.New("invalid fresh review finding")
+		}
 		sourceID := "fresh-review:" + strings.TrimSpace(finding.ID)
 		if strings.ContainsRune(sourceID, '\x00') {
 			return nil, errors.New("fresh review finding ID contains a NUL byte")
@@ -1171,6 +1250,9 @@ func normalizeFreshReviewFindings(run Run, outcome domain.ReviewOutcome) ([]Find
 		}
 		if finding.Line != nil {
 			record.Line = *finding.Line
+		}
+		if err := validateFreshReviewFindingRecord(record, run.ID, run.CandidateHead); err != nil {
+			return nil, err
 		}
 		findings = append(findings, record)
 	}
@@ -1311,7 +1393,22 @@ func (c *LocalController) RepairFindings(ctx context.Context, runID string, find
 	if inspectErr != nil {
 		return run, inspectErr
 	}
-	selected, err := RepairableFindings(findings, run.CandidateHead, inspection.TrustedFeedback)
+	if !sameFindingSet(findings, inspection.Findings) {
+		return run, errors.New("repair findings do not match persisted controller evidence")
+	}
+	persistedFindings := inspection.Findings
+	if hasCurrentFreshReviewFinding(persistedFindings, run.CandidateHead) {
+		if err := validatePersistedFreshReviewRepair(run, inspection); err != nil {
+			if run.State == domain.StateRepairing {
+				_ = c.store.Transition(ctx, runID, domain.StateRepairing, domain.StateManualIntervention, "fresh review finding authority invalid", "fresh review finding evidence failed validation", run.CandidateHead)
+				if updated, getErr := c.store.GetRun(ctx, runID); getErr == nil {
+					return updated, err
+				}
+			}
+			return run, err
+		}
+	}
+	selected, err := RepairableFindings(persistedFindings, run.CandidateHead, inspection.TrustedFeedback)
 	if err != nil {
 		if run.State == domain.StateRepairing {
 			_ = c.store.Transition(ctx, runID, domain.StateRepairing, domain.StateManualIntervention, "unsupported actionable review findings", "repair finding selection failed", run.CandidateHead)
@@ -1324,6 +1421,102 @@ func (c *LocalController) RepairFindings(ctx context.Context, runID string, find
 	}
 	evidence := repairEvidenceFor(selected)
 	return c.repair(ctx, runID, evidence.Prompt, &evidence)
+}
+
+type freshReviewRepairTransitionReference struct {
+	RunID        string `json:"run_id"`
+	AttemptID    int64  `json:"attempt_id"`
+	ReviewedHead string `json:"reviewed_head"`
+	OutcomeHash  string `json:"outcome_hash"`
+}
+
+func hasCurrentFreshReviewFinding(findings []FindingRecord, head string) bool {
+	for _, finding := range findings {
+		if finding.Source == freshReviewFindingSource && finding.HeadSHA == head && !finding.Resolved && !finding.Outdated {
+			return true
+		}
+	}
+	return false
+}
+
+func validatePersistedFreshReviewRepair(run Run, inspection RunInspection) error {
+	var reference freshReviewRepairTransitionReference
+	var transitionReference string
+	transitionCount := 0
+	for _, transition := range inspection.Timeline {
+		if transition.From != domain.StateFreshReview || transition.To != domain.StateRepairing || transition.BoundHead != run.CandidateHead || transition.Reason != "fresh structured review findings persisted" {
+			continue
+		}
+		if err := json.Unmarshal([]byte(transition.EvidenceReference), &reference); err != nil {
+			return errors.New("fresh review repair transition evidence is invalid")
+		}
+		transitionReference = transition.EvidenceReference
+		transitionCount++
+	}
+	if transitionCount != 1 || reference.RunID != run.ID || reference.AttemptID < 1 || reference.ReviewedHead != run.CandidateHead || strings.TrimSpace(reference.OutcomeHash) == "" {
+		return errors.New("fresh review repair transition evidence is missing or conflicting")
+	}
+	if transitionReference != (FreshReviewRepairEvidence{RunID: reference.RunID, AttemptID: reference.AttemptID, ReviewedHead: reference.ReviewedHead, OutcomeHash: reference.OutcomeHash}).TransitionReference() {
+		return errors.New("fresh review repair transition evidence contains unexpected fields")
+	}
+	var review ReviewRecord
+	reviewCount := 0
+	for _, candidate := range inspection.Reviews {
+		if candidate.RunID != run.ID || candidate.AttemptID != reference.AttemptID || candidate.ReviewedHead != run.CandidateHead || candidate.Verdict != string(domain.ReviewFindings) || candidate.OutcomeHash != reference.OutcomeHash {
+			continue
+		}
+		review = candidate
+		reviewCount++
+	}
+	if reviewCount != 1 {
+		return errors.New("fresh review finding review record is missing or conflicting")
+	}
+	if err := validateReviewAttempt(inspection.Attempts, review, run.ReviewModel); err != nil {
+		return err
+	}
+	outcome, err := readOutcome[domain.ReviewOutcome](review.OutcomePath, review.OutcomeHash)
+	if err != nil {
+		return err
+	}
+	if outcome.Verdict != domain.ReviewFindings || outcome.ReviewedHeadSHA != run.CandidateHead {
+		return errors.New("fresh review finding outcome is not bound to the current candidate")
+	}
+	expected, err := normalizeFreshReviewFindings(run, outcome)
+	if err != nil {
+		return err
+	}
+	actual := make([]FindingRecord, 0, len(inspection.Findings))
+	for _, finding := range inspection.Findings {
+		if finding.Source == freshReviewFindingSource && finding.HeadSHA == run.CandidateHead {
+			actual = append(actual, finding)
+		}
+	}
+	if !sameFindingSet(expected, actual) {
+		return errors.New("persisted fresh review findings do not match the reviewed outcome")
+	}
+	return nil
+}
+
+func sameFindingSet(left, right []FindingRecord) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	byKey := make(map[string]FindingRecord, len(left))
+	for _, finding := range left {
+		key := finding.Source + "\x00" + finding.SourceID + "\x00" + finding.HeadSHA
+		if _, exists := byKey[key]; exists {
+			return false
+		}
+		byKey[key] = finding
+	}
+	for _, finding := range right {
+		key := finding.Source + "\x00" + finding.SourceID + "\x00" + finding.HeadSHA
+		other, found := byKey[key]
+		if !found || other.ThreadID != finding.ThreadID || other.Source != finding.Source || other.File != finding.File || other.Line != finding.Line || other.Severity != finding.Severity || other.BodyDigest != finding.BodyDigest || other.Body != finding.Body || other.Resolved != finding.Resolved || other.Outdated != finding.Outdated {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *LocalController) repair(ctx context.Context, runID, normalizedPrompt string, persisted *repairEvidence) (Run, error) {
@@ -1590,7 +1783,7 @@ func validateReviewAttempt(attempts []Attempt, review ReviewRecord, expectedMode
 		if attempt.ID != review.AttemptID {
 			continue
 		}
-		if attempt.Kind != "review" || attempt.Status != "succeeded" || attempt.SessionID != review.SessionID || attempt.OutcomePath != review.OutcomePath || attempt.RequestedModel != expectedModel {
+		if attempt.Kind != "review" || attempt.Status != "succeeded" || attempt.ExitCode != 0 || strings.TrimSpace(attempt.SessionID) == "" || attempt.SessionID != review.SessionID || attempt.OutcomePath != review.OutcomePath || attempt.OutcomeHash != review.OutcomeHash || attempt.RequestedModel != expectedModel || strings.TrimSpace(review.OutcomeHash) == "" {
 			return errors.New("review attempt evidence does not match review record")
 		}
 		stdoutHash, stdoutSize, stdoutErr := fileDigest(attempt.StdoutPath)

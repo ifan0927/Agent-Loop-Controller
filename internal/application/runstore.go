@@ -2,7 +2,11 @@ package application
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
@@ -123,6 +127,80 @@ type ReviewRecord struct {
 	CreatedAt    time.Time `json:"timestamp"`
 }
 
+// FreshReviewRepairEvidence is the complete controller-owned authority for a
+// fresh-review findings handoff. The persistence adapter stores the findings
+// and the fresh_review -> repairing transition in one compare-and-swap
+// transaction, so a restart cannot leave a partially accepted finding set.
+type FreshReviewRepairEvidence struct {
+	RunID        string
+	AttemptID    int64
+	ReviewedHead string
+	OutcomePath  string
+	OutcomeHash  string
+	Findings     []FindingRecord
+}
+
+// TransitionReference returns sanitized, immutable evidence for the repair
+// handoff. The outcome path is intentionally excluded; the persisted review
+// row binds the attempt to that private artifact path.
+func (e FreshReviewRepairEvidence) TransitionReference() string {
+	reference := struct {
+		RunID        string `json:"run_id"`
+		AttemptID    int64  `json:"attempt_id"`
+		ReviewedHead string `json:"reviewed_head"`
+		OutcomeHash  string `json:"outcome_hash"`
+	}{RunID: e.RunID, AttemptID: e.AttemptID, ReviewedHead: e.ReviewedHead, OutcomeHash: e.OutcomeHash}
+	encoded, _ := json.Marshal(reference)
+	return string(encoded)
+}
+
+// Validate protects the adapter boundary even when a caller bypasses the
+// normal LocalController normalization path.
+func (e FreshReviewRepairEvidence) Validate() error {
+	if strings.TrimSpace(e.RunID) == "" || e.AttemptID < 1 || strings.TrimSpace(e.ReviewedHead) == "" || strings.TrimSpace(e.OutcomePath) == "" || len(e.OutcomeHash) != sha256.Size*2 {
+		return errors.New("fresh review repair authority is incomplete")
+	}
+	if _, err := hex.DecodeString(e.OutcomeHash); err != nil {
+		return errors.New("fresh review repair outcome digest is invalid")
+	}
+	if len(e.Findings) == 0 || len(e.Findings) > MaxNormalizedFindings {
+		return errors.New("fresh review repair findings count is outside controller bounds")
+	}
+	seen := make(map[string]struct{}, len(e.Findings))
+	for _, finding := range e.Findings {
+		if err := validateFreshReviewFindingRecord(finding, e.RunID, e.ReviewedHead); err != nil {
+			return err
+		}
+		if _, exists := seen[finding.SourceID]; exists {
+			return errors.New("duplicate fresh review finding source ID")
+		}
+		seen[finding.SourceID] = struct{}{}
+	}
+	if len([]byte(BuildRepairPrompt(e.Findings))) > MaxRepairPromptBytes {
+		return errors.New("fresh review repair findings exceed controller aggregate bounds")
+	}
+	return nil
+}
+
+func validateFreshReviewFindingRecord(finding FindingRecord, runID, head string) error {
+	if finding.RunID != runID || finding.HeadSHA != head || finding.Source != freshReviewFindingSource || !strings.HasPrefix(finding.SourceID, "fresh-review:") || strings.TrimSpace(strings.TrimPrefix(finding.SourceID, "fresh-review:")) == "" || strings.TrimSpace(finding.Body) == "" || strings.ContainsRune(finding.SourceID, '\x00') || strings.ContainsRune(finding.Body, '\x00') || strings.ContainsRune(finding.File, '\x00') {
+		return errors.New("fresh review finding authority is incomplete")
+	}
+	if finding.Line < 0 || finding.Resolved || finding.Outdated || len([]byte(finding.Body)) > MaxNormalizedFindingBodyBytes {
+		return errors.New("fresh review finding is outside controller bounds")
+	}
+	switch finding.Severity {
+	case "critical", "high", "medium", "low":
+	default:
+		return errors.New("fresh review finding severity is invalid")
+	}
+	digest := sha256.Sum256([]byte(finding.Body))
+	if finding.BodyDigest != hex.EncodeToString(digest[:]) {
+		return errors.New("fresh review finding body digest mismatch")
+	}
+	return nil
+}
+
 type OwnedResource struct {
 	ID               int64     `json:"resource_id"`
 	RunID            string    `json:"run_id"`
@@ -228,4 +306,10 @@ type RunStore interface {
 	SaveReview(context.Context, ReviewRecord) error
 	AddOwnedResource(context.Context, OwnedResource) error
 	Inspect(context.Context, string) (RunInspection, error)
+}
+
+// FreshReviewFindingStore is intentionally narrower than DeliveryStore. Only
+// the production fresh-review handoff may advance fresh_review to repairing.
+type FreshReviewFindingStore interface {
+	PersistFreshReviewFindings(context.Context, FreshReviewRepairEvidence) (bool, error)
 }

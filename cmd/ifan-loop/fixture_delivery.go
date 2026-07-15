@@ -102,6 +102,11 @@ func localFixtureDeliver(args []string) error {
 			return err
 		}
 		switch run.State {
+		case domain.StateFreshReview:
+			controller := newLocalController(store, "codex", filepath.Dir(run.WorktreePath))
+			if _, err := controller.HandoffFreshReviewFindings(ctx, runID); err != nil {
+				return err
+			}
 		case domain.StateApprovalReady:
 			controller := newLocalController(store, "codex", filepath.Dir(run.WorktreePath))
 			if err := controller.ValidateApprovalReady(ctx, runID); err != nil {

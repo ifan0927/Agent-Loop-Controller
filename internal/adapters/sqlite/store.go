@@ -1647,6 +1647,9 @@ func (s *Store) SavePollObservation(ctx context.Context, record application.Poll
 }
 
 func (s *Store) SaveFinding(ctx context.Context, record application.FindingRecord) error {
+	if record.Source == application.FreshReviewFindingSource {
+		return errors.New("controller fresh review findings require the typed persistence boundary")
+	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO review_findings(run_id,source_id,thread_id,source,file,line,severity,body_digest,body_text,resolved,outdated,head_sha,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,source,source_id,head_sha) DO UPDATE SET thread_id=excluded.thread_id,file=excluded.file,line=excluded.line,severity=excluded.severity,body_digest=excluded.body_digest,body_text=excluded.body_text,resolved=excluded.resolved,outdated=excluded.outdated,observed_at=excluded.observed_at`, record.RunID, record.SourceID, record.ThreadID, record.Source, record.File, record.Line, record.Severity, record.BodyDigest, record.Body, record.Resolved, record.Outdated, record.HeadSHA, formatTime(record.ObservedAt))
 	return err
 }

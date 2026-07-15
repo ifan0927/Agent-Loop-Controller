@@ -171,6 +171,17 @@ If review reports findings, the controller resumes the implementation session,
 runs verification, creates a new candidate head, and launches another fresh
 review. No reviewed SHA may be substituted with a later SHA.
 
+Fresh-review findings are a separate controller-owned handoff. The persisted
+review attempt, successful process result, outcome digest, reviewed candidate
+head, and normalized finding set are compared before any repair state change.
+SQLite persists that set and the `fresh_review -> repairing` transition in one
+idempotent transaction; an immutable source-ID conflict fails closed rather
+than overwriting an earlier finding. The local controller stops at
+`fresh_review`; the production driver/coordinator performs this typed handoff.
+Repair resumes only from that persisted authority and must produce new
+exact-head verification and fresh-review evidence before delivery can
+continue.
+
 `fresh_review -> pr_open` is deliberately absent from the generic state topology.
 The application gate authorizes it only when the review verdict is `pass`, the
 reviewed head equals current Git HEAD, and controller verification was recorded

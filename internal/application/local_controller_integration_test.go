@@ -849,8 +849,12 @@ func TestFreshReviewFindingsPersistAndResumeBoundedRepairWithSameSession(t *test
 	digest := sha256.Sum256(input.NormalizedJSON)
 	input.TaskHash = hex.EncodeToString(digest[:])
 	run, err := controller.Start(context.Background(), input)
-	if err != nil || run.State != domain.StateRepairing {
+	if err != nil || run.State != domain.StateFreshReview {
 		t.Fatalf("run=%+v err=%v", run, err)
+	}
+	run, err = controller.HandoffFreshReviewFindings(context.Background(), run.ID)
+	if err != nil || run.State != domain.StateRepairing {
+		t.Fatalf("handoff run=%+v err=%v", run, err)
 	}
 	inspection, err := store.Inspect(context.Background(), run.ID)
 	if err != nil {
@@ -867,12 +871,56 @@ func TestFreshReviewFindingsPersistAndResumeBoundedRepairWithSameSession(t *test
 	if len(inspection.Timeline) == 0 || inspection.Timeline[len(inspection.Timeline)-1].From != domain.StateFreshReview || inspection.Timeline[len(inspection.Timeline)-1].To != domain.StateRepairing || inspection.Timeline[len(inspection.Timeline)-1].BoundHead != run.CandidateHead {
 		t.Fatalf("timeline=%+v", inspection.Timeline)
 	}
+	review := inspection.Reviews[len(inspection.Reviews)-1]
+	replay := application.FreshReviewRepairEvidence{RunID: run.ID, AttemptID: review.AttemptID, ReviewedHead: review.ReviewedHead, OutcomePath: review.OutcomePath, OutcomeHash: review.OutcomeHash, Findings: append([]application.FindingRecord(nil), inspection.Findings...)}
+	if changed, err := store.PersistFreshReviewFindings(context.Background(), replay); err != nil || changed {
+		t.Fatalf("idempotent fresh review replay changed=%v err=%v", changed, err)
+	}
+	conflicting := replay
+	conflicting.Findings = append([]application.FindingRecord(nil), replay.Findings...)
+	conflicting.Findings[0].Body = "conflicting persisted review finding"
+	conflictDigest := sha256.Sum256([]byte(conflicting.Findings[0].Body))
+	conflicting.Findings[0].BodyDigest = hex.EncodeToString(conflictDigest[:])
+	if _, err := store.PersistFreshReviewFindings(context.Background(), conflicting); err == nil {
+		t.Fatal("conflicting fresh review source ID was accepted")
+	}
+	afterReplay, err := store.Inspect(context.Background(), run.ID)
+	if err != nil || afterReplay.Run.State != domain.StateRepairing || len(afterReplay.Findings) != 1 || afterReplay.Findings[0].Body != finding.Body {
+		t.Fatalf("fresh review replay changed durable authority: inspection=%+v err=%v", afterReplay, err)
+	}
 	run, err = newController(t, store, lab, process, gitadapter.Workspace{}).RepairFindings(context.Background(), run.ID, inspection.Findings)
 	if err != nil || run.State != domain.StateApprovalReady {
 		t.Fatalf("run=%+v err=%v", run, err)
 	}
 	if process.resumeCalls != 1 || process.reviewCalls != 2 {
 		t.Fatalf("resumes=%d reviews=%d", process.resumeCalls, process.reviewCalls)
+	}
+}
+
+func TestFreshReviewHandoffRejectsTamperedOutcomeBeforePersistence(t *testing.T) {
+	lab := newLocalLab(t)
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	process := &durableFakeProcess{reviewFindings: true}
+	controller := newController(t, store, lab, process, gitadapter.Workspace{})
+	run, err := controller.Start(context.Background(), startInput(lab))
+	if err != nil || run.State != domain.StateFreshReview {
+		t.Fatalf("run=%+v err=%v", run, err)
+	}
+	inspection, err := store.Inspect(context.Background(), run.ID)
+	if err != nil || len(inspection.Reviews) != 1 {
+		t.Fatalf("inspection=%+v err=%v", inspection, err)
+	}
+	mustWrite(t, inspection.Reviews[0].OutcomePath, `{}`)
+	if _, err := controller.HandoffFreshReviewFindings(context.Background(), run.ID); err == nil {
+		t.Fatal("tampered fresh review outcome was accepted")
+	}
+	after, err := store.Inspect(context.Background(), run.ID)
+	if err != nil || after.Run.State != domain.StateFreshReview || len(after.Findings) != 0 {
+		t.Fatalf("tampered outcome changed durable state: inspection=%+v err=%v", after, err)
 	}
 }
 
@@ -898,12 +946,12 @@ func TestProductionDriverRoutesFreshReviewFindingsIntoBoundedSameSessionRepair(t
 	}
 	requester := application.Requester{ID: "operator", Kind: "github_login"}
 	started, _, err := admission.Start(context.Background(), application.LinearStartCommand{Requester: requester, Identifier: "IFAN-FIXTURE"})
-	if err != nil || started.Run.State != domain.StateRepairing {
+	if err != nil || started.Run.State != domain.StateFreshReview {
 		t.Fatalf("started=%+v err=%v", started, err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	driver, err := application.NewProductionDriver(coordinator, store, application.ProductionDriverPorts{}, application.ProductionDriverPolicy{PollInterval: time.Second, MaxImmediateAction: 1}, func(context.Context, time.Duration) error {
+	driver, err := application.NewProductionDriver(coordinator, store, application.ProductionDriverPorts{}, application.ProductionDriverPolicy{PollInterval: time.Second, MaxImmediateAction: 2}, func(context.Context, time.Duration) error {
 		cancel()
 		return context.Canceled
 	})
@@ -918,7 +966,7 @@ func TestProductionDriverRoutesFreshReviewFindingsIntoBoundedSameSessionRepair(t
 	if err != nil || run.State != domain.StateApprovalReady {
 		t.Fatalf("run=%+v err=%v", run, err)
 	}
-	if process.resumeCalls != 1 || process.reviewCalls != 2 || reader.reads != 2 {
+	if process.resumeCalls != 1 || process.reviewCalls != 2 || reader.reads != 3 {
 		t.Fatalf("resumes=%d reviews=%d linear_reads=%d", process.resumeCalls, process.reviewCalls, reader.reads)
 	}
 }
