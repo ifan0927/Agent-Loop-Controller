@@ -239,79 +239,246 @@ func inspectLaunchAgentPlist(ctx context.Context, path string) (launchAgentPlist
 		return launchAgentPlistInspection{}, err
 	}
 	decoder := xml.NewDecoder(bytes.NewReader(data))
-	var inspection launchAgentPlistInspection
-	var key string
-	for {
-		token, tokenErr := decoder.Token()
-		if errors.Is(tokenErr, io.EOF) {
-			break
-		}
-		if tokenErr != nil {
-			return launchAgentPlistInspection{}, errors.New("plist_invalid")
-		}
-		start, ok := token.(xml.StartElement)
-		if !ok {
-			continue
-		}
-		switch start.Name.Local {
-		case "key":
-			if err := decoder.DecodeElement(&key, &start); err != nil {
-				return launchAgentPlistInspection{}, errors.New("plist_invalid")
-			}
-		case "string":
-			var value string
-			if err := decoder.DecodeElement(&value, &start); err != nil {
-				return launchAgentPlistInspection{}, errors.New("plist_invalid")
-			}
-			switch key {
-			case "Label":
-				inspection.Label = value
-			case "ProgramArguments":
-				inspection.ProgramArguments = append(inspection.ProgramArguments, value)
-			}
-		case "true", "false":
-			if key == "RunAtLoad" {
-				inspection.RunAtLoadObserved = true
-				inspection.RunAtLoad = start.Name.Local == "true"
-			}
-		case "array":
-			if key != "ProgramArguments" {
-				continue
-			}
-			arguments, err := decodePlistStringArray(decoder, start)
-			if err != nil {
-				return launchAgentPlistInspection{}, errors.New("plist_invalid")
-			}
-			inspection.ProgramArguments = arguments
-		}
+	token, err := nextPlistDocumentToken(decoder)
+	if err != nil {
+		return launchAgentPlistInspection{}, errors.New("plist_invalid")
+	}
+	root, ok := token.(xml.StartElement)
+	if !ok || root.Name.Space != "" || root.Name.Local != "plist" || len(root.Attr) != 1 || root.Attr[0].Name.Space != "" || root.Attr[0].Name.Local != "version" || root.Attr[0].Value != "1.0" {
+		return launchAgentPlistInspection{}, errors.New("plist_invalid")
+	}
+	token, err = nextPlistContentToken(decoder)
+	if err != nil {
+		return launchAgentPlistInspection{}, errors.New("plist_invalid")
+	}
+	dict, ok := token.(xml.StartElement)
+	if !ok || !validPlistElement(dict, "dict") {
+		return launchAgentPlistInspection{}, errors.New("plist_invalid")
+	}
+	inspection, err := decodeLaunchAgentPlistDict(decoder, dict, true)
+	if err != nil {
+		return launchAgentPlistInspection{}, err
+	}
+	token, err = nextPlistContentToken(decoder)
+	if err != nil {
+		return launchAgentPlistInspection{}, errors.New("plist_invalid")
+	}
+	end, ok := token.(xml.EndElement)
+	if !ok || end.Name != root.Name {
+		return launchAgentPlistInspection{}, errors.New("plist_invalid")
+	}
+	if _, err := nextPlistContentToken(decoder); !errors.Is(err, io.EOF) {
+		return launchAgentPlistInspection{}, errors.New("plist_invalid")
 	}
 	return inspection, nil
+}
+
+func nextPlistDocumentToken(decoder *xml.Decoder) (xml.Token, error) {
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		switch value := token.(type) {
+		case xml.CharData:
+			if strings.TrimSpace(string(value)) == "" {
+				continue
+			}
+		case xml.Comment, xml.Directive, xml.ProcInst:
+			continue
+		}
+		return token, nil
+	}
+}
+
+func nextPlistContentToken(decoder *xml.Decoder) (xml.Token, error) {
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		if value, ok := token.(xml.CharData); ok && strings.TrimSpace(string(value)) == "" {
+			continue
+		}
+		if _, ok := token.(xml.Comment); ok {
+			continue
+		}
+		return token, nil
+	}
+}
+
+func validPlistElement(start xml.StartElement, name string) bool {
+	if start.Name.Space != "" || start.Name.Local != name || len(start.Attr) != 0 {
+		return false
+	}
+	return true
+}
+
+func decodeLaunchAgentPlistDict(decoder *xml.Decoder, start xml.StartElement, extract bool) (launchAgentPlistInspection, error) {
+	if !validPlistElement(start, "dict") {
+		return launchAgentPlistInspection{}, errors.New("plist_invalid")
+	}
+	seen := make(map[string]struct{})
+	var inspection launchAgentPlistInspection
+	for {
+		token, err := nextPlistContentToken(decoder)
+		if err != nil {
+			return launchAgentPlistInspection{}, errors.New("plist_invalid")
+		}
+		if end, ok := token.(xml.EndElement); ok {
+			if end.Name != start.Name {
+				return launchAgentPlistInspection{}, errors.New("plist_invalid")
+			}
+			return inspection, nil
+		}
+		keyStart, ok := token.(xml.StartElement)
+		if !ok || !validPlistElement(keyStart, "key") {
+			return launchAgentPlistInspection{}, errors.New("plist_invalid")
+		}
+		key, err := decodePlistTextElement(decoder, keyStart, "key")
+		if err != nil {
+			return launchAgentPlistInspection{}, err
+		}
+		if _, exists := seen[key]; exists {
+			return launchAgentPlistInspection{}, errors.New("plist_invalid")
+		}
+		seen[key] = struct{}{}
+		valueToken, err := nextPlistContentToken(decoder)
+		if err != nil {
+			return launchAgentPlistInspection{}, errors.New("plist_invalid")
+		}
+		valueStart, ok := valueToken.(xml.StartElement)
+		if !ok {
+			return launchAgentPlistInspection{}, errors.New("plist_invalid")
+		}
+		if !extract {
+			if err := consumePlistValue(decoder, valueStart); err != nil {
+				return launchAgentPlistInspection{}, err
+			}
+			continue
+		}
+		switch key {
+		case "Label":
+			if !validPlistElement(valueStart, "string") {
+				return launchAgentPlistInspection{}, errors.New("plist_invalid")
+			}
+			inspection.Label, err = decodePlistTextElement(decoder, valueStart, "string")
+		case "ProgramArguments":
+			if !validPlistElement(valueStart, "array") {
+				return launchAgentPlistInspection{}, errors.New("plist_invalid")
+			}
+			inspection.ProgramArguments, err = decodePlistStringArray(decoder, valueStart)
+		case "RunAtLoad":
+			if valueStart.Name.Space != "" || (valueStart.Name.Local != "true" && valueStart.Name.Local != "false") || len(valueStart.Attr) != 0 {
+				return launchAgentPlistInspection{}, errors.New("plist_invalid")
+			}
+			err = consumePlistEmptyValue(decoder, valueStart)
+			inspection.RunAtLoadObserved = true
+			inspection.RunAtLoad = valueStart.Name.Local == "true"
+		default:
+			err = consumePlistValue(decoder, valueStart)
+		}
+		if err != nil {
+			return launchAgentPlistInspection{}, err
+		}
+	}
 }
 
 func decodePlistStringArray(decoder *xml.Decoder, start xml.StartElement) ([]string, error) {
 	var values []string
 	for {
-		token, err := decoder.Token()
-		if errors.Is(err, io.EOF) {
+		token, err := nextPlistContentToken(decoder)
+		if err != nil {
 			return nil, errors.New("plist_invalid")
 		}
+		if end, ok := token.(xml.EndElement); ok {
+			if end.Name != start.Name {
+				return nil, errors.New("plist_invalid")
+			}
+			return values, nil
+		}
+		item, ok := token.(xml.StartElement)
+		if !ok || !validPlistElement(item, "string") {
+			return nil, errors.New("plist_invalid")
+		}
+		value, err := decodePlistTextElement(decoder, item, "string")
 		if err != nil {
 			return nil, err
 		}
+		values = append(values, value)
+	}
+}
+
+func consumePlistValue(decoder *xml.Decoder, start xml.StartElement) error {
+	if start.Name.Space != "" || len(start.Attr) != 0 {
+		return errors.New("plist_invalid")
+	}
+	switch start.Name.Local {
+	case "dict":
+		_, err := decodeLaunchAgentPlistDict(decoder, start, false)
+		return err
+	case "array":
+		for {
+			token, err := nextPlistContentToken(decoder)
+			if err != nil {
+				return errors.New("plist_invalid")
+			}
+			if end, ok := token.(xml.EndElement); ok {
+				if end.Name != start.Name {
+					return errors.New("plist_invalid")
+				}
+				return nil
+			}
+			item, ok := token.(xml.StartElement)
+			if !ok {
+				return errors.New("plist_invalid")
+			}
+			if err := consumePlistValue(decoder, item); err != nil {
+				return err
+			}
+		}
+	case "true", "false":
+		return consumePlistEmptyValue(decoder, start)
+	case "string", "integer", "real", "date", "data", "uid":
+		_, err := decodePlistTextElement(decoder, start, start.Name.Local)
+		return err
+	default:
+		return errors.New("plist_invalid")
+	}
+}
+
+func consumePlistEmptyValue(decoder *xml.Decoder, start xml.StartElement) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return errors.New("plist_invalid")
+	}
+	end, ok := token.(xml.EndElement)
+	if !ok || end.Name != start.Name {
+		return errors.New("plist_invalid")
+	}
+	return nil
+}
+
+func decodePlistTextElement(decoder *xml.Decoder, start xml.StartElement, name string) (string, error) {
+	if !validPlistElement(start, name) {
+		return "", errors.New("plist_invalid")
+	}
+	var value strings.Builder
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return "", errors.New("plist_invalid")
+		}
 		switch item := token.(type) {
-		case xml.StartElement:
-			if item.Name.Local != "string" {
-				return nil, errors.New("plist_invalid")
-			}
-			var value string
-			if err := decoder.DecodeElement(&value, &item); err != nil {
-				return nil, err
-			}
-			values = append(values, value)
+		case xml.CharData:
+			_, _ = value.Write(item)
 		case xml.EndElement:
-			if item.Name == start.Name {
-				return values, nil
+			if item.Name != start.Name {
+				return "", errors.New("plist_invalid")
 			}
+			return value.String(), nil
+		default:
+			return "", errors.New("plist_invalid")
 		}
 	}
 }
@@ -327,6 +494,10 @@ func readLaunchAgentFile(ctx context.Context, path string) ([]byte, error) {
 	if err != nil {
 		return nil, errors.New("plist_unavailable")
 	}
+	return readLaunchAgentOpenedFile(ctx, file)
+}
+
+func readLaunchAgentOpenedFile(ctx context.Context, file *os.File) ([]byte, error) {
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() < 0 || info.Size() > maxLaunchAgentPlistBytes {

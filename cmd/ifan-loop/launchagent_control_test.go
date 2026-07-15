@@ -115,7 +115,7 @@ func TestLaunchAgentBootstrapReusesLoadedServiceAndVerifiesAfterBootstrap(t *tes
 	}
 }
 
-func TestLaunchAgentKickstartDoesNotRestartRunAtLoadService(t *testing.T) {
+func TestLaunchAgentKickstartRestartsStoppedRunAtLoadService(t *testing.T) {
 	root := resolvedTempDir(t)
 	config := filepath.Join(root, "controller.json")
 	binary := filepath.Join(root, "ifan-loop")
@@ -123,16 +123,45 @@ func TestLaunchAgentKickstartDoesNotRestartRunAtLoadService(t *testing.T) {
 	writeLaunchAgentFixture(t, binary, config, plist, true)
 	oldFactory := launchAgentControlFactory
 	defer func() { launchAgentControlFactory = oldFactory }()
-	fake := &scriptedLaunchAgentControl{statuses: []launchAgentObservation{{State: "stopped"}}}
+	fake := &scriptedLaunchAgentControl{statuses: []launchAgentObservation{{State: "stopped"}, {State: "running"}}}
 	launchAgentControlFactory = func(time.Duration) launchAgentControl { return fake }
 	output, err := captureConfigOutput(func() error {
 		return launchAgentKickstart([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
 	})
-	if err != nil || !strings.Contains(output, `"outcome": "awaiting_run_at_load"`) {
+	if err != nil || !strings.Contains(output, `"outcome": "kickstarted"`) {
 		t.Fatalf("output=%s err=%v calls=%v", output, err, fake.calls)
 	}
-	if strings.Join(fake.calls, ",") != "status" {
+	if strings.Join(fake.calls, ",") != "status,kickstart,status" {
 		t.Fatalf("calls=%v", fake.calls)
+	}
+}
+
+func TestLaunchAgentPlistParserRejectsInvalidStructureAndDuplicateKeys(t *testing.T) {
+	root := resolvedTempDir(t)
+	binary := filepath.Join(root, "ifan-loop")
+	config := filepath.Join(root, "controller.json")
+	plist := filepath.Join(root, "worker.plist")
+	if err := os.WriteFile(binary, []byte("fixture"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	valid := renderLaunchAgentPlist(binary, config, filepath.Join(root, "logs", launchAgentStdoutLogName), filepath.Join(root, "logs", launchAgentStderrLogName))
+	for _, test := range []struct {
+		name    string
+		content string
+	}{
+		{name: "wrong root", content: strings.Replace(valid, `<?xml version="1.0" encoding="UTF-8"?>`, `<?xml version="1.0" encoding="UTF-8"?><wrapper>`, 1) + "</wrapper>"},
+		{name: "duplicate label", content: strings.Replace(valid, "</dict>\n</plist>", "  <key>Label</key>\n  <string>duplicate</string>\n</dict>\n</plist>", 1)},
+		{name: "wrong program arguments type", content: strings.Replace(valid, "<key>ProgramArguments</key>\n  <array>", "<key>ProgramArguments</key>\n  <dict>", 1)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.WriteFile(plist, []byte(test.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := validateLaunchAgentPlist(context.Background(), launchAgentOptions{binary: binary, config: config, plist: plist})
+			if err == nil || err.Error() != "plist_invalid" {
+				t.Fatalf("err=%v", err)
+			}
+		})
 	}
 }
 

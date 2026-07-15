@@ -2,11 +2,12 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 func launchAgentInstall(args []string) error {
@@ -25,12 +26,18 @@ func launchAgentInstall(args []string) error {
 		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: reasons[0]})
 	}
 	desired := []byte(renderLaunchAgentPlist(options.binary, options.config, filepath.Join(filepath.Dir(options.config), launchAgentLogDirectory, launchAgentStdoutLogName), filepath.Join(filepath.Dir(options.config), launchAgentLogDirectory, launchAgentStderrLogName)))
-	if launchAgentPathExists(options.plist) {
-		if !safeLaunchAgentPlist(options.plist) {
-			result.Reason = "plist_unsafe"
-			return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
-		}
-		current, readErr := readLaunchAgentFile(context.Background(), options.plist)
+	parent, parentErr := openLaunchAgentParent(options.plist)
+	if parentErr != nil {
+		result.Reason = launchAgentInstallReason(parentErr)
+		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
+	}
+	defer parent.Close()
+	ctx, cancel := localContext(options.timeout)
+	defer cancel()
+	name := filepath.Base(options.plist)
+	existing, openErr := openLaunchAgentFileAt(parent, name)
+	if openErr == nil {
+		current, readErr := readLaunchAgentOpenedFile(ctx, existing)
 		if readErr == nil && bytes.Equal(current, desired) {
 			result.ObservedState = "not_observed"
 			result.Outcome = "already_installed"
@@ -40,28 +47,32 @@ func launchAgentInstall(args []string) error {
 		result.Reason = "plist_exists"
 		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
 	}
-	file, createErr := os.OpenFile(options.plist, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	if !errors.Is(openErr, unix.ENOENT) && !errors.Is(openErr, os.ErrNotExist) {
+		result.Reason = launchAgentInstallReason(openErr)
+		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
+	}
+	file, createErr := createLaunchAgentFileAt(parent, name)
 	if createErr != nil {
+		result.Reason = launchAgentInstallReason(createErr)
+		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
+	}
+	if chmodErr := file.Chmod(0o600); chmodErr != nil {
+		_ = file.Close()
 		result.Reason = "plist_unavailable"
-		if errors.Is(createErr, os.ErrExist) {
-			result.Reason = "plist_exists"
-		}
 		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
 	}
 	createdInfo, statErr := file.Stat()
-	if statErr != nil {
+	if statErr != nil || !safeLaunchAgentFileInfo(createdInfo) {
 		_ = file.Close()
 		result.Reason = "plist_unavailable"
 		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
 	}
 	if _, writeErr := file.Write(desired); writeErr != nil {
 		_ = file.Close()
-		removeLaunchAgentFileIfSame(options.plist, createdInfo)
 		result.Reason = "plist_unavailable"
 		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
 	}
 	if closeErr := file.Close(); closeErr != nil {
-		removeLaunchAgentFileIfSame(options.plist, createdInfo)
 		result.Reason = "plist_unavailable"
 		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
 	}
@@ -71,15 +82,90 @@ func launchAgentInstall(args []string) error {
 	return writeLaunchAgentControlResult(result, nil)
 }
 
-func removeLaunchAgentFileIfSame(path string, created os.FileInfo) {
-	if created == nil {
-		return
+func openLaunchAgentParent(path string) (*os.File, error) {
+	if !validLaunchAgentPath(path) {
+		return nil, errors.New("plist_unsafe")
 	}
-	current, err := os.Lstat(path)
-	if err != nil || current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() || !os.SameFile(created, current) {
-		return
+	parentPath := filepath.Dir(path)
+	parentInfo, err := os.Lstat(parentPath)
+	if os.IsNotExist(err) {
+		return nil, errors.New("plist_unavailable")
 	}
-	_ = os.Remove(path)
+	if err != nil || !safeLaunchAgentDirectoryInfo(parentInfo) {
+		return nil, errors.New("plist_unsafe")
+	}
+	resolved, err := filepath.EvalSymlinks(parentPath)
+	if err != nil || resolved != parentPath {
+		return nil, errors.New("plist_unsafe")
+	}
+	directory, err := os.OpenFile(parentPath, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, errors.New("plist_unavailable")
+	}
+	openedInfo, statErr := directory.Stat()
+	currentInfo, lstatErr := os.Lstat(parentPath)
+	resolved, resolveErr := filepath.EvalSymlinks(parentPath)
+	if statErr != nil || lstatErr != nil || resolveErr != nil || resolved != parentPath || !safeLaunchAgentDirectoryInfo(openedInfo) || !os.SameFile(openedInfo, currentInfo) {
+		_ = directory.Close()
+		return nil, errors.New("plist_unsafe")
+	}
+	return directory, nil
+}
+
+func safeLaunchAgentDirectoryInfo(info os.FileInfo) bool {
+	return info != nil && info.Mode()&os.ModeSymlink == 0 && info.IsDir() && info.Mode().Perm()&0o022 == 0 && ownedByCurrentUser(info)
+}
+
+func openLaunchAgentFileAt(directory *os.File, name string) (*os.File, error) {
+	fd, err := unix.Openat(int(directory.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), name)
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, errors.New("plist_unavailable")
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, errors.New("plist_unavailable")
+	}
+	if !safeLaunchAgentFileInfo(info) {
+		_ = file.Close()
+		return nil, errors.New("plist_unsafe")
+	}
+	return file, nil
+}
+
+func createLaunchAgentFileAt(directory *os.File, name string) (*os.File, error) {
+	fd, err := unix.Openat(int(directory.Fd()), name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), name)
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, errors.New("plist_unavailable")
+	}
+	return file, nil
+}
+
+func safeLaunchAgentFileInfo(info os.FileInfo) bool {
+	return info != nil && info.Mode()&os.ModeSymlink == 0 && info.Mode().IsRegular() && info.Mode().Perm() == 0o600 && ownedByCurrentUser(info)
+}
+
+func launchAgentInstallReason(err error) string {
+	if err == nil {
+		return "plist_unavailable"
+	}
+	if errors.Is(err, unix.EEXIST) || errors.Is(err, os.ErrExist) {
+		return "plist_exists"
+	}
+	if errors.Is(err, unix.ELOOP) || err.Error() == "plist_unsafe" {
+		return "plist_unsafe"
+	}
+	return "plist_unavailable"
 }
 
 func launchAgentPlistValidate(args []string) error {
@@ -160,7 +246,7 @@ func launchAgentKickstart(args []string) error {
 		result := launchAgentControlResultFor(options, "kickstart", observed.State, "already_running", "status", "", inspection.RunAtLoad, false)
 		return writeLaunchAgentControlResult(result, nil)
 	}
-	if inspection.RunAtLoad {
+	if inspection.RunAtLoad && launchAgentRunAtLoadPending(observed.State) {
 		result := launchAgentControlResultFor(options, "kickstart", observed.State, "awaiting_run_at_load", "status", "run_at_load", inspection.RunAtLoad, false)
 		return writeLaunchAgentControlResult(result, nil)
 	}
@@ -238,6 +324,15 @@ func launchAgentBootout(args []string) error {
 		return writeLaunchAgentControlResult(launchAgentControlErrorResult(options, "bootout", after.State, false, err, "status"), err)
 	}
 	return writeLaunchAgentControlResult(launchAgentControlResultFor(options, "bootout", after.State, "stopped", "status", "", false, false), nil)
+}
+
+func launchAgentRunAtLoadPending(state string) bool {
+	switch state {
+	case "loaded", "waiting", "scheduled":
+		return true
+	default:
+		return false
+	}
 }
 
 func safeLaunchAgentPlist(path string) bool {

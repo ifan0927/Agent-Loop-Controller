@@ -91,11 +91,12 @@ tail -n 100 "$LOG_DIR/worker.stderr.log"
 ```
 
 `kickstart` first observes the service. It does nothing when the service is
-already running or when a stopped service has `RunAtLoad=true`; launchd is
-allowed to perform that normal load transition without a confusing redundant
-restart. A timed-out control step reports operator attention and does not
-assume success or issue a second control command. `status` remains the
-observation source for the next manual decision.
+already running or when `RunAtLoad=true` is still in launchd's initial
+`loaded`, `waiting`, or `scheduled` state. A stable `stopped` or `exited`
+service is explicitly kickstarted once; `RunAtLoad` does not retrigger after a
+worker has already exited. A timed-out control step reports operator attention
+and does not assume success or issue a second control command. `status` remains
+the observation source for the next manual decision.
 
 To stop it without deleting the plist, use the idempotent bootout step:
 
