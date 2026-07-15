@@ -37,12 +37,17 @@ func launchAgentInstall(args []string) error {
 	name := filepath.Base(options.plist)
 	existing, openErr := openLaunchAgentFileAt(parent, name)
 	if openErr == nil {
+		identity, identityErr := launchAgentFileIdentityFor(existing)
 		current, readErr := readLaunchAgentOpenedFile(ctx, existing)
-		if readErr == nil && bytes.Equal(current, desired) {
+		if identityErr == nil && readErr == nil && bytes.Equal(current, desired) && launchAgentInstallTargetStillBound(options.plist, parent, name, identity) {
 			result.ObservedState = "not_observed"
 			result.Outcome = "already_installed"
 			result.NextSafeAction = "bootstrap"
 			return writeLaunchAgentControlResult(result, nil)
+		}
+		if identityErr == nil && readErr == nil && bytes.Equal(current, desired) && !launchAgentInstallTargetStillBound(options.plist, parent, name, identity) {
+			result.Reason = "install_unverified"
+			return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
 		}
 		result.Reason = "plist_exists"
 		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
@@ -93,7 +98,7 @@ func launchAgentInstall(args []string) error {
 		result.Reason = "plist_unavailable"
 		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
 	}
-	if !launchAgentParentStillBound(options.plist, parent) || !launchAgentEntryMatches(parent, name, identity) {
+	if !launchAgentInstallTargetStillBound(options.plist, parent, name, identity) {
 		result.Reason = "install_unverified"
 		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
 	}
@@ -213,6 +218,16 @@ func launchAgentParentStillBound(path string, directory *os.File) bool {
 	currentInfo, lstatErr := os.Lstat(parentPath)
 	resolved, resolveErr := filepath.EvalSymlinks(parentPath)
 	return statErr == nil && lstatErr == nil && resolveErr == nil && resolved == parentPath && safeLaunchAgentDirectoryInfo(currentInfo) && os.SameFile(openedInfo, currentInfo)
+}
+
+func launchAgentInstallTargetStillBound(path string, directory *os.File, name string, identity launchAgentFileIdentity) bool {
+	if !launchAgentParentStillBound(path, directory) || !launchAgentEntryMatches(directory, name, identity) {
+		return false
+	}
+	if !launchAgentParentStillBound(path, directory) {
+		return false
+	}
+	return launchAgentEntryMatches(directory, name, identity)
 }
 
 func launchAgentInstallReason(err error) string {

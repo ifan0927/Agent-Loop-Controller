@@ -204,6 +204,42 @@ func TestLaunchAgentInstallIsIdempotentAndDoesNotOverwrite(t *testing.T) {
 	}
 }
 
+func TestLaunchAgentInstallBindingRejectsDetachedParent(t *testing.T) {
+	root := resolvedTempDir(t)
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Join(root, "LaunchAgents")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	plist := filepath.Join(parent, launchAgentLabel+".plist")
+	if err := os.WriteFile(plist, []byte("plist"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	directory, err := openLaunchAgentParent(plist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directory.Close()
+	file, err := openLaunchAgentFileAt(directory, filepath.Base(plist))
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := launchAgentFileIdentityFor(file)
+	if err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	_ = file.Close()
+	if err := os.Rename(parent, filepath.Join(root, "detached")); err != nil {
+		t.Fatal(err)
+	}
+	if launchAgentInstallTargetStillBound(plist, directory, filepath.Base(plist), identity) {
+		t.Fatal("detached parent was accepted as the target")
+	}
+}
+
 func writeLaunchAgentFixture(t *testing.T, binary, config, plist string, runAtLoad bool) {
 	t.Helper()
 	if err := os.WriteFile(binary, []byte("fixture"), 0o700); err != nil {
