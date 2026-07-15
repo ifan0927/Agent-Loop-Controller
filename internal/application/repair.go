@@ -181,7 +181,7 @@ func repairDeadlineAnchorRequired(state domain.State, timeline []Transition) boo
 	case domain.StateRepairing:
 		// A run may legitimately wait in repairing before its first
 		// repairing -> executing transition creates the global anchor.
-		return !hasTransitionToState(timeline, domain.StateRepairing)
+		return countTransitionsToState(timeline, domain.StateRepairing) != 1
 	case domain.StateExecuting, domain.StateVerifying, domain.StateFreshReview:
 		if hasRepairLifecycleTransition(timeline) {
 			return true
@@ -201,13 +201,14 @@ func hasRepairLifecycleTransition(timeline []Transition) bool {
 	return false
 }
 
-func hasTransitionToState(timeline []Transition, state domain.State) bool {
+func countTransitionsToState(timeline []Transition, state domain.State) int {
+	count := 0
 	for _, transition := range timeline {
 		if transition.To == state {
-			return true
+			count++
 		}
 	}
-	return false
+	return count
 }
 
 func hasInitialRepairFreePath(state domain.State, timeline []Transition) bool {

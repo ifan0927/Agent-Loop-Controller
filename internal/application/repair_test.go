@@ -186,6 +186,21 @@ func TestRepairDeadlineFailsClosedForMissingOrMalformedRepairAnchor(t *testing.T
 	}
 }
 
+func TestLaterRepairingCycleRequiresOriginalRepairDeadlineAnchor(t *testing.T) {
+	store := &repairDeadlineTestStore{
+		run: Run{ID: "run", State: domain.StateRepairing, CandidateHead: "head"},
+		inspection: RunInspection{Timeline: []Transition{
+			{From: domain.StateReconcilingReviews, To: domain.StateRepairing, CreatedAt: time.Now().UTC()},
+			{From: domain.StateFreshReview, To: domain.StateRepairing, CreatedAt: time.Now().UTC()},
+		}},
+	}
+	controller := &LocalController{store: store}
+	updated, err := controller.enforceRepairDeadline(context.Background(), store.run)
+	if err == nil || updated.State != domain.StateManualIntervention || store.transitionCalls != 1 {
+		t.Fatalf("updated=%+v err=%v transitionCalls=%d", updated, err, store.transitionCalls)
+	}
+}
+
 func TestInitialRepairFreeFlowDoesNotRequireRepairDeadlineAnchor(t *testing.T) {
 	store := &repairDeadlineTestStore{
 		run: Run{ID: "run", State: domain.StateFreshReview, CandidateHead: "head"},

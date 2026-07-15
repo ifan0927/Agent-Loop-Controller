@@ -177,6 +177,19 @@ func (c *LocalController) Continue(ctx context.Context, runID string, decision *
 	return c.continueExpected(ctx, runID, "", "", decision)
 }
 
+// EnforceRepairDeadline performs the local persisted-policy preflight used by
+// the production coordinator before it revalidates external authorities.
+func (c *LocalController) EnforceRepairDeadline(ctx context.Context, runID string) (Run, error) {
+	run, err := c.store.GetRun(ctx, runID)
+	if err != nil {
+		if ctx.Err() != nil {
+			return c.recoverCanceledContinuation(ctx, runID)
+		}
+		return Run{}, err
+	}
+	return c.enforceRepairDeadline(ctx, run)
+}
+
 func (c *LocalController) recoverCanceledContinuation(ctx context.Context, runID string) (Run, error) {
 	callerErr := ctx.Err()
 	if callerErr == nil {

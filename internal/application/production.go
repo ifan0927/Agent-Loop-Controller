@@ -66,6 +66,10 @@ type freshReviewFindingHandoff interface {
 	HandoffFreshReviewFindings(context.Context, string) (Run, error)
 }
 
+type repairDeadlinePreflight interface {
+	EnforceRepairDeadline(context.Context, string) (Run, error)
+}
+
 func NewProductionCoordinator(admission *LinearAdmissionService, controller LocalRunController, store RunStore) (*ProductionCoordinator, error) {
 	if admission == nil || controller == nil || store == nil {
 		return nil, errors.New("production coordinator dependencies are required")
@@ -74,6 +78,13 @@ func NewProductionCoordinator(admission *LinearAdmissionService, controller Loca
 }
 
 func (c *ProductionCoordinator) Continue(ctx context.Context, command ProductionContinueCommand) (ProductionResult, error) {
+	if command.RunID != "" {
+		if preflight, ok := c.controller.(repairDeadlinePreflight); ok {
+			if _, preflightErr := preflight.EnforceRepairDeadline(ctx, command.RunID); preflightErr != nil {
+				return ProductionResult{}, preflightErr
+			}
+		}
+	}
 	run, err := c.admission.Revalidate(ctx, LinearRevalidateCommand{Requester: command.Requester, RunID: command.RunID, Repository: command.Repository, ExpectedState: command.ExpectedState, IdempotencyKey: command.IdempotencyKey})
 	if err != nil {
 		return ProductionResult{}, err

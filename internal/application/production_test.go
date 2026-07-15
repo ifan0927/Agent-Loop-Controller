@@ -44,6 +44,42 @@ func (c *repairingController) RepairFindings(_ context.Context, _ string, findin
 	return updated, nil
 }
 
+type repairDeadlinePreflightController struct {
+	serviceController
+	preflightCalls int
+	preflightErr   error
+}
+
+func (c *repairDeadlinePreflightController) EnforceRepairDeadline(context.Context, string) (Run, error) {
+	c.preflightCalls++
+	return c.run, c.preflightErr
+}
+
+func TestProductionContinueRunsRepairDeadlinePreflightBeforeLinear(t *testing.T) {
+	repository := LocalRepository{CanonicalRepository: "owner/repo", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
+	reader := &admissionReader{source: validLinearSource()}
+	snapshot, _, err := admitLinearTask(reader.source, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, State: domain.StateExecuting})
+	store := &admissionStore{serviceStore: serviceStore{run: run}}
+	admission, err := NewLinearAdmissionService(reader, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, store, &admissionController{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	preflightErr := errors.New("repair policy expired")
+	controller := &repairDeadlinePreflightController{serviceController: serviceController{run: run}, preflightErr: preflightErr}
+	coordinator, err := NewProductionCoordinator(admission, controller, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = coordinator.Continue(context.Background(), ProductionContinueCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey})
+	if !errors.Is(err, preflightErr) || controller.preflightCalls != 1 || reader.calls != 0 || controller.continued != 0 {
+		t.Fatalf("err=%v preflightCalls=%d linearReads=%d continues=%d", err, controller.preflightCalls, reader.calls, controller.continued)
+	}
+}
+
 func TestProductionContinueUsesOnlyPersistedRepairFindings(t *testing.T) {
 	coordinator, store, run := newPushCoordinator(t, domain.StateRepairing)
 	finding := repairFinding("finding-1", "quoted untrusted review text")

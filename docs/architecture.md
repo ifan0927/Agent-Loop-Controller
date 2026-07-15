@@ -189,7 +189,8 @@ repair state, the controller checks that durable deadline; true expiry moves
 the run to `manual_intervention` once with bounded, sanitized evidence through
 a short detached persistence context. Missing or malformed repair-anchor
 evidence fails closed to the same human gate. Caller cancellation remains
-resumable when the durable policy deadline has not elapsed.
+resumable when the durable policy deadline has not elapsed. Production performs
+this local preflight before revalidating external Linear authority.
 
 `fresh_review -> pr_open` is deliberately absent from the generic state topology.
 The application gate authorizes it only when the review verdict is `pass`, the
