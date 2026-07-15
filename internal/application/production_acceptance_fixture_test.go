@@ -348,10 +348,26 @@ func TestOfflineAcceptanceRepairDeadlineAnchorsAndCancellationDoesNotExpirePolic
 		stack := newAcceptanceProductionStack(t, true)
 		run := acceptanceReachRepairing(t, stack)
 		run = acceptanceBeginInterruptedRepair(t, stack, run)
+		anchor := acceptanceRepairAnchor(t, stack.store, run.ID)
 		reads := stack.reader.reads
-		anchored := &firstRepairDeadlineStore{RunStore: stack.store, firstRepairAt: time.Now().UTC().Add(-31 * time.Minute)}
-		controller := newController(t, anchored, stack.lab, stack.process, gitadapter.Workspace{})
-		coordinator, err := application.NewProductionCoordinator(stack.admission, controller, anchored)
+		if err := stack.store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		reopened, err := storeadapter.Open(stack.lab.db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reopened.Close()
+		persisted, err := reopened.Inspect(context.Background(), run.ID)
+		if err != nil || acceptanceRepairAnchorFromTimeline(persisted.Timeline).IsZero() || !acceptanceRepairAnchorFromTimeline(persisted.Timeline).Equal(anchor) {
+			t.Fatalf("reopened repair anchor=%v want=%v err=%v", acceptanceRepairAnchorFromTimeline(persisted.Timeline), anchor, err)
+		}
+		controller := newControllerWithRepairClock(t, reopened, stack.lab, stack.process, gitadapter.Workspace{}, func() time.Time { return anchor.Add(31 * time.Minute) })
+		admission, err := application.NewLinearAdmissionService(stack.reader, productionLinearResolver{repository: stack.repository}, reopened, controller)
+		if err != nil {
+			t.Fatal(err)
+		}
+		coordinator, err := application.NewProductionCoordinator(admission, controller, reopened)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -359,11 +375,11 @@ func TestOfflineAcceptanceRepairDeadlineAnchorsAndCancellationDoesNotExpirePolic
 		if err == nil {
 			t.Fatalf("deadline unexpectedly succeeded: result=%+v", result)
 		}
-		persisted, getErr := stack.store.GetRun(context.Background(), run.ID)
-		if getErr != nil || persisted.State != domain.StateManualIntervention || stack.reader.reads != reads || stack.process.resumeCalls != 1 {
-			t.Fatalf("persisted=%+v reads=%d resumes=%d err=%v", persisted, stack.reader.reads, stack.process.resumeCalls, getErr)
+		persistedRun, getErr := reopened.GetRun(context.Background(), run.ID)
+		if getErr != nil || persistedRun.State != domain.StateManualIntervention || stack.reader.reads != reads || stack.process.resumeCalls != 1 {
+			t.Fatalf("persisted=%+v reads=%d resumes=%d err=%v", persistedRun, stack.reader.reads, stack.process.resumeCalls, getErr)
 		}
-		inspection, inspectErr := stack.store.Inspect(context.Background(), run.ID)
+		inspection, inspectErr := reopened.Inspect(context.Background(), run.ID)
 		if inspectErr != nil || !hasAcceptanceTransition(inspection.Timeline, domain.StateExecuting, domain.StateManualIntervention, "") {
 			t.Fatalf("deadline timeline=%+v err=%v", inspection.Timeline, inspectErr)
 		}
@@ -373,10 +389,26 @@ func TestOfflineAcceptanceRepairDeadlineAnchorsAndCancellationDoesNotExpirePolic
 		stack := newAcceptanceProductionStack(t, true)
 		run := acceptanceReachRepairing(t, stack)
 		run = acceptanceBeginInterruptedRepair(t, stack, run)
+		anchor := acceptanceRepairAnchor(t, stack.store, run.ID)
 		reads := stack.reader.reads
-		anchored := &firstRepairDeadlineStore{RunStore: stack.store, firstRepairAt: time.Now().UTC().Add(-time.Minute)}
-		controller := newController(t, anchored, stack.lab, stack.process, gitadapter.Workspace{})
-		coordinator, err := application.NewProductionCoordinator(stack.admission, controller, anchored)
+		if err := stack.store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		reopened, err := storeadapter.Open(stack.lab.db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reopened.Close()
+		persisted, err := reopened.Inspect(context.Background(), run.ID)
+		if err != nil || acceptanceRepairAnchorFromTimeline(persisted.Timeline).IsZero() || !acceptanceRepairAnchorFromTimeline(persisted.Timeline).Equal(anchor) {
+			t.Fatalf("reopened repair anchor=%v want=%v err=%v", acceptanceRepairAnchorFromTimeline(persisted.Timeline), anchor, err)
+		}
+		controller := newControllerWithRepairClock(t, reopened, stack.lab, stack.process, gitadapter.Workspace{}, func() time.Time { return anchor.Add(time.Minute) })
+		admission, err := application.NewLinearAdmissionService(stack.reader, productionLinearResolver{repository: stack.repository}, reopened, controller)
+		if err != nil {
+			t.Fatal(err)
+		}
+		coordinator, err := application.NewProductionCoordinator(admission, controller, reopened)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -386,9 +418,9 @@ func TestOfflineAcceptanceRepairDeadlineAnchorsAndCancellationDoesNotExpirePolic
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("canceled repair returned err=%v result=%+v", err, result)
 		}
-		persisted, getErr := stack.store.GetRun(context.Background(), run.ID)
-		if getErr != nil || persisted.State != domain.StateExecuting || stack.reader.reads != reads || stack.process.resumeCalls != 1 {
-			t.Fatalf("canceled policy changed persisted=%+v reads=%d resumes=%d err=%v", persisted, stack.reader.reads, stack.process.resumeCalls, getErr)
+		persistedRun, getErr := reopened.GetRun(context.Background(), run.ID)
+		if getErr != nil || persistedRun.State != domain.StateExecuting || stack.reader.reads != reads || stack.process.resumeCalls != 1 {
+			t.Fatalf("canceled policy changed persisted=%+v reads=%d resumes=%d err=%v", persistedRun, stack.reader.reads, stack.process.resumeCalls, getErr)
 		}
 	})
 }
@@ -398,6 +430,7 @@ type acceptanceProductionStack struct {
 	store       *storeadapter.Store
 	process     *durableFakeProcess
 	local       *application.LocalController
+	repository  application.LocalRepository
 	reader      *productionLinearReader
 	source      application.LinearTaskSource
 	admission   *application.LinearAdmissionService
@@ -427,7 +460,14 @@ func newAcceptanceProductionStack(t *testing.T, reviewFindings bool) acceptanceP
 	if err != nil {
 		t.Fatal(err)
 	}
-	return acceptanceProductionStack{lab: lab, store: store, process: process, local: local, reader: reader, source: source, admission: admission, coordinator: coordinator, requester: application.Requester{ID: "operator", Kind: "github_login"}}
+	return acceptanceProductionStack{lab: lab, store: store, process: process, local: local, repository: repository, reader: reader, source: source, admission: admission, coordinator: coordinator, requester: application.Requester{ID: "operator", Kind: "github_login"}}
+}
+
+func newControllerWithRepairClock(t *testing.T, store application.RunStore, lab localLab, process *durableFakeProcess, git application.DurableGit, clock func() time.Time) *application.LocalController {
+	t.Helper()
+	workspace := gitadapter.Workspace{}
+	registry := verifier.NewRegistry(map[string]verifier.Command{"fixture-go-test": {Program: "go", Args: []string{"test", "./..."}}}, processadapter.OSRunner{}, workspace)
+	return application.NewLocalControllerWithClock(store, testWorktrees{}, codex.NewExecutor(process, "codex"), registry, git, "codex", lab.worktrees, clock)
 }
 
 func acceptanceReachRepairing(t *testing.T, stack acceptanceProductionStack) application.Run {
@@ -489,6 +529,28 @@ func acceptanceBeginInterruptedRepair(t *testing.T, stack acceptanceProductionSt
 		t.Fatalf("persisted interrupted repair=%+v err=%v", updated, err)
 	}
 	return updated
+}
+
+func acceptanceRepairAnchor(t *testing.T, store *storeadapter.Store, runID string) time.Time {
+	t.Helper()
+	inspection, err := store.Inspect(context.Background(), runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchor := acceptanceRepairAnchorFromTimeline(inspection.Timeline)
+	if anchor.IsZero() {
+		t.Fatalf("repair timeline has no persisted deadline anchor: %+v", inspection.Timeline)
+	}
+	return anchor
+}
+
+func acceptanceRepairAnchorFromTimeline(timeline []application.Transition) time.Time {
+	for _, transition := range timeline {
+		if transition.From == domain.StateRepairing && transition.To == domain.StateExecuting {
+			return transition.CreatedAt
+		}
+	}
+	return time.Time{}
 }
 
 func hasAcceptanceTransition(timeline []application.Transition, from, to domain.State, head string) bool {

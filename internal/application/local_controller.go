@@ -115,12 +115,33 @@ type LocalController struct {
 	commands     codex.CommandBuilder
 	planner      Planner
 	worktreeRoot string
+	repairClock  func() time.Time
 }
 
 func NewLocalController(store RunStore, worktrees WorktreeProvisioner, executor DurableCodex,
 	verification VerificationRunner, git DurableGit, codexBinary, worktreeRoot string) *LocalController {
 	return &LocalController{store: store, worktrees: worktrees, codex: executor, verify: verification, git: git,
-		commands: codex.NewCommandBuilder(codexBinary), planner: NewPlanner(codexBinary), worktreeRoot: worktreeRoot}
+		commands: codex.NewCommandBuilder(codexBinary), planner: NewPlanner(codexBinary), worktreeRoot: worktreeRoot,
+		repairClock: func() time.Time { return time.Now().UTC() }}
+}
+
+// NewLocalControllerWithClock keeps the production wall-clock behavior while
+// providing a deterministic clock seam for persisted repair-policy acceptance
+// tests and embedders that own time.
+func NewLocalControllerWithClock(store RunStore, worktrees WorktreeProvisioner, executor DurableCodex,
+	verification VerificationRunner, git DurableGit, codexBinary, worktreeRoot string, clock func() time.Time) *LocalController {
+	controller := NewLocalController(store, worktrees, executor, verification, git, codexBinary, worktreeRoot)
+	if clock != nil {
+		controller.repairClock = clock
+	}
+	return controller
+}
+
+func (c *LocalController) repairNow() time.Time {
+	if c.repairClock == nil {
+		return time.Now().UTC()
+	}
+	return c.repairClock().UTC()
 }
 
 func (c *LocalController) Start(ctx context.Context, input LocalStartInput) (Run, error) {
@@ -753,7 +774,7 @@ func (c *LocalController) execute(ctx context.Context, run Run, decision *Decisi
 	} else if found {
 		hasPersistedRepair = true
 		repairStartedAt = latestRepairStartedAt(inspection.Timeline)
-		deadline, expired := repairDeadlineAt(inspection.Timeline, time.Now().UTC())
+		deadline, expired := repairDeadlineAt(inspection.Timeline, c.repairNow())
 		if !repairDeadlineAnchorIsValid(inspection.Timeline) {
 			_, deadlineErr := c.persistInvalidRepairDeadline(run)
 			return deadlineErr
@@ -1688,7 +1709,7 @@ func (c *LocalController) repair(ctx context.Context, runID, normalizedPrompt st
 	if repairDeadlineAnchorInvalid(inspection.Timeline) {
 		return c.persistInvalidRepairDeadline(run)
 	}
-	if repairDeadlineExceeded(inspection.Timeline, time.Now().UTC()) {
+	if repairDeadlineExceeded(inspection.Timeline, c.repairNow()) {
 		return c.persistExpiredRepairDeadline(run)
 	}
 	task, err := decodeTaskSnapshot(run.NormalizedTaskJSON)
@@ -1727,7 +1748,7 @@ func (c *LocalController) repair(ctx context.Context, runID, normalizedPrompt st
 	if inspectErr != nil {
 		return run, inspectErr
 	}
-	deadline, _ := repairDeadlineAt(postBeginInspection.Timeline, time.Now().UTC())
+	deadline, _ := repairDeadlineAt(postBeginInspection.Timeline, c.repairNow())
 	repairCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	updated, continueErr := c.Continue(repairCtx, runID, &Decision{ChoiceID: "controller-normalized-review-findings", Instructions: normalizedPrompt})
@@ -1747,7 +1768,7 @@ func (c *LocalController) repair(ctx context.Context, runID, normalizedPrompt st
 			}
 			return stopped, continueErr
 		}
-		if repairDeadlineExceeded(recoveredInspection.Timeline, time.Now().UTC()) {
+		if repairDeadlineExceeded(recoveredInspection.Timeline, c.repairNow()) {
 			stopped, deadlineErr := c.persistExpiredRepairDeadline(updated)
 			if deadlineErr != nil {
 				return stopped, errors.Join(continueErr, deadlineErr)
@@ -1769,7 +1790,7 @@ func (c *LocalController) enforceRepairDeadline(ctx context.Context, run Run) (R
 	if repairDeadlineAnchorInvalid(inspection.Timeline) || (repairDeadlineAnchorRequired(run.State, inspection.Timeline) && !repairDeadlineAnchorIsValid(inspection.Timeline)) {
 		return c.persistInvalidRepairDeadline(run)
 	}
-	if !repairDeadlineExceeded(inspection.Timeline, time.Now().UTC()) {
+	if !repairDeadlineExceeded(inspection.Timeline, c.repairNow()) {
 		if ctx.Err() != nil {
 			return run, ctx.Err()
 		}
@@ -1801,7 +1822,7 @@ func (c *LocalController) boundRepairActionContext(ctx context.Context, run Run)
 		}
 		return ctx, func() {}, nil
 	}
-	if !time.Now().UTC().Before(deadline) {
+	if !c.repairNow().Before(deadline) {
 		_, deadlineErr = c.persistExpiredRepairDeadline(run)
 		return ctx, func() {}, deadlineErr
 	}
