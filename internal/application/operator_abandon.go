@@ -333,24 +333,32 @@ func worktreeEvidenceNonce(resource OwnedResource) string {
 }
 
 func cleanupAbandonedLocalResources(ctx context.Context, store RunStore, run Run, cleanup CleanupPort) error {
-	return cleanupAbandonedLocalResourcesWithLease(ctx, store, run, cleanup, "")
+	return cleanupAbandonedLocalResourcesWithLeaseTTL(ctx, store, run, cleanup, "", localLeaseTTL)
 }
 
-func renewAbandonLease(ctx context.Context, store RunStore, runID, owner string) error {
+func renewAbandonLease(ctx context.Context, store RunStore, runID, owner string, leaseTTL time.Duration) (time.Time, error) {
 	if strings.TrimSpace(owner) == "" {
-		return nil
+		return time.Time{}, nil
 	}
 	if cause := context.Cause(ctx); cause != nil {
-		return cause
+		return time.Time{}, cause
 	}
-	ok, err := store.RenewLease(ctx, runID, owner, time.Now().UTC().Add(localLeaseTTL))
+	expiresAt := time.Now().UTC().Add(leaseTTL)
+	ok, err := store.RenewLease(ctx, runID, owner, expiresAt)
 	if err != nil {
-		return fmt.Errorf("renew abandon run lease: %w", err)
+		return time.Time{}, fmt.Errorf("renew abandon run lease: %w", err)
 	}
 	if !ok {
-		return errors.New("abandon run lease ownership was lost")
+		return time.Time{}, errors.New("abandon run lease ownership was lost")
 	}
-	return nil
+	return expiresAt, nil
+}
+
+func abandonCleanupOperationContext(ctx context.Context, leaseOwner string, leaseExpiresAt time.Time) (context.Context, context.CancelFunc) {
+	if strings.TrimSpace(leaseOwner) == "" || leaseExpiresAt.IsZero() {
+		return ctx, func() {}
+	}
+	return context.WithDeadline(ctx, leaseExpiresAt)
 }
 
 const abandonCleanupLastErrorLimit = 512
@@ -412,7 +420,11 @@ func abandonCleanupFailure(ctx context.Context, store RunStore, delivery Deliver
 }
 
 func cleanupAbandonedLocalResourcesWithLease(ctx context.Context, store RunStore, run Run, cleanup CleanupPort, leaseOwner string) error {
-	if err := renewAbandonLease(ctx, store, run.ID, leaseOwner); err != nil {
+	return cleanupAbandonedLocalResourcesWithLeaseTTL(ctx, store, run, cleanup, leaseOwner, localLeaseTTL)
+}
+
+func cleanupAbandonedLocalResourcesWithLeaseTTL(ctx context.Context, store RunStore, run Run, cleanup CleanupPort, leaseOwner string, leaseTTL time.Duration) error {
+	if _, err := renewAbandonLease(ctx, store, run.ID, leaseOwner, leaseTTL); err != nil {
 		return err
 	}
 	inspection, err := store.Inspect(ctx, run.ID)
@@ -434,7 +446,7 @@ func cleanupAbandonedLocalResourcesWithLease(ctx context.Context, store RunStore
 			progress[record.Kind+"\x00"+record.Name] = record
 		}
 		if artifact, found := findAbandonResource(inspection.Resources, run.ID, "artifact_root", run.ArtifactRoot); found && artifact.Status != "deleted" {
-			if err := renewAbandonLease(ctx, store, run.ID, leaseOwner); err != nil {
+			if _, err := renewAbandonLease(ctx, store, run.ID, leaseOwner, leaseTTL); err != nil {
 				return err
 			}
 			key := artifact.Kind + "\x00" + artifact.Name
@@ -448,7 +460,7 @@ func cleanupAbandonedLocalResourcesWithLease(ctx context.Context, store RunStore
 			if resource.RunID != run.ID || resource.Status != "deleted" || (resource.Kind != "worktree" && resource.Kind != "branch") {
 				continue
 			}
-			if err := renewAbandonLease(ctx, store, run.ID, leaseOwner); err != nil {
+			if _, err := renewAbandonLease(ctx, store, run.ID, leaseOwner, leaseTTL); err != nil {
 				return err
 			}
 			key := resource.Kind + "\x00" + resource.Name
@@ -463,7 +475,7 @@ func cleanupAbandonedLocalResourcesWithLease(ctx context.Context, store RunStore
 		if item.resource.Status == "deleted" {
 			continue
 		}
-		if err := renewAbandonLease(ctx, store, run.ID, leaseOwner); err != nil {
+		if _, err := renewAbandonLease(ctx, store, run.ID, leaseOwner, leaseTTL); err != nil {
 			return err
 		}
 		if hasDelivery {
@@ -471,26 +483,29 @@ func cleanupAbandonedLocalResourcesWithLease(ctx context.Context, store RunStore
 				return err
 			}
 		}
-		if err := renewAbandonLease(ctx, store, run.ID, leaseOwner); err != nil {
+		leaseExpiresAt, err := renewAbandonLease(ctx, store, run.ID, leaseOwner, leaseTTL)
+		if err != nil {
 			if hasDelivery {
 				return abandonCleanupFailure(ctx, store, delivery, leaseOwner, CleanupRecord{RunID: run.ID, Kind: item.resource.Kind, Name: item.resource.Name}, err)
 			}
 			return err
 		}
 		var cleanupErr error
+		operationCtx, cancelOperation := abandonCleanupOperationContext(ctx, leaseOwner, leaseExpiresAt)
 		switch item.resource.Kind {
 		case "worktree":
-			cleanupErr = cleanup.RemoveWorktree(ctx, run.Repository, item.resource.Name, run.WorkingBranch, item.expectedSHA)
+			cleanupErr = cleanup.RemoveWorktree(operationCtx, run.Repository, item.resource.Name, run.WorkingBranch, item.expectedSHA)
 		case "branch":
-			cleanupErr = cleanup.DeleteLocalBranch(ctx, run.Repository, item.resource.Name, item.expectedSHA)
+			cleanupErr = cleanup.DeleteLocalBranch(operationCtx, run.Repository, item.resource.Name, item.expectedSHA)
 		}
+		cancelOperation()
 		if cleanupErr != nil {
 			if hasDelivery {
 				return abandonCleanupFailure(ctx, store, delivery, leaseOwner, CleanupRecord{RunID: run.ID, Kind: item.resource.Kind, Name: item.resource.Name}, cleanupErr)
 			}
 			return cleanupErr
 		}
-		if err := renewAbandonLease(ctx, store, run.ID, leaseOwner); err != nil {
+		if _, err := renewAbandonLease(ctx, store, run.ID, leaseOwner, leaseTTL); err != nil {
 			if hasDelivery {
 				return abandonCleanupFailure(ctx, store, delivery, leaseOwner, CleanupRecord{RunID: run.ID, Kind: item.resource.Kind, Name: item.resource.Name}, err)
 			}

@@ -68,8 +68,8 @@ func TestManualInterventionHasOnlyTheNarrowOwnedPushRecoveryEdge(t *testing.T) {
 	if !CanTransition(StateManualIntervention, StateApprovalReady) {
 		t.Fatal("owned push recovery must be able to restore the guarded push gate")
 	}
-	if !CanTransition(StateReceived, StateFailed) || !CanTransition(StateManualIntervention, StateFailed) {
-		t.Fatal("operator abandonment must have terminal failure edges")
+	if CanTransition(StateReceived, StateFailed) || CanTransition(StateManualIntervention, StateFailed) {
+		t.Fatal("operator abandonment must use its atomic application-level transition")
 	}
 	if CanTransition(StateManualIntervention, StatePushingBranch) || CanTransition(StateManualIntervention, StatePROpen) {
 		t.Fatal("manual intervention must not resume an external write state directly")

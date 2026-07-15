@@ -12,10 +12,12 @@ import (
 )
 
 type abandonCleanupFake struct {
-	calls         []string
-	err           error
-	afterWorktree func()
-	afterBranch   func()
+	calls             []string
+	err               error
+	afterWorktree     func()
+	afterBranch       func()
+	blockUntilContext bool
+	operationStarted  chan struct{}
 }
 
 type abandonCoordinatorStore struct {
@@ -36,20 +38,37 @@ func (s *abandonCoordinatorStore) AbandonAutomaticAdmission(_ context.Context, r
 	return s.run, false, nil
 }
 
-func (f *abandonCleanupFake) RemoveWorktree(context.Context, string, string, string, string) error {
+func (f *abandonCleanupFake) RemoveWorktree(ctx context.Context, _ string, _ string, _ string, _ string) error {
 	f.calls = append(f.calls, "worktree")
+	if f.blockUntilContext {
+		if f.operationStarted != nil {
+			close(f.operationStarted)
+		}
+		return waitForAbandonCleanupContext(ctx)
+	}
 	if f.afterWorktree != nil {
 		f.afterWorktree()
 	}
 	return f.err
 }
 
-func (f *abandonCleanupFake) DeleteLocalBranch(context.Context, string, string, string) error {
+func (f *abandonCleanupFake) DeleteLocalBranch(ctx context.Context, _ string, _ string, _ string) error {
 	f.calls = append(f.calls, "branch")
+	if f.blockUntilContext {
+		if f.operationStarted != nil {
+			close(f.operationStarted)
+		}
+		return waitForAbandonCleanupContext(ctx)
+	}
 	if f.afterBranch != nil {
 		f.afterBranch()
 	}
 	return f.err
+}
+
+func waitForAbandonCleanupContext(ctx context.Context) error {
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 func (f *abandonCleanupFake) DeleteRemoteBranch(context.Context, string, string, string) error {
@@ -160,6 +179,25 @@ func TestAbandonLocalCleanupStopsWhenLeaseIsLostBetweenResources(t *testing.T) {
 	}
 	if len(progress) != 1 || progress[0].Kind != "worktree" || progress[0].Status != "intent" {
 		t.Fatalf("lease loss audit=%+v", progress)
+	}
+}
+
+func TestAbandonLocalCleanupBoundsGitOperationByLeaseExpiry(t *testing.T) {
+	repository := LocalRepository{CanonicalRepository: "owner/repo", SourcePath: "/owned/source", OriginPath: "/owned/origin", BaseBranch: "main"}
+	run := abandonCleanupRun(t, repository)
+	evidence := `{"source_path":"/owned/source","origin_path":"/owned/origin","path":"/owned/worktree","branch":"ifan/one","base_branch":"main","base_sha":"base","nonce":"nonce"}`
+	store := &pushTestStore{run: run, leaseHeld: true, resources: []OwnedResource{{RunID: run.ID, Kind: "branch", Name: run.WorkingBranch, CreationEvidence: evidence, Status: "owned"}}}
+	cleanup := &abandonCleanupFake{blockUntilContext: true, operationStarted: make(chan struct{})}
+	err := cleanupAbandonedLocalResourcesWithLeaseTTL(context.Background(), store, run, cleanup, "abandon-owner", 20*time.Millisecond)
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("cleanup did not stop at the lease deadline: %v", err)
+	}
+	if len(cleanup.calls) != 1 || cleanup.calls[0] != "branch" {
+		t.Fatalf("cleanup calls=%v", cleanup.calls)
+	}
+	progress, progressErr := store.CleanupProgress(context.Background(), run.ID)
+	if progressErr != nil || len(progress) != 1 || progress[0].Status != "failed" {
+		t.Fatalf("cleanup progress=%+v err=%v", progress, progressErr)
 	}
 }
 
