@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/bootstrap"
 )
@@ -32,22 +33,35 @@ type launchAgentDoctorOutput struct {
 
 func controllerLaunchAgent(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: ifan-loop controller launchagent <render|doctor|validate> [options]")
+		return errors.New("usage: ifan-loop controller launchagent <build|render|install|doctor|validate|plist-validate|bootstrap|kickstart|status|bootout> [options]")
 	}
 	switch args[0] {
-	case "render":
+	case "build", "render":
 		return launchAgentRender(args[1:])
+	case "install":
+		return launchAgentInstall(args[1:])
 	case "doctor":
 		return launchAgentDoctor(args[1:], false)
 	case "validate":
 		return launchAgentDoctor(args[1:], true)
+	case "plist-validate":
+		return launchAgentPlistValidate(args[1:])
+	case "bootstrap":
+		return launchAgentBootstrap(args[1:])
+	case "kickstart":
+		return launchAgentKickstart(args[1:])
+	case "status":
+		return launchAgentStatus(args[1:])
+	case "bootout":
+		return launchAgentBootout(args[1:])
 	default:
-		return errors.New("usage: ifan-loop controller launchagent <render|doctor|validate> [options]")
+		return errors.New("usage: ifan-loop controller launchagent <build|render|install|doctor|validate|plist-validate|bootstrap|kickstart|status|bootout> [options]")
 	}
 }
 
 type launchAgentOptions struct {
-	binary, config, plist string
+	binary, config, plist, domain string
+	timeout                       time.Duration
 }
 
 func parseLaunchAgentOptions(name string, args []string) (launchAgentOptions, error) {
@@ -55,6 +69,8 @@ func parseLaunchAgentOptions(name string, args []string) (launchAgentOptions, er
 	binary := flags.String("binary", defaultInstalledBinary, "absolute installed controller binary")
 	config := configPathFlag(flags)
 	plist := flags.String("plist", "", "target user LaunchAgent plist path")
+	domain := flags.String("domain", "", "GUI launchd domain (default: gui/<current uid>)")
+	timeout := flags.Duration("timeout", defaultLaunchAgentControlTimeout, "maximum duration for one launchctl control step")
 	if err := flags.Parse(args); err != nil {
 		return launchAgentOptions{}, err
 	}
@@ -69,7 +85,29 @@ func parseLaunchAgentOptions(name string, args []string) (launchAgentOptions, er
 	if err != nil {
 		return launchAgentOptions{}, err
 	}
-	return launchAgentOptions{binary: *binary, config: configPath, plist: plistPath}, nil
+	domainValue, err := resolveLaunchAgentDomain(*domain)
+	if err != nil {
+		return launchAgentOptions{}, err
+	}
+	if *timeout <= 0 || *timeout > maxLaunchAgentControlTimeout {
+		return launchAgentOptions{}, errors.New("--timeout must be greater than zero and no more than 2m")
+	}
+	return launchAgentOptions{binary: *binary, config: configPath, plist: plistPath, domain: domainValue, timeout: *timeout}, nil
+}
+
+func resolveLaunchAgentDomain(override string) (string, error) {
+	if strings.TrimSpace(override) == "" {
+		return fmt.Sprintf("gui/%d", os.Getuid()), nil
+	}
+	if !strings.HasPrefix(override, "gui/") || strings.TrimPrefix(override, "gui/") == "" {
+		return "", errors.New("--domain must be a gui/<uid> domain")
+	}
+	for _, char := range strings.TrimPrefix(override, "gui/") {
+		if char < '0' || char > '9' {
+			return "", errors.New("--domain must be a gui/<uid> domain")
+		}
+	}
+	return override, nil
 }
 
 func resolveLaunchAgentPath(override string) (string, error) {

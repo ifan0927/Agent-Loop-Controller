@@ -66,14 +66,17 @@ Run only sanitized/read-only checks before loading the worker:
 ```
 
 Prepare and validate the plist as specified in
-[the LaunchAgent runbook](launchagent-worker.md). The controller does not
-create or overwrite a plist. Before installation, inspect the rendered file
-with `plutil -lint` and confirm the target plist is absent.
+[the LaunchAgent runbook](launchagent-worker.md). The controller's install step
+creates only an absent target plist and never overwrites an existing file.
+Before installation, inspect the rendered file with `plutil -lint` and confirm
+the target plist is absent.
 
 ## Execution
 
-1. Bootstrap and kickstart the exact validated LaunchAgent label. The worker
-   starts with no issue identifier.
+1. Run the separate bounded `launchagent bootstrap`, `status`, and
+   `kickstart` steps for the exact validated label. The worker starts with no
+   issue identifier; a timed-out step is operator attention and is not followed
+   by an assumed-success restart.
 2. Retain sanitized worker output. Observe one bounded Todo scan, one durable
    reservation, one Todo -> In Progress mutation, one run/worktree, and driver
    start.
@@ -100,7 +103,8 @@ synchronize it manually rather than modifying controller evidence.
 
 ## Stop, restore, and retain evidence
 
-After completion, boot out the test LaunchAgent and restore the test-only
+After completion, run the bounded `launchagent bootout` and `status` steps for
+the test LaunchAgent, then restore the test-only
 admission configuration as documented for the environment. Do not remove
 controller state, artifacts, credentials, or logs merely to make the run look
 clean.
