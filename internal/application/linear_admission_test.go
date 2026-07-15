@@ -297,6 +297,10 @@ func (failingAdmissionController) ContinueExpected(context.Context, string, doma
 	return Run{}, errors.New("unexpected continue")
 }
 
+func (failingAdmissionController) EnforceRepairDeadline(context.Context, string) (Run, error) {
+	return Run{}, nil
+}
+
 type concurrentAdmissionController struct {
 	run       Run
 	continued int
@@ -308,6 +312,10 @@ func (c concurrentAdmissionController) StartAuthorized(context.Context, LocalSta
 
 func (c concurrentAdmissionController) ContinueExpected(context.Context, string, domain.State, string, *Decision) (Run, error) {
 	c.continued++
+	return c.run, nil
+}
+
+func (c concurrentAdmissionController) EnforceRepairDeadline(context.Context, string) (Run, error) {
 	return c.run, nil
 }
 

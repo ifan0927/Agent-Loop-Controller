@@ -120,6 +120,7 @@ type RunResult struct {
 type LocalRunController interface {
 	StartAuthorized(context.Context, LocalStartInput, func(Run) error) (Run, error)
 	ContinueExpected(context.Context, string, domain.State, string, *Decision) (Run, error)
+	EnforceRepairDeadline(context.Context, string) (Run, error)
 }
 
 type CommandService struct {

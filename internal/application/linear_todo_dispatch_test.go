@@ -108,6 +108,15 @@ func (c *dispatchController) ContinueExpected(_ context.Context, runID string, e
 	return c.store.run, nil
 }
 
+func (c *dispatchController) EnforceRepairDeadline(_ context.Context, runID string) (Run, error) {
+	c.store.mu.Lock()
+	defer c.store.mu.Unlock()
+	if c.store.run.ID != runID {
+		return Run{}, errors.New("unexpected deadline preflight run")
+	}
+	return c.store.run, nil
+}
+
 type dispatchDriver struct {
 	mu      sync.Mutex
 	calls   []ProductionDriveCommand

@@ -114,6 +114,9 @@ func (c *serviceController) ContinueExpected(_ context.Context, _ string, expect
 	c.expected, c.key = expected, key
 	return c.run, nil
 }
+func (c *serviceController) EnforceRepairDeadline(_ context.Context, _ string) (Run, error) {
+	return c.run, nil
+}
 func (c *serviceController) RepairFindings(_ context.Context, _ string, _ []FindingRecord) (Run, error) {
 	c.continued++
 	return c.run, nil

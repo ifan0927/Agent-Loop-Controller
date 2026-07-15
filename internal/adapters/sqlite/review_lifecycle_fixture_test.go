@@ -299,6 +299,9 @@ func (c *fixtureController) StartAuthorized(ctx context.Context, input applicati
 func (c *fixtureController) ContinueExpected(ctx context.Context, runID string, _ domain.State, _ string, _ *application.Decision) (application.Run, error) {
 	return c.store.GetRun(ctx, runID)
 }
+func (c *fixtureController) EnforceRepairDeadline(ctx context.Context, runID string) (application.Run, error) {
+	return c.store.GetRun(ctx, runID)
+}
 func (c *fixtureController) RepairFindings(ctx context.Context, runID string, findings []application.FindingRecord) (application.Run, error) {
 	run, err := c.store.GetRun(ctx, runID)
 	if err != nil || run.State != domain.StateRepairing || len(findings) == 0 {
