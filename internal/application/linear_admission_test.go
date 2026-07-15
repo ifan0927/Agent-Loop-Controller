@@ -12,12 +12,15 @@ import (
 )
 
 type admissionReader struct {
-	source LinearTaskSource
-	calls  int
+	source          LinearTaskSource
+	calls           int
+	deadline        time.Time
+	deadlinePresent bool
 }
 
-func (r *admissionReader) ReadIssue(_ context.Context, identifier string) (LinearTaskSource, []LinearRequestObservation, error) {
+func (r *admissionReader) ReadIssue(ctx context.Context, identifier string) (LinearTaskSource, []LinearRequestObservation, error) {
 	r.calls++
+	r.deadline, r.deadlinePresent = ctx.Deadline()
 	source := r.source
 	source.Identifier = identifier
 	return source, []LinearRequestObservation{{Operation: "read_issue", ResponseDigest: "digest"}}, nil
@@ -301,6 +304,10 @@ func (failingAdmissionController) EnforceRepairDeadline(context.Context, string)
 	return Run{}, nil
 }
 
+func (failingAdmissionController) BoundRepairActionContext(ctx context.Context, _ string) (context.Context, context.CancelFunc, error) {
+	return ctx, func() {}, nil
+}
+
 type concurrentAdmissionController struct {
 	run       Run
 	continued int
@@ -317,6 +324,10 @@ func (c concurrentAdmissionController) ContinueExpected(context.Context, string,
 
 func (c concurrentAdmissionController) EnforceRepairDeadline(context.Context, string) (Run, error) {
 	return c.run, nil
+}
+
+func (c concurrentAdmissionController) BoundRepairActionContext(ctx context.Context, _ string) (context.Context, context.CancelFunc, error) {
+	return ctx, func() {}, nil
 }
 
 func TestLinearAdmissionRejectsIneligibleAndAmbiguousRepository(t *testing.T) {

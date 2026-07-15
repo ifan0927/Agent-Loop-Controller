@@ -190,7 +190,10 @@ the run to `manual_intervention` once with bounded, sanitized evidence through
 a short detached persistence context. Missing or malformed repair-anchor
 evidence fails closed to the same human gate. Caller cancellation remains
 resumable when the durable policy deadline has not elapsed. Production performs
-this local preflight before revalidating external Linear authority.
+this local preflight before revalidating external Linear authority and binds
+that read, plus the fresh-review findings handoff, to the same persisted
+deadline; detached reconciliation records expiry if either action crosses the
+boundary.
 
 `fresh_review -> pr_open` is deliberately absent from the generic state topology.
 The application gate authorizes it only when the review verdict is `pass`, the

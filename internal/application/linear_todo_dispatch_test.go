@@ -117,6 +117,10 @@ func (c *dispatchController) EnforceRepairDeadline(_ context.Context, runID stri
 	return c.store.run, nil
 }
 
+func (c *dispatchController) BoundRepairActionContext(ctx context.Context, _ string) (context.Context, context.CancelFunc, error) {
+	return ctx, func() {}, nil
+}
+
 type dispatchDriver struct {
 	mu      sync.Mutex
 	calls   []ProductionDriveCommand

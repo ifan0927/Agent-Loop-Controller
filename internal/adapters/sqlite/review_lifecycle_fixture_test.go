@@ -302,6 +302,9 @@ func (c *fixtureController) ContinueExpected(ctx context.Context, runID string, 
 func (c *fixtureController) EnforceRepairDeadline(ctx context.Context, runID string) (application.Run, error) {
 	return c.store.GetRun(ctx, runID)
 }
+func (c *fixtureController) BoundRepairActionContext(ctx context.Context, _ string) (context.Context, context.CancelFunc, error) {
+	return ctx, func() {}, nil
+}
 func (c *fixtureController) RepairFindings(ctx context.Context, runID string, findings []application.FindingRecord) (application.Run, error) {
 	run, err := c.store.GetRun(ctx, runID)
 	if err != nil || run.State != domain.StateRepairing || len(findings) == 0 {

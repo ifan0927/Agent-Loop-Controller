@@ -121,6 +121,7 @@ type LocalRunController interface {
 	StartAuthorized(context.Context, LocalStartInput, func(Run) error) (Run, error)
 	ContinueExpected(context.Context, string, domain.State, string, *Decision) (Run, error)
 	EnforceRepairDeadline(context.Context, string) (Run, error)
+	BoundRepairActionContext(context.Context, string) (context.Context, context.CancelFunc, error)
 }
 
 type CommandService struct {

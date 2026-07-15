@@ -74,19 +74,43 @@ func NewProductionCoordinator(admission *LinearAdmissionService, controller Loca
 }
 
 func (c *ProductionCoordinator) Continue(ctx context.Context, command ProductionContinueCommand) (ProductionResult, error) {
+	var cancelAction context.CancelFunc = func() {}
+	defer func() { cancelAction() }()
 	if command.RunID != "" {
 		if _, preflightErr := c.controller.EnforceRepairDeadline(ctx, command.RunID); preflightErr != nil {
 			return ProductionResult{}, preflightErr
 		}
+		var err error
+		ctx, cancelAction, err = c.controller.BoundRepairActionContext(ctx, command.RunID)
+		if err != nil {
+			return ProductionResult{}, err
+		}
 	}
 	run, err := c.admission.Revalidate(ctx, LinearRevalidateCommand{Requester: command.Requester, RunID: command.RunID, Repository: command.Repository, ExpectedState: command.ExpectedState, IdempotencyKey: command.IdempotencyKey})
 	if err != nil {
+		if command.RunID != "" {
+			_, deadlineErr := c.controller.EnforceRepairDeadline(ctx, command.RunID)
+			return ProductionResult{}, errors.Join(err, deadlineErr)
+		}
 		return ProductionResult{}, err
+	}
+	if command.RunID != "" {
+		checked, deadlineErr := c.controller.EnforceRepairDeadline(ctx, command.RunID)
+		if deadlineErr != nil {
+			return ProductionResult{}, deadlineErr
+		}
+		if checked.ID != "" {
+			run = checked
+		}
 	}
 	action, reason := productionNextAction(run.State)
 	if run.State == domain.StateRepairing {
 		inspection, inspectErr := c.store.Inspect(ctx, run.ID)
 		if inspectErr != nil {
+			if command.RunID != "" {
+				_, deadlineErr := c.controller.EnforceRepairDeadline(ctx, command.RunID)
+				return ProductionResult{}, errors.Join(inspectErr, deadlineErr)
+			}
 			return ProductionResult{}, classifyServiceError(inspectErr)
 		}
 		repairer, ok := c.controller.(findingRepairController)
@@ -95,6 +119,10 @@ func (c *ProductionCoordinator) Continue(ctx context.Context, command Production
 		}
 		repaired, repairErr := repairer.RepairFindings(ctx, run.ID, inspection.Findings)
 		if repairErr != nil {
+			if command.RunID != "" {
+				_, deadlineErr := c.controller.EnforceRepairDeadline(ctx, command.RunID)
+				return ProductionResult{}, errors.Join(repairErr, deadlineErr)
+			}
 			return ProductionResult{}, repairErr
 		}
 		next, nextReason := productionNextAction(repaired.State)
@@ -105,6 +133,10 @@ func (c *ProductionCoordinator) Continue(ctx context.Context, command Production
 	}
 	result, err := c.commands.Continue(ctx, ContinueCommand{Requester: command.Requester, RunID: command.RunID, Repository: command.Repository, ExpectedState: command.ExpectedState, IdempotencyKey: command.IdempotencyKey, Decision: command.Decision})
 	if err != nil {
+		if command.RunID != "" {
+			_, deadlineErr := c.controller.EnforceRepairDeadline(ctx, command.RunID)
+			return ProductionResult{}, errors.Join(err, deadlineErr)
+		}
 		return ProductionResult{}, err
 	}
 	if result.Run.State == domain.StateFreshReview {

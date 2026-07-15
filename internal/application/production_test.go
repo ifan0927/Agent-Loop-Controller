@@ -55,6 +55,18 @@ func (c *repairDeadlinePreflightController) EnforceRepairDeadline(context.Contex
 	return c.run, c.preflightErr
 }
 
+type boundedProductionController struct {
+	serviceController
+	boundCalls int
+	deadline   time.Time
+}
+
+func (c *boundedProductionController) BoundRepairActionContext(ctx context.Context, _ string) (context.Context, context.CancelFunc, error) {
+	c.boundCalls++
+	bounded, cancel := context.WithDeadline(ctx, c.deadline)
+	return bounded, cancel, nil
+}
+
 func TestProductionContinueRunsRepairDeadlinePreflightBeforeLinear(t *testing.T) {
 	repository := LocalRepository{CanonicalRepository: "owner/repo", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
 	reader := &admissionReader{source: validLinearSource()}
@@ -77,6 +89,33 @@ func TestProductionContinueRunsRepairDeadlinePreflightBeforeLinear(t *testing.T)
 	_, err = coordinator.Continue(context.Background(), ProductionContinueCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey})
 	if !errors.Is(err, preflightErr) || controller.preflightCalls != 1 || reader.calls != 0 || controller.continued != 0 {
 		t.Fatalf("err=%v preflightCalls=%d linearReads=%d continues=%d", err, controller.preflightCalls, reader.calls, controller.continued)
+	}
+}
+
+func TestProductionContinueBoundsLinearAuthorityReadByRepairDeadline(t *testing.T) {
+	repository := LocalRepository{CanonicalRepository: "owner/repo", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
+	reader := &admissionReader{source: validLinearSource()}
+	snapshot, _, err := admitLinearTask(reader.source, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, State: domain.StateExecuting})
+	store := &admissionStore{serviceStore: serviceStore{run: run}}
+	admission, err := NewLinearAdmissionService(reader, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, store, &admissionController{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().UTC().Add(time.Hour)
+	controller := &boundedProductionController{serviceController: serviceController{run: run}, deadline: deadline}
+	coordinator, err := NewProductionCoordinator(admission, controller, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.Continue(context.Background(), ProductionContinueCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}); err != nil {
+		t.Fatal(err)
+	}
+	if controller.boundCalls != 1 || !reader.deadlinePresent || !reader.deadline.Equal(deadline) {
+		t.Fatalf("boundCalls=%d deadlinePresent=%t readerDeadline=%s expected=%s", controller.boundCalls, reader.deadlinePresent, reader.deadline, deadline)
 	}
 }
 

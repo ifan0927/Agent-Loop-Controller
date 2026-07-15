@@ -117,6 +117,9 @@ func (c *serviceController) ContinueExpected(_ context.Context, _ string, expect
 func (c *serviceController) EnforceRepairDeadline(_ context.Context, _ string) (Run, error) {
 	return c.run, nil
 }
+func (c *serviceController) BoundRepairActionContext(ctx context.Context, _ string) (context.Context, context.CancelFunc, error) {
+	return ctx, func() {}, nil
+}
 func (c *serviceController) RepairFindings(_ context.Context, _ string, _ []FindingRecord) (Run, error) {
 	c.continued++
 	return c.run, nil
