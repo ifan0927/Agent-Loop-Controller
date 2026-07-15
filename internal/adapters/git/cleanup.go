@@ -80,7 +80,7 @@ func (c Cleanup) DeleteLocalBranch(ctx context.Context, repository, branch, expe
 	ref := "refs/heads/" + branch
 	actual, err := c.run(ctx, c.SourcePath, "rev-parse", "--verify", ref+"^{commit}")
 	if err != nil {
-		if strings.Contains(err.Error(), "exit status 128") {
+		if isGitExit(err, 128) {
 			return nil
 		}
 		return err

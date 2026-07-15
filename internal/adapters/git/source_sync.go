@@ -1,11 +1,9 @@
 package git
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -65,7 +63,7 @@ type SourceSyncResult struct {
 // SourceSynchronizer advances a configured source checkout only by a guarded
 // exact fast-forward. It is deliberately independent of cleanup orchestration.
 type SourceSynchronizer struct {
-	Binary string
+	Workspace
 
 	// run and afterFetch are private deterministic test seams. Production uses
 	// the argv-only OS command path and has no callback.
@@ -265,29 +263,9 @@ func (s SourceSynchronizer) isAncestor(ctx context.Context, directory, ancestor,
 	return false, err
 }
 
-type gitCommandError struct{ exitCode int }
-
-func (e gitCommandError) Error() string { return "git command failed" }
-
 func (s SourceSynchronizer) command(ctx context.Context, directory string, args ...string) (string, error) {
 	if s.run != nil {
 		return s.run(ctx, directory, args...)
 	}
-	binary := s.Binary
-	if strings.TrimSpace(binary) == "" {
-		binary = "git"
-	}
-	all := append([]string{"-c", "core.hooksPath=/dev/null", "-c", "rebase.autoStash=false", "-c", "merge.autoStash=false"}, args...)
-	command := exec.CommandContext(ctx, binary, all...)
-	command.Dir = directory
-	var stdout, stderr bytes.Buffer
-	command.Stdout, command.Stderr = &stdout, &stderr
-	if err := command.Run(); err != nil {
-		var exitError *exec.ExitError
-		if errors.As(err, &exitError) {
-			return "", gitCommandError{exitCode: exitError.ExitCode()}
-		}
-		return "", errors.New("git command failed")
-	}
-	return stdout.String(), nil
+	return s.Workspace.run(ctx, directory, args...)
 }

@@ -193,6 +193,32 @@ timeouts, state transitions, evidence, merge, and cleanup. Codex edits and tests
 inside the assigned worktree and returns structured semantic outcomes. Codex does
 not write Linear or GitHub state during implementation.
 
+### Managed Git runtime
+
+Controller-owned Git workspace operations and source-checkout synchronization use
+the same managed process boundary as Codex and verifiers. Each operation supplies
+an explicit Git binary, working directory, argv, cancellation context, exclusive
+stdout/stderr capture leaves, and the controller-managed PATH. It does not invoke
+a shell or inherit the operator's interactive shell profile.
+
+The Git runtime uses a minimal environment allowlist: only the non-secret `HOME`
+value is retained when present, while PATH is always the fixed managed PATH and
+all other ambient variables are omitted. It disables system/global configuration
+and interactive prompts, disables hooks and autostash, clears credential helpers,
+and supplies a fixed non-secret controller author/committer identity. Linear,
+GitHub, SSH-agent, askpass, dynamic-loader, and Git config injection channels
+therefore cannot enter the child environment. Process start,
+interruption, invalid-result, and non-zero exit outcomes are represented by a
+sanitized typed error; raw Git stderr, environment values, and arbitrary argv are
+never copied into controller errors. Exit status checks use the typed outcome,
+not string matching on process error text.
+
+The narrow generic Git argv seam is still argv-only and accepts only the Git
+subcommand arguments supplied by controller code. Task text and external command
+strings are not interpolated into a shell command. Worktree provisioning,
+candidate/repair commits, exact-head recovery, cleanup, push preconditions, and
+source synchronization therefore share one runtime policy.
+
 ## Delivery driver and human gates
 
 The worker normally admits the durable run and starts its long-lived delivery

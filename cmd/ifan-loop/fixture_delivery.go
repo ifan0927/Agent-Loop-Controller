@@ -9,7 +9,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -390,7 +389,7 @@ func fixturePush(ctx context.Context, store *sqlitestore.Store, run application.
 	if err != nil {
 		return err
 	}
-	remote, err := (gitadapter.Publisher{Workspace: gitadapter.Workspace{}}).RemoteSHA(ctx, run.WorktreePath, run.WorkingBranch)
+	remote, err := (gitadapter.Publisher{Workspace: gitadapter.Workspace{Process: processadapter.OSRunner{}}}).RemoteSHA(ctx, run.WorktreePath, run.WorkingBranch)
 	if err != nil {
 		return err
 	}
@@ -408,7 +407,7 @@ func fixturePush(ctx context.Context, store *sqlitestore.Store, run application.
 		remote = ""
 	}
 	if remote == "" {
-		evidence, pushErr := (gitadapter.Publisher{Workspace: gitadapter.Workspace{}, Process: processadapter.OSRunner{}}).Push(ctx, run.WorktreePath, run.WorkingBranch, run.CandidateHead, "", run.ArtifactRoot)
+		evidence, pushErr := (gitadapter.Publisher{Workspace: gitadapter.Workspace{Process: processadapter.OSRunner{}}, Process: processadapter.OSRunner{}}).Push(ctx, run.WorktreePath, run.WorkingBranch, run.CandidateHead, "", run.ArtifactRoot)
 		side.StdoutPath = evidence.Stdout
 		side.StderrPath = evidence.Stderr
 		if pushErr != nil {
@@ -797,11 +796,8 @@ func validateFixtureCleanupOwnership(run application.Run, repo fixtureRepository
 	return nil
 }
 func runCommand(directory, program string, args ...string) (string, error) {
-	command := exec.Command(program, args...)
-	command.Dir = directory
-	output, err := command.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("%s %v: %w: %s", program, args, err, output)
+	if program != "git" {
+		return "", errors.New("fixture command must use managed Git runtime")
 	}
-	return string(output), nil
+	return (gitadapter.Workspace{Process: processadapter.OSRunner{}}).Run(context.Background(), directory, args...)
 }

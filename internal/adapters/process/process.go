@@ -22,6 +22,10 @@ type Spec struct {
 	StderrPath   string
 	MustNotExist []string
 	ExcludedEnv  []string
+	Environment  []string
+	// EnvironmentAllowlist retains only these inherited names before fixed
+	// overrides are applied. PATH is always controller-managed.
+	EnvironmentAllowlist []string
 }
 
 // Outcome records whether the child process reached a waitable execution
@@ -67,7 +71,8 @@ type OSRunner struct {
 	InterruptGrace time.Duration
 }
 
-const managedCommandPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+// ManagedCommandPath is the controller-owned search path for child binaries.
+const ManagedCommandPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 func (r OSRunner) Run(ctx context.Context, spec Spec) (Result, error) {
 	return r.run(ctx, spec, os.Environ())
@@ -98,7 +103,12 @@ func (r OSRunner) run(ctx context.Context, spec Spec, environment []string) (Res
 	}
 	defer stderrFile.Close()
 
-	commandEnvironment := controllerEnvironment(environment, spec.ExcludedEnv)
+	baseEnvironment := environment
+	if len(spec.EnvironmentAllowlist) > 0 {
+		baseEnvironment = restrictEnvironment(environment, spec.EnvironmentAllowlist, spec.ExcludedEnv)
+	}
+	commandEnvironment := controllerEnvironment(baseEnvironment, spec.ExcludedEnv)
+	commandEnvironment = applyEnvironmentOverrides(commandEnvironment, spec.ExcludedEnv, spec.Environment)
 	program, err := resolveProgram(spec.Program, commandEnvironment)
 	if err != nil {
 		initial.FailureCategory = FailureStart
@@ -236,10 +246,67 @@ func controllerEnvironment(environment, excluded []string) []string {
 		if !strings.HasPrefix(value, "PATH=") {
 			continue
 		}
-		filtered[index] = "PATH=" + mergePath(managedCommandPath, strings.TrimPrefix(value, "PATH="))
+		filtered[index] = "PATH=" + mergePath(ManagedCommandPath, strings.TrimPrefix(value, "PATH="))
 		return filtered
 	}
-	return append(filtered, "PATH="+managedCommandPath)
+	return append(filtered, "PATH="+ManagedCommandPath)
+}
+
+func applyEnvironmentOverrides(environment, excluded, overrides []string) []string {
+	blocked := make(map[string]struct{}, len(excluded))
+	for _, name := range excluded {
+		blocked[name] = struct{}{}
+	}
+	result := append([]string(nil), environment...)
+	for _, value := range overrides {
+		name, _, found := strings.Cut(value, "=")
+		if !found || name == "" {
+			continue
+		}
+		if name == "PATH" {
+			continue
+		}
+		if _, reject := blocked[name]; reject {
+			continue
+		}
+		filtered := result[:0]
+		for _, existing := range result {
+			existingName, _, existingFound := strings.Cut(existing, "=")
+			if !existingFound || existingName != name {
+				filtered = append(filtered, existing)
+			}
+		}
+		result = append(filtered, value)
+	}
+	return result
+}
+
+func restrictEnvironment(environment, allowlist, excluded []string) []string {
+	allowed := make(map[string]struct{}, len(allowlist))
+	for _, name := range allowlist {
+		if name != "" && name != "PATH" {
+			allowed[name] = struct{}{}
+		}
+	}
+	blocked := make(map[string]struct{}, len(excluded))
+	for _, name := range excluded {
+		blocked[name] = struct{}{}
+	}
+	filtered := make([]string, 0, len(allowed))
+	for _, value := range environment {
+		name, _, found := strings.Cut(value, "=")
+		if !found {
+			continue
+		}
+		if _, ok := allowed[name]; !ok {
+			continue
+		}
+		if _, reject := blocked[name]; reject {
+			continue
+		}
+		filtered = append(filtered, value)
+	}
+	return filtered
 }
 
 func mergePath(prefix, current string) string {

@@ -53,7 +53,7 @@ func (p Publisher) RemoteSHA(ctx context.Context, workspace, branch string) (str
 	}
 	value, err := p.Workspace.run(ctx, workspace, "ls-remote", "--exit-code", "origin", "refs/heads/"+branch)
 	if err != nil {
-		if strings.Contains(err.Error(), "exit status 2") {
+		if isGitExit(err, 2) {
 			return "", nil
 		}
 		return "", err

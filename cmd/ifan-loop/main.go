@@ -367,11 +367,11 @@ func driveProductionRun(ctx context.Context, loaded bootstrap.Bootstrap, store *
 		GitHubReader:       github,
 		ReviewCommentReply: githubReplyAdapter{client: replyClient, observations: &replyObservations, mu: &replyMu},
 		ApprovalValidator:  validator,
-		BranchPublisher:    productionPushAdapter{publisher: gitadapter.Publisher{Workspace: gitadapter.Workspace{}, Process: processadapter.OSRunner{}}},
+		BranchPublisher:    productionPushAdapter{publisher: gitadapter.Publisher{Workspace: gitadapter.Workspace{Process: processadapter.OSRunner{}}, Process: processadapter.OSRunner{}}},
 		PullRequestOpener:  writeClient,
 		SquashMerger:       github,
-		CleanupPort:        gitadapter.Cleanup{Workspace: gitadapter.Workspace{}, SourcePath: repository.SourcePath, OriginPath: repository.OriginPath},
-		SourceSyncPort:     sourceSyncAdapter{sync: gitadapter.SourceSynchronizer{}},
+		CleanupPort:        gitadapter.Cleanup{Workspace: gitadapter.Workspace{Process: processadapter.OSRunner{}}, SourcePath: repository.SourcePath, OriginPath: repository.OriginPath},
+		SourceSyncPort:     sourceSyncAdapter{sync: gitadapter.SourceSynchronizer{Workspace: gitadapter.Workspace{Process: processadapter.OSRunner{}}}},
 	}, policy, nil)
 	if err != nil {
 		return application.ProductionDriveResult{}, err
@@ -489,7 +489,7 @@ func controllerPush(args []string) error {
 		return err
 	}
 	validator := newLocalController(store, loaded.Controller.CodexBinary, filepath.Dir(command.run.WorktreePath))
-	publisher := productionPushAdapter{publisher: gitadapter.Publisher{Workspace: gitadapter.Workspace{}, Process: processadapter.OSRunner{}}}
+	publisher := productionPushAdapter{publisher: gitadapter.Publisher{Workspace: gitadapter.Workspace{Process: processadapter.OSRunner{}}, Process: processadapter.OSRunner{}}}
 	ctx, cancel := localContext(loaded.Controller.RunTimeout)
 	defer cancel()
 	result, err := coordinator.Push(ctx, application.ProductionPushCommand{Requester: command.requester, RunID: command.run.ID, Repository: command.repository, ExpectedState: command.expectedState, IdempotencyKey: command.idempotencyKey}, validator, publisher)
@@ -639,10 +639,10 @@ func controllerCleanup(args []string) error {
 	if err := json.Unmarshal([]byte(command.run.RepositoryConfigJSON), &repository); err != nil {
 		return application.ClassifyError(errors.New("persisted repository authority is invalid"))
 	}
-	adapter := gitadapter.Cleanup{Workspace: gitadapter.Workspace{}, SourcePath: repository.SourcePath, OriginPath: repository.OriginPath}
+	adapter := gitadapter.Cleanup{Workspace: gitadapter.Workspace{Process: processadapter.OSRunner{}}, SourcePath: repository.SourcePath, OriginPath: repository.OriginPath}
 	ctx, cancel := localContext(loaded.Controller.RunTimeout)
 	defer cancel()
-	result, err := coordinator.Cleanup(ctx, application.ProductionCleanupCommand{Requester: command.requester, RunID: command.run.ID, Repository: command.repository, ExpectedState: command.expectedState, IdempotencyKey: command.idempotencyKey}, adapter, sourceSyncAdapter{sync: gitadapter.SourceSynchronizer{}})
+	result, err := coordinator.Cleanup(ctx, application.ProductionCleanupCommand{Requester: command.requester, RunID: command.run.ID, Repository: command.repository, ExpectedState: command.expectedState, IdempotencyKey: command.idempotencyKey}, adapter, sourceSyncAdapter{sync: gitadapter.SourceSynchronizer{Workspace: gitadapter.Workspace{Process: processadapter.OSRunner{}}}})
 	if err != nil {
 		return err
 	}
@@ -1263,10 +1263,10 @@ func (w commandWorktrees) ValidateOwned(ctx context.Context, r application.Workt
 
 func newLocalController(store application.RunStore, codexBinary, worktreeRoot string) *application.LocalController {
 	process := processadapter.OSRunner{}
-	git := gitadapter.Workspace{}
+	git := gitadapter.Workspace{Process: process}
 	registry := verifier.NewRegistry(localregistry.BuiltinVerifierCommands(), process, git)
 	executor := codexadapter.NewExecutor(process, codexBinary)
-	return application.NewLocalController(store, commandWorktrees{gitadapter.WorktreeManager{}}, executor, registry, git, codexBinary, worktreeRoot)
+	return application.NewLocalController(store, commandWorktrees{gitadapter.WorktreeManager{Workspace: git}}, executor, registry, git, codexBinary, worktreeRoot)
 }
 func localContext(timeout time.Duration) (context.Context, context.CancelFunc) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -1310,7 +1310,7 @@ func spike(args []string) error {
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
 	process := processadapter.OSRunner{}
-	git := gitadapter.Workspace{}
+	git := gitadapter.Workspace{Process: process}
 	registry := verifier.NewRegistry(map[string]verifier.Command{
 		"fixture-go-test": {Program: "go", Args: []string{"test", "./..."}},
 	}, process, git)

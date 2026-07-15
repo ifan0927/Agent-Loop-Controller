@@ -92,7 +92,7 @@ func TestWorktreeManagerBindsCanonicalGitHubRemoteIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	wrapper := filepath.Join(root, "git-wrapper")
-	script := "#!/bin/sh\nif [ \"$1\" = remote ] && [ \"$2\" = get-url ] && [ \"$3\" = origin ]; then\n  printf '%s\\n' 'git@github.com:owner/repo.git'\n  exit 0\nfi\nexec \"" + gitBinary + "\" \"$@\"\n"
+	script := "#!/bin/sh\nwhile [ \"$1\" = -c ]; do shift 2; done\nif [ \"$1\" = remote ] && [ \"$2\" = get-url ] && [ \"$3\" = origin ]; then\n  printf '%s\\n' 'git@github.com:owner/repo.git'\n  exit 0\nfi\nexec \"" + gitBinary + "\" \"$@\"\n"
 	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}

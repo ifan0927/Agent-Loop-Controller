@@ -135,13 +135,62 @@ func TestOSRunnerExcludesConfiguredEnvironment(t *testing.T) {
 	}
 }
 
+func TestOSRunnerAppliesManagedEnvironmentOverrides(t *testing.T) {
+	t.Setenv("GIT_CONFIG_GLOBAL", "ambient-config")
+	t.Setenv("GIT_AUTHOR_NAME", "ambient-author")
+	directory := t.TempDir()
+	result, err := (OSRunner{}).Run(context.Background(), Spec{
+		Program: os.Args[0], Args: []string{"-test.run=TestProcessHelper", "--", "managed-environment"},
+		StdoutPath: filepath.Join(directory, "stdout"), StderrPath: filepath.Join(directory, "stderr"),
+		Environment: []string{"GIT_CONFIG_GLOBAL=/dev/null", "GIT_AUTHOR_NAME=managed-author"},
+	})
+	if err != nil || !result.Succeeded() {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	data, err := os.ReadFile(filepath.Join(directory, "stdout"))
+	if err != nil || string(data) != "/dev/null\nmanaged-author\n" {
+		t.Fatalf("stdout=%q err=%v", data, err)
+	}
+}
+
+func TestOSRunnerRestrictsEnvironmentToAllowlist(t *testing.T) {
+	t.Setenv("HOME", "/managed-home")
+	t.Setenv("RETAINED_SECRET", "must-not-enter")
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	directory := t.TempDir()
+	result, err := (OSRunner{}).Run(context.Background(), Spec{
+		Program:              os.Args[0],
+		Args:                 []string{"-test.run=TestProcessHelper", "--", "allowlist-environment"},
+		StdoutPath:           filepath.Join(directory, "stdout"),
+		StderrPath:           filepath.Join(directory, "stderr"),
+		EnvironmentAllowlist: []string{"HOME"},
+	})
+	if err != nil || !result.Succeeded() {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	data, err := os.ReadFile(filepath.Join(directory, "stdout"))
+	if err != nil || string(data) != "/managed-home\nabsent\nabsent\n"+ManagedCommandPath+"\n" {
+		t.Fatalf("stdout=%q err=%v", data, err)
+	}
+}
+
 func TestControllerEnvironmentPrependsManagedCommandPath(t *testing.T) {
 	environment := controllerEnvironment([]string{"PATH=/custom/bin:/usr/bin", "RETAIN=1"}, nil)
-	if got, want := environment[0], "PATH="+managedCommandPath+":/custom/bin"; got != want {
+	if got, want := environment[0], "PATH="+ManagedCommandPath+":/custom/bin"; got != want {
 		t.Fatalf("PATH = %q, want %q", got, want)
 	}
 	if got := environment[1]; got != "RETAIN=1" {
 		t.Fatalf("retained environment = %q", got)
+	}
+}
+
+func TestEnvironmentOverridesCannotReplaceManagedPath(t *testing.T) {
+	environment := applyEnvironmentOverrides([]string{"PATH=" + ManagedCommandPath, "VALUE=old"}, nil, []string{"PATH=/unsafe", "VALUE=new"})
+	if got := environment[0]; got != "PATH="+ManagedCommandPath {
+		t.Fatalf("PATH override escaped managed runtime: %q", got)
+	}
+	if got := environment[1]; got != "VALUE=new" {
+		t.Fatalf("environment override = %q", got)
 	}
 }
 
@@ -186,6 +235,24 @@ func TestProcessHelper(t *testing.T) {
 			} else {
 				fmt.Println("absent")
 			}
+			os.Exit(0)
+		case "managed-environment":
+			fmt.Println(os.Getenv("GIT_CONFIG_GLOBAL"))
+			fmt.Println(os.Getenv("GIT_AUTHOR_NAME"))
+			os.Exit(0)
+		case "allowlist-environment":
+			fmt.Println(os.Getenv("HOME"))
+			if _, found := os.LookupEnv("RETAINED_SECRET"); found {
+				fmt.Println("present")
+			} else {
+				fmt.Println("absent")
+			}
+			if _, found := os.LookupEnv("GIT_CONFIG_COUNT"); found {
+				fmt.Println("present")
+			} else {
+				fmt.Println("absent")
+			}
+			fmt.Println(os.Getenv("PATH"))
 			os.Exit(0)
 		}
 	}

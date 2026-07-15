@@ -288,7 +288,7 @@ func TestSourceSynchronizerDisablesHostileMergeAutostash(t *testing.T) {
 	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	result, err := (SourceSynchronizer{Binary: wrapper}).Sync(context.Background(), fixture.request())
+	result, err := (SourceSynchronizer{Workspace: Workspace{Binary: wrapper}}).Sync(context.Background(), fixture.request())
 	if err != nil || result.Status != SourceSyncSynced || result.Outcome != SourceSyncFastForwarded {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
