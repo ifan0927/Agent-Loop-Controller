@@ -61,7 +61,7 @@ func (p Preflighter) Run(ctx context.Context, artifacts string) (PreflightEviden
 		ExcludedEnv: controllerManagedExcludedEnvironment,
 	})
 	if err != nil {
-		return PreflightEvidence{}, fmt.Errorf("codex version: %s", processadapter.SanitizeError(err))
+		return PreflightEvidence{}, newProcessFailure("version", processadapter.NormalizeResult(version, err))
 	}
 	version = processadapter.NormalizeResult(version, nil)
 	if !version.Valid() {
@@ -77,7 +77,7 @@ func (p Preflighter) Run(ctx context.Context, artifacts string) (PreflightEviden
 		ExcludedEnv: controllerManagedExcludedEnvironment,
 	})
 	if err != nil {
-		return PreflightEvidence{}, fmt.Errorf("codex exec help: %s", processadapter.SanitizeError(err))
+		return PreflightEvidence{}, newProcessFailure("exec_help", processadapter.NormalizeResult(help, err))
 	}
 	help = processadapter.NormalizeResult(help, nil)
 	if !help.Valid() {
@@ -104,7 +104,7 @@ func (p Preflighter) Run(ctx context.Context, artifacts string) (PreflightEviden
 		ExcludedEnv: controllerManagedExcludedEnvironment,
 	})
 	if err != nil {
-		return PreflightEvidence{}, fmt.Errorf("codex exec resume help: %s", processadapter.SanitizeError(err))
+		return PreflightEvidence{}, newProcessFailure("exec_resume_help", processadapter.NormalizeResult(resumeHelp, err))
 	}
 	resumeHelp = processadapter.NormalizeResult(resumeHelp, nil)
 	if !resumeHelp.Valid() {

@@ -797,7 +797,10 @@ func TestMigratesLegacyCodeRabbitApprovalColumnWithoutLosingApproval(t *testing.
 	if _, err := store.db.ExecContext(ctx, `ALTER TABLE verifications DROP COLUMN failure_category`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (12,13,14,15,16,17,18,19)`); err != nil {
+	if _, err := store.db.ExecContext(ctx, `DROP TABLE automatic_retry_schedules`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (12,13,14,15,16,17,18,19,20,21)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE trusted_review_feedback_conflicts`); err != nil {

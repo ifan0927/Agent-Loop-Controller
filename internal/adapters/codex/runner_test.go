@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 type fakeProcess struct {
 	result      processadapter.Result
+	err         error
 	lastMessage string
 }
 
@@ -24,7 +26,23 @@ func (f fakeProcess) Run(_ context.Context, spec processadapter.Spec) (processad
 			}
 		}
 	}
-	return f.result, nil
+	return f.result, f.err
+}
+
+func TestRunnerPreservesTypedProcessStartFailure(t *testing.T) {
+	artifacts, spec := runnerFixture(t)
+	runner := NewRunner(fakeProcess{
+		result: processadapter.Result{Outcome: processadapter.OutcomeNotStarted, FailureCategory: processadapter.FailureStart},
+		err:    processadapter.NewFailure(processadapter.FailureStart),
+	})
+	if _, err := runner.Implementation(context.Background(), spec, artifacts); err == nil {
+		t.Fatal("process start failure must be returned")
+	} else {
+		var failure ProcessFailureError
+		if !errors.As(err, &failure) || failure.Category != processadapter.FailureStart || failure.AutomaticRetryFailureClass() != "process_start" {
+			t.Fatalf("error=%T %v", err, err)
+		}
+	}
 }
 
 func TestRunnerToleratesUnknownJSONLEvents(t *testing.T) {

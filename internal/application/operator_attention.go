@@ -26,6 +26,7 @@ const (
 	OperatorAttentionCandidateScan         = "candidate_scan_incomplete"
 	OperatorAttentionSchedulerLease        = "scheduler_lease_attention"
 	OperatorAttentionAdmissionAuthority    = "admission_authority_conflict"
+	OperatorAttentionRetry                 = "automatic_retry_attention"
 	operatorAttentionUnknown               = "unknown"
 )
 
@@ -130,6 +131,28 @@ func AdmissionAuthorityConflictAttentionEvent(run Run, reason, evidenceDigest st
 	})
 }
 
+// AutomaticRetryAttentionEvent projects one durable retry stop. Its timestamps
+// come from the immutable attention schedule so repeated worker restarts
+// produce the same payload and SQLite can accept the replay idempotently.
+func AutomaticRetryAttentionEvent(run Run, schedule RetrySchedule) (OperatorAttentionEvent, error) {
+	if err := schedule.validate(); err != nil || schedule.RunID != run.ID || schedule.Status != RetryScheduleAttention {
+		if err != nil {
+			return OperatorAttentionEvent{}, errors.New("automatic retry attention evidence is invalid")
+		}
+		return OperatorAttentionEvent{}, errors.New("automatic retry attention evidence is invalid")
+	}
+	profile, err := operatorAttentionProfileForRun(run)
+	if err != nil {
+		return OperatorAttentionEvent{}, err
+	}
+	evidence := retryAttentionDigest(schedule)
+	return newOperatorAttentionEvent(operatorAttentionEventInput{
+		ScopeID: retryAttentionScope(schedule), RunID: run.ID, EventType: OperatorAttentionRetry,
+		Profile: profile, State: schedule.ControllerState, Severity: "error", ReasonCode: schedule.ReasonCode,
+		EvidenceDigest: evidence, OccurredAt: schedule.AttentionAt, ObservedAt: schedule.AttentionAt,
+	})
+}
+
 type operatorAttentionEventInput struct {
 	ScopeID            string
 	RunID              string
@@ -185,7 +208,7 @@ func operatorAttentionProfileForRun(run Run) (OperatorAttentionProfile, error) {
 
 func sanitizedOperatorAttentionEventType(value string) string {
 	switch value {
-	case OperatorAttentionSourceCheckoutSkipped, OperatorAttentionCandidatePriorityTie, OperatorAttentionCandidateScan, OperatorAttentionSchedulerLease, OperatorAttentionAdmissionAuthority:
+	case OperatorAttentionSourceCheckoutSkipped, OperatorAttentionCandidatePriorityTie, OperatorAttentionCandidateScan, OperatorAttentionSchedulerLease, OperatorAttentionAdmissionAuthority, OperatorAttentionRetry:
 		return value
 	default:
 		return operatorAttentionUnknown
@@ -199,6 +222,7 @@ func sanitizedOperatorAttentionReason(eventType, value string) string {
 		OperatorAttentionCandidateScan:         {"truncated": true, "incomplete_authority": true},
 		OperatorAttentionSchedulerLease:        {"lease_conflict": true, "lease_lost": true},
 		OperatorAttentionAdmissionAuthority:    {"admission_authority_conflict": true, "mutation_authority_conflict": true},
+		OperatorAttentionRetry:                 {RetryReasonProcessStart: true, RetryReasonUnavailable: true, RetryReasonAuthority: true, RetryReasonIntegrity: true, RetryReasonManual: true, RetryReasonTerminal: true, RetryReasonPersistence: true, RetryReasonBudgetExhausted: true},
 	}
 	if allowed[eventType][value] {
 		return value

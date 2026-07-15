@@ -37,21 +37,12 @@ func TestAdmissionWorkerStopsOnAttentionBeforeAnotherAdmission(t *testing.T) {
 	}
 }
 
-func TestAdmissionWorkerRetriesOnlyUnavailableFailuresWithBoundedBackoff(t *testing.T) {
-	calls := 0
-	var waits []time.Duration
+func TestAdmissionWorkerDoesNotRecreateInMemoryRetryPolicy(t *testing.T) {
 	result, err := runAdmissionWorker(context.Background(), false, time.Minute, func(context.Context) (application.LinearTodoDispatchResult, error) {
-		calls++
-		if calls == 1 {
-			return application.LinearTodoDispatchResult{}, &application.ServiceError{Category: application.ErrorUnavailable, Message: "unavailable"}
-		}
-		return application.LinearTodoDispatchResult{Outcome: application.LinearTodoDispatchAttention}, nil
-	}, func(_ context.Context, delay time.Duration) error {
-		waits = append(waits, delay)
-		return nil
-	})
-	if err != nil || calls != 2 || len(waits) != 1 || waits[0] != workerInitialBackoff || result.Cycles != 2 || result.Stopped != "attention_required" {
-		t.Fatalf("result=%+v calls=%d waits=%v err=%v", result, calls, waits, err)
+		return application.LinearTodoDispatchResult{}, &application.ServiceError{Category: application.ErrorUnavailable, Message: "unavailable"}
+	}, func(context.Context, time.Duration) error { t.Fatal("worker must not own retry backoff"); return nil })
+	if err == nil || result.Cycles != 1 {
+		t.Fatalf("result=%+v err=%v", result, err)
 	}
 
 	_, err = runAdmissionWorker(context.Background(), false, time.Minute, func(context.Context) (application.LinearTodoDispatchResult, error) {
@@ -59,6 +50,26 @@ func TestAdmissionWorkerRetriesOnlyUnavailableFailuresWithBoundedBackoff(t *test
 	}, func(context.Context, time.Duration) error { t.Fatal("non-retryable error waited"); return nil })
 	if err == nil {
 		t.Fatal("non-retryable failure was accepted")
+	}
+}
+
+func TestAdmissionWorkerWaitsForDurableRetryEligibility(t *testing.T) {
+	calls := 0
+	waits := []time.Duration{}
+	now := time.Date(2026, 7, 15, 0, 0, 0, 0, time.UTC)
+	result, err := runAdmissionWorkerAt(context.Background(), false, time.Minute, func(context.Context) (application.LinearTodoDispatchResult, error) {
+		calls++
+		if calls == 1 {
+			schedule := application.RetrySchedule{RunID: "run", Phase: "state_executing", ControllerState: "executing", AttemptCount: 1, MaxAttempts: 3, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: application.RetryFailureProcessStart, ReasonCode: application.RetryReasonProcessStart, Status: application.RetryScheduleScheduled, NextEligibleAt: now.Add(4 * time.Second), CreatedAt: now, UpdatedAt: now}
+			return application.LinearTodoDispatchResult{Outcome: application.LinearTodoDispatchRetryScheduled, Retry: &schedule}, nil
+		}
+		return application.LinearTodoDispatchResult{Outcome: application.LinearTodoDispatchAttention}, nil
+	}, func(_ context.Context, delay time.Duration) error {
+		waits = append(waits, delay)
+		return nil
+	}, func() time.Time { return now })
+	if err != nil || calls != 2 || len(waits) != 1 || waits[0] != 4*time.Second || result.Stopped != "attention_required" {
+		t.Fatalf("result=%+v calls=%d waits=%v err=%v", result, calls, waits, err)
 	}
 }
 

@@ -375,6 +375,7 @@ type InspectionResult struct {
 	Merge                   *MergeRecord                    `json:"merge_result,omitempty"`
 	LinearCompletion        []LinearCompletionObservation   `json:"linear_completion_observations"`
 	Cleanup                 []CleanupResult                 `json:"cleanup_progress"`
+	RetrySchedules          []RetrySchedule                 `json:"retry_schedules"`
 	OperatorAttention       []OperatorAttentionResult       `json:"operator_attention"`
 	OperatorAttentionOutbox []OperatorAttentionOutboxResult `json:"operator_attention_outbox"`
 	Checks                  []CheckResult                   `json:"checks"`
@@ -585,7 +586,7 @@ type PullRequestResult struct {
 
 func projectInspection(value RunInspection) InspectionResult {
 	result := InspectionResult{SchemaVersion: querySchemaVersion, Run: projectRunResult(value.Run), RepositoryBinding: projectRepositoryBinding(value.RepositoryBinding), Merge: value.Merge,
-		Timeline: []TransitionResult{}, Attempts: []AttemptResult{}, Verifications: []VerificationResult{}, Reviews: []ReviewResult{}, Resources: []ResourceResult{}, LinearCompletion: append([]LinearCompletionObservation(nil), value.LinearCompletion...), Cleanup: []CleanupResult{}, OperatorAttention: []OperatorAttentionResult{}, OperatorAttentionOutbox: []OperatorAttentionOutboxResult{}, Checks: []CheckResult{}, Findings: []FindingResult{}, TrustedFeedback: []TrustedFeedbackResult{}, FeedbackConflicts: []TrustedFeedbackConflictResult{}, Telemetry: []TelemetryResult{}}
+		Timeline: []TransitionResult{}, Attempts: []AttemptResult{}, Verifications: []VerificationResult{}, Reviews: []ReviewResult{}, Resources: []ResourceResult{}, LinearCompletion: append([]LinearCompletionObservation(nil), value.LinearCompletion...), Cleanup: []CleanupResult{}, RetrySchedules: append([]RetrySchedule(nil), value.RetrySchedules...), OperatorAttention: []OperatorAttentionResult{}, OperatorAttentionOutbox: []OperatorAttentionOutboxResult{}, Checks: []CheckResult{}, Findings: []FindingResult{}, TrustedFeedback: []TrustedFeedbackResult{}, FeedbackConflicts: []TrustedFeedbackConflictResult{}, Telemetry: []TelemetryResult{}}
 	if value.Approval != nil {
 		result.Approval = &HumanApprovalResult{Approver: sanitizeUntrustedContent(value.Approval.Approver), ApprovedSHA: value.Approval.ApprovedSHA, SourceAt: value.Approval.ApprovedAt, ObservedAt: value.Approval.ObservedAt}
 	}

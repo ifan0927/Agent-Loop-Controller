@@ -15,9 +15,11 @@ import (
 )
 
 const (
-	LinearTodoDispatchNoCandidate = "no_candidate"
-	LinearTodoDispatchDriven      = "driven"
-	LinearTodoDispatchAttention   = "attention_required"
+	LinearTodoDispatchNoCandidate    = "no_candidate"
+	LinearTodoDispatchDriven         = "driven"
+	LinearTodoDispatchAttention      = "attention_required"
+	LinearTodoDispatchRetryWait      = "retry_wait"
+	LinearTodoDispatchRetryScheduled = "retry_scheduled"
 )
 
 // LinearTodoDispatchDriver is deliberately the existing exact-run driver
@@ -30,6 +32,7 @@ type linearTodoDispatchStore interface {
 	LinearTodoAdmissionStore
 	linearIssueStartStore
 	OperatorAttentionStore
+	RetryScheduleStore
 }
 
 // LinearTodoDispatchPolicy contains controller-owned authority for one
@@ -42,6 +45,7 @@ type LinearTodoDispatchPolicy struct {
 	OwnerNonce         string
 	Requester          Requester
 	AttentionProfile   OperatorAttentionProfile
+	Retry              AutomaticRetryPolicy
 }
 
 // LinearTodoDispatchResult contains sanitized control-flow evidence. The
@@ -51,6 +55,7 @@ type LinearTodoDispatchResult struct {
 	Run        RunResult              `json:"run,omitempty"`
 	ScanDigest string                 `json:"scan_digest,omitempty"`
 	Drive      *ProductionDriveResult `json:"drive,omitempty"`
+	Retry      *RetrySchedule         `json:"retry,omitempty"`
 }
 
 // LinearTodoDispatcher advances at most one persisted run. It is intentionally
@@ -77,6 +82,7 @@ func NewLinearTodoDispatcher(scanner LinearTodoCandidateScanner, reader LinearIs
 	if err := validateLinearTodoDispatchPolicy(policy); err != nil {
 		return nil, err
 	}
+	policy.Retry = policy.Retry.normalized()
 	return &LinearTodoDispatcher{scanner: scanner, reader: reader, resolver: resolver, starter: starter, store: store, controller: controller, driver: driver, policy: policy, now: func() time.Time { return time.Now().UTC() }, leaseTicks: newDispatchLeaseTicker}, nil
 }
 
@@ -89,6 +95,9 @@ func validateLinearTodoDispatchPolicy(policy LinearTodoDispatchPolicy) error {
 	}
 	if policy.LeaseTTL < 30*time.Second || policy.LeaseTTL > MaxLinearTodoAdmissionLeaseTTL || strings.TrimSpace(policy.OwnerNonce) == "" || policy.Requester.ID == "" || policy.Requester.Kind != "github_login" {
 		return errors.New("Linear Todo dispatch lease or requester authority is invalid")
+	}
+	if err := policy.Retry.normalized().validate(); err != nil {
+		return errors.New("Linear Todo dispatch retry policy is invalid")
 	}
 	if _, err := CandidateScanIncompleteAttentionEvent(dispatchEvidence("policy"), policy.AttentionProfile, "incomplete_authority", dispatchEvidence("profile"), time.Unix(1, 0).UTC()); err != nil {
 		return errors.New("Linear Todo dispatch operator attention profile is invalid")
@@ -112,6 +121,13 @@ func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatch
 	defer func() {
 		_, _ = d.store.ReleaseLinearTodoAdmissionLease(context.Background(), lease)
 	}()
+	blocking, handled, err := d.blockingRetry(ctx)
+	if err != nil {
+		return LinearTodoDispatchResult{}, err
+	}
+	if handled {
+		return blocking, nil
+	}
 
 	runs, err := d.store.ListNonterminalRuns(ctx)
 	if err != nil {
@@ -121,7 +137,44 @@ func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatch
 		return d.runsAttention(ctx, runs, "admission_authority_conflict", dispatchEvidence("multiple_nonterminal_runs"))
 	}
 	if len(runs) == 1 {
-		return d.resume(ctx, &lease, runs[0])
+		run := runs[0]
+		phase := AutomaticRetryPhaseForRun(run)
+		schedule, scheduleFound, scheduleErr := d.store.GetRetrySchedule(ctx, run.ID, phase)
+		if scheduleErr != nil {
+			return LinearTodoDispatchResult{}, classifyServiceError(scheduleErr)
+		}
+		if scheduleFound {
+			if schedule.Status == RetryScheduleAttention {
+				return d.retryAttention(ctx, run, schedule)
+			}
+			if d.clock().Before(schedule.NextEligibleAt) {
+				return retryWaitResult(run, schedule), nil
+			}
+		}
+		result, resumeErr := d.resume(ctx, &lease, run)
+		if resumeErr != nil {
+			failureRun, failureRunErr := d.currentRetryRun(ctx, run)
+			if failureRunErr != nil {
+				return LinearTodoDispatchResult{}, failureRunErr
+			}
+			if scheduleFound && (failureRun.State != run.State || AutomaticRetryPhaseForRun(failureRun) != phase) {
+				return d.markRetryAttention(ctx, failureRun, schedule, RetryFailureAuthority, RetryReasonAuthority)
+			}
+			return d.handleRunFailure(ctx, failureRun, AutomaticRetryPhaseForRun(failureRun), schedule, scheduleFound, resumeErr)
+		}
+		if result.Outcome == LinearTodoDispatchDriven && scheduleFound {
+			if cleared, clearErr := d.store.ClearRetrySchedule(ctx, run.ID, phase, schedule.AttemptCount); clearErr != nil {
+				return LinearTodoDispatchResult{}, classifyServiceError(clearErr)
+			} else if !cleared {
+				return d.handleRunFailure(ctx, run, phase, schedule, scheduleFound, formatRetryScheduleConflict(run.ID, phase))
+			}
+		}
+		return result, nil
+	}
+	if orphan, handled, orphanErr := d.orphanRetryAttention(ctx); orphanErr != nil {
+		return LinearTodoDispatchResult{}, orphanErr
+	} else if handled {
+		return orphan, nil
 	}
 
 	if !d.renewLease(ctx, &lease) {
@@ -145,7 +198,15 @@ func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatch
 	if tie {
 		return d.candidateTieAttention(ctx, selected.candidate.Identifier, selected.repository, scan.Digest)
 	}
-	return d.reserveStartAndDrive(ctx, &lease, selected, scan.Digest)
+	result, driveErr := d.reserveStartAndDrive(ctx, &lease, selected, scan.Digest)
+	if driveErr != nil {
+		run, runErr := d.currentRetryRun(ctx, mustReservedRun(selected.snapshot, selected.repository))
+		if runErr != nil {
+			return LinearTodoDispatchResult{}, runErr
+		}
+		return d.handleRunFailure(ctx, run, AutomaticRetryPhaseForRun(run), RetrySchedule{}, false, driveErr)
+	}
+	return result, nil
 }
 
 type linearTodoDispatchCandidate struct {
@@ -282,11 +343,7 @@ func (d *LinearTodoDispatcher) startAndDrive(ctx context.Context, lease *LinearT
 	started, startErr := starter.MoveReservedIssueToStarted(ctx, MoveReservedIssueToStartedCommand{RunID: run.ID})
 	if startErr != nil || started.Status != "started" {
 		_ = d.advanceJournal(ctx, *lease, run.ID, "mutation_intent", "manual_intervention", "", "mutation_conflict")
-		updated, getErr := d.store.GetRun(ctx, run.ID)
-		if getErr == nil {
-			run = updated
-		}
-		return d.runAttention(ctx, run, "mutation_authority_conflict", dispatchEvidence("start_mutation_conflict", run.ID))
+		return LinearTodoDispatchResult{}, serviceError(ErrorConflict, "Linear issue start mutation authority changed", startErr)
 	}
 	if !d.renewLease(ctx, lease) {
 		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_after_mutation", run.ID))
@@ -303,7 +360,7 @@ func (d *LinearTodoDispatcher) startAndDrive(ctx context.Context, lease *LinearT
 	}
 	startedRun, err := command.Start(ctx, StartCommand{Requester: d.policy.Requester, RepositorySelection: input.Task.Repository, IdempotencyKey: input.IdempotencyKey, Input: input})
 	if err != nil {
-		return d.runAttention(ctx, run, "admission_authority_conflict", dispatchEvidence("local_start_conflict", run.ID))
+		return LinearTodoDispatchResult{}, err
 	}
 	persisted, err := d.store.GetRun(ctx, run.ID)
 	if err != nil || persisted.ID != run.ID || persisted.Repository != run.Repository || persisted.IdempotencyKey != run.IdempotencyKey || startedRun.Run.RunID != run.ID {
@@ -352,10 +409,6 @@ func (d *LinearTodoDispatcher) drive(ctx context.Context, lease *LinearTodoAdmis
 	default:
 	}
 	if err != nil {
-		var service *ServiceError
-		if errors.As(err, &service) && service.Category == ErrorConflict {
-			return d.runAttention(ctx, run, "admission_authority_conflict", dispatchEvidence("driver_conflict", run.ID))
-		}
 		return LinearTodoDispatchResult{}, err
 	}
 	return LinearTodoDispatchResult{Outcome: LinearTodoDispatchDriven, Run: projectRunResult(run), Drive: &result}, nil
@@ -446,6 +499,135 @@ func (d *LinearTodoDispatcher) appendAttention(ctx context.Context, event Operat
 	return LinearTodoDispatchResult{Outcome: LinearTodoDispatchAttention, ScanDigest: scanDigest}, nil
 }
 
+func retryWaitResult(run Run, schedule RetrySchedule) LinearTodoDispatchResult {
+	return LinearTodoDispatchResult{Outcome: LinearTodoDispatchRetryWait, Run: projectRunResult(run), Retry: &schedule}
+}
+
+func retryScheduledResult(run Run, schedule RetrySchedule) LinearTodoDispatchResult {
+	return LinearTodoDispatchResult{Outcome: LinearTodoDispatchRetryScheduled, Run: projectRunResult(run), Retry: &schedule}
+}
+
+// blockingRetry prevents a scheduler restart from falling through to a fresh
+// Linear scan while any durable run/phase retry or attention record exists.
+func (d *LinearTodoDispatcher) blockingRetry(ctx context.Context) (LinearTodoDispatchResult, bool, error) {
+	schedules, err := d.store.ListRetrySchedules(ctx)
+	if err != nil {
+		return LinearTodoDispatchResult{}, false, classifyServiceError(err)
+	}
+	for _, schedule := range schedules {
+		run, runErr := d.store.GetRun(ctx, schedule.RunID)
+		if runErr != nil {
+			return LinearTodoDispatchResult{}, false, classifyServiceError(runErr)
+		}
+		if schedule.Status == RetryScheduleAttention {
+			result, attentionErr := d.retryAttention(ctx, run, schedule)
+			return result, true, attentionErr
+		}
+		if class, reason, stop := automaticRetryStateStop(run.State); stop {
+			attention, attentionErr := d.markRetryAttention(ctx, run, schedule, class, reason)
+			return attention, true, attentionErr
+		}
+		if schedule.Phase != AutomaticRetryPhaseForRun(run) || schedule.ControllerState != string(run.State) {
+			attention, attentionErr := d.markRetryAttention(ctx, run, schedule, RetryFailureAuthority, RetryReasonAuthority)
+			return attention, true, attentionErr
+		}
+		if d.clock().Before(schedule.NextEligibleAt) {
+			return retryWaitResult(run, schedule), true, nil
+		}
+	}
+	return LinearTodoDispatchResult{}, false, nil
+}
+
+func (d *LinearTodoDispatcher) markRetryAttention(ctx context.Context, run Run, current RetrySchedule, class RetryFailureClass, reason string) (LinearTodoDispatchResult, error) {
+	schedule, applied, err := d.store.ApplyRetryFailure(ctx, RetryFailureRequest{
+		RunID: current.RunID, Phase: current.Phase, ControllerState: domain.State(current.ControllerState), ExpectedAttempt: current.AttemptCount,
+		FailureClass: class, ReasonCode: reason, Now: d.clock(), Policy: d.policy.Retry,
+	})
+	if err != nil {
+		return LinearTodoDispatchResult{}, classifyServiceError(err)
+	}
+	if !applied && schedule.Status != RetryScheduleAttention {
+		return LinearTodoDispatchResult{}, formatRetryScheduleConflict(current.RunID, current.Phase)
+	}
+	return d.retryAttention(ctx, run, schedule)
+}
+
+func (d *LinearTodoDispatcher) retryAttention(ctx context.Context, run Run, schedule RetrySchedule) (LinearTodoDispatchResult, error) {
+	event, err := AutomaticRetryAttentionEvent(run, schedule)
+	if err != nil {
+		return LinearTodoDispatchResult{}, serviceError(ErrorInternal, "automatic retry attention is invalid", err)
+	}
+	result, appendErr := d.appendAttention(ctx, event, "")
+	if appendErr != nil {
+		return result, appendErr
+	}
+	result.Retry = &schedule
+	return result, nil
+}
+
+func (d *LinearTodoDispatcher) handleRunFailure(ctx context.Context, run Run, phase string, existing RetrySchedule, found bool, cause error) (LinearTodoDispatchResult, error) {
+	if ctx.Err() != nil {
+		return LinearTodoDispatchResult{}, cause
+	}
+	class, reason := ClassifyAutomaticRetryFailure(cause)
+	if stoppedClass, stoppedReason, stop := automaticRetryStateStop(run.State); stop {
+		class, reason = stoppedClass, stoppedReason
+	}
+	expected := 0
+	if found {
+		expected = existing.AttemptCount
+	}
+	schedule, applied, err := d.store.ApplyRetryFailure(ctx, RetryFailureRequest{
+		RunID: run.ID, Phase: phase, ControllerState: run.State, ExpectedAttempt: expected,
+		FailureClass: class, ReasonCode: reason, Now: d.clock(), Policy: d.policy.Retry,
+	})
+	if err != nil {
+		return LinearTodoDispatchResult{}, classifyServiceError(err)
+	}
+	if !applied && schedule.Status != RetryScheduleScheduled && schedule.Status != RetryScheduleAttention {
+		return LinearTodoDispatchResult{}, formatRetryScheduleConflict(run.ID, phase)
+	}
+	if schedule.Status == RetryScheduleAttention {
+		return d.retryAttention(ctx, run, schedule)
+	}
+	return retryScheduledResult(run, schedule), nil
+}
+
+func (d *LinearTodoDispatcher) orphanRetryAttention(ctx context.Context) (LinearTodoDispatchResult, bool, error) {
+	schedules, err := d.store.ListRetrySchedules(ctx)
+	if err != nil {
+		return LinearTodoDispatchResult{}, false, classifyServiceError(err)
+	}
+	for _, schedule := range schedules {
+		run, runErr := d.store.GetRun(ctx, schedule.RunID)
+		if runErr != nil {
+			return LinearTodoDispatchResult{}, false, classifyServiceError(runErr)
+		}
+		if schedule.Status == RetryScheduleAttention {
+			result, attentionErr := d.retryAttention(ctx, run, schedule)
+			return result, true, attentionErr
+		}
+		if class, reason, stop := automaticRetryStateStop(run.State); stop {
+			attention, attentionErr := d.markRetryAttention(ctx, run, schedule, class, reason)
+			return attention, true, attentionErr
+		}
+		result, attentionErr := d.markRetryAttention(ctx, run, schedule, RetryFailureAuthority, RetryReasonAuthority)
+		return result, true, attentionErr
+	}
+	return LinearTodoDispatchResult{}, false, nil
+}
+
+func (d *LinearTodoDispatcher) currentRetryRun(ctx context.Context, fallback Run) (Run, error) {
+	run, err := d.store.GetRun(ctx, fallback.ID)
+	if err != nil {
+		return Run{}, classifyServiceError(err)
+	}
+	if run.ID != fallback.ID {
+		return Run{}, serviceError(ErrorConflict, "retry run identity changed", nil)
+	}
+	return run, nil
+}
+
 func (d *LinearTodoDispatcher) clock() time.Time { return d.now().UTC() }
 
 func validLinearTodoCandidateScan(scan LinearTodoCandidateScan, authority LinearTodoCandidateAuthority) bool {
@@ -511,6 +693,7 @@ func (d *LinearTodoDispatcher) profileForRun(run Run) OperatorAttentionProfile {
 
 func mustReservedRun(snapshot linearAdmissionSnapshot, repository LocalRepository) Run {
 	run, _ := ReservedRunFromAdmissionSnapshot(linearTodoDispatchInput(snapshot, repository))
+	run.State = domain.StateReceived
 	return run
 }
 

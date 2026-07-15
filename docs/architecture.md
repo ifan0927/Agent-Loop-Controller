@@ -246,6 +246,25 @@ restart-safe `drive`; I-Fan alone grants the final GitHub approval. The
 lower-level state-specific CLI commands are kept for incident recovery and
 deliberate E2E fault injection, not routine operation.
 
+### Durable automatic retry scheduling
+
+Automatic admission retry eligibility is persisted in SQLite schema version 20
+as one record keyed by `run_id` and the controller phase derived from the
+persisted run state. The record contains the bounded failure count, fixed retry
+policy, sanitized failure class and reason code, and either a future eligibility
+time or a durable operator-attention time. An attempt compare-and-swap prevents
+a stale worker or a second scheduler from extending a newer schedule.
+
+Only controller-owned process-start and temporary-unavailable evidence is
+eligible for automatic retry. Authority drift, integrity failures, manual or
+human-gated states, terminal failures, and persistence conflicts become
+attention stops. A scheduled record authorizes resuming that exact run and
+phase only; it cannot create another run, choose another branch, or start a new
+Codex session. The worker reads the persisted time after every restart and
+waits until it is eligible, so in-memory backoff state cannot reset the budget
+or shorten the delay. Exhaustion and all attention projections use the stable
+schedule identity and are idempotent in the local outbox.
+
 ## Persistence direction
 
 Phase 1B uses SQLite as the authoritative source of local run state. The schema

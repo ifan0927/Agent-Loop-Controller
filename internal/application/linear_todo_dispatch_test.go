@@ -152,6 +152,7 @@ type dispatchStore struct {
 	continues      int
 	side           SideEffectRecord
 	attention      []OperatorAttentionEvent
+	retrySchedules []RetrySchedule
 	leaseLost      bool
 	renewCalls     int
 	failRenewAt    int
@@ -348,6 +349,80 @@ func (s *dispatchStore) ListOperatorAttention(context.Context, int) ([]OperatorA
 	return append([]OperatorAttentionEvent(nil), s.attention...), nil
 }
 
+func (s *dispatchStore) GetRetrySchedule(_ context.Context, runID, phase string) (RetrySchedule, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, schedule := range s.retrySchedules {
+		if schedule.RunID == runID && schedule.Phase == phase {
+			return schedule, true, nil
+		}
+	}
+	return RetrySchedule{}, false, nil
+}
+
+func (s *dispatchStore) ListRetrySchedules(context.Context) ([]RetrySchedule, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]RetrySchedule(nil), s.retrySchedules...), nil
+}
+
+func (s *dispatchStore) ApplyRetryFailure(_ context.Context, request RetryFailureRequest) (RetrySchedule, bool, error) {
+	if err := ValidateRetryFailureRequest(request); err != nil {
+		return RetrySchedule{}, false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for index, current := range s.retrySchedules {
+		if current.RunID != request.RunID || current.Phase != request.Phase {
+			continue
+		}
+		if current.Status == RetryScheduleAttention || current.AttemptCount != request.ExpectedAttempt {
+			return current, false, nil
+		}
+		attempt := current.AttemptCount + 1
+		policy := AutomaticRetryPolicy{MaxAttempts: current.MaxAttempts, InitialDelay: current.InitialDelay, MaximumDelay: current.MaximumDelay}
+		next := request.Now.Add(AutomaticRetryDelay(policy, attempt))
+		schedule := current
+		schedule.ControllerState, schedule.AttemptCount, schedule.UpdatedAt = string(request.ControllerState), attempt, request.Now
+		schedule.FailureClass, schedule.ReasonCode = request.FailureClass, request.ReasonCode
+		if RetryFailureIsRetryable(request.FailureClass) && attempt <= schedule.MaxAttempts {
+			schedule.Status, schedule.NextEligibleAt, schedule.AttentionAt = RetryScheduleScheduled, next, time.Time{}
+		} else {
+			schedule.Status, schedule.NextEligibleAt, schedule.AttentionAt = RetryScheduleAttention, time.Time{}, request.Now
+			if RetryFailureIsRetryable(request.FailureClass) && attempt > schedule.MaxAttempts {
+				schedule.ReasonCode = RetryReasonBudgetExhausted
+			}
+		}
+		s.retrySchedules[index] = schedule
+		return schedule, true, nil
+	}
+	policy := request.Policy.normalized()
+	attempt := 1
+	schedule := RetrySchedule{RunID: request.RunID, Phase: request.Phase, ControllerState: string(request.ControllerState), AttemptCount: attempt, MaxAttempts: policy.MaxAttempts, InitialDelay: policy.InitialDelay, MaximumDelay: policy.MaximumDelay, FailureClass: request.FailureClass, ReasonCode: request.ReasonCode, CreatedAt: request.Now, UpdatedAt: request.Now}
+	if RetryFailureIsRetryable(request.FailureClass) && attempt <= policy.MaxAttempts {
+		schedule.Status, schedule.NextEligibleAt = RetryScheduleScheduled, request.Now.Add(AutomaticRetryDelay(policy, attempt))
+	} else {
+		schedule.Status, schedule.AttentionAt = RetryScheduleAttention, request.Now
+	}
+	s.retrySchedules = append(s.retrySchedules, schedule)
+	return schedule, true, nil
+}
+
+func (s *dispatchStore) ClearRetrySchedule(_ context.Context, runID, phase string, expectedAttempt int) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for index, schedule := range s.retrySchedules {
+		if schedule.RunID == runID && schedule.Phase == phase {
+			if schedule.Status == RetryScheduleAttention || schedule.AttemptCount != expectedAttempt {
+				return false, nil
+			}
+			s.retrySchedules = append(s.retrySchedules[:index], s.retrySchedules[index+1:]...)
+			return true, nil
+		}
+	}
+	return true, nil
+}
+
 func dispatchAuthority() LinearTodoCandidateAuthority {
 	return LinearTodoCandidateAuthority{TeamID: dispatchTeamID, TeamKey: "IFAN", TodoState: LinearState{ID: dispatchTodoID, Name: "Todo", Type: "unstarted"}, InProgressState: LinearState{ID: dispatchStartedID, Name: "In Progress", Type: "started"}, MaxCandidates: 4, MaxPages: 1}
 }
@@ -498,7 +573,7 @@ func TestLinearTodoDispatcherStopsForManualAndDriverConflict(t *testing.T) {
 		store.run = authorizeDispatchRun(Run{ID: "run-conflict", IssueID: candidate.Identifier, IdempotencyKey: "conflict-key", Repository: "owner/repo", State: domain.StateExecuting})
 		driver.err = serviceError(ErrorConflict, "driver authority changed", nil)
 		result, err := dispatcher.Dispatch(context.Background())
-		if err != nil || result.Outcome != LinearTodoDispatchAttention || len(driver.calls) != 1 || len(store.attention) != 1 || store.attention[0].ReasonCode != "admission_authority_conflict" {
+		if err != nil || result.Outcome != LinearTodoDispatchAttention || len(driver.calls) != 1 || len(store.attention) != 1 || store.attention[0].EventType != OperatorAttentionRetry || store.attention[0].ReasonCode != RetryReasonAuthority {
 			t.Fatalf("result=%+v driver=%+v attention=%+v err=%v", result, driver.calls, store.attention, err)
 		}
 	})
@@ -586,7 +661,7 @@ func TestLinearTodoDispatcherMutationAndPostStartConflictsStopWithoutAnotherCand
 		dispatcher, store, _, _, starter, driver := newDispatchLab(t, first, second)
 		starter.err = &LinearIssueStartMutationError{Class: "graphql"}
 		result, err := dispatcher.Dispatch(context.Background())
-		if err != nil || result.Outcome != LinearTodoDispatchAttention || store.reserveCalls != 1 || store.run.IssueID != first.Identifier || len(starter.calls) != 1 || len(driver.calls) != 0 || len(store.attention) != 1 || store.journal.Status != "manual_intervention" {
+		if err != nil || result.Outcome != LinearTodoDispatchAttention || store.reserveCalls != 1 || store.run.IssueID != first.Identifier || len(starter.calls) != 1 || len(driver.calls) != 0 || len(store.attention) != 1 || store.attention[0].EventType != OperatorAttentionRetry || store.journal.Status != "manual_intervention" {
 			t.Fatalf("result=%+v reserve=%d run=%+v starter=%+v driver=%+v journal=%+v attention=%+v err=%v", result, store.reserveCalls, store.run, starter.calls, driver.calls, store.journal, store.attention, err)
 		}
 	})

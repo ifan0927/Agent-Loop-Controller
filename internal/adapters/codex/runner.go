@@ -28,6 +28,34 @@ type Runner struct {
 	process processadapter.Runner
 }
 
+// ProcessFailureError preserves only the controller-owned process category.
+// It deliberately does not retain child output, arguments, environment, or
+// the underlying adapter error.
+type ProcessFailureError struct {
+	Stage    string
+	Category processadapter.FailureCategory
+}
+
+func (e ProcessFailureError) Error() string {
+	if e.Category == "" {
+		return "Codex process failure"
+	}
+	return "Codex process failure: " + string(e.Category)
+}
+
+// AutomaticRetryFailureClass is consumed through a small application-layer
+// interface without coupling the adapter to application packages.
+func (e ProcessFailureError) AutomaticRetryFailureClass() string {
+	if e.Category == processadapter.FailureStart {
+		return "process_start"
+	}
+	return "integrity_failure"
+}
+
+func newProcessFailure(stage string, result processadapter.Result) error {
+	return ProcessFailureError{Stage: stage, Category: result.FailureCategory}
+}
+
 type Executor struct {
 	preflight Preflighter
 	runner    Runner
@@ -79,7 +107,7 @@ func runStructured[T any](ctx context.Context, runner processadapter.Runner, com
 		ExcludedEnv:  controllerManagedExcludedEnvironment,
 	})
 	if err != nil {
-		return zero, fmt.Errorf("Codex %s process: %s", name, processadapter.SanitizeError(err))
+		return zero, newProcessFailure(name, processadapter.NormalizeResult(result, err))
 	}
 	result = processadapter.NormalizeResult(result, nil)
 	if !result.Valid() {

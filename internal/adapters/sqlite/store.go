@@ -20,7 +20,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 19
+const schemaVersion = 21
 
 type Store struct{ db *sql.DB }
 
@@ -127,6 +127,10 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV18
 		case 19:
 			statements = migrationV19
+		case 20:
+			statements = migrationV20
+		case 21:
+			statements = migrationV21
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -360,6 +364,37 @@ var migrationV18 = []string{
 var migrationV19 = []string{
 	`ALTER TABLE verifications ADD COLUMN process_outcome TEXT NOT NULL DEFAULT 'legacy'`,
 	`ALTER TABLE verifications ADD COLUMN failure_category TEXT NOT NULL DEFAULT 'legacy_evidence'`,
+}
+
+// migrationV20 persists automatic retry eligibility per run and controller
+// phase. Integer time and compare-and-swap attempt counts keep restart and
+// concurrent-worker behavior independent from wall-clock string formatting.
+var migrationV20 = []string{
+	`CREATE TABLE automatic_retry_schedules (
+		run_id TEXT NOT NULL REFERENCES runs(run_id),
+		phase TEXT NOT NULL,
+		controller_state TEXT NOT NULL,
+		attempt_count INTEGER NOT NULL CHECK(attempt_count > 0),
+		max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
+		failure_class TEXT NOT NULL,
+		reason_code TEXT NOT NULL,
+		status TEXT NOT NULL CHECK(status IN ('scheduled','attention')),
+		next_eligible_at TEXT NOT NULL DEFAULT '',
+		next_eligible_unix_ns INTEGER NOT NULL DEFAULT 0,
+		attention_at TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		PRIMARY KEY(run_id,phase)
+	)`,
+	`CREATE INDEX automatic_retry_schedules_status ON automatic_retry_schedules(status,next_eligible_unix_ns,updated_at)`,
+}
+
+// migrationV21 freezes the delay policy that created each retry schedule.
+// Existing schema-20 schedules use the controller defaults when upgraded;
+// later attempts never adopt a changed process policy silently.
+var migrationV21 = []string{
+	`ALTER TABLE automatic_retry_schedules ADD COLUMN initial_delay_ns INTEGER NOT NULL DEFAULT 1000000000`,
+	`ALTER TABLE automatic_retry_schedules ADD COLUMN maximum_delay_ns INTEGER NOT NULL DEFAULT 30000000000`,
 }
 
 func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput) (application.Run, bool, error) {
@@ -2101,6 +2136,10 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 		return application.RunInspection{}, err
 	}
 	inspection := application.RunInspection{Run: run}
+	inspection.RetrySchedules, err = s.listRetrySchedulesForRun(ctx, id)
+	if err != nil {
+		return application.RunInspection{}, err
+	}
 	if run.RegistryVersion > 0 {
 		var binding application.LocalRepository
 		if err := json.Unmarshal([]byte(run.RepositoryConfigJSON), &binding); err != nil {

@@ -8,11 +8,6 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 )
 
-const (
-	workerInitialBackoff = time.Second
-	workerMaximumBackoff = 30 * time.Second
-)
-
 type admissionWorkerResult struct {
 	Cycles      int
 	LastOutcome string
@@ -22,15 +17,18 @@ type admissionWorkerResult struct {
 type admissionWorkerDispatch func(context.Context) (application.LinearTodoDispatchResult, error)
 type admissionWorkerWait func(context.Context, time.Duration) error
 
-// runAdmissionWorker owns only cadence and retry policy. One dispatch retains
-// sole authority for lease acquisition, recovery, candidate selection, and
-// delivery; an attention outcome deliberately stops this worker before it can
-// consider another issue.
+// runAdmissionWorker owns only cadence. Retry policy is persisted by the
+// dispatcher per run and phase; the worker only waits for the returned durable
+// eligibility time. One dispatch retains sole authority for lease acquisition,
+// recovery, candidate selection, and delivery.
 func runAdmissionWorker(ctx context.Context, once bool, poll time.Duration, dispatch admissionWorkerDispatch, wait admissionWorkerWait) (admissionWorkerResult, error) {
-	if poll <= 0 || dispatch == nil || wait == nil {
+	return runAdmissionWorkerAt(ctx, once, poll, dispatch, wait, func() time.Time { return time.Now().UTC() })
+}
+
+func runAdmissionWorkerAt(ctx context.Context, once bool, poll time.Duration, dispatch admissionWorkerDispatch, wait admissionWorkerWait, now func() time.Time) (admissionWorkerResult, error) {
+	if poll <= 0 || dispatch == nil || wait == nil || now == nil {
 		return admissionWorkerResult{}, errors.New("automatic admission worker configuration is invalid")
 	}
-	backoff := workerInitialBackoff
 	var result admissionWorkerResult
 	for {
 		if err := ctx.Err(); err != nil {
@@ -47,21 +45,8 @@ func runAdmissionWorker(ctx context.Context, once bool, poll time.Duration, disp
 			return result, nil
 		}
 		if err != nil {
-			if once || !retryableWorkerError(err) {
-				return result, err
-			}
-			result.Stopped = "retry_backoff"
-			if err := wait(ctx, backoff); err != nil {
-				result.Stopped = "canceled"
-				return result, nil
-			}
-			backoff *= 2
-			if backoff > workerMaximumBackoff {
-				backoff = workerMaximumBackoff
-			}
-			continue
+			return result, err
 		}
-		backoff = workerInitialBackoff
 		result.LastOutcome = cycle.Outcome
 		if once {
 			result.Stopped = "once"
@@ -71,16 +56,21 @@ func runAdmissionWorker(ctx context.Context, once bool, poll time.Duration, disp
 			result.Stopped = "attention_required"
 			return result, nil
 		}
-		if err := wait(ctx, poll); err != nil {
+		delay := poll
+		if cycle.Outcome == application.LinearTodoDispatchRetryWait || cycle.Outcome == application.LinearTodoDispatchRetryScheduled {
+			if cycle.Retry == nil || cycle.Retry.NextEligibleAt.IsZero() {
+				return result, errors.New("durable retry outcome is missing eligibility evidence")
+			}
+			delay = cycle.Retry.NextEligibleAt.Sub(now().UTC())
+			if delay < 0 {
+				delay = 0
+			}
+		}
+		if err := wait(ctx, delay); err != nil {
 			result.Stopped = "canceled"
 			return result, nil
 		}
 	}
-}
-
-func retryableWorkerError(err error) bool {
-	var service *application.ServiceError
-	return errors.As(err, &service) && service.Category == application.ErrorUnavailable
 }
 
 func waitAdmissionWorker(ctx context.Context, delay time.Duration) error {
