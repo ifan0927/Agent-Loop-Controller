@@ -382,6 +382,13 @@ func persistAbandonCleanupFailure(ctx context.Context, delivery DeliveryStore, r
 	return delivery.UpsertCleanup(auditCtx, record)
 }
 
+func abandonCleanupFailure(ctx context.Context, delivery DeliveryStore, record CleanupRecord, cleanupErr error) error {
+	if auditErr := persistAbandonCleanupFailure(ctx, delivery, record, cleanupErr); auditErr != nil {
+		return errors.Join(cleanupErr, fmt.Errorf("persist abandon cleanup failure audit: %w", auditErr))
+	}
+	return cleanupErr
+}
+
 func cleanupAbandonedLocalResourcesWithLease(ctx context.Context, store RunStore, run Run, cleanup CleanupPort, leaseOwner string) error {
 	if err := renewAbandonLease(ctx, store, run.ID, leaseOwner); err != nil {
 		return err
@@ -444,7 +451,7 @@ func cleanupAbandonedLocalResourcesWithLease(ctx context.Context, store RunStore
 		}
 		if err := renewAbandonLease(ctx, store, run.ID, leaseOwner); err != nil {
 			if hasDelivery {
-				_ = persistAbandonCleanupFailure(ctx, delivery, CleanupRecord{RunID: run.ID, Kind: item.resource.Kind, Name: item.resource.Name}, err)
+				return abandonCleanupFailure(ctx, delivery, CleanupRecord{RunID: run.ID, Kind: item.resource.Kind, Name: item.resource.Name}, err)
 			}
 			return err
 		}
@@ -457,13 +464,13 @@ func cleanupAbandonedLocalResourcesWithLease(ctx context.Context, store RunStore
 		}
 		if cleanupErr != nil {
 			if hasDelivery {
-				_ = persistAbandonCleanupFailure(ctx, delivery, CleanupRecord{RunID: run.ID, Kind: item.resource.Kind, Name: item.resource.Name}, cleanupErr)
+				return abandonCleanupFailure(ctx, delivery, CleanupRecord{RunID: run.ID, Kind: item.resource.Kind, Name: item.resource.Name}, cleanupErr)
 			}
 			return cleanupErr
 		}
 		if err := renewAbandonLease(ctx, store, run.ID, leaseOwner); err != nil {
 			if hasDelivery {
-				_ = persistAbandonCleanupFailure(ctx, delivery, CleanupRecord{RunID: run.ID, Kind: item.resource.Kind, Name: item.resource.Name}, err)
+				return abandonCleanupFailure(ctx, delivery, CleanupRecord{RunID: run.ID, Kind: item.resource.Kind, Name: item.resource.Name}, err)
 			}
 			return err
 		}

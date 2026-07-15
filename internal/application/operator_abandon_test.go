@@ -118,6 +118,22 @@ func TestAbandonLocalCleanupPersistsFailureDetails(t *testing.T) {
 	}
 }
 
+func TestAbandonLocalCleanupReportsFailureAuditPersistenceError(t *testing.T) {
+	repository := LocalRepository{CanonicalRepository: "owner/repo", SourcePath: "/owned/source", OriginPath: "/owned/origin", BaseBranch: "main"}
+	run := abandonCleanupRun(t, repository)
+	evidence := `{"source_path":"/owned/source","origin_path":"/owned/origin","path":"/owned/worktree","branch":"ifan/one","base_branch":"main","base_sha":"base","nonce":"nonce"}`
+	store := &pushTestStore{run: run, cleanupFailAt: 2, resources: []OwnedResource{{RunID: run.ID, Kind: "branch", Name: run.WorkingBranch, CreationEvidence: evidence, Status: "owned"}}}
+	cleanup := &abandonCleanupFake{err: errors.New("branch cleanup failed while removing candidate")}
+	err := cleanupAbandonedLocalResources(context.Background(), store, run, cleanup)
+	if err == nil || !strings.Contains(err.Error(), "branch cleanup failed while removing candidate") || !strings.Contains(err.Error(), "persist abandon cleanup failure audit") {
+		t.Fatalf("cleanup error did not expose audit persistence failure: %v", err)
+	}
+	progress, progressErr := store.CleanupProgress(context.Background(), run.ID)
+	if progressErr != nil || len(progress) != 1 || progress[0].Status != "intent" {
+		t.Fatalf("cleanup progress=%+v err=%v", progress, progressErr)
+	}
+}
+
 func TestAbandonLocalCleanupStopsWhenLeaseIsLostBetweenResources(t *testing.T) {
 	repository := LocalRepository{CanonicalRepository: "owner/repo", SourcePath: "/owned/source", OriginPath: "/owned/origin", BaseBranch: "main"}
 	run := abandonCleanupRun(t, repository)
