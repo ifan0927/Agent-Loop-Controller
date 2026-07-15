@@ -32,6 +32,7 @@ type LocalRepository struct {
 	RegistryDigest          string                 `json:"registry_digest"`
 	RepositoryBindingDigest string                 `json:"repository_binding_digest"`
 	CanonicalRepository     string                 `json:"canonical_repository"`
+	LinearLabel             string                 `json:"linear_label"`
 	OriginPath              string                 `json:"origin_path"`
 	SourcePath              string                 `json:"source_path"`
 	RunRoot                 string                 `json:"run_root"`
@@ -244,6 +245,9 @@ func (c *LocalController) continueExpected(ctx context.Context, runID string, ex
 		if err != nil {
 			return Run{}, err
 		}
+		if stopped, deadlineErr := c.enforceRepairDeadline(ctx, run); deadlineErr != nil {
+			return stopped, deadlineErr
+		}
 		if err := c.ensureArtifactRoot(ctx, run); err != nil {
 			_ = c.store.SetLastError(ctx, run.ID, err.Error())
 			return run, err
@@ -271,6 +275,11 @@ func (c *LocalController) continueExpected(ctx context.Context, runID string, ex
 			err = c.verifyCandidate(ctx, run)
 		case domain.StateFreshReview:
 			err = c.freshReview(ctx, run)
+		case domain.StateRepairing:
+			// Repair selection is owned by ProductionCoordinator: it revalidates the
+			// persisted Linear source before passing only persisted normalized findings
+			// into the bounded implementation-session resume path.
+			return run, nil
 		case domain.StateApprovalReady:
 			err = c.validateApproval(ctx, run)
 			if err == nil {
@@ -1015,7 +1024,7 @@ func (c *LocalController) freshReview(ctx context.Context, run Run) error {
 			return err
 		}
 		if outcome.Verdict != domain.ReviewFailed {
-			return c.authorizeReview(ctx, run, outcome, record.OutcomePath, inspection)
+			return c.applyFreshReviewOutcome(ctx, run, outcome, record.OutcomePath, inspection)
 		}
 	}
 	task, err := decodeTaskSnapshot(run.NormalizedTaskJSON)
@@ -1076,7 +1085,102 @@ func (c *LocalController) freshReview(ctx context.Context, run Run) error {
 	if err != nil {
 		return err
 	}
-	return c.authorizeReview(ctx, run, result.Outcome, attempt.OutcomePath, inspection)
+	return c.applyFreshReviewOutcome(ctx, run, result.Outcome, attempt.OutcomePath, inspection)
+}
+
+func (c *LocalController) applyFreshReviewOutcome(ctx context.Context, run Run, outcome domain.ReviewOutcome, evidence string, inspection RunInspection) error {
+	switch outcome.Verdict {
+	case domain.ReviewPass:
+		return c.authorizeReview(ctx, run, outcome, evidence, inspection)
+	case domain.ReviewFindings:
+		if outcome.ReviewedHeadSHA != run.CandidateHead {
+			return errors.New("fresh review findings do not match the candidate HEAD")
+		}
+		reviewValidated := false
+		for _, record := range inspection.Reviews {
+			if record.ReviewedHead != run.CandidateHead || record.OutcomePath != evidence {
+				continue
+			}
+			if err := validateReviewAttempt(inspection.Attempts, record, run.ReviewModel); err != nil {
+				return err
+			}
+			reviewValidated = true
+		}
+		if !reviewValidated {
+			return errors.New("fresh review finding attempt evidence is missing")
+		}
+		findings, err := normalizeFreshReviewFindings(run, outcome)
+		if err != nil {
+			return err
+		}
+		persister, ok := c.store.(interface {
+			SaveFinding(context.Context, FindingRecord) error
+		})
+		if !ok {
+			return errors.New("fresh review finding persistence is unavailable")
+		}
+		for _, finding := range findings {
+			if err := persister.SaveFinding(ctx, finding); err != nil {
+				return err
+			}
+		}
+		return c.store.Transition(ctx, run.ID, domain.StateFreshReview, domain.StateRepairing, "fresh structured review findings persisted", evidence, run.CandidateHead)
+	case domain.ReviewFailed:
+		return fmt.Errorf("fresh review stopped with verdict %s", outcome.Verdict)
+	default:
+		return fmt.Errorf("unsupported fresh review verdict %s", outcome.Verdict)
+	}
+}
+
+const freshReviewFindingSource = "controller_fresh_review"
+
+func normalizeFreshReviewFindings(run Run, outcome domain.ReviewOutcome) ([]FindingRecord, error) {
+	if outcome.Verdict != domain.ReviewFindings || outcome.ReviewedHeadSHA != run.CandidateHead {
+		return nil, errors.New("fresh review finding authority is incomplete")
+	}
+	if len(outcome.Findings) > MaxNormalizedFindings {
+		return nil, errors.New("fresh review findings exceed controller count bounds")
+	}
+	findings := make([]FindingRecord, 0, len(outcome.Findings))
+	seen := make(map[string]struct{}, len(outcome.Findings))
+	for _, finding := range outcome.Findings {
+		sourceID := "fresh-review:" + strings.TrimSpace(finding.ID)
+		if strings.ContainsRune(sourceID, '\x00') {
+			return nil, errors.New("fresh review finding ID contains a NUL byte")
+		}
+		if _, duplicate := seen[sourceID]; duplicate {
+			return nil, errors.New("fresh review findings contain a duplicate ID")
+		}
+		seen[sourceID] = struct{}{}
+		body := fmt.Sprintf("Fresh independent review finding (%s): %s\n\n%s", finding.Severity, finding.Title, finding.Body)
+		if len([]byte(body)) > MaxNormalizedFindingBodyBytes || strings.ContainsRune(body, '\x00') {
+			return nil, errors.New("fresh review finding body exceeds controller bounds")
+		}
+		record := FindingRecord{
+			RunID:      run.ID,
+			SourceID:   sourceID,
+			Source:     freshReviewFindingSource,
+			Severity:   finding.Severity,
+			Body:       body,
+			BodyDigest: bytesHash([]byte(body)),
+			HeadSHA:    run.CandidateHead,
+			ObservedAt: time.Now().UTC(),
+		}
+		if finding.File != nil {
+			record.File = *finding.File
+		}
+		if finding.Line != nil {
+			record.Line = *finding.Line
+		}
+		findings = append(findings, record)
+	}
+	if len(findings) == 0 {
+		return nil, errors.New("fresh review findings are empty")
+	}
+	if len([]byte(BuildRepairPrompt(findings))) > MaxRepairPromptBytes {
+		return nil, errors.New("fresh review findings exceed controller aggregate bounds")
+	}
+	return findings, nil
 }
 
 func (c *LocalController) authorizeReview(ctx context.Context, run Run, outcome domain.ReviewOutcome, evidence string, inspection RunInspection) error {
@@ -1283,25 +1387,59 @@ func (c *LocalController) repair(ctx context.Context, runID, normalizedPrompt st
 	if err := c.store.BeginRepair(ctx, runID, run.CandidateHead, string(evidenceData)); err != nil {
 		return run, err
 	}
-	deadline, _ := repairDeadlineAt(inspection.Timeline, time.Now().UTC())
-	if persisted != nil {
-		deadline = time.Now().UTC().Add(repairDeadline)
+	postBeginInspection, inspectErr := c.store.Inspect(ctx, runID)
+	if inspectErr != nil {
+		return run, inspectErr
 	}
+	deadline, _ := repairDeadlineAt(postBeginInspection.Timeline, time.Now().UTC())
 	repairCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	updated, continueErr := c.Continue(repairCtx, runID, &Decision{ChoiceID: "controller-normalized-review-findings", Instructions: normalizedPrompt})
-	if continueErr == nil || !errors.Is(context.Cause(repairCtx), context.DeadlineExceeded) {
-		return updated, continueErr
+	// Continue may unwind through either the caller deadline or the repair policy
+	// deadline. Re-read with a short detached context so only the persisted policy
+	// clock—not a shorter caller context—can authorize manual intervention.
+	recoveryCtx, recoveryCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer recoveryCancel()
+	if persistedRun, getErr := c.store.GetRun(recoveryCtx, runID); getErr == nil {
+		updated = persistedRun
 	}
-	if updated.State == domain.StateExecuting {
-		transitionErr := c.store.Transition(ctx, runID, domain.StateExecuting, domain.StateManualIntervention, "repair policy deadline exceeded", "repair execution exceeded controller deadline", latestRepairBase(inspection.Timeline))
-		if transitionErr == nil {
-			if persistedRun, getErr := c.store.GetRun(ctx, runID); getErr == nil {
-				return persistedRun, continueErr
-			}
+	if recoveredInspection, getErr := c.store.Inspect(recoveryCtx, runID); getErr == nil && repairDeadlineExceeded(recoveredInspection.Timeline, time.Now().UTC()) {
+		stopped, deadlineErr := c.persistExpiredRepairDeadline(recoveryCtx, updated, "repair execution exceeded controller deadline")
+		if deadlineErr != nil {
+			return stopped, errors.Join(continueErr, deadlineErr)
 		}
+		return stopped, continueErr
 	}
 	return updated, continueErr
+}
+
+func (c *LocalController) enforceRepairDeadline(ctx context.Context, run Run) (Run, error) {
+	if !domain.CanRequireManualIntervention(run.State) {
+		return run, nil
+	}
+	inspection, err := c.store.Inspect(ctx, run.ID)
+	if err != nil {
+		return run, err
+	}
+	if !repairDeadlineExceeded(inspection.Timeline, time.Now().UTC()) {
+		return run, nil
+	}
+	return c.persistExpiredRepairDeadline(ctx, run, "repair workflow exceeded controller deadline")
+}
+
+func (c *LocalController) persistExpiredRepairDeadline(ctx context.Context, run Run, evidence string) (Run, error) {
+	if !domain.CanRequireManualIntervention(run.State) {
+		return run, nil
+	}
+	err := errors.New("bounded repair deadline exceeded; manual intervention required")
+	if transitionErr := c.store.Transition(ctx, run.ID, run.State, domain.StateManualIntervention, "repair policy deadline exceeded", evidence, run.CandidateHead); transitionErr != nil {
+		return run, errors.Join(err, transitionErr)
+	}
+	updated, getErr := c.store.GetRun(ctx, run.ID)
+	if getErr != nil {
+		return run, errors.Join(err, getErr)
+	}
+	return updated, err
 }
 
 // persistLegacyRepairInput keeps the deprecated direct Repair path resumable

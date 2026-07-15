@@ -57,7 +57,7 @@ func RepairableFindings(findings []FindingRecord, head string, feedback ...[]Tru
 		if finding.HeadSHA != head || finding.Resolved || finding.Outdated {
 			continue
 		}
-		if finding.Source != "github_required_check" && finding.Source != "github_human_review_comment" {
+		if finding.Source != "github_required_check" && finding.Source != "github_human_review_comment" && finding.Source != freshReviewFindingSource {
 			return nil, fmt.Errorf("unsupported actionable finding source %q", finding.Source)
 		}
 		if finding.Source == "github_human_review_comment" {

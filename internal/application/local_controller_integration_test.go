@@ -69,6 +69,48 @@ func (labAdmissionRegistry) HasVerifier(label, id string) bool {
 	return label == "repo:test-project" && id == "fixture-go-test"
 }
 
+type productionLinearReader struct {
+	source application.LinearTaskSource
+	reads  int
+}
+
+func (r *productionLinearReader) ReadIssue(_ context.Context, _ string) (application.LinearTaskSource, []application.LinearRequestObservation, error) {
+	r.reads++
+	source := r.source
+	if r.reads > 1 {
+		source.State = application.LinearState{ID: "started", Name: "In Progress", Type: "started"}
+	}
+	return source, []application.LinearRequestObservation{{Operation: "read_issue", HTTPStatus: 200, ResponseDigest: "fixture", ObservedAt: time.Now().UTC()}}, nil
+}
+
+type productionLinearResolver struct{ repository application.LocalRepository }
+
+func (r productionLinearResolver) ResolveLinearAdmissionRepository(label string) (application.LocalRepository, bool) {
+	return r.repository, label == "repo:test-project"
+}
+
+func productionLinearSource() application.LinearTaskSource {
+	created := time.Date(2026, 7, 15, 0, 0, 0, 0, time.UTC)
+	updated := created.Add(time.Hour)
+	return application.LinearTaskSource{
+		Provider:       "linear",
+		IssueID:        "linear-fixture-id",
+		Identifier:     "IFAN-FIXTURE",
+		URL:            "https://linear.example.invalid/IFAN-FIXTURE",
+		Title:          "Add Clamp",
+		Description:    "## Goal\n\nImplement mathutil.Clamp\n\n## Acceptance Criteria\n\n- Clamp returns min below range, max above range, and value inside range.\n- go test ./... passes.\n\n## Out of Scope\n\n- Network\n- External services",
+		Team:           application.LinearTeam{ID: "team", Key: "IFAN", Name: "I-Fan"},
+		State:          application.LinearState{ID: "todo", Name: "Todo", Type: "backlog"},
+		Labels:         []application.LinearLabel{{ID: "agent", Name: "agent:codex"}, {ID: "repository", Name: "repo:test-project"}},
+		Cycle:          application.LinearCycle{ID: "cycle", Number: 1, StartsAt: created, EndsAt: updated.Add(24 * time.Hour), IsActive: true},
+		BranchName:     "ifan/ifan-fixture-clamp",
+		SourceRevision: "fixture-v1",
+		CreatedAt:      created,
+		UpdatedAt:      updated,
+		ObservedAt:     updated,
+	}
+}
+
 type testWorktrees struct{ manager gitadapter.WorktreeManager }
 
 func (w testWorktrees) Provision(ctx context.Context, s application.WorktreeSpec) (application.WorktreeRecord, error) {
@@ -102,11 +144,12 @@ type durableFakeProcess struct {
 	failFirstReview                               bool
 	reviewFindings                                bool
 	noChangeOnResume                              bool
+	blockResumeUntilContextDone                   bool
 	implementationCalls, resumeCalls, reviewCalls int
 	resumeArgs                                    []string
 }
 
-func (p *durableFakeProcess) Run(_ context.Context, s processadapter.Spec) (processadapter.Result, error) {
+func (p *durableFakeProcess) Run(ctx context.Context, s processadapter.Spec) (processadapter.Result, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	stdout := ""
@@ -121,6 +164,10 @@ func (p *durableFakeProcess) Run(_ context.Context, s processadapter.Spec) (proc
 		if s.Args[1] == "resume" {
 			p.resumeCalls++
 			p.resumeArgs = append([]string(nil), s.Args...)
+			if p.blockResumeUntilContextDone {
+				<-ctx.Done()
+				return processadapter.Result{}, ctx.Err()
+			}
 			if !p.noChangeOnResume {
 				mustWriteFile(filepath.Join(s.WorkingDir, "mathutil", "clamp.go"), "package mathutil\n\nfunc Clamp(value, min, max int) int { if value < min { return min }; if value > max { return max }; return value }\n")
 				mustWriteFile(filepath.Join(s.WorkingDir, "mathutil", "clamp_test.go"), "package mathutil\n\nimport \"testing\"\n\nfunc TestClamp(t *testing.T) { tests := []struct{ v, min, max, want int }{{-1,0,5,0},{3,0,5,3},{9,0,5,5}}; for _, tt := range tests { if got := Clamp(tt.v,tt.min,tt.max); got != tt.want { t.Fatalf(\"got %d want %d\",got,tt.want) } } }\n")
@@ -138,7 +185,7 @@ func (p *durableFakeProcess) Run(_ context.Context, s processadapter.Spec) (proc
 			if p.failFirstReview && p.reviewCalls == 1 {
 				verdict, summary = "failed", "transient reviewer failure"
 			}
-			if p.reviewFindings {
+			if p.reviewFindings && p.reviewCalls == 1 {
 				verdict, summary = "findings", "actionable finding"
 				findings = `[{"id":"f1","severity":"medium","title":"Finding","body":"Fix it","file":null,"line":null}]`
 			}
@@ -579,7 +626,143 @@ func TestNoChangeRepairReusesExactRepairBaseAndExactHeadEvidence(t *testing.T) {
 	}
 }
 
-func TestReviewFindingsRemainSafeStopWithoutSameHeadRerun(t *testing.T) {
+func TestLaterRepairUsesFirstRepairDeadlineAndStopsAtManualIntervention(t *testing.T) {
+	lab := newLocalLab(t)
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	process := &durableFakeProcess{}
+	controller := newController(t, store, lab, process, gitadapter.Workspace{})
+	input := startInput(lab)
+	input.Task.Policy.MaxRepairAttempts = domain.DefaultMaxRepairAttempts
+	input.NormalizedJSON, err = json.Marshal(input.Task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(input.NormalizedJSON)
+	input.TaskHash = hex.EncodeToString(digest[:])
+	run, err := controller.Start(context.Background(), input)
+	if err != nil || run.State != domain.StateApprovalReady {
+		t.Fatalf("initial run=%+v err=%v", run, err)
+	}
+	moveToRepairing := func(run application.Run) {
+		for _, transition := range []struct{ from, to domain.State }{
+			{domain.StateApprovalReady, domain.StatePushingBranch},
+			{domain.StatePushingBranch, domain.StateBranchPushed},
+			{domain.StateBranchPushed, domain.StateOpeningPR},
+			{domain.StateOpeningPR, domain.StatePROpen},
+			{domain.StatePROpen, domain.StateReconcilingReviews},
+			{domain.StateReconcilingReviews, domain.StateRepairing},
+		} {
+			if err := store.Transition(context.Background(), run.ID, transition.from, transition.to, "fixture transition", "fixture", run.CandidateHead); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	moveToRepairing(run)
+	run, err = controller.Repair(context.Background(), run.ID, "first bounded repair")
+	if err != nil || run.State != domain.StateApprovalReady || process.resumeCalls != 1 {
+		t.Fatalf("first repair run=%+v resumes=%d err=%v", run, process.resumeCalls, err)
+	}
+	moveToRepairing(run)
+	process.blockResumeUntilContextDone = true
+	anchored := firstRepairDeadlineStore{RunStore: store, firstRepairAt: time.Now().UTC().Add(-30*time.Minute + 750*time.Millisecond)}
+	deadlineController := newController(t, anchored, lab, process, gitadapter.Workspace{})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	started := time.Now()
+	run, err = deadlineController.Repair(ctx, run.ID, "second bounded repair")
+	if err == nil || run.State != domain.StateManualIntervention {
+		t.Fatalf("second repair run=%+v err=%v", run, err)
+	}
+	if process.resumeCalls != 2 {
+		t.Fatalf("second repair did not start the existing implementation session: resumes=%d", process.resumeCalls)
+	}
+	if elapsed := time.Since(started); elapsed > 1500*time.Millisecond {
+		t.Fatalf("later repair exceeded the first repair deadline: elapsed=%s", elapsed)
+	}
+}
+
+func TestCallerDeadlineDoesNotBecomeRepairPolicyManualIntervention(t *testing.T) {
+	_, store, process, run := beginInterruptedRepair(t)
+	defer store.Close()
+	if run.State != domain.StateExecuting || process.resumeCalls != 1 {
+		t.Fatalf("run=%+v resumes=%d", run, process.resumeCalls)
+	}
+}
+
+func TestExpiredRepairDeadlineStopsVerificationAndFreshReview(t *testing.T) {
+	for _, state := range []domain.State{domain.StateVerifying, domain.StateFreshReview} {
+		t.Run(string(state), func(t *testing.T) {
+			lab, store, process, run := beginInterruptedRepair(t)
+			defer store.Close()
+			if err := store.Transition(context.Background(), run.ID, domain.StateExecuting, domain.StateVerifying, "fixture repair progression", "fixture", run.CandidateHead); err != nil {
+				t.Fatal(err)
+			}
+			if state == domain.StateFreshReview {
+				if err := store.Transition(context.Background(), run.ID, domain.StateVerifying, domain.StateFreshReview, "fixture repair progression", "fixture", run.CandidateHead); err != nil {
+					t.Fatal(err)
+				}
+			}
+			expired := firstRepairDeadlineStore{RunStore: store, firstRepairAt: time.Now().UTC().Add(-31 * time.Minute)}
+			updated, err := newController(t, expired, lab, process, gitadapter.Workspace{}).Continue(context.Background(), run.ID, nil)
+			if err == nil || updated.State != domain.StateManualIntervention {
+				t.Fatalf("state=%s updated=%+v err=%v", state, updated, err)
+			}
+		})
+	}
+}
+
+func beginInterruptedRepair(t *testing.T) (localLab, *storeadapter.Store, *durableFakeProcess, application.Run) {
+	t.Helper()
+	lab := newLocalLab(t)
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	process := &durableFakeProcess{}
+	controller := newController(t, store, lab, process, gitadapter.Workspace{})
+	input := startInput(lab)
+	input.Task.Policy.MaxRepairAttempts = domain.DefaultMaxRepairAttempts
+	input.NormalizedJSON, err = json.Marshal(input.Task)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(input.NormalizedJSON)
+	input.TaskHash = hex.EncodeToString(digest[:])
+	run, err := controller.Start(context.Background(), input)
+	if err != nil || run.State != domain.StateApprovalReady {
+		store.Close()
+		t.Fatalf("initial run=%+v err=%v", run, err)
+	}
+	for _, transition := range []struct{ from, to domain.State }{
+		{domain.StateApprovalReady, domain.StatePushingBranch},
+		{domain.StatePushingBranch, domain.StateBranchPushed},
+		{domain.StateBranchPushed, domain.StateOpeningPR},
+		{domain.StateOpeningPR, domain.StatePROpen},
+		{domain.StatePROpen, domain.StateReconcilingReviews},
+		{domain.StateReconcilingReviews, domain.StateRepairing},
+	} {
+		if err := store.Transition(context.Background(), run.ID, transition.from, transition.to, "fixture transition", "fixture", run.CandidateHead); err != nil {
+			store.Close()
+			t.Fatal(err)
+		}
+	}
+	process.blockResumeUntilContextDone = true
+	callerCtx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	defer cancel()
+	run, err = controller.Repair(callerCtx, run.ID, "caller deadline fixture")
+	if err == nil || run.State != domain.StateExecuting {
+		store.Close()
+		t.Fatalf("interrupted repair run=%+v err=%v", run, err)
+	}
+	return lab, store, process, run
+}
+
+func TestFreshReviewFindingsPersistAndResumeBoundedRepairWithSameSession(t *testing.T) {
 	lab := newLocalLab(t)
 	store, err := storeadapter.Open(lab.db)
 	if err != nil {
@@ -588,16 +771,86 @@ func TestReviewFindingsRemainSafeStopWithoutSameHeadRerun(t *testing.T) {
 	defer store.Close()
 	process := &durableFakeProcess{reviewFindings: true}
 	controller := newController(t, store, lab, process, gitadapter.Workspace{})
-	run, err := controller.Start(context.Background(), startInput(lab))
-	if err == nil || run.State != domain.StateFreshReview {
+	input := startInput(lab)
+	input.Task.Policy.MaxRepairAttempts = domain.DefaultMaxRepairAttempts
+	input.NormalizedJSON, err = json.Marshal(input.Task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(input.NormalizedJSON)
+	input.TaskHash = hex.EncodeToString(digest[:])
+	run, err := controller.Start(context.Background(), input)
+	if err != nil || run.State != domain.StateRepairing {
 		t.Fatalf("run=%+v err=%v", run, err)
 	}
-	_, err = controller.Continue(context.Background(), run.ID, nil)
-	if err == nil {
-		t.Fatal("findings must remain a safe stop")
+	inspection, err := store.Inspect(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if process.reviewCalls != 1 {
-		t.Fatalf("review calls=%d", process.reviewCalls)
+	if len(inspection.Findings) != 1 {
+		t.Fatalf("findings=%+v", inspection.Findings)
+	}
+	finding := inspection.Findings[0]
+	findingDigest := sha256.Sum256([]byte(finding.Body))
+	if finding.Source != "controller_fresh_review" || finding.SourceID != "fresh-review:f1" || finding.HeadSHA != run.CandidateHead || finding.BodyDigest != hex.EncodeToString(findingDigest[:]) {
+		t.Fatalf("finding=%+v candidate=%s", finding, run.CandidateHead)
+	}
+	if len(inspection.Timeline) == 0 || inspection.Timeline[len(inspection.Timeline)-1].From != domain.StateFreshReview || inspection.Timeline[len(inspection.Timeline)-1].To != domain.StateRepairing || inspection.Timeline[len(inspection.Timeline)-1].BoundHead != run.CandidateHead {
+		t.Fatalf("timeline=%+v", inspection.Timeline)
+	}
+	run, err = newController(t, store, lab, process, gitadapter.Workspace{}).RepairFindings(context.Background(), run.ID, inspection.Findings)
+	if err != nil || run.State != domain.StateApprovalReady {
+		t.Fatalf("run=%+v err=%v", run, err)
+	}
+	if process.resumeCalls != 1 || process.reviewCalls != 2 {
+		t.Fatalf("resumes=%d reviews=%d", process.resumeCalls, process.reviewCalls)
+	}
+}
+
+func TestProductionDriverRoutesFreshReviewFindingsIntoBoundedSameSessionRepair(t *testing.T) {
+	lab := newLocalLab(t)
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	repository := lab.repository
+	repository.AllowedOperatorLogins = []string{"operator"}
+	process := &durableFakeProcess{reviewFindings: true}
+	local := newController(t, store, lab, process, gitadapter.Workspace{})
+	reader := &productionLinearReader{source: productionLinearSource()}
+	admission, err := application.NewLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err := application.NewProductionCoordinator(admission, local, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requester := application.Requester{ID: "operator", Kind: "github_login"}
+	started, _, err := admission.Start(context.Background(), application.LinearStartCommand{Requester: requester, Identifier: "IFAN-FIXTURE"})
+	if err != nil || started.Run.State != domain.StateRepairing {
+		t.Fatalf("started=%+v err=%v", started, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	driver, err := application.NewProductionDriver(coordinator, store, application.ProductionDriverPorts{}, application.ProductionDriverPolicy{PollInterval: time.Second, MaxImmediateAction: 1}, func(context.Context, time.Duration) error {
+		cancel()
+		return context.Canceled
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = driver.Drive(ctx, application.ProductionDriveCommand{Requester: requester, RunID: started.Run.RunID, Repository: repository.CanonicalRepository, IdempotencyKey: started.Run.IdempotencyKey})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("driver error=%v", err)
+	}
+	run, err := store.GetRun(context.Background(), started.Run.RunID)
+	if err != nil || run.State != domain.StateApprovalReady {
+		t.Fatalf("run=%+v err=%v", run, err)
+	}
+	if process.resumeCalls != 1 || process.reviewCalls != 2 || reader.reads != 2 {
+		t.Fatalf("resumes=%d reviews=%d linear_reads=%d", process.resumeCalls, process.reviewCalls, reader.reads)
 	}
 }
 
@@ -605,6 +858,35 @@ type failingTransitionStore struct {
 	application.RunStore
 	from, to  domain.State
 	remaining int
+}
+
+type firstRepairDeadlineStore struct {
+	application.RunStore
+	firstRepairAt time.Time
+}
+
+func (s firstRepairDeadlineStore) Inspect(ctx context.Context, runID string) (application.RunInspection, error) {
+	inspection, err := s.RunStore.Inspect(ctx, runID)
+	if err != nil {
+		return inspection, err
+	}
+	for index := range inspection.Timeline {
+		if inspection.Timeline[index].From == domain.StateRepairing && inspection.Timeline[index].To == domain.StateExecuting {
+			inspection.Timeline[index].CreatedAt = s.firstRepairAt
+			break
+		}
+	}
+	return inspection, nil
+}
+
+func (s firstRepairDeadlineStore) SaveFinding(ctx context.Context, finding application.FindingRecord) error {
+	persister, ok := s.RunStore.(interface {
+		SaveFinding(context.Context, application.FindingRecord) error
+	})
+	if !ok {
+		return errors.New("finding persistence is unavailable")
+	}
+	return persister.SaveFinding(ctx, finding)
 }
 
 type failAfterTransitionStore struct {

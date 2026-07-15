@@ -23,6 +23,14 @@ func TestFreshReviewCanReachApprovalReadyButNotPROpen(t *testing.T) {
 	}
 }
 
+func TestActiveRepairFlowCanRequireManualIntervention(t *testing.T) {
+	for _, state := range []State{StateVerifying, StateFreshReview} {
+		if !CanTransition(state, StateManualIntervention) {
+			t.Fatalf("expired repair policy must stop %s", state)
+		}
+	}
+}
+
 func TestActionableRequiredCheckReturnsToRepair(t *testing.T) {
 	if !CanTransition(StateReconcilingReviews, StateRepairing) {
 		t.Fatal("actionable required checks must return the run to repair")
