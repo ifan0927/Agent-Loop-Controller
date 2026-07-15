@@ -145,6 +145,7 @@ type durableFakeProcess struct {
 	reviewFindings                                bool
 	noChangeOnResume                              bool
 	blockResumeUntilContextDone                   bool
+	resumeStarted                                 chan struct{}
 	implementationCalls, resumeCalls, reviewCalls int
 	resumeArgs                                    []string
 }
@@ -164,6 +165,12 @@ func (p *durableFakeProcess) Run(ctx context.Context, s processadapter.Spec) (pr
 		if s.Args[1] == "resume" {
 			p.resumeCalls++
 			p.resumeArgs = append([]string(nil), s.Args...)
+			if p.resumeStarted != nil {
+				select {
+				case p.resumeStarted <- struct{}{}:
+				default:
+				}
+			}
 			if p.blockResumeUntilContextDone {
 				<-ctx.Done()
 				return processadapter.Result{}, ctx.Err()
@@ -722,7 +729,7 @@ func beginInterruptedRepair(t *testing.T) (localLab, *storeadapter.Store, *durab
 	if err != nil {
 		t.Fatal(err)
 	}
-	process := &durableFakeProcess{}
+	process := &durableFakeProcess{resumeStarted: make(chan struct{}, 1)}
 	controller := newController(t, store, lab, process, gitadapter.Workspace{})
 	input := startInput(lab)
 	input.Task.Policy.MaxRepairAttempts = domain.DefaultMaxRepairAttempts
@@ -752,9 +759,32 @@ func beginInterruptedRepair(t *testing.T) (localLab, *storeadapter.Store, *durab
 		}
 	}
 	process.blockResumeUntilContextDone = true
-	callerCtx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
-	defer cancel()
-	run, err = controller.Repair(callerCtx, run.ID, "caller deadline fixture")
+	callerCtx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(context.Canceled)
+	type repairResult struct {
+		run application.Run
+		err error
+	}
+	result := make(chan repairResult, 1)
+	go func() {
+		updated, repairErr := controller.Repair(callerCtx, run.ID, "caller deadline fixture")
+		result <- repairResult{run: updated, err: repairErr}
+	}()
+	select {
+	case <-process.resumeStarted:
+	case <-time.After(5 * time.Second):
+		cancel(context.DeadlineExceeded)
+		store.Close()
+		t.Fatal("repair did not enter the persisted implementation session")
+	}
+	cancel(context.DeadlineExceeded)
+	select {
+	case outcome := <-result:
+		run, err = outcome.run, outcome.err
+	case <-time.After(5 * time.Second):
+		store.Close()
+		t.Fatal("repair did not stop after the caller deadline")
+	}
 	if err == nil || run.State != domain.StateExecuting {
 		store.Close()
 		t.Fatalf("interrupted repair run=%+v err=%v", run, err)
