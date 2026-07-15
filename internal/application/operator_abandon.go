@@ -369,7 +369,29 @@ func abandonCleanupLastError(err error) string {
 	return message
 }
 
-func persistAbandonCleanupFailure(ctx context.Context, delivery DeliveryStore, record CleanupRecord, cleanupErr error) error {
+func upsertAbandonCleanup(ctx context.Context, store RunStore, delivery DeliveryStore, leaseOwner string, record CleanupRecord) error {
+	if strings.TrimSpace(leaseOwner) == "" {
+		return delivery.UpsertCleanup(ctx, record)
+	}
+	fenced, ok := store.(AutomaticAdmissionCleanupStore)
+	if !ok {
+		return errors.New("configured store cannot persist lease-fenced abandon cleanup evidence")
+	}
+	return fenced.UpsertAutomaticAdmissionCleanup(ctx, leaseOwner, record)
+}
+
+func markAbandonResourceDeleted(ctx context.Context, store RunStore, leaseOwner string, resource OwnedResource) error {
+	if strings.TrimSpace(leaseOwner) == "" {
+		return store.AddOwnedResource(ctx, resource)
+	}
+	fenced, ok := store.(AutomaticAdmissionCleanupStore)
+	if !ok {
+		return errors.New("configured store cannot persist lease-fenced abandon resource state")
+	}
+	return fenced.MarkAutomaticAdmissionResourceDeleted(ctx, leaseOwner, resource)
+}
+
+func persistAbandonCleanupFailure(ctx context.Context, store RunStore, delivery DeliveryStore, leaseOwner string, record CleanupRecord, cleanupErr error) error {
 	auditCtx := ctx
 	var cancel context.CancelFunc
 	if auditCtx.Err() != nil {
@@ -379,11 +401,11 @@ func persistAbandonCleanupFailure(ctx context.Context, delivery DeliveryStore, r
 	record.Status = "failed"
 	record.ErrorClass = classifyCleanupFailure(cleanupErr)
 	record.LastError = abandonCleanupLastError(cleanupErr)
-	return delivery.UpsertCleanup(auditCtx, record)
+	return upsertAbandonCleanup(auditCtx, store, delivery, leaseOwner, record)
 }
 
-func abandonCleanupFailure(ctx context.Context, delivery DeliveryStore, record CleanupRecord, cleanupErr error) error {
-	if auditErr := persistAbandonCleanupFailure(ctx, delivery, record, cleanupErr); auditErr != nil {
+func abandonCleanupFailure(ctx context.Context, store RunStore, delivery DeliveryStore, leaseOwner string, record CleanupRecord, cleanupErr error) error {
+	if auditErr := persistAbandonCleanupFailure(ctx, store, delivery, leaseOwner, record, cleanupErr); auditErr != nil {
 		return errors.Join(cleanupErr, fmt.Errorf("persist abandon cleanup failure audit: %w", auditErr))
 	}
 	return cleanupErr
@@ -417,7 +439,7 @@ func cleanupAbandonedLocalResourcesWithLease(ctx context.Context, store RunStore
 			}
 			key := artifact.Kind + "\x00" + artifact.Name
 			if record, found := progress[key]; !found || record.Status != "retained" {
-				if err := delivery.UpsertCleanup(ctx, CleanupRecord{RunID: run.ID, Kind: artifact.Kind, Name: artifact.Name, Status: "retained"}); err != nil {
+				if err := upsertAbandonCleanup(ctx, store, delivery, leaseOwner, CleanupRecord{RunID: run.ID, Kind: artifact.Kind, Name: artifact.Name, Status: "retained"}); err != nil {
 					return err
 				}
 			}
@@ -431,7 +453,7 @@ func cleanupAbandonedLocalResourcesWithLease(ctx context.Context, store RunStore
 			}
 			key := resource.Kind + "\x00" + resource.Name
 			if record, found := progress[key]; !found || record.Status != "deleted" {
-				if err := delivery.UpsertCleanup(ctx, CleanupRecord{RunID: run.ID, Kind: resource.Kind, Name: resource.Name, Status: "deleted"}); err != nil {
+				if err := upsertAbandonCleanup(ctx, store, delivery, leaseOwner, CleanupRecord{RunID: run.ID, Kind: resource.Kind, Name: resource.Name, Status: "deleted"}); err != nil {
 					return err
 				}
 			}
@@ -445,13 +467,13 @@ func cleanupAbandonedLocalResourcesWithLease(ctx context.Context, store RunStore
 			return err
 		}
 		if hasDelivery {
-			if err := delivery.UpsertCleanup(ctx, CleanupRecord{RunID: run.ID, Kind: item.resource.Kind, Name: item.resource.Name, Status: "intent"}); err != nil {
+			if err := upsertAbandonCleanup(ctx, store, delivery, leaseOwner, CleanupRecord{RunID: run.ID, Kind: item.resource.Kind, Name: item.resource.Name, Status: "intent"}); err != nil {
 				return err
 			}
 		}
 		if err := renewAbandonLease(ctx, store, run.ID, leaseOwner); err != nil {
 			if hasDelivery {
-				return abandonCleanupFailure(ctx, delivery, CleanupRecord{RunID: run.ID, Kind: item.resource.Kind, Name: item.resource.Name}, err)
+				return abandonCleanupFailure(ctx, store, delivery, leaseOwner, CleanupRecord{RunID: run.ID, Kind: item.resource.Kind, Name: item.resource.Name}, err)
 			}
 			return err
 		}
@@ -464,21 +486,21 @@ func cleanupAbandonedLocalResourcesWithLease(ctx context.Context, store RunStore
 		}
 		if cleanupErr != nil {
 			if hasDelivery {
-				return abandonCleanupFailure(ctx, delivery, CleanupRecord{RunID: run.ID, Kind: item.resource.Kind, Name: item.resource.Name}, cleanupErr)
+				return abandonCleanupFailure(ctx, store, delivery, leaseOwner, CleanupRecord{RunID: run.ID, Kind: item.resource.Kind, Name: item.resource.Name}, cleanupErr)
 			}
 			return cleanupErr
 		}
 		if err := renewAbandonLease(ctx, store, run.ID, leaseOwner); err != nil {
 			if hasDelivery {
-				return abandonCleanupFailure(ctx, delivery, CleanupRecord{RunID: run.ID, Kind: item.resource.Kind, Name: item.resource.Name}, err)
+				return abandonCleanupFailure(ctx, store, delivery, leaseOwner, CleanupRecord{RunID: run.ID, Kind: item.resource.Kind, Name: item.resource.Name}, err)
 			}
 			return err
 		}
-		if err := store.AddOwnedResource(ctx, OwnedResource{RunID: run.ID, Kind: item.resource.Kind, Name: item.resource.Name, CreationEvidence: item.resource.CreationEvidence, Status: "deleted"}); err != nil {
+		if err := markAbandonResourceDeleted(ctx, store, leaseOwner, OwnedResource{RunID: run.ID, Kind: item.resource.Kind, Name: item.resource.Name, CreationEvidence: item.resource.CreationEvidence, Status: "deleted"}); err != nil {
 			return err
 		}
 		if hasDelivery {
-			if err := delivery.UpsertCleanup(ctx, CleanupRecord{RunID: run.ID, Kind: item.resource.Kind, Name: item.resource.Name, Status: "deleted"}); err != nil {
+			if err := upsertAbandonCleanup(ctx, store, delivery, leaseOwner, CleanupRecord{RunID: run.ID, Kind: item.resource.Kind, Name: item.resource.Name, Status: "deleted"}); err != nil {
 				return err
 			}
 		}

@@ -524,7 +524,7 @@ func controllerRecoverOwnedPush(args []string) error {
 }
 
 func controllerAbandon(args []string) error {
-	command, loaded, store, err := productionCommand(args, "controller abandon")
+	command, loaded, store, err := productionCommandWithoutDecision(args, "controller abandon")
 	if err != nil {
 		return err
 	}
@@ -708,13 +708,24 @@ type productionCLICommand struct {
 }
 
 func productionCommand(args []string, name string) (productionCLICommand, bootstrap.Bootstrap, *sqlitestore.Store, error) {
+	return productionCommandWithDecision(args, name, true)
+}
+
+func productionCommandWithoutDecision(args []string, name string) (productionCLICommand, bootstrap.Bootstrap, *sqlitestore.Store, error) {
+	return productionCommandWithDecision(args, name, false)
+}
+
+func productionCommandWithDecision(args []string, name string, allowDecision bool) (productionCLICommand, bootstrap.Bootstrap, *sqlitestore.Store, error) {
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
 	requester := addRequesterFlags(flags)
 	configPath := configPathFlag(flags)
 	repository := flags.String("repository", "", "previously observed canonical repository")
 	expectedState := flags.String("expected-state", "", "previously observed run state used as a compare-and-swap token")
 	idempotencyKey := flags.String("idempotency-key", "", "persisted run idempotency key from authorized start or status output")
-	decisionPath := flags.String("decision", "", "optional human decision JSON")
+	var decisionPath *string
+	if allowDecision {
+		decisionPath = flags.String("decision", "", "optional human decision JSON")
+	}
 	runID, remaining := splitLeadingRunID(args)
 	if err := flags.Parse(remaining); err != nil {
 		return productionCLICommand{}, bootstrap.Bootstrap{}, nil, err
@@ -743,7 +754,7 @@ func productionCommand(args []string, name string) (productionCLICommand, bootst
 		return productionCLICommand{}, bootstrap.Bootstrap{}, nil, application.ClassifyError(err)
 	}
 	var decision *application.Decision
-	if *decisionPath != "" {
+	if decisionPath != nil && *decisionPath != "" {
 		file, err := os.Open(*decisionPath)
 		if err != nil {
 			store.Close()

@@ -147,7 +147,8 @@ func TestAbandonLocalCleanupStopsWhenLeaseIsLostBetweenResources(t *testing.T) {
 		store.leaseLost = true
 		store.leaseMu.Unlock()
 	}}
-	if err := cleanupAbandonedLocalResourcesWithLease(context.Background(), store, run, cleanup, "abandon-owner"); err == nil {
+	err := cleanupAbandonedLocalResourcesWithLease(context.Background(), store, run, cleanup, "abandon-owner")
+	if err == nil || !strings.Contains(err.Error(), "persist abandon cleanup failure audit") {
 		t.Fatal("cleanup unexpectedly crossed a lost lease")
 	}
 	if len(cleanup.calls) != 1 || cleanup.calls[0] != "worktree" {
@@ -157,7 +158,7 @@ func TestAbandonLocalCleanupStopsWhenLeaseIsLostBetweenResources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(progress) != 1 || progress[0].Kind != "worktree" || progress[0].Status != "failed" || !strings.Contains(progress[0].LastError, "lease") {
+	if len(progress) != 1 || progress[0].Kind != "worktree" || progress[0].Status != "intent" {
 		t.Fatalf("lease loss audit=%+v", progress)
 	}
 }

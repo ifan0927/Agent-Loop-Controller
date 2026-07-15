@@ -217,6 +217,13 @@ func TestControllerAbandonRequiresExplicitCASAndRequesterIdentity(t *testing.T) 
 	}
 }
 
+func TestControllerAbandonRejectsHumanDecisionFlag(t *testing.T) {
+	err := controller([]string{"abandon", "run-abandon", "--decision", "/tmp/decision.json"})
+	if err == nil || !strings.Contains(err.Error(), "flag provided but not defined: -decision") {
+		t.Fatalf("abandon accepted human decision input error=%v", err)
+	}
+}
+
 func TestControllerDriveRejectsUnsafeAutomaticDriverOptionsBeforeConfigLoad(t *testing.T) {
 	identity := []string{"--requester", "ifan0927", "--requester-database-id", "33", "--requester-node-id", "MDQ6VXNlcjMz", "--requester-type", "User"}
 	err := controller(append([]string{"drive", "run-42", "--poll-interval", "0s"}, identity...))

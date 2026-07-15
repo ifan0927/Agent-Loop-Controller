@@ -363,6 +363,28 @@ func (s *pushTestStore) UpsertCleanup(_ context.Context, value CleanupRecord) er
 	return nil
 }
 
+func (s *pushTestStore) UpsertAutomaticAdmissionCleanup(ctx context.Context, owner string, value CleanupRecord) error {
+	ok, err := s.RenewLease(ctx, value.RunID, owner, time.Now().UTC().Add(localLeaseTTL))
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("automatic admission cleanup run lease was lost")
+	}
+	return s.UpsertCleanup(ctx, value)
+}
+
+func (s *pushTestStore) MarkAutomaticAdmissionResourceDeleted(ctx context.Context, owner string, value OwnedResource) error {
+	ok, err := s.RenewLease(ctx, value.RunID, owner, time.Now().UTC().Add(localLeaseTTL))
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("automatic admission cleanup run lease was lost")
+	}
+	return s.AddOwnedResource(ctx, value)
+}
+
 func (s *pushTestStore) CleanupProgress(_ context.Context, runID string) ([]CleanupRecord, error) {
 	var result []CleanupRecord
 	for _, item := range s.cleanup {

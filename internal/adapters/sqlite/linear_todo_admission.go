@@ -442,6 +442,85 @@ func rejectAbandonmentDeliveryEvidenceTx(ctx context.Context, tx *sql.Tx, run ap
 	return nil
 }
 
+// UpsertAutomaticAdmissionCleanup is the lease-fenced cleanup audit boundary
+// used after an abandon CAS. The no-op run update takes the write lock before
+// the cleanup upsert, so a replacement lease owner cannot be overwritten by a
+// stale retry.
+func (s *Store) UpsertAutomaticAdmissionCleanup(ctx context.Context, owner string, record application.CleanupRecord) error {
+	if err := validateAutomaticAdmissionCleanupRecord(owner, record); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := fenceAutomaticAdmissionCleanupLeaseTx(ctx, tx, owner, record.RunID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO cleanup_results(run_id,resource_kind,resource_name,status,error_class,last_error,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(run_id,resource_kind,resource_name) DO UPDATE SET status=excluded.status,error_class=excluded.error_class,last_error=excluded.last_error,updated_at=excluded.updated_at`, record.RunID, record.Kind, record.Name, record.Status, record.ErrorClass, record.LastError, nowText()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// MarkAutomaticAdmissionResourceDeleted updates ownership under the same
+// active run lease fence as cleanup audit writes.
+func (s *Store) MarkAutomaticAdmissionResourceDeleted(ctx context.Context, owner string, resource application.OwnedResource) error {
+	if strings.TrimSpace(owner) == "" || strings.TrimSpace(resource.RunID) == "" || (resource.Kind != "worktree" && resource.Kind != "branch") || strings.TrimSpace(resource.Name) == "" || resource.Status != "deleted" {
+		return errors.New("automatic admission cleanup resource update is invalid")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := fenceAutomaticAdmissionCleanupLeaseTx(ctx, tx, owner, resource.RunID); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE owned_resources SET creation_evidence=?,ownership_status=? WHERE resource_kind=? AND resource_name=? AND owning_run=?`, resource.CreationEvidence, resource.Status, resource.Kind, resource.Name, resource.RunID)
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return errors.New("automatic admission cleanup resource ownership changed")
+	}
+	return tx.Commit()
+}
+
+func validateAutomaticAdmissionCleanupRecord(owner string, record application.CleanupRecord) error {
+	if strings.TrimSpace(owner) == "" || strings.TrimSpace(record.RunID) == "" || strings.TrimSpace(record.Name) == "" {
+		return errors.New("automatic admission cleanup audit authority is incomplete")
+	}
+	switch record.Kind {
+	case "artifact_root":
+		if record.Status != "retained" {
+			return errors.New("automatic admission artifact cleanup status is invalid")
+		}
+	case "worktree", "branch", "local_branch":
+		switch record.Status {
+		case "intent", "failed", "deleted":
+		default:
+			return errors.New("automatic admission local cleanup status is invalid")
+		}
+	default:
+		return errors.New("automatic admission cleanup kind is invalid")
+	}
+	return nil
+}
+
+func fenceAutomaticAdmissionCleanupLeaseTx(ctx context.Context, tx *sql.Tx, owner, runID string) error {
+	now := time.Now().UTC()
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET updated_at=updated_at WHERE run_id=? AND current_state=? AND lease_owner=? AND lease_expires_unix>?`, runID, domain.StateFailed, owner, leaseUnixNano(now))
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return errors.New("automatic admission cleanup run lease was lost")
+	}
+	return nil
+}
+
 func isAbandonLocalCleanupEvidence(run application.Run, kind, name, status string) bool {
 	if run.ID == "" {
 		return false

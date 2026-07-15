@@ -564,6 +564,37 @@ func TestAutomaticAdmissionAbandonCleanupFailureDetailsSurviveReopen(t *testing.
 	}
 }
 
+func TestAutomaticAdmissionCleanupAuditRejectsStaleLeaseOwner(t *testing.T) {
+	store, run, _ := prepareAutomaticAbandonmentRun(t, domain.StateReceived)
+	defer store.Close()
+	ctx := context.Background()
+	request := automaticAbandonmentRequest(run, run.State, run.LeaseOwner)
+	if _, idempotent, err := store.AbandonAutomaticAdmission(ctx, request); err != nil || idempotent {
+		t.Fatalf("abandon idempotent=%v err=%v", idempotent, err)
+	}
+	intent := application.CleanupRecord{RunID: run.ID, Kind: "branch", Name: run.WorkingBranch, Status: "intent"}
+	if err := store.UpsertAutomaticAdmissionCleanup(ctx, run.LeaseOwner, intent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE runs SET lease_expires_unix=? WHERE run_id=?`, time.Now().UTC().Add(-time.Second).UnixNano(), run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if acquired, err := store.AcquireLease(ctx, run.ID, "replacement-owner", time.Now().UTC().Add(time.Minute)); err != nil || !acquired {
+		t.Fatalf("replacement run lease acquired=%v err=%v", acquired, err)
+	}
+	stale := intent
+	stale.Status = "failed"
+	stale.ErrorClass = "operation_failed"
+	stale.LastError = "stale cleanup failure"
+	if err := store.UpsertAutomaticAdmissionCleanup(ctx, run.LeaseOwner, stale); err == nil {
+		t.Fatal("stale lease owner overwrote cleanup audit")
+	}
+	progress, err := store.CleanupProgress(ctx, run.ID)
+	if err != nil || len(progress) != 1 || progress[0].Status != "intent" || progress[0].LastError != "" {
+		t.Fatalf("stale cleanup audit=%+v err=%v", progress, err)
+	}
+}
+
 func TestAutomaticAdmissionAbandonRejectsRetainedDeliveryEvidence(t *testing.T) {
 	for _, name := range []string{"pull_request", "approval_observation", "push", "merge", "reply_intent", "remote_cleanup_intent"} {
 		t.Run(name, func(t *testing.T) {

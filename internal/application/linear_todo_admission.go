@@ -119,6 +119,14 @@ type AutomaticAdmissionAbandonStore interface {
 	AbandonAutomaticAdmission(context.Context, AutomaticAdmissionAbandonment) (Run, bool, error)
 }
 
+// AutomaticAdmissionCleanupStore persists abandon cleanup evidence only while
+// the same active run lease still fences the caller. It prevents a stale
+// cleanup retry from overwriting a newer owner's result.
+type AutomaticAdmissionCleanupStore interface {
+	UpsertAutomaticAdmissionCleanup(context.Context, string, CleanupRecord) error
+	MarkAutomaticAdmissionResourceDeleted(context.Context, string, OwnedResource) error
+}
+
 // LinearTodoAdmissionStore is intentionally narrow. Future scheduling code
 // cannot turn it into a generic Linear mutation or controller-driving port.
 type LinearTodoAdmissionStore interface {
