@@ -114,13 +114,16 @@ func validateAbandonInspection(inspection RunInspection) error {
 		return errors.New("pull request, approval, or merge evidence is retained")
 	}
 	for _, side := range inspection.SideEffects {
-		switch side.Kind {
-		case "push", "open_pull_request", "squash_merge", "merge":
-			return errors.New("push, pull request, or merge intent is retained")
-		case "linear_move_to_started":
-			if side.Status == "intent" || side.Status == "in_flight" {
-				return errors.New("Linear admission mutation is still in flight")
-			}
+		if side.Kind != "linear_move_to_started" {
+			return errors.New("external side-effect evidence is retained")
+		}
+		if side.Status != "observed" && side.Status != "failed" {
+			return errors.New("Linear admission mutation is still in flight or unresolved")
+		}
+	}
+	for _, cleanup := range inspection.Cleanup {
+		if !isAbandonLocalCleanupEvidence(inspection.Run, cleanup) {
+			return errors.New("unresolved external cleanup evidence is retained")
 		}
 	}
 	for _, resource := range inspection.Resources {
@@ -132,6 +135,42 @@ func validateAbandonInspection(inspection RunInspection) error {
 		}
 	}
 	return nil
+}
+
+func isAbandonLocalCleanupEvidence(run Run, record CleanupRecord) bool {
+	if record.RunID != run.ID {
+		return false
+	}
+	switch record.Kind {
+	case "artifact_root":
+		return record.Name == run.ArtifactRoot && record.Status == "retained"
+	case "worktree":
+		return record.Name == run.WorktreePath && abandonLocalCleanupStatus(record.Status)
+	case "branch", "local_branch":
+		return record.Name == run.WorkingBranch && abandonLocalCleanupStatus(record.Status)
+	case "source_checkout":
+		return record.Name == sourceCheckoutCleanupIdentity && abandonSourceCheckoutCleanupStatus(record.Status)
+	default:
+		return false
+	}
+}
+
+func abandonLocalCleanupStatus(status string) bool {
+	switch status {
+	case "intent", "failed", "deleted":
+		return true
+	default:
+		return false
+	}
+}
+
+func abandonSourceCheckoutCleanupStatus(status string) bool {
+	switch status {
+	case "intent", "failed", "synced", "skipped_attention":
+		return true
+	default:
+		return false
+	}
 }
 
 func selectAbandonLocalResources(run Run, resources []OwnedResource) ([]abandonLocalResource, error) {

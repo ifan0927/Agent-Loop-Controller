@@ -523,7 +523,7 @@ func TestAutomaticAdmissionAbandonReleasesSlotAndReplaysIdempotently(t *testing.
 }
 
 func TestAutomaticAdmissionAbandonRejectsRetainedDeliveryEvidence(t *testing.T) {
-	for _, name := range []string{"pull_request", "approval_observation", "push", "merge"} {
+	for _, name := range []string{"pull_request", "approval_observation", "push", "merge", "reply_intent", "remote_cleanup_intent"} {
 		t.Run(name, func(t *testing.T) {
 			store, run, _ := prepareAutomaticAbandonmentRun(t, domain.StateManualIntervention)
 			defer store.Close()
@@ -546,6 +546,14 @@ func TestAutomaticAdmissionAbandonRejectsRetainedDeliveryEvidence(t *testing.T) 
 				if err := store.SaveMerge(ctx, application.MergeRecord{RunID: run.ID, PRNumber: 7, PreMergeSHA: "head", BaseSHA: run.BaseSHA, Method: "squash", MergeSHA: "merge", MergedAt: time.Now().UTC()}); err != nil {
 					t.Fatal(err)
 				}
+			case "reply_intent":
+				if _, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{RunID: run.ID, Kind: "reply_to_review_comment", IdempotencyKey: "reply-intent", IntentJSON: `{"pull_request":7}`, Attempt: 1}); err != nil {
+					t.Fatal(err)
+				}
+			case "remote_cleanup_intent":
+				if err := store.UpsertCleanup(ctx, application.CleanupRecord{RunID: run.ID, Kind: "remote_branch", Name: run.WorkingBranch, Status: "intent"}); err != nil {
+					t.Fatal(err)
+				}
 			}
 			_, _, err := store.AbandonAutomaticAdmission(ctx, application.AutomaticAdmissionAbandonment{RunID: run.ID, ExpectedState: domain.StateManualIntervention, IdempotencyKey: run.IdempotencyKey})
 			if err == nil {
@@ -554,6 +562,37 @@ func TestAutomaticAdmissionAbandonRejectsRetainedDeliveryEvidence(t *testing.T) 
 			current, getErr := store.GetRun(ctx, run.ID)
 			if getErr != nil || current.State != domain.StateManualIntervention {
 				t.Fatalf("state changed after rejection current=%+v err=%v", current, getErr)
+			}
+		})
+	}
+}
+
+func TestAutomaticAdmissionAbandonReplayRejectsNewExternalDeliveryEvidence(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		add  func(context.Context, *Store, application.Run) error
+	}{
+		{name: "reply intent", add: func(ctx context.Context, store *Store, run application.Run) error {
+			_, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{RunID: run.ID, Kind: "reply_to_review_comment", IdempotencyKey: "reply-replay", IntentJSON: `{"pull_request":7}`, Attempt: 1})
+			return err
+		}},
+		{name: "remote cleanup intent", add: func(ctx context.Context, store *Store, run application.Run) error {
+			return store.UpsertCleanup(ctx, application.CleanupRecord{RunID: run.ID, Kind: "remote_branch", Name: run.WorkingBranch, Status: "intent"})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, run, _ := prepareAutomaticAbandonmentRun(t, domain.StateReceived)
+			defer store.Close()
+			ctx := context.Background()
+			request := application.AutomaticAdmissionAbandonment{RunID: run.ID, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}
+			if _, idempotent, err := store.AbandonAutomaticAdmission(ctx, request); err != nil || idempotent {
+				t.Fatalf("initial abandon idempotent=%v err=%v", idempotent, err)
+			}
+			if err := test.add(ctx, store, run); err != nil {
+				t.Fatal(err)
+			}
+			if _, idempotent, err := store.AbandonAutomaticAdmission(ctx, request); err == nil || idempotent {
+				t.Fatalf("replay accepted new external evidence idempotent=%v err=%v", idempotent, err)
 			}
 		})
 	}

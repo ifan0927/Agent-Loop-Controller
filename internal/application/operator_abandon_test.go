@@ -136,13 +136,16 @@ func TestSelectAbandonLocalResourcesRequiresExactNamesAndSharedNonce(t *testing.
 
 func TestValidateAbandonInspectionRejectsExternalDeliveryEvidence(t *testing.T) {
 	run := Run{ID: "run", State: domain.StateManualIntervention}
-	for _, side := range []SideEffectRecord{{Kind: "push", Status: "failed"}, {Kind: "squash_merge", Status: "intent"}, {Kind: "linear_move_to_started", Status: "in_flight"}} {
+	for _, side := range []SideEffectRecord{{Kind: "push", Status: "failed"}, {Kind: "squash_merge", Status: "intent"}, {Kind: "reply_to_review_comment", Status: "intent"}, {Kind: "linear_move_to_started", Status: "in_flight"}} {
 		if err := validateAbandonInspection(RunInspection{Run: run, SideEffects: []SideEffectRecord{side}}); err == nil {
 			t.Fatalf("side effect was accepted: %+v", side)
 		}
 	}
 	if err := validateAbandonInspection(RunInspection{Run: run, PullRequest: &domain.PullRequest{Number: 1}}); err == nil {
 		t.Fatal("pull request evidence was accepted")
+	}
+	if err := validateAbandonInspection(RunInspection{Run: run, Cleanup: []CleanupRecord{{RunID: run.ID, Kind: "remote_branch", Name: "ifan/one", Status: "intent"}}}); err == nil {
+		t.Fatal("remote cleanup intent was accepted")
 	}
 }
 

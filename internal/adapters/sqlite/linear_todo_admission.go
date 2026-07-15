@@ -302,7 +302,7 @@ func (s *Store) AbandonAutomaticAdmission(ctx context.Context, request applicati
 		if err := verifyAbandonmentTransitionTx(ctx, tx, request); err != nil {
 			return application.Run{}, false, err
 		}
-		if err := rejectAbandonmentDeliveryEvidenceTx(ctx, tx, run.ID); err != nil {
+		if err := rejectAbandonmentDeliveryEvidenceTx(ctx, tx, run); err != nil {
 			return application.Run{}, false, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -327,7 +327,7 @@ func (s *Store) AbandonAutomaticAdmission(ctx context.Context, request applicati
 	if journal.Status == "mutation_intent" {
 		return application.Run{}, false, errors.New("automatic admission abandonment is blocked by a pending Linear mutation")
 	}
-	if err := rejectAbandonmentDeliveryEvidenceTx(ctx, tx, run.ID); err != nil {
+	if err := rejectAbandonmentDeliveryEvidenceTx(ctx, tx, run); err != nil {
 		return application.Run{}, false, err
 	}
 
@@ -374,7 +374,7 @@ func verifyAbandonmentTransitionTx(ctx context.Context, tx *sql.Tx, request appl
 	return nil
 }
 
-func rejectAbandonmentDeliveryEvidenceTx(ctx context.Context, tx *sql.Tx, runID string) error {
+func rejectAbandonmentDeliveryEvidenceTx(ctx context.Context, tx *sql.Tx, run application.Run) error {
 	var count int
 	for _, query := range []string{
 		`SELECT COUNT(*) FROM pull_requests WHERE run_id=?`,
@@ -382,17 +382,69 @@ func rejectAbandonmentDeliveryEvidenceTx(ctx context.Context, tx *sql.Tx, runID 
 		`SELECT COUNT(*) FROM human_approvals WHERE run_id=?`,
 		`SELECT COUNT(*) FROM human_approval_observations WHERE run_id=?`,
 		`SELECT COUNT(*) FROM owned_resources WHERE owning_run=? AND resource_kind IN ('remote_branch','pull_request') AND ownership_status<>'deleted'`,
-		`SELECT COUNT(*) FROM side_effects WHERE run_id=? AND kind IN ('push','open_pull_request','squash_merge','merge')`,
-		`SELECT COUNT(*) FROM side_effects WHERE run_id=? AND kind='linear_move_to_started' AND status IN ('intent','in_flight')`,
+		`SELECT COUNT(*) FROM side_effects WHERE run_id=? AND NOT (kind='linear_move_to_started' AND status IN ('observed','failed'))`,
 	} {
-		if err := tx.QueryRowContext(ctx, query, runID).Scan(&count); err != nil {
+		if err := tx.QueryRowContext(ctx, query, run.ID).Scan(&count); err != nil {
 			return err
 		}
 		if count != 0 {
 			return errors.New("automatic admission abandonment is blocked by retained external delivery evidence")
 		}
 	}
+	rows, err := tx.QueryContext(ctx, `SELECT resource_kind,resource_name,status FROM cleanup_results WHERE run_id=?`, run.ID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var kind, name, status string
+		if err := rows.Scan(&kind, &name, &status); err != nil {
+			return err
+		}
+		if !isAbandonLocalCleanupEvidence(run, kind, name, status) {
+			return errors.New("automatic admission abandonment is blocked by retained external cleanup evidence")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
 	return nil
+}
+
+func isAbandonLocalCleanupEvidence(run application.Run, kind, name, status string) bool {
+	if run.ID == "" {
+		return false
+	}
+	switch kind {
+	case "artifact_root":
+		return name == run.ArtifactRoot && status == "retained"
+	case "worktree":
+		return name == run.WorktreePath && abandonLocalCleanupStatus(status)
+	case "branch", "local_branch":
+		return name == run.WorkingBranch && abandonLocalCleanupStatus(status)
+	case "source_checkout":
+		return name == "configured_source_checkout" && abandonSourceCheckoutCleanupStatus(status)
+	default:
+		return false
+	}
+}
+
+func abandonLocalCleanupStatus(status string) bool {
+	switch status {
+	case "intent", "failed", "deleted":
+		return true
+	default:
+		return false
+	}
+}
+
+func abandonSourceCheckoutCleanupStatus(status string) bool {
+	switch status {
+	case "intent", "failed", "synced", "skipped_attention":
+		return true
+	default:
+		return false
+	}
 }
 
 func nextTransitionSequenceTx(ctx context.Context, tx *sql.Tx, runID string) (int64, error) {
