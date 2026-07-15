@@ -12,8 +12,10 @@ import (
 )
 
 type abandonCleanupFake struct {
-	calls []string
-	err   error
+	calls         []string
+	err           error
+	afterWorktree func()
+	afterBranch   func()
 }
 
 type abandonCoordinatorStore struct {
@@ -36,11 +38,17 @@ func (s *abandonCoordinatorStore) AbandonAutomaticAdmission(_ context.Context, r
 
 func (f *abandonCleanupFake) RemoveWorktree(context.Context, string, string, string, string) error {
 	f.calls = append(f.calls, "worktree")
+	if f.afterWorktree != nil {
+		f.afterWorktree()
+	}
 	return f.err
 }
 
 func (f *abandonCleanupFake) DeleteLocalBranch(context.Context, string, string, string) error {
 	f.calls = append(f.calls, "branch")
+	if f.afterBranch != nil {
+		f.afterBranch()
+	}
 	return f.err
 }
 
@@ -82,6 +90,59 @@ func TestAbandonLocalCleanupRetainsArtifactAndUsesOnlyOwnedLocalResources(t *tes
 		if resource.Kind == "artifact_root" && resource.Status != "owned" {
 			t.Fatalf("artifact ownership changed=%+v", resource)
 		}
+	}
+}
+
+func TestAbandonLocalCleanupPersistsFailureDetails(t *testing.T) {
+	repository := LocalRepository{CanonicalRepository: "owner/repo", SourcePath: "/owned/source", OriginPath: "/owned/origin", BaseBranch: "main"}
+	run := abandonCleanupRun(t, repository)
+	evidence := `{"source_path":"/owned/source","origin_path":"/owned/origin","path":"/owned/worktree","branch":"ifan/one","base_branch":"main","base_sha":"base","nonce":"nonce"}`
+	store := &pushTestStore{run: run, resources: []OwnedResource{{RunID: run.ID, Kind: "branch", Name: run.WorkingBranch, CreationEvidence: evidence, Status: "owned"}}}
+	cleanup := &abandonCleanupFake{err: errors.New("branch cleanup failed while removing candidate")}
+	if err := cleanupAbandonedLocalResources(context.Background(), store, run, cleanup); err == nil {
+		t.Fatal("cleanup unexpectedly succeeded")
+	}
+	progress, err := store.CleanupProgress(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(progress) != 1 || progress[0].Status != "failed" || progress[0].LastError != "branch cleanup failed while removing candidate" {
+		t.Fatalf("cleanup failure audit=%+v", progress)
+	}
+	inspection, err := store.Inspect(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inspection.Cleanup) != 1 || inspection.Cleanup[0].LastError != progress[0].LastError {
+		t.Fatalf("inspection cleanup audit=%+v", inspection.Cleanup)
+	}
+}
+
+func TestAbandonLocalCleanupStopsWhenLeaseIsLostBetweenResources(t *testing.T) {
+	repository := LocalRepository{CanonicalRepository: "owner/repo", SourcePath: "/owned/source", OriginPath: "/owned/origin", BaseBranch: "main"}
+	run := abandonCleanupRun(t, repository)
+	evidence := `{"source_path":"/owned/source","origin_path":"/owned/origin","path":"/owned/worktree","branch":"ifan/one","base_branch":"main","base_sha":"base","nonce":"nonce"}`
+	store := &pushTestStore{run: run, leaseHeld: true, resources: []OwnedResource{
+		{RunID: run.ID, Kind: "worktree", Name: run.WorktreePath, CreationEvidence: evidence, Status: "owned"},
+		{RunID: run.ID, Kind: "branch", Name: run.WorkingBranch, CreationEvidence: evidence, Status: "owned"},
+	}}
+	cleanup := &abandonCleanupFake{afterWorktree: func() {
+		store.leaseMu.Lock()
+		store.leaseLost = true
+		store.leaseMu.Unlock()
+	}}
+	if err := cleanupAbandonedLocalResourcesWithLease(context.Background(), store, run, cleanup, "abandon-owner"); err == nil {
+		t.Fatal("cleanup unexpectedly crossed a lost lease")
+	}
+	if len(cleanup.calls) != 1 || cleanup.calls[0] != "worktree" {
+		t.Fatalf("cleanup calls after lease loss=%v", cleanup.calls)
+	}
+	progress, err := store.CleanupProgress(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(progress) != 1 || progress[0].Kind != "worktree" || progress[0].Status != "failed" || !strings.Contains(progress[0].LastError, "lease") {
+		t.Fatalf("lease loss audit=%+v", progress)
 	}
 }
 

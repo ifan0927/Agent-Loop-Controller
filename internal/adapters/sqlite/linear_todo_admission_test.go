@@ -522,6 +522,48 @@ func TestAutomaticAdmissionAbandonReleasesSlotAndReplaysIdempotently(t *testing.
 	}
 }
 
+func TestAutomaticAdmissionAbandonCleanupFailureDetailsSurviveReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "controller.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	lease, acquired, err := store.AcquireLinearTodoAdmissionLease(ctx, "abandon-test", time.Minute, time.Now().UTC())
+	if err != nil || !acquired {
+		store.Close()
+		t.Fatalf("lease acquired=%v err=%v", acquired, err)
+	}
+	reservation := automaticAdmissionReservation("123e4567-e89b-42d3-a456-426614174100", "run-abandon-audit", "IFAN-100", lease)
+	run, _, reserved, err := store.ReserveLinearTodoAdmission(ctx, reservation)
+	if err != nil || !reserved {
+		store.Close()
+		t.Fatalf("reserved=%v err=%v", reserved, err)
+	}
+	record := application.CleanupRecord{RunID: run.ID, Kind: "branch", Name: run.WorkingBranch, Status: "failed", ErrorClass: "operation_failed", LastError: "branch cleanup failed while removing candidate"}
+	if err := store.UpsertCleanup(ctx, record); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	progress, err := reopened.CleanupProgress(ctx, run.ID)
+	if err != nil || len(progress) != 1 || progress[0].LastError != record.LastError {
+		t.Fatalf("reopened cleanup progress=%+v err=%v", progress, err)
+	}
+	inspection, err := reopened.Inspect(ctx, run.ID)
+	if err != nil || len(inspection.Cleanup) != 1 || inspection.Cleanup[0].LastError != record.LastError {
+		t.Fatalf("reopened inspection cleanup=%+v err=%v", inspection.Cleanup, err)
+	}
+}
+
 func TestAutomaticAdmissionAbandonRejectsRetainedDeliveryEvidence(t *testing.T) {
 	for _, name := range []string{"pull_request", "approval_observation", "push", "merge", "reply_intent", "remote_cleanup_intent"} {
 		t.Run(name, func(t *testing.T) {
