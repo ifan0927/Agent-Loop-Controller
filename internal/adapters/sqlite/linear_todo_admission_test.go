@@ -596,7 +596,7 @@ func TestAutomaticAdmissionCleanupAuditRejectsStaleLeaseOwner(t *testing.T) {
 }
 
 func TestAutomaticAdmissionAbandonRejectsRetainedDeliveryEvidence(t *testing.T) {
-	for _, name := range []string{"pull_request", "approval_observation", "push", "merge", "reply_intent", "remote_cleanup_intent", "human_decision"} {
+	for _, name := range []string{"pull_request", "approval_observation", "push", "merge", "reply_intent", "reply_evidence", "remote_cleanup_intent", "human_decision"} {
 		t.Run(name, func(t *testing.T) {
 			store, run, _ := prepareAutomaticAbandonmentRun(t, domain.StateManualIntervention)
 			defer store.Close()
@@ -621,6 +621,10 @@ func TestAutomaticAdmissionAbandonRejectsRetainedDeliveryEvidence(t *testing.T) 
 				}
 			case "reply_intent":
 				if _, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{RunID: run.ID, Kind: "reply_to_review_comment", IdempotencyKey: "reply-intent", IntentJSON: `{"pull_request":7}`, Attempt: 1}); err != nil {
+					t.Fatal(err)
+				}
+			case "reply_evidence":
+				if _, err := store.db.ExecContext(ctx, `INSERT INTO trusted_review_reply_evidence(run_id,root_comment_node_id,pr_number,root_comment_database_id,repaired_head,marker_digest,reply_database_id,reply_node_id,app_id,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, run.ID, "COMMENT_7", 7, 70, "head", strings.Repeat("a", 64), 71, "COMMENT_REPLY_7", 99, formatTime(time.Now().UTC())); err != nil {
 					t.Fatal(err)
 				}
 			case "remote_cleanup_intent":
@@ -655,6 +659,10 @@ func TestAutomaticAdmissionAbandonReplayRejectsNewExternalDeliveryEvidence(t *te
 	}{
 		{name: "reply intent", add: func(ctx context.Context, store *Store, run application.Run) error {
 			_, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{RunID: run.ID, Kind: "reply_to_review_comment", IdempotencyKey: "reply-replay", IntentJSON: `{"pull_request":7}`, Attempt: 1})
+			return err
+		}},
+		{name: "reply evidence", add: func(ctx context.Context, store *Store, run application.Run) error {
+			_, err := store.db.ExecContext(ctx, `INSERT INTO trusted_review_reply_evidence(run_id,root_comment_node_id,pr_number,root_comment_database_id,repaired_head,marker_digest,reply_database_id,reply_node_id,app_id,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, run.ID, "COMMENT_REPLAY", 7, 70, "head", strings.Repeat("b", 64), 71, "COMMENT_REPLY_REPLAY", 99, formatTime(time.Now().UTC()))
 			return err
 		}},
 		{name: "remote cleanup intent", add: func(ctx context.Context, store *Store, run application.Run) error {

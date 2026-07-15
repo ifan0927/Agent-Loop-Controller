@@ -163,8 +163,8 @@ func startAbandonLeaseRenewal(ctx context.Context, store RunStore, runID, owner 
 }
 
 func validateAbandonInspection(inspection RunInspection) error {
-	if inspection.PullRequest != nil || inspection.Merge != nil || inspection.Approval != nil || inspection.ApprovalObservation != nil {
-		return errors.New("pull request, approval, or merge evidence is retained")
+	if inspection.PullRequest != nil || inspection.Merge != nil || inspection.Approval != nil || inspection.ApprovalObservation != nil || len(inspection.ReviewReplies) != 0 {
+		return errors.New("pull request, approval, merge, or reply evidence is retained")
 	}
 	for _, side := range inspection.SideEffects {
 		if side.Kind != "linear_move_to_started" {
