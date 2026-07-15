@@ -345,6 +345,9 @@ func (c *LocalController) continueExpected(ctx context.Context, runID string, ex
 			return run, fmt.Errorf("local controller cannot continue state %s", run.State)
 		}
 		if err != nil {
+			if stopped, deadlineErr := c.enforceRepairDeadline(ctx, run); deadlineErr != nil {
+				return stopped, errors.Join(err, deadlineErr)
+			}
 			_ = c.store.SetLastError(ctx, run.ID, err.Error())
 			persisted, getErr := c.store.GetRun(ctx, run.ID)
 			if getErr != nil {
@@ -930,6 +933,12 @@ func (c *LocalController) acceptDecision(ctx context.Context, run Run, decision 
 }
 
 func (c *LocalController) verifyCandidate(ctx context.Context, run Run) error {
+	actionCtx, cancelAction, err := c.boundRepairActionContext(ctx, run)
+	if err != nil {
+		return err
+	}
+	defer cancelAction()
+	ctx = actionCtx
 	if err := c.validateWorkspace(ctx, run, false); err != nil {
 		return err
 	}
@@ -1058,6 +1067,12 @@ func (c *LocalController) runVerification(ctx context.Context, run Run, phase st
 }
 
 func (c *LocalController) freshReview(ctx context.Context, run Run) error {
+	actionCtx, cancelAction, err := c.boundRepairActionContext(ctx, run)
+	if err != nil {
+		return err
+	}
+	defer cancelAction()
+	ctx = actionCtx
 	if err := validateRunModelPolicy(run); err != nil {
 		return err
 	}
@@ -1715,6 +1730,48 @@ func (c *LocalController) enforceRepairDeadline(ctx context.Context, run Run) (R
 		return run, nil
 	}
 	return c.persistExpiredRepairDeadline(run)
+}
+
+func (c *LocalController) boundRepairActionContext(ctx context.Context, run Run) (context.Context, context.CancelFunc, error) {
+	if run.State != domain.StateVerifying && run.State != domain.StateFreshReview {
+		return ctx, func() {}, nil
+	}
+	inspection, err := c.store.Inspect(ctx, run.ID)
+	if err != nil {
+		if ctx.Err() == nil {
+			return ctx, func() {}, err
+		}
+		policyCtx, cancel := context.WithTimeout(context.Background(), repairDeadlinePersistenceTTL)
+		defer cancel()
+		inspection, err = c.store.Inspect(policyCtx, run.ID)
+		if err != nil {
+			return ctx, func() {}, errors.Join(ctx.Err(), err)
+		}
+	}
+	if repairDeadlineAnchorInvalid(inspection.Timeline) || (repairDeadlineAnchorRequired(run.State, inspection.Timeline) && !repairDeadlineAnchorIsValid(inspection.Timeline)) {
+		_, deadlineErr := c.persistInvalidRepairDeadline(run)
+		return ctx, func() {}, deadlineErr
+	}
+	deadline, found, deadlineErr := persistedRepairDeadline(inspection.Timeline)
+	if deadlineErr != nil {
+		_, deadlineErr = c.persistInvalidRepairDeadline(run)
+		return ctx, func() {}, deadlineErr
+	}
+	if !found {
+		if ctx.Err() != nil {
+			return ctx, func() {}, ctx.Err()
+		}
+		return ctx, func() {}, nil
+	}
+	if !time.Now().UTC().Before(deadline) {
+		_, deadlineErr = c.persistExpiredRepairDeadline(run)
+		return ctx, func() {}, deadlineErr
+	}
+	if ctx.Err() != nil {
+		return ctx, func() {}, ctx.Err()
+	}
+	bounded, cancelBounded := context.WithDeadline(ctx, deadline)
+	return bounded, cancelBounded, nil
 }
 
 const (

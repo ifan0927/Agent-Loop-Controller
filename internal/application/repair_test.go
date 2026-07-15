@@ -217,6 +217,27 @@ func TestInitialRepairFreeFlowDoesNotRequireRepairDeadlineAnchor(t *testing.T) {
 	}
 }
 
+func TestRepairActionContextUsesPersistedDeadline(t *testing.T) {
+	store := &repairDeadlineTestStore{
+		run:        Run{ID: "run", State: domain.StateFreshReview, CandidateHead: "head"},
+		inspection: RunInspection{Timeline: []Transition{{From: domain.StateRepairing, To: domain.StateExecuting, CreatedAt: time.Now().UTC().Add(-repairDeadline + 20*time.Millisecond)}}},
+	}
+	controller := &LocalController{store: store}
+	actionCtx, cancel, err := controller.boundRepairActionContext(context.Background(), store.run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	select {
+	case <-actionCtx.Done():
+		if !errors.Is(actionCtx.Err(), context.DeadlineExceeded) {
+			t.Fatalf("action context error=%v", actionCtx.Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("repair action context ignored persisted deadline")
+	}
+}
+
 func TestLatestRepairStartedAtUsesNewestRepairTransition(t *testing.T) {
 	first := time.Now().UTC().Add(-time.Minute)
 	second := time.Now().UTC()
