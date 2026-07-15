@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/codex"
@@ -2185,7 +2186,12 @@ func readBoundedFile(ctx context.Context, path string, maximum int64) ([]byte, e
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	info, err := os.Lstat(path)
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
 	if err != nil {
 		return nil, err
 	}
@@ -2195,11 +2201,6 @@ func readBoundedFile(ctx context.Context, path string, maximum int64) ([]byte, e
 	if info.Size() < 0 || info.Size() > maximum {
 		return nil, errors.New("artifact exceeds the bounded read size")
 	}
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
 	data := make([]byte, 0, info.Size())
 	buffer := make([]byte, 32*1024)
 	for {

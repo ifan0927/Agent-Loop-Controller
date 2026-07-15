@@ -110,6 +110,17 @@ func TestOutcomeReadHonorsCancellationAndSizeBound(t *testing.T) {
 	if _, err := readOutcomeWithContext[domain.ReviewOutcome](context.Background(), oversized, "ignored"); err == nil {
 		t.Fatal("oversized outcome was read")
 	}
+	link := filepath.Join(t.TempDir(), "linked-outcome.json")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readOutcomeWithContext[domain.ReviewOutcome](context.Background(), link, "ignored"); err == nil {
+		t.Fatal("symlink outcome was read")
+	}
+	directory := t.TempDir()
+	if _, err := readOutcomeWithContext[domain.ReviewOutcome](context.Background(), directory, "ignored"); err == nil {
+		t.Fatal("directory outcome was read")
+	}
 }
 
 type repairDeadlineTestStore struct {
