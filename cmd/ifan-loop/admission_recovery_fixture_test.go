@@ -12,64 +12,75 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-// This fixture restarts the dispatcher between every worker cycle while the
-// real SQLite store remains the only retry authority. The Linear ports and
-// driver are controlled offline adapters; no external service is contacted.
+// This fixture ends one worker invocation after scheduling a retry, closes and
+// reopens the real SQLite store, then uses a fresh worker and adapter
+// composition to recover. The Linear ports and driver are controlled offline
+// adapters; no external service is contacted.
 func TestOfflineAcceptanceWorkerRestartPreservesRetryAndStopsAtDurableAttention(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	store, err := openOfflineAdmissionStore(t)
+	dbPath := t.TempDir() + "/controller.db"
+	store, err := storeadapter.Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
 
 	repository := offlineAdmissionRepository(t)
 	candidate := offlineAdmissionCandidate()
-	reader := newOfflineAdmissionReader(offlineAdmissionSource(candidate))
-	scanner := &offlineAdmissionScanner{scan: application.LinearTodoCandidateScan{Candidates: []application.LinearTodoCandidate{candidate}, Digest: offlineAdmissionDigest("recovery-scan"), ObservedAt: candidate.UpdatedAt}}
-	starter := &offlineAdmissionStarter{reader: reader}
-	worktrees := &offlineAdmissionWorktrees{}
-	driver := &acceptanceRetryDriver{}
-
-	owners := []string{}
 	waits := []time.Duration{}
-	dispatches := 0
-	dispatch := func(ctx context.Context) (application.LinearTodoDispatchResult, error) {
-		dispatches++
-		owner := "acceptance-restart-owner-" + string(rune('0'+dispatches))
-		owners = append(owners, owner)
-		controller := application.NewLocalController(store, worktrees, &acceptanceRetryCodex{}, offlineAdmissionVerifier{}, offlineAdmissionGit{}, "fixture-codex", repository.WorktreeRoot)
-		dispatcher, err := newAcceptanceRetryDispatcher(scanner, reader, starter, store, controller, driver, repository, owner)
-		if err != nil {
-			return application.LinearTodoDispatchResult{}, err
-		}
-		return dispatcher.Dispatch(ctx)
-	}
 	wait := func(ctx context.Context, delay time.Duration) error {
 		waits = append(waits, delay)
 		return waitAdmissionWorker(ctx, delay)
 	}
-	worker, err := runAdmissionWorker(ctx, false, time.Minute, dispatch, wait)
+
+	first, err := newAcceptanceRetryWorkerFixture(t, store, repository, candidate, "acceptance-restart-owner-one")
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	firstResult, err := runAdmissionWorker(ctx, true, time.Minute, first.dispatcher.Dispatch, wait)
+	if err != nil || firstResult.Cycles != 1 || firstResult.LastOutcome != application.LinearTodoDispatchRetryScheduled || firstResult.Stopped != "once" {
+		store.Close()
+		t.Fatalf("first worker=%+v err=%v", firstResult, err)
+	}
+	schedules, err := store.ListRetrySchedules(ctx)
+	if err != nil || len(schedules) != 1 || schedules[0].Status != application.RetryScheduleScheduled || schedules[0].AttemptCount != 1 {
+		store.Close()
+		t.Fatalf("first durable retry schedules=%+v err=%v", schedules, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = storeadapter.Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if worker.Cycles != 2 || worker.LastOutcome != application.LinearTodoDispatchAttention || worker.Stopped != "attention_required" || dispatches != 2 || len(owners) != 2 || owners[0] == owners[1] {
-		t.Fatalf("worker=%+v dispatches=%d owners=%v", worker, dispatches, owners)
+	defer store.Close()
+	second, err := newAcceptanceRetryWorkerFixture(t, store, repository, candidate, "acceptance-restart-owner-two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondResult, err := runAdmissionWorker(ctx, false, time.Minute, second.dispatcher.Dispatch, wait)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondResult.Cycles != 2 || secondResult.LastOutcome != application.LinearTodoDispatchAttention || secondResult.Stopped != "attention_required" {
+		t.Fatalf("second worker=%+v err=%v", secondResult, err)
 	}
 	if len(waits) != 1 || waits[0] < 900*time.Millisecond || waits[0] > application.DefaultAutomaticRetryInitialDelay {
 		t.Fatalf("durable retry waits=%v", waits)
 	}
-	if scanner.calls() != 1 || len(starter.mutations()) != 1 || driver.calls() != 1 || worktrees.calls() != 1 {
-		t.Fatalf("second admission side effects scan=%d mutations=%d driver=%d worktrees=%d", scanner.calls(), len(starter.mutations()), driver.calls(), worktrees.calls())
+	if first.scanner.calls()+second.scanner.calls() != 1 || len(first.starter.mutations())+len(second.starter.mutations()) != 1 || first.driver.calls()+second.driver.calls() != 1 || first.worktrees.calls()+second.worktrees.calls() != 1 {
+		t.Fatalf("second admission side effects scan=%d mutations=%d driver=%d worktrees=%d", first.scanner.calls()+second.scanner.calls(), len(first.starter.mutations())+len(second.starter.mutations()), first.driver.calls()+second.driver.calls(), first.worktrees.calls()+second.worktrees.calls())
 	}
 
 	runs, err := store.ListNonterminalRuns(ctx)
 	if err != nil || len(runs) != 1 {
 		t.Fatalf("nonterminal runs=%+v err=%v", runs, err)
 	}
-	schedules, err := store.ListRetrySchedules(ctx)
+	schedules, err = store.ListRetrySchedules(ctx)
 	if err != nil || len(schedules) != 1 {
 		t.Fatalf("retry schedules=%+v err=%v", schedules, err)
 	}
@@ -87,9 +98,27 @@ func TestOfflineAcceptanceWorkerRestartPreservesRetryAndStopsAtDurableAttention(
 	}
 }
 
-func openOfflineAdmissionStore(t *testing.T) (*storeadapter.Store, error) {
+type acceptanceRetryWorkerFixture struct {
+	scanner    *offlineAdmissionScanner
+	starter    *offlineAdmissionStarter
+	worktrees  *offlineAdmissionWorktrees
+	driver     *acceptanceRetryDriver
+	dispatcher *application.LinearTodoDispatcher
+}
+
+func newAcceptanceRetryWorkerFixture(t *testing.T, store *storeadapter.Store, repository application.LocalRepository, candidate application.LinearTodoCandidate, owner string) (acceptanceRetryWorkerFixture, error) {
 	t.Helper()
-	return storeadapter.Open(t.TempDir() + "/controller.db")
+	reader := newOfflineAdmissionReader(offlineAdmissionSource(candidate))
+	scanner := &offlineAdmissionScanner{scan: application.LinearTodoCandidateScan{Candidates: []application.LinearTodoCandidate{candidate}, Digest: offlineAdmissionDigest("recovery-scan"), ObservedAt: candidate.UpdatedAt}}
+	starter := &offlineAdmissionStarter{reader: reader}
+	worktrees := &offlineAdmissionWorktrees{}
+	driver := &acceptanceRetryDriver{}
+	controller := application.NewLocalController(store, worktrees, &acceptanceRetryCodex{}, offlineAdmissionVerifier{}, offlineAdmissionGit{}, "fixture-codex", repository.WorktreeRoot)
+	dispatcher, err := newAcceptanceRetryDispatcher(scanner, reader, starter, store, controller, driver, repository, owner)
+	if err != nil {
+		return acceptanceRetryWorkerFixture{}, err
+	}
+	return acceptanceRetryWorkerFixture{scanner: scanner, starter: starter, worktrees: worktrees, driver: driver, dispatcher: dispatcher}, nil
 }
 
 type acceptanceRetryDriver struct {
