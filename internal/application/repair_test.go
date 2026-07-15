@@ -123,6 +123,33 @@ func TestOutcomeReadHonorsCancellationAndSizeBound(t *testing.T) {
 	}
 }
 
+type boundedRunLookupStore struct {
+	RunStore
+	run             Run
+	firstRead       bool
+	deadlinePresent bool
+}
+
+func (s *boundedRunLookupStore) GetRun(ctx context.Context, _ string) (Run, error) {
+	if _, ok := ctx.Deadline(); ok {
+		s.deadlinePresent = true
+	}
+	if s.firstRead {
+		s.firstRead = false
+		return Run{}, context.DeadlineExceeded
+	}
+	return s.run, nil
+}
+
+func TestRepairRunLookupUsesBoundedReadAndDetachedFallback(t *testing.T) {
+	store := &boundedRunLookupStore{run: Run{ID: "run"}, firstRead: true}
+	controller := &LocalController{store: store}
+	run, err := controller.getRunForRepairAction(context.Background(), "run")
+	if err != nil || run.ID != "run" || !store.deadlinePresent {
+		t.Fatalf("run=%+v err=%v deadlinePresent=%t", run, err, store.deadlinePresent)
+	}
+}
+
 type repairDeadlineTestStore struct {
 	RunStore
 	run                    Run

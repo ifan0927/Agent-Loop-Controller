@@ -182,7 +182,7 @@ func (c *LocalController) Continue(ctx context.Context, runID string, decision *
 // EnforceRepairDeadline performs the local persisted-policy preflight used by
 // the production coordinator before it revalidates external authorities.
 func (c *LocalController) EnforceRepairDeadline(ctx context.Context, runID string) (Run, error) {
-	run, err := c.store.GetRun(ctx, runID)
+	run, err := c.getRunForRepairAction(ctx, runID)
 	if err != nil {
 		if ctx.Err() != nil {
 			return c.recoverCanceledContinuation(ctx, runID)
@@ -196,19 +196,49 @@ func (c *LocalController) EnforceRepairDeadline(ctx context.Context, runID strin
 // repair-policy deadline when the run is in an active repair state. It is used
 // to bound external reads and local handoffs that happen outside Continue.
 func (c *LocalController) BoundRepairActionContext(ctx context.Context, runID string) (context.Context, context.CancelFunc, error) {
-	run, err := c.store.GetRun(ctx, runID)
+	run, err := c.getRunForRepairAction(ctx, runID)
 	if err != nil {
-		if ctx.Err() == nil {
-			return ctx, func() {}, err
-		}
-		policyCtx, cancel := context.WithTimeout(context.Background(), repairDeadlinePersistenceTTL)
-		defer cancel()
-		run, err = c.store.GetRun(policyCtx, runID)
-		if err != nil {
-			return ctx, func() {}, errors.Join(ctx.Err(), err)
-		}
+		return ctx, func() {}, err
 	}
 	return c.boundRepairActionContext(ctx, run)
+}
+
+func (c *LocalController) getRunForRepairAction(ctx context.Context, runID string) (Run, error) {
+	readCtx, cancel := context.WithTimeout(ctx, repairDeadlinePersistenceTTL)
+	run, err := c.store.GetRun(readCtx, runID)
+	cancel()
+	if err == nil {
+		return run, nil
+	}
+	if ctx.Err() == nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		return Run{}, err
+	}
+	policyCtx, policyCancel := context.WithTimeout(context.Background(), repairDeadlinePersistenceTTL)
+	defer policyCancel()
+	run, detachedErr := c.store.GetRun(policyCtx, runID)
+	if detachedErr != nil {
+		return Run{}, errors.Join(err, detachedErr)
+	}
+	return run, nil
+}
+
+func (c *LocalController) inspectForRepairAction(ctx context.Context, runID string) (RunInspection, error) {
+	readCtx, cancel := context.WithTimeout(ctx, repairDeadlinePersistenceTTL)
+	inspection, err := c.store.Inspect(readCtx, runID)
+	cancel()
+	if err == nil {
+		return inspection, nil
+	}
+	if ctx.Err() == nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		return RunInspection{}, err
+	}
+	policyCtx, policyCancel := context.WithTimeout(context.Background(), repairDeadlinePersistenceTTL)
+	defer policyCancel()
+	inspection, detachedErr := c.store.Inspect(policyCtx, runID)
+	if detachedErr != nil {
+		return RunInspection{}, errors.Join(err, detachedErr)
+	}
+	return inspection, nil
 }
 
 func (c *LocalController) recoverCanceledContinuation(ctx context.Context, runID string) (Run, error) {
@@ -1201,17 +1231,9 @@ func (c *LocalController) applyFreshReviewOutcome(ctx context.Context, run Run, 
 // re-reads the immutable review evidence instead of accepting a caller-supplied
 // prompt or finding list.
 func (c *LocalController) HandoffFreshReviewFindings(ctx context.Context, runID string) (Run, error) {
-	run, err := c.store.GetRun(ctx, runID)
+	run, err := c.getRunForRepairAction(ctx, runID)
 	if err != nil {
-		if ctx.Err() == nil {
-			return Run{}, err
-		}
-		policyCtx, cancel := context.WithTimeout(context.Background(), repairDeadlinePersistenceTTL)
-		defer cancel()
-		run, err = c.store.GetRun(policyCtx, runID)
-		if err != nil {
-			return Run{}, errors.Join(ctx.Err(), err)
-		}
+		return Run{}, err
 	}
 	if run.State != domain.StateFreshReview {
 		return run, fmt.Errorf("fresh review findings handoff requires fresh_review state, got %s", run.State)
@@ -1230,7 +1252,7 @@ func (c *LocalController) HandoffFreshReviewFindings(ctx context.Context, runID 
 	finish := func(actionErr error) (Run, error) {
 		return c.reconcileRepairAction(runID, run, actionErr)
 	}
-	inspection, err := c.store.Inspect(ctx, runID)
+	inspection, err := c.inspectForRepairAction(ctx, runID)
 	if err != nil {
 		return finish(err)
 	}
@@ -1487,7 +1509,7 @@ func (c *LocalController) Repair(ctx context.Context, runID, normalizedPrompt st
 // RepairFindings resumes the persisted Terra session using a deterministic,
 // bounded selection of controller-owned normalized findings.
 func (c *LocalController) RepairFindings(ctx context.Context, runID string, findings []FindingRecord) (Run, error) {
-	run, err := c.store.GetRun(ctx, runID)
+	run, err := c.getRunForRepairAction(ctx, runID)
 	if err != nil {
 		if ctx.Err() != nil {
 			return c.recoverCanceledContinuation(ctx, runID)
@@ -1631,7 +1653,7 @@ func (c *LocalController) repair(ctx context.Context, runID, normalizedPrompt st
 	if strings.TrimSpace(normalizedPrompt) == "" {
 		return Run{}, errors.New("normalized repair prompt must not be blank")
 	}
-	run, err := c.store.GetRun(ctx, runID)
+	run, err := c.getRunForRepairAction(ctx, runID)
 	if err != nil {
 		if ctx.Err() == nil {
 			return Run{}, err
@@ -1740,17 +1762,9 @@ func (c *LocalController) enforceRepairDeadline(ctx context.Context, run Run) (R
 	if !domain.CanRequireRepairPolicyIntervention(run.State) {
 		return run, nil
 	}
-	inspection, err := c.store.Inspect(ctx, run.ID)
+	inspection, err := c.inspectForRepairAction(ctx, run.ID)
 	if err != nil {
-		if ctx.Err() == nil {
-			return run, err
-		}
-		policyCtx, cancel := context.WithTimeout(context.Background(), repairDeadlinePersistenceTTL)
-		defer cancel()
-		inspection, err = c.store.Inspect(policyCtx, run.ID)
-		if err != nil {
-			return run, errors.Join(ctx.Err(), err)
-		}
+		return run, err
 	}
 	if repairDeadlineAnchorInvalid(inspection.Timeline) || (repairDeadlineAnchorRequired(run.State, inspection.Timeline) && !repairDeadlineAnchorIsValid(inspection.Timeline)) {
 		return c.persistInvalidRepairDeadline(run)
@@ -1768,17 +1782,9 @@ func (c *LocalController) boundRepairActionContext(ctx context.Context, run Run)
 	if !domain.CanRequireRepairPolicyIntervention(run.State) {
 		return ctx, func() {}, nil
 	}
-	inspection, err := c.store.Inspect(ctx, run.ID)
+	inspection, err := c.inspectForRepairAction(ctx, run.ID)
 	if err != nil {
-		if ctx.Err() == nil {
-			return ctx, func() {}, err
-		}
-		policyCtx, cancel := context.WithTimeout(context.Background(), repairDeadlinePersistenceTTL)
-		defer cancel()
-		inspection, err = c.store.Inspect(policyCtx, run.ID)
-		if err != nil {
-			return ctx, func() {}, errors.Join(ctx.Err(), err)
-		}
+		return ctx, func() {}, err
 	}
 	if repairDeadlineAnchorInvalid(inspection.Timeline) || (repairDeadlineAnchorRequired(run.State, inspection.Timeline) && !repairDeadlineAnchorIsValid(inspection.Timeline)) {
 		_, deadlineErr := c.persistInvalidRepairDeadline(run)
