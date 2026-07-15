@@ -56,24 +56,45 @@ func launchAgentInstall(args []string) error {
 		result.Reason = launchAgentInstallReason(createErr)
 		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
 	}
+	identity, identityErr := launchAgentFileIdentityFor(file)
+	if identityErr != nil {
+		_ = file.Close()
+		result.Reason = "plist_unavailable"
+		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
+	}
 	if chmodErr := file.Chmod(0o600); chmodErr != nil {
 		_ = file.Close()
+		removeLaunchAgentFileIfSame(parent, name, identity)
 		result.Reason = "plist_unavailable"
 		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
 	}
 	createdInfo, statErr := file.Stat()
 	if statErr != nil || !safeLaunchAgentFileInfo(createdInfo) {
 		_ = file.Close()
+		removeLaunchAgentFileIfSame(parent, name, identity)
 		result.Reason = "plist_unavailable"
 		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
 	}
-	if _, writeErr := file.Write(desired); writeErr != nil {
+	written, writeErr := file.Write(desired)
+	if writeErr != nil || written != len(desired) {
 		_ = file.Close()
+		removeLaunchAgentFileIfSame(parent, name, identity)
+		result.Reason = "plist_unavailable"
+		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
+	}
+	if syncErr := file.Sync(); syncErr != nil {
+		_ = file.Close()
+		removeLaunchAgentFileIfSame(parent, name, identity)
 		result.Reason = "plist_unavailable"
 		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
 	}
 	if closeErr := file.Close(); closeErr != nil {
+		removeLaunchAgentFileIfSame(parent, name, identity)
 		result.Reason = "plist_unavailable"
+		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
+	}
+	if !launchAgentParentStillBound(options.plist, parent) || !launchAgentEntryMatches(parent, name, identity) {
+		result.Reason = "install_unverified"
 		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
 	}
 	result.ObservedState = "not_observed"
@@ -153,6 +174,45 @@ func createLaunchAgentFileAt(directory *os.File, name string) (*os.File, error) 
 
 func safeLaunchAgentFileInfo(info os.FileInfo) bool {
 	return info != nil && info.Mode()&os.ModeSymlink == 0 && info.Mode().IsRegular() && info.Mode().Perm() == 0o600 && ownedByCurrentUser(info)
+}
+
+type launchAgentFileIdentity struct {
+	device uint64
+	inode  uint64
+	uid    uint32
+	mode   uint32
+}
+
+func launchAgentFileIdentityFor(file *os.File) (launchAgentFileIdentity, error) {
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+		return launchAgentFileIdentity{}, err
+	}
+	return launchAgentFileIdentity{device: uint64(stat.Dev), inode: uint64(stat.Ino), uid: stat.Uid, mode: uint32(stat.Mode)}, nil
+}
+
+func launchAgentEntryMatches(directory *os.File, name string, want launchAgentFileIdentity) bool {
+	var stat unix.Stat_t
+	if err := unix.Fstatat(int(directory.Fd()), name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return false
+	}
+	got := launchAgentFileIdentity{device: uint64(stat.Dev), inode: uint64(stat.Ino), uid: stat.Uid, mode: uint32(stat.Mode)}
+	return got == want
+}
+
+func removeLaunchAgentFileIfSame(directory *os.File, name string, want launchAgentFileIdentity) {
+	if !launchAgentEntryMatches(directory, name, want) {
+		return
+	}
+	_ = unix.Unlinkat(int(directory.Fd()), name, 0)
+}
+
+func launchAgentParentStillBound(path string, directory *os.File) bool {
+	parentPath := filepath.Dir(path)
+	openedInfo, statErr := directory.Stat()
+	currentInfo, lstatErr := os.Lstat(parentPath)
+	resolved, resolveErr := filepath.EvalSymlinks(parentPath)
+	return statErr == nil && lstatErr == nil && resolveErr == nil && resolved == parentPath && safeLaunchAgentDirectoryInfo(currentInfo) && os.SameFile(openedInfo, currentInfo)
 }
 
 func launchAgentInstallReason(err error) string {
