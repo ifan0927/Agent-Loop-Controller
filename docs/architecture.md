@@ -40,11 +40,14 @@ name, repository-owned verifier IDs, policy, and source revision. Linear never
 carries executable verification commands. A material Linear edit
 after admission creates a human decision point; it never silently changes a run.
 
-`controller run IFAN-xxx` is the explicit trigger adapter. Its only task input
-is the identifier; it fetches the issue through the configured read-only adapter.
-The issue must be in `Todo`, an active current cycle, team `IFAN`, labelled
-`agent:codex` (and not `agent:hermes`), and contain exactly one label that maps
-to a controller-owned repository profile. The issue description must have a
+The automatic worker is the production admission adapter. It scans only
+configured IFAN Todo candidates, then reserves and moves exactly one eligible
+issue to In Progress before handing it to the durable driver. `controller run
+IFAN-xxx` remains a bounded recovery or local-lab adapter. Both paths fetch the
+same authoritative source and apply the same eligibility rules: the issue must
+be in `Todo`, an active current cycle, team `IFAN`, labelled `agent:codex` (and
+not `agent:hermes`), and contain exactly one label that maps to a
+controller-owned repository profile. The issue description must have a
 `## Goal` or `## Outcome` section and a `## Acceptance Criteria` section;
 `## Out of Scope` is preserved when present. Verification always comes from the
 matched repository profile, never from Linear text. A repeated trigger with the
@@ -192,13 +195,13 @@ not write Linear or GitHub state during implementation.
 
 ## Delivery driver and human gates
 
-`controller run IFAN-xxx` is the normal explicit trigger. It admits or resumes
-the durable run and starts a long-lived delivery driver. `controller drive
-<run-id>` starts the same driver for an already admitted run after a process or
-host restart. The driver reads the authoritative SQLite state, takes the one
-legal next action, persists its intent before any external write, observes the
-result, and repeats. It does not accept an action order from a CLI caller, issue
-body, web UI, or external response.
+The worker normally admits the durable run and starts its long-lived delivery
+driver. `controller drive <run-id>` starts the same driver for an already
+admitted run after a process or host restart. `controller run IFAN-xxx` is
+reserved for a bounded recovery or local-lab trigger. The driver reads the
+authoritative SQLite state, takes the one legal next action, persists its intent
+before any external write, observes the result, and repeats. It does not accept
+an action order from a CLI caller, issue body, web UI, or external response.
 
 After admission, normal progression is automatic: Codex implementation,
 verification, fresh review, push, PR creation, required-CI reconciliation,

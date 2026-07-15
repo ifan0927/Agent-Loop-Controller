@@ -8,8 +8,9 @@ and recovery.
 
 ## Prepare the local files
 
-Install a release binary outside a repository checkout. The examples use
-`/usr/local/bin/ifan-loop`; it must be an absolute, canonical executable path.
+Install a release binary outside a repository checkout. The examples use the
+current-user-managed `~/.local/bin/ifan-loop`; it must be an absolute,
+canonical executable path.
 The doctor also requires that the binary is a current-user-owned, non-symlink
 regular file with an execute bit and no group/world write bit. `controller.json`
 must be a current-user-owned non-symlink regular file at exactly mode `0600`.
@@ -20,7 +21,7 @@ and leaves before launchd opens them:
 CONFIG="$HOME/Library/Application Support/agent-loop-controller/controller.json"
 LOG_DIR="$HOME/Library/Application Support/agent-loop-controller/logs"
 PLIST="$HOME/Library/LaunchAgents/com.ifan.agent-loop-controller.worker.plist"
-BIN=/usr/local/bin/ifan-loop
+BIN="$HOME/.local/bin/ifan-loop"
 
 mkdir -p "$LOG_DIR"
 chmod 700 "$LOG_DIR"

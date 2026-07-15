@@ -82,10 +82,12 @@ go run ./cmd/ifan-loop github-read \
   --expected-head '<exact-head-sha>'
 ```
 
-`controller run` starts the normal long-lived delivery driver, and `controller
-drive` resumes it after a restart. They derive and perform the legal GitHub
-operations from the persisted run; an operator does not normally copy a state
-and idempotency key between `push`, `open-pr`, `reconcile`, and `merge` commands.
+For the live E2E, `controller worker` admits the eligible fixture issue and
+starts its normal long-lived delivery driver; it receives no issue identifier.
+`controller drive` resumes that already admitted run after a restart. An
+operator does not normally copy a state and idempotency key between `push`,
+`open-pr`, `reconcile`, and `merge` commands. `controller run` remains a
+bounded recovery or local-lab interface, not the live-E2E trigger.
 Requester-authorized `controller status` and `controller inspect` may expose the
 run-scoped idempotency key for an audited recovery procedure. It is not a GitHub
 App private key, installation token, or Linear credential; requester
