@@ -596,7 +596,7 @@ func TestAutomaticAdmissionCleanupAuditRejectsStaleLeaseOwner(t *testing.T) {
 }
 
 func TestAutomaticAdmissionAbandonRejectsRetainedDeliveryEvidence(t *testing.T) {
-	for _, name := range []string{"pull_request", "approval_observation", "push", "merge", "reply_intent", "remote_cleanup_intent"} {
+	for _, name := range []string{"pull_request", "approval_observation", "push", "merge", "reply_intent", "remote_cleanup_intent", "human_decision"} {
 		t.Run(name, func(t *testing.T) {
 			store, run, _ := prepareAutomaticAbandonmentRun(t, domain.StateManualIntervention)
 			defer store.Close()
@@ -625,6 +625,14 @@ func TestAutomaticAdmissionAbandonRejectsRetainedDeliveryEvidence(t *testing.T) 
 				}
 			case "remote_cleanup_intent":
 				if err := store.UpsertCleanup(ctx, application.CleanupRecord{RunID: run.ID, Kind: "remote_branch", Name: run.WorkingBranch, Status: "intent"}); err != nil {
+					t.Fatal(err)
+				}
+			case "human_decision":
+				var sequence int64
+				if err := store.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM transitions WHERE run_id=?`, run.ID).Scan(&sequence); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.db.ExecContext(ctx, `INSERT INTO transitions(run_id,sequence,from_state,to_state,reason,evidence_reference,bound_head,created_at) VALUES(?,?,?,?,?,?,?,?)`, run.ID, sequence, domain.StateAwaitingHumanDecision, domain.StateExecuting, "accepted simulated human decision", "decision-evidence", run.CandidateHead, formatTime(time.Now().UTC())); err != nil {
 					t.Fatal(err)
 				}
 			}
