@@ -2,6 +2,8 @@ package application
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"path/filepath"
@@ -81,13 +83,20 @@ type LinearTodoAdmissionJournalTransition struct {
 // requester-authorized terminal action. The idempotency key is the persisted
 // run authority, not a caller-generated free-form token.
 type AutomaticAdmissionAbandonment struct {
-	RunID          string
-	ExpectedState  domain.State
-	IdempotencyKey string
+	Requester              Requester
+	RunID                  string
+	Repository             string
+	RawIssueHash           string
+	TaskHash               string
+	ProfileDigest          string
+	RepositoryConfigDigest string
+	LeaseOwner             string
+	ExpectedState          domain.State
+	IdempotencyKey         string
 }
 
 func (a AutomaticAdmissionAbandonment) Validate() error {
-	if strings.TrimSpace(a.RunID) == "" || strings.TrimSpace(a.IdempotencyKey) == "" {
+	if a.Requester.ID == "" || a.Requester.Kind != "github_login" || strings.TrimSpace(a.RunID) == "" || strings.TrimSpace(a.Repository) == "" || strings.TrimSpace(a.RawIssueHash) == "" || strings.TrimSpace(a.TaskHash) == "" || strings.TrimSpace(a.ProfileDigest) == "" || strings.TrimSpace(a.RepositoryConfigDigest) == "" || strings.TrimSpace(a.LeaseOwner) == "" || strings.TrimSpace(a.IdempotencyKey) == "" {
 		return errors.New("automatic admission abandonment authority is incomplete")
 	}
 	switch a.ExpectedState {
@@ -96,6 +105,11 @@ func (a AutomaticAdmissionAbandonment) Validate() error {
 	default:
 		return errors.New("automatic admission abandonment state is not eligible")
 	}
+}
+
+func AutomaticAdmissionRepositoryConfigDigest(raw string) string {
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
 }
 
 // AutomaticAdmissionAbandonStore is kept separate from RunStore so existing

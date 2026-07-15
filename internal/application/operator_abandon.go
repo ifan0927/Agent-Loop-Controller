@@ -83,11 +83,11 @@ func (c *ProductionCoordinator) Abandon(ctx context.Context, command ProductionA
 	if err != nil {
 		return ProductionAbandonResult{}, classifyServiceError(err)
 	}
-	if current.State != domain.StateFailed {
-		if _, err := c.admission.RevalidateForAbandon(ctx, LinearRevalidateCommand{Requester: command.Requester, RunID: command.RunID, Repository: command.Repository, ExpectedState: command.ExpectedState, IdempotencyKey: command.IdempotencyKey}); err != nil {
-			return ProductionAbandonResult{}, err
-		}
+	revalidated, err := c.admission.RevalidateForAbandon(ctx, LinearRevalidateCommand{Requester: command.Requester, RunID: command.RunID, Repository: command.Repository, ExpectedState: command.ExpectedState, IdempotencyKey: command.IdempotencyKey})
+	if err != nil {
+		return ProductionAbandonResult{}, err
 	}
+	current = revalidated
 	inspection, err := c.store.Inspect(ctx, command.RunID)
 	if err != nil {
 		return ProductionAbandonResult{}, classifyServiceError(err)
@@ -99,7 +99,23 @@ func (c *ProductionCoordinator) Abandon(ctx context.Context, command ProductionA
 		return ProductionAbandonResult{}, serviceError(ErrorConflict, "automatic run local ownership evidence is insufficient", err)
 	}
 
-	run, idempotent, err := abandonStore.AbandonAutomaticAdmission(ctx, AutomaticAdmissionAbandonment{RunID: command.RunID, ExpectedState: command.ExpectedState, IdempotencyKey: command.IdempotencyKey})
+	if renewed, err := c.store.RenewLease(ctx, command.RunID, owner, time.Now().UTC().Add(localLeaseTTL)); err != nil {
+		return ProductionAbandonResult{}, classifyServiceError(err)
+	} else if !renewed {
+		return ProductionAbandonResult{}, serviceError(ErrorConflict, "run lease was lost before abandonment", nil)
+	}
+	run, idempotent, err := abandonStore.AbandonAutomaticAdmission(ctx, AutomaticAdmissionAbandonment{
+		Requester:              command.Requester,
+		RunID:                  command.RunID,
+		Repository:             command.Repository,
+		RawIssueHash:           current.RawIssueHash,
+		TaskHash:               current.TaskHash,
+		ProfileDigest:          current.ProfileDigest,
+		RepositoryConfigDigest: AutomaticAdmissionRepositoryConfigDigest(current.RepositoryConfigJSON),
+		LeaseOwner:             owner,
+		ExpectedState:          command.ExpectedState,
+		IdempotencyKey:         command.IdempotencyKey,
+	})
 	if err != nil {
 		return ProductionAbandonResult{}, classifyServiceError(err)
 	}

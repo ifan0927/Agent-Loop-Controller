@@ -360,6 +360,10 @@ func authorizePersistedRequester(run Run, requester Requester) error {
 	return requester.authorize(repository.AllowedOperatorLogins, repository.TrustedOperatorActors)
 }
 
+func AuthorizePersistedRequester(run Run, requester Requester) error {
+	return authorizePersistedRequester(run, requester)
+}
+
 type InspectionResult struct {
 	SchemaVersion           string                          `json:"schema_version"`
 	Run                     RunResult                       `json:"run"`

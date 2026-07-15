@@ -418,7 +418,7 @@ func newPushCoordinator(t *testing.T, state domain.State) (*ProductionCoordinato
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), Repository: snapshot.Task.Repository, RepositoryConfigJSON: mustJSON(t, repository), WorkingBranch: snapshot.Task.WorkingBranch, BaseBranch: "main", BaseSHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", NormalizedTaskJSON: mustJSON(t, snapshot.Task), TaskHash: snapshot.TaskHash, State: state, CandidateHead: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", WorktreePath: "/owned/worktree", ArtifactRoot: "/owned/artifacts"})
+	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), RawIssueHash: snapshot.RawHash, Repository: snapshot.Task.Repository, RepositoryConfigJSON: mustJSON(t, repository), WorkingBranch: snapshot.Task.WorkingBranch, BaseBranch: "main", BaseSHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", NormalizedTaskJSON: mustJSON(t, snapshot.Task), TaskHash: snapshot.TaskHash, State: state, CandidateHead: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", WorktreePath: "/owned/worktree", ArtifactRoot: "/owned/artifacts"})
 	run.RepositoryConfigJSON = mustJSON(t, repository)
 	store := &pushTestStore{run: run}
 	branchEvidence := `{"source_path":"/owned/source","origin_path":"/owned/origin","path":"` + run.WorktreePath + `","branch":"` + run.WorkingBranch + `","base_branch":"` + run.BaseBranch + `","base_sha":"` + run.BaseSHA + `","nonce":"nonce"}`

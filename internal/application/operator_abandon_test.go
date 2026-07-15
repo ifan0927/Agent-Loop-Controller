@@ -99,6 +99,25 @@ func TestProductionAbandonRevalidatesBeforeDurableMutationAndCleansLocally(t *te
 	}
 }
 
+func TestProductionAbandonReplayRevalidatesBeforeRetryingLocalCleanup(t *testing.T) {
+	coordinator, store, run := newPushCoordinator(t, domain.StateManualIntervention)
+	wrapped := &abandonCoordinatorStore{pushTestStore: store}
+	coordinator.store = wrapped
+	cleanup := &abandonCleanupFake{err: errors.New("local cleanup is temporarily unavailable")}
+	first := ProductionAbandonCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}
+	if _, err := coordinator.Abandon(context.Background(), first, cleanup); err == nil || len(cleanup.calls) != 1 {
+		t.Fatalf("first abandon err=%v cleanup calls=%v", err, cleanup.calls)
+	}
+	reader := coordinator.admission.reader.(*admissionReader)
+	reader.source.SourceRevision = "2026-07-16T00:00:00Z"
+	before := len(cleanup.calls)
+	replay := first
+	replay.ExpectedState = domain.StateFailed
+	if _, err := coordinator.Abandon(context.Background(), replay, cleanup); err == nil || len(cleanup.calls) != before {
+		t.Fatalf("drifted replay crossed cleanup boundary err=%v cleanup calls=%v", err, cleanup.calls)
+	}
+}
+
 func TestAbandonLocalCleanupRejectsForgedOwnershipBeforeGit(t *testing.T) {
 	repository := LocalRepository{CanonicalRepository: "owner/repo", SourcePath: "/owned/source", OriginPath: "/owned/origin", BaseBranch: "main"}
 	run := abandonCleanupRun(t, repository)

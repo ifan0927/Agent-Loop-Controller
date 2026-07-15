@@ -483,7 +483,7 @@ func TestAutomaticAdmissionAbandonReleasesSlotAndReplaysIdempotently(t *testing.
 	store, run, lease := prepareAutomaticAbandonmentRun(t, domain.StateReceived)
 	defer store.Close()
 	ctx := context.Background()
-	request := application.AutomaticAdmissionAbandonment{RunID: run.ID, ExpectedState: domain.StateReceived, IdempotencyKey: run.IdempotencyKey}
+	request := automaticAbandonmentRequest(run, domain.StateReceived, run.LeaseOwner)
 
 	abandoned, idempotent, err := store.AbandonAutomaticAdmission(ctx, request)
 	if err != nil || idempotent || abandoned.State != domain.StateFailed {
@@ -555,7 +555,7 @@ func TestAutomaticAdmissionAbandonRejectsRetainedDeliveryEvidence(t *testing.T) 
 					t.Fatal(err)
 				}
 			}
-			_, _, err := store.AbandonAutomaticAdmission(ctx, application.AutomaticAdmissionAbandonment{RunID: run.ID, ExpectedState: domain.StateManualIntervention, IdempotencyKey: run.IdempotencyKey})
+			_, _, err := store.AbandonAutomaticAdmission(ctx, automaticAbandonmentRequest(run, domain.StateManualIntervention, run.LeaseOwner))
 			if err == nil {
 				t.Fatal("abandonment ignored retained delivery evidence")
 			}
@@ -584,7 +584,7 @@ func TestAutomaticAdmissionAbandonReplayRejectsNewExternalDeliveryEvidence(t *te
 			store, run, _ := prepareAutomaticAbandonmentRun(t, domain.StateReceived)
 			defer store.Close()
 			ctx := context.Background()
-			request := application.AutomaticAdmissionAbandonment{RunID: run.ID, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}
+			request := automaticAbandonmentRequest(run, run.State, run.LeaseOwner)
 			if _, idempotent, err := store.AbandonAutomaticAdmission(ctx, request); err != nil || idempotent {
 				t.Fatalf("initial abandon idempotent=%v err=%v", idempotent, err)
 			}
@@ -602,7 +602,7 @@ func TestAutomaticAdmissionAbandonReplayRejectsNewApprovalObservation(t *testing
 	store, run, _ := prepareAutomaticAbandonmentRun(t, domain.StateReceived)
 	defer store.Close()
 	ctx := context.Background()
-	request := application.AutomaticAdmissionAbandonment{RunID: run.ID, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}
+	request := automaticAbandonmentRequest(run, run.State, run.LeaseOwner)
 	if _, idempotent, err := store.AbandonAutomaticAdmission(ctx, request); err != nil || idempotent {
 		t.Fatalf("initial abandon idempotent=%v err=%v", idempotent, err)
 	}
@@ -622,7 +622,7 @@ func TestAutomaticAdmissionAbandonRejectsPendingLinearMutation(t *testing.T) {
 	if _, err := store.db.ExecContext(ctx, `UPDATE linear_todo_admission_journal SET status=?,mutation_intent_ref=? WHERE run_id=?`, "mutation_intent", digestBytes([]byte("pending abandon")), run.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.AbandonAutomaticAdmission(ctx, application.AutomaticAdmissionAbandonment{RunID: run.ID, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}); err == nil {
+	if _, _, err := store.AbandonAutomaticAdmission(ctx, automaticAbandonmentRequest(run, run.State, run.LeaseOwner)); err == nil {
 		t.Fatal("pending Linear mutation was accepted for abandonment")
 	}
 	current, err := store.GetRun(ctx, run.ID)
@@ -635,10 +635,10 @@ func TestAutomaticAdmissionAbandonRejectsStaleAuthority(t *testing.T) {
 	store, run, _ := prepareAutomaticAbandonmentRun(t, domain.StateManualIntervention)
 	defer store.Close()
 	ctx := context.Background()
-	for _, request := range []application.AutomaticAdmissionAbandonment{
-		{RunID: run.ID, ExpectedState: domain.StateExecuting, IdempotencyKey: run.IdempotencyKey},
-		{RunID: run.ID, ExpectedState: domain.StateManualIntervention, IdempotencyKey: "wrong-key"},
-	} {
+	stateMismatch := automaticAbandonmentRequest(run, domain.StateExecuting, run.LeaseOwner)
+	keyMismatch := automaticAbandonmentRequest(run, domain.StateManualIntervention, run.LeaseOwner)
+	keyMismatch.IdempotencyKey = "wrong-key"
+	for _, request := range []application.AutomaticAdmissionAbandonment{stateMismatch, keyMismatch} {
 		if _, _, err := store.AbandonAutomaticAdmission(ctx, request); err == nil {
 			t.Fatalf("stale request was accepted: %+v", request)
 		}
@@ -646,6 +646,26 @@ func TestAutomaticAdmissionAbandonRejectsStaleAuthority(t *testing.T) {
 	current, err := store.GetRun(ctx, run.ID)
 	if err != nil || current.State != domain.StateManualIntervention {
 		t.Fatalf("state changed after stale calls current=%+v err=%v", current, err)
+	}
+}
+
+func TestAutomaticAdmissionAbandonRejectsTakenOverRunLease(t *testing.T) {
+	store, run, _ := prepareAutomaticAbandonmentRun(t, domain.StateManualIntervention)
+	defer store.Close()
+	ctx := context.Background()
+	request := automaticAbandonmentRequest(run, run.State, run.LeaseOwner)
+	if _, err := store.db.ExecContext(ctx, `UPDATE runs SET lease_expires_unix=? WHERE run_id=?`, time.Now().UTC().Add(-time.Second).UnixNano(), run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if acquired, err := store.AcquireLease(ctx, run.ID, "replacement-owner", time.Now().UTC().Add(time.Minute)); err != nil || !acquired {
+		t.Fatalf("replacement run lease acquired=%v err=%v", acquired, err)
+	}
+	if _, idempotent, err := store.AbandonAutomaticAdmission(ctx, request); err == nil || idempotent {
+		t.Fatalf("stale lease abandoned run idempotent=%v err=%v", idempotent, err)
+	}
+	current, err := store.GetRun(ctx, run.ID)
+	if err != nil || current.State != domain.StateManualIntervention {
+		t.Fatalf("state changed after lease takeover current=%+v err=%v", current, err)
 	}
 }
 
@@ -683,7 +703,31 @@ func prepareAutomaticAbandonmentRun(t *testing.T, state domain.State) (*Store, a
 		}
 		run.State = state
 	}
+	if acquired, err := store.AcquireLease(ctx, run.ID, "abandon-owner", time.Now().UTC().Add(time.Minute)); err != nil || !acquired {
+		store.Close()
+		t.Fatalf("run lease acquired=%v err=%v", acquired, err)
+	}
+	run, err = store.GetRun(ctx, run.ID)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
 	return store, run, lease
+}
+
+func automaticAbandonmentRequest(run application.Run, expected domain.State, owner string) application.AutomaticAdmissionAbandonment {
+	return application.AutomaticAdmissionAbandonment{
+		Requester:              application.Requester{ID: "operator", Kind: "github_login"},
+		RunID:                  run.ID,
+		Repository:             run.Repository,
+		RawIssueHash:           run.RawIssueHash,
+		TaskHash:               run.TaskHash,
+		ProfileDigest:          run.ProfileDigest,
+		RepositoryConfigDigest: application.AutomaticAdmissionRepositoryConfigDigest(run.RepositoryConfigJSON),
+		LeaseOwner:             owner,
+		ExpectedState:          expected,
+		IdempotencyKey:         run.IdempotencyKey,
+	}
 }
 
 func TestMigratesVersionFifteenDatabaseToAutomaticAdmissionSchema(t *testing.T) {
@@ -733,5 +777,5 @@ func automaticAdmissionReservation(issueUUID, runID, identifier string, lease ap
 	normalized, _ := json.Marshal(task)
 	digest := func(value []byte) string { return digestBytes(value) }
 	profileDigest := digest([]byte("profile:" + identifier))
-	return application.LinearTodoAdmissionReservation{Lease: lease, IssueUUID: issueUUID, ScanDigest: digest([]byte("scan:" + identifier)), Input: application.LocalStartInput{Task: task, RawIssueJSON: raw, RawIssueHash: digest(raw), NormalizedJSON: normalized, TaskHash: digest(normalized), IdempotencyKey: digest([]byte("key:" + identifier)), Repository: application.LocalRepository{ProfileID: "profile-" + identifier, ProfileSnapshotVersion: 1, ProfileDigest: profileDigest, ProfileSnapshotJSON: `{"profile":"sanitized"}`, RegistryVersion: 1, RegistryDigest: digest([]byte("registry:" + identifier)), RepositoryBindingDigest: digest([]byte("binding:" + identifier)), CanonicalRepository: task.Repository, BaseBranch: task.BaseBranch, VerifierIDs: task.VerifierIDs}, RunRoot: "/tmp/automatic-admission-runs", WorktreeRoot: "/tmp/automatic-admission-worktrees"}}
+	return application.LinearTodoAdmissionReservation{Lease: lease, IssueUUID: issueUUID, ScanDigest: digest([]byte("scan:" + identifier)), Input: application.LocalStartInput{Task: task, RawIssueJSON: raw, RawIssueHash: digest(raw), NormalizedJSON: normalized, TaskHash: digest(normalized), IdempotencyKey: digest([]byte("key:" + identifier)), Repository: application.LocalRepository{ProfileID: "profile-" + identifier, ProfileSnapshotVersion: 1, ProfileDigest: profileDigest, ProfileSnapshotJSON: `{"profile":"sanitized"}`, RegistryVersion: 1, RegistryDigest: digest([]byte("registry:" + identifier)), RepositoryBindingDigest: digest([]byte("binding:" + identifier)), CanonicalRepository: task.Repository, BaseBranch: task.BaseBranch, VerifierIDs: task.VerifierIDs, AllowedOperatorLogins: []string{"operator"}}, RunRoot: "/tmp/automatic-admission-runs", WorktreeRoot: "/tmp/automatic-admission-worktrees"}}
 }

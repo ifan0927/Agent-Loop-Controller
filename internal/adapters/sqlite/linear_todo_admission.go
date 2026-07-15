@@ -284,6 +284,9 @@ func (s *Store) AbandonAutomaticAdmission(ctx context.Context, request applicati
 	if err != nil {
 		return application.Run{}, false, err
 	}
+	if err := validateAutomaticAdmissionAbandonmentAuthorityTx(request, run, time.Now().UTC()); err != nil {
+		return application.Run{}, false, err
+	}
 	if run.IdempotencyKey != request.IdempotencyKey {
 		return application.Run{}, false, errors.New("automatic admission abandonment idempotency authority changed")
 	}
@@ -303,6 +306,9 @@ func (s *Store) AbandonAutomaticAdmission(ctx context.Context, request applicati
 			return application.Run{}, false, err
 		}
 		if err := rejectAbandonmentDeliveryEvidenceTx(ctx, tx, run); err != nil {
+			return application.Run{}, false, err
+		}
+		if err := fenceAutomaticAdmissionAbandonmentTx(ctx, tx, request, time.Now().UTC()); err != nil {
 			return application.Run{}, false, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -335,9 +341,10 @@ func (s *Store) AbandonAutomaticAdmission(ctx context.Context, request applicati
 	if err != nil {
 		return application.Run{}, false, err
 	}
-	now := nowText()
+	nowTime := time.Now().UTC()
+	now := formatTime(nowTime)
 	evidence := "operator_abandon:" + request.IdempotencyKey
-	result, err := tx.ExecContext(ctx, `UPDATE runs SET current_state=?,last_error=?,updated_at=? WHERE run_id=? AND current_state=? AND idempotency_key=?`, domain.StateFailed, application.AutomaticAdmissionAbandonTransition, now, run.ID, request.ExpectedState, request.IdempotencyKey)
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET current_state=?,last_error=?,updated_at=? WHERE run_id=? AND current_state=? AND idempotency_key=? AND repository=? AND raw_issue_hash=? AND task_hash=? AND profile_digest=? AND lease_owner=? AND lease_expires_unix>?`, domain.StateFailed, application.AutomaticAdmissionAbandonTransition, now, run.ID, request.ExpectedState, request.IdempotencyKey, request.Repository, request.RawIssueHash, request.TaskHash, request.ProfileDigest, request.LeaseOwner, leaseUnixNano(nowTime))
 	if err != nil {
 		return application.Run{}, false, err
 	}
@@ -357,6 +364,30 @@ func (s *Store) AbandonAutomaticAdmission(ctx context.Context, request applicati
 	run.LastError = application.AutomaticAdmissionAbandonTransition
 	run.UpdatedAt = parseTime(now)
 	return run, false, nil
+}
+
+func validateAutomaticAdmissionAbandonmentAuthorityTx(request application.AutomaticAdmissionAbandonment, run application.Run, now time.Time) error {
+	if run.Repository != request.Repository || run.RawIssueHash != request.RawIssueHash || run.TaskHash != request.TaskHash || run.ProfileDigest != request.ProfileDigest || application.AutomaticAdmissionRepositoryConfigDigest(run.RepositoryConfigJSON) != request.RepositoryConfigDigest {
+		return errors.New("automatic admission abandonment persisted authority changed")
+	}
+	if run.LeaseOwner != request.LeaseOwner || run.LeaseExpiresAt.IsZero() || !run.LeaseExpiresAt.After(now.UTC()) {
+		return errors.New("automatic admission abandonment run lease was lost")
+	}
+	if err := application.AuthorizePersistedRequester(run, request.Requester); err != nil {
+		return errors.New("automatic admission abandonment requester authority changed")
+	}
+	return nil
+}
+
+func fenceAutomaticAdmissionAbandonmentTx(ctx context.Context, tx *sql.Tx, request application.AutomaticAdmissionAbandonment, now time.Time) error {
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET updated_at=updated_at WHERE run_id=? AND current_state=? AND idempotency_key=? AND repository=? AND raw_issue_hash=? AND task_hash=? AND profile_digest=? AND lease_owner=? AND lease_expires_unix>?`, request.RunID, domain.StateFailed, request.IdempotencyKey, request.Repository, request.RawIssueHash, request.TaskHash, request.ProfileDigest, request.LeaseOwner, leaseUnixNano(now))
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return errors.New("automatic admission abandonment run lease compare lost")
+	}
+	return nil
 }
 
 func verifyAbandonmentTransitionTx(ctx context.Context, tx *sql.Tx, request application.AutomaticAdmissionAbandonment) error {

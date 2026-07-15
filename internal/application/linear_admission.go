@@ -116,14 +116,15 @@ func (s *LinearAdmissionService) RevalidateOwnedPushRecovery(ctx context.Context
 }
 
 // RevalidateForAbandon is the read-only Linear authority gate for the narrow
-// automatic-run abandon action. It permits only the states whose external
-// delivery writes have not yet become recoverable PR/push/merge work.
+// automatic-run abandon action. Failed is accepted only for an idempotent
+// replay; it still performs the same source and requester checks before any
+// unfinished local cleanup is retried.
 func (s *LinearAdmissionService) RevalidateForAbandon(ctx context.Context, command LinearRevalidateCommand) (Run, error) {
 	switch command.ExpectedState {
-	case domain.StateReceived, domain.StateAdmitting, domain.StateManualIntervention:
+	case domain.StateReceived, domain.StateAdmitting, domain.StateManualIntervention, domain.StateFailed:
 		return s.revalidate(ctx, command, true)
 	default:
-		return Run{}, serviceError(ErrorInvalidInput, "automatic run abandonment requires received, admitting, or manual_intervention", nil)
+		return Run{}, serviceError(ErrorInvalidInput, "automatic run abandonment requires received, admitting, manual_intervention, or failed replay", nil)
 	}
 }
 
