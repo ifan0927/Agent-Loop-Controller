@@ -20,6 +20,7 @@ const (
 	ProductionMerge               ProductionAction = "squash_merge_pull_request"
 	ProductionReconcileLinear     ProductionAction = "reconcile_linear_completion"
 	ProductionCleanup             ProductionAction = "cleanup_owned_resources"
+	ProductionAbandon             ProductionAction = "abandon_automatic_run"
 	ProductionStop                ProductionAction = "stop"
 )
 

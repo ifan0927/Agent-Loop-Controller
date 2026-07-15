@@ -3,12 +3,12 @@ package application
 import "context"
 
 type WorktreeSpec struct {
-	SourcePath string
-	OriginPath string
-	BaseBranch string
-	Branch     string
-	Path       string
-	Nonce      string
+	SourcePath string `json:"source_path"`
+	OriginPath string `json:"origin_path"`
+	BaseBranch string `json:"base_branch"`
+	Branch     string `json:"branch"`
+	Path       string `json:"path"`
+	Nonce      string `json:"nonce"`
 }
 
 type WorktreeRecord struct {

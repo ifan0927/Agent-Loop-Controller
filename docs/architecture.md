@@ -375,6 +375,20 @@ ownership, but performs no external write. The next driver push repeats local
 exact-HEAD validation, remote observation, and the fast-forward lease before
 updating the branch.
 
+An automatic-admission run that is still in `received`, `admitting`, or
+`manual_intervention` has one separate terminal operator action:
+`controller abandon`. The action requires the persisted requester, expected
+state, repository, and idempotency key, re-reads the stable Linear task, and
+uses one SQLite compare-and-swap transaction to move the run to `failed` and
+the admission journal to its `manual_intervention` attention projection. It
+rejects any retained pull request, approval, merge result, push/PR/merge
+intent, remote-branch ownership, or in-flight Linear mutation. After the
+transaction it removes only durably owned local worktree and branch resources;
+artifacts and the complete audit trail remain readable. Replaying the same
+authority (with `failed` as the expected state after the first CAS) resumes
+only unfinished local cleanup and never repeats an external Linear, GitHub, or
+remote-branch write.
+
 One run owns at most one pull request. Adoption requires durable ownership
 metadata plus matching head, base, candidate SHA, PR identity, and body digest.
 A same-named branch or matching head/base alone is insufficient. PR bodies carry

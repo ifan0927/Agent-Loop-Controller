@@ -32,7 +32,7 @@ const (
 )
 
 var allowedTransitions = map[State]map[State]struct{}{
-	StateReceived:                   set(StateAdmitting),
+	StateReceived:                   set(StateAdmitting, StateFailed),
 	StateAdmitting:                  set(StateRejected, StateProvisioning, StateFailed),
 	StateProvisioning:               set(StateExecuting, StateFailed),
 	StateExecuting:                  set(StateAwaitingHumanDecision, StateVerifying, StateFailed, StateManualIntervention),
@@ -54,7 +54,7 @@ var allowedTransitions = map[State]map[State]struct{}{
 	StateCleaning:                   set(StateCompleted, StateFailed, StateManualIntervention),
 	// This is a narrow application-level recovery edge. It is reachable only
 	// after stable Linear revalidation and retained controller-owned PR proof.
-	StateManualIntervention: set(StateApprovalReady),
+	StateManualIntervention: set(StateApprovalReady, StateFailed),
 }
 
 func CanTransition(from, to State) bool {

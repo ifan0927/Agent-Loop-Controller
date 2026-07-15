@@ -100,6 +100,30 @@ proves stable Linear source plus persisted PR ownership before returning the run
 to the guarded push gate. It has no GitHub App write and no Git write of its
 own; the resumed driver performs the normal exact-HEAD and lease checks.
 
+`controller abandon` is the only terminal administrative action for an
+automatic-admission run that is still in `received`, `admitting`, or a
+pre-delivery `manual_intervention`. It requires the same requester identity,
+repository, expected state, and idempotency key as the other recovery commands:
+
+```sh
+go run ./cmd/ifan-loop controller abandon '<persisted-run-id>' \
+  --config /absolute/protected/path/controller.json \
+  --requester ifan0927 --requester-database-id '<id>' \
+  --requester-node-id '<node-id>' --requester-type User \
+  --repository owner/isolated-fixture \
+  --expected-state manual_intervention \
+  --idempotency-key '<persisted-key>'
+```
+
+The action never changes Linear fields or state. It fails closed when a
+controller-owned PR, approval, merge result, push/PR/merge intent, remote
+branch, or in-flight Linear mutation is retained. Once its SQLite CAS commits,
+it removes only proven controller-owned local worktree and branch resources;
+missing resources are safe to reconcile only when their durable ownership row
+and evidence match. Artifacts and audit evidence are retained. Repeating the
+same command with `failed` as the expected state is idempotent and resumes
+unfinished local cleanup.
+
 The driver polls pending GitHub and Linear evidence every 30 seconds by default
 and exits after 24 hours. An operator may deliberately set `--poll-interval`,
 `--max-immediate-actions`, or `--max-runtime` (no more than seven days) for an

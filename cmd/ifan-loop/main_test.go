@@ -210,6 +210,13 @@ func TestControllerDriveRequiresRunAndRequesterIdentity(t *testing.T) {
 	}
 }
 
+func TestControllerAbandonRequiresExplicitCASAndRequesterIdentity(t *testing.T) {
+	err := controller([]string{"abandon"})
+	if err == nil || !strings.Contains(err.Error(), "run ID, complete requester identity, --repository, --expected-state, and --idempotency-key") {
+		t.Fatalf("missing controller abandon argument error=%v", err)
+	}
+}
+
 func TestControllerDriveRejectsUnsafeAutomaticDriverOptionsBeforeConfigLoad(t *testing.T) {
 	identity := []string{"--requester", "ifan0927", "--requester-database-id", "33", "--requester-node-id", "MDQ6VXNlcjMz", "--requester-type", "User"}
 	err := controller(append([]string{"drive", "run-42", "--poll-interval", "0s"}, identity...))

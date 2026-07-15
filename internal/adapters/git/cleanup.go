@@ -66,9 +66,6 @@ func (c Cleanup) DeleteLocalBranch(ctx context.Context, repository, branch, expe
 		return err
 	}
 	if err := domain.ValidateGitBranch(branch); err != nil {
-		return err
-	}
-	if strings.TrimSpace(expectedSHA) == "" {
 		return errors.New("local branch ownership mismatch")
 	}
 	if err := c.validateSourceOrigin(ctx); err != nil {
@@ -84,6 +81,9 @@ func (c Cleanup) DeleteLocalBranch(ctx context.Context, repository, branch, expe
 			return nil
 		}
 		return err
+	}
+	if strings.TrimSpace(expectedSHA) == "" {
+		return errors.New("local branch ownership mismatch")
 	}
 	if strings.TrimSpace(actual) != expectedSHA {
 		return errors.New("local branch no longer matches persisted candidate")

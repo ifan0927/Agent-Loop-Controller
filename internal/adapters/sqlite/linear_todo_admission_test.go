@@ -479,6 +479,152 @@ func TestAutomaticAdmissionJournalRejectsStatusAndRunStateContradictions(t *test
 	}
 }
 
+func TestAutomaticAdmissionAbandonReleasesSlotAndReplaysIdempotently(t *testing.T) {
+	store, run, lease := prepareAutomaticAbandonmentRun(t, domain.StateReceived)
+	defer store.Close()
+	ctx := context.Background()
+	request := application.AutomaticAdmissionAbandonment{RunID: run.ID, ExpectedState: domain.StateReceived, IdempotencyKey: run.IdempotencyKey}
+
+	abandoned, idempotent, err := store.AbandonAutomaticAdmission(ctx, request)
+	if err != nil || idempotent || abandoned.State != domain.StateFailed {
+		t.Fatalf("abandoned=%+v idempotent=%v err=%v", abandoned, idempotent, err)
+	}
+	if runs, err := store.ListNonterminalRuns(ctx); err != nil || len(runs) != 0 {
+		t.Fatalf("nonterminal runs=%+v err=%v", runs, err)
+	}
+	journal, found, err := store.GetLinearTodoAdmissionJournal(ctx, run.ID)
+	if err != nil || !found || journal.Status != application.LinearTodoAdmissionJournalManualIntervention || journal.ReasonCode != application.AutomaticAdmissionAbandonReason {
+		t.Fatalf("journal=%+v found=%v err=%v", journal, found, err)
+	}
+	inspection, err := store.Inspect(ctx, run.ID)
+	if err != nil || len(inspection.Timeline) != 2 || inspection.Timeline[1].To != domain.StateFailed || inspection.Timeline[1].EvidenceReference != "operator_abandon:"+run.IdempotencyKey {
+		t.Fatalf("inspection=%+v err=%v", inspection, err)
+	}
+
+	replayed, idempotent, err := store.AbandonAutomaticAdmission(ctx, request)
+	if err != nil || !idempotent || replayed.State != domain.StateFailed {
+		t.Fatalf("replayed=%+v idempotent=%v err=%v", replayed, idempotent, err)
+	}
+	inspection, err = store.Inspect(ctx, run.ID)
+	if err != nil || len(inspection.Timeline) != 2 {
+		t.Fatalf("replay duplicated audit timeline=%+v err=%v", inspection.Timeline, err)
+	}
+	if _, err := store.ReleaseLinearTodoAdmissionLease(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+	newLease, acquired, err := store.AcquireLinearTodoAdmissionLease(ctx, "replacement", time.Minute, time.Now().UTC())
+	if err != nil || !acquired {
+		t.Fatalf("replacement lease acquired=%v err=%v", acquired, err)
+	}
+	defer store.ReleaseLinearTodoAdmissionLease(ctx, newLease)
+	if _, _, reserved, err := store.ReserveLinearTodoAdmission(ctx, automaticAdmissionReservation("123e4567-e89b-42d3-a456-426614174099", "run-after-abandon", "IFAN-99", newLease)); err != nil || !reserved {
+		t.Fatalf("slot was not released reserved=%v err=%v", reserved, err)
+	}
+}
+
+func TestAutomaticAdmissionAbandonRejectsRetainedDeliveryEvidence(t *testing.T) {
+	for _, name := range []string{"pull_request", "push", "merge"} {
+		t.Run(name, func(t *testing.T) {
+			store, run, _ := prepareAutomaticAbandonmentRun(t, domain.StateManualIntervention)
+			defer store.Close()
+			ctx := context.Background()
+			switch name {
+			case "pull_request":
+				if err := store.SavePullRequest(ctx, run.ID, domain.PullRequest{Number: 7, DatabaseID: 70, URL: "https://example.invalid/pr/7", NodeID: "PR_7", HeadBranch: run.WorkingBranch, BaseBranch: run.BaseBranch, HeadSHA: "head", BaseSHA: run.BaseSHA, BodyDigest: "body", OwnershipKey: run.IdempotencyKey, State: "open"}); err != nil {
+					t.Fatal(err)
+				}
+			case "push":
+				if _, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{RunID: run.ID, Kind: "push", IdempotencyKey: "push-intent", IntentJSON: `{"branch":"owned"}`, Attempt: 1}); err != nil {
+					t.Fatal(err)
+				}
+			case "merge":
+				if err := store.SaveMerge(ctx, application.MergeRecord{RunID: run.ID, PRNumber: 7, PreMergeSHA: "head", BaseSHA: run.BaseSHA, Method: "squash", MergeSHA: "merge", MergedAt: time.Now().UTC()}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, _, err := store.AbandonAutomaticAdmission(ctx, application.AutomaticAdmissionAbandonment{RunID: run.ID, ExpectedState: domain.StateManualIntervention, IdempotencyKey: run.IdempotencyKey})
+			if err == nil {
+				t.Fatal("abandonment ignored retained delivery evidence")
+			}
+			current, getErr := store.GetRun(ctx, run.ID)
+			if getErr != nil || current.State != domain.StateManualIntervention {
+				t.Fatalf("state changed after rejection current=%+v err=%v", current, getErr)
+			}
+		})
+	}
+}
+
+func TestAutomaticAdmissionAbandonRejectsPendingLinearMutation(t *testing.T) {
+	store, run, _ := prepareAutomaticAbandonmentRun(t, domain.StateReceived)
+	defer store.Close()
+	ctx := context.Background()
+	if _, err := store.db.ExecContext(ctx, `UPDATE linear_todo_admission_journal SET status=?,mutation_intent_ref=? WHERE run_id=?`, "mutation_intent", digestBytes([]byte("pending abandon")), run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.AbandonAutomaticAdmission(ctx, application.AutomaticAdmissionAbandonment{RunID: run.ID, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}); err == nil {
+		t.Fatal("pending Linear mutation was accepted for abandonment")
+	}
+	current, err := store.GetRun(ctx, run.ID)
+	if err != nil || current.State != domain.StateReceived {
+		t.Fatalf("state changed after pending mutation rejection current=%+v err=%v", current, err)
+	}
+}
+
+func TestAutomaticAdmissionAbandonRejectsStaleAuthority(t *testing.T) {
+	store, run, _ := prepareAutomaticAbandonmentRun(t, domain.StateManualIntervention)
+	defer store.Close()
+	ctx := context.Background()
+	for _, request := range []application.AutomaticAdmissionAbandonment{
+		{RunID: run.ID, ExpectedState: domain.StateExecuting, IdempotencyKey: run.IdempotencyKey},
+		{RunID: run.ID, ExpectedState: domain.StateManualIntervention, IdempotencyKey: "wrong-key"},
+	} {
+		if _, _, err := store.AbandonAutomaticAdmission(ctx, request); err == nil {
+			t.Fatalf("stale request was accepted: %+v", request)
+		}
+	}
+	current, err := store.GetRun(ctx, run.ID)
+	if err != nil || current.State != domain.StateManualIntervention {
+		t.Fatalf("state changed after stale calls current=%+v err=%v", current, err)
+	}
+}
+
+func prepareAutomaticAbandonmentRun(t *testing.T, state domain.State) (*Store, application.Run, application.LinearTodoAdmissionLease) {
+	t.Helper()
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	lease, acquired, err := store.AcquireLinearTodoAdmissionLease(ctx, "abandon-test", time.Minute, time.Now().UTC())
+	if err != nil || !acquired {
+		store.Close()
+		t.Fatalf("lease acquired=%v err=%v", acquired, err)
+	}
+	reservation := automaticAdmissionReservation("123e4567-e89b-42d3-a456-426614174098", "run-abandon", "IFAN-98", lease)
+	run, _, reserved, err := store.ReserveLinearTodoAdmission(ctx, reservation)
+	if err != nil || !reserved {
+		store.Close()
+		t.Fatalf("reserved=%v err=%v", reserved, err)
+	}
+	if state != domain.StateReceived {
+		intent := digestBytes([]byte("abandon intent"))
+		if changed, err := store.AdvanceLinearTodoAdmissionJournal(ctx, application.LinearTodoAdmissionJournalTransition{Lease: lease, RunID: run.ID, ExpectedStatus: application.LinearTodoAdmissionJournalReserved, NextStatus: "mutation_intent", MutationIntentRef: intent}); err != nil || !changed {
+			store.Close()
+			t.Fatalf("mutation intent changed=%v err=%v", changed, err)
+		}
+		if changed, err := store.AdvanceLinearTodoAdmissionJournal(ctx, application.LinearTodoAdmissionJournalTransition{Lease: lease, RunID: run.ID, ExpectedStatus: "mutation_intent", NextStatus: "started", MutationIntentRef: intent}); err != nil || !changed {
+			store.Close()
+			t.Fatalf("started changed=%v err=%v", changed, err)
+		}
+		if _, err := store.db.ExecContext(ctx, `UPDATE runs SET current_state=? WHERE run_id=?`, state, run.ID); err != nil {
+			store.Close()
+			t.Fatal(err)
+		}
+		run.State = state
+	}
+	return store, run, lease
+}
+
 func TestMigratesVersionFifteenDatabaseToAutomaticAdmissionSchema(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
 	db, err := sql.Open("sqlite", sqliteDSN(path))

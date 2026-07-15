@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/codex"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
 // LinearTodoAdmissionLeaseNamespace is the sole scheduler lease. It is not a
@@ -19,7 +20,13 @@ const (
 )
 
 const (
-	LinearTodoAdmissionJournalReserved = "reserved"
+	LinearTodoAdmissionJournalReserved           = "reserved"
+	LinearTodoAdmissionJournalManualIntervention = "manual_intervention"
+)
+
+const (
+	AutomaticAdmissionAbandonReason     = "operator_abandoned"
+	AutomaticAdmissionAbandonTransition = "operator abandoned automatic run"
 )
 
 // LinearTodoAdmissionLease is a compare-and-swap capability. Callers must
@@ -68,6 +75,34 @@ type LinearTodoAdmissionJournalTransition struct {
 	NextStatus        string
 	MutationIntentRef string
 	ReasonCode        string
+}
+
+// AutomaticAdmissionAbandonment is the compare-and-swap authority for the
+// requester-authorized terminal action. The idempotency key is the persisted
+// run authority, not a caller-generated free-form token.
+type AutomaticAdmissionAbandonment struct {
+	RunID          string
+	ExpectedState  domain.State
+	IdempotencyKey string
+}
+
+func (a AutomaticAdmissionAbandonment) Validate() error {
+	if strings.TrimSpace(a.RunID) == "" || strings.TrimSpace(a.IdempotencyKey) == "" {
+		return errors.New("automatic admission abandonment authority is incomplete")
+	}
+	switch a.ExpectedState {
+	case domain.StateReceived, domain.StateAdmitting, domain.StateManualIntervention, domain.StateFailed:
+		return nil
+	default:
+		return errors.New("automatic admission abandonment state is not eligible")
+	}
+}
+
+// AutomaticAdmissionAbandonStore is kept separate from RunStore so existing
+// read and delivery test doubles cannot accidentally gain an administrative
+// terminal mutation.
+type AutomaticAdmissionAbandonStore interface {
+	AbandonAutomaticAdmission(context.Context, AutomaticAdmissionAbandonment) (Run, bool, error)
 }
 
 // LinearTodoAdmissionStore is intentionally narrow. Future scheduling code

@@ -68,7 +68,7 @@ func main() {
 
 func controller(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: ifan-loop controller <start|run|drive|worker|launchagent|status|inspect|continue|recover-owned-push|push|open-pr|reconcile|merge|reconcile-linear|cleanup> ...")
+		return errors.New("usage: ifan-loop controller <start|run|drive|worker|launchagent|status|inspect|continue|recover-owned-push|abandon|push|open-pr|reconcile|merge|reconcile-linear|cleanup> ...")
 	}
 	switch args[0] {
 	case "start":
@@ -87,6 +87,8 @@ func controller(args []string) error {
 		return controllerContinue(args[1:])
 	case "recover-owned-push":
 		return controllerRecoverOwnedPush(args[1:])
+	case "abandon":
+		return controllerAbandon(args[1:])
 	case "push":
 		return controllerPush(args[1:])
 	case "open-pr":
@@ -515,6 +517,33 @@ func controllerRecoverOwnedPush(args []string) error {
 	ctx, cancel := localContext(loaded.Linear.HTTPTimeout)
 	defer cancel()
 	result, err := coordinator.RecoverOwnedPush(ctx, application.ProductionRecoverOwnedPushCommand{Requester: command.requester, RunID: command.run.ID, Repository: command.repository, ExpectedState: command.expectedState, IdempotencyKey: command.idempotencyKey})
+	if err != nil {
+		return err
+	}
+	return printJSON(result)
+}
+
+func controllerAbandon(args []string) error {
+	command, loaded, store, err := productionCommand(args, "controller abandon")
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := validateProductionPersistedBinding(command.run, loaded.Registry); err != nil {
+		return application.ClassifyError(err)
+	}
+	coordinator, err := newProductionCoordinator(loaded, store, filepath.Dir(command.run.WorktreePath))
+	if err != nil {
+		return err
+	}
+	var repository application.LocalRepository
+	if err := json.Unmarshal([]byte(command.run.RepositoryConfigJSON), &repository); err != nil {
+		return application.ClassifyError(errors.New("persisted repository authority is invalid"))
+	}
+	cleanup := gitadapter.Cleanup{Workspace: gitadapter.Workspace{Process: processadapter.OSRunner{}}, SourcePath: repository.SourcePath, OriginPath: repository.OriginPath}
+	ctx, cancel := localContext(loaded.Controller.RunTimeout)
+	defer cancel()
+	result, err := coordinator.Abandon(ctx, application.ProductionAbandonCommand{Requester: command.requester, RunID: command.run.ID, Repository: command.repository, ExpectedState: command.expectedState, IdempotencyKey: command.idempotencyKey}, cleanup)
 	if err != nil {
 		return err
 	}

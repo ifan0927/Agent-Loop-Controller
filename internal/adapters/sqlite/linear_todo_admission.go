@@ -232,7 +232,7 @@ func (s *Store) AdvanceLinearTodoAdmissionJournal(ctx context.Context, transitio
 	if transition.NextStatus == application.LinearTodoAdmissionJournalReserved && (transition.MutationIntentRef != "" || transition.ReasonCode != "") {
 		return false, errors.New("automatic admission reservation journal cannot carry outcome data")
 	}
-	if transition.NextStatus == "manual_intervention" && transition.ReasonCode == "" {
+	if transition.NextStatus == application.LinearTodoAdmissionJournalManualIntervention && transition.ReasonCode == "" {
 		return false, errors.New("automatic admission journal reason is required")
 	}
 	if !validAutomaticAdmissionJournalTransition(transition.ExpectedStatus, transition.NextStatus) {
@@ -261,6 +261,145 @@ func (s *Store) AdvanceLinearTodoAdmissionJournal(ctx context.Context, transitio
 		return false, err
 	}
 	return true, nil
+}
+
+// AbandonAutomaticAdmission atomically closes the controller-owned admission
+// slot and moves the journal to its existing terminal attention projection.
+// It performs no Linear, Git, or GitHub operation; local resource cleanup is a
+// separate application step after this durable CAS succeeds.
+func (s *Store) AbandonAutomaticAdmission(ctx context.Context, request application.AutomaticAdmissionAbandonment) (application.Run, bool, error) {
+	if err := request.Validate(); err != nil {
+		return application.Run{}, false, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return application.Run{}, false, err
+	}
+	defer tx.Rollback()
+
+	run, err := scanRun(tx.QueryRowContext(ctx, runSelect+` WHERE run_id=?`, request.RunID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return application.Run{}, false, application.ErrRunNotFound
+	}
+	if err != nil {
+		return application.Run{}, false, err
+	}
+	if run.IdempotencyKey != request.IdempotencyKey {
+		return application.Run{}, false, errors.New("automatic admission abandonment idempotency authority changed")
+	}
+
+	if run.State == domain.StateFailed {
+		journal, found, err := automaticAdmissionJournalTx(ctx, tx, run.ID)
+		if err != nil {
+			return application.Run{}, false, err
+		}
+		if !found || !validAutomaticAdmissionJournal(journal, run) {
+			return application.Run{}, false, errors.New("automatic admission journal is missing or corrupt")
+		}
+		if journal.Status == "mutation_intent" {
+			return application.Run{}, false, errors.New("automatic admission abandonment is blocked by a pending Linear mutation")
+		}
+		if err := verifyAbandonmentTransitionTx(ctx, tx, request); err != nil {
+			return application.Run{}, false, err
+		}
+		if err := rejectAbandonmentDeliveryEvidenceTx(ctx, tx, run.ID); err != nil {
+			return application.Run{}, false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return application.Run{}, false, err
+		}
+		return run, true, nil
+	}
+	if request.ExpectedState == domain.StateFailed || run.State != request.ExpectedState {
+		return application.Run{}, false, errors.New("automatic admission abandonment state compare failed")
+	}
+	if request.ExpectedState != domain.StateReceived && request.ExpectedState != domain.StateAdmitting && request.ExpectedState != domain.StateManualIntervention {
+		return application.Run{}, false, errors.New("automatic admission abandonment state is not eligible")
+	}
+
+	journal, found, err := automaticAdmissionJournalTx(ctx, tx, run.ID)
+	if err != nil {
+		return application.Run{}, false, err
+	}
+	if !found || !validAutomaticAdmissionJournal(journal, run) {
+		return application.Run{}, false, errors.New("automatic admission journal is missing or corrupt")
+	}
+	if journal.Status == "mutation_intent" {
+		return application.Run{}, false, errors.New("automatic admission abandonment is blocked by a pending Linear mutation")
+	}
+	if err := rejectAbandonmentDeliveryEvidenceTx(ctx, tx, run.ID); err != nil {
+		return application.Run{}, false, err
+	}
+
+	sequence, err := nextTransitionSequenceTx(ctx, tx, run.ID)
+	if err != nil {
+		return application.Run{}, false, err
+	}
+	now := nowText()
+	evidence := "operator_abandon:" + request.IdempotencyKey
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET current_state=?,last_error=?,updated_at=? WHERE run_id=? AND current_state=? AND idempotency_key=?`, domain.StateFailed, application.AutomaticAdmissionAbandonTransition, now, run.ID, request.ExpectedState, request.IdempotencyKey)
+	if err != nil {
+		return application.Run{}, false, err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return application.Run{}, false, errors.New("automatic admission abandonment state compare update lost")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO transitions(run_id,sequence,from_state,to_state,reason,evidence_reference,bound_head,created_at) VALUES(?,?,?,?,?,?,?,?)`, run.ID, sequence, request.ExpectedState, domain.StateFailed, application.AutomaticAdmissionAbandonTransition, evidence, run.CandidateHead, now); err != nil {
+		return application.Run{}, false, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE linear_todo_admission_journal SET status=?,mutation_intent_ref='',reason_code=?,updated_at=? WHERE run_id=? AND status=?`, application.LinearTodoAdmissionJournalManualIntervention, application.AutomaticAdmissionAbandonReason, now, run.ID, journal.Status); err != nil {
+		return application.Run{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return application.Run{}, false, err
+	}
+	run.State = domain.StateFailed
+	run.LastError = application.AutomaticAdmissionAbandonTransition
+	run.UpdatedAt = parseTime(now)
+	return run, false, nil
+}
+
+func verifyAbandonmentTransitionTx(ctx context.Context, tx *sql.Tx, request application.AutomaticAdmissionAbandonment) error {
+	var from, to, reason, evidence string
+	err := tx.QueryRowContext(ctx, `SELECT from_state,to_state,reason,evidence_reference FROM transitions WHERE run_id=? ORDER BY sequence DESC LIMIT 1`, request.RunID).Scan(&from, &to, &reason, &evidence)
+	if err != nil {
+		return errors.New("automatic admission abandonment idempotency evidence is unavailable")
+	}
+	if to != string(domain.StateFailed) || reason != application.AutomaticAdmissionAbandonTransition || evidence != "operator_abandon:"+request.IdempotencyKey {
+		return errors.New("automatic admission abandonment is not idempotently replayable")
+	}
+	if request.ExpectedState != domain.StateFailed && from != string(request.ExpectedState) {
+		return errors.New("automatic admission abandonment idempotency state does not match")
+	}
+	return nil
+}
+
+func rejectAbandonmentDeliveryEvidenceTx(ctx context.Context, tx *sql.Tx, runID string) error {
+	var count int
+	for _, query := range []string{
+		`SELECT COUNT(*) FROM pull_requests WHERE run_id=?`,
+		`SELECT COUNT(*) FROM merge_results WHERE run_id=?`,
+		`SELECT COUNT(*) FROM human_approvals WHERE run_id=?`,
+		`SELECT COUNT(*) FROM owned_resources WHERE owning_run=? AND resource_kind IN ('remote_branch','pull_request') AND ownership_status<>'deleted'`,
+		`SELECT COUNT(*) FROM side_effects WHERE run_id=? AND kind IN ('push','open_pull_request','squash_merge','merge')`,
+		`SELECT COUNT(*) FROM side_effects WHERE run_id=? AND kind='linear_move_to_started' AND status IN ('intent','in_flight')`,
+	} {
+		if err := tx.QueryRowContext(ctx, query, runID).Scan(&count); err != nil {
+			return err
+		}
+		if count != 0 {
+			return errors.New("automatic admission abandonment is blocked by retained external delivery evidence")
+		}
+	}
+	return nil
+}
+
+func nextTransitionSequenceTx(ctx context.Context, tx *sql.Tx, runID string) (int64, error) {
+	var sequence int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM transitions WHERE run_id=?`, runID).Scan(&sequence); err != nil {
+		return 0, err
+	}
+	return sequence, nil
 }
 
 func validateAutomaticAdmissionLeaseRequest(owner string, ttl time.Duration, now time.Time) error {
@@ -387,7 +526,7 @@ func isAutomaticAdmissionDigest(value string) bool {
 
 func validAutomaticAdmissionJournalStatus(value string) bool {
 	switch value {
-	case application.LinearTodoAdmissionJournalReserved, "mutation_intent", "started", "manual_intervention":
+	case application.LinearTodoAdmissionJournalReserved, "mutation_intent", "started", application.LinearTodoAdmissionJournalManualIntervention:
 		return true
 	default:
 		return false
@@ -399,7 +538,7 @@ func validAutomaticAdmissionReason(value string) bool {
 		return true
 	}
 	switch value {
-	case "authority_conflict", "lease_lost", "persistence_conflict", "source_drift", "mutation_conflict":
+	case "authority_conflict", "lease_lost", "persistence_conflict", "source_drift", "mutation_conflict", application.AutomaticAdmissionAbandonReason:
 		return true
 	default:
 		return false
@@ -407,8 +546,9 @@ func validAutomaticAdmissionReason(value string) bool {
 }
 
 func validAutomaticAdmissionJournalTransition(expected, next string) bool {
-	return (expected == application.LinearTodoAdmissionJournalReserved && (next == "mutation_intent" || next == "manual_intervention")) ||
-		(expected == "mutation_intent" && (next == "started" || next == "manual_intervention"))
+	return (expected == application.LinearTodoAdmissionJournalReserved && (next == "mutation_intent" || next == application.LinearTodoAdmissionJournalManualIntervention)) ||
+		(expected == "mutation_intent" && (next == "started" || next == application.LinearTodoAdmissionJournalManualIntervention)) ||
+		(expected == "started" && next == application.LinearTodoAdmissionJournalManualIntervention)
 }
 
 func digestBytes(value []byte) string {
@@ -484,7 +624,7 @@ func scanAutomaticAdmissionJournal(row rowScanner) (application.LinearTodoAdmiss
 }
 
 func validAutomaticAdmissionJournal(journal application.LinearTodoAdmissionJournal, run application.Run) bool {
-	if !validAutomaticAdmissionUUID(journal.IssueUUID) || !isAutomaticAdmissionDigest(journal.ScanDigest) || !isAutomaticAdmissionDigest(journal.TaskDigest) || !isAutomaticAdmissionDigest(journal.ProfileDigest) || !validAutomaticAdmissionJournalStatus(journal.Status) || (journal.MutationIntentRef != "" && !isAutomaticAdmissionDigest(journal.MutationIntentRef)) || !validAutomaticAdmissionReason(journal.ReasonCode) || (journal.Status == application.LinearTodoAdmissionJournalReserved && (journal.MutationIntentRef != "" || journal.ReasonCode != "")) || ((journal.Status == "mutation_intent" || journal.Status == "started") && !isAutomaticAdmissionDigest(journal.MutationIntentRef)) || (journal.Status == "manual_intervention" && journal.ReasonCode == "") || journal.CreatedAt.IsZero() || journal.UpdatedAt.IsZero() || journal.UpdatedAt.Before(journal.CreatedAt) {
+	if !validAutomaticAdmissionUUID(journal.IssueUUID) || !isAutomaticAdmissionDigest(journal.ScanDigest) || !isAutomaticAdmissionDigest(journal.TaskDigest) || !isAutomaticAdmissionDigest(journal.ProfileDigest) || !validAutomaticAdmissionJournalStatus(journal.Status) || (journal.MutationIntentRef != "" && !isAutomaticAdmissionDigest(journal.MutationIntentRef)) || !validAutomaticAdmissionReason(journal.ReasonCode) || (journal.Status == application.LinearTodoAdmissionJournalReserved && (journal.MutationIntentRef != "" || journal.ReasonCode != "")) || ((journal.Status == "mutation_intent" || journal.Status == "started") && !isAutomaticAdmissionDigest(journal.MutationIntentRef)) || (journal.Status == application.LinearTodoAdmissionJournalManualIntervention && journal.ReasonCode == "") || journal.CreatedAt.IsZero() || journal.UpdatedAt.IsZero() || journal.UpdatedAt.Before(journal.CreatedAt) {
 		return false
 	}
 	if journal.RunID != run.ID || journal.TaskDigest != run.TaskHash || journal.ProfileDigest != run.ProfileDigest || !isAutomaticAdmissionDigest(run.RawIssueHash) || !isAutomaticAdmissionDigest(run.TaskHash) || digestBytes([]byte(run.RawIssueJSON)) != run.RawIssueHash || digestBytes([]byte(run.NormalizedTaskJSON)) != run.TaskHash {
@@ -511,8 +651,8 @@ func automaticAdmissionJournalStateMatchesRun(status string, state domain.State)
 		// A normal delivery lifecycle can subsequently reach any terminal state
 		// without another journal transition, so terminal states remain valid.
 		return true
-	case "manual_intervention":
-		return state == domain.StateManualIntervention
+	case application.LinearTodoAdmissionJournalManualIntervention:
+		return state == domain.StateManualIntervention || state == domain.StateFailed
 	default:
 		return false
 	}
