@@ -20,7 +20,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 18
+const schemaVersion = 19
 
 type Store struct{ db *sql.DB }
 
@@ -125,6 +125,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV17
 		case 18:
 			statements = migrationV18
+		case 19:
+			statements = migrationV19
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -350,6 +352,14 @@ var migrationV17 = []string{
 // temporal compare-and-swap primitive.
 var migrationV18 = []string{
 	`ALTER TABLE linear_todo_admission_lease ADD COLUMN expires_at_unix_ns INTEGER NOT NULL DEFAULT 0`,
+}
+
+// migrationV19 records the process boundary for every verifier check. Legacy
+// rows remain explicitly non-authoritative until a new verification attempt
+// records its execution outcome.
+var migrationV19 = []string{
+	`ALTER TABLE verifications ADD COLUMN process_outcome TEXT NOT NULL DEFAULT 'legacy'`,
+	`ALTER TABLE verifications ADD COLUMN failure_category TEXT NOT NULL DEFAULT 'legacy_evidence'`,
 }
 
 func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput) (application.Run, bool, error) {
@@ -1108,9 +1118,23 @@ func (s *Store) FinishAttempt(ctx context.Context, attempt application.Attempt) 
 }
 
 func (s *Store) SaveVerification(ctx context.Context, record application.VerificationRecord) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO verifications(run_id,attempt_id,verifier_id,phase,verified_head,exit_code,stdout_path,stderr_path,stdout_hash,stderr_hash,stdout_size,stderr_size,evidence_path,evidence_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		record.RunID, record.AttemptID, record.VerifierID, record.Phase, record.VerifiedHead, record.ExitCode, record.StdoutPath, record.StderrPath, record.StdoutHash, record.StderrHash, record.StdoutSize, record.StderrSize, record.EvidencePath, record.EvidenceHash, nowText())
+	if !validVerificationProcessEvidence(record.ProcessOutcome, record.FailureCategory, record.ExitCode) {
+		return errors.New("invalid verifier process evidence")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO verifications(run_id,attempt_id,verifier_id,phase,verified_head,process_outcome,failure_category,exit_code,stdout_path,stderr_path,stdout_hash,stderr_hash,stdout_size,stderr_size,evidence_path,evidence_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		record.RunID, record.AttemptID, record.VerifierID, record.Phase, record.VerifiedHead, record.ProcessOutcome, record.FailureCategory, record.ExitCode, record.StdoutPath, record.StderrPath, record.StdoutHash, record.StderrHash, record.StdoutSize, record.StderrSize, record.EvidencePath, record.EvidenceHash, nowText())
 	return err
+}
+
+func validVerificationProcessEvidence(outcome, category string, exitCode int) bool {
+	switch outcome {
+	case application.VerificationOutcomeNotStarted, application.VerificationOutcomeInterrupted:
+		return exitCode == -1 && category != application.VerificationFailureNone
+	case application.VerificationOutcomeExited:
+		return category == application.VerificationFailureNone
+	default:
+		return false
+	}
 }
 func (s *Store) SaveReview(ctx context.Context, record application.ReviewRecord) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO reviews(run_id,attempt_id,review_session_id,reviewed_head,verdict,outcome_path,outcome_hash,created_at) VALUES(?,?,?,?,?,?,?,?)`,
@@ -2124,14 +2148,14 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 		inspection.Attempts = append(inspection.Attempts, v)
 	}
 	rows.Close()
-	rows, err = s.db.QueryContext(ctx, `SELECT verification_id,run_id,attempt_id,verifier_id,phase,verified_head,exit_code,stdout_path,stderr_path,stdout_hash,stderr_hash,stdout_size,stderr_size,evidence_path,evidence_hash,created_at FROM verifications WHERE run_id=? ORDER BY verification_id`, id)
+	rows, err = s.db.QueryContext(ctx, `SELECT verification_id,run_id,attempt_id,verifier_id,phase,verified_head,process_outcome,failure_category,exit_code,stdout_path,stderr_path,stdout_hash,stderr_hash,stdout_size,stderr_size,evidence_path,evidence_hash,created_at FROM verifications WHERE run_id=? ORDER BY verification_id`, id)
 	if err != nil {
 		return inspection, err
 	}
 	for rows.Next() {
 		var v application.VerificationRecord
 		var created string
-		if err := rows.Scan(&v.ID, &v.RunID, &v.AttemptID, &v.VerifierID, &v.Phase, &v.VerifiedHead, &v.ExitCode, &v.StdoutPath, &v.StderrPath, &v.StdoutHash, &v.StderrHash, &v.StdoutSize, &v.StderrSize, &v.EvidencePath, &v.EvidenceHash, &created); err != nil {
+		if err := rows.Scan(&v.ID, &v.RunID, &v.AttemptID, &v.VerifierID, &v.Phase, &v.VerifiedHead, &v.ProcessOutcome, &v.FailureCategory, &v.ExitCode, &v.StdoutPath, &v.StderrPath, &v.StdoutHash, &v.StderrHash, &v.StdoutSize, &v.StderrSize, &v.EvidencePath, &v.EvidenceHash, &created); err != nil {
 			rows.Close()
 			return inspection, err
 		}

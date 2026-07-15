@@ -311,7 +311,7 @@ func (*offlineAdmissionCodex) Implementation(_ context.Context, _ codex.CommandS
 	if err := os.WriteFile(stderr, nil, 0o600); err != nil {
 		return codex.StructuredResult[domain.AgentOutcome]{}, err
 	}
-	return codex.StructuredResult[domain.AgentOutcome]{SessionID: "offline-session", Outcome: outcome, Process: processadapter.Result{ExitCode: 0, StdoutPath: stdout, StderrPath: stderr}}, nil
+	return codex.StructuredResult[domain.AgentOutcome]{SessionID: "offline-session", Outcome: outcome, Process: processadapter.Result{Outcome: processadapter.OutcomeExited, ExitCode: 0, StdoutPath: stdout, StderrPath: stderr}}, nil
 }
 
 func (*offlineAdmissionCodex) Resume(context.Context, codex.CommandSpec, string) (codex.StructuredResult[domain.AgentOutcome], error) {

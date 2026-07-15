@@ -101,7 +101,7 @@ func TestLatestRepairStartedAtUsesNewestRepairTransition(t *testing.T) {
 func TestPostRepairEvidenceCannotReuseSameHeadVerificationOrReview(t *testing.T) {
 	started := time.Now().UTC()
 	head := "head"
-	oldVerification := VerificationRecord{VerifierID: "verify", Phase: "candidate", VerifiedHead: head, ExitCode: 0, EvidencePath: "old.json", CreatedAt: started.Add(-time.Second)}
+	oldVerification := VerificationRecord{VerifierID: "verify", Phase: "candidate", VerifiedHead: head, ProcessOutcome: VerificationOutcomeExited, ExitCode: 0, EvidencePath: "old.json", CreatedAt: started.Add(-time.Second)}
 	if _, ok := successfulVerificationBatchAfter([]VerificationRecord{oldVerification}, head, []string{"verify"}, started); ok {
 		t.Fatal("pre-repair verification was reused")
 	}
@@ -118,5 +118,23 @@ func TestPostRepairEvidenceCannotReuseSameHeadVerificationOrReview(t *testing.T)
 	newReview.ID, newReview.CreatedAt = 2, started
 	if got, ok := latestReviewForHeadAfter([]ReviewRecord{oldReview, newReview}, head, started); !ok || got.ID != newReview.ID {
 		t.Fatalf("post-repair review=%+v ok=%t", got, ok)
+	}
+}
+
+func TestCandidateAuthorizationRejectsNewestStartFailureAfterOlderSuccess(t *testing.T) {
+	now := time.Now().UTC()
+	old := VerificationRecord{VerifierID: "verify", Phase: "candidate", VerifiedHead: "head", ProcessOutcome: VerificationOutcomeExited, ExitCode: 0, EvidencePath: "old.json", CreatedAt: now.Add(-time.Second)}
+	failed := VerificationRecord{VerifierID: "verify", Phase: "candidate", VerifiedHead: "head", ProcessOutcome: VerificationOutcomeNotStarted, FailureCategory: "process_start", ExitCode: -1, EvidencePath: "failed.json", CreatedAt: now}
+	if _, ok := successfulVerificationBatch([]VerificationRecord{old, failed}, "head", []string{"verify"}); ok {
+		t.Fatal("newest start failure reused older successful verification")
+	}
+	passed := failed
+	passed.ProcessOutcome = VerificationOutcomeExited
+	passed.FailureCategory = VerificationFailureNone
+	passed.ExitCode = 0
+	passed.EvidencePath = "passed.json"
+	passed.CreatedAt = now.Add(time.Second)
+	if _, ok := successfulVerificationBatch([]VerificationRecord{old, failed, passed}, "head", []string{"verify"}); !ok {
+		t.Fatal("complete successful retry was not accepted")
 	}
 }

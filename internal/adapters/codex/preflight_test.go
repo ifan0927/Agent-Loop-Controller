@@ -15,7 +15,7 @@ type preflightProcess struct {
 
 func (p preflightProcess) Run(_ context.Context, spec processadapter.Spec) (processadapter.Result, error) {
 	if len(spec.Args) == 1 && spec.Args[0] == "--version" {
-		return processadapter.Result{Stdout: []byte("codex-cli test\n")}, nil
+		return processadapter.Result{Outcome: processadapter.OutcomeExited, Stdout: []byte("codex-cli test\n")}, nil
 	}
 	flags := requiredExecFlags
 	prefix := ""
@@ -30,7 +30,7 @@ func (p preflightProcess) Run(_ context.Context, spec processadapter.Spec) (proc
 	help := prefix + strings.Join(lines, "\n")
 	help = strings.ReplaceAll(help, p.missing, "")
 	help += "\n" + p.extraHelp
-	return processadapter.Result{Stdout: []byte(help)}, nil
+	return processadapter.Result{Outcome: processadapter.OutcomeExited, Stdout: []byte(help)}, nil
 }
 
 func TestPreflightRequiresExactDeclaredOption(t *testing.T) {

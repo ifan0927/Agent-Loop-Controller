@@ -79,9 +79,13 @@ func runStructured[T any](ctx context.Context, runner processadapter.Runner, com
 		ExcludedEnv:  controllerManagedExcludedEnvironment,
 	})
 	if err != nil {
-		return zero, err
+		return zero, fmt.Errorf("Codex %s process: %s", name, processadapter.SanitizeError(err))
 	}
-	if result.ExitCode != 0 {
+	result = processadapter.NormalizeResult(result, nil)
+	if !result.Valid() {
+		return zero, errors.New("Codex process returned invalid execution evidence")
+	}
+	if !result.Succeeded() {
 		return zero, fmt.Errorf("Codex %s exited with code %d", name, result.ExitCode)
 	}
 	stdout, err := openProcessStdout(result)

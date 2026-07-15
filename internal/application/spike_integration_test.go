@@ -26,13 +26,13 @@ func (fixtureCodexProcess) Run(_ context.Context, spec processadapter.Spec) (pro
 		return processadapter.Result{}, err
 	}
 	if len(spec.Args) == 1 && spec.Args[0] == "--version" {
-		return processadapter.Result{Stdout: []byte("codex-cli fixture\n")}, nil
+		return processadapter.Result{Outcome: processadapter.OutcomeExited, Stdout: []byte("codex-cli fixture\n")}, nil
 	}
 	if len(spec.Args) == 2 && spec.Args[0] == "exec" && spec.Args[1] == "--help" {
-		return processadapter.Result{Stdout: []byte("--model --ignore-user-config --sandbox --cd --json --output-schema --output-last-message --ephemeral")}, nil
+		return processadapter.Result{Outcome: processadapter.OutcomeExited, Stdout: []byte("--model --ignore-user-config --sandbox --cd --json --output-schema --output-last-message --ephemeral")}, nil
 	}
 	if len(spec.Args) == 3 && spec.Args[0] == "exec" && spec.Args[1] == "resume" && spec.Args[2] == "--help" {
-		return processadapter.Result{Stdout: []byte("Usage: codex exec resume [OPTIONS] [SESSION_ID]\n--model --ignore-user-config --config --json --output-schema --output-last-message")}, nil
+		return processadapter.Result{Outcome: processadapter.OutcomeExited, Stdout: []byte("Usage: codex exec resume [OPTIONS] [SESSION_ID]\n--model --ignore-user-config --config --json --output-schema --output-last-message")}, nil
 	}
 	output := argumentValue(spec.Args, "--output-last-message")
 	if argumentValue(spec.Args, "--sandbox") == "workspace-write" {
@@ -46,7 +46,7 @@ func (fixtureCodexProcess) Run(_ context.Context, spec processadapter.Spec) (pro
 		if err := os.WriteFile(output, []byte(message), 0o600); err != nil {
 			return processadapter.Result{}, err
 		}
-		return processadapter.Result{Stdout: []byte("{\"type\":\"thread.started\",\"thread_id\":\"fixture-implementation\"}\n{\"type\":\"future.telemetry\"}\n")}, nil
+		return processadapter.Result{Outcome: processadapter.OutcomeExited, Stdout: []byte("{\"type\":\"thread.started\",\"thread_id\":\"fixture-implementation\"}\n{\"type\":\"future.telemetry\"}\n")}, nil
 	}
 	head, err := (gitadapter.Workspace{}).Head(context.Background(), spec.WorkingDir)
 	if err != nil {
@@ -56,7 +56,7 @@ func (fixtureCodexProcess) Run(_ context.Context, spec processadapter.Spec) (pro
 	if err := os.WriteFile(output, []byte(message), 0o600); err != nil {
 		return processadapter.Result{}, err
 	}
-	return processadapter.Result{Stdout: []byte("{\"type\":\"thread.started\",\"thread_id\":\"fixture-review\"}\n")}, nil
+	return processadapter.Result{Outcome: processadapter.OutcomeExited, Stdout: []byte("{\"type\":\"thread.started\",\"thread_id\":\"fixture-review\"}\n")}, nil
 }
 
 func TestSpikeFixtureIntegration(t *testing.T) {

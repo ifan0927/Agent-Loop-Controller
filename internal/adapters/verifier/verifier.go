@@ -21,13 +21,15 @@ type HeadReader interface {
 }
 
 type CheckEvidence struct {
-	VerifierID string   `json:"verifier_id"`
-	Program    string   `json:"program"`
-	Args       []string `json:"args"`
-	ExitCode   int      `json:"exit_code"`
-	StdoutPath string   `json:"stdout_path"`
-	StderrPath string   `json:"stderr_path"`
-	RunError   string   `json:"run_error,omitempty"`
+	VerifierID      string                         `json:"verifier_id"`
+	Program         string                         `json:"program"`
+	Args            []string                       `json:"args"`
+	ProcessOutcome  processadapter.Outcome         `json:"process_outcome"`
+	FailureCategory processadapter.FailureCategory `json:"failure_category,omitempty"`
+	ExitCode        int                            `json:"exit_code"`
+	StdoutPath      string                         `json:"stdout_path"`
+	StderrPath      string                         `json:"stderr_path"`
+	RunError        string                         `json:"run_error,omitempty"`
 }
 
 type Evidence struct {
@@ -69,19 +71,37 @@ func (r Registry) Run(ctx context.Context, ids []string, workspace, artifacts, l
 			Program: command.Program, Args: command.Args, WorkingDir: workspace,
 			StdoutPath: stdoutPath, StderrPath: stderrPath,
 		})
+		result = processadapter.NormalizeResult(result, runErr)
+		if !result.Valid() {
+			result = processadapter.Result{Outcome: processadapter.OutcomeNotStarted, FailureCategory: processadapter.FailureInvalidResult, ExitCode: -1, StdoutPath: stdoutPath, StderrPath: stderrPath}
+			if runErr == nil {
+				runErr = processadapter.NewFailure(processadapter.FailureInvalidResult)
+			}
+		}
 		check := CheckEvidence{
 			VerifierID: id, Program: command.Program, Args: append([]string(nil), command.Args...),
+			ProcessOutcome: result.Outcome, FailureCategory: result.FailureCategory,
 			ExitCode: result.ExitCode, StdoutPath: stdoutPath, StderrPath: stderrPath,
 		}
 		if runErr != nil {
-			check.RunError = runErr.Error()
+			check.RunError = processadapter.SanitizeError(runErr)
+			if check.FailureCategory == processadapter.FailureNone {
+				check.FailureCategory = processadapter.FailureUnknown
+			}
 		}
 		evidence.Checks = append(evidence.Checks, check)
 		if runErr != nil {
 			if writeErr := writeEvidence(filepath.Join(artifacts, label+"-verification.json"), evidence); writeErr != nil {
-				return Evidence{}, fmt.Errorf("run verifier %s: %v; persist evidence: %w", id, runErr, writeErr)
+				return Evidence{}, fmt.Errorf("run verifier %s: %s; persist evidence: %w", id, check.RunError, writeErr)
 			}
-			return evidence, fmt.Errorf("run verifier %s: %w", id, runErr)
+			return evidence, fmt.Errorf("run verifier %s: %s", id, check.RunError)
+		}
+		if result.Outcome != processadapter.OutcomeExited {
+			reason := fmt.Errorf("verifier %s did not exit successfully", id)
+			if writeErr := writeEvidence(filepath.Join(artifacts, label+"-verification.json"), evidence); writeErr != nil {
+				return Evidence{}, fmt.Errorf("%v; persist evidence: %w", reason, writeErr)
+			}
+			return evidence, reason
 		}
 		if result.ExitCode != 0 {
 			reason := fmt.Errorf("verifier %s exited with code %d", id, result.ExitCode)

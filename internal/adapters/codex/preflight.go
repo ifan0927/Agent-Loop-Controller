@@ -3,6 +3,7 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -60,9 +61,13 @@ func (p Preflighter) Run(ctx context.Context, artifacts string) (PreflightEviden
 		ExcludedEnv: controllerManagedExcludedEnvironment,
 	})
 	if err != nil {
-		return PreflightEvidence{}, fmt.Errorf("codex version: %w", err)
+		return PreflightEvidence{}, fmt.Errorf("codex version: %s", processadapter.SanitizeError(err))
 	}
-	if version.ExitCode != 0 {
+	version = processadapter.NormalizeResult(version, nil)
+	if !version.Valid() {
+		return PreflightEvidence{}, fmt.Errorf("codex version returned invalid execution evidence")
+	}
+	if !version.Succeeded() {
 		return PreflightEvidence{}, fmt.Errorf("codex --version exited with code %d", version.ExitCode)
 	}
 	help, err := p.process.Run(ctx, processadapter.Spec{
@@ -72,9 +77,13 @@ func (p Preflighter) Run(ctx context.Context, artifacts string) (PreflightEviden
 		ExcludedEnv: controllerManagedExcludedEnvironment,
 	})
 	if err != nil {
-		return PreflightEvidence{}, fmt.Errorf("codex exec help: %w", err)
+		return PreflightEvidence{}, fmt.Errorf("codex exec help: %s", processadapter.SanitizeError(err))
 	}
-	if help.ExitCode != 0 {
+	help = processadapter.NormalizeResult(help, nil)
+	if !help.Valid() {
+		return PreflightEvidence{}, errors.New("codex exec help returned invalid execution evidence")
+	}
+	if !help.Succeeded() {
 		return PreflightEvidence{}, fmt.Errorf("codex exec --help exited with code %d", help.ExitCode)
 	}
 	helpOutput, err := boundedStdout(help, 1<<20)
@@ -95,9 +104,13 @@ func (p Preflighter) Run(ctx context.Context, artifacts string) (PreflightEviden
 		ExcludedEnv: controllerManagedExcludedEnvironment,
 	})
 	if err != nil {
-		return PreflightEvidence{}, fmt.Errorf("codex exec resume help: %w", err)
+		return PreflightEvidence{}, fmt.Errorf("codex exec resume help: %s", processadapter.SanitizeError(err))
 	}
-	if resumeHelp.ExitCode != 0 {
+	resumeHelp = processadapter.NormalizeResult(resumeHelp, nil)
+	if !resumeHelp.Valid() {
+		return PreflightEvidence{}, errors.New("codex exec resume help returned invalid execution evidence")
+	}
+	if !resumeHelp.Succeeded() {
 		return PreflightEvidence{}, fmt.Errorf("codex exec resume --help exited with code %d", resumeHelp.ExitCode)
 	}
 	resumeOutput, err := boundedStdout(resumeHelp, 1<<20)

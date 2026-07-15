@@ -997,7 +997,7 @@ func (c *LocalController) runVerification(ctx context.Context, run Run, phase st
 		if stdoutErr != nil || stderrErr != nil {
 			return evidence, errors.Join(runErr, stdoutErr, stderrErr)
 		}
-		if err := c.store.SaveVerification(ctx, VerificationRecord{RunID: run.ID, VerifierID: check.VerifierID, Phase: phase, VerifiedHead: evidence.VerifiedHeadSHA, ExitCode: check.ExitCode, StdoutPath: check.StdoutPath, StderrPath: check.StderrPath, StdoutHash: stdoutHash, StderrHash: stderrHash, StdoutSize: stdoutSize, StderrSize: stderrSize, EvidencePath: path, EvidenceHash: hash}); err != nil {
+		if err := c.store.SaveVerification(ctx, VerificationRecord{RunID: run.ID, VerifierID: check.VerifierID, Phase: phase, VerifiedHead: evidence.VerifiedHeadSHA, ProcessOutcome: string(check.ProcessOutcome), FailureCategory: string(check.FailureCategory), ExitCode: check.ExitCode, StdoutPath: check.StdoutPath, StderrPath: check.StderrPath, StdoutHash: stdoutHash, StderrHash: stderrHash, StdoutSize: stdoutSize, StderrSize: stderrSize, EvidencePath: path, EvidenceHash: hash}); err != nil {
 			return evidence, errors.Join(runErr, err)
 		}
 	}
@@ -1853,31 +1853,31 @@ func successfulVerificationBatch(records []VerificationRecord, head string, ids 
 		}
 		groups[record.EvidencePath] = append(groups[record.EvidencePath], record)
 	}
-	var selected []VerificationRecord
-	for _, path := range order {
-		group := groups[path]
-		success := true
-		for _, record := range group {
-			if record.ExitCode != 0 {
-				success = false
-			}
-		}
-		for _, id := range ids {
-			found := false
-			for _, record := range group {
-				if record.VerifierID == id && record.ExitCode == 0 {
-					found = true
-				}
-			}
-			if !found {
-				success = false
-			}
-		}
-		if success {
-			selected = group
+	if len(order) == 0 {
+		return nil, false
+	}
+	// A newer failed batch is authoritative evidence that the candidate has not
+	// passed. Reusing an older successful batch after a start failure would make
+	// a verifier outage look like an exact-head success.
+	latest := groups[order[len(order)-1]]
+	for _, record := range latest {
+		if record.ProcessOutcome != VerificationOutcomeExited || record.FailureCategory != VerificationFailureNone || record.ExitCode != 0 {
+			return nil, false
 		}
 	}
-	return selected, len(selected) > 0
+	for _, id := range ids {
+		found := false
+		for _, record := range latest {
+			if record.VerifierID == id && record.ProcessOutcome == VerificationOutcomeExited && record.FailureCategory == VerificationFailureNone && record.ExitCode == 0 {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, false
+		}
+	}
+	return latest, true
 }
 
 func successfulVerificationBatchAfter(records []VerificationRecord, head string, ids []string, notBefore time.Time) ([]VerificationRecord, bool) {
@@ -1900,6 +1900,9 @@ func validateVerificationBatch(records []VerificationRecord, head string) error 
 	for _, record := range records {
 		if record.Phase != "candidate" || record.VerifiedHead != head || record.EvidencePath != evidencePath {
 			return errors.New("verification batch identity mismatch")
+		}
+		if record.ProcessOutcome != VerificationOutcomeExited || record.FailureCategory != VerificationFailureNone {
+			return errors.New("verification process did not exit successfully")
 		}
 		hash, err := fileHash(record.EvidencePath)
 		if err != nil {

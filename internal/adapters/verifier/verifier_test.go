@@ -2,8 +2,10 @@ package verifier
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	processadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/process"
@@ -25,13 +27,25 @@ func (f *fakeHead) Head(context.Context, string) (string, error) {
 type successfulProcess struct{}
 
 func (successfulProcess) Run(context.Context, processadapter.Spec) (processadapter.Result, error) {
-	return processadapter.Result{}, nil
+	return processadapter.Result{Outcome: processadapter.OutcomeExited}, nil
 }
 
 type failingProcess struct{}
 
 func (failingProcess) Run(context.Context, processadapter.Spec) (processadapter.Result, error) {
-	return processadapter.Result{ExitCode: 7}, nil
+	return processadapter.Result{Outcome: processadapter.OutcomeExited, ExitCode: 7}, nil
+}
+
+type startFailingProcess struct{}
+
+func (startFailingProcess) Run(_ context.Context, spec processadapter.Spec) (processadapter.Result, error) {
+	if err := os.WriteFile(spec.StdoutPath, nil, 0o600); err != nil {
+		return processadapter.Result{}, err
+	}
+	if err := os.WriteFile(spec.StderrPath, nil, 0o600); err != nil {
+		return processadapter.Result{}, err
+	}
+	return processadapter.Result{Outcome: processadapter.OutcomeNotStarted, FailureCategory: processadapter.FailureStart, ExitCode: -1}, errors.Join(processadapter.NewFailure(processadapter.FailureStart), errors.New("Authorization: Bearer secret-from-child"))
 }
 
 func TestRegistryReturnsFailedCheckEvidence(t *testing.T) {
@@ -46,6 +60,30 @@ func TestRegistryReturnsFailedCheckEvidence(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(artifacts, "candidate-verification.json")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRegistryPersistsSanitizedStartFailureEvidence(t *testing.T) {
+	artifacts := t.TempDir()
+	registry := NewRegistry(map[string]Command{"missing": {Program: "missing-verifier", Args: []string{"--fixture"}}}, startFailingProcess{}, &fakeHead{heads: []string{"abc"}})
+	evidence, err := registry.Run(context.Background(), []string{"missing"}, t.TempDir(), artifacts, "candidate")
+	if err == nil || !strings.Contains(err.Error(), "process_start") {
+		t.Fatalf("err=%v", err)
+	}
+	if len(evidence.Checks) != 1 {
+		t.Fatalf("evidence=%+v", evidence)
+	}
+	check := evidence.Checks[0]
+	if check.ProcessOutcome != processadapter.OutcomeNotStarted || check.FailureCategory != processadapter.FailureStart || check.ExitCode == 0 {
+		t.Fatalf("check=%+v", check)
+	}
+	data, readErr := os.ReadFile(filepath.Join(artifacts, "candidate-verification.json"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	contents := string(data)
+	if strings.Contains(contents, "Authorization") || strings.Contains(contents, "Bearer") || strings.Contains(contents, "secret-from-child") {
+		t.Fatalf("unsanitized process error in evidence: %s", contents)
 	}
 }
 

@@ -98,8 +98,12 @@ func (p Publisher) Push(ctx context.Context, workspace, branch, candidate, expec
 	if err != nil {
 		return PushEvidence{}, err
 	}
+	result = processadapter.NormalizeResult(result, nil)
+	if !result.Valid() {
+		return PushEvidence{}, errors.New("git push returned invalid process evidence")
+	}
 	evidence := PushEvidence{RemoteRef: "refs/heads/" + branch, SHA: candidate, ExitCode: result.ExitCode, Stdout: result.StdoutPath, Stderr: result.StderrPath}
-	if result.ExitCode != 0 {
+	if !result.Succeeded() {
 		return evidence, fmt.Errorf("git push exited with code %d", result.ExitCode)
 	}
 	remote, err := p.RemoteSHA(ctx, workspace, branch)

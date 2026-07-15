@@ -83,23 +83,33 @@ type Attempt struct {
 }
 
 type VerificationRecord struct {
-	ID           int64     `json:"verification_id"`
-	RunID        string    `json:"run_id"`
-	AttemptID    int64     `json:"attempt_id,omitempty"`
-	VerifierID   string    `json:"verifier_id"`
-	Phase        string    `json:"phase"`
-	VerifiedHead string    `json:"verified_head"`
-	ExitCode     int       `json:"exit_code"`
-	StdoutPath   string    `json:"stdout_path"`
-	StderrPath   string    `json:"stderr_path"`
-	StdoutHash   string    `json:"stdout_hash"`
-	StderrHash   string    `json:"stderr_hash"`
-	StdoutSize   int64     `json:"stdout_size"`
-	StderrSize   int64     `json:"stderr_size"`
-	EvidencePath string    `json:"evidence_path"`
-	EvidenceHash string    `json:"evidence_hash"`
-	CreatedAt    time.Time `json:"timestamp"`
+	ID              int64     `json:"verification_id"`
+	RunID           string    `json:"run_id"`
+	AttemptID       int64     `json:"attempt_id,omitempty"`
+	VerifierID      string    `json:"verifier_id"`
+	Phase           string    `json:"phase"`
+	VerifiedHead    string    `json:"verified_head"`
+	ProcessOutcome  string    `json:"process_outcome"`
+	FailureCategory string    `json:"failure_category,omitempty"`
+	ExitCode        int       `json:"exit_code"`
+	StdoutPath      string    `json:"stdout_path"`
+	StderrPath      string    `json:"stderr_path"`
+	StdoutHash      string    `json:"stdout_hash"`
+	StderrHash      string    `json:"stderr_hash"`
+	StdoutSize      int64     `json:"stdout_size"`
+	StderrSize      int64     `json:"stderr_size"`
+	EvidencePath    string    `json:"evidence_path"`
+	EvidenceHash    string    `json:"evidence_hash"`
+	CreatedAt       time.Time `json:"timestamp"`
 }
+
+const (
+	VerificationOutcomeNotStarted  = "not_started"
+	VerificationOutcomeExited      = "exited"
+	VerificationOutcomeInterrupted = "interrupted"
+	VerificationOutcomeLegacy      = "legacy"
+	VerificationFailureNone        = ""
+)
 
 type ReviewRecord struct {
 	ID           int64     `json:"review_id"`

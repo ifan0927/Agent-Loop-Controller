@@ -31,7 +31,7 @@ func TestRunnerToleratesUnknownJSONLEvents(t *testing.T) {
 	artifacts, spec := runnerFixture(t)
 	telemetry := "{\"type\":\"future.event\",\"new_field\":true}\n{\"type\":\"thread.started\",\"thread_id\":\"thread-123\"}\n"
 	runner := NewRunner(fakeProcess{
-		result:      processadapter.Result{ExitCode: 0, Stdout: []byte(telemetry)},
+		result:      processadapter.Result{Outcome: processadapter.OutcomeExited, ExitCode: 0, Stdout: []byte(telemetry)},
 		lastMessage: validAgentOutcome,
 	})
 	result, err := runner.Implementation(context.Background(), spec, artifacts)
@@ -56,7 +56,7 @@ func TestRunnerToleratesUnknownJSONLEvents(t *testing.T) {
 func TestRunnerRejectsMissingSessionID(t *testing.T) {
 	artifacts, spec := runnerFixture(t)
 	runner := NewRunner(fakeProcess{
-		result:      processadapter.Result{Stdout: []byte("{\"type\":\"turn.completed\"}\n")},
+		result:      processadapter.Result{Outcome: processadapter.OutcomeExited, Stdout: []byte("{\"type\":\"turn.completed\"}\n")},
 		lastMessage: validAgentOutcome,
 	})
 	if _, err := runner.Implementation(context.Background(), spec, artifacts); err == nil || !strings.Contains(err.Error(), "missing explicit session ID") {
@@ -66,7 +66,7 @@ func TestRunnerRejectsMissingSessionID(t *testing.T) {
 
 func TestRunnerRejectsNonZeroExit(t *testing.T) {
 	artifacts, spec := runnerFixture(t)
-	runner := NewRunner(fakeProcess{result: processadapter.Result{ExitCode: 9}})
+	runner := NewRunner(fakeProcess{result: processadapter.Result{Outcome: processadapter.OutcomeExited, ExitCode: 9}})
 	if _, err := runner.Implementation(context.Background(), spec, artifacts); err == nil || !strings.Contains(err.Error(), "code 9") {
 		t.Fatalf("error = %v", err)
 	}
@@ -75,7 +75,7 @@ func TestRunnerRejectsNonZeroExit(t *testing.T) {
 func TestRunnerRejectsMalformedLastMessage(t *testing.T) {
 	artifacts, spec := runnerFixture(t)
 	runner := NewRunner(fakeProcess{
-		result: processadapter.Result{Stdout: []byte(startedEvent)}, lastMessage: "not-json",
+		result: processadapter.Result{Outcome: processadapter.OutcomeExited, Stdout: []byte(startedEvent)}, lastMessage: "not-json",
 	})
 	if _, err := runner.Implementation(context.Background(), spec, artifacts); err == nil {
 		t.Fatal("malformed last message must be rejected")
@@ -85,7 +85,7 @@ func TestRunnerRejectsMalformedLastMessage(t *testing.T) {
 func TestRunnerRejectsSemanticallyInvalidOutcome(t *testing.T) {
 	artifacts, spec := runnerFixture(t)
 	runner := NewRunner(fakeProcess{
-		result:      processadapter.Result{Stdout: []byte(startedEvent)},
+		result:      processadapter.Result{Outcome: processadapter.OutcomeExited, Stdout: []byte(startedEvent)},
 		lastMessage: `{"status":"completed","summary":"","decision_request":null,"discovered_issues":[],"suggested_checks":[],"implementation_sha":null}`,
 	})
 	if _, err := runner.Implementation(context.Background(), spec, artifacts); err == nil || !strings.Contains(err.Error(), "semantic") {

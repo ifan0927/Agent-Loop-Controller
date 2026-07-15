@@ -266,14 +266,19 @@ the decision value, file digest, and the exact implementation-outcome path/hash
 that contained the offered options. Restart resume revalidates all bindings and
 rejects a changed file or a choice absent from the original request.
 
-Verifier adapters return partial evidence together with execution errors. The
-controller hashes and persists every check that actually ran, including failed
-exit codes, before returning the failure to the state machine. Failed verifier
-artifacts therefore remain reachable through SQLite status and inspection.
+Verifier adapters return partial evidence together with execution errors. Each
+check records a typed process outcome (`not_started`, `exited`, or
+`interrupted`) and a controller-owned failure category. A process that never
+started or was interrupted always has a non-success exit representation; exit
+code zero is valid only for a process that started and exited successfully.
+The controller hashes and persists every check that actually ran, including
+failed exit codes and start-failure evidence, before returning the failure to
+the state machine. Failed verifier artifacts therefore remain reachable
+through SQLite status and inspection without retaining raw process errors.
 Authorization groups records by their unique verification evidence path and
-selects the latest complete successful batch for the candidate HEAD; older
-failed batches remain auditable without permanently blocking a successful
-restart retry.
+considers only the newest candidate batch. An older successful batch cannot
+authorize the candidate after a newer failed, not-started, or interrupted
+batch; a later complete successful retry may authorize it again.
 
 Schema version 3 retains multiple review records for one candidate HEAD. A
 transient `failed` verdict may use a new isolated review attempt, while a

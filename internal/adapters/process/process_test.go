@@ -53,7 +53,7 @@ func TestOSRunnerKeepsProductionOutputOnlyInArtifactFiles(t *testing.T) {
 		Program: os.Args[0], Args: []string{"-test.run=TestProcessHelper", "--", "exit"},
 		StdoutPath: stdoutPath, StderrPath: filepath.Join(directory, "stderr"),
 	})
-	if err != nil {
+	if err != nil || result.Outcome != OutcomeExited || !result.Succeeded() {
 		t.Fatal(err)
 	}
 	if len(result.Stdout) != 0 || result.StdoutPath != stdoutPath {
@@ -73,15 +73,48 @@ func TestOSRunnerCancelsProcessGroupWithBoundedTermination(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	_, err := (OSRunner{InterruptGrace: 50 * time.Millisecond}).Run(ctx, Spec{
+	result, err := (OSRunner{InterruptGrace: 50 * time.Millisecond}).Run(ctx, Spec{
 		Program: os.Args[0], Args: []string{"-test.run=TestProcessHelper", "--", "ignore-interrupt"},
 		StdoutPath: filepath.Join(directory, "stdout"), StderrPath: filepath.Join(directory, "stderr"),
 	})
 	if err == nil {
 		t.Fatal("cancelled process must return an error")
 	}
+	if result.Outcome != OutcomeInterrupted || result.ExitCode == 0 || result.FailureCategory != FailureInterrupted {
+		t.Fatalf("interrupted result=%+v", result)
+	}
 	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("bounded termination took %s", elapsed)
+	}
+}
+
+func TestOSRunnerRecordsMissingExecutableAsNotStarted(t *testing.T) {
+	directory := t.TempDir()
+	result, err := (OSRunner{}).Run(context.Background(), Spec{
+		Program:    "definitely-missing-verifier",
+		StdoutPath: filepath.Join(directory, "stdout"), StderrPath: filepath.Join(directory, "stderr"),
+	})
+	if err == nil {
+		t.Fatal("missing executable must fail")
+	}
+	if result.Outcome != OutcomeNotStarted || result.FailureCategory != FailureStart || result.ExitCode == 0 {
+		t.Fatalf("start failure result=%+v", result)
+	}
+	if got := SanitizeError(err); got != "managed process failure: process_start" {
+		t.Fatalf("sanitized error=%q", got)
+	}
+	for _, path := range []string{result.StdoutPath, result.StderrPath} {
+		data, readErr := os.ReadFile(path)
+		if readErr != nil || len(data) != 0 {
+			t.Fatalf("capture path=%q data=%q err=%v", path, data, readErr)
+		}
+	}
+}
+
+func TestResultCannotTreatNotStartedZeroAsSuccess(t *testing.T) {
+	result := Result{Outcome: OutcomeNotStarted, FailureCategory: FailureStart, ExitCode: 0}
+	if NormalizeResult(result, NewFailure(FailureStart)).Succeeded() {
+		t.Fatal("not-started process must never be successful")
 	}
 }
 

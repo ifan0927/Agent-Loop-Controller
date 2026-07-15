@@ -221,7 +221,7 @@ func (p *durableFakeProcess) Run(ctx context.Context, s processadapter.Spec) (pr
 			return processadapter.Result{}, err
 		}
 	}
-	return processadapter.Result{ExitCode: 0, StdoutPath: s.StdoutPath, StderrPath: s.StderrPath}, nil
+	return processadapter.Result{Outcome: processadapter.OutcomeExited, ExitCode: 0, StdoutPath: s.StdoutPath, StderrPath: s.StderrPath}, nil
 }
 
 const completedOutcome = `{"status":"completed","summary":"implemented","decision_request":null,"discovered_issues":[],"suggested_checks":[],"implementation_sha":null}`
@@ -342,7 +342,7 @@ func (exitVerifierProcess) Run(_ context.Context, s processadapter.Spec) (proces
 	if err := exclusiveWrite(s.StderrPath, "failure detail\n"); err != nil {
 		return processadapter.Result{}, err
 	}
-	return processadapter.Result{ExitCode: 7, StdoutPath: s.StdoutPath, StderrPath: s.StderrPath}, nil
+	return processadapter.Result{Outcome: processadapter.OutcomeExited, ExitCode: 7, StdoutPath: s.StdoutPath, StderrPath: s.StderrPath}, nil
 }
 
 func TestFailedVerifierEvidenceIsDurableAndInspectable(t *testing.T) {
@@ -371,11 +371,50 @@ func TestFailedVerifierEvidenceIsDurableAndInspectable(t *testing.T) {
 		t.Fatalf("verifications=%+v", inspection.Verifications)
 	}
 	record := inspection.Verifications[0]
-	if record.ExitCode != 7 || record.StdoutHash == "" || record.StderrHash == "" || record.EvidencePath == "" {
+	if record.ProcessOutcome != application.VerificationOutcomeExited || record.FailureCategory != application.VerificationFailureNone || record.ExitCode != 7 || record.StdoutHash == "" || record.StderrHash == "" || record.EvidencePath == "" {
 		t.Fatalf("record=%+v", record)
 	}
 	if _, statErr := os.Stat(record.EvidencePath); statErr != nil {
 		t.Fatal(statErr)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	restarted, err := store.Inspect(context.Background(), run.ID)
+	if err != nil || len(restarted.Verifications) != 1 || restarted.Verifications[0].ProcessOutcome != application.VerificationOutcomeExited {
+		t.Fatalf("restarted verification=%+v err=%v", restarted.Verifications, err)
+	}
+}
+
+func TestMissingVerifierExecutablePersistsNotStartedEvidence(t *testing.T) {
+	lab := newLocalLab(t)
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	workspace := gitadapter.Workspace{}
+	registry := verifier.NewRegistry(map[string]verifier.Command{"fixture-go-test": {Program: "definitely-missing-verifier", Args: []string{"--fixture"}}}, processadapter.OSRunner{}, workspace)
+	controller := application.NewLocalController(store, testWorktrees{}, codex.NewExecutor(&durableFakeProcess{}, "codex"), registry, workspace, "codex", lab.worktrees)
+	run, err := controller.Start(context.Background(), startInput(lab))
+	if err == nil || run.State != domain.StateVerifying {
+		t.Fatalf("run=%+v err=%v", run, err)
+	}
+	inspection, inspectErr := store.Inspect(context.Background(), run.ID)
+	if inspectErr != nil || len(inspection.Verifications) != 1 {
+		t.Fatalf("run=%+v verifications=%+v err=%v", run, inspection.Verifications, inspectErr)
+	}
+	record := inspection.Verifications[0]
+	if record.ProcessOutcome != application.VerificationOutcomeNotStarted || record.FailureCategory != "process_start" || record.ExitCode == 0 {
+		t.Fatalf("start failure record=%+v", record)
+	}
+	if strings.Contains(run.LastError, "definitely-missing-verifier") || strings.Contains(run.LastError, "--fixture") {
+		t.Fatalf("raw process details leaked in run error: %q", run.LastError)
 	}
 }
 
@@ -396,7 +435,7 @@ func (p *failSecondVerifierProcess) Run(ctx context.Context, s processadapter.Sp
 		if err := exclusiveWrite(s.StderrPath, "retryable\n"); err != nil {
 			return processadapter.Result{}, err
 		}
-		return processadapter.Result{ExitCode: 7, StdoutPath: s.StdoutPath, StderrPath: s.StderrPath}, nil
+		return processadapter.Result{Outcome: processadapter.OutcomeExited, ExitCode: 7, StdoutPath: s.StdoutPath, StderrPath: s.StderrPath}, nil
 	}
 	return (processadapter.OSRunner{}).Run(ctx, s)
 }

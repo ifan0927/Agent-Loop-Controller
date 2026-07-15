@@ -436,12 +436,14 @@ type AttemptResult struct {
 	ArtifactRecorded bool      `json:"artifact_recorded"`
 }
 type VerificationResult struct {
-	VerifierID   string    `json:"verifier_id"`
-	Phase        string    `json:"phase"`
-	VerifiedHead string    `json:"verified_head"`
-	ExitCode     int       `json:"exit_code"`
-	EvidenceHash string    `json:"evidence_hash"`
-	CreatedAt    time.Time `json:"timestamp"`
+	VerifierID      string    `json:"verifier_id"`
+	Phase           string    `json:"phase"`
+	VerifiedHead    string    `json:"verified_head"`
+	ProcessOutcome  string    `json:"process_outcome"`
+	FailureCategory string    `json:"failure_category,omitempty"`
+	ExitCode        int       `json:"exit_code"`
+	EvidenceHash    string    `json:"evidence_hash"`
+	CreatedAt       time.Time `json:"timestamp"`
 }
 type ReviewResult struct {
 	ReviewedHead string    `json:"reviewed_head"`
@@ -601,7 +603,15 @@ func projectInspection(value RunInspection) InspectionResult {
 		result.Attempts = append(result.Attempts, AttemptResult{v.Number, v.Kind, v.Status, v.RequestedModel, v.ErrorCategory, v.StartedAt, v.FinishedAt, v.ExitCode, v.OutcomeHash, v.SessionID != "", v.ArtifactDir != ""})
 	}
 	for _, v := range value.Verifications {
-		result.Verifications = append(result.Verifications, VerificationResult{v.VerifierID, v.Phase, v.VerifiedHead, v.ExitCode, v.EvidenceHash, v.CreatedAt})
+		outcome := v.ProcessOutcome
+		if outcome != VerificationOutcomeNotStarted && outcome != VerificationOutcomeExited && outcome != VerificationOutcomeInterrupted && outcome != VerificationOutcomeLegacy {
+			outcome = "unknown"
+		}
+		category := v.FailureCategory
+		if category != "" && category != "artifact_setup" && category != "not_started" && category != "process_start" && category != "process_interrupted" && category != "process_wait" && category != "invalid_result" && category != "unknown" && category != "legacy_evidence" {
+			category = "unknown"
+		}
+		result.Verifications = append(result.Verifications, VerificationResult{VerifierID: v.VerifierID, Phase: v.Phase, VerifiedHead: v.VerifiedHead, ProcessOutcome: outcome, FailureCategory: category, ExitCode: v.ExitCode, EvidenceHash: v.EvidenceHash, CreatedAt: v.CreatedAt})
 	}
 	for _, v := range value.Reviews {
 		result.Reviews = append(result.Reviews, ReviewResult{v.ReviewedHead, v.Verdict, v.OutcomeHash, v.CreatedAt})
