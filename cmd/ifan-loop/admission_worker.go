@@ -9,9 +9,10 @@ import (
 )
 
 type admissionWorkerResult struct {
-	Cycles      int
-	LastOutcome string
-	Stopped     string
+	Cycles        int
+	LastOutcome   string
+	QueueDecision *application.LinearTodoQueueDecision
+	Stopped       string
 }
 
 type admissionWorkerDispatch func(context.Context) (application.LinearTodoDispatchResult, error)
@@ -48,6 +49,7 @@ func runAdmissionWorkerAt(ctx context.Context, once bool, poll time.Duration, di
 			return result, err
 		}
 		result.LastOutcome = cycle.Outcome
+		result.QueueDecision = cycle.QueueDecision
 		if once {
 			result.Stopped = "once"
 			return result, nil

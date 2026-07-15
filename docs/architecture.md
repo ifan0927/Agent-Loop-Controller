@@ -55,6 +55,14 @@ same immutable source resumes the same run. A material source, branch, or
 repository change sends the active run to `manual_intervention` for a human
 decision rather than creating another active run or rewriting its snapshot.
 
+Automatic admission is priority-only: explicit priorities rank `1` through `4`,
+in that order, and unprioritized `0` ranks below all explicit priorities. A
+non-terminal run prevents a new scan and cannot be preempted. If authoritative
+candidate reads produce more than one best priority, the dispatcher records
+sanitized operator attention and performs no reservation or Linear mutation;
+the operator must resolve the tie before a later poll. Stable ordering is
+limited to evidence/display and is never a selection fallback.
+
 ### Repository registry
 
 Registry version 1 selects one repository by case-insensitive canonical

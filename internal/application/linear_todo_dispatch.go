@@ -22,6 +22,60 @@ const (
 	LinearTodoDispatchRetryScheduled = "retry_scheduled"
 )
 
+const (
+	LinearTodoQueueDecisionNoCandidate        = "no_candidate"
+	LinearTodoQueueDecisionActiveRun          = "active_run"
+	LinearTodoQueueDecisionIncompleteScan     = "incomplete_scan"
+	LinearTodoQueueDecisionPriorityTie        = "priority_tie"
+	LinearTodoQueueDecisionSelectedPriority   = "selected_priority"
+	LinearTodoQueueDecisionSchedulerAttention = "scheduler_attention"
+	LinearTodoQueueDecisionRetryAttention     = "retry_attention"
+	LinearTodoQueueTieReasonTopPriority       = "top_priority_tie"
+)
+
+// LinearTodoQueueDecision is sanitized, bounded evidence for one admission
+// cycle. It never carries issue prose, credentials, or an automatic tie
+// breaker. CandidateCount is the number returned by the bounded candidate
+// scan, before authoritative per-issue filtering.
+type LinearTodoQueueDecision struct {
+	Reason                   string `json:"reason"`
+	CandidateCount           int    `json:"candidate_count"`
+	SelectedPriority         *int   `json:"selected_priority,omitempty"`
+	TieReason                string `json:"tie_reason,omitempty"`
+	ExistingRunPreventedScan bool   `json:"existing_run_prevented_scan"`
+}
+
+func (d LinearTodoQueueDecision) Validate() error {
+	if d.CandidateCount < 0 {
+		return errors.New("queue decision candidate count is invalid")
+	}
+	switch d.Reason {
+	case LinearTodoQueueDecisionNoCandidate, LinearTodoQueueDecisionActiveRun,
+		LinearTodoQueueDecisionIncompleteScan, LinearTodoQueueDecisionPriorityTie,
+		LinearTodoQueueDecisionSelectedPriority, LinearTodoQueueDecisionSchedulerAttention,
+		LinearTodoQueueDecisionRetryAttention:
+	default:
+		return errors.New("queue decision reason is invalid")
+	}
+	if d.SelectedPriority != nil && (*d.SelectedPriority < 0 || *d.SelectedPriority > 4) {
+		return errors.New("queue decision selected priority is invalid")
+	}
+	if d.Reason == LinearTodoQueueDecisionSelectedPriority && d.SelectedPriority == nil {
+		return errors.New("selected priority queue decision is missing priority")
+	}
+	if d.Reason != LinearTodoQueueDecisionSelectedPriority && d.SelectedPriority != nil {
+		return errors.New("queue decision selected priority is unexpected")
+	}
+	if d.Reason == LinearTodoQueueDecisionPriorityTie {
+		if d.TieReason != LinearTodoQueueTieReasonTopPriority {
+			return errors.New("priority tie queue decision reason is invalid")
+		}
+	} else if d.TieReason != "" {
+		return errors.New("queue decision tie reason is unexpected")
+	}
+	return nil
+}
+
 // LinearTodoDispatchDriver is deliberately the existing exact-run driver
 // boundary. A dispatch cycle cannot choose a different run through this port.
 type LinearTodoDispatchDriver interface {
@@ -51,11 +105,25 @@ type LinearTodoDispatchPolicy struct {
 // LinearTodoDispatchResult contains sanitized control-flow evidence. The
 // selected task snapshot and Linear prose are deliberately not projected.
 type LinearTodoDispatchResult struct {
-	Outcome    string                 `json:"outcome"`
-	Run        RunResult              `json:"run,omitempty"`
-	ScanDigest string                 `json:"scan_digest,omitempty"`
-	Drive      *ProductionDriveResult `json:"drive,omitempty"`
-	Retry      *RetrySchedule         `json:"retry,omitempty"`
+	Outcome       string                   `json:"outcome"`
+	Run           RunResult                `json:"run,omitempty"`
+	ScanDigest    string                   `json:"scan_digest,omitempty"`
+	Drive         *ProductionDriveResult   `json:"drive,omitempty"`
+	Retry         *RetrySchedule           `json:"retry,omitempty"`
+	QueueDecision *LinearTodoQueueDecision `json:"queue_decision,omitempty"`
+}
+
+func queueDecision(reason string, candidateCount int, selectedPriority *int, tieReason string, existingRunPreventedScan bool) LinearTodoQueueDecision {
+	return LinearTodoQueueDecision{Reason: reason, CandidateCount: candidateCount, SelectedPriority: selectedPriority, TieReason: tieReason, ExistingRunPreventedScan: existingRunPreventedScan}
+}
+
+func selectedPriorityQueueDecision(candidateCount, priority int) LinearTodoQueueDecision {
+	return queueDecision(LinearTodoQueueDecisionSelectedPriority, candidateCount, &priority, "", false)
+}
+
+func withQueueDecision(result LinearTodoDispatchResult, decision LinearTodoQueueDecision) LinearTodoDispatchResult {
+	result.QueueDecision = &decision
+	return result
 }
 
 // LinearTodoDispatcher advances at most one persisted run. It is intentionally
@@ -116,7 +184,8 @@ func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatch
 		return LinearTodoDispatchResult{}, classifyServiceError(err)
 	}
 	if !acquired {
-		return d.schedulerAttention(ctx, d.policy.AttentionProfile, "lease_conflict", dispatchEvidence("lease_conflict"))
+		result, attentionErr := d.schedulerAttention(ctx, d.policy.AttentionProfile, "lease_conflict", dispatchEvidence("lease_conflict"))
+		return withQueueDecision(result, queueDecision(LinearTodoQueueDecisionSchedulerAttention, 0, nil, "", false)), attentionErr
 	}
 	defer func() {
 		_, _ = d.store.ReleaseLinearTodoAdmissionLease(context.Background(), lease)
@@ -126,7 +195,7 @@ func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatch
 		return LinearTodoDispatchResult{}, err
 	}
 	if handled {
-		return blocking, nil
+		return withQueueDecision(blocking, queueDecision(LinearTodoQueueDecisionActiveRun, 0, nil, "", true)), nil
 	}
 
 	runs, err := d.store.ListNonterminalRuns(ctx)
@@ -134,7 +203,8 @@ func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatch
 		return LinearTodoDispatchResult{}, classifyServiceError(err)
 	}
 	if len(runs) > 1 {
-		return d.runsAttention(ctx, runs, "admission_authority_conflict", dispatchEvidence("multiple_nonterminal_runs"))
+		result, attentionErr := d.runsAttention(ctx, runs, "admission_authority_conflict", dispatchEvidence("multiple_nonterminal_runs"))
+		return withQueueDecision(result, queueDecision(LinearTodoQueueDecisionActiveRun, 0, nil, "", true)), attentionErr
 	}
 	if len(runs) == 1 {
 		run := runs[0]
@@ -145,10 +215,11 @@ func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatch
 		}
 		if scheduleFound {
 			if schedule.Status == RetryScheduleAttention {
-				return d.retryAttention(ctx, run, schedule)
+				result, attentionErr := d.retryAttention(ctx, run, schedule)
+				return withQueueDecision(result, queueDecision(LinearTodoQueueDecisionActiveRun, 0, nil, "", true)), attentionErr
 			}
 			if d.clock().Before(schedule.NextEligibleAt) {
-				return retryWaitResult(run, schedule), nil
+				return withQueueDecision(retryWaitResult(run, schedule), queueDecision(LinearTodoQueueDecisionActiveRun, 0, nil, "", true)), nil
 			}
 		}
 		result, resumeErr := d.resume(ctx, &lease, run)
@@ -158,45 +229,51 @@ func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatch
 				return LinearTodoDispatchResult{}, failureRunErr
 			}
 			if scheduleFound && (failureRun.State != run.State || AutomaticRetryPhaseForRun(failureRun) != phase) {
-				return d.markRetryAttention(ctx, failureRun, schedule, RetryFailureAuthority, RetryReasonAuthority)
+				attention, attentionErr := d.markRetryAttention(ctx, failureRun, schedule, RetryFailureAuthority, RetryReasonAuthority)
+				return withQueueDecision(attention, queueDecision(LinearTodoQueueDecisionActiveRun, 0, nil, "", true)), attentionErr
 			}
-			return d.handleRunFailure(ctx, failureRun, AutomaticRetryPhaseForRun(failureRun), schedule, scheduleFound, resumeErr)
+			retryResult, retryErr := d.handleRunFailure(ctx, failureRun, AutomaticRetryPhaseForRun(failureRun), schedule, scheduleFound, resumeErr)
+			return withQueueDecision(retryResult, queueDecision(LinearTodoQueueDecisionActiveRun, 0, nil, "", true)), retryErr
 		}
 		if result.Outcome == LinearTodoDispatchDriven && scheduleFound {
 			if cleared, clearErr := d.store.ClearRetrySchedule(ctx, run.ID, phase, schedule.AttemptCount); clearErr != nil {
 				return LinearTodoDispatchResult{}, classifyServiceError(clearErr)
 			} else if !cleared {
-				return d.handleRunFailure(ctx, run, phase, schedule, scheduleFound, formatRetryScheduleConflict(run.ID, phase))
+				retryResult, retryErr := d.handleRunFailure(ctx, run, phase, schedule, scheduleFound, formatRetryScheduleConflict(run.ID, phase))
+				return withQueueDecision(retryResult, queueDecision(LinearTodoQueueDecisionActiveRun, 0, nil, "", true)), retryErr
 			}
 		}
-		return result, nil
+		return withQueueDecision(result, queueDecision(LinearTodoQueueDecisionActiveRun, 0, nil, "", true)), nil
 	}
 	if orphan, handled, orphanErr := d.orphanRetryAttention(ctx); orphanErr != nil {
 		return LinearTodoDispatchResult{}, orphanErr
 	} else if handled {
-		return orphan, nil
+		return withQueueDecision(orphan, queueDecision(LinearTodoQueueDecisionRetryAttention, 0, nil, "", false)), nil
 	}
 
 	if !d.renewLease(ctx, &lease) {
-		return d.schedulerAttention(ctx, d.policy.AttentionProfile, "lease_lost", dispatchEvidence("lease_lost_before_scan"))
+		result, attentionErr := d.schedulerAttention(ctx, d.policy.AttentionProfile, "lease_lost", dispatchEvidence("lease_lost_before_scan"))
+		return withQueueDecision(result, queueDecision(LinearTodoQueueDecisionSchedulerAttention, 0, nil, "", false)), attentionErr
 	}
 	scan, _, err := d.scanner.ListTodoCandidates(ctx, d.policy.CandidateAuthority)
 	if err != nil || !validLinearTodoCandidateScan(scan, d.policy.CandidateAuthority) {
-		return d.scanAttention(ctx, "incomplete_authority", dispatchEvidence("candidate_scan_incomplete"))
+		return d.scanAttentionWithDecision(ctx, "incomplete_authority", dispatchEvidence("candidate_scan_incomplete"), queueDecision(LinearTodoQueueDecisionIncompleteScan, len(scan.Candidates), nil, "", false))
 	}
 	if len(scan.Candidates) == 0 {
-		return LinearTodoDispatchResult{Outcome: LinearTodoDispatchNoCandidate, ScanDigest: scan.Digest}, nil
+		return withQueueDecision(LinearTodoDispatchResult{Outcome: LinearTodoDispatchNoCandidate, ScanDigest: scan.Digest}, queueDecision(LinearTodoQueueDecisionNoCandidate, 0, nil, "", false)), nil
 	}
 
-	selected, tie, found, leaseLost := d.readAndSelect(ctx, &lease, scan)
+	selected, tieDisplay, tie, found, leaseLost := d.readAndSelect(ctx, &lease, scan)
 	if leaseLost {
-		return d.schedulerAttention(ctx, d.policy.AttentionProfile, "lease_lost", dispatchEvidence("lease_lost_before_candidate_read", scan.Digest))
+		result, attentionErr := d.schedulerAttention(ctx, d.policy.AttentionProfile, "lease_lost", dispatchEvidence("lease_lost_before_candidate_read", scan.Digest))
+		return withQueueDecision(result, queueDecision(LinearTodoQueueDecisionSchedulerAttention, len(scan.Candidates), nil, "", false)), attentionErr
 	}
 	if !found {
-		return d.scanAttention(ctx, "incomplete_authority", dispatchEvidence("no_authoritatively_valid_candidate", scan.Digest))
+		return d.scanAttentionWithDecision(ctx, "incomplete_authority", dispatchEvidence("no_authoritatively_valid_candidate", scan.Digest), queueDecision(LinearTodoQueueDecisionIncompleteScan, len(scan.Candidates), nil, "", false))
 	}
 	if tie {
-		return d.candidateTieAttention(ctx, selected.candidate.Identifier, selected.repository, scan.Digest)
+		result, attentionErr := d.candidateTieAttention(ctx, tieDisplay.candidate.Identifier, tieDisplay.repository, scan.Digest)
+		return withQueueDecision(result, queueDecision(LinearTodoQueueDecisionPriorityTie, len(scan.Candidates), nil, LinearTodoQueueTieReasonTopPriority, false)), attentionErr
 	}
 	result, driveErr := d.reserveStartAndDrive(ctx, &lease, selected, scan.Digest)
 	if driveErr != nil {
@@ -204,9 +281,10 @@ func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatch
 		if runErr != nil {
 			return LinearTodoDispatchResult{}, runErr
 		}
-		return d.handleRunFailure(ctx, run, AutomaticRetryPhaseForRun(run), RetrySchedule{}, false, driveErr)
+		retryResult, retryErr := d.handleRunFailure(ctx, run, AutomaticRetryPhaseForRun(run), RetrySchedule{}, false, driveErr)
+		return withQueueDecision(retryResult, selectedPriorityQueueDecision(len(scan.Candidates), selected.candidate.Priority)), retryErr
 	}
-	return result, nil
+	return withQueueDecision(result, selectedPriorityQueueDecision(len(scan.Candidates), selected.candidate.Priority)), nil
 }
 
 type linearTodoDispatchCandidate struct {
@@ -215,12 +293,12 @@ type linearTodoDispatchCandidate struct {
 	repository LocalRepository
 }
 
-func (d *LinearTodoDispatcher) readAndSelect(ctx context.Context, lease *LinearTodoAdmissionLease, scan LinearTodoCandidateScan) (linearTodoDispatchCandidate, bool, bool, bool) {
-	var selected linearTodoDispatchCandidate
+func (d *LinearTodoDispatcher) readAndSelect(ctx context.Context, lease *LinearTodoAdmissionLease, scan LinearTodoCandidateScan) (linearTodoDispatchCandidate, linearTodoDispatchCandidate, bool, bool, bool) {
+	var selected, tieDisplay linearTodoDispatchCandidate
 	selectedSet, tie := false, false
 	for _, candidate := range scan.Candidates {
 		if !d.renewLease(ctx, lease) {
-			return linearTodoDispatchCandidate{}, false, false, true
+			return linearTodoDispatchCandidate{}, linearTodoDispatchCandidate{}, false, false, true
 		}
 		source, _, err := d.reader.ReadIssue(ctx, candidate.Identifier)
 		if err != nil || !sameLinearTodoCandidateSource(candidate, source, d.policy.CandidateAuthority) {
@@ -235,17 +313,22 @@ func (d *LinearTodoDispatcher) readAndSelect(ctx context.Context, lease *LinearT
 		}
 		current := linearTodoDispatchCandidate{candidate: candidate, snapshot: snapshot, repository: repository}
 		if !selectedSet || linearTodoPriorityRank(candidate.Priority) < linearTodoPriorityRank(selected.candidate.Priority) {
-			selected, selectedSet, tie = current, true, false
+			selected, tieDisplay, selectedSet, tie = current, current, true, false
 			continue
 		}
 		if linearTodoPriorityRank(candidate.Priority) == linearTodoPriorityRank(selected.candidate.Priority) {
 			tie = true
+			// The candidate remains unselected on a tie. This comparison is only
+			// for deterministic operator evidence, never an admission fallback.
+			if strings.Compare(current.candidate.Identifier, tieDisplay.candidate.Identifier) < 0 {
+				tieDisplay = current
+			}
 		}
 	}
 	if !selectedSet {
-		return linearTodoDispatchCandidate{}, false, false, false
+		return linearTodoDispatchCandidate{}, linearTodoDispatchCandidate{}, false, false, false
 	}
-	return selected, tie, true, false
+	return selected, tieDisplay, tie, true, false
 }
 
 // Linear represents unprioritized work as zero; it is lower than all explicit
@@ -465,6 +548,11 @@ func (d *LinearTodoDispatcher) scanAttention(ctx context.Context, reason, eviden
 		return LinearTodoDispatchResult{}, serviceError(ErrorInternal, "candidate scan attention is invalid", err)
 	}
 	return d.appendAttention(ctx, event, "")
+}
+
+func (d *LinearTodoDispatcher) scanAttentionWithDecision(ctx context.Context, reason, evidence string, decision LinearTodoQueueDecision) (LinearTodoDispatchResult, error) {
+	result, attentionErr := d.scanAttention(ctx, reason, evidence)
+	return withQueueDecision(result, decision), attentionErr
 }
 
 func (d *LinearTodoDispatcher) schedulerAttention(ctx context.Context, profile OperatorAttentionProfile, reason, evidence string) (LinearTodoDispatchResult, error) {

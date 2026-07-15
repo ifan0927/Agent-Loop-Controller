@@ -24,6 +24,12 @@ The worker, driver, and SQLite journal are restart-safe. They may resume a
 persisted run, but never create a second active run or repeat an external write
 without reconciling durable evidence.
 
+Automatic admission uses a priority-only queue policy: explicit priorities
+`1` through `4` outrank unprioritized `0`, one non-terminal run blocks scanning
+and is never preempted, and an equal best priority stops for operator attention
+without a FIFO fallback. The worker emits the sanitized decision evidence;
+see [configuration](docs/configuration.md#automatic-admission-queue-policy).
+
 `controller run IFAN-xxx` and the low-level delivery commands remain bounded
 recovery or local-lab interfaces. They are not the #42 live-E2E entrypoint.
 That E2E starts a supervised worker with no issue identifier.

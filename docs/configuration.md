@@ -89,8 +89,35 @@ service installation behavior. It uses the configured admission poll interval,
 one scheduler lease per dispatch cycle, and stops before another admission when
 the cycle emits operator attention. `--once` performs exactly one resume or
 scan/dispatch cycle; `--max-runtime` bounds the process and SIGINT/SIGTERM
-cancel the current wait or driver. The worker reports only its generated
-instance ID, configuration digest, cycle count, outcome, and stop reason.
+cancel the current wait or driver. The worker reports its generated instance
+ID, configuration digest, cycle count, outcome, stop reason, and a sanitized
+`queue_decision` projection when a dispatch cycle produced one.
+
+### Automatic admission queue policy
+
+Admission is priority-only and has no FIFO or timestamp tie-break:
+
+- Explicit priority `1` ranks highest, followed by `2`, `3`, and `4`.
+- Unprioritized priority `0` ranks below every explicit priority.
+- A unique best priority may be admitted, but an equal best priority produces
+  operator attention and performs no reservation, Linear mutation, Codex start,
+  or arbitrary first-in-list selection.
+- One existing non-terminal run blocks a new scan and is never preempted, even
+  when a newly observed candidate has a higher priority. Retry records for that
+  run also remain blocking until their persisted policy permits recovery.
+- The operator must resolve a top-priority tie in Linear or otherwise remove
+  the ambiguity, then allow the next worker poll to re-evaluate it. The
+  controller does not mutate priority or choose a tie-break policy.
+
+The worker's `queue_decision` contains only bounded control evidence:
+`reason`, `candidate_count`, optional `selected_priority`, optional
+`tie_reason`, and `existing_run_prevented_scan`. `candidate_count` is the
+number returned by the bounded scan before authoritative per-issue filtering;
+it is zero when an existing run prevents scanning. Normal reasons are
+`no_candidate`, `active_run`, `incomplete_scan`, `priority_tie`, and
+`selected_priority`; scheduler and retry attention use their corresponding
+sanitized attention reasons. Stable candidate ordering is used only for scan
+evidence and tie-attention display. It never selects a candidate.
 
 ## Future Web UI
 

@@ -18,12 +18,13 @@ import (
 )
 
 type workerOutput struct {
-	WorkerInstanceID    string `json:"worker_instance_id"`
-	ConfigurationDigest string `json:"configuration_digest"`
-	Disabled            bool   `json:"disabled,omitempty"`
-	Cycles              int    `json:"cycles,omitempty"`
-	LastOutcome         string `json:"last_outcome,omitempty"`
-	Stopped             string `json:"stopped"`
+	WorkerInstanceID    string                               `json:"worker_instance_id"`
+	ConfigurationDigest string                               `json:"configuration_digest"`
+	Disabled            bool                                 `json:"disabled,omitempty"`
+	Cycles              int                                  `json:"cycles,omitempty"`
+	LastOutcome         string                               `json:"last_outcome,omitempty"`
+	QueueDecision       *application.LinearTodoQueueDecision `json:"queue_decision,omitempty"`
+	Stopped             string                               `json:"stopped"`
 }
 
 type automaticWorkerDriver struct {
@@ -105,7 +106,7 @@ func controllerWorker(args []string) error {
 	if err != nil {
 		return application.ClassifyError(err)
 	}
-	output.Cycles, output.LastOutcome, output.Stopped = result.Cycles, result.LastOutcome, result.Stopped
+	output.Cycles, output.LastOutcome, output.QueueDecision, output.Stopped = result.Cycles, result.LastOutcome, result.QueueDecision, result.Stopped
 	return printJSON(output)
 }
 

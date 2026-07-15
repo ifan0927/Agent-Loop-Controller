@@ -245,7 +245,7 @@ func (s *dispatchStore) ReserveLinearTodoAdmission(_ context.Context, reservatio
 	if s.reserveBlocked != nil {
 		<-s.reserveBlocked
 	}
-	if !s.held || s.run.ID != "" {
+	if !s.held || (s.run.ID != "" && s.run.State != domain.StateCompleted && s.run.State != domain.StateFailed && s.run.State != domain.StateRejected) {
 		return Run{}, LinearTodoAdmissionJournal{}, false, nil
 	}
 	run, err := ReservedRunFromAdmissionSnapshot(reservation.Input)
@@ -501,6 +501,9 @@ func TestLinearTodoDispatcherSelectsOnePriorityCandidateThenStartsAndDrives(t *t
 	if err != nil || result.Outcome != LinearTodoDispatchDriven || scanner.calls != 1 || store.reserveCalls != 1 || store.run.IssueID != high.Identifier || len(starter.calls) != 1 || starter.calls[0].IssueID != high.IssueID || len(driver.calls) != 1 || driver.calls[0].RunID != store.run.ID || len(store.attention) != 0 {
 		t.Fatalf("result=%+v scanner=%d reserve=%d run=%+v starter=%+v driver=%+v attention=%+v err=%v", result, scanner.calls, store.reserveCalls, store.run, starter.calls, driver.calls, store.attention, err)
 	}
+	if result.QueueDecision == nil || result.QueueDecision.Reason != LinearTodoQueueDecisionSelectedPriority || result.QueueDecision.CandidateCount != 2 || result.QueueDecision.SelectedPriority == nil || *result.QueueDecision.SelectedPriority != 1 || result.QueueDecision.ExistingRunPreventedScan {
+		t.Fatalf("queue decision=%+v", result.QueueDecision)
+	}
 	if len(reader.calls) != 4 || reader.calls[0] != low.Identifier || reader.calls[1] != high.Identifier || store.journal.Status != "started" || store.continues != 1 || store.renewCalls != 9 || store.releasedLease.Version != store.lease.Version || store.held {
 		t.Fatalf("reader=%v journal=%+v continues=%d renews=%d released=%+v current=%+v held=%t", reader.calls, store.journal, store.continues, store.renewCalls, store.releasedLease, store.lease, store.held)
 	}
@@ -530,12 +533,108 @@ func TestLinearTodoDispatcherRenewalFailureStopsBeforeEachLongBoundary(t *testin
 }
 
 func TestLinearTodoDispatcherPriorityTieAppendsAttentionWithoutMutation(t *testing.T) {
-	first, second := dispatchCandidate("first", "IFAN-11", 1), dispatchCandidate("second", "IFAN-12", 1)
+	first, second := dispatchCandidate("first", "IFAN-12", 1), dispatchCandidate("second", "IFAN-11", 1)
 	dispatcher, store, scanner, _, starter, driver := newDispatchLab(t, first, second)
 
 	result, err := dispatcher.Dispatch(context.Background())
-	if err != nil || result.Outcome != LinearTodoDispatchAttention || scanner.calls != 1 || store.reserveCalls != 0 || len(starter.calls) != 0 || len(driver.calls) != 0 || len(store.attention) != 1 || store.attention[0].EventType != OperatorAttentionCandidatePriorityTie {
+	if err != nil || result.Outcome != LinearTodoDispatchAttention || scanner.calls != 1 || store.reserveCalls != 0 || len(starter.calls) != 0 || len(driver.calls) != 0 || len(store.attention) != 1 || store.attention[0].EventType != OperatorAttentionCandidatePriorityTie || store.attention[0].LinearIdentifier != "IFAN-11" {
 		t.Fatalf("result=%+v reserve=%d starter=%+v driver=%+v attention=%+v err=%v", result, store.reserveCalls, starter.calls, driver.calls, store.attention, err)
+	}
+	if result.QueueDecision == nil || result.QueueDecision.Reason != LinearTodoQueueDecisionPriorityTie || result.QueueDecision.CandidateCount != 2 || result.QueueDecision.TieReason != LinearTodoQueueTieReasonTopPriority || result.QueueDecision.SelectedPriority != nil || result.QueueDecision.ExistingRunPreventedScan {
+		t.Fatalf("queue decision=%+v", result.QueueDecision)
+	}
+}
+
+func TestLinearTodoDispatcherExplicitPriorityBeatsUnprioritizedCandidate(t *testing.T) {
+	unprioritized, explicit := dispatchCandidate("unprioritized", "IFAN-40", 0), dispatchCandidate("explicit", "IFAN-41", 4)
+	dispatcher, store, _, _, _, _ := newDispatchLab(t, unprioritized, explicit)
+
+	result, err := dispatcher.Dispatch(context.Background())
+	if err != nil || result.Outcome != LinearTodoDispatchDriven || store.run.IssueID != explicit.Identifier || store.reserveCalls != 1 {
+		t.Fatalf("result=%+v run=%+v reserve=%d err=%v", result, store.run, store.reserveCalls, err)
+	}
+	if result.QueueDecision == nil || result.QueueDecision.SelectedPriority == nil || *result.QueueDecision.SelectedPriority != 4 {
+		t.Fatalf("queue decision=%+v", result.QueueDecision)
+	}
+}
+
+func TestLinearTodoDispatcherExistingRunPreventsHigherPriorityPreemption(t *testing.T) {
+	candidate := dispatchCandidate("higher", "IFAN-42", 1)
+	dispatcher, store, scanner, _, _, driver := newDispatchLab(t, candidate)
+	store.run = authorizeDispatchRun(Run{ID: "run-existing", IssueID: "IFAN-99", IdempotencyKey: "existing-key", Repository: "owner/repo", State: domain.StateExecuting})
+
+	result, err := dispatcher.Dispatch(context.Background())
+	if err != nil || result.Outcome != LinearTodoDispatchDriven || scanner.calls != 0 || store.reserveCalls != 0 || len(driver.calls) != 1 || store.run.IssueID != "IFAN-99" {
+		t.Fatalf("result=%+v scanner=%d reserve=%d driver=%+v run=%+v err=%v", result, scanner.calls, store.reserveCalls, driver.calls, store.run, err)
+	}
+	if result.QueueDecision == nil || result.QueueDecision.Reason != LinearTodoQueueDecisionActiveRun || result.QueueDecision.CandidateCount != 0 || !result.QueueDecision.ExistingRunPreventedScan {
+		t.Fatalf("queue decision=%+v", result.QueueDecision)
+	}
+}
+
+func TestLinearTodoDispatcherCompletedRunAllowsNextPollSelection(t *testing.T) {
+	first, second := dispatchCandidate("completed-first", "IFAN-43", 2), dispatchCandidate("completed-second", "IFAN-44", 3)
+	dispatcher, store, scanner, reader, starter, driver := newDispatchLab(t, first)
+
+	firstResult, err := dispatcher.Dispatch(context.Background())
+	if err != nil || firstResult.Outcome != LinearTodoDispatchDriven {
+		t.Fatalf("first result=%+v err=%v", firstResult, err)
+	}
+	firstRunID := store.run.ID
+	if err := store.Transition(context.Background(), firstRunID, domain.StateExecuting, domain.StateCompleted, "fixture completed", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	store.side = SideEffectRecord{}
+	store.mu.Unlock()
+	reader.sources[second.Identifier] = dispatchSource(second)
+	scanner.scan = LinearTodoCandidateScan{Candidates: []LinearTodoCandidate{second}, Digest: dispatchDigest("completed-second-scan"), ObservedAt: store.now}
+
+	secondResult, err := dispatcher.Dispatch(context.Background())
+	if err != nil || secondResult.Outcome != LinearTodoDispatchDriven || scanner.calls != 2 || store.reserveCalls != 2 || len(starter.calls) != 2 || len(driver.calls) != 2 || store.run.ID == firstRunID || store.run.IssueID != second.Identifier {
+		t.Fatalf("second result=%+v scanner=%d reserve=%d starter=%+v driver=%+v run=%+v err=%v", secondResult, scanner.calls, store.reserveCalls, starter.calls, driver.calls, store.run, err)
+	}
+	if secondResult.QueueDecision == nil || secondResult.QueueDecision.Reason != LinearTodoQueueDecisionSelectedPriority || secondResult.QueueDecision.CandidateCount != 1 || secondResult.QueueDecision.SelectedPriority == nil || *secondResult.QueueDecision.SelectedPriority != 3 {
+		t.Fatalf("queue decision=%+v", secondResult.QueueDecision)
+	}
+}
+
+func TestLinearTodoDispatcherNoCandidateProjectsQueueDecision(t *testing.T) {
+	dispatcher, _, scanner, _, _, _ := newDispatchLab(t)
+
+	result, err := dispatcher.Dispatch(context.Background())
+	if err != nil || result.Outcome != LinearTodoDispatchNoCandidate || scanner.calls != 1 {
+		t.Fatalf("result=%+v scanner=%d err=%v", result, scanner.calls, err)
+	}
+	if result.QueueDecision == nil || result.QueueDecision.Reason != LinearTodoQueueDecisionNoCandidate || result.QueueDecision.CandidateCount != 0 || result.QueueDecision.SelectedPriority != nil || result.QueueDecision.TieReason != "" || result.QueueDecision.ExistingRunPreventedScan {
+		t.Fatalf("queue decision=%+v", result.QueueDecision)
+	}
+}
+
+func TestLinearTodoQueueDecisionValidationIsAllowlisted(t *testing.T) {
+	priority := 0
+	valid := []LinearTodoQueueDecision{
+		queueDecision(LinearTodoQueueDecisionNoCandidate, 0, nil, "", false),
+		queueDecision(LinearTodoQueueDecisionActiveRun, 0, nil, "", true),
+		queueDecision(LinearTodoQueueDecisionIncompleteScan, 2, nil, "", false),
+		queueDecision(LinearTodoQueueDecisionPriorityTie, 2, nil, LinearTodoQueueTieReasonTopPriority, false),
+		queueDecision(LinearTodoQueueDecisionSelectedPriority, 3, &priority, "", false),
+	}
+	for _, decision := range valid {
+		if err := decision.Validate(); err != nil {
+			t.Fatalf("valid decision=%+v err=%v", decision, err)
+		}
+	}
+	invalid := []LinearTodoQueueDecision{
+		{Reason: "external-text", CandidateCount: 1},
+		{Reason: LinearTodoQueueDecisionSelectedPriority, CandidateCount: 1},
+		{Reason: LinearTodoQueueDecisionPriorityTie, CandidateCount: 1, TieReason: "fifo"},
+		{Reason: LinearTodoQueueDecisionNoCandidate, CandidateCount: -1},
+	}
+	for _, decision := range invalid {
+		if err := decision.Validate(); err == nil {
+			t.Fatalf("invalid decision accepted: %+v", decision)
+		}
 	}
 }
 
@@ -664,6 +763,9 @@ func TestLinearTodoDispatcherExcludesInvalidCandidatesBeforePrioritySelection(t 
 		result, err := dispatcher.Dispatch(context.Background())
 		if err != nil || result.Outcome != LinearTodoDispatchAttention || scanner.calls != 1 || store.reserveCalls != 0 || len(starter.calls) != 0 || len(driver.calls) != 0 || len(store.attention) != 1 || store.attention[0].EventType != OperatorAttentionCandidateScan || store.attention[0].ReasonCode != "incomplete_authority" {
 			t.Fatalf("result=%+v scanner=%d reserve=%d starter=%+v driver=%+v attention=%+v err=%v", result, scanner.calls, store.reserveCalls, starter.calls, driver.calls, store.attention, err)
+		}
+		if result.QueueDecision == nil || result.QueueDecision.Reason != LinearTodoQueueDecisionIncompleteScan || result.QueueDecision.CandidateCount != 2 || result.QueueDecision.ExistingRunPreventedScan {
+			t.Fatalf("queue decision=%+v", result.QueueDecision)
 		}
 	})
 }
