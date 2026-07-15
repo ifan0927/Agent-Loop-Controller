@@ -22,6 +22,7 @@ import (
 
 const candidateCommitSubject = "Controller-owned local candidate"
 const localLeaseTTL = 45 * time.Second
+const maxStructuredOutcomeBytes int64 = 1 << 20
 
 type LocalRepository struct {
 	ProfileID               string                 `json:"profile_id"`
@@ -1176,7 +1177,7 @@ func (c *LocalController) freshReview(ctx context.Context, run Run) error {
 }
 
 func (c *LocalController) applyFreshReviewOutcome(ctx context.Context, run Run, outcome domain.ReviewOutcome, evidence string, inspection RunInspection) error {
-	_, persistedOutcome, err := persistedFreshReviewOutcome(run, outcome, evidence, inspection)
+	_, persistedOutcome, err := persistedFreshReviewOutcome(ctx, run, outcome, evidence, inspection)
 	if err != nil {
 		return err
 	}
@@ -1236,11 +1237,11 @@ func (c *LocalController) HandoffFreshReviewFindings(ctx context.Context, runID 
 	if !found {
 		return finish(errors.New("fresh review findings handoff lacks a persisted review"))
 	}
-	outcome, err := readOutcome[domain.ReviewOutcome](review.OutcomePath, review.OutcomeHash)
+	outcome, err := readOutcomeWithContext[domain.ReviewOutcome](ctx, review.OutcomePath, review.OutcomeHash)
 	if err != nil {
 		return finish(err)
 	}
-	matched, persisted, err := persistedFreshReviewOutcome(run, outcome, review.OutcomePath, inspection)
+	matched, persisted, err := persistedFreshReviewOutcome(ctx, run, outcome, review.OutcomePath, inspection)
 	if err != nil {
 		return finish(err)
 	}
@@ -1267,7 +1268,7 @@ func (c *LocalController) HandoffFreshReviewFindings(ctx context.Context, runID 
 	return finish(nil)
 }
 
-func persistedFreshReviewOutcome(run Run, supplied domain.ReviewOutcome, evidence string, inspection RunInspection) (ReviewRecord, domain.ReviewOutcome, error) {
+func persistedFreshReviewOutcome(ctx context.Context, run Run, supplied domain.ReviewOutcome, evidence string, inspection RunInspection) (ReviewRecord, domain.ReviewOutcome, error) {
 	if strings.TrimSpace(evidence) == "" {
 		return ReviewRecord{}, domain.ReviewOutcome{}, errors.New("fresh review outcome evidence path is required")
 	}
@@ -1286,7 +1287,7 @@ func persistedFreshReviewOutcome(run Run, supplied domain.ReviewOutcome, evidenc
 	if err := validateReviewAttempt(inspection.Attempts, matched, run.ReviewModel); err != nil {
 		return ReviewRecord{}, domain.ReviewOutcome{}, err
 	}
-	persisted, err := readOutcome[domain.ReviewOutcome](matched.OutcomePath, matched.OutcomeHash)
+	persisted, err := readOutcomeWithContext[domain.ReviewOutcome](ctx, matched.OutcomePath, matched.OutcomeHash)
 	if err != nil {
 		return ReviewRecord{}, domain.ReviewOutcome{}, err
 	}
@@ -2154,17 +2155,17 @@ func writeExclusive(path string, data []byte) error {
 	return file.Close()
 }
 func readOutcome[T any](path, wantHash string) (T, error) {
+	return readOutcomeWithContext[T](context.Background(), path, wantHash)
+}
+
+func readOutcomeWithContext[T any](ctx context.Context, path, wantHash string) (T, error) {
 	var value T
-	hash, err := fileHash(path)
+	data, err := readBoundedFile(ctx, path, maxStructuredOutcomeBytes)
 	if err != nil {
 		return value, err
 	}
-	if hash != wantHash {
+	if bytesHash(data) != wantHash {
 		return value, errors.New("persisted outcome hash mismatch")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return value, err
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -2178,6 +2179,51 @@ func readOutcome[T any](path, wantHash string) (T, error) {
 		err = typed.Validate()
 	}
 	return value, err
+}
+
+func readBoundedFile(ctx context.Context, path string, maximum int64) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("artifact must be a regular file")
+	}
+	if info.Size() < 0 || info.Size() > maximum {
+		return nil, errors.New("artifact exceeds the bounded read size")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	data := make([]byte, 0, info.Size())
+	buffer := make([]byte, 32*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		read, readErr := file.Read(buffer)
+		if read > 0 {
+			data = append(data, buffer[:read]...)
+			if int64(len(data)) > maximum {
+				return nil, errors.New("artifact exceeds the bounded read size")
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return nil, readErr
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return data, nil
 }
 func taskVerifierIDs(snapshot string) []string {
 	task, err := decodeTaskSnapshot(snapshot)

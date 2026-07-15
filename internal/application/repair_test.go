@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -88,6 +90,25 @@ func TestRepairDeadlineUsesFirstPersistedRepairAttempt(t *testing.T) {
 	}
 	if repairDeadlineExceeded([]Transition{{From: domain.StateRepairing, To: domain.StateExecuting, CreatedAt: now.Add(-repairDeadline + time.Second)}}, now) {
 		t.Fatal("repair before deadline was rejected")
+	}
+}
+
+func TestOutcomeReadHonorsCancellationAndSizeBound(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "review-outcome.json")
+	if err := os.WriteFile(path, []byte(`{"verdict":"pass","summary":"ok","reviewed_head_sha":"head","findings":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := readOutcomeWithContext[domain.ReviewOutcome](canceled, path, "ignored"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled outcome read err=%v", err)
+	}
+	oversized := filepath.Join(t.TempDir(), "oversized-outcome.json")
+	if err := os.WriteFile(oversized, make([]byte, maxStructuredOutcomeBytes+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readOutcomeWithContext[domain.ReviewOutcome](context.Background(), oversized, "ignored"); err == nil {
+		t.Fatal("oversized outcome was read")
 	}
 }
 
