@@ -380,6 +380,7 @@ func rejectAbandonmentDeliveryEvidenceTx(ctx context.Context, tx *sql.Tx, runID 
 		`SELECT COUNT(*) FROM pull_requests WHERE run_id=?`,
 		`SELECT COUNT(*) FROM merge_results WHERE run_id=?`,
 		`SELECT COUNT(*) FROM human_approvals WHERE run_id=?`,
+		`SELECT COUNT(*) FROM human_approval_observations WHERE run_id=?`,
 		`SELECT COUNT(*) FROM owned_resources WHERE owning_run=? AND resource_kind IN ('remote_branch','pull_request') AND ownership_status<>'deleted'`,
 		`SELECT COUNT(*) FROM side_effects WHERE run_id=? AND kind IN ('push','open_pull_request','squash_merge','merge')`,
 		`SELECT COUNT(*) FROM side_effects WHERE run_id=? AND kind='linear_move_to_started' AND status IN ('intent','in_flight')`,

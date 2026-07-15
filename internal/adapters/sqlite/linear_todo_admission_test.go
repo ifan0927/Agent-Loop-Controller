@@ -523,7 +523,7 @@ func TestAutomaticAdmissionAbandonReleasesSlotAndReplaysIdempotently(t *testing.
 }
 
 func TestAutomaticAdmissionAbandonRejectsRetainedDeliveryEvidence(t *testing.T) {
-	for _, name := range []string{"pull_request", "push", "merge"} {
+	for _, name := range []string{"pull_request", "approval_observation", "push", "merge"} {
 		t.Run(name, func(t *testing.T) {
 			store, run, _ := prepareAutomaticAbandonmentRun(t, domain.StateManualIntervention)
 			defer store.Close()
@@ -531,6 +531,11 @@ func TestAutomaticAdmissionAbandonRejectsRetainedDeliveryEvidence(t *testing.T) 
 			switch name {
 			case "pull_request":
 				if err := store.SavePullRequest(ctx, run.ID, domain.PullRequest{Number: 7, DatabaseID: 70, URL: "https://example.invalid/pr/7", NodeID: "PR_7", HeadBranch: run.WorkingBranch, BaseBranch: run.BaseBranch, HeadSHA: "head", BaseSHA: run.BaseSHA, BodyDigest: "body", OwnershipKey: run.IdempotencyKey, State: "open"}); err != nil {
+					t.Fatal(err)
+				}
+			case "approval_observation":
+				observedAt := time.Now().UTC()
+				if _, err := store.db.ExecContext(ctx, `INSERT INTO human_approval_observations(run_id,pr_number,candidate_head,status,review_database_id,review_node_id,actor_database_id,actor_node_id,actor_login,actor_type,review_head_sha,source_at,observed_at,evidence_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, run.ID, 7, "head", string(domain.HumanApprovalApproved), 70, "PRR_70", 33, "USER_33", "operator", "User", "head", formatTime(observedAt.Add(-time.Minute)), formatTime(observedAt), strings.Repeat("a", 64)); err != nil {
 					t.Fatal(err)
 				}
 			case "push":
@@ -551,6 +556,23 @@ func TestAutomaticAdmissionAbandonRejectsRetainedDeliveryEvidence(t *testing.T) 
 				t.Fatalf("state changed after rejection current=%+v err=%v", current, getErr)
 			}
 		})
+	}
+}
+
+func TestAutomaticAdmissionAbandonReplayRejectsNewApprovalObservation(t *testing.T) {
+	store, run, _ := prepareAutomaticAbandonmentRun(t, domain.StateReceived)
+	defer store.Close()
+	ctx := context.Background()
+	request := application.AutomaticAdmissionAbandonment{RunID: run.ID, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}
+	if _, idempotent, err := store.AbandonAutomaticAdmission(ctx, request); err != nil || idempotent {
+		t.Fatalf("initial abandon idempotent=%v err=%v", idempotent, err)
+	}
+	now := time.Now().UTC()
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO human_approval_observations(run_id,pr_number,candidate_head,status,review_database_id,review_node_id,actor_database_id,actor_node_id,actor_login,actor_type,review_head_sha,source_at,observed_at,evidence_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, run.ID, 7, "head", string(domain.HumanApprovalApproved), 70, "PRR_70", 33, "USER_33", "operator", "User", "head", formatTime(now.Add(-time.Minute)), formatTime(now), strings.Repeat("b", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if _, idempotent, err := store.AbandonAutomaticAdmission(ctx, request); err == nil || idempotent {
+		t.Fatalf("replay accepted approval observation idempotent=%v err=%v", idempotent, err)
 	}
 }
 
