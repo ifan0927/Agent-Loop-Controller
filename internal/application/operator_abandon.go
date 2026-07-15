@@ -180,11 +180,11 @@ func validateAbandonInspection(inspection RunInspection) error {
 		}
 	}
 	for _, resource := range inspection.Resources {
-		if resource.Status == "deleted" {
-			continue
-		}
 		if resource.Kind == "remote_branch" || resource.Kind == "pull_request" {
 			return errors.New("remote branch or pull request ownership is retained")
+		}
+		if resource.Status == "deleted" {
+			continue
 		}
 	}
 	return nil

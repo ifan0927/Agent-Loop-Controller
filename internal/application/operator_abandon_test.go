@@ -282,6 +282,11 @@ func TestValidateAbandonInspectionRejectsExternalDeliveryEvidence(t *testing.T) 
 	if err := validateAbandonInspection(RunInspection{Run: run, ReviewReplies: []ReviewReplyEvidence{{RunID: run.ID, RootCommentNodeID: "COMMENT"}}}); err == nil {
 		t.Fatal("reply evidence was accepted")
 	}
+	for _, kind := range []string{"remote_branch", "pull_request"} {
+		if err := validateAbandonInspection(RunInspection{Run: run, Resources: []OwnedResource{{RunID: run.ID, Kind: kind, Name: "external", Status: "deleted"}}}); err == nil {
+			t.Fatalf("deleted %s evidence was accepted", kind)
+		}
+	}
 	if err := validateAbandonInspection(RunInspection{Run: run, Cleanup: []CleanupRecord{{RunID: run.ID, Kind: "remote_branch", Name: "ifan/one", Status: "intent"}}}); err == nil {
 		t.Fatal("remote cleanup intent was accepted")
 	}

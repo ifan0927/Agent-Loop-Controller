@@ -430,7 +430,7 @@ func rejectAbandonmentDeliveryEvidenceTx(ctx context.Context, tx *sql.Tx, run ap
 		`SELECT COUNT(*) FROM human_approvals WHERE run_id=?`,
 		`SELECT COUNT(*) FROM human_approval_observations WHERE run_id=?`,
 		`SELECT COUNT(*) FROM trusted_review_reply_evidence WHERE run_id=?`,
-		`SELECT COUNT(*) FROM owned_resources WHERE owning_run=? AND resource_kind IN ('remote_branch','pull_request') AND ownership_status<>'deleted'`,
+		`SELECT COUNT(*) FROM owned_resources WHERE owning_run=? AND resource_kind IN ('remote_branch','pull_request')`,
 		`SELECT COUNT(*) FROM side_effects WHERE run_id=? AND NOT (kind='linear_move_to_started' AND status IN ('observed','failed'))`,
 	} {
 		if err := tx.QueryRowContext(ctx, query, run.ID).Scan(&count); err != nil {

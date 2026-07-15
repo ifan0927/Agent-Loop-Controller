@@ -596,7 +596,7 @@ func TestAutomaticAdmissionCleanupAuditRejectsStaleLeaseOwner(t *testing.T) {
 }
 
 func TestAutomaticAdmissionAbandonRejectsRetainedDeliveryEvidence(t *testing.T) {
-	for _, name := range []string{"pull_request", "approval_observation", "push", "merge", "reply_intent", "reply_evidence", "remote_cleanup_intent", "human_decision"} {
+	for _, name := range []string{"pull_request", "approval_observation", "push", "merge", "reply_intent", "reply_evidence", "remote_cleanup_intent", "deleted_remote_branch", "deleted_pull_request", "human_decision"} {
 		t.Run(name, func(t *testing.T) {
 			store, run, _ := prepareAutomaticAbandonmentRun(t, domain.StateManualIntervention)
 			defer store.Close()
@@ -629,6 +629,10 @@ func TestAutomaticAdmissionAbandonRejectsRetainedDeliveryEvidence(t *testing.T) 
 				}
 			case "remote_cleanup_intent":
 				if err := store.UpsertCleanup(ctx, application.CleanupRecord{RunID: run.ID, Kind: "remote_branch", Name: run.WorkingBranch, Status: "intent"}); err != nil {
+					t.Fatal(err)
+				}
+			case "deleted_remote_branch", "deleted_pull_request":
+				if err := store.AddOwnedResource(ctx, application.OwnedResource{RunID: run.ID, Kind: map[string]string{"deleted_remote_branch": "remote_branch", "deleted_pull_request": "pull_request"}[name], Name: name, CreationEvidence: "retained external delivery evidence", Status: "deleted"}); err != nil {
 					t.Fatal(err)
 				}
 			case "human_decision":
