@@ -176,6 +176,40 @@ func TestLinearRevalidateManualInterventionRequiresExplicitOwnedPushRecovery(t *
 	}
 }
 
+func TestLinearAbandonRevalidationAllowsOnlyUnchangedCanceledSource(t *testing.T) {
+	repository := LocalRepository{CanonicalRepository: "owner/repo", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
+	original := validLinearSource()
+	snapshot, _, err := admitLinearTask(original, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: mustJSON(t, snapshot.Task), State: domain.StateManualIntervention})
+	canceled := original
+	canceled.State = LinearState{ID: "canceled", Name: "Canceled", Type: "canceled"}
+	canceled.SourceRevision = "2026-07-13T00:00:00Z"
+	command := LinearRevalidateCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}
+
+	service, err := NewLinearAdmissionService(&admissionReader{source: canceled}, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, &admissionStore{serviceStore: serviceStore{run: run}}, &admissionController{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Revalidate(context.Background(), command); err == nil {
+		t.Fatal("ordinary revalidation accepted a canceled issue")
+	}
+	if got, err := service.RevalidateForAbandon(context.Background(), command); err != nil || got.ID != run.ID {
+		t.Fatalf("abandon revalidation run=%+v err=%v", got, err)
+	}
+
+	canceled.Description += "\n\nMaterial task drift."
+	drifted, err := NewLinearAdmissionService(&admissionReader{source: canceled}, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, &admissionStore{serviceStore: serviceStore{run: run}}, &admissionController{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := drifted.RevalidateForAbandon(context.Background(), command); err == nil {
+		t.Fatal("abandon revalidation accepted canceled source drift")
+	}
+}
+
 func TestLinearRevalidateAllowsUnchangedStartedStateDuringRepairExecution(t *testing.T) {
 	repository := LocalRepository{CanonicalRepository: "owner/repo", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
 	original := validLinearSource()

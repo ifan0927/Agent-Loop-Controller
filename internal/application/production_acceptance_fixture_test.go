@@ -221,6 +221,8 @@ func TestOfflineAcceptanceProductionAbandonReleasesReceivedAdmissionWithoutExter
 		store.Close()
 		t.Fatal(err)
 	}
+	reader.source.State = application.LinearState{ID: "canceled", Name: "Canceled", Type: "canceled"}
+	reader.source.SourceRevision = source.SourceRevision + "-canceled"
 
 	cleanup := &acceptanceCleanupPort{}
 	result, err := coordinator.Abandon(context.Background(), application.ProductionAbandonCommand{Requester: requester, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, cleanup)
