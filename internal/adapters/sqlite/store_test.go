@@ -800,7 +800,7 @@ func TestMigratesLegacyCodeRabbitApprovalColumnWithoutLosingApproval(t *testing.
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE automatic_retry_schedules`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (12,13,14,15,16,17,18,19,20,21)`); err != nil {
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (12,13,14,15,16,17,18,19,20,21,22)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE trusted_review_feedback_conflicts`); err != nil {
@@ -829,6 +829,28 @@ func TestMigratesLegacyCodeRabbitApprovalColumnWithoutLosingApproval(t *testing.
 	}
 	if removed != 0 || preserved != 1 {
 		t.Fatalf("removed=%d preserved=%d", removed, preserved)
+	}
+}
+
+func TestMergeMethodMigrationAcceptsOnlySquashAndExternal(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	run := application.Run{ID: "external-merge", IssueID: "IFAN-EXT", IdempotencyKey: "external-key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "ifan/external", ArtifactRoot: "/tmp/external-merge"}
+	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	record := application.MergeRecord{RunID: run.ID, PRNumber: 1, PreMergeSHA: "head", BaseSHA: "base", Method: "external", MergeSHA: "merge", MergedAt: time.Now().UTC()}
+	if err := store.SaveMerge(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	record.RunID = "other"
+	record.Method = "merge"
+	if err := store.SaveMerge(ctx, record); err == nil {
+		t.Fatal("unsupported merge method must be rejected")
 	}
 }
 

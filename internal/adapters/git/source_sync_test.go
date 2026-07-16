@@ -337,7 +337,7 @@ func TestSourceSynchronizerUsesOnlyAllowedArgvOperations(t *testing.T) {
 }
 
 type syncFixture struct {
-	root, origin, source, base, target, later, unreachable, annotatedTag string
+	root, origin, source, writer, base, target, later, unreachable, annotatedTag string
 }
 
 func (f syncFixture) request() SourceSyncRequest {
@@ -386,7 +386,7 @@ func sourceSyncFixture(t *testing.T) syncFixture {
 	runGit(t, writer, "commit", "-m", "unreachable")
 	unreachable := stringOutput(t, writer, "rev-parse", "HEAD")
 	runGit(t, writer, "push", "origin", "unreachable")
-	return syncFixture{root: root, origin: origin, source: source, base: base, target: target, later: later, unreachable: unreachable, annotatedTag: annotatedTag}
+	return syncFixture{root: root, origin: origin, source: source, writer: writer, base: base, target: target, later: later, unreachable: unreachable, annotatedTag: annotatedTag}
 }
 
 func writeSyncFile(t *testing.T, directory, name string) {

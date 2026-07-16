@@ -407,6 +407,13 @@ ownership, but performs no external write. The next driver push repeats local
 exact-HEAD validation, remote observation, and the fast-forward lease before
 updating the branch.
 
+An owned PR merged manually by I-Fan remains fail-closed until the explicit
+`accept-external-merge` operator action proves persisted exact-HEAD local
+verification, fresh review, required checks, trusted approval, remote-base
+containment, and identical candidate/merge trees. The accepted external merge
+then resumes only at `awaiting_linear_completion`; it does not bypass Linear
+Done observation or the existing guarded cleanup.
+
 An automatic-admission run that is still in `received`, `admitting`, or
 `manual_intervention` has one separate terminal operator action:
 `controller abandon`. The action requires the persisted requester, expected

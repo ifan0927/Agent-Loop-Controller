@@ -32,8 +32,8 @@ func SyncSourceCheckout(ctx context.Context, store DeliveryStore, port SourceSyn
 	if port == nil {
 		return errors.New("source synchronization port is required")
 	}
-	if merge.RunID != run.ID || merge.PreMergeSHA != run.CandidateHead || merge.Method != "squash" || merge.MergeSHA == "" || merge.MergedAt.IsZero() {
-		return errors.New("source synchronization requires persisted squash-merge evidence for the exact candidate")
+	if merge.RunID != run.ID || merge.PreMergeSHA != run.CandidateHead || !acceptedMergeMethod(merge.Method) || merge.MergeSHA == "" || merge.MergedAt.IsZero() {
+		return errors.New("source synchronization requires persisted accepted merge evidence for the exact candidate")
 	}
 	if run.State != domain.StateCleaning {
 		return errors.New("source synchronization requires cleaning state")
@@ -154,8 +154,8 @@ func sourceSyncCleanupResult(result SourceSyncResult, mergeSHA string) (string, 
 }
 
 func CleanupOwned(ctx context.Context, store DeliveryStore, port CleanupPort, run Run, merge MergeRecord, resources []OwnedResource) error {
-	if merge.RunID != run.ID || merge.PreMergeSHA != run.CandidateHead || merge.Method != "squash" || merge.MergeSHA == "" || merge.MergedAt.IsZero() {
-		return errors.New("cleanup requires persisted squash-merge evidence for the exact candidate")
+	if merge.RunID != run.ID || merge.PreMergeSHA != run.CandidateHead || !acceptedMergeMethod(merge.Method) || merge.MergeSHA == "" || merge.MergedAt.IsZero() {
+		return errors.New("cleanup requires persisted accepted merge evidence for the exact candidate")
 	}
 	if run.State != domain.StateCleaning {
 		return errors.New("cleanup requires cleaning state")
@@ -226,6 +226,10 @@ func CleanupOwned(ctx context.Context, store DeliveryStore, port CleanupPort, ru
 		}
 	}
 	return errors.Join(partial...)
+}
+
+func acceptedMergeMethod(method string) bool {
+	return method == "squash" || method == "external"
 }
 
 type cleanupResourceSelection struct {

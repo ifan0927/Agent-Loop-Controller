@@ -100,6 +100,24 @@ proves stable Linear source plus persisted PR ownership before returning the run
 to the guarded push gate. It has no GitHub App write and no Git write of its
 own; the resumed driver performs the normal exact-HEAD and lease checks.
 
+`controller accept-external-merge` is the explicit recovery for a
+controller-owned PR that I-Fan merged outside the controller gate. It accepts
+only the matching `manual_intervention` run after revalidating the local
+candidate, persisted required checks and trusted approval, remote-base
+containment, and exact candidate/merge tree equality. It records the merge as
+`external`, resumes at `awaiting_linear_completion`, and leaves the existing
+driver to observe Linear Done and perform guarded cleanup:
+
+```sh
+ifan-loop controller accept-external-merge '<persisted-run-id>' \
+  --config /absolute/protected/path/controller.json \
+  --requester ifan0927 --requester-database-id '<id>' \
+  --requester-node-id '<node-id>' --requester-type User \
+  --repository owner/isolated-fixture \
+  --expected-state manual_intervention \
+  --idempotency-key '<persisted-key>'
+```
+
 `controller abandon` is the only terminal administrative action for an
 automatic-admission run that is still in `received`, `admitting`, or a
 pre-delivery `manual_intervention`. It requires the same requester identity,

@@ -1579,6 +1579,19 @@ func (c *LocalController) ValidateApprovalReady(ctx context.Context, runID strin
 	return c.validateApproval(ctx, run)
 }
 
+// ValidateExternalMergeCandidate revalidates the exact local candidate while
+// keeping manual_intervention unavailable to ordinary publisher commands.
+func (c *LocalController) ValidateExternalMergeCandidate(ctx context.Context, runID string) error {
+	run, err := c.store.GetRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	if run.State != domain.StateManualIntervention {
+		return fmt.Errorf("external merge validation cannot authorize state %s", run.State)
+	}
+	return c.validateApproval(ctx, run)
+}
+
 // Repair resumes the persisted Terra implementation session with only
 // controller-normalized review data, then runs the ordinary verification and
 // fresh Sol review pipeline through Continue.

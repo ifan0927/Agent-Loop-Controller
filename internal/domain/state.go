@@ -52,9 +52,9 @@ var allowedTransitions = map[State]map[State]struct{}{
 	StateAwaitingGitHubMergeability: set(StateReconcilingReviews, StateMerging, StateAwaitingHumanApproval, StateRepairing, StateFailed, StateManualIntervention),
 	StateAwaitingLinearCompletion:   set(StateCleaning, StateFailed, StateManualIntervention),
 	StateCleaning:                   set(StateCompleted, StateFailed, StateManualIntervention),
-	// This is a narrow application-level recovery edge. It is reachable only
-	// after stable Linear revalidation and retained controller-owned PR proof.
-	StateManualIntervention: set(StateApprovalReady),
+	// These are narrow application-level recovery edges. Each is reachable only
+	// through its dedicated evidence-gated operator command.
+	StateManualIntervention: set(StateApprovalReady, StateAwaitingLinearCompletion),
 }
 
 func CanTransition(from, to State) bool {

@@ -77,9 +77,12 @@ func TestMergeProtectionWaitIsReadOnlyAndMustRevalidateBeforeRetry(t *testing.T)
 	}
 }
 
-func TestManualInterventionHasOnlyTheNarrowOwnedPushRecoveryEdge(t *testing.T) {
+func TestManualInterventionHasOnlyNarrowExplicitRecoveryEdges(t *testing.T) {
 	if !CanTransition(StateManualIntervention, StateApprovalReady) {
 		t.Fatal("owned push recovery must be able to restore the guarded push gate")
+	}
+	if !CanTransition(StateManualIntervention, StateAwaitingLinearCompletion) {
+		t.Fatal("accepted external merge recovery must resume at Linear completion")
 	}
 	if CanTransition(StateReceived, StateFailed) || CanTransition(StateManualIntervention, StateFailed) {
 		t.Fatal("operator abandonment must use its atomic application-level transition")

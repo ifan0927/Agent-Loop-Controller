@@ -68,7 +68,7 @@ func main() {
 
 func controller(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: ifan-loop controller <start|run|drive|worker|launchagent|status|inspect|continue|recover-owned-push|abandon|push|open-pr|reconcile|merge|reconcile-linear|cleanup> ...")
+		return errors.New("usage: ifan-loop controller <start|run|drive|worker|launchagent|status|inspect|continue|recover-owned-push|accept-external-merge|abandon|push|open-pr|reconcile|merge|reconcile-linear|cleanup> ...")
 	}
 	switch args[0] {
 	case "start":
@@ -87,6 +87,8 @@ func controller(args []string) error {
 		return controllerContinue(args[1:])
 	case "recover-owned-push":
 		return controllerRecoverOwnedPush(args[1:])
+	case "accept-external-merge":
+		return controllerAcceptExternalMerge(args[1:])
 	case "abandon":
 		return controllerAbandon(args[1:])
 	case "push":
@@ -523,6 +525,30 @@ func controllerRecoverOwnedPush(args []string) error {
 	return printJSON(result)
 }
 
+func controllerAcceptExternalMerge(args []string) error {
+	command, loaded, store, err := productionCommandWithoutDecision(args, "controller accept-external-merge")
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := validateProductionPersistedBinding(command.run, loaded.Registry); err != nil {
+		return application.ClassifyError(err)
+	}
+	coordinator, err := newProductionCoordinator(loaded, store, filepath.Dir(command.run.WorktreePath))
+	if err != nil {
+		return err
+	}
+	validator := newLocalController(store, loaded.Controller.CodexBinary, filepath.Dir(command.run.WorktreePath))
+	verifier := externalMergeAdapter{verifier: gitadapter.ExternalMergeVerifier{Workspace: gitadapter.Workspace{Process: processadapter.OSRunner{}}}}
+	ctx, cancel := localContext(loaded.Controller.RunTimeout)
+	defer cancel()
+	result, err := coordinator.AcceptExternalMerge(ctx, application.ProductionAcceptExternalMergeCommand{Requester: command.requester, RunID: command.run.ID, Repository: command.repository, ExpectedState: command.expectedState, IdempotencyKey: command.idempotencyKey}, validator, verifier)
+	if err != nil {
+		return err
+	}
+	return printJSON(result)
+}
+
 func controllerAbandon(args []string) error {
 	command, loaded, store, err := productionCommandWithoutDecision(args, "controller abandon")
 	if err != nil {
@@ -683,6 +709,15 @@ type productionPushAdapter struct{ publisher gitadapter.Publisher }
 // sourceSyncAdapter is the composition boundary between the application port
 // and the independently tested guarded Git primitive from issue #22.
 type sourceSyncAdapter struct{ sync gitadapter.SourceSynchronizer }
+
+type externalMergeAdapter struct {
+	verifier gitadapter.ExternalMergeVerifier
+}
+
+func (a externalMergeAdapter) Verify(ctx context.Context, request application.ExternalMergeVerificationRequest) (application.ExternalMergeVerification, error) {
+	result, err := a.verifier.Verify(ctx, gitadapter.ExternalMergeVerificationRequest{Repository: request.Repository, SourcePath: request.SourcePath, OriginPath: request.OriginPath, BaseBranch: request.BaseBranch, CandidateSHA: request.CandidateSHA, MergeSHA: request.MergeSHA})
+	return application.ExternalMergeVerification{CandidateSHA: result.CandidateSHA, MergeSHA: result.MergeSHA, BaseSHA: result.BaseSHA, TreeSHA: result.TreeSHA}, err
+}
 
 func (a sourceSyncAdapter) Sync(ctx context.Context, request application.SourceSyncRequest) (application.SourceSyncResult, error) {
 	result, err := a.sync.Sync(ctx, gitadapter.SourceSyncRequest{Repository: request.Repository, SourcePath: request.SourcePath, OriginPath: request.OriginPath, BaseBranch: request.BaseBranch, MergeSHA: request.MergeSHA})

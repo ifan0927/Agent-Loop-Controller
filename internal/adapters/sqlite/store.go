@@ -20,7 +20,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 21
+const schemaVersion = 22
 
 type Store struct{ db *sql.DB }
 
@@ -131,6 +131,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV20
 		case 21:
 			statements = migrationV21
+		case 22:
+			statements = migrationV22
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -395,6 +397,15 @@ var migrationV20 = []string{
 var migrationV21 = []string{
 	`ALTER TABLE automatic_retry_schedules ADD COLUMN initial_delay_ns INTEGER NOT NULL DEFAULT 1000000000`,
 	`ALTER TABLE automatic_retry_schedules ADD COLUMN maximum_delay_ns INTEGER NOT NULL DEFAULT 30000000000`,
+}
+
+// migrationV22 permits the separately evidence-gated external merge recovery
+// without weakening the ordinary squash-only GitHub write path.
+var migrationV22 = []string{
+	`ALTER TABLE merge_results RENAME TO merge_results_v22`,
+	`CREATE TABLE merge_results (run_id TEXT PRIMARY KEY REFERENCES runs(run_id), pr_number INTEGER NOT NULL, pre_merge_head_sha TEXT NOT NULL, base_sha TEXT NOT NULL, merge_method TEXT NOT NULL CHECK(merge_method IN ('squash','external')), merge_sha TEXT NOT NULL, merged_at TEXT NOT NULL)`,
+	`INSERT INTO merge_results(run_id,pr_number,pre_merge_head_sha,base_sha,merge_method,merge_sha,merged_at) SELECT run_id,pr_number,pre_merge_head_sha,base_sha,merge_method,merge_sha,merged_at FROM merge_results_v22`,
+	`DROP TABLE merge_results_v22`,
 }
 
 func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput) (application.Run, bool, error) {
@@ -2057,8 +2068,8 @@ func sameHumanApprovalAuthority(left, right domain.HumanApproval) bool {
 }
 
 func (s *Store) SaveMerge(ctx context.Context, record application.MergeRecord) error {
-	if record.Method != "squash" {
-		return errors.New("only squash merge evidence is accepted")
+	if record.Method != "squash" && record.Method != "external" {
+		return errors.New("unsupported merge evidence method")
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO merge_results(run_id,pr_number,pre_merge_head_sha,base_sha,merge_method,merge_sha,merged_at) VALUES(?,?,?,?,?,?,?)`, record.RunID, record.PRNumber, record.PreMergeSHA, record.BaseSHA, record.Method, record.MergeSHA, formatTime(record.MergedAt))
 	if err == nil {
