@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
@@ -87,10 +90,11 @@ type restReviewComment struct {
 	Body        string    `json:"body"`
 	CreatedAt   time.Time `json:"created_at"`
 	User        struct {
-		ID     int64  `json:"id"`
-		NodeID string `json:"node_id"`
-		Login  string `json:"login"`
-		Type   string `json:"type"`
+		ID        int64  `json:"id"`
+		NodeID    string `json:"node_id"`
+		Login     string `json:"login"`
+		Type      string `json:"type"`
+		AvatarURL string `json:"avatar_url"`
 	} `json:"user"`
 	PerformedViaGitHubApp *struct {
 		ID int64 `json:"id"`
@@ -101,6 +105,24 @@ func (r restReviewComment) reviewReply(marker string) domain.ReviewReply {
 	actor := domain.ActorIdentity{DatabaseID: r.User.ID, NodeID: r.User.NodeID, Login: r.User.Login, Type: r.User.Type}
 	if r.PerformedViaGitHubApp != nil {
 		actor.AppID = r.PerformedViaGitHubApp.ID
+	} else if r.User.Type == "Bot" {
+		actor.AppID = githubAppIDFromAvatarURL(r.User.AvatarURL)
 	}
 	return domain.ReviewReply{DatabaseID: r.ID, NodeID: r.NodeID, ReplyToID: r.InReplyToID, MarkerDigest: marker, Actor: actor, CreatedAt: r.CreatedAt.UTC()}
+}
+
+func githubAppIDFromAvatarURL(raw string) int64 {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Host, "avatars.githubusercontent.com") || parsed.User != nil || parsed.RawPath != "" || parsed.Fragment != "" {
+		return 0
+	}
+	parts := strings.Split(strings.TrimPrefix(parsed.Path, "/"), "/")
+	if len(parts) != 2 || parts[0] != "in" {
+		return 0
+	}
+	id, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || id < 1 {
+		return 0
+	}
+	return id
 }

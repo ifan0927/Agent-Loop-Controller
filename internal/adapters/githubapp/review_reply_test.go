@@ -41,7 +41,7 @@ func TestReplyToReviewCommentUsesOnlyRootReplyEndpointAndConfiguredApp(t *testin
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.Body != body {
 			t.Fatalf("payload=%+v err=%v", payload, err)
 		}
-		fmt.Fprintf(w, `{"id":10,"node_id":"COMMENT_10","in_reply_to_id":9,"body":%q,"created_at":"2026-07-14T00:00:00Z","user":{"id":2,"node_id":"BOT_2","login":"ifan-loop[bot]","type":"Bot"},"performed_via_github_app":{"id":1}}`, body)
+		fmt.Fprintf(w, `{"id":10,"node_id":"COMMENT_10","in_reply_to_id":9,"body":%q,"created_at":"2026-07-14T00:00:00Z","user":{"id":2,"node_id":"BOT_2","login":"ifan-loop[bot]","type":"Bot","avatar_url":"https://avatars.githubusercontent.com/in/1?v=4"},"performed_via_github_app":null}`, body)
 	})
 	server := httptest.NewServer(mux)
 	defer server.Close()
@@ -55,6 +55,22 @@ func TestReplyToReviewCommentUsesOnlyRootReplyEndpointAndConfiguredApp(t *testin
 	reply, err := client.ReplyToReviewComment(context.Background(), application.ReplyToReviewCommentRequest{PullRequestNumber: 7, RootCommentID: 9, Body: body, MarkerDigest: digest})
 	if err != nil || reply.DatabaseID != 10 || reply.ReplyToID != 9 || reply.MarkerDigest != digest || reply.Actor.AppID != 1 {
 		t.Fatalf("reply=%+v err=%v", reply, err)
+	}
+}
+
+func TestGitHubAppIDFromAvatarURLRejectsUntrustedShapes(t *testing.T) {
+	for _, raw := range []string{
+		"http://avatars.githubusercontent.com/in/1",
+		"https://example.com/in/1",
+		"https://avatars.githubusercontent.com/in/not-a-number",
+		"https://avatars.githubusercontent.com/in/0",
+		"https://avatars.githubusercontent.com/in/1/extra",
+		"https://avatars.githubusercontent.com/avatar/1",
+		"https://avatars.githubusercontent.com/in/%31",
+	} {
+		if got := githubAppIDFromAvatarURL(raw); got != 0 {
+			t.Fatalf("url=%q app_id=%d", raw, got)
+		}
 	}
 }
 
