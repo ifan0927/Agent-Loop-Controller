@@ -664,7 +664,7 @@ type graphPageInfo struct {
 
 const reviewQuery = `query ReadPullRequestReviews($owner:String!,$name:String!,$number:Int!,$reviewCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviews(first:100,after:$reviewCursor){nodes{id databaseId state commit{oid} submittedAt author{login __typename ... on User{id databaseId} ... on Bot{id databaseId}}} pageInfo{hasNextPage endCursor}}}}}`
 
-const reviewThreadQuery = `query ReadPullRequestReviewThreads($owner:String!,$name:String!,$number:Int!,$threadCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$threadCursor){nodes{id isResolved isOutdated path line originalCommit{oid} comments(first:100){nodes{id databaseId replyTo{id databaseId} author{login __typename ... on User{id databaseId} ... on Bot{id databaseId}} pullRequestReview{id databaseId state commit{oid} submittedAt author{login __typename ... on User{id databaseId} ... on Bot{id databaseId}}} body createdAt updatedAt} pageInfo{hasNextPage endCursor}} pageInfo{hasNextPage endCursor}}}}}`
+const reviewThreadQuery = `query ReadPullRequestReviewThreads($owner:String!,$name:String!,$number:Int!,$threadCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$threadCursor){nodes{id isResolved isOutdated path line comments(first:100){nodes{id databaseId replyTo{id databaseId} originalCommit{oid} author{login __typename ... on User{id databaseId} ... on Bot{id databaseId}} pullRequestReview{id databaseId state commit{oid} submittedAt author{login __typename ... on User{id databaseId} ... on Bot{id databaseId}}} body createdAt updatedAt} pageInfo{hasNextPage endCursor}}} pageInfo{hasNextPage endCursor}}}}}`
 
 func (c *Client) readReviews(ctx context.Context, pr int64) ([]domain.GitHubReview, []string, error) {
 	reviewCursor := ""
@@ -785,14 +785,11 @@ func (c *Client) readReviewThreads(ctx context.Context, pr int64) ([]domain.GitH
 }
 
 type rawReviewThread struct {
-	ID             string `json:"id"`
-	Resolved       bool   `json:"isResolved"`
-	Outdated       bool   `json:"isOutdated"`
-	Path           string `json:"path"`
-	Line           *int   `json:"line"`
-	OriginalCommit *struct {
-		OID string `json:"oid"`
-	} `json:"originalCommit"`
+	ID       string `json:"id"`
+	Resolved bool   `json:"isResolved"`
+	Outdated bool   `json:"isOutdated"`
+	Path     string `json:"path"`
+	Line     *int   `json:"line"`
 	Comments struct {
 		Nodes    []rawReviewComment `json:"nodes"`
 		PageInfo *graphPageInfo     `json:"pageInfo"`
@@ -806,6 +803,9 @@ type rawReviewComment struct {
 		ID         string `json:"id"`
 		DatabaseID int64  `json:"databaseId"`
 	} `json:"replyTo"`
+	OriginalCommit *struct {
+		OID string `json:"oid"`
+	} `json:"originalCommit"`
 	Author *struct {
 		Login      string `json:"login"`
 		Typename   string `json:"__typename"`
@@ -836,9 +836,6 @@ func (raw rawReviewThread) normalized() (domain.GitHubReviewThread, []domain.Inl
 	if strings.TrimSpace(raw.ID) == "" {
 		return domain.GitHubReviewThread{}, nil, errors.New("review thread ID is missing")
 	}
-	if raw.OriginalCommit == nil || !validFullSHA(raw.OriginalCommit.OID) {
-		return domain.GitHubReviewThread{}, nil, errors.New("review thread original commit is incomplete")
-	}
 	if raw.Comments.PageInfo == nil {
 		return domain.GitHubReviewThread{}, nil, errors.New("review-thread comment pagination metadata is missing")
 	}
@@ -851,7 +848,7 @@ func (raw rawReviewThread) normalized() (domain.GitHubReviewThread, []domain.Inl
 	if len(raw.Comments.Nodes) == 0 {
 		return domain.GitHubReviewThread{}, nil, errors.New("review thread has no comments")
 	}
-	thread := domain.GitHubReviewThread{NodeID: raw.ID, Resolved: raw.Resolved, Outdated: raw.Outdated, OriginalCommitSHA: raw.OriginalCommit.OID, Path: raw.Path, Line: raw.Line, Comments: make([]domain.GitHubReviewComment, 0, len(raw.Comments.Nodes))}
+	thread := domain.GitHubReviewThread{NodeID: raw.ID, Resolved: raw.Resolved, Outdated: raw.Outdated, Path: raw.Path, Line: raw.Line, Comments: make([]domain.GitHubReviewComment, 0, len(raw.Comments.Nodes))}
 	bodies := make([]domain.InlineReviewBody, 0, len(raw.Comments.Nodes))
 	rootID := ""
 	rootDatabaseID := int64(0)
@@ -864,7 +861,12 @@ func (raw rawReviewThread) normalized() (domain.GitHubReviewThread, []domain.Inl
 			if rootID != "" {
 				return domain.GitHubReviewThread{}, nil, errors.New("review thread has multiple root comments")
 			}
+			originalCommit := comment.OriginalCommit
+			if originalCommit == nil || !validFullSHA(originalCommit.OID) {
+				return domain.GitHubReviewThread{}, nil, errors.New("review thread original commit is incomplete")
+			}
 			rootID, rootDatabaseID = normalized.NodeID, normalized.DatabaseID
+			thread.OriginalCommitSHA = originalCommit.OID
 		}
 		thread.Comments = append(thread.Comments, normalized)
 		bodies = append(bodies, body)
