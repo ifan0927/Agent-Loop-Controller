@@ -20,6 +20,36 @@ type Cleanup struct {
 	OriginPath string
 }
 
+func (c Cleanup) CleanupResourceAbsent(ctx context.Context, repository, kind, name string) (bool, error) {
+	if err := c.validateRepository(repository); err != nil {
+		return false, err
+	}
+	if err := c.validateSourceOrigin(ctx); err != nil {
+		return false, err
+	}
+	switch kind {
+	case "worktree":
+		return c.worktreeAbsent(ctx, name)
+	case "branch":
+		if err := domain.ValidateGitBranch(name); err != nil {
+			return false, errors.New("local branch ownership mismatch")
+		}
+		_, err := c.run(ctx, c.SourcePath, "show-ref", "--verify", "--quiet", "refs/heads/"+name)
+		if err != nil && isGitExit(err, 1) {
+			return true, nil
+		}
+		return false, err
+	case "remote_branch":
+		if err := domain.ValidateGitBranch(name); err != nil {
+			return false, errors.New("remote branch ownership mismatch")
+		}
+		remote, err := c.run(ctx, c.SourcePath, "ls-remote", "origin", "refs/heads/"+name)
+		return strings.TrimSpace(remote) == "", err
+	default:
+		return false, errors.New("cleanup resource kind is not reconcilable")
+	}
+}
+
 func (c Cleanup) RemoveWorktree(ctx context.Context, repository, worktree, expectedBranch, expectedSHA string) error {
 	if err := c.validateRepository(repository); err != nil {
 		return err
@@ -28,6 +58,13 @@ func (c Cleanup) RemoveWorktree(ctx context.Context, repository, worktree, expec
 		return err
 	}
 	if _, err := os.Lstat(worktree); errors.Is(err, os.ErrNotExist) {
+		absent, registrationErr := c.worktreeAbsent(ctx, worktree)
+		if registrationErr != nil {
+			return registrationErr
+		}
+		if !absent {
+			return errors.New("worktree path is absent but remains registered")
+		}
 		return nil
 	} else if err != nil {
 		return fmt.Errorf("inspect worktree: %w", err)
@@ -57,8 +94,17 @@ func (c Cleanup) RemoveWorktree(ctx context.Context, repository, worktree, expec
 	if strings.TrimSpace(status) != "" {
 		return errors.New("refusing to remove dirty worktree")
 	}
-	_, err = c.run(ctx, c.SourcePath, "worktree", "remove", worktree)
-	return err
+	if _, err = c.run(ctx, c.SourcePath, "worktree", "remove", worktree); err != nil {
+		return err
+	}
+	absent, err := c.worktreeAbsent(ctx, worktree)
+	if err != nil {
+		return err
+	}
+	if !absent {
+		return errors.New("worktree removal postcondition is not satisfied")
+	}
+	return nil
 }
 
 func (c Cleanup) DeleteLocalBranch(ctx context.Context, repository, branch, expectedSHA string) error {
@@ -75,11 +121,14 @@ func (c Cleanup) DeleteLocalBranch(ctx context.Context, repository, branch, expe
 		return errors.New("local branch remains attached to a worktree")
 	}
 	ref := "refs/heads/" + branch
-	actual, err := c.run(ctx, c.SourcePath, "rev-parse", "--verify", ref+"^{commit}")
-	if err != nil {
-		if isGitExit(err, 128) {
+	if _, err := c.run(ctx, c.SourcePath, "show-ref", "--verify", "--quiet", ref); err != nil {
+		if isGitExit(err, 1) {
 			return nil
 		}
+		return err
+	}
+	actual, err := c.run(ctx, c.SourcePath, "rev-parse", "--verify", ref+"^{commit}")
+	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(expectedSHA) == "" {
@@ -149,6 +198,36 @@ func (c Cleanup) validateRegisteredWorktree(ctx context.Context, path, branch st
 	return nil
 }
 
+func worktreeListHasPath(list, path string) bool {
+	for _, line := range strings.Split(list, "\n") {
+		if strings.HasPrefix(line, "worktree ") && strings.TrimPrefix(line, "worktree ") == path {
+			return true
+		}
+	}
+	return false
+}
+
+func (c Cleanup) worktreeAbsentFromRegistration(ctx context.Context, path string) (bool, error) {
+	canonical, err := canonicalPathAllowMissing(path)
+	if err != nil {
+		return false, fmt.Errorf("resolve absent worktree: %w", err)
+	}
+	list, err := c.run(ctx, c.SourcePath, "worktree", "list", "--porcelain")
+	if err != nil {
+		return false, err
+	}
+	return !worktreeListHasPath(list, canonical), nil
+}
+
+func (c Cleanup) worktreeAbsent(ctx context.Context, path string) (bool, error) {
+	if _, err := os.Lstat(path); err == nil {
+		return false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("inspect worktree: %w", err)
+	}
+	return c.worktreeAbsentFromRegistration(ctx, path)
+}
+
 func (c Cleanup) branchHasWorktree(ctx context.Context, branch string) bool {
 	list, err := c.run(ctx, c.SourcePath, "worktree", "list", "--porcelain")
 	if err != nil {
@@ -166,4 +245,32 @@ func canonicalPath(path string) (string, error) {
 		return "", errors.New("path must not be a symlink")
 	}
 	return filepath.EvalSymlinks(path)
+}
+
+func canonicalPathAllowMissing(path string) (string, error) {
+	if !filepath.IsAbs(path) {
+		return "", errors.New("path must be absolute")
+	}
+	current := filepath.Clean(path)
+	var suffix []string
+	for {
+		if _, err := os.Lstat(current); err == nil {
+			resolved, resolveErr := filepath.EvalSymlinks(current)
+			if resolveErr != nil {
+				return "", resolveErr
+			}
+			for index := len(suffix) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, suffix[index])
+			}
+			return resolved, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", errors.New("no existing path ancestor")
+		}
+		suffix = append(suffix, filepath.Base(current))
+		current = parent
+	}
 }

@@ -142,13 +142,11 @@ func (s *LinearAdmissionService) RevalidateOwnedPushRecovery(ctx context.Context
 // replay; it still performs the same source and requester checks before any
 // unfinished local cleanup is retried.
 func (s *LinearAdmissionService) RevalidateForAbandon(ctx context.Context, command LinearRevalidateCommand) (Run, error) {
-	switch command.ExpectedState {
-	case domain.StateReceived, domain.StateAdmitting, domain.StateManualIntervention, domain.StateFailed:
-		run, _, err := s.revalidate(ctx, command, true, true, false, true, true)
-		return run, err
-	default:
-		return Run{}, serviceError(ErrorInvalidInput, "automatic run abandonment requires received, admitting, manual_intervention, or failed replay", nil)
+	if !GracefulAbandonState(command.ExpectedState) {
+		return Run{}, serviceError(ErrorInvalidInput, "run state is not eligible for graceful abandonment", nil)
 	}
+	run, _, err := s.revalidate(ctx, command, true, true, false, false, false)
+	return run, err
 }
 
 func (s *LinearAdmissionService) revalidate(ctx context.Context, command LinearRevalidateCommand, allowManualRecovery, allowCanceledAbandon, allowCompletedObservation, allowAutomatedProgress, markDrift bool) (Run, bool, error) {

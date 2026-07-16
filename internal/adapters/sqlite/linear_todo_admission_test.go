@@ -484,6 +484,9 @@ func TestAutomaticAdmissionAbandonReleasesSlotAndReplaysIdempotently(t *testing.
 	defer store.Close()
 	ctx := context.Background()
 	request := automaticAbandonmentRequest(run, domain.StateReceived, run.LeaseOwner)
+	if schedule, changed, err := store.ApplyRetryFailure(ctx, application.RetryFailureRequest{RunID: run.ID, Phase: application.AutomaticRetryPhaseForRun(run), ControllerState: run.State, ExpectedAttempt: 0, FailureClass: application.RetryFailureUnavailable, ReasonCode: application.RetryReasonUnavailable, Now: time.Now().UTC(), Policy: application.DefaultAutomaticRetryPolicy()}); err != nil || !changed || schedule.Status != application.RetryScheduleScheduled {
+		t.Fatalf("scheduled retry=%+v changed=%v err=%v", schedule, changed, err)
+	}
 
 	abandoned, idempotent, err := store.AbandonAutomaticAdmission(ctx, request)
 	if err != nil || idempotent || abandoned.State != domain.StateFailed {
@@ -497,7 +500,7 @@ func TestAutomaticAdmissionAbandonReleasesSlotAndReplaysIdempotently(t *testing.
 		t.Fatalf("journal=%+v found=%v err=%v", journal, found, err)
 	}
 	inspection, err := store.Inspect(ctx, run.ID)
-	if err != nil || len(inspection.Timeline) != 2 || inspection.Timeline[1].To != domain.StateFailed || inspection.Timeline[1].EvidenceReference != "operator_abandon:"+run.IdempotencyKey {
+	if err != nil || len(inspection.Timeline) != 2 || inspection.Timeline[1].To != domain.StateFailed || inspection.Timeline[1].EvidenceReference != "operator_abandon:"+run.IdempotencyKey || len(inspection.RetrySchedules) != 1 || inspection.RetrySchedules[0].Status != application.RetryScheduleAttention || inspection.RetrySchedules[0].FailureClass != application.RetryFailureManual {
 		t.Fatalf("inspection=%+v err=%v", inspection, err)
 	}
 
@@ -595,7 +598,7 @@ func TestAutomaticAdmissionCleanupAuditRejectsStaleLeaseOwner(t *testing.T) {
 	}
 }
 
-func TestAutomaticAdmissionAbandonRejectsRetainedDeliveryEvidence(t *testing.T) {
+func TestAutomaticAdmissionAbandonRetainsNonMergeDeliveryEvidence(t *testing.T) {
 	for _, name := range []string{"pull_request", "approval_observation", "push", "merge", "reply_intent", "reply_evidence", "remote_cleanup_intent", "deleted_remote_branch", "deleted_pull_request"} {
 		t.Run(name, func(t *testing.T) {
 			store, run, _ := prepareAutomaticAbandonmentRun(t, domain.StateManualIntervention)
@@ -637,12 +640,15 @@ func TestAutomaticAdmissionAbandonRejectsRetainedDeliveryEvidence(t *testing.T) 
 				}
 			}
 			_, _, err := store.AbandonAutomaticAdmission(ctx, automaticAbandonmentRequest(run, domain.StateManualIntervention, run.LeaseOwner))
-			if err == nil {
-				t.Fatal("abandonment ignored retained delivery evidence")
-			}
 			current, getErr := store.GetRun(ctx, run.ID)
-			if getErr != nil || current.State != domain.StateManualIntervention {
-				t.Fatalf("state changed after rejection current=%+v err=%v", current, getErr)
+			if name == "merge" {
+				if err == nil || getErr != nil || current.State != domain.StateManualIntervention {
+					t.Fatalf("merge evidence was not rejected current=%+v abandonErr=%v getErr=%v", current, err, getErr)
+				}
+				return
+			}
+			if err != nil || getErr != nil || current.State != domain.StateFailed {
+				t.Fatalf("non-merge delivery evidence was not retained current=%+v abandonErr=%v getErr=%v", current, err, getErr)
 			}
 		})
 	}
@@ -678,7 +684,7 @@ func TestAutomaticAdmissionAbandonRetainsHumanDecisionEvidence(t *testing.T) {
 	}
 }
 
-func TestAutomaticAdmissionAbandonReplayRejectsNewExternalDeliveryEvidence(t *testing.T) {
+func TestAutomaticAdmissionAbandonReplayRetainsNewNonMergeDeliveryEvidence(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		add  func(context.Context, *Store, application.Run) error
@@ -706,14 +712,14 @@ func TestAutomaticAdmissionAbandonReplayRejectsNewExternalDeliveryEvidence(t *te
 			if err := test.add(ctx, store, run); err != nil {
 				t.Fatal(err)
 			}
-			if _, idempotent, err := store.AbandonAutomaticAdmission(ctx, request); err == nil || idempotent {
-				t.Fatalf("replay accepted new external evidence idempotent=%v err=%v", idempotent, err)
+			if _, idempotent, err := store.AbandonAutomaticAdmission(ctx, request); err != nil || !idempotent {
+				t.Fatalf("replay rejected retained non-merge evidence idempotent=%v err=%v", idempotent, err)
 			}
 		})
 	}
 }
 
-func TestAutomaticAdmissionAbandonReplayRejectsNewApprovalObservation(t *testing.T) {
+func TestAutomaticAdmissionAbandonReplayRetainsNewApprovalObservation(t *testing.T) {
 	store, run, _ := prepareAutomaticAbandonmentRun(t, domain.StateReceived)
 	defer store.Close()
 	ctx := context.Background()
@@ -725,8 +731,8 @@ func TestAutomaticAdmissionAbandonReplayRejectsNewApprovalObservation(t *testing
 	if _, err := store.db.ExecContext(ctx, `INSERT INTO human_approval_observations(run_id,pr_number,candidate_head,status,review_database_id,review_node_id,actor_database_id,actor_node_id,actor_login,actor_type,review_head_sha,source_at,observed_at,evidence_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, run.ID, 7, "head", string(domain.HumanApprovalApproved), 70, "PRR_70", 33, "USER_33", "operator", "User", "head", formatTime(now.Add(-time.Minute)), formatTime(now), strings.Repeat("b", 64)); err != nil {
 		t.Fatal(err)
 	}
-	if _, idempotent, err := store.AbandonAutomaticAdmission(ctx, request); err == nil || idempotent {
-		t.Fatalf("replay accepted approval observation idempotent=%v err=%v", idempotent, err)
+	if _, idempotent, err := store.AbandonAutomaticAdmission(ctx, request); err != nil || !idempotent {
+		t.Fatalf("replay rejected retained approval observation idempotent=%v err=%v", idempotent, err)
 	}
 }
 

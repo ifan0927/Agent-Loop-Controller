@@ -85,6 +85,22 @@ func TestManualInterventionAttentionIsStableAndAdvertisesAbandonOnly(t *testing.
 	}
 }
 
+func TestCleanupResidueAttentionIsTerminalAndAdvertisesNoWorkflowAction(t *testing.T) {
+	now := time.Date(2026, 7, 16, 2, 0, 0, 0, time.UTC)
+	run := operatorAttentionTestRun(t, domain.StateFailed)
+	first, err := CleanupResidueAttentionEvent(run, 10, strings.Repeat("c", 64), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := CleanupResidueAttentionEvent(run, 10, strings.Repeat("c", 64), now)
+	if err != nil || first.EventKey != second.EventKey || first.PayloadDigest != second.PayloadDigest || first.EventType != OperatorAttentionCleanupResidue || first.ReasonCode != "cleanup_residue" || len(first.AllowedActions) != 0 {
+		t.Fatalf("first=%+v second=%+v err=%v", first, second, err)
+	}
+	if err := ValidateOperatorAttentionEvent(first); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestHumanDecisionAttentionIsStableAndAdvertisesDecideOnly(t *testing.T) {
 	run := operatorAttentionTestRun(t, domain.StateAwaitingHumanDecision)
 	now := time.Date(2026, 7, 16, 2, 0, 0, 0, time.UTC)

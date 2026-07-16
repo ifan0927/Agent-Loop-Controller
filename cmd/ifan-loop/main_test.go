@@ -210,9 +210,9 @@ func TestControllerDriveRequiresRunAndRequesterIdentity(t *testing.T) {
 	}
 }
 
-func TestControllerAbandonRequiresExplicitCASAndRequesterIdentity(t *testing.T) {
+func TestControllerAbandonRequiresRunAndRequesterIdentity(t *testing.T) {
 	err := controller([]string{"abandon"})
-	if err == nil || !strings.Contains(err.Error(), "run ID, complete requester identity, --repository, --expected-state, and --idempotency-key") {
+	if err == nil || !strings.Contains(err.Error(), "run ID and complete requester identity") {
 		t.Fatalf("missing controller abandon argument error=%v", err)
 	}
 }
@@ -221,6 +221,13 @@ func TestControllerAbandonRejectsHumanDecisionFlag(t *testing.T) {
 	err := controller([]string{"abandon", "run-abandon", "--decision", "/tmp/decision.json"})
 	if err == nil || !strings.Contains(err.Error(), "flag provided but not defined: -decision") {
 		t.Fatalf("abandon accepted human decision input error=%v", err)
+	}
+}
+
+func TestControllerAbandonRejectsCallerSuppliedRunAuthority(t *testing.T) {
+	err := controller([]string{"abandon", "run-abandon", "--expected-state", "manual_intervention"})
+	if err == nil || !strings.Contains(err.Error(), "flag provided but not defined: -expected-state") {
+		t.Fatalf("abandon accepted caller-supplied run authority error=%v", err)
 	}
 }
 

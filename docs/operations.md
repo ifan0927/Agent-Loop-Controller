@@ -1266,36 +1266,87 @@ operator-owned checkout deliberately, then re-inspect.
 
 **Purpose**
 
-Terminally abandon an eligible automatic-admission run before external delivery.
+Gracefully terminalize one eligible parked run while preserving evidence and
+releasing the singleton worker slot even when cleanup leaves residue.
 
 **When to use**
 
-Only in `received`, `admitting`, or qualifying pre-delivery
-`manual_intervention` when inspection proves no external delivery authority or
-in-flight mutation remains.
+Only when the current operator-attention event advertises `abandon`. An observed
+merge, merge intent, authority drift, missing fresh PR evidence, or an active
+run lease remains fail-closed.
 
 **Syntax**
 
-Use the shared recovery syntax.
+The command loads repository, current-state, sequence, and idempotency authority
+from SQLite after authenticating the requester.
 
 **Required arguments and flags**
 
-All shared authority flags.
+Run ID, config path when non-default, and the complete requester identity flags.
 
 **Example**
 
 ```sh
-ifan-loop controller abandon '<run-id>' <requester flags> \
-  --repository owner/repo --expected-state manual_intervention \
-  --idempotency-key '<persisted-key>'
+ifan-loop controller abandon '<run-id>' <requester flags>
 ```
 
 **What it does**
 
-Revalidates Linear, atomically records terminal `failed` plus admission
-attention, then removes only proven local worktree/branch resources. Audit
-evidence and artifacts remain. A repeat from `failed` resumes unfinished local
-cleanup.
+Revalidates the immutable Linear and repository authority plus the exact parked
+attention, records the typed operator action intent, and classifies durable
+ownership evidence. A `prepared` attempt is durable evidence that no process
+launch was authorized; abandon can terminalize it without inventing missing
+process evidence. Under the acquired run lease the controller authenticates
+every durably `started` managed process group with its SQLite-held per-attempt key,
+bound lock inode, exact kernel process-start identity, and authenticated launch
+roster. Every roster entry must remain complete; finding only an older preflight
+identity cannot authorize cleanup. The controller keeps
+the lifecycle lock on a private open-file description that is never inherited
+by the child, so the child cannot release or replace its authority. A managed
+launch supervisor prevents the requested target from executing until this
+identity is durable. The supervisor remains the group leader and drains the
+trusted Codex target and other members of that process group before it reports
+completion. It does not claim adversarial containment if a trusted executable
+deliberately creates another process group or session; that isolation is outside
+the local macOS MVP. After a controller crash, a restart claims the same
+authenticated lock inode before signaling the surviving group. An orphan lock, missing
+identity, or leaderless-but-live process group is ambiguous and fails closed.
+The controller revalidates the kernel start token, the leader's current kernel
+process-group membership, the live process group, and controller-held lock
+immediately before each interrupt or kill signal and on every bounded exit-proof
+poll; stale pre-signal observations are not authority.
+If identity authentication or exit proof is unavailable, resource cleanup is
+skipped and retained as residue. It then
+applies persisted best-effort cleanup to unchanged
+owned worktrees and local branches. A remote branch is cleaned only when a
+freshly observed open controller-owned PR proves unmerged delivery authority; a
+remote branch without that PR authority is retained. A freshly observed closed, unmerged,
+controller-owned PR is adopted as cleaned. For an open PR, the controller does
+not close it directly; it re-reads GitHub after local cleanup, then deletes the
+exact owned remote branch only if that final read still proves the PR open,
+unmerged, and owned. If that final read fails or reports merged or mismatched
+authority, remote resources are retained as residue while terminalization still
+completes. A PR that remains open is retained as residue. Artifacts are always
+retained. The run then becomes
+terminal `failed`
+with `operator_abandoned` even if an unsafe or failed resource produces
+cleanup-residue attention. Retained retry history no longer blocks the worker
+from scanning another issue. Replay adopts the terminal action and never
+repeats cleanup already recorded successful. Once action intent is durable,
+request cancellation becomes cleanup residue
+while a separate controller-bounded context completes terminalization. Cleanup
+uses a narrower deadline; exhausting it retains residue while the still-valid
+terminalization budget records `failed` with `operator_abandoned`. Replay
+repairs a missing action result from the persisted terminal transition.
+If a prior invocation persisted
+remote-deletion intent and Git accepted the deletion but the local result write
+was interrupted, replay first proves every managed child exited, then
+authenticates that exact ownership and freshly proves the remote
+ref absent, records the deletion, and accepts only a current unmerged PR status
+read whose missing head is explained by that deletion. Other GitHub drift still
+fails closed. A terminal replay performs cleanup probes only while the current
+attention is the exact cleanup-residue event; without that attention it returns
+the already-terminal result as an idempotent no-op.
 
 **Possible durable stop states**
 
@@ -1303,8 +1354,12 @@ cleanup.
 
 **Safety notes**
 
-It never changes Linear, GitHub, or a remote branch and cannot abandon a run
-with PR/approval/merge or unresolved external-write evidence.
+It never changes Linear or closes a PR, never deletes unknown or drifted
+resources, and never interprets a database attempt status as OS-process stop
+evidence. A persisted PR
+requires a fresh GitHub read; merged evidence is rejected in favor of explicit
+external-merge recovery. Inspect `cleanup_progress`,
+`operator_attention_events`, and `operator_actions` for retained operator work.
 
 **Related commands**
 

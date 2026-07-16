@@ -36,14 +36,14 @@ func (p preflightProcess) Run(_ context.Context, spec processadapter.Spec) (proc
 func TestPreflightRequiresExactDeclaredOption(t *testing.T) {
 	process := preflightProcess{missing: "--sandbox"}
 	process.extraHelp = "      --sandbox-policy <MODE>\n          description mentions --sandbox"
-	_, err := NewPreflighter(process, "codex").Run(context.Background(), t.TempDir())
+	_, err := NewPreflighter(process, "codex").Run(context.Background(), t.TempDir(), "")
 	if err == nil || !strings.Contains(err.Error(), "--sandbox") {
 		t.Fatalf("error = %v", err)
 	}
 }
 
 func TestPreflightFailsClosedOnMissingCapability(t *testing.T) {
-	_, err := NewPreflighter(preflightProcess{missing: "--ephemeral"}, "codex").Run(context.Background(), t.TempDir())
+	_, err := NewPreflighter(preflightProcess{missing: "--ephemeral"}, "codex").Run(context.Background(), t.TempDir(), "")
 	if err == nil || !strings.Contains(err.Error(), "--ephemeral") {
 		t.Fatalf("error = %v", err)
 	}

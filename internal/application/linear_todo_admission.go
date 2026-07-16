@@ -99,11 +99,26 @@ func (a AutomaticAdmissionAbandonment) Validate() error {
 	if a.Requester.ID == "" || a.Requester.Kind != "github_login" || strings.TrimSpace(a.RunID) == "" || strings.TrimSpace(a.Repository) == "" || strings.TrimSpace(a.RawIssueHash) == "" || strings.TrimSpace(a.TaskHash) == "" || strings.TrimSpace(a.ProfileDigest) == "" || strings.TrimSpace(a.RepositoryConfigDigest) == "" || strings.TrimSpace(a.LeaseOwner) == "" || strings.TrimSpace(a.IdempotencyKey) == "" {
 		return errors.New("automatic admission abandonment authority is incomplete")
 	}
-	switch a.ExpectedState {
-	case domain.StateReceived, domain.StateAdmitting, domain.StateManualIntervention, domain.StateFailed:
-		return nil
-	default:
+	if !GracefulAbandonState(a.ExpectedState) {
 		return errors.New("automatic admission abandonment state is not eligible")
+	}
+	return nil
+}
+
+// GracefulAbandonState is the closed allowlist for an explicit operator
+// termination. Human-decision, merge, Linear-completion, cleanup, and other
+// terminal states remain owned by their dedicated contracts.
+func GracefulAbandonState(state domain.State) bool {
+	switch state {
+	case domain.StateReceived, domain.StateAdmitting, domain.StateProvisioning,
+		domain.StateExecuting, domain.StateVerifying, domain.StateFreshReview,
+		domain.StateRepairing, domain.StateApprovalReady, domain.StatePushingBranch,
+		domain.StateBranchPushed, domain.StateOpeningPR, domain.StatePROpen,
+		domain.StateReconcilingReviews, domain.StateReplyingReviewFeedback,
+		domain.StateManualIntervention, domain.StateFailed:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -125,6 +140,18 @@ type AutomaticAdmissionAbandonStore interface {
 type AutomaticAdmissionCleanupStore interface {
 	UpsertAutomaticAdmissionCleanup(context.Context, string, CleanupRecord) error
 	MarkAutomaticAdmissionResourceDeleted(context.Context, string, OwnedResource) error
+}
+
+// AutomaticAdmissionAttemptStopStore durably stops unfinished child-attempt
+// authority under the same run lease and operator-action fence as cleanup.
+type AutomaticAdmissionAttemptStopStore interface {
+	StopAutomaticAdmissionAttempts(context.Context, string, string, time.Time) (int64, error)
+}
+
+// AutomaticAdmissionChildStopper proves that the OS process group associated
+// with a durable started attempt has exited before resource cleanup begins.
+type AutomaticAdmissionChildStopper interface {
+	StopAttempt(context.Context, string, string) error
 }
 
 // LinearTodoAdmissionStore is intentionally narrow. Future scheduling code

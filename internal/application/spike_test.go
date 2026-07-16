@@ -58,7 +58,7 @@ type fakeSpikeCodex struct {
 	reviewPrompt *string
 }
 
-func (f fakeSpikeCodex) Preflight(context.Context, string) (codex.PreflightEvidence, error) {
+func (f fakeSpikeCodex) Preflight(context.Context, string, string) (codex.PreflightEvidence, error) {
 	return codex.PreflightEvidence{Version: "codex-cli fake"}, nil
 }
 

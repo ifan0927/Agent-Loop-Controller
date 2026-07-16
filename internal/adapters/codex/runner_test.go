@@ -45,6 +45,22 @@ func TestRunnerPreservesTypedProcessStartFailure(t *testing.T) {
 	}
 }
 
+func TestRunnerPreservesUnprovenProcessGroupExit(t *testing.T) {
+	artifacts, spec := runnerFixture(t)
+	runner := NewRunner(fakeProcess{
+		result: processadapter.Result{Outcome: processadapter.OutcomeInterrupted, FailureCategory: processadapter.FailureInterrupted, ExitCode: -1},
+		err:    errors.Join(processadapter.NewFailure(processadapter.FailureInterrupted), processadapter.ProcessGroupExitUnprovenError{}),
+	})
+	if _, err := runner.Implementation(context.Background(), spec, artifacts); err == nil {
+		t.Fatal("unproven process-group exit must be returned")
+	} else {
+		var evidence interface{ ProcessGroupExitUnproven() bool }
+		if !errors.As(err, &evidence) || !evidence.ProcessGroupExitUnproven() {
+			t.Fatalf("error=%T %v", err, err)
+		}
+	}
+}
+
 func TestRunnerToleratesUnknownJSONLEvents(t *testing.T) {
 	artifacts, spec := runnerFixture(t)
 	telemetry := "{\"type\":\"future.event\",\"new_field\":true}\n{\"type\":\"thread.started\",\"thread_id\":\"thread-123\"}\n"

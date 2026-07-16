@@ -36,6 +36,7 @@ const (
 	OperatorAttentionSchedulerLease        = "scheduler_lease_attention"
 	OperatorAttentionAdmissionAuthority    = "admission_authority_conflict"
 	OperatorAttentionRetry                 = "automatic_retry_attention"
+	OperatorAttentionCleanupResidue        = "cleanup_residue_attention"
 	OperatorAttentionManualIntervention    = "manual_intervention_attention"
 	OperatorAttentionHumanDecision         = "human_decision_attention"
 	operatorAttentionUnknown               = "unknown"
@@ -103,6 +104,22 @@ func SourceCheckoutSkippedAttentionEvent(run Run, transitionSequence int64, reas
 	return newOperatorAttentionEvent(operatorAttentionEventInput{
 		ScopeID: run.ID, RunID: run.ID, EventType: OperatorAttentionSourceCheckoutSkipped,
 		Profile: profile, State: run.State, Severity: "warning", ReasonCode: reason,
+		EvidenceDigest: evidenceDigest, TransitionSequence: transitionSequence,
+		OccurredAt: observedAt, ObservedAt: observedAt,
+	})
+}
+
+// CleanupResidueAttentionEvent reports retained post-terminal operator work.
+// It advertises no workflow action: the run slot is already released and the
+// underlying ownership and cleanup rows remain the recovery authority.
+func CleanupResidueAttentionEvent(run Run, transitionSequence int64, evidenceDigest string, observedAt time.Time) (OperatorAttentionEvent, error) {
+	profile, err := operatorAttentionProfileForRun(run)
+	if err != nil {
+		return OperatorAttentionEvent{}, err
+	}
+	return newOperatorAttentionEvent(operatorAttentionEventInput{
+		ScopeID: run.ID, RunID: run.ID, EventType: OperatorAttentionCleanupResidue,
+		Profile: profile, State: run.State, Severity: "warning", ReasonCode: "cleanup_residue",
 		EvidenceDigest: evidenceDigest, TransitionSequence: transitionSequence,
 		OccurredAt: observedAt, ObservedAt: observedAt,
 	})
@@ -379,7 +396,7 @@ func operatorAttentionProfileForRun(run Run) (OperatorAttentionProfile, error) {
 
 func sanitizedOperatorAttentionEventType(value string) string {
 	switch value {
-	case OperatorAttentionSourceCheckoutSkipped, OperatorAttentionCandidatePriorityTie, OperatorAttentionCandidateScan, OperatorAttentionSchedulerLease, OperatorAttentionAdmissionAuthority, OperatorAttentionRetry, OperatorAttentionManualIntervention, OperatorAttentionHumanDecision:
+	case OperatorAttentionSourceCheckoutSkipped, OperatorAttentionCandidatePriorityTie, OperatorAttentionCandidateScan, OperatorAttentionSchedulerLease, OperatorAttentionAdmissionAuthority, OperatorAttentionRetry, OperatorAttentionCleanupResidue, OperatorAttentionManualIntervention, OperatorAttentionHumanDecision:
 		return value
 	default:
 		return operatorAttentionUnknown
@@ -394,6 +411,7 @@ func sanitizedOperatorAttentionReason(eventType, value string) string {
 		OperatorAttentionSchedulerLease:        {"lease_conflict": true, "lease_lost": true},
 		OperatorAttentionAdmissionAuthority:    {"admission_authority_conflict": true, "mutation_authority_conflict": true},
 		OperatorAttentionRetry:                 {RetryReasonProcessStart: true, RetryReasonUnavailable: true, RetryReasonAuthority: true, RetryReasonIntegrity: true, RetryReasonManual: true, RetryReasonTerminal: true, RetryReasonPersistence: true, RetryReasonBudgetExhausted: true},
+		OperatorAttentionCleanupResidue:        {"cleanup_residue": true},
 		OperatorAttentionManualIntervention:    {"manual_intervention": true},
 		OperatorAttentionHumanDecision:         {"human_decision_required": true},
 	}

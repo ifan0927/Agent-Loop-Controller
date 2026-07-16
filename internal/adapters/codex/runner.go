@@ -32,8 +32,9 @@ type Runner struct {
 // It deliberately does not retain child output, arguments, environment, or
 // the underlying adapter error.
 type ProcessFailureError struct {
-	Stage    string
-	Category processadapter.FailureCategory
+	Stage                string
+	Category             processadapter.FailureCategory
+	ProcessGroupUnproven bool
 }
 
 func (e ProcessFailureError) Error() string {
@@ -52,8 +53,17 @@ func (e ProcessFailureError) AutomaticRetryFailureClass() string {
 	return "integrity_failure"
 }
 
-func newProcessFailure(stage string, result processadapter.Result) error {
-	return ProcessFailureError{Stage: stage, Category: result.FailureCategory}
+func (e ProcessFailureError) ProcessGroupExitUnproven() bool {
+	return e.ProcessGroupUnproven
+}
+
+func newProcessFailure(stage string, result processadapter.Result, cause error) error {
+	var evidence interface{ ProcessGroupExitUnproven() bool }
+	return ProcessFailureError{
+		Stage:                stage,
+		Category:             result.FailureCategory,
+		ProcessGroupUnproven: errors.As(cause, &evidence) && evidence.ProcessGroupExitUnproven(),
+	}
 }
 
 type Executor struct {
@@ -65,8 +75,8 @@ func NewExecutor(process processadapter.Runner, binary string) Executor {
 	return Executor{preflight: NewPreflighter(process, binary), runner: NewRunner(process)}
 }
 
-func (e Executor) Preflight(ctx context.Context, artifacts string) (PreflightEvidence, error) {
-	return e.preflight.Run(ctx, artifacts)
+func (e Executor) Preflight(ctx context.Context, artifacts, processControlKey string) (PreflightEvidence, error) {
+	return e.preflight.Run(ctx, artifacts, processControlKey)
 }
 
 func (e Executor) Implementation(ctx context.Context, spec CommandSpec, artifacts string) (StructuredResult[domain.AgentOutcome], error) {
@@ -103,11 +113,13 @@ func runStructured[T any](ctx context.Context, runner processadapter.Runner, com
 		Program: command.Program, Args: command.Args, WorkingDir: command.WorkingDir, Stdin: command.Stdin,
 		StdoutPath:   filepath.Join(artifacts, name+".stdout.jsonl"),
 		StderrPath:   filepath.Join(artifacts, name+".stderr.txt"),
+		ControlPath:  filepath.Join(artifacts, name+".process-control.json"),
+		ControlKey:   []byte(command.ProcessControlKey),
 		MustNotExist: command.MustNotExist,
 		ExcludedEnv:  controllerManagedExcludedEnvironment,
 	})
 	if err != nil {
-		return zero, newProcessFailure(name, processadapter.NormalizeResult(result, err))
+		return zero, newProcessFailure(name, processadapter.NormalizeResult(result, err), err)
 	}
 	result = processadapter.NormalizeResult(result, nil)
 	if !result.Valid() {

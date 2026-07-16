@@ -20,6 +20,13 @@ type CleanupPort interface {
 	DeleteRemoteBranch(context.Context, string, string, string) error
 }
 
+// CleanupReconciliationPort observes whether a previously intended cleanup
+// already took effect. It performs no mutation and prevents restart recovery
+// from issuing a successful delete twice after persistence was interrupted.
+type CleanupReconciliationPort interface {
+	CleanupResourceAbsent(context.Context, string, string, string) (bool, error)
+}
+
 const sourceCheckoutCleanupIdentity = "configured_source_checkout"
 
 var errSourceSyncRetryable = errors.New("source checkout synchronization is retryable")

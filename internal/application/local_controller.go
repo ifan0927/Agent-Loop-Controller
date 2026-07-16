@@ -91,7 +91,7 @@ type artifactOwnership struct {
 }
 
 type DurableCodex interface {
-	Preflight(context.Context, string) (codex.PreflightEvidence, error)
+	Preflight(context.Context, string, string) (codex.PreflightEvidence, error)
 	Implementation(context.Context, codex.CommandSpec, string) (codex.StructuredResult[domain.AgentOutcome], error)
 	Resume(context.Context, codex.CommandSpec, string) (codex.StructuredResult[domain.AgentOutcome], error)
 	Review(context.Context, codex.CommandSpec, string) (codex.StructuredResult[domain.ReviewOutcome], error)
@@ -835,7 +835,20 @@ func (c *LocalController) execute(ctx context.Context, run Run, decision *Decisi
 		if attempt.RequestedModel != run.ImplementationModel {
 			return errors.New("implementation session/model attempt evidence conflict")
 		}
+		if attempt.Status == "prepared" {
+			attempt.Status = "failed"
+			attempt.FinishedAt = time.Now().UTC()
+			attempt.ExitCode = -1
+			attempt.ErrorCategory = "controller_restart_before_process_launch"
+			if err := c.store.FinishAttempt(ctx, attempt); err != nil {
+				return err
+			}
+			continue
+		}
 		if attempt.Status == "started" {
+			if attempt.ErrorCategory == "process_group_exit_unproven" {
+				return errors.New("managed Codex process group exit remains unproven; operator abandonment is required")
+			}
 			stdoutPath := filepath.Join(attempt.ArtifactDir, "implementation.stdout.jsonl")
 			stderrPath := filepath.Join(attempt.ArtifactDir, "implementation.stderr.txt")
 			sessionID, recoverErr := codex.ExtractSessionIDFile(stdoutPath)
@@ -912,12 +925,17 @@ func (c *LocalController) execute(ctx context.Context, run Run, decision *Decisi
 	if err := MaterializeArtifacts(plan.Artifacts); err != nil {
 		return c.failAttempt(ctx, attempt, "artifact_materialization", err)
 	}
-	if _, err := c.codex.Preflight(ctx, directory); err != nil {
+	if err := c.commitAttemptProcessLaunch(ctx, &attempt); err != nil {
+		return c.failAttempt(ctx, attempt, "process_launch_commit", err)
+	}
+	if _, err := c.codex.Preflight(ctx, directory, attempt.ProcessControlKey); err != nil {
 		return c.failAttempt(ctx, attempt, "codex_preflight", err)
 	}
 	var result codex.StructuredResult[domain.AgentOutcome]
 	if kind == "implementation" {
-		result, err = c.codex.Implementation(ctx, c.commands.Implementation(task, run.WorktreePath, directory), directory)
+		spec := c.commands.Implementation(task, run.WorktreePath, directory)
+		spec.ProcessControlKey = attempt.ProcessControlKey
+		result, err = c.codex.Implementation(ctx, spec, directory)
 	} else {
 		instructions := "Controller restarted after an interrupted attempt. Inspect the current owned worktree, continue the same task safely, and return a new structured outcome."
 		if decision != nil {
@@ -927,6 +945,7 @@ func (c *LocalController) execute(ctx context.Context, run Run, decision *Decisi
 		if specErr != nil {
 			return c.failAttempt(ctx, attempt, "resume_command", specErr)
 		}
+		spec.ProcessControlKey = attempt.ProcessControlKey
 		result, err = c.codex.Resume(ctx, spec, directory)
 	}
 	if err != nil {
@@ -1208,6 +1227,21 @@ func (c *LocalController) freshReview(ctx context.Context, run Run) error {
 	if err != nil {
 		return err
 	}
+	if err := rejectUnprovenStartedProcessGroup(inspection.Attempts); err != nil {
+		return err
+	}
+	for _, attempt := range inspection.Attempts {
+		if attempt.Kind != "review" || attempt.Status != "prepared" {
+			continue
+		}
+		attempt.Status = "failed"
+		attempt.FinishedAt = time.Now().UTC()
+		attempt.ExitCode = -1
+		attempt.ErrorCategory = "controller_restart_before_process_launch"
+		if err := c.store.FinishAttempt(ctx, attempt); err != nil {
+			return err
+		}
+	}
 	if record, ok := latestReviewForHeadAfter(inspection.Reviews, run.CandidateHead, latestRepairStartedAt(inspection.Timeline)); ok {
 		outcome, err := readOutcome[domain.ReviewOutcome](record.OutcomePath, record.OutcomeHash)
 		if err != nil {
@@ -1248,10 +1282,14 @@ func (c *LocalController) freshReview(ctx context.Context, run Run) error {
 	if err := MaterializeArtifacts(plan.Artifacts); err != nil {
 		return c.failAttempt(ctx, attempt, "artifact_materialization", err)
 	}
-	if _, err := c.codex.Preflight(ctx, directory); err != nil {
+	if err := c.commitAttemptProcessLaunch(ctx, &attempt); err != nil {
+		return c.failAttempt(ctx, attempt, "process_launch_commit", err)
+	}
+	if _, err := c.codex.Preflight(ctx, directory, attempt.ProcessControlKey); err != nil {
 		return c.failAttempt(ctx, attempt, "codex_preflight", err)
 	}
 	spec := c.commands.FreshReview(task, run.WorktreePath, directory)
+	spec.ProcessControlKey = attempt.ProcessControlKey
 	spec.Stdin += fmt.Sprintf("\nController candidate HEAD: %s\nController verification is authoritative for this exact HEAD.\n", run.CandidateHead)
 	if hasDecision {
 		contract, err := humanDecisionContract(decision)
@@ -2165,7 +2203,31 @@ func (c *LocalController) validateWorkspace(ctx context.Context, run Run, requir
 	return nil
 }
 
+func (c *LocalController) commitAttemptProcessLaunch(ctx context.Context, attempt *Attempt) error {
+	committed, err := c.store.CommitAttemptProcessLaunch(ctx, attempt.ID)
+	if err != nil {
+		return err
+	}
+	if !committed {
+		return errors.New("attempt process launch was not committed")
+	}
+	attempt.Status = "started"
+	return nil
+}
+
 func (c *LocalController) failAttempt(ctx context.Context, attempt Attempt, category string, cause error) error {
+	var exitEvidence interface{ ProcessGroupExitUnproven() bool }
+	if errors.As(cause, &exitEvidence) && exitEvidence.ProcessGroupExitUnproven() {
+		attempt.ErrorCategory = "process_group_exit_unproven"
+		attempt.ExitCode = -1
+		if attempt.StdoutPath != "" && attempt.StderrPath != "" {
+			_ = c.populateAttemptCaptureDigests(&attempt)
+		}
+		if err := c.store.FinishAttempt(ctx, attempt); err != nil {
+			return errors.Join(cause, err)
+		}
+		return cause
+	}
 	attempt.Status = "failed"
 	attempt.FinishedAt = time.Now().UTC()
 	attempt.ExitCode = -1
@@ -2175,6 +2237,15 @@ func (c *LocalController) failAttempt(ctx context.Context, attempt Attempt, cate
 	}
 	_ = c.store.FinishAttempt(ctx, attempt)
 	return cause
+}
+
+func rejectUnprovenStartedProcessGroup(attempts []Attempt) error {
+	for _, attempt := range attempts {
+		if attempt.Status == "started" && attempt.ErrorCategory == "process_group_exit_unproven" {
+			return errors.New("managed Codex process group exit remains unproven; operator abandonment is required")
+		}
+	}
+	return nil
 }
 
 func (c *LocalController) populateAttemptCaptureDigests(attempt *Attempt) error {

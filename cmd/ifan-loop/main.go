@@ -552,26 +552,81 @@ func controllerAcceptExternalMerge(args []string) error {
 }
 
 func controllerAbandon(args []string) error {
-	command, loaded, store, err := productionCommandWithoutDecision(args, "controller abandon")
+	flags := flag.NewFlagSet("controller abandon", flag.ContinueOnError)
+	requester := addRequesterFlags(flags)
+	configPath := configPathFlag(flags)
+	runID, remaining := splitLeadingRunID(args)
+	if err := flags.Parse(remaining); err != nil {
+		return err
+	}
+	if runID == "" && flags.NArg() == 1 {
+		runID = flags.Arg(0)
+	}
+	if runID == "" || flags.NArg() != 0 || !requester.complete() {
+		return errors.New("run ID and complete requester identity are required")
+	}
+	path, err := resolveConfigPath(*configPath)
+	if err != nil {
+		return err
+	}
+	loaded, err := bootstrap.Load(path)
+	if err != nil {
+		return err
+	}
+	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	if err := validateProductionPersistedBinding(command.run, loaded.Registry); err != nil {
+	run, err := store.GetRun(context.Background(), runID)
+	if err != nil {
 		return application.ClassifyError(err)
 	}
-	coordinator, err := newProductionCoordinator(loaded, store, filepath.Dir(command.run.WorktreePath))
+	requesterValue := requester.value()
+	if _, err := application.NewQueryService(store).Status(context.Background(), application.QueryInput{Requester: requesterValue, RunID: run.ID, Repository: run.Repository}); err != nil {
+		return err
+	}
+	if err := validateProductionPersistedBinding(run, loaded.Registry); err != nil {
+		return application.ClassifyError(err)
+	}
+	coordinator, err := newProductionCoordinator(loaded, store, filepath.Dir(run.WorktreePath))
 	if err != nil {
 		return err
 	}
 	var repository application.LocalRepository
-	if err := json.Unmarshal([]byte(command.run.RepositoryConfigJSON), &repository); err != nil {
+	if err := json.Unmarshal([]byte(run.RepositoryConfigJSON), &repository); err != nil {
 		return application.ClassifyError(errors.New("persisted repository authority is invalid"))
 	}
 	cleanup := gitadapter.Cleanup{Workspace: gitadapter.Workspace{Process: processadapter.OSRunner{}}, SourcePath: repository.SourcePath, OriginPath: repository.OriginPath}
-	ctx, cancel := localContext(loaded.Controller.RunTimeout)
+	inspection, err := store.Inspect(context.Background(), run.ID)
+	if err != nil {
+		return err
+	}
+	var readers []application.GitHubReadPort
+	timeout := loaded.Controller.RunTimeout
+	if inspection.PullRequest != nil {
+		profile, err := loaded.GitHubProfileForRepository(run.Repository)
+		if err != nil {
+			return err
+		}
+		if err := profile.Config.Validate(); err != nil {
+			return errors.New("configured GitHub App credential source is unavailable")
+		}
+		observations := []application.GitHubRequestObservation{}
+		client, err := githubapp.New(profile.Config, githubapp.RealClock{}, func(o application.GitHubRequestObservation) {
+			o.RunID = run.ID
+			observations = append(observations, o)
+		})
+		if err != nil {
+			return err
+		}
+		readers = append(readers, githubReadAdapter{client: client, observations: &observations})
+		timeout = profile.Config.HTTPTimeout * 20
+	}
+	ctx, cancel := localContext(timeout)
 	defer cancel()
-	result, err := coordinator.Abandon(ctx, application.ProductionAbandonCommand{Requester: command.requester, RunID: command.run.ID, Repository: command.repository, ExpectedState: command.expectedState, IdempotencyKey: command.idempotencyKey}, cleanup)
+	childStopper := processadapter.AttemptStopper{}
+	result, err := coordinator.Abandon(ctx, application.ProductionAbandonCommand{Requester: requesterValue, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, cleanup, childStopper, readers...)
 	if err != nil {
 		return err
 	}

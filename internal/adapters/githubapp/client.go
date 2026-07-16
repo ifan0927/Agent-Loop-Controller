@@ -92,10 +92,10 @@ func (c *Client) read(ctx context.Context, pr int64, expectedHead string, handof
 	if err := c.rest(ctx, "pull_request", "GET", fmt.Sprintf("/repos/%s/%s/pulls/%d", c.cfg.RepositoryOwner, c.cfg.RepositoryName, pr), nil, &raw, true); err != nil {
 		return domain.GitHubReadEvidence{}, err
 	}
-	if raw.Base.Repo.ID != c.cfg.RepositoryID || raw.Head.Repo.ID != c.cfg.RepositoryID {
-		return domain.GitHubReadEvidence{}, errors.New("pull request head/base repository identity mismatch")
-	}
 	e := domain.GitHubReadEvidence{Repository: identity, PullRequest: raw.normalized(), ObservedAt: c.clock.Now().UTC()}
+	if raw.Base.Repo.ID != c.cfg.RepositoryID || raw.Head.Repo.ID != c.cfg.RepositoryID {
+		return e, errors.New("pull request head/base repository identity mismatch")
+	}
 	if e.PullRequest.DatabaseID < 1 || e.PullRequest.NodeID == "" {
 		return e, errors.New("pull request identity is incomplete")
 	}

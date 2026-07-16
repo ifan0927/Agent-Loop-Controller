@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -20,7 +21,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 26
+const schemaVersion = 27
 
 type Store struct{ db *sql.DB }
 
@@ -141,6 +142,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV25
 		case 26:
 			statements = migrationV26
+		case 27:
+			statements = migrationV27
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -220,6 +223,10 @@ var migrationV2 = []string{
 	`ALTER TABLE verifications ADD COLUMN stderr_hash TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE verifications ADD COLUMN stdout_size INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE verifications ADD COLUMN stderr_size INTEGER NOT NULL DEFAULT 0`,
+}
+
+var migrationV27 = []string{
+	`ALTER TABLE attempts ADD COLUMN process_control_key TEXT NOT NULL DEFAULT ''`,
 }
 
 var migrationV3 = []string{
@@ -1277,8 +1284,13 @@ func (s *Store) BeginAttempt(ctx context.Context, runID, kind, requestedModel, a
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(number),0)+1 FROM attempts WHERE run_id=?`, runID).Scan(&number); err != nil {
 		return application.Attempt{}, err
 	}
+	controlKeyBytes := make([]byte, 32)
+	if _, err := rand.Read(controlKeyBytes); err != nil {
+		return application.Attempt{}, errors.New("generate attempt process control key")
+	}
+	controlKey := hex.EncodeToString(controlKeyBytes)
 	now := nowText()
-	result, err := tx.ExecContext(ctx, `INSERT INTO attempts(run_id,number,kind,status,requested_model,started_at,artifact_dir) VALUES(?,?,?,'started',?,?,?)`, runID, number, kind, requestedModel, now, artifactDir)
+	result, err := tx.ExecContext(ctx, `INSERT INTO attempts(run_id,number,kind,status,requested_model,started_at,artifact_dir,process_control_key) VALUES(?,?,?,'prepared',?,?,?,?)`, runID, number, kind, requestedModel, now, artifactDir, controlKey)
 	if err != nil {
 		return application.Attempt{}, err
 	}
@@ -1286,7 +1298,16 @@ func (s *Store) BeginAttempt(ctx context.Context, runID, kind, requestedModel, a
 	if err := tx.Commit(); err != nil {
 		return application.Attempt{}, err
 	}
-	return application.Attempt{ID: id, RunID: runID, Number: number, Kind: kind, Status: "started", RequestedModel: requestedModel, StartedAt: parseTime(now), ArtifactDir: artifactDir}, nil
+	return application.Attempt{ID: id, RunID: runID, Number: number, Kind: kind, Status: "prepared", RequestedModel: requestedModel, StartedAt: parseTime(now), ArtifactDir: artifactDir, ProcessControlKey: controlKey}, nil
+}
+
+func (s *Store) CommitAttemptProcessLaunch(ctx context.Context, attemptID int64) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE attempts SET status='started' WHERE attempt_id=? AND status='prepared'`, attemptID)
+	if err != nil {
+		return false, err
+	}
+	count, err := result.RowsAffected()
+	return count == 1, err
 }
 
 func (s *Store) FinishAttempt(ctx context.Context, attempt application.Attempt) error {
@@ -2320,14 +2341,14 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 		inspection.Timeline = append(inspection.Timeline, v)
 	}
 	rows.Close()
-	rows, err = s.db.QueryContext(ctx, `SELECT attempt_id,run_id,number,kind,status,codex_session_id,requested_model,started_at,finished_at,exit_code,stdout_path,stderr_path,stdout_hash,stderr_hash,stdout_size,stderr_size,outcome_path,outcome_hash,artifact_dir,error_category FROM attempts WHERE run_id=? ORDER BY number`, id)
+	rows, err = s.db.QueryContext(ctx, `SELECT attempt_id,run_id,number,kind,status,codex_session_id,requested_model,started_at,finished_at,exit_code,stdout_path,stderr_path,stdout_hash,stderr_hash,stdout_size,stderr_size,outcome_path,outcome_hash,artifact_dir,error_category,process_control_key FROM attempts WHERE run_id=? ORDER BY number`, id)
 	if err != nil {
 		return inspection, err
 	}
 	for rows.Next() {
 		var v application.Attempt
 		var started, finished string
-		if err := rows.Scan(&v.ID, &v.RunID, &v.Number, &v.Kind, &v.Status, &v.SessionID, &v.RequestedModel, &started, &finished, &v.ExitCode, &v.StdoutPath, &v.StderrPath, &v.StdoutHash, &v.StderrHash, &v.StdoutSize, &v.StderrSize, &v.OutcomePath, &v.OutcomeHash, &v.ArtifactDir, &v.ErrorCategory); err != nil {
+		if err := rows.Scan(&v.ID, &v.RunID, &v.Number, &v.Kind, &v.Status, &v.SessionID, &v.RequestedModel, &started, &finished, &v.ExitCode, &v.StdoutPath, &v.StderrPath, &v.StdoutHash, &v.StderrHash, &v.StdoutSize, &v.StderrSize, &v.OutcomePath, &v.OutcomeHash, &v.ArtifactDir, &v.ErrorCategory, &v.ProcessControlKey); err != nil {
 			rows.Close()
 			return inspection, err
 		}

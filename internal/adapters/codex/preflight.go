@@ -53,15 +53,23 @@ func NewPreflighter(process processadapter.Runner, binary string) Preflighter {
 	return Preflighter{process: process, binary: binary}
 }
 
-func (p Preflighter) Run(ctx context.Context, artifacts string) (PreflightEvidence, error) {
+func (p Preflighter) Run(ctx context.Context, artifacts, processControlKey string) (PreflightEvidence, error) {
+	controlPath := func(name string) string {
+		if processControlKey == "" {
+			return ""
+		}
+		return filepath.Join(artifacts, name)
+	}
 	version, err := p.process.Run(ctx, processadapter.Spec{
 		Program: p.binary, Args: []string{"--version"},
 		StdoutPath:  filepath.Join(artifacts, "codex-version.stdout.txt"),
 		StderrPath:  filepath.Join(artifacts, "codex-version.stderr.txt"),
+		ControlPath: controlPath("codex-version.process-control.json"),
+		ControlKey:  []byte(processControlKey),
 		ExcludedEnv: controllerManagedExcludedEnvironment,
 	})
 	if err != nil {
-		return PreflightEvidence{}, newProcessFailure("version", processadapter.NormalizeResult(version, err))
+		return PreflightEvidence{}, newProcessFailure("version", processadapter.NormalizeResult(version, err), err)
 	}
 	version = processadapter.NormalizeResult(version, nil)
 	if !version.Valid() {
@@ -74,10 +82,12 @@ func (p Preflighter) Run(ctx context.Context, artifacts string) (PreflightEviden
 		Program: p.binary, Args: []string{"exec", "--help"},
 		StdoutPath:  filepath.Join(artifacts, "codex-exec-help.stdout.txt"),
 		StderrPath:  filepath.Join(artifacts, "codex-exec-help.stderr.txt"),
+		ControlPath: controlPath("codex-exec-help.process-control.json"),
+		ControlKey:  []byte(processControlKey),
 		ExcludedEnv: controllerManagedExcludedEnvironment,
 	})
 	if err != nil {
-		return PreflightEvidence{}, newProcessFailure("exec_help", processadapter.NormalizeResult(help, err))
+		return PreflightEvidence{}, newProcessFailure("exec_help", processadapter.NormalizeResult(help, err), err)
 	}
 	help = processadapter.NormalizeResult(help, nil)
 	if !help.Valid() {
@@ -101,10 +111,12 @@ func (p Preflighter) Run(ctx context.Context, artifacts string) (PreflightEviden
 		Program: p.binary, Args: []string{"exec", "resume", "--help"},
 		StdoutPath:  filepath.Join(artifacts, "codex-exec-resume-help.stdout.txt"),
 		StderrPath:  filepath.Join(artifacts, "codex-exec-resume-help.stderr.txt"),
+		ControlPath: controlPath("codex-exec-resume-help.process-control.json"),
+		ControlKey:  []byte(processControlKey),
 		ExcludedEnv: controllerManagedExcludedEnvironment,
 	})
 	if err != nil {
-		return PreflightEvidence{}, newProcessFailure("exec_resume_help", processadapter.NormalizeResult(resumeHelp, err))
+		return PreflightEvidence{}, newProcessFailure("exec_resume_help", processadapter.NormalizeResult(resumeHelp, err), err)
 	}
 	resumeHelp = processadapter.NormalizeResult(resumeHelp, nil)
 	if !resumeHelp.Valid() {

@@ -76,8 +76,10 @@ This milestone is recorded by the closed
 - Trusted I-Fan inline review feedback lifecycle, same-session repair, fresh
   review, idempotent GitHub App reply, and conversation-resolution wait.
 - Exact merge-SHA source checkout synchronization and partial cleanup recovery.
-- Typed pre-delivery abandon, owned repair-push recovery, and verified external
-  merge acceptance.
+- Graceful parked-run abandon with proven managed-child termination and guarded
+  local/remote ownership cleanup,
+  terminal residue attention, worker slot release, owned repair-push recovery,
+  and verified external merge acceptance.
 - Typed exhausted-retry recovery with durable operator intent and automatic
   worker resume through the normal driver.
 - Deterministic restart/fault fixtures for these boundaries.

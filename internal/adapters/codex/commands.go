@@ -17,15 +17,16 @@ const (
 var controllerManagedExcludedEnvironment = []string{"IFAN_LOOP_LINEAR_TOKEN"}
 
 type CommandSpec struct {
-	Program       string   `json:"program"`
-	Args          []string `json:"args"`
-	WorkingDir    string   `json:"working_dir"`
-	Stdin         string   `json:"stdin"`
-	StdoutFormat  string   `json:"stdout_format"`
-	StderrPolicy  string   `json:"stderr_policy"`
-	FreshSession  bool     `json:"fresh_session"`
-	ExpectedScope string   `json:"expected_scope"`
-	MustNotExist  []string `json:"must_not_exist_before_start"`
+	Program           string   `json:"program"`
+	Args              []string `json:"args"`
+	WorkingDir        string   `json:"working_dir"`
+	Stdin             string   `json:"stdin"`
+	StdoutFormat      string   `json:"stdout_format"`
+	StderrPolicy      string   `json:"stderr_policy"`
+	FreshSession      bool     `json:"fresh_session"`
+	ExpectedScope     string   `json:"expected_scope"`
+	MustNotExist      []string `json:"must_not_exist_before_start"`
+	ProcessControlKey string   `json:"-"`
 }
 
 type CommandBuilder struct {

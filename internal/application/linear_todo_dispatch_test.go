@@ -694,6 +694,19 @@ func TestLinearTodoDispatcherAdoptsReservedRunOnRestartWithoutScanning(t *testin
 	}
 }
 
+func TestLinearTodoDispatcherScansNextCandidateAfterAbandonedRunWithRetainedRetryAttention(t *testing.T) {
+	candidate := dispatchCandidate("after-abandon", "IFAN-74", 1)
+	dispatcher, store, scanner, _, _, driver := newDispatchLab(t, candidate)
+	now := store.now
+	store.run = authorizeDispatchRun(Run{ID: "run-abandoned", IssueID: "IFAN-OLD", IdempotencyKey: "abandoned-key", Repository: "owner/repo", State: domain.StateFailed})
+	store.retrySchedules = []RetrySchedule{{RunID: store.run.ID, Phase: "state_executing", ControllerState: string(domain.StateFailed), AttemptCount: 2, MaxAttempts: 1, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: RetryFailureManual, ReasonCode: RetryReasonManual, Status: RetryScheduleAttention, AttentionAt: now, CreatedAt: now.Add(-time.Minute), UpdatedAt: now}}
+
+	result, err := dispatcher.Dispatch(context.Background())
+	if err != nil || result.Outcome != LinearTodoDispatchDriven || scanner.calls != 1 || store.reserveCalls != 1 || len(driver.calls) != 1 || store.run.IssueID != candidate.Identifier {
+		t.Fatalf("result=%+v scanner=%d reserve=%d driver=%+v run=%+v err=%v", result, scanner.calls, store.reserveCalls, driver.calls, store.run, err)
+	}
+}
+
 func TestLinearTodoDispatcherStopsForManualAndDriverConflict(t *testing.T) {
 	for _, test := range []struct {
 		state      domain.State

@@ -288,7 +288,7 @@ func (w *offlineAdmissionWorktrees) calls() int {
 
 type offlineAdmissionCodex struct{}
 
-func (*offlineAdmissionCodex) Preflight(context.Context, string) (codex.PreflightEvidence, error) {
+func (*offlineAdmissionCodex) Preflight(context.Context, string, string) (codex.PreflightEvidence, error) {
 	return codex.PreflightEvidence{Version: "offline-fixture"}, nil
 }
 

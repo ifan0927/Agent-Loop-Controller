@@ -225,7 +225,10 @@ func TestOperatorActionMigrationFromV23CreatesEmptyJournal(t *testing.T) {
 	if _, err := store.db.Exec(`ALTER TABLE automatic_retry_schedules DROP COLUMN failure_evidence_ref`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.Exec(`DELETE FROM schema_migrations WHERE version IN (24,25,26)`); err != nil {
+	if _, err := store.db.Exec(`ALTER TABLE attempts DROP COLUMN process_control_key`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`DELETE FROM schema_migrations WHERE version IN (24,25,26,27)`); err != nil {
 		t.Fatal(err)
 	}
 	store.Close()
@@ -234,7 +237,7 @@ func TestOperatorActionMigrationFromV23CreatesEmptyJournal(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if version, err := store.SchemaVersion(context.Background()); err != nil || version != 26 {
+	if version, err := store.SchemaVersion(context.Background()); err != nil || version != schemaVersion {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	var count int

@@ -232,6 +232,9 @@ func (s *pushTestStore) Inspect(context.Context, string) (RunInspection, error) 
 	if len(result.Timeline) == 0 {
 		result.Timeline = append([]Transition(nil), s.transitions...)
 	}
+	if len(result.OperatorAttention) == 0 {
+		result.OperatorAttention = append([]OperatorAttentionEvent(nil), s.attention...)
+	}
 	return result, nil
 }
 func (s *pushTestStore) BeginSideEffect(_ context.Context, value SideEffectRecord) (SideEffectRecord, bool, error) {

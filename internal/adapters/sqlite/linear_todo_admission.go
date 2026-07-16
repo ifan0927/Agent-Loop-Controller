@@ -319,7 +319,7 @@ func (s *Store) AbandonAutomaticAdmission(ctx context.Context, request applicati
 	if request.ExpectedState == domain.StateFailed || run.State != request.ExpectedState {
 		return application.Run{}, false, errors.New("automatic admission abandonment state compare failed")
 	}
-	if request.ExpectedState != domain.StateReceived && request.ExpectedState != domain.StateAdmitting && request.ExpectedState != domain.StateManualIntervention {
+	if !application.GracefulAbandonState(request.ExpectedState) || request.ExpectedState == domain.StateFailed {
 		return application.Run{}, false, errors.New("automatic admission abandonment state is not eligible")
 	}
 
@@ -355,6 +355,9 @@ func (s *Store) AbandonAutomaticAdmission(ctx context.Context, request applicati
 		return application.Run{}, false, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE linear_todo_admission_journal SET status=?,mutation_intent_ref='',reason_code=?,updated_at=? WHERE run_id=? AND status=?`, application.LinearTodoAdmissionJournalManualIntervention, application.AutomaticAdmissionAbandonReason, now, run.ID, journal.Status); err != nil {
+		return application.Run{}, false, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE automatic_retry_schedules SET failure_class=?,failure_evidence_ref='',reason_code=?,status='attention',next_eligible_at='',next_eligible_unix_ns=0,attention_at=?,updated_at=? WHERE run_id=? AND status='scheduled'`, application.RetryFailureManual, application.RetryReasonManual, now, now, run.ID); err != nil {
 		return application.Run{}, false, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -408,13 +411,9 @@ func verifyAbandonmentTransitionTx(ctx context.Context, tx *sql.Tx, request appl
 func rejectAbandonmentDeliveryEvidenceTx(ctx context.Context, tx *sql.Tx, run application.Run) error {
 	var count int
 	for _, query := range []string{
-		`SELECT COUNT(*) FROM pull_requests WHERE run_id=?`,
 		`SELECT COUNT(*) FROM merge_results WHERE run_id=?`,
-		`SELECT COUNT(*) FROM human_approvals WHERE run_id=?`,
-		`SELECT COUNT(*) FROM human_approval_observations WHERE run_id=?`,
-		`SELECT COUNT(*) FROM trusted_review_reply_evidence WHERE run_id=?`,
-		`SELECT COUNT(*) FROM owned_resources WHERE owning_run=? AND resource_kind IN ('remote_branch','pull_request')`,
-		`SELECT COUNT(*) FROM side_effects WHERE run_id=? AND NOT (kind='linear_move_to_started' AND status IN ('observed','failed'))`,
+		`SELECT COUNT(*) FROM pull_requests WHERE run_id=? AND merged=1`,
+		`SELECT COUNT(*) FROM side_effects WHERE run_id=? AND kind='squash_merge'`,
 	} {
 		if err := tx.QueryRowContext(ctx, query, run.ID).Scan(&count); err != nil {
 			return err
@@ -468,7 +467,7 @@ func (s *Store) UpsertAutomaticAdmissionCleanup(ctx context.Context, owner strin
 // MarkAutomaticAdmissionResourceDeleted updates ownership under the same
 // active run lease fence as cleanup audit writes.
 func (s *Store) MarkAutomaticAdmissionResourceDeleted(ctx context.Context, owner string, resource application.OwnedResource) error {
-	if strings.TrimSpace(owner) == "" || strings.TrimSpace(resource.RunID) == "" || (resource.Kind != "worktree" && resource.Kind != "branch") || strings.TrimSpace(resource.Name) == "" || resource.Status != "deleted" {
+	if strings.TrimSpace(owner) == "" || strings.TrimSpace(resource.RunID) == "" || (resource.Kind != "worktree" && resource.Kind != "branch" && resource.Kind != "remote_branch" && resource.Kind != "pull_request") || strings.TrimSpace(resource.Name) == "" || resource.Status != "deleted" {
 		return errors.New("automatic admission cleanup resource update is invalid")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -489,6 +488,29 @@ func (s *Store) MarkAutomaticAdmissionResourceDeleted(ctx context.Context, owner
 	return tx.Commit()
 }
 
+func (s *Store) StopAutomaticAdmissionAttempts(ctx context.Context, runID, owner string, stoppedAt time.Time) (int64, error) {
+	if strings.TrimSpace(runID) == "" || strings.TrimSpace(owner) == "" || stoppedAt.IsZero() {
+		return 0, errors.New("automatic admission attempt stop authority is incomplete")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if err := fenceAutomaticAdmissionCleanupLeaseTx(ctx, tx, owner, runID); err != nil {
+		return 0, err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE attempts SET status='failed',finished_at=?,exit_code=-1,error_category=? WHERE run_id=? AND status IN ('prepared','started')`, formatTime(stoppedAt.UTC()), application.AutomaticAdmissionAbandonReason, runID)
+	if err != nil {
+		return 0, err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return count, tx.Commit()
+}
+
 func validateAutomaticAdmissionCleanupRecord(owner string, record application.CleanupRecord) error {
 	if strings.TrimSpace(owner) == "" || strings.TrimSpace(record.RunID) == "" || strings.TrimSpace(record.Name) == "" {
 		return errors.New("automatic admission cleanup audit authority is incomplete")
@@ -504,6 +526,16 @@ func validateAutomaticAdmissionCleanupRecord(owner string, record application.Cl
 		default:
 			return errors.New("automatic admission local cleanup status is invalid")
 		}
+	case "remote_branch":
+		switch record.Status {
+		case "intent", "failed", "deleted", "retained":
+		default:
+			return errors.New("automatic admission remote cleanup status is invalid")
+		}
+	case "pull_request":
+		if record.Status != "retained" && record.Status != "deleted" {
+			return errors.New("automatic admission pull request cleanup status is invalid")
+		}
 	default:
 		return errors.New("automatic admission cleanup kind is invalid")
 	}
@@ -512,7 +544,20 @@ func validateAutomaticAdmissionCleanupRecord(owner string, record application.Cl
 
 func fenceAutomaticAdmissionCleanupLeaseTx(ctx context.Context, tx *sql.Tx, owner, runID string) error {
 	now := time.Now().UTC()
-	result, err := tx.ExecContext(ctx, `UPDATE runs SET updated_at=updated_at WHERE run_id=? AND current_state=? AND lease_owner=? AND lease_expires_unix>?`, runID, domain.StateFailed, owner, leaseUnixNano(now))
+	var state string
+	if err := tx.QueryRowContext(ctx, `SELECT current_state FROM runs WHERE run_id=? AND lease_owner=? AND lease_expires_unix>?`, runID, owner, leaseUnixNano(now)).Scan(&state); err != nil {
+		return errors.New("automatic admission cleanup run lease was lost")
+	}
+	if !application.GracefulAbandonState(domain.State(state)) {
+		return errors.New("automatic admission cleanup run state is not eligible")
+	}
+	if domain.State(state) != domain.StateFailed {
+		var count int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM operator_actions WHERE run_id=? AND action_type=? AND status IN (?,?,?)`, runID, application.OperatorActionAbandon, application.OperatorActionStatusValidated, application.OperatorActionStatusApplied, application.OperatorActionStatusObserved).Scan(&count); err != nil || count != 1 {
+			return errors.New("automatic admission cleanup lacks operator abandon authority")
+		}
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET updated_at=updated_at WHERE run_id=? AND current_state=? AND lease_owner=? AND lease_expires_unix>?`, runID, state, owner, leaseUnixNano(now))
 	if err != nil {
 		return err
 	}
@@ -533,8 +578,21 @@ func isAbandonLocalCleanupEvidence(run application.Run, kind, name, status strin
 		return name == run.WorktreePath && abandonLocalCleanupStatus(status)
 	case "branch", "local_branch":
 		return name == run.WorkingBranch && abandonLocalCleanupStatus(status)
+	case "remote_branch":
+		return name == run.WorkingBranch && abandonRemoteCleanupStatus(status)
+	case "pull_request":
+		return status == "retained" || status == "deleted"
 	case "source_checkout":
 		return name == "configured_source_checkout" && abandonSourceCheckoutCleanupStatus(status)
+	default:
+		return false
+	}
+}
+
+func abandonRemoteCleanupStatus(status string) bool {
+	switch status {
+	case "intent", "failed", "deleted", "retained":
+		return true
 	default:
 		return false
 	}

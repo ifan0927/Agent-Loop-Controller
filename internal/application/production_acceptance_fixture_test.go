@@ -170,7 +170,7 @@ func TestOfflineAcceptanceSparseEnvironmentUsesManagedVerifierAndGitPaths(t *tes
 	}
 }
 
-func TestOfflineAcceptanceProductionAbandonReleasesReceivedAdmissionWithoutExternalMutation(t *testing.T) {
+func TestOfflineAcceptanceProductionAbandonTerminalizesWithResidueAndReplaysCleanup(t *testing.T) {
 	lab := newLocalLab(t)
 	store, err := storeadapter.Open(lab.db)
 	if err != nil {
@@ -178,6 +178,7 @@ func TestOfflineAcceptanceProductionAbandonReleasesReceivedAdmissionWithoutExter
 	}
 
 	repository := lab.repository
+	repository.CanonicalRepository = "owner/repo"
 	repository.ProfileID = "profile-test"
 	repository.ProfileSnapshotVersion = 1
 	repository.ProfileDigest = acceptanceDigest([]byte("profile"))
@@ -201,7 +202,7 @@ func TestOfflineAcceptanceProductionAbandonReleasesReceivedAdmissionWithoutExter
 		store.Close()
 		t.Fatal(err)
 	}
-	requester := application.Requester{ID: "operator", Kind: "github_login"}
+	requester := application.Requester{ID: "operator", Kind: "github_login", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
 	_, _, err = admission.Start(context.Background(), application.LinearStartCommand{Requester: requester, Identifier: source.Identifier})
 	if err != nil {
 		store.Close()
@@ -221,25 +222,84 @@ func TestOfflineAcceptanceProductionAbandonReleasesReceivedAdmissionWithoutExter
 		store.Close()
 		t.Fatal(err)
 	}
-	reader.source.State = application.LinearState{ID: "canceled", Name: "Canceled", Type: "canceled"}
-	reader.source.SourceRevision = source.SourceRevision + "-canceled"
-
-	cleanup := &acceptanceCleanupPort{}
-	result, err := coordinator.Abandon(context.Background(), application.ProductionAbandonCommand{Requester: requester, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, cleanup)
-	if err != nil || result.Action != application.ProductionAbandon || result.Run.State != domain.StateFailed || result.Idempotent || len(cleanup.calls) != 0 {
+	ownership, err := json.Marshal(map[string]string{"source_path": repository.SourcePath, "origin_path": repository.OriginPath, "path": run.WorktreePath, "branch": run.WorkingBranch, "base_branch": run.BaseBranch, "nonce": "abandon-fixture"})
+	if err != nil {
 		store.Close()
-		t.Fatalf("result=%+v cleanup=%v err=%v", result, cleanup.calls, err)
+		t.Fatal(err)
 	}
-	if reader.reads != 2 {
+	if err := store.AddOwnedResource(context.Background(), application.OwnedResource{RunID: run.ID, Kind: "branch", Name: run.WorkingBranch, CreationEvidence: string(ownership), Status: "reserved"}); err != nil {
 		store.Close()
-		t.Fatalf("Linear reads=%d want initial admission plus one abandon revalidation", reader.reads)
+		t.Fatal(err)
+	}
+	attempt, err := store.BeginAttempt(context.Background(), run.ID, "implementation", run.ImplementationModel, filepath.Join(run.ArtifactRoot, "attempt-1"))
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if committed, err := store.CommitAttemptProcessLaunch(context.Background(), attempt.ID); err != nil || !committed {
+		store.Close()
+		t.Fatalf("commit process launch: committed=%t err=%v", committed, err)
+	}
+	now := time.Now().UTC()
+	schedule := application.RetrySchedule{RunID: run.ID, Phase: application.AutomaticRetryPhaseForRun(run), ControllerState: string(run.State), AttemptCount: 4, MaxAttempts: 3, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: application.RetryFailureProcessStart, FailureEvidenceRef: "attempt:1", ReasonCode: application.RetryReasonBudgetExhausted, Status: application.RetryScheduleAttention, AttentionAt: now, CreatedAt: now.Add(-time.Minute), UpdatedAt: now}
+	event, err := application.AutomaticRetryAttentionEvent(run, schedule)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if _, err := store.AppendOperatorAttention(context.Background(), event); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	cleanup := &acceptanceCleanupPort{err: errors.New("simulated branch cleanup residue")}
+	stopper := &acceptanceChildStopper{}
+	result, err := coordinator.Abandon(context.Background(), application.ProductionAbandonCommand{Requester: requester, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, cleanup, stopper)
+	if err != nil || result.Action != application.ProductionAbandon || result.Run.State != domain.StateFailed || result.Idempotent || !result.ResidueAttention || len(cleanup.calls) != 1 {
+		debugInspection, _ := store.Inspect(context.Background(), run.ID)
+		store.Close()
+		t.Fatalf("result=%+v cleanup=%v progress=%+v resources=%+v err=%v", result, cleanup.calls, debugInspection.Cleanup, debugInspection.Resources, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller = &acceptancePersistingController{store: store, persist: false}
+	admission, err = application.NewLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, controller)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	coordinator, err = application.NewProductionCoordinator(admission, controller, store)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	cleanup.err = nil
+	replay := application.ProductionAbandonCommand{Requester: requester, RunID: run.ID, Repository: run.Repository, ExpectedState: domain.StateFailed, IdempotencyKey: run.IdempotencyKey}
+	second, err := coordinator.Abandon(context.Background(), replay, cleanup, stopper)
+	if err != nil || !second.Idempotent || !second.ResidueAttention || len(cleanup.calls) != 2 {
+		store.Close()
+		t.Fatalf("second=%+v cleanup=%v err=%v", second, cleanup.calls, err)
+	}
+	third, err := coordinator.Abandon(context.Background(), replay, cleanup, stopper)
+	if err != nil || !third.Idempotent || !third.ResidueAttention || len(cleanup.calls) != 2 {
+		store.Close()
+		t.Fatalf("third=%+v cleanup=%v err=%v", third, cleanup.calls, err)
+	}
+	if reader.reads != 4 {
+		store.Close()
+		t.Fatalf("Linear reads=%d want initial admission plus three abandon revalidations", reader.reads)
 	}
 	inspection, err := store.Inspect(context.Background(), run.ID)
 	if err != nil {
 		store.Close()
 		t.Fatal(err)
 	}
-	if len(inspection.SideEffects) != 0 || len(inspection.Resources) != 0 || len(inspection.OperatorAttention) != 0 {
+	attention, attentionErr := store.ListOperatorAttention(context.Background(), application.OperatorAttentionQueryInput{RunID: run.ID, Limit: 10})
+	if len(inspection.SideEffects) != 0 || len(inspection.Resources) != 1 || inspection.Resources[0].Status != "deleted" || len(inspection.Attempts) != 1 || inspection.Attempts[0].Status != "failed" || inspection.Attempts[0].ErrorCategory != application.AutomaticAdmissionAbandonReason || attentionErr != nil || len(attention) != 2 || attention[1].EventType != application.OperatorAttentionCleanupResidue || len(inspection.OperatorActions) != 1 || len(inspection.Cleanup) != 1 || inspection.Cleanup[0].Status != "deleted" {
 		store.Close()
 		t.Fatalf("abandon retained unexpected external evidence: %+v", inspection)
 	}
@@ -609,7 +669,12 @@ func (c *acceptancePersistingController) BoundRepairActionContext(ctx context.Co
 
 type acceptanceCleanupPort struct {
 	calls []string
+	err   error
 }
+
+type acceptanceChildStopper struct{}
+
+func (*acceptanceChildStopper) StopAttempt(context.Context, string, string) error { return nil }
 
 func (c *acceptanceCleanupPort) RemoveWorktree(context.Context, string, string, string, string) error {
 	c.calls = append(c.calls, "worktree")
@@ -618,7 +683,7 @@ func (c *acceptanceCleanupPort) RemoveWorktree(context.Context, string, string, 
 
 func (c *acceptanceCleanupPort) DeleteLocalBranch(context.Context, string, string, string) error {
 	c.calls = append(c.calls, "branch")
-	return nil
+	return c.err
 }
 
 func (c *acceptanceCleanupPort) DeleteRemoteBranch(context.Context, string, string, string) error {

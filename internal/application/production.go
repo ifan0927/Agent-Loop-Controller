@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
@@ -52,11 +53,12 @@ type ProductionResult struct {
 // transport or adapter details to the domain. It first revalidates the immutable
 // Linear source, then derives one legal action from durable state.
 type ProductionCoordinator struct {
-	admission  *LinearAdmissionService
-	controller LocalRunController
-	commands   CommandService
-	store      RunStore
-	publisher  OperatorAttentionPublisher
+	admission         *LinearAdmissionService
+	controller        LocalRunController
+	commands          CommandService
+	store             RunStore
+	publisher         OperatorAttentionPublisher
+	abandonCleanupTTL time.Duration
 }
 
 type productionStore interface {

@@ -14,7 +14,7 @@ import (
 )
 
 type CodexExecutor interface {
-	Preflight(context.Context, string) (codex.PreflightEvidence, error)
+	Preflight(context.Context, string, string) (codex.PreflightEvidence, error)
 	Implementation(context.Context, codex.CommandSpec, string) (codex.StructuredResult[domain.AgentOutcome], error)
 	Review(context.Context, codex.CommandSpec, string) (codex.StructuredResult[domain.ReviewOutcome], error)
 }
@@ -60,7 +60,7 @@ func (s Spike) Run(ctx context.Context, task domain.CodingTask, workspace, artif
 	if err := MaterializeArtifacts(plan.Artifacts); err != nil {
 		return SpikeResult{}, fmt.Errorf("materialize artifacts: %w", err)
 	}
-	preflight, err := s.codex.Preflight(ctx, artifacts)
+	preflight, err := s.codex.Preflight(ctx, artifacts, "")
 	if err != nil {
 		return SpikeResult{}, fmt.Errorf("Codex preflight: %w", err)
 	}

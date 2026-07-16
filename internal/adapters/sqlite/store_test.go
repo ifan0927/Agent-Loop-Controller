@@ -806,7 +806,7 @@ func TestMigratesLegacyCodeRabbitApprovalColumnWithoutLosingApproval(t *testing.
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE operator_actions`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (12,13,14,15,16,17,18,19,20,21,22,23,24,25,26)`); err != nil {
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE trusted_review_feedback_conflicts`); err != nil {
@@ -816,6 +816,9 @@ func TestMigratesLegacyCodeRabbitApprovalColumnWithoutLosingApproval(t *testing.
 		t.Fatal(err)
 	}
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE trusted_review_reply_evidence`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `ALTER TABLE attempts DROP COLUMN process_control_key`); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
@@ -1381,12 +1384,29 @@ func TestAttemptArtifactDirectoryCannotBeReused(t *testing.T) {
 	if _, _, err := store.CreateRun(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.BeginAttempt(context.Background(), "run-1", "implementation", "gpt-5.6-terra", "/tmp/run/attempt-1"); err != nil {
+	attempt, err := store.BeginAttempt(context.Background(), "run-1", "implementation", "gpt-5.6-terra", "/tmp/run/attempt-1")
+	if err != nil {
 		t.Fatal(err)
 	}
+	if len(attempt.ProcessControlKey) != 64 {
+		t.Fatalf("process control key length=%d", len(attempt.ProcessControlKey))
+	}
+	if attempt.Status != "prepared" {
+		t.Fatalf("attempt status=%q", attempt.Status)
+	}
+	if committed, err := store.CommitAttemptProcessLaunch(context.Background(), attempt.ID); err != nil || !committed {
+		t.Fatalf("commit process launch: committed=%t err=%v", committed, err)
+	}
+	if committed, err := store.CommitAttemptProcessLaunch(context.Background(), attempt.ID); err != nil || committed {
+		t.Fatalf("duplicate process launch commit: committed=%t err=%v", committed, err)
+	}
 	inspection, err := store.Inspect(context.Background(), "run-1")
-	if err != nil || len(inspection.Attempts) != 1 || inspection.Attempts[0].RequestedModel != "gpt-5.6-terra" {
-		t.Fatalf("requested model evidence not persisted: inspection=%+v err=%v", inspection, err)
+	if err != nil || len(inspection.Attempts) != 1 || inspection.Attempts[0].Status != "started" || inspection.Attempts[0].RequestedModel != "gpt-5.6-terra" || inspection.Attempts[0].ProcessControlKey != attempt.ProcessControlKey {
+		t.Fatalf("attempt control evidence was not persisted: err=%v", err)
+	}
+	public, err := json.Marshal(inspection)
+	if err != nil || bytes.Contains(public, []byte(attempt.ProcessControlKey)) {
+		t.Fatalf("process control key leaked into inspection JSON: err=%v", err)
 	}
 	if _, err := store.BeginAttempt(context.Background(), "run-1", "resume", "gpt-5.6-terra", "/tmp/run/attempt-1"); err == nil {
 		t.Fatal("artifact directory reuse must fail")

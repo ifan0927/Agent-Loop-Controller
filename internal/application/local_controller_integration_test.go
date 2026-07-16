@@ -147,6 +147,8 @@ type durableFakeProcess struct {
 	decisionOnFirstResume                         bool
 	noChangeOnResume                              bool
 	blockResumeUntilContextDone                   bool
+	failImplementationWithUnprovenProcessGroup    bool
+	failReviewWithUnprovenProcessGroup            bool
 	resumeStarted                                 chan struct{}
 	implementationCalls, resumeCalls, reviewCalls int
 	resumeArgs                                    []string
@@ -196,6 +198,9 @@ func (p *durableFakeProcess) Run(ctx context.Context, s processadapter.Spec) (pr
 			stdout = fmt.Sprintf("{\"type\":\"thread.started\",\"thread_id\":%q}\n", sessionID)
 		} else if argument(s.Args, "--sandbox") == "read-only" {
 			p.reviewCalls++
+			if p.failReviewWithUnprovenProcessGroup {
+				return processadapter.Result{Outcome: processadapter.OutcomeInterrupted, FailureCategory: processadapter.FailureInterrupted, ExitCode: -1, StdoutPath: s.StdoutPath, StderrPath: s.StderrPath}, errors.Join(processadapter.NewFailure(processadapter.FailureInterrupted), processadapter.ProcessGroupExitUnprovenError{})
+			}
 			p.reviewStdin = append(p.reviewStdin, s.Stdin)
 			head := gitHead(s.WorkingDir)
 			verdict, summary, findings := "pass", "ready", "[]"
@@ -210,6 +215,9 @@ func (p *durableFakeProcess) Run(ctx context.Context, s processadapter.Spec) (pr
 			stdout = fmt.Sprintf("{\"type\":\"thread.started\",\"thread_id\":\"review-session-%d\"}\n", p.reviewCalls)
 		} else {
 			p.implementationCalls++
+			if p.failImplementationWithUnprovenProcessGroup {
+				return processadapter.Result{Outcome: processadapter.OutcomeInterrupted, FailureCategory: processadapter.FailureInterrupted, ExitCode: -1, StdoutPath: s.StdoutPath, StderrPath: s.StderrPath}, errors.Join(processadapter.NewFailure(processadapter.FailureInterrupted), processadapter.ProcessGroupExitUnprovenError{})
+			}
 			if p.needsDecision {
 				writeLastMessage(s.Args, decisionOutcome)
 				stdout = "{\"type\":\"thread.started\",\"thread_id\":\"implementation-session\"}\n"
@@ -232,6 +240,64 @@ func (p *durableFakeProcess) Run(ctx context.Context, s processadapter.Spec) (pr
 		}
 	}
 	return processadapter.Result{Outcome: processadapter.OutcomeExited, ExitCode: 0, StdoutPath: s.StdoutPath, StderrPath: s.StderrPath}, nil
+}
+
+func TestUnprovenCodexProcessGroupRemainsStartedForOperatorAbandonment(t *testing.T) {
+	lab := newLocalLab(t)
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	process := &durableFakeProcess{failImplementationWithUnprovenProcessGroup: true}
+	controller := newController(t, store, lab, process, gitadapter.Workspace{})
+	if _, err := controller.Start(context.Background(), startInput(lab)); err == nil {
+		t.Fatal("unproven process-group exit must stop continuation")
+	}
+	inspection, err := store.Inspect(context.Background(), lab.snapshot.Task.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inspection.Attempts) != 1 || inspection.Attempts[0].Status != "started" || inspection.Attempts[0].ErrorCategory != "process_group_exit_unproven" {
+		t.Fatalf("attempts=%+v", inspection.Attempts)
+	}
+	if _, err := controller.Continue(context.Background(), lab.snapshot.Task.RunID, nil); err == nil || !strings.Contains(err.Error(), "operator abandonment is required") {
+		t.Fatalf("continue error=%v", err)
+	}
+	after, err := store.Inspect(context.Background(), lab.snapshot.Task.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.Attempts) != 1 || after.Attempts[0].Status != "started" || process.implementationCalls != 1 {
+		t.Fatalf("attempt was overwritten or execution repeated: attempts=%+v calls=%d", after.Attempts, process.implementationCalls)
+	}
+}
+
+func TestUnprovenReviewProcessGroupCannotBeRepeated(t *testing.T) {
+	lab := newLocalLab(t)
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	process := &durableFakeProcess{failReviewWithUnprovenProcessGroup: true}
+	controller := newController(t, store, lab, process, gitadapter.Workspace{})
+	if _, err := controller.Start(context.Background(), startInput(lab)); err == nil {
+		t.Fatal("unproven review process-group exit must stop continuation")
+	}
+	inspection, err := store.Inspect(context.Background(), lab.snapshot.Task.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inspection.Attempts) != 2 || inspection.Attempts[1].Kind != "review" || inspection.Attempts[1].Status != "started" || inspection.Attempts[1].ErrorCategory != "process_group_exit_unproven" {
+		t.Fatalf("attempts=%+v", inspection.Attempts)
+	}
+	if _, err := controller.Continue(context.Background(), lab.snapshot.Task.RunID, nil); err == nil || !strings.Contains(err.Error(), "operator abandonment is required") {
+		t.Fatalf("continue error=%v", err)
+	}
+	if process.reviewCalls != 1 {
+		t.Fatalf("review calls=%d", process.reviewCalls)
+	}
 }
 
 const completedOutcome = `{"status":"completed","summary":"implemented","decision_request":null,"discovered_issues":[],"suggested_checks":[],"implementation_sha":null}`
@@ -1200,8 +1266,12 @@ func TestRestartRecoversStartedAttemptSessionAndResumesExplicitly(t *testing.T) 
 	if err := os.Mkdir(directory, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.BeginAttempt(context.Background(), run.ID, "implementation", codex.ImplementationModel, directory); err != nil {
+	attempt, err := store.BeginAttempt(context.Background(), run.ID, "implementation", codex.ImplementationModel, directory)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if committed, err := store.CommitAttemptProcessLaunch(context.Background(), attempt.ID); err != nil || !committed {
+		t.Fatalf("commit process launch: committed=%t err=%v", committed, err)
 	}
 	mustWrite(t, filepath.Join(directory, "implementation.stdout.jsonl"), "{\"type\":\"thread.started\",\"thread_id\":\"recovered-session\"}\n")
 	mustWrite(t, filepath.Join(directory, "implementation.stderr.txt"), "")
@@ -1230,6 +1300,42 @@ func TestRestartRecoversStartedAttemptSessionAndResumesExplicitly(t *testing.T) 
 	}
 	if !found {
 		t.Fatal("recovered interrupted attempt evidence missing")
+	}
+}
+
+func TestRestartClosesPreparedAttemptWithoutProcessStopEvidence(t *testing.T) {
+	lab := newLocalLab(t)
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	process := &durableFakeProcess{}
+	wrapper := &failAfterTransitionStore{RunStore: store, from: domain.StateProvisioning, to: domain.StateExecuting, remaining: 1}
+	run, err := newController(t, wrapper, lab, process, gitadapter.Workspace{}).Start(context.Background(), startInput(lab))
+	if err == nil || run.State != domain.StateExecuting {
+		t.Fatalf("run=%+v err=%v", run, err)
+	}
+	prepared, err := store.BeginAttempt(context.Background(), run.ID, "implementation", codex.ImplementationModel, filepath.Join(run.ArtifactRoot, "attempts", "prepared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err = newController(t, store, lab, process, gitadapter.Workspace{}).Continue(context.Background(), run.ID, nil)
+	if err != nil || run.State != domain.StateApprovalReady {
+		t.Fatalf("run=%+v err=%v", run, err)
+	}
+	inspection, err := store.Inspect(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, attempt := range inspection.Attempts {
+		if attempt.ID == prepared.ID {
+			found = attempt.Status == "failed" && attempt.ErrorCategory == "controller_restart_before_process_launch" && !attempt.FinishedAt.IsZero()
+		}
+	}
+	if !found {
+		t.Fatalf("prepared attempt was not closed: %+v", inspection.Attempts)
 	}
 }
 

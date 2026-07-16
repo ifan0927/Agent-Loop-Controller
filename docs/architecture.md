@@ -223,7 +223,8 @@ not a general operator override.
 - `completed`: merge, Linear completion, and required cleanup evidence are done.
 - `rejected`: admission rejected the task before delivery.
 - `failed`: terminal execution/admission failure or an explicit eligible
-  pre-delivery abandon.
+  graceful abandon. Cleanup residue remains separately visible and does not
+  retain the singleton active-run slot.
 
 ### Narrow recovery edges
 
@@ -647,7 +648,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 26; migration history is code, not a
+inspection. The current schema is version 27; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees
@@ -665,7 +666,19 @@ review commands; preflights required CLI flags/version; materializes embedded
 schemas; captures JSONL and stderr separately; extracts session evidence; and
 validates structured outcomes. Current policy requests `gpt-5.6-terra` for
 implementation/resume and `gpt-5.6-sol` for every fresh review. Managed runs
-ignore global user configuration.
+ignore global user configuration. Every Codex preflight and execution process
+is associated with a controller-locked lifecycle record in its attempt
+directory. A controller-owned launch supervisor blocks on a private gate until
+the parent persists that record, so parent death before release cannot execute
+the requested target. The supervisor remains the authenticated group leader,
+drains the trusted Codex target and other members of its process group before
+reporting completion, and prevents a leaderless live group. This boundary does
+not claim containment of a trusted executable that deliberately detaches into
+another process group or session; adversarial executable isolation is outside
+the local macOS MVP. Only the controller retains the separate lock descriptor; a
+restart may claim its authenticated inode after the prior controller releases
+it. This lets graceful abandon interrupt the exact surviving process group and
+prove it exited without trusting a reusable PID alone.
 
 ### Linear
 
@@ -770,8 +783,49 @@ inspectable without storing command arguments, paths, prose, or secrets. This
 journal is distinct from automatic state transitions and side effects, so notification
 delivery or an automatic controller step cannot be mistaken for human
 authorization. The operator journal supplies this shared persistence and
-application composition foundation. Typed retry composes it with the automatic schedule;
-abandon and other recovery commands remain separate dedicated use cases.
+application composition foundation. Typed retry composes it with the automatic
+schedule. Graceful abandon composes the same journal with guarded ownership
+cleanup: it records intent, attempts only proven-safe resources, terminalizes
+even when cleanup is retained or fails, and publishes residue attention without
+an advertised workflow action. Successful cleanup is not repeated after a
+restart; artifacts and authority evidence remain queryable. An attempt is first
+persisted as `prepared`, which proves that no process launch was authorized.
+Immediately before the first Codex preflight, the controller durably commits it
+to `started`; only started attempts require OS-process stop proof. Started Codex
+attempts carry an authenticated controller-owned process identity. A random
+per-attempt key remains in SQLite and authenticates the process group, exact
+kernel start identity, bound lock inode, and exact per-attempt launch roster.
+Every roster entry is required during stop proof, so an older completed
+preflight record cannot hide missing current execution evidence. The launch
+supervisor cannot execute the target before this identity is durable. The
+controller retains its lock on
+a private open-file description never inherited by the child, so the child
+cannot unlock or replace controller authority; after a controller crash, the
+next controller claims the same authenticated inode before signaling.
+After action intent is durable, caller cancellation no longer controls the
+bounded terminalization context. Cleanup has a narrower deadline than the
+terminal transition, so exhausting its budget becomes residue rather than
+stranding the singleton slot. Crash replay repairs an action result from the
+persisted terminal transition before returning idempotent success.
+Cleanup begins only after the authenticated identity
+proves exit; missing, corrupt, or mismatched stop evidence, an orphan launch
+lock, or a leaderless live process group retains all mutable resources. Exact
+kernel identity, the leader's current kernel process-group membership,
+process-group existence, and lock authority are rechecked before every signal
+and throughout bounded exit proof. Remote
+branches without a freshly observed open, owned,
+unmerged PR are likewise retained instead of being treated as safe deletion
+candidates; the mutation-authorizing read occurs after local cleanup and
+immediately before the guarded remote deletion and terminal CAS. Failure or
+authority drift on that final read retains remote residue but does not strand
+the already-partially-cleaned run outside the terminal abandonment state. A
+persisted remote-deletion intent is replayable across the narrow delete/result
+crash window: only after managed-child exit proof does exact ownership plus a
+fresh observed ref absence close the journal, and
+only an authenticated current unmerged PR status may tolerate the now-missing
+head identity. Once terminal, cleanup replay requires the current persisted
+cleanup-residue attention; otherwise it is a no-op and cannot probe or mutate
+owned resources.
 
 ### Hermes integration boundary
 
@@ -841,8 +895,10 @@ creates a fail-closed stop rather than reconstruction by guesswork.
 
 Normal recovery is `controller drive <run-id>`: it derives the next action from
 SQLite. Low-level commands expose the same coordinator methods for audited
-incident response and fault injection; they require requester identity,
-repository, expected state, and persisted idempotency key.
+incident response and fault injection. Most require caller-supplied repository,
+expected state, and persisted idempotency key; typed `retry` and `abandon` load
+those compare-and-swap authorities from SQLite after authenticating the
+requester and bind the action to the exact parked attention event.
 
 `recover-owned-push`, `accept-external-merge`, and `abandon` are typed recovery
 policies, not generic state editing. No supported operation requires or permits
