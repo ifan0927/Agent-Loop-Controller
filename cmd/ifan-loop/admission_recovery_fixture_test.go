@@ -106,6 +106,29 @@ func TestOfflineAcceptanceWorkerRestartPreservesRetryAndParksAtDurableAttention(
 	if err != nil || !found || journal.Status != "started" {
 		t.Fatalf("journal=%+v found=%t err=%v", journal, found, err)
 	}
+	retryService, err := application.NewOperatorRetryService(store, acceptanceRetryRevalidator{run: runs[0]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requester := application.Requester{ID: "operator", Kind: "github_login", DatabaseID: 33, NodeID: "MDQ6VXNlcjMz", ActorType: "User"}
+	retried, err := retryService.Retry(ctx, application.OperatorRetryCommand{Requester: requester, RunID: runs[0].ID})
+	if err != nil || retried.Action.Status != application.OperatorActionStatusObserved || retried.Retry == nil || retried.Retry.Status != application.RetryScheduleScheduled {
+		t.Fatalf("operator retry=%+v err=%v", retried, err)
+	}
+	second.driver.succeed = true
+	resumed, err := runAdmissionWorker(ctx, true, time.Minute, second.dispatcher.Dispatch, wait)
+	if err != nil || resumed.LastOutcome != application.LinearTodoDispatchDriven || resumed.Cycles != 1 || second.driver.calls() != 2 {
+		t.Fatalf("automatic resume=%+v driver=%d err=%v", resumed, second.driver.calls(), err)
+	}
+	if schedules, err := store.ListRetrySchedules(ctx); err != nil || len(schedules) != 0 {
+		t.Fatalf("consumed retry schedules=%+v err=%v", schedules, err)
+	}
+}
+
+type acceptanceRetryRevalidator struct{ run application.Run }
+
+func (r acceptanceRetryRevalidator) RevalidateForOperatorRetry(context.Context, application.LinearRevalidateCommand) (application.Run, error) {
+	return r.run, nil
 }
 
 type acceptanceRetryWorkerFixture struct {
@@ -122,7 +145,7 @@ func newAcceptanceRetryWorkerFixture(t *testing.T, store *storeadapter.Store, re
 	scanner := &offlineAdmissionScanner{scan: application.LinearTodoCandidateScan{Candidates: []application.LinearTodoCandidate{candidate}, Digest: offlineAdmissionDigest("recovery-scan"), ObservedAt: candidate.UpdatedAt}}
 	starter := &offlineAdmissionStarter{reader: reader}
 	worktrees := &offlineAdmissionWorktrees{}
-	driver := &acceptanceRetryDriver{}
+	driver := &acceptanceRetryDriver{store: store}
 	controller := application.NewLocalController(store, worktrees, &acceptanceRetryCodex{}, offlineAdmissionVerifier{}, offlineAdmissionGit{}, "fixture-codex", repository.WorktreeRoot)
 	dispatcher, err := newAcceptanceRetryDispatcher(scanner, reader, starter, store, controller, driver, repository, owner)
 	if err != nil {
@@ -132,14 +155,27 @@ func newAcceptanceRetryWorkerFixture(t *testing.T, store *storeadapter.Store, re
 }
 
 type acceptanceRetryDriver struct {
-	mu    sync.Mutex
-	count int
+	mu      sync.Mutex
+	count   int
+	store   *storeadapter.Store
+	succeed bool
 }
 
-func (d *acceptanceRetryDriver) Drive(context.Context, application.ProductionDriveCommand) (application.ProductionDriveResult, error) {
+func (d *acceptanceRetryDriver) Drive(ctx context.Context, command application.ProductionDriveCommand) (application.ProductionDriveResult, error) {
 	d.mu.Lock()
 	d.count++
+	succeed := d.succeed
 	d.mu.Unlock()
+	if succeed {
+		return application.ProductionDriveResult{}, nil
+	}
+	if d.store != nil {
+		attempt, err := d.store.BeginAttempt(ctx, command.RunID, "implementation", "fixture", "fixture")
+		if err == nil {
+			attempt.Status, attempt.ErrorCategory, attempt.ExitCode, attempt.FinishedAt = "failed", application.RetryReasonProcessStart, -1, time.Now().UTC()
+			_ = d.store.FinishAttempt(ctx, attempt)
+		}
+	}
 	return application.ProductionDriveResult{}, acceptanceRetryFailure{}
 }
 

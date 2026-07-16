@@ -305,12 +305,26 @@ priority, incomplete scans, conflicts, and exhaustion stop for attention.
 Human-decision and manual-intervention states are parked with transition-bound
 attention; GitHub approval remains inside the production driver's bounded poll
 loop. Every dispatch cycle releases its short scheduler lease before waiting.
-After an authorized operator mutation, the next worker cycle resumes the same
-run through the normal production driver without a separate drive command.
+An authenticated `retry` action is deliberately narrower than general recovery:
+it accepts only a current `retry_budget_exhausted` attention whose retained
+failure class is `process_start`, with matching failed-attempt or verifier
+process evidence identified by an exact persisted record reference while the
+run remains before GitHub delivery authority, or
+`unavailable` at the pre-provision admission boundary
+where a successful fresh Linear read rechecks the dependency. The controller revalidates
+Linear source, run/repository/key/state, transition sequence, local ownership,
+and resolved side-effect evidence before atomically changing that exact
+schedule to typed `operator_retry` eligibility. The attempt count, retry limit,
+deadlines, state, and prior evidence are not reset. After the journaled action,
+the next worker cycle resumes the same run through the normal production driver
+without a separate drive command. A repeated failure increments the retained
+attempt and produces a new stable attention event instead of looping.
 
 **Key invariants**
 
 No preemption, FIFO fallback, arbitrary tie-break, or more than one active run.
+Retry cannot answer a human decision, approve or merge a PR, abandon a run, or
+adopt unrelated external state.
 
 ### Local controller
 
@@ -633,7 +647,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 24; migration history is code, not a
+inspection. The current schema is version 26; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees
@@ -755,9 +769,9 @@ payload/applied-evidence/outcome digests make incomplete or ambiguous outcomes
 inspectable without storing command arguments, paths, prose, or secrets. This
 journal is distinct from automatic state transitions and side effects, so notification
 delivery or an automatic controller step cannot be mistaken for human
-authorization. Schema 24 supplies this shared persistence and application
-composition foundation; typed retry and abandon execution remain separate
-command use cases.
+authorization. The operator journal supplies this shared persistence and
+application composition foundation. Typed retry composes it with the automatic schedule;
+abandon and other recovery commands remain separate dedicated use cases.
 
 ### Hermes integration boundary
 

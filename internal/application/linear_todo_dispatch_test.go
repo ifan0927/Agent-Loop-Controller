@@ -122,11 +122,12 @@ func (c *dispatchController) BoundRepairActionContext(ctx context.Context, _ str
 }
 
 type dispatchDriver struct {
-	mu      sync.Mutex
-	calls   []ProductionDriveCommand
-	err     error
-	started chan struct{}
-	allow   chan struct{}
+	mu          sync.Mutex
+	calls       []ProductionDriveCommand
+	err         error
+	beforeError func(ProductionDriveCommand)
+	started     chan struct{}
+	allow       chan struct{}
 }
 
 func (d *dispatchDriver) Drive(ctx context.Context, command ProductionDriveCommand) (ProductionDriveResult, error) {
@@ -145,6 +146,9 @@ func (d *dispatchDriver) Drive(ctx context.Context, command ProductionDriveComma
 		}
 	}
 	if d.err != nil {
+		if d.beforeError != nil {
+			d.beforeError(command)
+		}
 		return ProductionDriveResult{}, d.err
 	}
 	return ProductionDriveResult{Run: RunResult{RunID: command.RunID}, Action: ProductionStop}, nil
@@ -165,6 +169,7 @@ type dispatchStore struct {
 	adoptCalls             int
 	continues              int
 	side                   SideEffectRecord
+	attempts               []Attempt
 	attention              []OperatorAttentionEvent
 	retrySchedules         []RetrySchedule
 	leaseLost              bool
@@ -302,7 +307,7 @@ func (s *dispatchStore) Inspect(_ context.Context, runID string) (RunInspection,
 	if s.run.ID != runID {
 		return RunInspection{}, ErrRunNotFound
 	}
-	inspection := RunInspection{Run: s.run}
+	inspection := RunInspection{Run: s.run, Attempts: append([]Attempt(nil), s.attempts...)}
 	if s.run.State == domain.StateManualIntervention {
 		inspection.Timeline = []Transition{{Sequence: 2, From: domain.StateReceived, To: domain.StateManualIntervention, Reason: "operator decision required", EvidenceReference: "linear_issue_start", CreatedAt: s.run.UpdatedAt}}
 	} else if s.run.State == domain.StateAwaitingHumanDecision && !s.omitDecisionTransition {
@@ -418,6 +423,7 @@ func (s *dispatchStore) ApplyRetryFailure(_ context.Context, request RetryFailur
 		schedule := current
 		schedule.ControllerState, schedule.AttemptCount, schedule.UpdatedAt = string(request.ControllerState), attempt, request.Now
 		schedule.FailureClass, schedule.ReasonCode = request.FailureClass, request.ReasonCode
+		schedule.FailureEvidenceRef = request.FailureEvidenceRef
 		if RetryFailureIsRetryable(request.FailureClass) && attempt <= schedule.MaxAttempts {
 			schedule.Status, schedule.NextEligibleAt, schedule.AttentionAt = RetryScheduleScheduled, next, time.Time{}
 		} else {
@@ -432,6 +438,7 @@ func (s *dispatchStore) ApplyRetryFailure(_ context.Context, request RetryFailur
 	policy := request.Policy.normalized()
 	attempt := 1
 	schedule := RetrySchedule{RunID: request.RunID, Phase: request.Phase, ControllerState: string(request.ControllerState), AttemptCount: attempt, MaxAttempts: policy.MaxAttempts, InitialDelay: policy.InitialDelay, MaximumDelay: policy.MaximumDelay, FailureClass: request.FailureClass, ReasonCode: request.ReasonCode, CreatedAt: request.Now, UpdatedAt: request.Now}
+	schedule.FailureEvidenceRef = request.FailureEvidenceRef
 	if RetryFailureIsRetryable(request.FailureClass) && attempt <= policy.MaxAttempts {
 		schedule.Status, schedule.NextEligibleAt = RetryScheduleScheduled, request.Now.Add(AutomaticRetryDelay(policy, attempt))
 	} else {

@@ -796,6 +796,69 @@ ifan-loop controller <command> <run-id> [--config <file>] <requester flags> \
 `cleanup` each invoke one coordinator action. A mismatched state either reports
 the derived action or fails; it cannot be used to jump ahead.
 
+### `controller retry`
+
+**Purpose**
+
+Grant one additional, auditable execution eligibility to a run parked because
+its typed automatic retry budget was exhausted.
+
+**When to use**
+
+Only when `controller inspect` shows the current automatic retry schedule in
+`attention` with reason `retry_budget_exhausted` and failure class
+`process_start` while the run is still between `received` and `approval_ready`,
+before GitHub delivery authority, or `unavailable` while still in `received` or
+`admitting`. Once push or pull-request delivery begins, use the state-specific
+inspection and recovery path instead of this command.
+
+**Syntax**
+
+```sh
+ifan-loop controller retry '<run-id>' [--config <file>] <requester flags>
+```
+
+**Required arguments and flags**
+
+The run ID and all requester identity flags. Repository, state, transition
+sequence, Linear revision, idempotency key, retry reason, and local ownership
+come only from persisted controller authority; this command does not accept
+caller-supplied replacements.
+
+**Example**
+
+```sh
+ifan-loop controller retry '<run-id>' \
+  --requester ifan0927 --requester-database-id 123 \
+  --requester-node-id '<github-node-id>' --requester-type User
+```
+
+**What it does**
+
+Revalidates the requester, unchanged Linear source, exact run authority,
+current attention, resolved side effects, and controller-owned local resources.
+It first records the typed operator intent, then atomically marks that exact
+exhausted schedule as immediately eligible with reason `operator_retry`. A
+running worker detects the persisted eligibility on its next poll and resumes
+the normal production driver automatically.
+
+**Possible durable stop states**
+
+The controller state is unchanged by the command. The schedule becomes
+`scheduled`; after the worker runs, normal driver states apply. If that attempt
+fails again, its incremented attempt receives a new stable attention event.
+
+**Safety notes**
+
+The command does not rewind state, delete evidence, reset attempts or limits,
+answer human decisions, approve or merge, abandon, or override authority and
+integrity failures. It cannot unlock push, pull-request, review, or merge
+states. Exact replay returns the same journaled result.
+
+**Related commands**
+
+`controller inspect`, `controller worker`, `controller drive`.
+
 ### `controller continue`
 
 **Purpose**
@@ -1835,11 +1898,13 @@ stable fail-closed reason.
 answers. It shows the allowlisted action, immutable requester identity, exact
 attention/reason and transition binding, lifecycle/result, resulting
 state/sequence, separate sanitized applied-evidence/outcome digests, and
-received/validated/applied/observed times. It never exposes the action or run
+the exact persisted retry eligibility plus received/validated/applied/observed
+times. It never exposes the action or run
 idempotency key, raw CLI arguments, paths, prose, or credentials. An entry is
 human-action provenance; ordinary timeline transitions and external side
-effects remain automatic/controller evidence. The journal is currently a shared foundation for the typed recovery
-commands, not a generic state-mutation interface.
+effects remain automatic/controller evidence. `controller retry` consumes this
+journal; other recovery commands retain their dedicated boundaries. It is not a
+generic state-mutation interface.
 
 The persisted idempotency key is controller authority for an authenticated
 recovery command, not a credential for an external service. Keep it run-scoped

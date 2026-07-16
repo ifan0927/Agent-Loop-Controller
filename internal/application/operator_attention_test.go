@@ -38,7 +38,7 @@ func TestOperatorAttentionProducerMappingsAreAllowlistedAndDeterministic(t *test
 func TestAutomaticRetryAttentionAdvertisesOnlyTypedPresentationActions(t *testing.T) {
 	run := operatorAttentionTestRun(t, domain.StateExecuting)
 	now := time.Date(2026, 7, 15, 1, 2, 3, 0, time.UTC)
-	schedule := RetrySchedule{RunID: run.ID, Phase: AutomaticRetryPhaseForRun(run), ControllerState: string(run.State), AttemptCount: 4, MaxAttempts: 3, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: RetryFailureProcessStart, ReasonCode: RetryReasonBudgetExhausted, Status: RetryScheduleAttention, AttentionAt: now, CreatedAt: now.Add(-time.Minute), UpdatedAt: now}
+	schedule := RetrySchedule{RunID: run.ID, Phase: AutomaticRetryPhaseForRun(run), ControllerState: string(run.State), AttemptCount: 4, MaxAttempts: 3, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: RetryFailureProcessStart, FailureEvidenceRef: "attempt:1", ReasonCode: RetryReasonBudgetExhausted, Status: RetryScheduleAttention, AttentionAt: now, CreatedAt: now.Add(-time.Minute), UpdatedAt: now}
 	event, err := AutomaticRetryAttentionEvent(run, schedule)
 	if err != nil {
 		t.Fatal(err)
@@ -60,7 +60,7 @@ func TestOperatorAttentionPreservesEveryRetryControllerState(t *testing.T) {
 	for _, state := range []domain.State{domain.StateReplyingReviewFeedback, domain.StateAwaitingLinearCompletion} {
 		t.Run(string(state), func(t *testing.T) {
 			run := operatorAttentionTestRun(t, state)
-			schedule := RetrySchedule{RunID: run.ID, Phase: AutomaticRetryPhaseForRun(run), ControllerState: string(state), AttemptCount: 4, MaxAttempts: 3, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: RetryFailureProcessStart, ReasonCode: RetryReasonBudgetExhausted, Status: RetryScheduleAttention, AttentionAt: now, CreatedAt: now.Add(-time.Minute), UpdatedAt: now}
+			schedule := RetrySchedule{RunID: run.ID, Phase: AutomaticRetryPhaseForRun(run), ControllerState: string(state), AttemptCount: 4, MaxAttempts: 3, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: RetryFailureProcessStart, FailureEvidenceRef: "attempt:1", ReasonCode: RetryReasonBudgetExhausted, Status: RetryScheduleAttention, AttentionAt: now, CreatedAt: now.Add(-time.Minute), UpdatedAt: now}
 			event, err := AutomaticRetryAttentionEvent(run, schedule)
 			if err != nil || event.ControllerState != string(state) || !equalOperatorAttentionActions(event.AllowedActions, []OperatorAttentionActionID{OperatorAttentionActionRetry, OperatorAttentionActionAbandon}) {
 				t.Fatalf("event=%+v err=%v", event, err)

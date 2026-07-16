@@ -19,7 +19,7 @@ func TestOperatorActionJournalBindsAuthorityReplaysAndSurvivesRestart(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	input := operatorActionInput(run, event, sequence, application.OperatorActionRetry)
+	input := operatorActionInput(run, event, sequence, application.OperatorActionAbandon)
 	first, created, err := service.Prepare(context.Background(), input)
 	if err != nil || !created || first.Status != application.OperatorActionStatusValidated || first.ResultStatus != application.OperatorActionResultPending {
 		t.Fatalf("first=%+v created=%t err=%v", first, created, err)
@@ -68,7 +68,7 @@ func TestOperatorActionJournalBindsAuthorityReplaysAndSurvivesRestart(t *testing
 		t.Fatalf("inspection=%+v err=%v", inspection.OperatorActions, err)
 	}
 	raw, _ := json.Marshal(inspection.OperatorActions[0])
-	if strings.Contains(string(raw), run.IdempotencyKey) || strings.Contains(string(raw), first.IdempotencyKey) || !strings.Contains(string(raw), `"action_type":"retry"`) {
+	if strings.Contains(string(raw), run.IdempotencyKey) || strings.Contains(string(raw), first.IdempotencyKey) || !strings.Contains(string(raw), `"action_type":"abandon"`) {
 		t.Fatalf("unsafe projection=%s", raw)
 	}
 }
@@ -106,7 +106,7 @@ func TestOperatorActionJournalRejectsHistoricalAttentionAndAcceptsCurrentBeyondP
 	var current application.OperatorAttentionEvent
 	for attempt := 5; attempt <= 105; attempt++ {
 		at := time.Date(2026, 7, 16, 13, 0, attempt, 0, time.UTC)
-		schedule := application.RetrySchedule{RunID: run.ID, Phase: application.AutomaticRetryPhaseForRun(run), ControllerState: string(run.State), AttemptCount: attempt, MaxAttempts: 3, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: application.RetryFailureProcessStart, ReasonCode: application.RetryReasonBudgetExhausted, Status: application.RetryScheduleAttention, AttentionAt: at, CreatedAt: at.Add(-time.Minute), UpdatedAt: at}
+		schedule := application.RetrySchedule{RunID: run.ID, Phase: application.AutomaticRetryPhaseForRun(run), ControllerState: string(run.State), AttemptCount: attempt, MaxAttempts: 3, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: application.RetryFailureProcessStart, FailureEvidenceRef: "attempt:1", ReasonCode: application.RetryReasonBudgetExhausted, Status: application.RetryScheduleAttention, AttentionAt: at, CreatedAt: at.Add(-time.Minute), UpdatedAt: at}
 		event, err := application.AutomaticRetryAttentionEvent(run, schedule)
 		if err != nil {
 			t.Fatal(err)
@@ -222,7 +222,10 @@ func TestOperatorActionMigrationFromV23CreatesEmptyJournal(t *testing.T) {
 	if _, err := store.db.Exec(`DROP TABLE operator_actions`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.Exec(`DELETE FROM schema_migrations WHERE version=24`); err != nil {
+	if _, err := store.db.Exec(`ALTER TABLE automatic_retry_schedules DROP COLUMN failure_evidence_ref`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`DELETE FROM schema_migrations WHERE version IN (24,25,26)`); err != nil {
 		t.Fatal(err)
 	}
 	store.Close()
@@ -231,7 +234,7 @@ func TestOperatorActionMigrationFromV23CreatesEmptyJournal(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if version, err := store.SchemaVersion(context.Background()); err != nil || version != 24 {
+	if version, err := store.SchemaVersion(context.Background()); err != nil || version != 26 {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	var count int
@@ -260,7 +263,14 @@ func operatorActionFixture(t *testing.T, path string) (*Store, application.Run, 
 	run = inspection.Run
 	sequence := inspection.Timeline[len(inspection.Timeline)-1].Sequence
 	now := time.Date(2026, 7, 16, 13, 0, 0, 0, time.UTC)
-	schedule := application.RetrySchedule{RunID: run.ID, Phase: application.AutomaticRetryPhaseForRun(run), ControllerState: string(run.State), AttemptCount: 4, MaxAttempts: 3, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: application.RetryFailureProcessStart, ReasonCode: application.RetryReasonBudgetExhausted, Status: application.RetryScheduleAttention, AttentionAt: now, CreatedAt: now.Add(-time.Minute), UpdatedAt: now}
+	var schedule application.RetrySchedule
+	for attempt := 0; attempt < 4; attempt++ {
+		schedule, _, err = store.ApplyRetryFailure(context.Background(), application.RetryFailureRequest{RunID: run.ID, Phase: application.AutomaticRetryPhaseForRun(run), ControllerState: run.State, ExpectedAttempt: attempt, FailureClass: application.RetryFailureUnavailable, ReasonCode: application.RetryReasonUnavailable, Now: now.Add(time.Duration(attempt) * time.Second), Policy: application.AutomaticRetryPolicy{MaxAttempts: 3, InitialDelay: time.Second, MaximumDelay: 30 * time.Second}})
+		if err != nil {
+			store.Close()
+			t.Fatal(err)
+		}
+	}
 	event, err := application.AutomaticRetryAttentionEvent(run, schedule)
 	if err != nil {
 		store.Close()

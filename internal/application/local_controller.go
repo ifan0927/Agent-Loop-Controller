@@ -930,7 +930,12 @@ func (c *LocalController) execute(ctx context.Context, run Run, decision *Decisi
 		result, err = c.codex.Resume(ctx, spec, directory)
 	}
 	if err != nil {
-		return c.failAttempt(ctx, attempt, "codex_execution", err)
+		category := "codex_execution"
+		var retryEvidence interface{ AutomaticRetryFailureClass() string }
+		if errors.As(err, &retryEvidence) && retryEvidence.AutomaticRetryFailureClass() == string(RetryFailureProcessStart) {
+			category = RetryReasonProcessStart
+		}
+		return c.failAttempt(ctx, attempt, category, err)
 	}
 	if run.ImplementationSession != "" && result.SessionID != run.ImplementationSession {
 		return c.failAttempt(ctx, attempt, "session_mismatch", errors.New("resume returned a different session ID"))

@@ -58,6 +58,29 @@ func TestAdmissionWorkerKeepsPollingWhileAttentionParksAdmission(t *testing.T) {
 	}
 }
 
+func TestAdmissionWorkerAutomaticallyResumesAfterOperatorRetryBecomesEligible(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	retryApplied := false
+	result, err := runAdmissionWorker(ctx, false, time.Minute, func(context.Context) (application.LinearTodoDispatchResult, error) {
+		calls++
+		if !retryApplied {
+			return application.LinearTodoDispatchResult{Outcome: application.LinearTodoDispatchAttention}, nil
+		}
+		return application.LinearTodoDispatchResult{Outcome: application.LinearTodoDispatchDriven}, nil
+	}, func(context.Context, time.Duration) error {
+		if !retryApplied {
+			retryApplied = true
+			return nil
+		}
+		cancel()
+		return context.Canceled
+	})
+	if err != nil || calls != 2 || result.Stopped != "canceled" || result.Cycles != 2 || result.LastOutcome != application.LinearTodoDispatchDriven || result.PreviousStatus != workerStatusRunning {
+		t.Fatalf("result=%+v calls=%d err=%v", result, calls, err)
+	}
+}
+
 func TestAdmissionWorkerObservesLiveStatusTransitions(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var statuses []string

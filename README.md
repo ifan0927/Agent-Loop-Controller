@@ -73,8 +73,8 @@ the state machine.
   observation, safe source-checkout synchronization, and ownership-checked
   cleanup.
 - Requester-authorized status/inspection and narrow recovery actions for
-  interrupted delivery, abandoned pre-delivery runs, and verified external
-  merges.
+  exhausted typed retries, interrupted delivery, abandoned pre-delivery runs,
+  and verified external merges.
 - macOS LaunchAgent tooling for building, installing, validating, starting,
   observing, and stopping one local worker.
 

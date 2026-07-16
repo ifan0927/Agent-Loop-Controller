@@ -130,12 +130,15 @@ func TestOperatorAttentionMigrationPreservesLegacyEvidenceAndNormalizesEnvelope(
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE operator_actions`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.db.ExecContext(ctx, `ALTER TABLE automatic_retry_schedules DROP COLUMN failure_evidence_ref`); err != nil {
+		t.Fatal(err)
+	}
 	for _, statement := range migrationV17 {
 		if _, err := store.db.ExecContext(ctx, statement); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (23,24)`); err != nil {
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (23,24,25,26)`); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 7, 15, 4, 0, 0, 0, time.UTC)
@@ -198,12 +201,15 @@ func TestOperatorAttentionMigrationAcceptsFrozenLegacyProfileContract(t *testing
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE operator_actions`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.db.ExecContext(ctx, `ALTER TABLE automatic_retry_schedules DROP COLUMN failure_evidence_ref`); err != nil {
+		t.Fatal(err)
+	}
 	for _, statement := range migrationV17 {
 		if _, err := store.db.ExecContext(ctx, statement); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (23,24)`); err != nil {
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (23,24,25,26)`); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 7, 15, 5, 0, 0, 0, time.UTC)

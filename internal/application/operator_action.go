@@ -55,6 +55,7 @@ type OperatorActionRecord struct {
 	ResultingTransitionSequence int64
 	EvidenceDigest              string
 	OutcomeDigest               string
+	NextEligibleAt              time.Time
 	ReceivedAt                  time.Time
 	ValidatedAt                 time.Time
 	AppliedAt                   time.Time
@@ -215,13 +216,16 @@ func ValidateOperatorActionRecord(record OperatorActionRecord) error {
 		return errors.New("operator action record authority is invalid")
 	}
 	if record.Status == OperatorActionStatusValidated {
-		if record.ResultStatus != OperatorActionResultPending || !record.AppliedAt.IsZero() || !record.ObservedAt.IsZero() || record.ResultingState != "" || record.ResultingTransitionSequence != 0 || record.EvidenceDigest != "" || record.OutcomeDigest != "" {
+		if record.ResultStatus != OperatorActionResultPending || !record.AppliedAt.IsZero() || !record.ObservedAt.IsZero() || !record.NextEligibleAt.IsZero() || record.ResultingState != "" || record.ResultingTransitionSequence != 0 || record.EvidenceDigest != "" || record.OutcomeDigest != "" {
 			return errors.New("validated operator action result is invalid")
 		}
 		return nil
 	}
 	if record.ResultingState == "" || record.ResultingTransitionSequence < record.TransitionSequence || !validOperatorAttentionDigest(record.EvidenceDigest) || record.AppliedAt.IsZero() || record.AppliedAt.Before(record.ValidatedAt) {
 		return errors.New("operator action applied result is invalid")
+	}
+	if record.ActionType == OperatorActionRetry && !record.NextEligibleAt.After(record.AppliedAt) {
+		return errors.New("operator retry eligibility evidence is invalid")
 	}
 	if record.Status == OperatorActionStatusApplied {
 		if record.ResultStatus != OperatorActionResultApplied || !record.ObservedAt.IsZero() || record.OutcomeDigest != "" {

@@ -105,7 +105,15 @@ func (s *LinearAdmissionService) Start(ctx context.Context, command LinearStartC
 }
 
 func (s *LinearAdmissionService) Revalidate(ctx context.Context, command LinearRevalidateCommand) (Run, error) {
-	run, _, err := s.revalidate(ctx, command, false, false, false)
+	run, _, err := s.revalidate(ctx, command, false, false, false, true, true)
+	return run, err
+}
+
+// RevalidateForOperatorRetry performs the same source and requester checks as
+// ordinary recovery without changing run state on drift. A retry action must
+// record its own intent before its one permitted schedule mutation.
+func (s *LinearAdmissionService) RevalidateForOperatorRetry(ctx context.Context, command LinearRevalidateCommand) (Run, error) {
+	run, _, err := s.revalidate(ctx, command, false, false, false, false, false)
 	return run, err
 }
 
@@ -118,14 +126,14 @@ func (s *LinearAdmissionService) RevalidateForGitHubReconcile(ctx context.Contex
 	default:
 		return Run{}, false, serviceError(ErrorInvalidInput, "GitHub reconciliation requires an active pull request state", nil)
 	}
-	return s.revalidate(ctx, command, false, false, true)
+	return s.revalidate(ctx, command, false, false, true, true, true)
 }
 
 // RevalidateOwnedPushRecovery is deliberately narrower than ordinary
 // revalidation. It is used only by the explicit operator recovery that may
 // return a halted owned-PR fast-forward to its already-verified push gate.
 func (s *LinearAdmissionService) RevalidateOwnedPushRecovery(ctx context.Context, command LinearRevalidateCommand) (Run, error) {
-	run, _, err := s.revalidate(ctx, command, true, false, false)
+	run, _, err := s.revalidate(ctx, command, true, false, false, true, true)
 	return run, err
 }
 
@@ -136,14 +144,14 @@ func (s *LinearAdmissionService) RevalidateOwnedPushRecovery(ctx context.Context
 func (s *LinearAdmissionService) RevalidateForAbandon(ctx context.Context, command LinearRevalidateCommand) (Run, error) {
 	switch command.ExpectedState {
 	case domain.StateReceived, domain.StateAdmitting, domain.StateManualIntervention, domain.StateFailed:
-		run, _, err := s.revalidate(ctx, command, true, true, false)
+		run, _, err := s.revalidate(ctx, command, true, true, false, true, true)
 		return run, err
 	default:
 		return Run{}, serviceError(ErrorInvalidInput, "automatic run abandonment requires received, admitting, manual_intervention, or failed replay", nil)
 	}
 }
 
-func (s *LinearAdmissionService) revalidate(ctx context.Context, command LinearRevalidateCommand, allowManualRecovery, allowCanceledAbandon, allowCompletedObservation bool) (Run, bool, error) {
+func (s *LinearAdmissionService) revalidate(ctx context.Context, command LinearRevalidateCommand, allowManualRecovery, allowCanceledAbandon, allowCompletedObservation, allowAutomatedProgress, markDrift bool) (Run, bool, error) {
 	if command.RunID == "" || command.Repository == "" || command.ExpectedState == "" || command.IdempotencyKey == "" {
 		return Run{}, false, serviceError(ErrorInvalidInput, "run, expected state, repository, and idempotency key are required", nil)
 	}
@@ -171,24 +179,24 @@ func (s *LinearAdmissionService) revalidate(ctx context.Context, command LinearR
 	if snapshot.Task.IssueID != run.IssueID {
 		return Run{}, false, serviceError(ErrorConflict, "Linear source does not match the persisted run", nil)
 	}
-	if err := s.requireStableLinearSourceForRecovery(ctx, run, snapshot, repository, allowManualRecovery, allowCanceledAbandon, allowCompletedObservation); err != nil {
+	if err := s.requireStableLinearSourceForRecovery(ctx, run, snapshot, repository, allowManualRecovery, allowCanceledAbandon, allowCompletedObservation, allowAutomatedProgress, markDrift); err != nil {
 		return Run{}, false, err
 	}
 	return run, strings.EqualFold(strings.TrimSpace(source.State.Type), "completed"), nil
 }
 
 func (s *LinearAdmissionService) requireStableLinearSource(ctx context.Context, existing Run, snapshot linearAdmissionSnapshot, repository LocalRepository) error {
-	return s.requireStableLinearSourceForRecovery(ctx, existing, snapshot, repository, false, false, false)
+	return s.requireStableLinearSourceForRecovery(ctx, existing, snapshot, repository, false, false, false, true, true)
 }
 
-func (s *LinearAdmissionService) requireStableLinearSourceForRecovery(ctx context.Context, existing Run, snapshot linearAdmissionSnapshot, repository LocalRepository, allowManualRecovery, allowCanceledAbandon, allowCompletedObservation bool) error {
+func (s *LinearAdmissionService) requireStableLinearSourceForRecovery(ctx context.Context, existing Run, snapshot linearAdmissionSnapshot, repository LocalRepository, allowManualRecovery, allowCanceledAbandon, allowCompletedObservation, allowAutomatedProgress, markDrift bool) error {
 	if existing.State == domain.StateManualIntervention && !allowManualRecovery {
 		return serviceError(ErrorConflict, "existing run requires a human decision", nil)
 	}
 	if existing.SourceRevision == snapshot.Task.SourceRevision && existing.Repository == repository.CanonicalRepository && existing.WorkingBranch == snapshot.Task.WorkingBranch && existing.TaskHash == snapshot.TaskHash {
 		return nil
 	}
-	if allowsAutomatedLinearProgress(existing, snapshot, repository) {
+	if allowAutomatedProgress && allowsAutomatedLinearProgress(existing, snapshot, repository) {
 		return nil
 	}
 	if allowCompletedObservation && allowsAutomatedLinearCompletionObservation(existing, snapshot, repository) {
@@ -199,6 +207,9 @@ func (s *LinearAdmissionService) requireStableLinearSourceForRecovery(ctx contex
 	}
 	if existing.State == domain.StateManualIntervention && allowManualRecovery {
 		return serviceError(ErrorConflict, "owned push recovery requires an unchanged Linear source", nil)
+	}
+	if !markDrift {
+		return serviceError(ErrorConflict, "Linear source conflicts with an existing run", nil)
 	}
 	evidence := "linear-source-drift:" + snapshot.RawHash
 	marked, err := s.store.MarkLinearSourceDrift(ctx, existing.ID, existing.State, existing.SourceRevision, evidence)

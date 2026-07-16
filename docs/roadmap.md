@@ -78,6 +78,8 @@ This milestone is recorded by the closed
 - Exact merge-SHA source checkout synchronization and partial cleanup recovery.
 - Typed pre-delivery abandon, owned repair-push recovery, and verified external
   merge acceptance.
+- Typed exhausted-retry recovery with durable operator intent and automatic
+  worker resume through the normal driver.
 - Deterministic restart/fault fixtures for these boundaries.
 
 The implementation child work under the open

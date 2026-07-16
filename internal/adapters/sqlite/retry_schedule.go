@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,7 +12,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const retryScheduleSelect = `SELECT run_id,phase,controller_state,attempt_count,max_attempts,initial_delay_ns,maximum_delay_ns,failure_class,reason_code,status,next_eligible_at,next_eligible_unix_ns,attention_at,created_at,updated_at FROM automatic_retry_schedules`
+const retryScheduleSelect = `SELECT run_id,phase,controller_state,attempt_count,max_attempts,initial_delay_ns,maximum_delay_ns,failure_class,failure_evidence_ref,reason_code,status,next_eligible_at,next_eligible_unix_ns,attention_at,created_at,updated_at FROM automatic_retry_schedules`
 
 func (s *Store) GetRetrySchedule(ctx context.Context, runID, phase string) (application.RetrySchedule, bool, error) {
 	if !validRetryScheduleKey(runID) || !validRetryScheduleKey(phase) {
@@ -112,6 +113,18 @@ func (s *Store) ApplyRetryFailure(ctx context.Context, request application.Retry
 		}
 	}
 	now := request.Now.UTC()
+	evidenceRef := request.FailureEvidenceRef
+	if failureClass == application.RetryFailureProcessStart {
+		var after time.Time
+		if found {
+			after = current.UpdatedAt
+		}
+		if err := validateProcessStartEvidenceRefTx(ctx, tx, request.RunID, evidenceRef, after, now); err != nil {
+			return application.RetrySchedule{}, false, err
+		}
+	} else {
+		evidenceRef = ""
+	}
 	attempt := request.ExpectedAttempt + 1
 	status := application.RetryScheduleAttention
 	var nextEligible, attentionAt time.Time
@@ -126,12 +139,12 @@ func (s *Store) ApplyRetryFailure(ctx context.Context, request application.Retry
 	}
 	schedule := application.RetrySchedule{
 		RunID: request.RunID, Phase: request.Phase, ControllerState: string(controllerState), AttemptCount: attempt,
-		MaxAttempts: policy.MaxAttempts, InitialDelay: policy.InitialDelay, MaximumDelay: policy.MaximumDelay, FailureClass: failureClass, ReasonCode: reason, Status: status,
+		MaxAttempts: policy.MaxAttempts, InitialDelay: policy.InitialDelay, MaximumDelay: policy.MaximumDelay, FailureClass: failureClass, FailureEvidenceRef: evidenceRef, ReasonCode: reason, Status: status,
 		NextEligibleAt: nextEligible, AttentionAt: attentionAt, CreatedAt: now, UpdatedAt: now,
 	}
 	if found {
 		schedule.CreatedAt = current.CreatedAt
-		result, updateErr := tx.ExecContext(ctx, `UPDATE automatic_retry_schedules SET controller_state=?,attempt_count=?,failure_class=?,reason_code=?,status=?,next_eligible_at=?,next_eligible_unix_ns=?,attention_at=?,updated_at=? WHERE run_id=? AND phase=? AND status='scheduled' AND attempt_count=? AND (SELECT current_state FROM runs WHERE run_id=?)=?`, schedule.ControllerState, schedule.AttemptCount, schedule.FailureClass, schedule.ReasonCode, schedule.Status, formatTime(schedule.NextEligibleAt), retryUnixNano(schedule.NextEligibleAt), formatTime(schedule.AttentionAt), formatTime(schedule.UpdatedAt), schedule.RunID, schedule.Phase, request.ExpectedAttempt, request.RunID, state)
+		result, updateErr := tx.ExecContext(ctx, `UPDATE automatic_retry_schedules SET controller_state=?,attempt_count=?,failure_class=?,failure_evidence_ref=?,reason_code=?,status=?,next_eligible_at=?,next_eligible_unix_ns=?,attention_at=?,updated_at=? WHERE run_id=? AND phase=? AND status='scheduled' AND attempt_count=? AND (SELECT current_state FROM runs WHERE run_id=?)=?`, schedule.ControllerState, schedule.AttemptCount, schedule.FailureClass, schedule.FailureEvidenceRef, schedule.ReasonCode, schedule.Status, formatTime(schedule.NextEligibleAt), retryUnixNano(schedule.NextEligibleAt), formatTime(schedule.AttentionAt), formatTime(schedule.UpdatedAt), schedule.RunID, schedule.Phase, request.ExpectedAttempt, request.RunID, state)
 		if updateErr != nil {
 			return application.RetrySchedule{}, false, updateErr
 		}
@@ -153,7 +166,7 @@ func (s *Store) ApplyRetryFailure(ctx context.Context, request application.Retry
 			return latest, false, nil
 		}
 	} else {
-		_, insertErr := tx.ExecContext(ctx, `INSERT INTO automatic_retry_schedules(run_id,phase,controller_state,attempt_count,max_attempts,initial_delay_ns,maximum_delay_ns,failure_class,reason_code,status,next_eligible_at,next_eligible_unix_ns,attention_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, schedule.RunID, schedule.Phase, schedule.ControllerState, schedule.AttemptCount, schedule.MaxAttempts, schedule.InitialDelay, schedule.MaximumDelay, schedule.FailureClass, schedule.ReasonCode, schedule.Status, formatTime(schedule.NextEligibleAt), retryUnixNano(schedule.NextEligibleAt), formatTime(schedule.AttentionAt), formatTime(schedule.CreatedAt), formatTime(schedule.UpdatedAt))
+		_, insertErr := tx.ExecContext(ctx, `INSERT INTO automatic_retry_schedules(run_id,phase,controller_state,attempt_count,max_attempts,initial_delay_ns,maximum_delay_ns,failure_class,failure_evidence_ref,reason_code,status,next_eligible_at,next_eligible_unix_ns,attention_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, schedule.RunID, schedule.Phase, schedule.ControllerState, schedule.AttemptCount, schedule.MaxAttempts, schedule.InitialDelay, schedule.MaximumDelay, schedule.FailureClass, schedule.FailureEvidenceRef, schedule.ReasonCode, schedule.Status, formatTime(schedule.NextEligibleAt), retryUnixNano(schedule.NextEligibleAt), formatTime(schedule.AttentionAt), formatTime(schedule.CreatedAt), formatTime(schedule.UpdatedAt))
 		if insertErr != nil {
 			latest, latestFound, latestErr := retryScheduleTx(ctx, tx, request.RunID, request.Phase)
 			if latestErr != nil {
@@ -212,7 +225,7 @@ func scanRetrySchedule(row rowScanner) (application.RetrySchedule, bool, error) 
 	var schedule application.RetrySchedule
 	var status, nextEligible, attention, created, updated string
 	var nextEligibleUnix int64
-	if err := row.Scan(&schedule.RunID, &schedule.Phase, &schedule.ControllerState, &schedule.AttemptCount, &schedule.MaxAttempts, &schedule.InitialDelay, &schedule.MaximumDelay, &schedule.FailureClass, &schedule.ReasonCode, &status, &nextEligible, &nextEligibleUnix, &attention, &created, &updated); err != nil {
+	if err := row.Scan(&schedule.RunID, &schedule.Phase, &schedule.ControllerState, &schedule.AttemptCount, &schedule.MaxAttempts, &schedule.InitialDelay, &schedule.MaximumDelay, &schedule.FailureClass, &schedule.FailureEvidenceRef, &schedule.ReasonCode, &status, &nextEligible, &nextEligibleUnix, &attention, &created, &updated); err != nil {
 		return application.RetrySchedule{}, false, err
 	}
 	schedule.Status = application.RetryScheduleStatus(status)
@@ -228,6 +241,37 @@ func scanRetrySchedule(row rowScanner) (application.RetrySchedule, bool, error) 
 		return application.RetrySchedule{}, false, errors.New("automatic retry schedule is corrupt")
 	}
 	return schedule, true, nil
+}
+
+func validateProcessStartEvidenceRefTx(ctx context.Context, tx *sql.Tx, runID, ref string, after, at time.Time) error {
+	kind, rawID, ok := strings.Cut(ref, ":")
+	if !ok {
+		return errors.New("process-start retry evidence reference is invalid")
+	}
+	id, err := strconv.ParseInt(rawID, 10, 64)
+	if err != nil || id < 1 {
+		return errors.New("process-start retry evidence reference is invalid")
+	}
+	var persistedAt string
+	switch kind {
+	case "attempt":
+		err = tx.QueryRowContext(ctx, `SELECT finished_at FROM attempts WHERE run_id=? AND attempt_id=? AND status='failed' AND error_category='process_start' AND finished_at<>''`, runID, id).Scan(&persistedAt)
+	case "verification":
+		err = tx.QueryRowContext(ctx, `SELECT created_at FROM verifications WHERE run_id=? AND verification_id=? AND process_outcome='not_started' AND failure_category='process_start'`, runID, id).Scan(&persistedAt)
+	default:
+		return errors.New("process-start retry evidence reference is invalid")
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return errors.New("process-start retry lacks exact persisted failure evidence")
+	}
+	if err != nil {
+		return err
+	}
+	evidenceAt := parseTime(persistedAt)
+	if evidenceAt.IsZero() || evidenceAt.After(at) || !after.IsZero() && !evidenceAt.After(after) {
+		return errors.New("process-start retry evidence time is invalid")
+	}
+	return nil
 }
 
 func retryUnixNano(value time.Time) int64 {

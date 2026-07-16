@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -24,7 +25,7 @@ func TestRetryScheduleSurvivesRestartAndBoundsAttention(t *testing.T) {
 	}
 	policy := application.AutomaticRetryPolicy{MaxAttempts: 2, InitialDelay: 10 * time.Second, MaximumDelay: 20 * time.Second}
 	now := time.Date(2026, 7, 15, 4, 0, 0, 0, time.UTC)
-	request := application.RetryFailureRequest{RunID: run.ID, Phase: "state_received", ControllerState: run.State, ExpectedAttempt: 0, FailureClass: application.RetryFailureProcessStart, ReasonCode: application.RetryReasonProcessStart, Now: now, Policy: policy}
+	request := application.RetryFailureRequest{RunID: run.ID, Phase: "state_received", ControllerState: run.State, ExpectedAttempt: 0, FailureClass: application.RetryFailureUnavailable, ReasonCode: application.RetryReasonUnavailable, Now: now, Policy: policy}
 	first, applied, err := store.ApplyRetryFailure(context.Background(), request)
 	if err != nil || !applied || first.AttemptCount != 1 || first.NextEligibleAt != now.Add(10*time.Second) || first.Status != application.RetryScheduleScheduled {
 		t.Fatalf("first=%+v applied=%v err=%v", first, applied, err)
@@ -146,5 +147,42 @@ func TestRetryScheduleStateDriftBecomesAuthorityAttention(t *testing.T) {
 	}
 	if application.RetryFailureIsRetryable(schedule.FailureClass) {
 		t.Fatalf("state drift remained retryable: %+v", schedule)
+	}
+}
+
+func TestProcessStartRetryBindsCallerSelectedExactPersistedAttempt(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run := outboxRun(t, "run-process-evidence")
+	if _, _, err := store.CreateRun(context.Background(), application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.BeginAttempt(context.Background(), run.ID, "implementation", "fixture", "/tmp/fixture-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Status, first.ErrorCategory, first.ExitCode, first.FinishedAt = "failed", application.RetryReasonProcessStart, -1, time.Now().UTC().Add(-time.Second)
+	if err := store.FinishAttempt(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.BeginAttempt(context.Background(), run.ID, "resume", "fixture", "/tmp/fixture-two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.Status, second.ErrorCategory, second.ExitCode, second.FinishedAt = "failed", application.RetryReasonProcessStart, -1, time.Now().UTC()
+	if err := store.FinishAttempt(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	want := "attempt:" + strconv.FormatInt(second.ID, 10)
+	schedule, applied, err := store.ApplyRetryFailure(context.Background(), application.RetryFailureRequest{RunID: run.ID, Phase: "state_received", ControllerState: run.State, FailureClass: application.RetryFailureProcessStart, FailureEvidenceRef: want, ReasonCode: application.RetryReasonProcessStart, Now: second.FinishedAt.Add(time.Second), Policy: application.DefaultAutomaticRetryPolicy()})
+	if err != nil || !applied || schedule.FailureEvidenceRef != want {
+		t.Fatalf("schedule=%+v want=%q applied=%t err=%v", schedule, want, applied, err)
+	}
+	stale := "attempt:" + strconv.FormatInt(first.ID, 10)
+	if _, _, err := store.ApplyRetryFailure(context.Background(), application.RetryFailureRequest{RunID: run.ID, Phase: "state_received", ControllerState: run.State, ExpectedAttempt: schedule.AttemptCount, FailureClass: application.RetryFailureProcessStart, FailureEvidenceRef: stale, ReasonCode: application.RetryReasonProcessStart, Now: second.FinishedAt.Add(2 * time.Second), Policy: application.DefaultAutomaticRetryPolicy()}); err == nil {
+		t.Fatal("older process-start evidence was rebound to a later failure")
 	}
 }

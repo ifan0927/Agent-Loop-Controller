@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -225,6 +226,11 @@ func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatch
 				return withQueueDecision(retryWaitResult(run, schedule), queueDecision(LinearTodoQueueDecisionActiveRun, 0, nil, "", true)), nil
 			}
 		}
+		beforeResume, inspectErr := d.store.Inspect(ctx, run.ID)
+		if inspectErr != nil {
+			return LinearTodoDispatchResult{}, classifyServiceError(inspectErr)
+		}
+		failureCursor := retryFailureEvidenceCursorFor(beforeResume)
 		result, resumeErr := d.resume(ctx, &lease, run)
 		if resumeErr != nil {
 			failureRun, failureRunErr := d.currentRetryRun(ctx, run)
@@ -235,14 +241,14 @@ func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatch
 				attention, attentionErr := d.markRetryAttention(ctx, failureRun, schedule, RetryFailureAuthority, RetryReasonAuthority)
 				return withQueueDecision(attention, queueDecision(LinearTodoQueueDecisionActiveRun, 0, nil, "", true)), attentionErr
 			}
-			retryResult, retryErr := d.handleRunFailure(ctx, failureRun, AutomaticRetryPhaseForRun(failureRun), schedule, scheduleFound, resumeErr)
+			retryResult, retryErr := d.handleRunFailure(ctx, failureRun, AutomaticRetryPhaseForRun(failureRun), schedule, scheduleFound, failureCursor, resumeErr)
 			return withQueueDecision(retryResult, queueDecision(LinearTodoQueueDecisionActiveRun, 0, nil, "", true)), retryErr
 		}
 		if result.Outcome == LinearTodoDispatchDriven && scheduleFound {
 			if cleared, clearErr := d.store.ClearRetrySchedule(ctx, run.ID, phase, schedule.AttemptCount); clearErr != nil {
 				return LinearTodoDispatchResult{}, classifyServiceError(clearErr)
 			} else if !cleared {
-				retryResult, retryErr := d.handleRunFailure(ctx, run, phase, schedule, scheduleFound, formatRetryScheduleConflict(run.ID, phase))
+				retryResult, retryErr := d.handleRunFailure(ctx, run, phase, schedule, scheduleFound, retryFailureEvidenceCursor{}, formatRetryScheduleConflict(run.ID, phase))
 				return withQueueDecision(retryResult, queueDecision(LinearTodoQueueDecisionActiveRun, 0, nil, "", true)), retryErr
 			}
 		}
@@ -284,7 +290,7 @@ func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatch
 		if runErr != nil {
 			return LinearTodoDispatchResult{}, runErr
 		}
-		retryResult, retryErr := d.handleRunFailure(ctx, run, AutomaticRetryPhaseForRun(run), RetrySchedule{}, false, driveErr)
+		retryResult, retryErr := d.handleRunFailure(ctx, run, AutomaticRetryPhaseForRun(run), RetrySchedule{}, false, retryFailureEvidenceCursor{}, driveErr)
 		return withQueueDecision(retryResult, selectedPriorityQueueDecision(len(scan.Candidates), selected.candidate.Priority)), retryErr
 	}
 	return withQueueDecision(result, selectedPriorityQueueDecision(len(scan.Candidates), selected.candidate.Priority)), nil
@@ -695,7 +701,7 @@ func (d *LinearTodoDispatcher) retryAttention(ctx context.Context, run Run, sche
 	return result, nil
 }
 
-func (d *LinearTodoDispatcher) handleRunFailure(ctx context.Context, run Run, phase string, existing RetrySchedule, found bool, cause error) (LinearTodoDispatchResult, error) {
+func (d *LinearTodoDispatcher) handleRunFailure(ctx context.Context, run Run, phase string, existing RetrySchedule, found bool, before retryFailureEvidenceCursor, cause error) (LinearTodoDispatchResult, error) {
 	if ctx.Err() != nil {
 		return LinearTodoDispatchResult{}, cause
 	}
@@ -719,9 +725,21 @@ func (d *LinearTodoDispatcher) handleRunFailure(ctx context.Context, run Run, ph
 	if found {
 		expected = existing.AttemptCount
 	}
+	evidenceRef := ""
+	if class == RetryFailureProcessStart {
+		inspection, inspectErr := d.store.Inspect(ctx, run.ID)
+		if inspectErr != nil {
+			return LinearTodoDispatchResult{}, classifyServiceError(inspectErr)
+		}
+		var evidenceErr error
+		evidenceRef, evidenceErr = processStartFailureEvidenceAfter(inspection, before)
+		if evidenceErr != nil {
+			return LinearTodoDispatchResult{}, serviceError(ErrorInternal, "process-start retry lacks exact new failure evidence", evidenceErr)
+		}
+	}
 	schedule, applied, err := d.store.ApplyRetryFailure(ctx, RetryFailureRequest{
 		RunID: run.ID, Phase: phase, ControllerState: run.State, ExpectedAttempt: expected,
-		FailureClass: class, ReasonCode: reason, Now: d.clock(), Policy: d.policy.Retry,
+		FailureClass: class, FailureEvidenceRef: evidenceRef, ReasonCode: reason, Now: d.clock(), Policy: d.policy.Retry,
 	})
 	if err != nil {
 		return LinearTodoDispatchResult{}, classifyServiceError(err)
@@ -733,6 +751,54 @@ func (d *LinearTodoDispatcher) handleRunFailure(ctx context.Context, run Run, ph
 		return d.retryAttention(ctx, run, schedule)
 	}
 	return retryScheduledResult(run, schedule), nil
+}
+
+type retryFailureEvidenceCursor struct {
+	attemptID      int64
+	verificationID int64
+}
+
+func retryFailureEvidenceCursorFor(inspection RunInspection) retryFailureEvidenceCursor {
+	var cursor retryFailureEvidenceCursor
+	for _, attempt := range inspection.Attempts {
+		if attempt.ID > cursor.attemptID {
+			cursor.attemptID = attempt.ID
+		}
+	}
+	for _, verification := range inspection.Verifications {
+		if verification.ID > cursor.verificationID {
+			cursor.verificationID = verification.ID
+		}
+	}
+	return cursor
+}
+
+func processStartFailureEvidenceAfter(inspection RunInspection, before retryFailureEvidenceCursor) (string, error) {
+	type candidate struct {
+		ref string
+		at  time.Time
+	}
+	var latest candidate
+	for _, attempt := range inspection.Attempts {
+		if attempt.ID <= before.attemptID || attempt.RunID != inspection.Run.ID || attempt.Status != "failed" || attempt.ErrorCategory != RetryReasonProcessStart || attempt.FinishedAt.IsZero() {
+			continue
+		}
+		if latest.ref == "" || attempt.FinishedAt.After(latest.at) {
+			latest = candidate{ref: fmt.Sprintf("attempt:%d", attempt.ID), at: attempt.FinishedAt}
+		}
+	}
+	for _, verification := range inspection.Verifications {
+		if verification.ID <= before.verificationID || verification.RunID != inspection.Run.ID || verification.ProcessOutcome != VerificationOutcomeNotStarted || verification.FailureCategory != RetryReasonProcessStart || verification.CreatedAt.IsZero() {
+			continue
+		}
+		if latest.ref == "" || verification.CreatedAt.After(latest.at) {
+			latest = candidate{ref: fmt.Sprintf("verification:%d", verification.ID), at: verification.CreatedAt}
+		}
+	}
+	if latest.ref == "" {
+		return "", errors.New("no newly persisted process-start attempt or verification was found")
+	}
+	return latest.ref, nil
 }
 
 func (d *LinearTodoDispatcher) orphanRetryAttention(ctx context.Context) (LinearTodoDispatchResult, bool, error) {

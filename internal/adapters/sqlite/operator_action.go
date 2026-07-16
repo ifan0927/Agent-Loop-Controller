@@ -4,12 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"strings"
+	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const operatorActionSelect = `SELECT action_id,idempotency_key,payload_digest,run_id,repository,expected_state,run_idempotency_key,transition_sequence,action_type,requester_login,requester_database_id,requester_node_id,requester_actor_type,reason_code,attention_event_key,status,result_status,resulting_state,resulting_transition_sequence,evidence_digest,outcome_digest,received_at,validated_at,applied_at,observed_at FROM operator_actions`
+const operatorActionSelect = `SELECT action_id,idempotency_key,payload_digest,run_id,repository,expected_state,run_idempotency_key,transition_sequence,action_type,requester_login,requester_database_id,requester_node_id,requester_actor_type,reason_code,attention_event_key,status,result_status,resulting_state,resulting_transition_sequence,evidence_digest,outcome_digest,next_eligible_at,received_at,validated_at,applied_at,observed_at FROM operator_actions`
 
 func (s *Store) listOperatorActions(ctx context.Context, runID string) ([]application.OperatorActionRecord, error) {
 	rows, err := s.db.QueryContext(ctx, operatorActionSelect+` WHERE run_id=? ORDER BY transition_sequence,action_id`, runID)
@@ -81,7 +84,106 @@ func (s *Store) ObserveOperatorActionResult(ctx context.Context, result applicat
 	return s.advanceOperatorAction(ctx, result, true)
 }
 
+func (s *Store) ApplyOperatorRetry(ctx context.Context, request application.OperatorRetryApply) (application.OperatorActionRecord, application.RetrySchedule, bool, error) {
+	for attempt := 0; ; attempt++ {
+		action, schedule, changed, err := s.applyOperatorRetryOnce(ctx, request)
+		if !operatorActionSQLiteBusy(err) || attempt >= 4 {
+			return action, schedule, changed, err
+		}
+		if err := waitOperatorActionRetry(ctx, attempt); err != nil {
+			return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+		}
+	}
+}
+
+func (s *Store) applyOperatorRetryOnce(ctx context.Context, request application.OperatorRetryApply) (application.OperatorActionRecord, application.RetrySchedule, bool, error) {
+	if request.ActionID == "" || request.Phase == "" || request.ExpectedAttempt < 1 || request.NextEligibleAt.IsZero() || request.AppliedAt.IsZero() || !request.NextEligibleAt.After(request.AppliedAt) || !validOperatorActionDigest(request.EvidenceDigest) {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, errors.New("operator retry apply input is invalid")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+	}
+	defer tx.Rollback()
+	action, found, err := getOperatorActionByIDTx(ctx, tx, request.ActionID)
+	if err != nil || !found {
+		if err == nil {
+			err = errors.New("operator retry action was not found")
+		}
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+	}
+	schedule, scheduleFound, err := retryScheduleTx(ctx, tx, action.RunID, request.Phase)
+	if err != nil || !scheduleFound {
+		if err == nil {
+			err = errors.New("operator retry schedule was not found")
+		}
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+	}
+	if action.Status == application.OperatorActionStatusApplied || action.Status == application.OperatorActionStatusObserved {
+		return action, schedule, false, tx.Commit()
+	}
+	if action.Status != application.OperatorActionStatusValidated || action.ActionType != application.OperatorActionRetry || schedule.Status != application.RetryScheduleAttention || schedule.AttemptCount != request.ExpectedAttempt || schedule.ControllerState != string(action.ExpectedState) || schedule.Phase != request.Phase || schedule.ReasonCode != application.RetryReasonBudgetExhausted || (schedule.FailureClass != application.RetryFailureProcessStart && schedule.FailureClass != application.RetryFailureUnavailable) {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, errors.New("operator retry authority conflicts")
+	}
+	var state string
+	var sequence int64
+	if err := tx.QueryRowContext(ctx, `SELECT current_state,(SELECT COALESCE(MAX(sequence),0) FROM transitions WHERE run_id=runs.run_id) FROM runs WHERE run_id=?`, action.RunID).Scan(&state, &sequence); err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+	}
+	if state != string(action.ExpectedState) || sequence != action.TransitionSequence {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, errors.New("operator retry run authority conflicts")
+	}
+	var currentEvent string
+	if err := tx.QueryRowContext(ctx, `SELECT event_key FROM operator_attention_outbox WHERE run_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1`, action.RunID).Scan(&currentEvent); err != nil || currentEvent != action.AttentionEventKey {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, errors.New("operator retry attention authority conflicts")
+	}
+	update, err := tx.ExecContext(ctx, `UPDATE automatic_retry_schedules SET reason_code=?,status='scheduled',next_eligible_at=?,next_eligible_unix_ns=?,attention_at='',updated_at=? WHERE run_id=? AND phase=? AND controller_state=? AND attempt_count=? AND status='attention' AND reason_code='retry_budget_exhausted'`, application.RetryReasonOperatorRetry, formatTime(request.NextEligibleAt), retryUnixNano(request.NextEligibleAt), formatTime(request.AppliedAt), action.RunID, request.Phase, state, request.ExpectedAttempt)
+	if err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+	}
+	if changed, rowsErr := update.RowsAffected(); rowsErr != nil || changed != 1 {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, errors.New("operator retry schedule compare-and-swap lost")
+	}
+	update, err = tx.ExecContext(ctx, `UPDATE operator_actions SET status='applied',result_status='applied',resulting_state=?,resulting_transition_sequence=?,evidence_digest=?,next_eligible_at=?,applied_at=? WHERE action_id=? AND status='validated'`, state, sequence, request.EvidenceDigest, formatTime(request.NextEligibleAt), formatTime(request.AppliedAt), action.ActionID)
+	if err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+	}
+	if changed, rowsErr := update.RowsAffected(); rowsErr != nil || changed != 1 {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, errors.New("operator retry action compare-and-swap lost")
+	}
+	action, _, err = getOperatorActionByIDTx(ctx, tx, action.ActionID)
+	if err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+	}
+	schedule, _, err = retryScheduleTx(ctx, tx, action.RunID, request.Phase)
+	if err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+	}
+	if err := application.ValidateOperatorActionRecord(action); err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, fmt.Errorf("operator retry persisted action is invalid: %w", err)
+	}
+	if err := application.ValidateRetrySchedule(schedule); err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, fmt.Errorf("operator retry persisted schedule is invalid: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+	}
+	return action, schedule, true, nil
+}
+
 func (s *Store) advanceOperatorAction(ctx context.Context, result application.OperatorActionMutationResult, observed bool) (application.OperatorActionRecord, bool, error) {
+	for attempt := 0; ; attempt++ {
+		record, changed, err := s.advanceOperatorActionOnce(ctx, result, observed)
+		if !operatorActionSQLiteBusy(err) || attempt >= 4 {
+			return record, changed, err
+		}
+		if err := waitOperatorActionRetry(ctx, attempt); err != nil {
+			return application.OperatorActionRecord{}, false, err
+		}
+	}
+}
+
+func (s *Store) advanceOperatorActionOnce(ctx context.Context, result application.OperatorActionMutationResult, observed bool) (application.OperatorActionRecord, bool, error) {
 	if err := application.ValidateOperatorActionMutationResult(result, observed); err != nil {
 		return application.OperatorActionRecord{}, false, err
 	}
@@ -165,15 +267,47 @@ func scanOperatorActionMaybe(row rowScanner) (application.OperatorActionRecord, 
 
 func scanOperatorAction(row rowScanner) (application.OperatorActionRecord, error) {
 	var record application.OperatorActionRecord
-	var expected, actionType, resulting, received, validated, applied, observed string
-	if err := row.Scan(&record.ActionID, &record.IdempotencyKey, &record.PayloadDigest, &record.RunID, &record.Repository, &expected, &record.RunIdempotencyKey, &record.TransitionSequence, &actionType, &record.Requester.ID, &record.Requester.DatabaseID, &record.Requester.NodeID, &record.Requester.ActorType, &record.ReasonCode, &record.AttentionEventKey, &record.Status, &record.ResultStatus, &resulting, &record.ResultingTransitionSequence, &record.EvidenceDigest, &record.OutcomeDigest, &received, &validated, &applied, &observed); err != nil {
+	var expected, actionType, resulting, eligible, received, validated, applied, observed string
+	if err := row.Scan(&record.ActionID, &record.IdempotencyKey, &record.PayloadDigest, &record.RunID, &record.Repository, &expected, &record.RunIdempotencyKey, &record.TransitionSequence, &actionType, &record.Requester.ID, &record.Requester.DatabaseID, &record.Requester.NodeID, &record.Requester.ActorType, &record.ReasonCode, &record.AttentionEventKey, &record.Status, &record.ResultStatus, &resulting, &record.ResultingTransitionSequence, &record.EvidenceDigest, &record.OutcomeDigest, &eligible, &received, &validated, &applied, &observed); err != nil {
 		return application.OperatorActionRecord{}, err
 	}
 	record.ExpectedState, record.ActionType, record.ResultingState = domain.State(expected), application.OperatorActionType(actionType), domain.State(resulting)
 	record.Requester.Kind = "github_login"
 	record.ReceivedAt, record.ValidatedAt, record.AppliedAt, record.ObservedAt = parseTime(received), parseTime(validated), parseTime(applied), parseTime(observed)
+	record.NextEligibleAt = parseTime(eligible)
 	if err := application.ValidateOperatorActionRecord(record); err != nil {
 		return application.OperatorActionRecord{}, errors.New("operator action record is corrupt")
 	}
 	return record, nil
+}
+
+func validOperatorActionDigest(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, char := range value {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func operatorActionSQLiteBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "database is locked") || strings.Contains(message, "sqlite_busy")
+}
+
+func waitOperatorActionRetry(ctx context.Context, attempt int) error {
+	timer := time.NewTimer(time.Duration(attempt+1) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }

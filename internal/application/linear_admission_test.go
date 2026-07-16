@@ -237,6 +237,9 @@ func TestLinearRevalidateAllowsUnchangedStartedStateDuringRepairExecution(t *tes
 	if _, err := service.Revalidate(context.Background(), LinearRevalidateCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: existing.ID, Repository: existing.Repository, ExpectedState: existing.State, IdempotencyKey: existing.IdempotencyKey}); err != nil || store.marked {
 		t.Fatalf("err=%v marked=%t", err, store.marked)
 	}
+	if _, err := service.RevalidateForOperatorRetry(context.Background(), LinearRevalidateCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: existing.ID, Repository: existing.Repository, ExpectedState: existing.State, IdempotencyKey: existing.IdempotencyKey}); err == nil || store.marked {
+		t.Fatalf("operator retry accepted progressed Linear source: err=%v marked=%t", err, store.marked)
+	}
 }
 
 func TestLinearGitHubRevalidateAllowsOnlyUnchangedCompletedObservation(t *testing.T) {
@@ -302,6 +305,15 @@ func TestLinearRevalidateRejectsStartedStateWithTaskChange(t *testing.T) {
 	_, err = service.Revalidate(context.Background(), LinearRevalidateCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: existing.ID, Repository: existing.Repository, ExpectedState: existing.State, IdempotencyKey: existing.IdempotencyKey})
 	if err == nil || !store.marked {
 		t.Fatalf("err=%v marked=%t", err, store.marked)
+	}
+	retryStore := &admissionStore{serviceStore: serviceStore{run: existing}}
+	retryService, err := NewLinearAdmissionService(&admissionReader{source: changed}, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, retryStore, &admissionController{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = retryService.RevalidateForOperatorRetry(context.Background(), LinearRevalidateCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: existing.ID, Repository: existing.Repository, ExpectedState: existing.State, IdempotencyKey: existing.IdempotencyKey})
+	if err == nil || retryStore.marked {
+		t.Fatalf("operator retry drift err=%v marked=%t", err, retryStore.marked)
 	}
 }
 

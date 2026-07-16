@@ -20,7 +20,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 24
+const schemaVersion = 26
 
 type Store struct{ db *sql.DB }
 
@@ -137,6 +137,10 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV23
 		case 24:
 			statements = migrationV24
+		case 25:
+			statements = migrationV25
+		case 26:
+			statements = migrationV26
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -480,6 +484,15 @@ var migrationV24 = []string{
 		UNIQUE(run_id,transition_sequence,attention_event_key)
 	)`,
 	`CREATE INDEX operator_actions_run ON operator_actions(run_id,transition_sequence,action_id)`,
+}
+
+var migrationV25 = []string{
+	`ALTER TABLE operator_actions ADD COLUMN next_eligible_at TEXT NOT NULL DEFAULT ''`,
+}
+
+var migrationV26 = []string{
+	`ALTER TABLE automatic_retry_schedules ADD COLUMN failure_evidence_ref TEXT NOT NULL DEFAULT ''`,
+	`UPDATE automatic_retry_schedules SET failure_class='integrity_failure',reason_code='integrity_failure',status='attention',next_eligible_at='',next_eligible_unix_ns=0,attention_at=CASE WHEN attention_at='' THEN updated_at ELSE attention_at END WHERE failure_class='process_start'`,
 }
 
 func migrateOperatorAttentionV23Tx(ctx context.Context, tx *sql.Tx) error {

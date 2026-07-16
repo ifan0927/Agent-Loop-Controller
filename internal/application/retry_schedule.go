@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
@@ -46,6 +47,7 @@ const (
 	RetryReasonTerminal        = "terminal_failure"
 	RetryReasonPersistence     = "persistence_conflict"
 	RetryReasonBudgetExhausted = "retry_budget_exhausted"
+	RetryReasonOperatorRetry   = "operator_retry"
 )
 
 // AutomaticRetryPolicy is deliberately small and bounded. AttemptCount is the
@@ -101,33 +103,35 @@ func AutomaticRetryDelay(policy AutomaticRetryPolicy, attempt int) time.Duration
 // stores the controller state that produced it so a later read cannot silently
 // turn a state-specific retry into authority for another phase.
 type RetrySchedule struct {
-	RunID           string              `json:"run_id"`
-	Phase           string              `json:"phase"`
-	ControllerState string              `json:"controller_state"`
-	AttemptCount    int                 `json:"attempt_count"`
-	MaxAttempts     int                 `json:"max_attempts"`
-	InitialDelay    time.Duration       `json:"initial_delay_ns"`
-	MaximumDelay    time.Duration       `json:"maximum_delay_ns"`
-	FailureClass    RetryFailureClass   `json:"failure_class"`
-	ReasonCode      string              `json:"reason_code"`
-	Status          RetryScheduleStatus `json:"status"`
-	NextEligibleAt  time.Time           `json:"next_eligible_at,omitempty"`
-	AttentionAt     time.Time           `json:"attention_at,omitempty"`
-	CreatedAt       time.Time           `json:"created_at"`
-	UpdatedAt       time.Time           `json:"updated_at"`
+	RunID              string              `json:"run_id"`
+	Phase              string              `json:"phase"`
+	ControllerState    string              `json:"controller_state"`
+	AttemptCount       int                 `json:"attempt_count"`
+	MaxAttempts        int                 `json:"max_attempts"`
+	InitialDelay       time.Duration       `json:"initial_delay_ns"`
+	MaximumDelay       time.Duration       `json:"maximum_delay_ns"`
+	FailureClass       RetryFailureClass   `json:"failure_class"`
+	FailureEvidenceRef string              `json:"failure_evidence_ref,omitempty"`
+	ReasonCode         string              `json:"reason_code"`
+	Status             RetryScheduleStatus `json:"status"`
+	NextEligibleAt     time.Time           `json:"next_eligible_at,omitempty"`
+	AttentionAt        time.Time           `json:"attention_at,omitempty"`
+	CreatedAt          time.Time           `json:"created_at"`
+	UpdatedAt          time.Time           `json:"updated_at"`
 }
 
 // RetryFailureRequest is the only mutable input to the durable retry CAS.
 // ExpectedAttempt prevents a stale worker from extending a newer schedule.
 type RetryFailureRequest struct {
-	RunID           string
-	Phase           string
-	ControllerState domain.State
-	ExpectedAttempt int
-	FailureClass    RetryFailureClass
-	ReasonCode      string
-	Now             time.Time
-	Policy          AutomaticRetryPolicy
+	RunID              string
+	Phase              string
+	ControllerState    domain.State
+	ExpectedAttempt    int
+	FailureClass       RetryFailureClass
+	FailureEvidenceRef string
+	ReasonCode         string
+	Now                time.Time
+	Policy             AutomaticRetryPolicy
 }
 
 type RetryScheduleStore interface {
@@ -163,6 +167,13 @@ func (r RetryFailureRequest) validate() error {
 	if !validRetryReasonCode(r.ReasonCode) || r.ReasonCode == RetryReasonBudgetExhausted || retryReasonForClass(r.FailureClass) != r.ReasonCode {
 		return errors.New("automatic retry reason code is invalid")
 	}
+	if r.FailureClass == RetryFailureProcessStart {
+		if !validRetryProcessEvidenceRef(r.FailureEvidenceRef) {
+			return errors.New("process-start retry failure evidence reference is invalid")
+		}
+	} else if r.FailureEvidenceRef != "" {
+		return errors.New("retry failure evidence reference does not match the failure class")
+	}
 	_, err := r.Policy.normalizedAndValidated()
 	return err
 }
@@ -179,16 +190,40 @@ func (s RetrySchedule) validate() error {
 		if s.Status != RetryScheduleAttention || s.AttemptCount <= s.MaxAttempts || !retryFailureIsRetryable(s.FailureClass) {
 			return errors.New("automatic retry budget evidence is inconsistent")
 		}
+	} else if s.ReasonCode == RetryReasonOperatorRetry {
+		if s.Status != RetryScheduleScheduled || s.AttemptCount <= s.MaxAttempts || !retryFailureIsRetryable(s.FailureClass) {
+			return errors.New("operator retry schedule evidence is inconsistent")
+		}
 	} else if retryReasonForClass(s.FailureClass) != s.ReasonCode {
 		return errors.New("automatic retry schedule classification is inconsistent")
 	}
-	if s.Status == RetryScheduleScheduled && (s.AttemptCount > s.MaxAttempts || !s.NextEligibleAt.After(s.UpdatedAt) || !s.AttentionAt.IsZero()) {
+	if s.FailureClass == RetryFailureProcessStart {
+		if !validRetryProcessEvidenceRef(s.FailureEvidenceRef) {
+			return errors.New("process-start retry evidence reference is invalid")
+		}
+	} else if s.FailureEvidenceRef != "" {
+		return errors.New("retry evidence reference does not match the failure class")
+	}
+	if s.Status == RetryScheduleScheduled && ((s.AttemptCount > s.MaxAttempts && s.ReasonCode != RetryReasonOperatorRetry) || !s.NextEligibleAt.After(s.UpdatedAt) || !s.AttentionAt.IsZero()) {
 		return errors.New("scheduled retry evidence is incomplete")
 	}
 	if s.Status == RetryScheduleAttention && (s.AttentionAt.IsZero() || !s.NextEligibleAt.IsZero() || (s.AttemptCount > s.MaxAttempts && (s.ReasonCode != RetryReasonBudgetExhausted || !retryFailureIsRetryable(s.FailureClass)))) {
 		return errors.New("retry attention evidence is incomplete")
 	}
 	return nil
+}
+
+func validRetryProcessEvidenceRef(value string) bool {
+	parts := strings.Split(value, ":")
+	if len(parts) != 2 || parts[0] != "attempt" && parts[0] != "verification" || parts[1] == "" {
+		return false
+	}
+	for _, char := range parts[1] {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func ValidateRetrySchedule(s RetrySchedule) error {
@@ -206,7 +241,7 @@ func validRetryFailureClass(value RetryFailureClass) bool {
 
 func validRetryReasonCode(value string) bool {
 	switch value {
-	case RetryReasonProcessStart, RetryReasonUnavailable, RetryReasonAuthority, RetryReasonIntegrity, RetryReasonManual, RetryReasonTerminal, RetryReasonPersistence, RetryReasonBudgetExhausted:
+	case RetryReasonProcessStart, RetryReasonUnavailable, RetryReasonAuthority, RetryReasonIntegrity, RetryReasonManual, RetryReasonTerminal, RetryReasonPersistence, RetryReasonBudgetExhausted, RetryReasonOperatorRetry:
 		return true
 	default:
 		return false

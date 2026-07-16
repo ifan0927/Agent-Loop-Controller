@@ -128,6 +128,12 @@ func TestLinearTodoDispatcherBoundsTypedProcessStartRetry(t *testing.T) {
 	dispatcher.now = func() time.Time { return now }
 	dispatcher.policy.Retry = AutomaticRetryPolicy{MaxAttempts: 1, InitialDelay: time.Second, MaximumDelay: time.Second}
 	driver.err = typedRetryEvidence{}
+	driver.beforeError = func(command ProductionDriveCommand) {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		id := int64(len(store.attempts) + 1)
+		store.attempts = append(store.attempts, Attempt{ID: id, RunID: command.RunID, Status: "failed", ErrorCategory: RetryReasonProcessStart, FinishedAt: now})
+	}
 
 	first, err := dispatcher.Dispatch(context.Background())
 	if err != nil || first.Outcome != LinearTodoDispatchRetryScheduled || first.Retry == nil {
@@ -140,5 +146,35 @@ func TestLinearTodoDispatcherBoundsTypedProcessStartRetry(t *testing.T) {
 	}
 	if scanner.calls != 0 || len(driver.calls) != 2 || len(store.attention) != 1 {
 		t.Fatalf("scanner=%d driver=%d attention=%d", scanner.calls, len(driver.calls), len(store.attention))
+	}
+}
+
+func TestOperatorRetrySchedulePreservesExhaustedAttemptEvidence(t *testing.T) {
+	now := time.Now().UTC()
+	schedule := RetrySchedule{RunID: "run", Phase: "state_executing", ControllerState: string(domain.StateExecuting), AttemptCount: 4, MaxAttempts: 3, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: RetryFailureProcessStart, FailureEvidenceRef: "attempt:1", ReasonCode: RetryReasonOperatorRetry, Status: RetryScheduleScheduled, NextEligibleAt: now.Add(time.Nanosecond), CreatedAt: now.Add(-time.Minute), UpdatedAt: now}
+	if err := ValidateRetrySchedule(schedule); err != nil {
+		t.Fatalf("operator retry schedule rejected: %v", err)
+	}
+	schedule.AttemptCount = schedule.MaxAttempts
+	if err := ValidateRetrySchedule(schedule); err == nil {
+		t.Fatal("operator retry reason accepted without exhausted attempt evidence")
+	}
+	request := RetryFailureRequest{RunID: "run", Phase: "state_executing", ControllerState: domain.StateExecuting, FailureClass: RetryFailureProcessStart, ReasonCode: RetryReasonOperatorRetry, Now: now}
+	if err := ValidateRetryFailureRequest(request); err == nil {
+		t.Fatal("worker failure input accepted operator-only reason")
+	}
+}
+
+func TestProcessStartFailureEvidenceMustBeNewerThanDispatchBaseline(t *testing.T) {
+	now := time.Now().UTC()
+	stale := Attempt{ID: 4, RunID: "run", Status: "failed", ErrorCategory: RetryReasonProcessStart, FinishedAt: now}
+	inspection := RunInspection{Run: Run{ID: "run"}, Attempts: []Attempt{stale}}
+	before := retryFailureEvidenceCursorFor(inspection)
+	if _, err := processStartFailureEvidenceAfter(inspection, before); err == nil {
+		t.Fatal("stale process-start evidence satisfied a later dispatcher failure")
+	}
+	inspection.Attempts = append(inspection.Attempts, Attempt{ID: 5, RunID: "run", Status: "failed", ErrorCategory: RetryReasonProcessStart, FinishedAt: now.Add(time.Second)})
+	if ref, err := processStartFailureEvidenceAfter(inspection, before); err != nil || ref != "attempt:5" {
+		t.Fatalf("ref=%q err=%v", ref, err)
 	}
 }
