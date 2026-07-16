@@ -145,6 +145,12 @@ func signalObservedProcessGroup(control processControl, signal syscall.Signal) e
 }
 
 func killManagedProcessGroupMembers(control processControl) error {
+	if control.ControlName == "" {
+		if err := syscall.Kill(-control.ProcessGroupID, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return err
+		}
+		return nil
+	}
 	members, err := observedProcessGroupMembers(control.ProcessGroupID)
 	if err != nil {
 		return err

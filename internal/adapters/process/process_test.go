@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -91,6 +93,62 @@ func TestOSRunnerCancelsProcessGroupWithBoundedTermination(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("bounded termination took %s", elapsed)
 	}
+}
+
+func TestOSRunnerCancellationKillsCompleteUncontrolledProcessGroup(t *testing.T) {
+	directory := t.TempDir()
+	leaderMarker := filepath.Join(directory, "leader.pid")
+	childMarker := filepath.Join(directory, "child.pid")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type runResult struct {
+		result Result
+		err    error
+	}
+	done := make(chan runResult, 1)
+	go func() {
+		result, err := (OSRunner{InterruptGrace: 50 * time.Millisecond}).Run(ctx, Spec{
+			Program: os.Args[0], Args: []string{"-test.run=TestProcessHelper", "--", "ignore-with-child-pids", leaderMarker, childMarker},
+			StdoutPath: filepath.Join(directory, "stdout"), StderrPath: filepath.Join(directory, "stderr"),
+		})
+		done <- runResult{result: result, err: err}
+	}()
+	leaderPID := waitForPIDMarker(t, leaderMarker)
+	childPID := waitForPIDMarker(t, childMarker)
+	if leaderPID == childPID {
+		t.Fatalf("leader and child unexpectedly share pid=%d", leaderPID)
+	}
+	for role, pid := range map[string]int{"leader": leaderPID, "child": childPID} {
+		group, err := syscall.Getpgid(pid)
+		if err != nil || group != leaderPID {
+			t.Fatalf("%s pid=%d pgid=%d expected=%d err=%v", role, pid, group, leaderPID, err)
+		}
+	}
+	cancel()
+	completed := <-done
+	result, err := completed.result, completed.err
+	if err == nil || result.Outcome != OutcomeInterrupted {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if exists, err := processGroupExists(leaderPID); err != nil || exists {
+		_ = syscall.Kill(-leaderPID, syscall.SIGKILL)
+		t.Fatalf("uncontrolled process group remains: pgid=%d exists=%t err=%v", leaderPID, exists, err)
+	}
+}
+
+func waitForPIDMarker(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(path); err == nil {
+			if pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data))); parseErr == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("PID marker %s was not written", filepath.Base(path))
+	return 0
 }
 
 func TestOSRunnerCancellationProvesDescendantProcessGroupExited(t *testing.T) {
@@ -637,6 +695,16 @@ func TestProcessHelper(t *testing.T) {
 			signal.Ignore(os.Interrupt)
 			time.Sleep(10 * time.Second)
 			os.Exit(0)
+		case "ignore-interrupt-pid":
+			if index+2 >= len(os.Args) {
+				os.Exit(2)
+			}
+			signal.Ignore(os.Interrupt)
+			if os.WriteFile(os.Args[index+2], []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600) != nil {
+				os.Exit(2)
+			}
+			time.Sleep(10 * time.Second)
+			os.Exit(0)
 		case "check-lock-fd":
 			if index+2 >= len(os.Args) {
 				os.Exit(2)
@@ -678,6 +746,21 @@ func TestProcessHelper(t *testing.T) {
 				os.Exit(2)
 			}
 			signal.Ignore(os.Interrupt)
+			time.Sleep(10 * time.Second)
+			os.Exit(0)
+		case "ignore-with-child-pids":
+			if index+3 >= len(os.Args) {
+				os.Exit(2)
+			}
+			child := exec.Command(os.Args[0], "-test.run=TestProcessHelper", "--", "ignore-interrupt-pid", os.Args[index+3])
+			if err := child.Start(); err != nil {
+				os.Exit(2)
+			}
+			signal.Ignore(os.Interrupt)
+			if err := os.WriteFile(os.Args[index+2], []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+				_ = child.Process.Kill()
+				os.Exit(2)
+			}
 			time.Sleep(10 * time.Second)
 			os.Exit(0)
 		case "write-marker":
