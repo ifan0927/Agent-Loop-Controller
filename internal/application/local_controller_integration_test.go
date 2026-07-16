@@ -143,12 +143,14 @@ type durableFakeProcess struct {
 	needsDecision                                 bool
 	failFirstReview                               bool
 	reviewFindings                                bool
+	reviewFindingCount                            int
 	decisionOnFirstResume                         bool
 	noChangeOnResume                              bool
 	blockResumeUntilContextDone                   bool
 	resumeStarted                                 chan struct{}
 	implementationCalls, resumeCalls, reviewCalls int
 	resumeArgs                                    []string
+	resumeStdin                                   []string
 	reviewStdin                                   []string
 }
 
@@ -167,6 +169,7 @@ func (p *durableFakeProcess) Run(ctx context.Context, s processadapter.Spec) (pr
 		if s.Args[1] == "resume" {
 			p.resumeCalls++
 			p.resumeArgs = append([]string(nil), s.Args...)
+			p.resumeStdin = append(p.resumeStdin, s.Stdin)
 			if p.resumeStarted != nil {
 				select {
 				case p.resumeStarted <- struct{}{}:
@@ -199,7 +202,7 @@ func (p *durableFakeProcess) Run(ctx context.Context, s processadapter.Spec) (pr
 			if p.failFirstReview && p.reviewCalls == 1 {
 				verdict, summary = "failed", "transient reviewer failure"
 			}
-			if p.reviewFindings && p.reviewCalls == 1 {
+			if p.reviewFindings && (p.reviewFindingCount == 0 && p.reviewCalls == 1 || p.reviewCalls <= p.reviewFindingCount) {
 				verdict, summary = "findings", "actionable finding"
 				findings = `[{"id":"f1","severity":"medium","title":"Finding","body":"Fix it","file":null,"line":null}]`
 			}
@@ -959,7 +962,7 @@ func TestRepairHumanDecisionResumesInsteadOfReplayingDecisionRequest(t *testing.
 		t.Fatal(err)
 	}
 	defer store.Close()
-	process := &durableFakeProcess{reviewFindings: true, decisionOnFirstResume: true}
+	process := &durableFakeProcess{reviewFindings: true, reviewFindingCount: 2, decisionOnFirstResume: true}
 	controller := newController(t, store, lab, process, gitadapter.Workspace{})
 	input := startInput(lab)
 	input.Task.Policy.MaxRepairAttempts = domain.DefaultMaxRepairAttempts
@@ -994,14 +997,29 @@ func TestRepairHumanDecisionResumesInsteadOfReplayingDecisionRequest(t *testing.
 		t.Fatal(err)
 	}
 	run, err = newController(t, store, lab, process, gitadapter.Workspace{}).Continue(context.Background(), run.ID, &application.Decision{ChoiceID: "inclusive", Instructions: "Use inclusive min and max bounds."})
+	if err != nil || run.State != domain.StateFreshReview {
+		t.Fatalf("second finding run=%+v err=%v", run, err)
+	}
+	run, err = newController(t, store, lab, process, gitadapter.Workspace{}).HandoffFreshReviewFindings(context.Background(), run.ID)
+	if err != nil || run.State != domain.StateRepairing {
+		t.Fatalf("second handoff run=%+v err=%v", run, err)
+	}
+	inspection, err = store.Inspect(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err = newController(t, store, lab, process, gitadapter.Workspace{}).RepairFindings(context.Background(), run.ID, inspection.Findings)
 	if err != nil || run.State != domain.StateApprovalReady {
 		t.Fatalf("completed run=%+v err=%v", run, err)
 	}
-	if process.resumeCalls != 2 || process.reviewCalls != 2 {
+	if process.resumeCalls != 3 || process.reviewCalls != 3 {
 		t.Fatalf("resumes=%d reviews=%d", process.resumeCalls, process.reviewCalls)
 	}
-	if len(process.reviewStdin) != 2 || strings.Contains(process.reviewStdin[0], "Controller-authorized human decision") || !strings.Contains(process.reviewStdin[1], "Controller-authorized human decision") || !strings.Contains(process.reviewStdin[1], `"choice_id":"inclusive"`) || !strings.Contains(process.reviewStdin[1], "Use inclusive min and max bounds.") {
+	if len(process.reviewStdin) != 3 || strings.Contains(process.reviewStdin[0], "Controller-authorized human decision") || !strings.Contains(process.reviewStdin[1], "Controller-authorized human decision") || !strings.Contains(process.reviewStdin[1], `"choice_id":"inclusive"`) || !strings.Contains(process.reviewStdin[1], "Use inclusive min and max bounds.") || !strings.Contains(process.reviewStdin[2], "Controller-authorized human decision") {
 		t.Fatalf("review prompts did not bind the decision contract: %+v", process.reviewStdin)
+	}
+	if len(process.resumeStdin) != 3 || !strings.Contains(process.resumeStdin[2], "Controller-authorized human decision") || !strings.Contains(process.resumeStdin[2], `"choice_id":"inclusive"`) {
+		t.Fatalf("repair prompt did not bind the decision contract: %+v", process.resumeStdin)
 	}
 	inspection, err = store.Inspect(context.Background(), run.ID)
 	if err != nil {
