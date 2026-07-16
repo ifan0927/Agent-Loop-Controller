@@ -414,3 +414,14 @@ func TestOutstandingRepliesBlockApprovalUntilEveryRepairIsReplied(t *testing.T) 
 		t.Fatal("completed replies continued to block approval")
 	}
 }
+
+func TestOutstandingReplyUsesOnlyLegalReviewReplyTransitions(t *testing.T) {
+	head := strings.Repeat("b", 40)
+	feedback := replyFeedback(1, "ROOT")
+	if shouldEnterReviewReply(domain.StatePROpen, domain.ReconciliationPass, []TrustedReviewFeedbackRecord{feedback}, head) {
+		t.Fatal("pr_open bypassed the required reconciling_reviews transition")
+	}
+	if !shouldEnterReviewReply(domain.StateReconcilingReviews, domain.ReconciliationPass, []TrustedReviewFeedbackRecord{feedback}, head) {
+		t.Fatal("verified feedback did not enter the legal review reply transition")
+	}
+}
