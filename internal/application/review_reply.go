@@ -461,7 +461,7 @@ func replyTargetStatus(threads []domain.GitHubReviewThread, bodies domain.Inline
 		if thread.NodeID != feedback.ThreadNodeID {
 			continue
 		}
-		if thread.OriginalCommitSHA != feedback.OriginalReviewHeadSHA || thread.Path != feedback.Path || !sameReplyLine(thread.Line, feedback.Line) {
+		if thread.OriginalCommitSHA != feedback.OriginalReviewHeadSHA || thread.Path != feedback.Path || !sameReplyLocationLine(thread.Line, feedback.Line, thread.Outdated) {
 			return false, false, false
 		}
 		for _, comment := range thread.Comments {
@@ -489,6 +489,10 @@ func sameReplyLine(a, b *int) bool {
 		return a == nil && b == nil
 	}
 	return *a == *b
+}
+
+func sameReplyLocationLine(observed, expected *int, outdated bool) bool {
+	return sameReplyLine(observed, expected) || (outdated && observed == nil && expected != nil)
 }
 
 func (c *ProductionCoordinator) completeReviewReply(ctx context.Context, run Run, owner string, store reviewReplyStore, side SideEffectRecord, feedback TrustedReviewFeedbackRecord, reply domain.ReviewReply, observations []GitHubRequestObservation, idempotent bool) (ProductionReplyResult, error) {

@@ -368,11 +368,23 @@ func TestReplyEligibilityAllowsOutdatedRepairThreadAndRecordsResolved(t *testing
 	}{{"outdated", false, true}, {"resolved outdated", true, true}} {
 		t.Run(tc.name, func(t *testing.T) {
 			threads, bodies := replyTarget(feedback, tc.resolved, tc.outdated)
+			threads[0].Line = nil
 			resolved, outdated, valid := replyTargetStatus(threads, bodies, feedback)
 			if !valid || resolved != tc.resolved || outdated != tc.outdated {
 				t.Fatalf("resolved=%t outdated=%t valid=%t", resolved, outdated, valid)
 			}
 		})
+	}
+	threads, bodies := replyTarget(feedback, false, false)
+	threads[0].Line = nil
+	if _, _, valid := replyTargetStatus(threads, bodies, feedback); valid {
+		t.Fatal("non-outdated cleared line was accepted")
+	}
+	threads, bodies = replyTarget(feedback, false, true)
+	otherLine := *feedback.Line + 1
+	threads[0].Line = &otherLine
+	if _, _, valid := replyTargetStatus(threads, bodies, feedback); valid {
+		t.Fatal("outdated mismatched concrete line was accepted")
 	}
 }
 
