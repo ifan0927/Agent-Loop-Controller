@@ -126,12 +126,16 @@ func TestOfflineAcceptanceSparseEnvironmentUsesManagedVerifierAndGitPaths(t *tes
 	}
 	defer store.Close()
 	process := &durableFakeProcess{}
-	controller := newController(t, store, lab, process, gitadapter.Workspace{})
+	workspace := gitadapter.Workspace{Binary: gitPath}
+	registry := verifier.NewRegistry(map[string]verifier.Command{
+		"fixture-go-test": {Program: goPath, Args: []string{"test", "./..."}},
+	}, processadapter.OSRunner{}, workspace)
+	controller := application.NewLocalController(store, testWorktrees{}, codex.NewExecutor(process, "codex"), registry, workspace, "codex", lab.worktrees)
 	run, err := controller.Start(context.Background(), startInput(lab))
 	if err != nil || run.State != domain.StateApprovalReady {
 		t.Fatalf("run=%+v err=%v", run, err)
 	}
-	head, err := (gitadapter.Workspace{}).Head(context.Background(), run.WorktreePath)
+	head, err := workspace.Head(context.Background(), run.WorktreePath)
 	if err != nil {
 		t.Fatal(err)
 	}
