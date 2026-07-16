@@ -1,489 +1,807 @@
 # Architecture
 
-## System boundary
+## 1. Design Goals
 
-Agent Loop Controller is a deterministic workflow coordinator. It accepts a
-normalized trigger, fetches and snapshots the canonical Linear issue, provisions
-an isolated workspace, invokes Codex, verifies evidence, and advances a durable
-state machine. It is not an LLM agent.
+Agent Loop Controller is a deterministic state machine around nondeterministic
+coding executors and external delivery systems. Its design optimizes for:
+
+- exact evidence instead of agent assertions;
+- one legal next action derived from persisted state;
+- restart-safe and idempotent external effects;
+- explicit human authority for ambiguous scope and final approval;
+- isolated repository resources with provable ownership;
+- narrow adapters rather than generic write clients;
+- sanitized, durable observability without credential retention.
+
+The controller does not implement code reasoning, a general workflow engine, or
+an autonomous policy-improvement loop.
+
+## 2. System Context
 
 ```text
-Manual CLI / future Cron / Linear webhook / Hermes
-                         |
-                    TriggerSignal
-                         |
-                         v
-              admission and durable run state
-                         |
-                         v
-                long-lived delivery driver
-             next action | evidence | gates
-              /          |            \
-         Linear       Codex Exec       GitHub
-                          |               |
-                implementation/review   PR -> required CI -> I-Fan approval
+Manual CLI / automatic worker / future Hermes or API adapter
+                           |
+                    admission signal
+                           v
+Linear task read -> immutable CodingTask + repository authority snapshot
+                           |
+                           v
+             SQLite-backed production driver
+               |           |             |
+            Codex         Git          GitHub App
+       implement/review  workspace   PR/checks/review/merge
+               \           |             /
+                exact-HEAD evidence gates
+                           |
+                           v
+               Linear completion observation
+                           |
+                           v
+              source sync and owned cleanup
 ```
 
-## Canonical contracts
-
-### TriggerSignal
-
-Trigger adapters submit only an issue identifier, action, requester, timestamp,
-and idempotency key. They do not submit authoritative issue contents. The
-controller re-fetches Linear to prevent stale or forged task specifications.
-
-### CodingTask
-
-After admission, the controller creates an immutable snapshot containing the
-issue goal, acceptance criteria, out-of-scope items, repository, Linear branch
-name, repository-owned verifier IDs, policy, and source revision. Linear never
-carries executable verification commands. A material Linear edit
-after admission creates a human decision point; it never silently changes a run.
-
-The automatic worker is the production admission adapter. It scans only
-configured IFAN Todo candidates, then reserves and moves exactly one eligible
-issue to In Progress before handing it to the durable driver. `controller run
-IFAN-xxx` remains a bounded recovery or local-lab adapter. Both paths fetch the
-same authoritative source and apply the same eligibility rules: the issue must
-be in `Todo`, an active current cycle, team `IFAN`, labelled `agent:codex` (and
-not `agent:hermes`), and contain exactly one label that maps to a
-controller-owned repository profile. The issue description must have a
-`## Goal` or `## Outcome` section and a `## Acceptance Criteria` section;
-`## Out of Scope` is preserved when present. Verification always comes from the
-matched repository profile, never from Linear text. A repeated trigger with the
-same immutable source resumes the same run. A material source, branch, or
-repository change sends the active run to `manual_intervention` for a human
-decision rather than creating another active run or rewriting its snapshot.
-
-Automatic admission is priority-only: explicit priorities rank `1` through `4`,
-in that order, and unprioritized `0` ranks below all explicit priorities. A
-non-terminal run prevents a new scan and cannot be preempted. If authoritative
-candidate reads produce more than one best priority, the dispatcher records
-sanitized operator attention and performs no reservation or Linear mutation;
-the operator must resolve the tie before a later poll. Stable ordering is
-limited to evidence/display and is never a selection fallback.
-
-### Repository registry
-
-Registry version 1 selects one repository by case-insensitive canonical
-`owner/name`. Each concrete entry binds a non-symlink local checkout, artifact,
-and worktree roots plus either a local bare fixture origin or a credential-free
-canonical GitHub origin URL. The GitHub URL must name the same `owner/name` as
-the registry entry; checkout transport may be SSH or HTTPS without changing
-that identity. The entry also binds `builtin:v1` verifier policy; base branch; a
-non-secret GitHub App profile reference; installation and immutable repository
-IDs; and allowed operator logins. Duplicate identities, shared or overlapping
-paths, unsupported verifiers, and incomplete legacy entries fail closed.
-
-Controller configuration versions 2 and 3 store these repository entries inline
-in the one operator configuration document. Version 1 configurations retain the
-separate registry-file reference only for compatibility; the registry validator
-and per-run authority evidence are the same in both forms.
-
-SQLite schema version 8 freezes a stable `repository-profile:<owner>/<repo>` ID,
-the profile snapshot schema version, canonical credential-free JSON, and its
-SHA-256 digest for every new run. The snapshot binds repository and base branch,
-verifier policy, immutable GitHub App ID and profile identity, installation and
-repository IDs, and trusted operator database/node/type identities. JSON source field order cannot affect the
-canonical digest. Full local paths remain in the private binding needed to
-reproduce and protect controller-owned resources; status and inspect expose only
-the sanitized profile identity, policy references, and digests.
-
-Restart rejects any change to the selected profile snapshot or its source,
-artifact, worktree, or origin authority binding, while unrelated repository
-entries may change without invalidating the run. GitHub App private-key or installation-token rotation does
-not change the profile when the configured App identity, installation, and
-repository identities are unchanged. Rows created before schema version 8 keep
-empty profile-evidence columns and fail closed because migration cannot prove
-their original authority binding.
-
-### Codex implementation outcome
-
-Implementation is a resumable `codex exec` session. The semantic last message is
-validated against `contracts/implementation-outcome.schema.json`. JSONL stdout is
-append-only telemetry and stderr is captured separately. Exit code zero alone is
-not success.
-
-The JSON schemas constrain the Codex structured-output shape. The controller's
-domain validators enforce cross-field semantics, including that a human-decision
-status contains a decision request and that a passing review has no findings.
-The schemas are embedded into the controller binary and emitted as explicit
-preparation artifacts; the runner must materialize them before starting Codex.
-Every attempt uses a new empty artifact directory. Schema files are created
-exclusively, and each Codex output leaf must still be absent immediately before
-the process starts, preventing pre-created symlink output targets.
-
-Resume names the persisted implementation session, runs from the same owned
-worktree, and explicitly overrides `sandbox_mode` to `workspace-write` through
-the resume command's supported config interface. It never uses `--last`.
-
-### Fresh review outcome
-
-Review is a new `codex exec --ephemeral --sandbox read-only` invocation, never a
-resume of the implementation session. Its fixed prompt requires inspection of
-the complete `origin/<base>...HEAD` delta. The controller binds the structured
-outcome to the exact candidate head SHA and verifies that review did not mutate
-the workspace.
-
-Codex CLI 0.144.1's built-in `codex exec review` was not selected for the MVP
-adapter because live verification showed that it emitted prose through
-`--output-last-message` despite `--output-schema`, and its scope selector could
-not be combined reliably with the required custom prompt. This decision can be
-revisited after a versioned CLI compatibility test proves structured output.
-
-The fresh reviewer explicitly overrides `sandbox_mode` to `read-only`. Run
-artifacts must be outside and non-overlapping with the owned worktree so semantic
-output and telemetry cannot pollute the candidate branch. The controller resolves
-filesystem identity and physical ancestor directories before enforcing this
-separation. Both directories must already exist after provisioning. This lets the
-operating system resolve symlinks, case aliases, and Unicode-equivalent paths.
-Controller-managed paths also reject raw parent-traversal components.
-
-The Phase 1 runner must record and preflight the installed Codex CLI version and
-required flags before executing a plan. Managed commands do not use
-`--strict-config`: unrelated stale fields in a user's global Codex configuration
-must not prevent an otherwise compatible coding run.
-
-Subprocess stdout and stderr are captured directly to exclusive artifact files,
-not duplicated into unbounded memory buffers. Codex session extraction scans
-the JSONL artifact as a stream. Only the small version and help outputs are read
-through explicit size limits, and capability checks require exact option tokens
-from help declaration lines.
-
-Managed runs use `--ignore-user-config` so global MCP servers, hooks, or tools
-cannot bypass controller ownership of external side effects. Authentication and
-repository instructions remain available; required runtime behavior is supplied
-explicitly by the command contract.
-
-The model is controller-owned policy, not task input or Codex configuration.
-Implementation and every explicit resume request `gpt-5.6-terra`; a fresh,
-independent review requests `gpt-5.6-sol`. The implementation model and session
-ID are persisted together, and resume fails closed if either is missing or if
-attempt evidence conflicts. Review remains on Sol until representative
-evaluation demonstrates that Terra provides equivalent review quality.
-
-The Phase 1A spike runs repository verification once against the uncommitted
-implementation before the controller creates a candidate commit, then repeats
-the same verifier against the committed candidate. Only the second result is
-used as exact-HEAD authorization evidence. This preserves the required ordering
-without claiming that a pre-commit result was executed at a later commit SHA.
-The spike also treats ignored workspace files as dirty evidence and verifies
-that `refs/remotes/origin/<base>` exists and is an ancestor both before
-implementation and before fresh review. The reviewed branch delta therefore has
-a deterministic Git base and does not depend on uncommitted ignored inputs.
-The working branch name is revalidated after every Codex or verifier boundary,
-so switching a symbolic branch without changing HEAD cannot redirect the
-controller-owned candidate commit.
-
-If review reports findings, the controller resumes the implementation session,
-runs verification, creates a new candidate head, and launches another fresh
-review. No reviewed SHA may be substituted with a later SHA.
-
-Fresh-review findings are a separate controller-owned handoff. The persisted
-review attempt, successful process result, outcome digest, reviewed candidate
-head, and normalized finding set are compared before any repair state change.
-SQLite persists that set and the `fresh_review -> repairing` transition in one
-idempotent transaction; an immutable source-ID conflict fails closed rather
-than overwriting an earlier finding. The local controller stops at
-`fresh_review`; the production driver/coordinator performs this typed handoff.
-Repair resumes only from that persisted authority and must produce new
-exact-head verification and fresh-review evidence before delivery can
-continue.
-
-The repair policy deadline is anchored at the first persisted
-`repairing -> executing` transition and is reused by every later repair cycle,
-including verification and fresh-review handoff. Before an action in an active
-repair state, the controller checks that durable deadline; true expiry moves
-the run to `manual_intervention` once with bounded, sanitized evidence through
-a short detached persistence context. Missing or malformed repair-anchor
-evidence fails closed to the same human gate. Caller cancellation remains
-resumable when the durable policy deadline has not elapsed. Production performs
-this local preflight before revalidating external Linear authority and binds
-that read, plus the fresh-review findings handoff, to the same persisted
-deadline; detached reconciliation records expiry if either action crosses the
-boundary.
-
-`fresh_review -> pr_open` is deliberately absent from the generic state topology.
-The application gate authorizes it only when the review verdict is `pass`, the
-reviewed head equals current Git HEAD, and controller verification was recorded
-for that same head.
-
-## Review order
-
-1. Codex implementation self-checks while coding.
-2. Controller runs repository verification.
-3. A fresh Codex reviewer evaluates the entire branch delta.
-4. Only a passing internal review allows PR creation.
-5. Required CI evaluates the PR at its exact head.
-6. Any code change repeats verification and fresh Codex review.
-7. I-Fan approves the exact final head as the final gate.
-
-## Ownership
-
-The controller owns worktrees, branches, commits, pushes, PR creation, retries,
-timeouts, state transitions, evidence, merge, and cleanup. Codex edits and tests
-inside the assigned worktree and returns structured semantic outcomes. Codex does
-not write Linear or GitHub state during implementation.
-
-### Managed Git runtime
-
-Controller-owned Git workspace operations and source-checkout synchronization use
-the same managed process boundary as Codex and verifiers. Each operation supplies
-an explicit Git binary, working directory, argv, cancellation context, exclusive
-stdout/stderr capture leaves, and the controller-managed PATH. It does not invoke
-a shell or inherit the operator's interactive shell profile.
-
-The Git runtime uses a minimal environment allowlist: only the non-secret `HOME`
-value is retained when present, while PATH is always the fixed managed PATH and
-all other ambient variables are omitted. It disables system/global configuration
-and interactive prompts, disables hooks and autostash, clears credential helpers,
-and supplies a fixed non-secret controller author/committer identity. Linear,
-GitHub, SSH-agent, askpass, dynamic-loader, and Git config injection channels
-therefore cannot enter the child environment. Process start,
-interruption, invalid-result, and non-zero exit outcomes are represented by a
-sanitized typed error; raw Git stderr, environment values, and arbitrary argv are
-never copied into controller errors. Exit status checks use the typed outcome,
-not string matching on process error text.
-
-The narrow generic Git argv seam is still argv-only and accepts only the Git
-subcommand arguments supplied by controller code. Task text and external command
-strings are not interpolated into a shell command. Worktree provisioning,
-candidate/repair commits, exact-head recovery, cleanup, push preconditions, and
-source synchronization therefore share one runtime policy.
-
-## Delivery driver and human gates
-
-The worker normally admits the durable run and starts its long-lived delivery
-driver. `controller drive <run-id>` starts the same driver for an already
-admitted run after a process or host restart. `controller run IFAN-xxx` is
-reserved for a bounded recovery or local-lab trigger. The driver reads the
-authoritative SQLite state, takes the one legal next action, persists its intent
-before any external write, observes the result, and repeats. It does not accept
-an action order from a CLI caller, issue body, web UI, or external response.
-
-After admission, normal progression is automatic: Codex implementation,
-verification, fresh review, push, PR creation, required-CI reconciliation,
-repair when a required check fails, squash merge, Linear completion observation,
-and cleanup. The driver stays alive and polls while CI, I-Fan approval, or
-Linear completion is pending. A valid exact-head
-I-Fan approval is evidence, not a controller command; once observed, it lets the
-same driver continue to merge and cleanup.
-
-The CLI driver has a bounded process lifetime (24 hours by default; a deliberate
-`--max-runtime` may be set up to seven days). It exits without speculative
-repair for terminal states, `awaiting_human_decision`, `manual_intervention`,
-process cancellation, or expiry of that process lifetime. Human decision and
-conflict resolution are structured operator work that can be followed by a
-restart-safe `drive`; I-Fan alone grants the final GitHub approval. The
-lower-level state-specific CLI commands are kept for incident recovery and
-deliberate E2E fault injection, not routine operation.
-
-### Durable automatic retry scheduling
-
-Automatic admission retry eligibility is persisted in SQLite schema version 20
-as one record keyed by `run_id` and the controller phase derived from the
-persisted run state. The record contains the bounded failure count, fixed retry
-policy, sanitized failure class and reason code, and either a future eligibility
-time or a durable operator-attention time. An attempt compare-and-swap prevents
-a stale worker or a second scheduler from extending a newer schedule.
-
-Only controller-owned process-start and temporary-unavailable evidence is
-eligible for automatic retry. Authority drift, integrity failures, manual or
-human-gated states, terminal failures, and persistence conflicts become
-attention stops. A scheduled record authorizes resuming that exact run and
-phase only; it cannot create another run, choose another branch, or start a new
-Codex session. The worker reads the persisted time after every restart and
-waits until it is eligible, so in-memory backoff state cannot reset the budget
-or shorten the delay. Exhaustion and all attention projections use the stable
-schedule identity and are idempotent in the local outbox.
-
-## Persistence direction
-
-Phase 1B uses SQLite as the authoritative source of local run state. The schema
-has explicit ordered migrations and persists runs, ordered transitions, Codex
-attempts, head-bound verifications, reviews, and controller-owned resources.
-Filesystem artifacts retain full JSONL, stderr, structured outcomes, and verifier
-output; SQLite retains paths, hashes, session IDs, exact SHAs, verdicts, and
-summaries needed to reject incomplete or mutated evidence.
-
-SQLite schema version 2 adds a compare-and-swap run lease with owner and expiry,
-plus digest and size bindings for Codex and verifier stdout/stderr. A local
-controller renews its lease while an external process is active and cancels the
-operation if ownership is lost. A crashed owner becomes reclaimable after the
-bounded lease expiry, preventing concurrent controllers from mutating one owned
-worktree. SQLite foreign keys and busy timeout are configured in the driver DSN
-so they apply to every physical connection, including connections recreated by
-`database/sql`.
-
-The predictable per-run artifact path is reserved in `owned_resources` before
-filesystem creation. A random ownership nonce is persisted in SQLite and in an
-exclusive marker inside the newly created root. Every start or continue checks
-that the root and `attempts` are real directories, remain canonically contained
-under the configured run root, and match the marker before reading snapshots or
-creating a new attempt. A pre-existing path without the durable reservation is
-never adopted.
-
-Run creation is idempotent by immutable issue/source-revision content and only
-one active run may own an issue. State transitions use a transaction with an
-expected-current-state comparison. External steps are entered from an already
-persisted intent state, and implementation/review attempts receive a persisted
-row and unique empty artifact directory before process execution. Candidate
-commit recovery accepts only the controller's fixed commit identity as the sole
-child of the persisted exact base; any other Git/SQLite disagreement fails
-closed.
-
-If a controller restarts with a `started` Codex attempt, it does not silently
-open a new implementation session. It recovers the explicit session ID from the
-attempt JSONL, records the interrupted attempt and session in SQLite, and uses a
-new isolated resume attempt. Missing or malformed session evidence stops for
-manual handling.
-
-A simulated human decision is immutable evidence as well. Its transition stores
-the decision value, file digest, and the exact implementation-outcome path/hash
-that contained the offered options. Restart resume revalidates all bindings and
-rejects a changed file or a choice absent from the original request.
-
-Verifier adapters return partial evidence together with execution errors. Each
-check records a typed process outcome (`not_started`, `exited`, or
-`interrupted`) and a controller-owned failure category. A process that never
-started or was interrupted always has a non-success exit representation; exit
-code zero is valid only for a process that started and exited successfully.
-The controller hashes and persists every check that actually ran, including
-failed exit codes and start-failure evidence, before returning the failure to
-the state machine. Failed verifier artifacts therefore remain reachable
-through SQLite status and inspection without retaining raw process errors.
-Authorization groups records by their unique verification evidence path and
-considers only the newest candidate batch. An older successful batch cannot
-authorize the candidate after a newer failed, not-started, or interrupted
-batch; a later complete successful retry may authorize it again.
-
-Schema version 3 retains multiple review records for one candidate HEAD. A
-transient `failed` verdict may use a new isolated review attempt, while a
-`findings` verdict remains a safe stop until a later repair produces a new HEAD.
-Authorization considers the latest exact-HEAD review without discarding earlier
-review history.
-
-SQLite schema version 4 persists the implementation and review models on each
-run and the requested model on every Codex attempt. Migration deliberately
-leaves these fields empty for pre-version-4 runs: that empty value is explicit
-legacy evidence, not permission to claim the current policy was historically
-used. Such runs fail closed before another Codex execution. Codex CLI 0.144.1
-does not provide a verified stable effective-model field in the JSONL contract,
-so the controller records the authoritative requested model and does not infer
-an effective model from unstable telemetry.
-
-The SQLite adapter uses `modernc.org/sqlite`. Its pure-Go implementation avoids a
-CGO compiler/runtime dependency and keeps local and race-test execution
-portable. The trade-off is a larger indirect dependency graph and binary than a
-CGO-backed SQLite driver. The controller still has only one direct SQLite
-dependency and does not shell out to the `sqlite3` CLI.
-
-## Post-approval delivery
-
-Schema version 5 extends the durable trial beyond `approval_ready` with explicit
-`pushing_branch`, `branch_pushed`, `opening_pr`, `pr_open`,
-`reconciling_reviews`, `repairing`, `awaiting_human_approval`, `merging`,
-`cleaning`, and terminal states. No generic publishing state hides multiple
-external operations.
-
-Every external operation follows an intent/reconcile/observe pattern. The
-controller commits an idempotency key and immutable intent before invoking Git
-or GitHub, compares actual external state, and then saves the observed result.
-A restart never treats an interrupted process as evidence of success or failure.
-
-Push uses the persisted branch in an explicit
-`refs/heads/<branch>:refs/heads/<branch>` refspec and never force-pushes. The
-controller revalidates the owned worktree, origin, clean status, candidate HEAD,
-exact-HEAD verification, and latest passing fresh review. A matching remote SHA
-is idempotent. A different SHA fails closed unless it is the persisted head of
-the same open controller-owned PR; a repair may then use an ordinary
-fast-forward, `--force-with-lease` update to the new verified candidate. The
-persisted PR head is advanced before the next read-only GitHub reconciliation.
-
-If that owned-PR repair update halts in `manual_intervention`, the explicit
-`recover-owned-push` operator action can return only that run to
-`approval_ready`. It proves unchanged Linear source and retained open PR
-ownership, but performs no external write. The next driver push repeats local
-exact-HEAD validation, remote observation, and the fast-forward lease before
-updating the branch.
-
-An owned PR merged manually by I-Fan remains fail-closed until the explicit
-`accept-external-merge` operator action proves persisted exact-HEAD local
-verification, fresh review, required checks, trusted approval, remote-base
-containment, and identical candidate/merge trees. The accepted external merge
-then resumes only at `awaiting_linear_completion`; it does not bypass Linear
-Done observation or the existing guarded cleanup.
-
-An automatic-admission run that is still in `received`, `admitting`, or
-`manual_intervention` has one separate terminal operator action:
-`controller abandon`. The action requires the persisted requester, expected
-state, repository, and idempotency key, re-reads the stable Linear task, and
-uses one SQLite compare-and-swap transaction to move the run to `failed` and
-the admission journal to its `manual_intervention` attention projection. It
-rejects any retained pull request, approval, merge result, push/PR/merge
-intent, remote-branch ownership, or in-flight Linear mutation. After the
-transaction it removes only durably owned local worktree and branch resources;
-artifacts and the complete audit trail remain readable. Replaying the same
-authority (with `failed` as the expected state after the first CAS) resumes
-only unfinished local cleanup and never repeats an external Linear, GitHub, or
-remote-branch write.
-
-One run owns at most one pull request. Adoption requires durable ownership
-metadata plus matching head, base, candidate SHA, PR identity, and body digest.
-A same-named branch or matching head/base alone is insufficient. PR bodies carry
-summary, rationale, validation, fresh-review, out-of-scope, and Linear magic-word
-evidence.
-
-Required checks and human-review status use bounded polling attempts, intervals,
-and an overall deadline under the delivery driver. Observations are pending,
-pass, actionable failure, infrastructure failure, or timeout. Pending CI,
-exact-head approval,
-and Linear completion leave the driver waiting and polling; a timeout
-or conflicting result becomes auditable fail-closed intervention rather than a
-manual sequence of normal-state commands. Unknown events remain telemetry.
-The ephemeral Sol review remains the independent implementation-review gate.
-
-Required-CI failures are normalized to a controller-generated finding with a
-stable check identity and body digest. Repair resumes only the persisted Terra
-session with controller-normalized stdin. Every new HEAD invalidates all older
-verification, review, push, check, and human-approval authorization.
-
-Only verifiable I-Fan approval for the exact PR HEAD, passing checks, and the
-latest passing internal review authorizes merge. The
-controller never approves its own PR. Merge is squash-only and records the
-pre-merge head, base SHA, result SHA, and timestamp after re-reading GitHub.
-
-Cleanup is a separate restart-safe state. Each owned resource has its own intent
-and result. Base branches, user-created resources, changed refs, dirty worktrees,
-and resources owned elsewhere are rejected. Partial failures preserve evidence
-and retry only unfinished resources. Linear completion is observed but not
-forced; production Linear writes remain deferred. Once a completion observation
-is valid, cleanup is automatically driven rather than requiring an operator to
-invoke a cleanup command.
-
-## Fixture-first dogfooding
-
-The deterministic integration suite is restricted to disposable repositories,
-local bare origins, and fake GitHub services. The normal SQLite state and public
-CLI are used across a simulated restart, and artifacts remain inspectable. A
-separate external E2E run may use a credential-free GitHub origin binding only
-for an explicitly authorized isolated test repository. This repository's
-production remote is never a PR, merge, or cleanup fixture. See
-[`docs/e2e-dogfood.md`](e2e-dogfood.md) for the operator-owned acceptance
-matrix.
-
-## Direct read-only GitHub App adapter
-
-Schema version 6 added non-secret installation, repository, request, rate-limit,
-actor-derived normalized evidence, and response digests. JWTs, installation
-tokens, private keys, authorization headers, and raw token responses are never
-persisted. The adapter uses RS256 App JWTs and memory-only installation tokens,
-refreshes before expiry, and permits one refresh/retry after HTTP 401.
-
-REST owns installation token minting, repository and pull-request identity,
-check runs, and commit status evidence. GraphQL owns human-review identity
-topology. Both transports are read-only, bounded, and
-paginated. A final approval requires the configured User's immutable GitHub
-identity and exact candidate head; display names and login similarity are
-insufficient. Production use is explicit through `github-read` and does not
-consult `gh` configuration or user credentials.
+Linear is the authoritative task source. Git and GitHub are authoritative for
+repository and delivery facts. SQLite is authoritative for controller intent,
+state, ownership, and recorded observations. I-Fan is authoritative for
+structured task decisions, review-thread resolution, and final GitHub approval.
+Codex output is input to validation; it is never authority by itself.
+
+## 3. Component Responsibilities
+
+| Layer | Responsibility | Must not know or own |
+| --- | --- | --- |
+| `internal/domain` | Pure contracts, state topology, evidence semantics, and validation | CLI, SQLite, HTTP, filesystem, or process details |
+| `internal/application` | Use cases, authorization, orchestration, reconciliation, and ports | Flag parsing, concrete API clients, SQL, or shell execution |
+| `internal/adapters` | SQLite, Git, Codex/process, Linear, GitHub App, configuration, verifier, and fixture implementations | Product policy beyond each typed port |
+| `cmd/ifan-loop` | Composition root, CLI routing, flags, signal/time bounds, and JSON rendering | Alternate state transitions or duplicated domain policy |
+| `contracts` | Versioned JSON schemas embedded into the binary for Codex outcomes | Workflow state or external side effects |
+
+## 4. Trust and Authority Model
+
+Authority is deliberately split:
+
+| Decision or fact | Authority |
+| --- | --- |
+| Task goal, scope, criteria, priority, branch name | Current Linear issue, then immutable admitted snapshot |
+| Repository, base branch, verifier IDs, GitHub App and trusted actors | Validated repository profile frozen into the run |
+| Candidate content and ancestry | Managed Git observation |
+| Test success | Latest complete verifier batch for the exact candidate HEAD |
+| Internal review | Latest successful fresh review for that exact HEAD |
+| CI and PR topology | Direct GitHub App observation for the owned PR and exact HEAD |
+| Human review feedback | Trusted immutable I-Fan actor/review/comment/thread evidence |
+| Final approval | Trusted GitHub review identity approving the exact current HEAD |
+| Merge | Conditional GitHub result, or explicit evidence-gated external-merge acceptance |
+| Controller progress and ownership | SQLite state, transitions, leases, intents, and evidence rows |
+
+An authority record and prompt input are different. For example, trusted review
+feedback is retained as immutable identity/body-digest lifecycle evidence; a
+bounded normalized finding derived from it may be sent to Codex. The prompt
+cannot replace the authority record.
+
+## 5. End-to-End Data Flow
+
+1. Admission reads Linear by identifier or scans a bounded eligible Todo set.
+2. Eligibility requires team IFAN, current cycle, Todo, `agent:codex`, no
+   `agent:hermes`, exactly one configured repository label, a safe Linear
+   `branchName`, and parseable goal/acceptance sections.
+3. The controller resolves verifier IDs and repository/GitHub authority from
+   local configuration, then persists the immutable task and profile snapshots.
+4. A dedicated worktree and artifact root are reserved before creation and
+   checked against ownership markers on every resume.
+5. Codex implements in the worktree. Structured semantic output is schema- and
+   domain-validated; JSONL and stderr remain artifacts.
+6. The controller commits the candidate, runs the configured verifier batch,
+   and starts a new ephemeral read-only review against the exact branch delta.
+7. Findings cause a bounded same-session repair followed by a new commit,
+   verification, and fresh review. A pass reaches delivery authorization.
+8. The production driver persists and reconciles branch push, owned PR,
+   GitHub checks, trusted review feedback/reply, approval, and merge.
+9. After GitHub merge, Linear is polled until it reports completed. The
+   controller does not force completion.
+10. A clean configured source checkout may fast-forward to the exact merge SHA;
+    owned worktree and branches are cleaned independently and restart-safely.
+
+## 6. Domain Model
+
+### Task contract
+
+`TriggerSignal` carries only source, issue ID, start action, requester, time, and
+request ID. It cannot supply task contents. `CodingTask` freezes the normalized
+issue identity, repository/base/working branch, goal, acceptance criteria,
+out-of-scope items, controller-owned verifier IDs, source revision, and policy.
+Validation protects safe Git branch syntax, non-empty criteria, verifier-ID
+syntax, mandatory human approval, squash merge, and no silent scope expansion.
+
+### State machine and legal transitions
+
+`State` and `ValidateTransition` define the generic legal topology. Application
+services add narrower evidence gates; being topologically legal is not enough.
+For example, `fresh_review -> approval_ready` also requires a passing review,
+successful verification, and matching current Git HEAD.
+
+The topology protects against callers choosing arbitrary action order. Terminal
+states have no outgoing generic edge. Only dedicated recovery services can use
+the two narrow `manual_intervention` edges.
+
+### Exact-head evidence
+
+Candidate verification, internal review, pushed branch, PR head, required
+checks, human approval, and merge precondition all carry a Git SHA. Any new
+candidate invalidates authorization from the prior head. Evidence paths also
+carry hashes and sizes so a modified artifact cannot silently retain authority.
+
+### Verification, review, and approval authority
+
+Verifier commands come from the controller-owned `builtin:v1` registry; Linear
+may name only configured IDs. A verifier records whether the process was not
+started, exited, or was interrupted, plus all output bindings. Review is a new
+ephemeral Codex session in a read-only sandbox, never an implementation resume.
+A human approval must come from the configured immutable GitHub `User` identity,
+the owned PR, and the exact candidate reviewed internally and passed by CI.
+
+### Human decision
+
+A Codex `needs_human_decision` outcome supplies a bounded question and offered
+choice IDs. `awaiting_human_decision` can continue only with a selected offered
+choice stored alongside the originating outcome hash. The decision becomes an
+authoritative contract clarification for same-session implementation and later
+fresh review; it does not mutate the original task snapshot.
+
+### Trusted review feedback lifecycle
+
+Only an exact-head root inline `CHANGES_REQUESTED` comment by the configured
+trusted I-Fan identity can enter the lifecycle:
+
+```text
+observed -> selected_for_repair -> repair_verified
+         -> reply_pending -> replied -> resolved
+                         \-> superseded (when authority becomes obsolete)
+```
+
+Immutable PR, review, thread, comment, actor, original-head, location, body
+digest, and timestamps prevent a similar-looking comment from being adopted.
+The controller may post one fixed marker-bound reply after repair verification
+and fresh review. It never resolves the conversation.
+
+### Reconciliation classification
+
+GitHub check/review snapshots classify as `pending`, `pass`,
+`actionable_failure`, `infrastructure_failure`, or `timeout`. Pending evidence
+is polled; actionable failures may become normalized repair findings;
+infrastructure or authority conflicts fail closed. Unknown external events are
+retained as telemetry rather than becoming implicit success or a fatal parser
+assumption.
+
+### Cleanup ownership
+
+Every managed artifact root, worktree, local branch, and remote branch has a
+durable ownership row and expected identity/SHA. Cleanup operates per resource,
+records intent/result independently, and refuses base branches, dirty or changed
+resources, user-owned paths, and ownership conflicts. Artifacts and audit
+evidence remain unless a specific owned-resource policy says otherwise.
+
+## 7. Workflow State Machine
+
+### Normal automatic states
+
+```text
+received -> admitting -> provisioning -> executing -> verifying -> fresh_review
+  -> approval_ready -> pushing_branch -> branch_pushed -> opening_pr -> pr_open
+  -> reconciling_reviews -> awaiting_human_approval -> merging
+  -> awaiting_linear_completion -> cleaning -> completed
+```
+
+`rejected` and `failed` are terminal alternatives during admission or execution.
+`repairing` loops through `executing`/`verifying`/`fresh_review` and returns to
+delivery only with a new authorized head. `replying_review_feedback` is the
+idempotent GitHub reply step after a verified trusted-feedback repair.
+
+### Polling and waiting states
+
+- `pr_open`, `reconciling_reviews`, and `awaiting_human_approval` re-read GitHub.
+- `awaiting_github_mergeability` waits for GitHub protection, especially human
+  conversation resolution, then returns to reconciliation or merge.
+- `awaiting_linear_completion` re-reads Linear after a recorded merge.
+- Scheduled automatic retries are separate durable records; they do not invent
+  a new domain state or reset after restart.
+
+### Human decision states
+
+- `awaiting_human_decision`: one persisted offered choice must be submitted.
+- `awaiting_human_approval`: no CLI approval action exists; I-Fan acts in
+  GitHub and the controller observes it.
+
+### Manual intervention
+
+`manual_intervention` is a durable fail-closed stop for authority drift,
+integrity conflict, unsafe recovery, exhausted repair policy, ambiguous external
+result, merge rejection, or partial cleanup that cannot be retried safely. It is
+not a general operator override.
+
+### Terminal states
+
+- `completed`: merge, Linear completion, and required cleanup evidence are done.
+- `rejected`: admission rejected the task before delivery.
+- `failed`: terminal execution/admission failure or an explicit eligible
+  pre-delivery abandon.
+
+### Narrow recovery edges
+
+- `manual_intervention -> approval_ready` is available only through
+  `recover-owned-push` after proving an existing owned open PR and safe
+  fast-forward repair recovery.
+- `manual_intervention -> awaiting_linear_completion` is available only through
+  `accept-external-merge` after proving exact candidate evidence, trusted
+  approval, remote containment, and tree equality.
+
+## 8. Application Modules
+
+### Linear admission
+
+**Purpose**
+
+Read, validate, normalize, snapshot, and revalidate a Linear task.
+
+**Inputs**
+
+Issue identifier, requester, Linear reader, repository resolver, and persisted
+run authority.
+
+**Outputs**
+
+An immutable `CodingTask`, repository/profile binding, or a sanitized drift and
+eligibility failure.
+
+**Authoritative state/evidence**
+
+Linear source revision plus task/profile/registry digests stored on `runs`.
+
+**External side effects**
+
+Manual admission is read-only. Reserved automatic admission performs the one
+configured Todo-to-In-Progress mutation after persisting intent.
+
+**Failure and recovery behavior**
+
+Repeated identical admission resumes; material drift stops rather than
+rewriting a snapshot. Ambiguous mutation responses reconcile against the
+admission journal.
+
+**Key invariants**
+
+Linear cannot supply executable commands, repository authority, or a
+controller-chosen branch name.
+
+### Automatic admission and worker
+
+**Purpose**
+
+Select at most one eligible Todo and run or resume its production driver.
+
+**Inputs**
+
+Validated automation authority, bounded candidate scan, scheduler lease,
+existing nonterminal runs, retry schedules, and fixed trusted requester.
+
+**Outputs**
+
+Sanitized queue decision, driven run result, retry wait/schedule, or local
+operator-attention event.
+
+**Authoritative state/evidence**
+
+Singleton admission lease, journal, run state, priority-only selection evidence,
+and retry schedule.
+
+**External side effects**
+
+One Linear state mutation and the existing driver's narrow side effects.
+
+**Failure and recovery behavior**
+
+One nonterminal run prevents scanning and is resumed first. Only typed process
+start/temporary-unavailable failures receive bounded durable retries. Equal top
+priority, incomplete scans, conflicts, and exhaustion stop for attention.
+
+**Key invariants**
+
+No preemption, FIFO fallback, arbitrary tie-break, or more than one active run.
+
+### Local controller
+
+**Purpose**
+
+Provision the worktree, invoke/resume Codex, commit candidates, run verification,
+launch fresh review, normalize findings, and enforce repair deadlines.
+
+**Inputs**
+
+Persisted run/task/profile, Codex executor, verifier registry, Git workspace,
+optional validated human decision or normalized findings.
+
+**Outputs**
+
+New state, candidate/evidence records, or a human/manual/terminal stop.
+
+**Authoritative state/evidence**
+
+Codex attempts, session ID, outcome hashes, worktree/base/head observations,
+verification batches, reviews, decisions, and repair anchor/deadline.
+
+**External side effects**
+
+Creates owned local resources, runs child processes, edits only through Codex in
+the assigned worktree, and creates controller-authored candidate commits.
+
+**Failure and recovery behavior**
+
+Started attempts are inspected after restart; a recoverable implementation uses
+a new attempt with the explicit persisted session. Missing or conflicting
+session/evidence fails closed.
+
+**Key invariants**
+
+Implementation sessions resume; reviews never resume. Review artifacts cannot
+overlap the writable worktree. Branch/base/head are revalidated around process
+boundaries.
+
+### Production driver
+
+**Purpose**
+
+Continuously derive and execute one safe next action from current persisted
+state.
+
+**Inputs**
+
+Run ID, persisted requester/repository/idempotency authority, bounded policy,
+coordinator, and action-specific ports.
+
+**Outputs**
+
+A durable human/manual/terminal stop or continued polling.
+
+**Authoritative state/evidence**
+
+The run re-read after every action; no stale action result drives the next step.
+
+**External side effects**
+
+Only those exposed by typed push, PR, reply, merge, Linear read, sync, and
+cleanup ports.
+
+**Failure and recovery behavior**
+
+Pending/unavailable results poll; process cancellation or maximum runtime exits
+without changing authority. `controller drive` reconstructs the same driver.
+
+**Key invariants**
+
+No caller, issue text, UI, or external response supplies action order.
+
+### Production coordinator
+
+**Purpose**
+
+Apply application gates around each driver action and revalidate Linear and
+persisted authority before local or external work.
+
+**Inputs**
+
+Typed command with requester, run, repository, expected state, idempotency key,
+and optional decision; narrow action port.
+
+**Outputs**
+
+Typed action/result and updated run projection.
+
+**Authoritative state/evidence**
+
+SQLite run/inspection plus fresh Linear, Git, and GitHub observations required
+by the action.
+
+**External side effects**
+
+Delegates one bounded action after intent is durable.
+
+**Failure and recovery behavior**
+
+Conflicts are classified and persisted when safe; caller retries or the driver
+reconciles rather than blindly repeating writes.
+
+**Key invariants**
+
+The coordinator cannot bypass the local exact-head validator or state CAS.
+
+### Query and status projection
+
+**Purpose**
+
+Return requester-authorized, credential-safe run status and detailed evidence.
+
+**Inputs**
+
+Immutable requester identity and run ID.
+
+**Outputs**
+
+Run summary/detail, state timeline, attempts, exact-head evidence, side-effect
+records, attention, and safe recovery authority.
+
+**Authoritative state/evidence**
+
+SQLite inspection joined from the run-scoped evidence tables.
+
+**External side effects**
+
+None.
+
+**Failure and recovery behavior**
+
+Unauthorized, unknown, or identity-drifted requests fail without opening
+external credentials.
+
+**Key invariants**
+
+Raw issue/task bodies, private paths where unsafe, tokens, keys, headers, and
+unsanitized transport payloads are not projected.
+
+### Human decision handling
+
+**Purpose**
+
+Validate and persist one choice from a Codex decision request, then resume the
+same implementation contract.
+
+**Inputs**
+
+Decision JSON, exact expected state, requester, idempotency key, and originating
+outcome evidence.
+
+**Outputs**
+
+Immutable decision evidence and transition back to `executing`.
+
+**Authoritative state/evidence**
+
+Choice ID, instructions, decision-file digest, and originating outcome
+path/hash.
+
+**External side effects**
+
+None until the local controller resumes Codex.
+
+**Failure and recovery behavior**
+
+Changed files, unoffered choices, stale state, or outcome conflicts fail closed;
+the persisted valid decision can be reused after restart.
+
+**Key invariants**
+
+The controller never invents or auto-selects a human choice.
+
+### Repair and fresh review
+
+**Purpose**
+
+Convert controller-normalized CI, trusted feedback, or fresh-review findings
+into bounded same-session repair and require new exact-head evidence.
+
+**Inputs**
+
+Immutable source IDs/digests, bounded normalized findings, repair policy, and
+the persisted Terra session.
+
+**Outputs**
+
+New candidate, verification, fresh review, or manual intervention at deadline.
+
+**Authoritative state/evidence**
+
+Finding set, original/bound repair head, attempt/session, repair anchor, and
+fresh-review outcome.
+
+**External side effects**
+
+Codex edits and local Git commit; later driver actions publish separately.
+
+**Failure and recovery behavior**
+
+Cancellation is resumable before the durable deadline. Expiry or malformed
+anchor records a bounded manual stop.
+
+**Key invariants**
+
+Findings are prompt input, not external-write authority; every repair requires a
+new head and full verifier/review cycle.
+
+### GitHub reconciliation and trusted feedback
+
+**Purpose**
+
+Observe the owned PR, checks, review topology, trusted approval, feedback, and
+mergeability; persist typed evidence and select wait, repair, reply, or merge.
+
+**Inputs**
+
+Owned PR evidence, expected head, trusted actor profile, paginated REST/GraphQL
+reads, and current run state.
+
+**Outputs**
+
+Poll classification, findings/feedback lifecycle, approval, mergeability wait,
+or manual intervention.
+
+**Authoritative state/evidence**
+
+Immutable GitHub identities, request/response digests, PR/head/base, checks,
+review/thread/comment topology, approval, and timestamps.
+
+**External side effects**
+
+Reads only; reply and merge are separate narrow coordinator operations.
+
+**Failure and recovery behavior**
+
+Pagination overflow, partial GraphQL results, actor/topology drift, or ownership
+conflict fails closed. Pending states remain read-only polls.
+
+**Key invariants**
+
+Login similarity and prose never establish trust; identity and exact head do.
+
+### Merge and Linear completion reconciliation
+
+**Purpose**
+
+Perform one protected squash merge and wait for Linear's external completion
+automation, or explicitly accept a separately verified external merge.
+
+**Inputs**
+
+Exact candidate, current base, passing verifier/review/checks, trusted approval,
+owned PR, and Linear source.
+
+**Outputs**
+
+Merge record, completion observations, and transition to cleanup.
+
+**Authoritative state/evidence**
+
+Merge intent/result, pre-merge head/base, merge SHA/time, and Linear state
+observation bound to that merge.
+
+**External side effects**
+
+Conditional squash merge. Linear completion reconciliation is read-only.
+
+**Failure and recovery behavior**
+
+An ambiguous merge response is re-read. A manually merged owned PR enters
+manual intervention and requires the typed external-merge acceptance proof.
+
+**Key invariants**
+
+No automatic branch-protection bypass, alternative merge method, or forced
+Linear completion.
+
+### Source synchronization and cleanup
+
+**Purpose**
+
+Advance a safe configured source checkout to the exact merge and remove only
+proven controller-owned resources.
+
+**Inputs**
+
+Persisted merge, repository binding, cleanup records, source/worktree/branch
+observations, and ownership nonces.
+
+**Outputs**
+
+Per-resource results, optional operator attention, and `completed`.
+
+**Authoritative state/evidence**
+
+Expected refs/SHAs, resource ownership rows, sync before/after/merge SHAs, and
+cleanup intent/result.
+
+**External side effects**
+
+Safe fast-forward and deletion of eligible owned worktree/local/remote branch.
+
+**Failure and recovery behavior**
+
+Partial progress is persisted and only unfinished resources retry. Unsafe dirty
+source state remains untouched and produces sanitized attention.
+
+**Key invariants**
+
+No stash, reset, rebase, checkout switch, force deletion, or user-resource
+adoption.
+
+## 9. Adapter Modules
+
+### SQLite
+
+`internal/adapters/sqlite` is the durable store and migration owner. It enforces
+foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
+constraints, leases, atomic evidence/transition handoffs, and sanitized
+inspection. The current schema is version 22; migration history is code, not a
+human workflow API.
+
+### Git and worktrees
+
+`internal/adapters/git` provisions and validates isolated worktrees, observes
+branch/base/head/status, creates controller-authored commits, publishes explicit
+refspecs, verifies accepted external merges, synchronizes source checkouts, and
+cleans resources. Commands are argv-only through the managed process adapter;
+there is no shell interpolation.
+
+### Codex process
+
+`internal/adapters/codex` builds versioned implementation, resume, and fresh
+review commands; preflights required CLI flags/version; materializes embedded
+schemas; captures JSONL and stderr separately; extracts session evidence; and
+validates structured outcomes. Current policy requests `gpt-5.6-terra` for
+implementation/resume and `gpt-5.6-sol` for every fresh review. Managed runs
+ignore global user configuration.
+
+### Linear
+
+`internal/adapters/linear` validates the official (or loopback fixture) GraphQL
+endpoint, reads issues and candidates with bounded pagination, observes source
+revision and workflow identity, and exposes the one reserved state mutation.
+Credentials are re-read from the exact configured file or legacy environment
+source; no fallback occurs.
+
+### GitHub App REST and GraphQL
+
+`internal/adapters/githubapp` mints short-lived installation tokens in memory,
+checks numeric repository/installation authority, and performs bounded typed
+operations. REST handles repository/PR/check/status/reply/merge operations;
+GraphQL handles human review and thread topology. Only the configured capability
+switches enable PR create, review reply, and squash merge writes.
+
+### Bootstrap and configuration
+
+`internal/adapters/bootstrap` loads strict configuration versions 1-3,
+canonicalizes and cross-checks repositories and GitHub profiles, validates path
+isolation, derives stable digests, and produces a credential-safe readiness
+projection. Version 3 is current; older versions are compatibility inputs, not
+recommended templates.
+
+### Filesystem and artifact handling
+
+Application artifact helpers and the process/Git/Codex adapters require new
+empty attempt directories, exclusive output leaves, non-overlap with the
+worktree, canonical containment, and stored hashes/sizes. Artifact contents are
+private evidence, not query output.
+
+### LaunchAgent and worker supervision
+
+The CLI embeds a fixed worker plist template and implements safe render/install,
+static validation, bounded `launchctl` control, and sanitized results. launchd
+supervises one logged-in user's worker process; SQLite leases and journals—not
+launchd—remain workflow authority.
+
+### Hermes integration boundary
+
+Hermes has no runtime adapter today. Its planned role is an authenticated
+conversation, trigger, notification, and status interface over the same typed
+application use cases and sanitized projections. It must not execute shell
+instructions, read Mac files directly, manufacture decisions/approval, or own
+workflow state.
+
+## 10. Persistence Model
+
+SQLite stores current state in `runs` and append-oriented or lifecycle evidence
+around it. The principal table groups are:
+
+| Table group | Responsibility |
+| --- | --- |
+| `runs`, `transitions` | Current run snapshot, requester/profile/task authority, lease, candidate, and ordered state history |
+| `attempts`, `verifications`, `reviews` | Codex sessions/process results and exact-head automated evidence |
+| `owned_resources`, `cleanup_results` | Resource ownership and per-resource cleanup progress |
+| `side_effects` | Persisted external intent, claim, attempt, and observed result |
+| `pull_requests`, `poll_observations`, `review_findings` | Owned PR and normalized GitHub/CI reconciliation evidence |
+| `github_installations`, `github_request_observations`, `github_read_evidence` | Direct App/repository authority and sanitized transport observations |
+| `human_approval_observations`, `human_approvals` | Rejected/pending/accepted approval reads and final exact-head authority |
+| `trusted_review_feedback`, conflict and reply tables | Immutable trusted feedback lifecycle, drift conflicts, and one reply proof |
+| `merge_results` | Controller squash or explicitly accepted external merge evidence |
+| Linear request/completion and Todo admission tables | Linear observations, singleton scheduler lease, reservation/mutation journal |
+| `automatic_retry_schedules`, `operator_attention_outbox` | Restart-stable retry policy and local sanitized human-attention projection |
+
+### Current state versus evidence
+
+`runs.current_state` answers where the controller is now. Transitions and
+evidence tables answer why it may be there and what exact observations support
+the next action. Updating current state without its required evidence is not a
+valid recovery.
+
+### Intent versus observation
+
+For an external write, `side_effects` or its specialized table records immutable
+intent and idempotency before invocation. The response or a later read records
+observation. A `started` or pending intent is not success; restart reconciles the
+target system before deciding whether another write is permitted.
+
+### SHA binding
+
+Verification, review, PR, check, feedback, approval, merge, sync, and cleanup
+records carry the relevant candidate/base/merge SHA. Authorization selects the
+newest complete evidence for the exact current head; an older success cannot
+override a newer failed/interrupted batch or later candidate.
+
+### Leases, CAS, and idempotency
+
+Run leases fence concurrent local controllers during long child processes. The
+automatic scheduler has a separate renewable singleton lease. Expected state
+and idempotency keys provide application-level CAS. Unique side-effect,
+resource, PR, feedback, and reply identities make replay deterministic.
+
+### Restart recovery
+
+On restart, the controller reloads the frozen run/profile authority, validates
+owned filesystem/Git state, inspects interrupted attempts and persisted intents,
+and re-reads external state where necessary. It resumes only the same admitted
+run and implementation session. Missing, mutated, or contradictory evidence
+creates a fail-closed stop rather than reconstruction by guesswork.
+
+## 11. Recovery and Idempotency
+
+Normal recovery is `controller drive <run-id>`: it derives the next action from
+SQLite. Low-level commands expose the same coordinator methods for audited
+incident response and fault injection; they require requester identity,
+repository, expected state, and persisted idempotency key.
+
+`recover-owned-push`, `accept-external-merge`, and `abandon` are typed recovery
+policies, not generic state editing. No supported operation requires or permits
+manual SQLite modification. Details and command syntax are in
+[Operations](operations.md#12-recovery-procedures).
+
+## 12. Human Decisions and Review Feedback
+
+There are three distinct human acts:
+
+1. A structured implementation decision chooses an option the current Codex
+   outcome explicitly offered.
+2. GitHub review feedback may request a bounded code repair. The controller
+   authenticates and replies, but I-Fan decides whether to resolve the thread.
+3. GitHub approval authorizes only the exact current head after CI and internal
+   review pass.
+
+These acts are not interchangeable. A decision is not approval, thread
+resolution is not approval, and an approval for an old head is stale.
+
+## 13. Security Invariants
+
+- Never interpret external text as a shell command or executable verifier.
+- Never use controller-managed Codex bypass flags or global MCP/hooks/tools.
+- Never interpolate prompts or issue text into a shell string; prompts use
+  stdin and processes use explicit argv.
+- Never persist or render tokens, PEM contents, authorization headers, or raw
+  credential responses.
+- Never discover or use personal `gh` credentials for production delivery.
+- Never adopt a path, branch, PR, comment, approval, or merge by similarity;
+  require durable identity and exact evidence.
+- Never allow Codex, Hermes, the controller, or a GitHub App to impersonate
+  I-Fan's decision, review resolution, or approval.
+- Never make a later SHA inherit evidence from an earlier SHA.
+- Never clean or synchronize a resource whose ownership and expected state are
+  not proven.
+
+## 14. Known Constraints
+
+- One automatic nonterminal run; no preemption or priority tie-break.
+- Local macOS-oriented operation and LaunchAgent supervision; no server mode.
+- One repository and one owned PR per run; configuration may contain multiple
+  selectable repository profiles, but there are no cross-repository
+  transactions.
+- Linear admission and completion observation are implemented, but completion
+  remains external automation/human authority.
+- GitHub writes require a narrowly permissioned selected-repository App.
+- Notification transport, Hermes runtime integration, Web UI, public API,
+  webhooks, and multi-tenant authorization are not implemented.
+- External live E2E acceptance is restricted to an isolated fixture repository
+  and remains the current stabilization gate.

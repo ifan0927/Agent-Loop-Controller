@@ -1,95 +1,160 @@
 # Agent Loop Controller
 
-Agent Loop Controller is a deterministic, human-gated control plane for one
-coding-ready Linear issue at a time. It owns workflow state and evidence;
-Codex owns implementation and fresh review. Linear supplies the task,
-GitHub supplies delivery and branch protection, and I-Fan remains the only
-review, resolution, and approval authority.
+## Overview
 
-## Current delivery model
+Agent Loop Controller is a deterministic, human-gated software-delivery control
+plane. It translates one coding-ready Linear issue into an isolated, resumable
+Codex delivery run and records the state and evidence required to publish,
+review, merge, reconcile, and clean up that run safely.
 
-The active acceptance path is local automatic Linear Todo admission:
+The controller is not an LLM agent. Codex reasons about and changes code; the
+controller decides whether authoritative evidence permits the next workflow
+transition.
+
+## Why This Exists
+
+A coding agent can implement a task, but it cannot by natural-language claim
+prove that the task was authoritative, tests ran against the current commit,
+an independent review passed, GitHub approved the same head, or an interrupted
+external write completed exactly once. This project makes those concerns
+durable, explicit, restart-safe, and inspectable.
+
+## System Roles
+
+| System | Responsibility |
+| --- | --- |
+| Linear | Task definition, priority, current-cycle eligibility, acceptance criteria, and the controller-owned branch name |
+| Codex | Resumable implementation and repair, plus fresh independent read-only review |
+| GitHub | Repository, pull request, required CI, human review, protected merge, and merge evidence |
+| Hermes | Conversation, future trigger, notification, and status interface; it is not yet connected to the runtime |
+| Controller | Durable state, authority snapshots, evidence, orchestration, retries, reconciliation, and owned cleanup |
+
+I-Fan remains the final human authority. The controller never approves its own
+work or resolves a human review conversation.
+
+## End-to-End Workflow
 
 ```text
 eligible Linear Todo
-  -> worker reservation and Todo -> In Progress
-  -> isolated worktree and Codex implementation
-  -> controller verification and fresh independent review
-  -> push, one owned PR, and required CI
-  -> I-Fan change request / resolution / exact-head approval
-  -> guarded squash merge, Linear completion, source sync, owned cleanup
+  -> reserve and move to In Progress
+  -> freeze task and repository authority
+  -> create an isolated worktree
+  -> Codex implementation or same-session repair
+  -> repository verification bound to candidate HEAD
+  -> fresh independent Codex review bound to the same HEAD
+  -> push one owned branch and open/adopt one owned PR
+  -> observe required CI and trusted I-Fan review feedback
+  -> repair, re-verify, re-review, and reply when changes are requested
+  -> wait for conversation resolution and exact-HEAD human approval
+  -> guarded squash merge
+  -> observe Linear completion
+  -> fast-forward a safe source checkout and clean owned resources
+  -> completed
 ```
 
-The worker, driver, and SQLite journal are restart-safe. They may resume a
-persisted run, but never create a second active run or repeat an external write
-without reconciling durable evidence.
+Every code-changing repair invalidates prior verification, review, CI, and
+approval evidence. Pending CI, human approval, review resolution, and Linear
+completion are normal polling conditions, not reasons to manually step through
+the state machine.
 
-Automatic admission uses a priority-only queue policy: explicit priorities
-`1` through `4` outrank unprioritized `0`, one non-terminal run blocks scanning
-and is never preempted, and an equal best priority stops for operator attention
-without a FIFO fallback. The worker emits the sanitized decision evidence;
-see [configuration](docs/configuration.md#automatic-admission-queue-policy).
+## Current Capabilities
 
-`controller run IFAN-xxx` and the low-level delivery commands remain bounded
-recovery or local-lab interfaces. They are not the #42 live-E2E entrypoint.
-That E2E starts a supervised worker with no issue identifier.
+- Versioned, secret-free local configuration with inline repository profiles
+  and narrow GitHub App authorities.
+- Manual Linear admission and disabled-by-default automatic Todo admission.
+- Priority-only single-run worker scheduling, durable leases, retry schedules,
+  and local operator-attention records.
+- Isolated worktrees, resumable Codex implementation sessions, structured
+  outcomes, repository-owned verifier commands, and fresh read-only review.
+- Exact-HEAD branch push, owned PR creation/adoption, required-check and review
+  reconciliation, trusted inline feedback repair, and idempotent App replies.
+- Exact-HEAD human approval, guarded squash merge, Linear completion
+  observation, safe source-checkout synchronization, and ownership-checked
+  cleanup.
+- Requester-authorized status/inspection and narrow recovery actions for
+  interrupted delivery, abandoned pre-delivery runs, and verified external
+  merges.
+- macOS LaunchAgent tooling for building, installing, validating, starting,
+  observing, and stopping one local worker.
 
-## Safety boundary
+## Safety and Trust Model
 
-- Linear issue text is untrusted input, never a shell command.
-- Each run freezes its task, repository profile, verifier policy, and exact
-  evidence bindings.
-- A code change invalidates the prior verification, fresh review, and approval.
-- The controller only writes to its isolated fixture repository and resources it
-  recorded as owned. It never targets this repository or an STDS repository.
-- The controller never resolves GitHub conversations, approves reviews, bypasses
-  branch protection, or uses personal `gh` credentials for delivery.
-- Credentials stay outside the repository, SQLite projections, artifacts, logs,
-  and documentation.
+- External issue, comment, and API text is untrusted data, never a shell
+  command or authority by assertion.
+- Task, repository profile, verifier policy, requester, branch, and external
+  identities are frozen or revalidated before use.
+- Verification, fresh review, checks, approval, merge, and cleanup evidence is
+  bound to exact Git SHAs.
+- External writes follow persisted intent, bounded execution, observation, and
+  idempotent reconciliation.
+- Controller-managed processes use explicit argv and restricted environments;
+  controller-managed Codex runs ignore global user configuration.
+- Credentials remain outside configuration snapshots, SQLite projections,
+  artifacts, logs, and documentation.
+- A process or host restart resumes from SQLite and observed external state; it
+  never treats an interrupted response as success.
 
-## Operator workflow
+## Quick Start
 
-1. Prepare and validate the non-secret controller configuration and external
-   credentials.
-2. Verify the selected fixture repository, App permissions, branch protection,
-   and clean source checkout.
-3. Create one eligible IFAN fixture issue and move it to Todo.
-4. Start the supervised worker without an issue identifier.
-5. During the PR gate, I-Fan alone submits review feedback, resolves satisfied
-   conversations, and approves the exact current head.
-6. Retain sanitized evidence, scan retained state/artifacts, stop the worker,
-   and restore the isolated test configuration.
-
-The authoritative step-by-step procedure is [the isolated live E2E
-runbook](docs/e2e-dogfood.md). Do not replace it with a sequence of manual
-`push`, `open-pr`, `merge`, or cleanup commands.
-
-## Verification
-
-Run the controller gate before publishing a change:
+Prerequisites are Go from [`go.mod`](go.mod), Git, a compatible authenticated
+Codex CLI, Linear access, and a selected-repository GitHub App. Production
+configuration is macOS-local by default.
 
 ```sh
-./scripts/verify-controller.sh
+mkdir -p ./bin
+go build -o ./bin/ifan-loop ./cmd/ifan-loop
+./bin/ifan-loop config init
+# Edit the generated secret-free controller.json and provision credentials
+# outside the repository.
+./bin/ifan-loop config validate
+./bin/ifan-loop config inspect
+./bin/ifan-loop config doctor
+./bin/ifan-loop controller worker --once
 ```
 
-It checks formatting, normal and race tests, vet, the GitHub read fixture, and
-the sensitive-output scan. The deterministic fixture suites are necessary
-preconditions for a live E2E, not a substitute for it.
+`config init` deliberately creates an incomplete starter. Follow
+[Operations](docs/operations.md) before enabling automatic admission or any
+GitHub write capability.
 
-## Document ownership
+## Normal Operator Flow
 
-- [Architecture](docs/architecture.md): domain boundaries, durable state, and
-  delivery invariants.
-- [Configuration](docs/configuration.md): versioned local configuration,
-  credentials boundary, and worker admission authority.
-- [Isolated live E2E](docs/e2e-dogfood.md): the one canonical #42 operator
-  procedure and evidence checklist.
-- [GitHub App operator handoff](docs/github-app-operator.md): selected-repo
-  permissions and GitHub protection requirements.
-- [LaunchAgent worker runbook](docs/launchagent-worker.md): local macOS
-  supervision lifecycle.
-- [Controller/executor decision](docs/decisions/0001-controller-and-executor-boundary.md)
-  and [Hermes handoff](docs/handoff/hermes.md): durable architectural context.
+For the supported automatic path, validate configuration and credentials,
+enable the bounded Linear Todo admission policy, then run
+`ifan-loop controller worker` directly or under the provided LaunchAgent.
+Observe a run with `controller status` or `controller inspect`. If the run stops
+at `awaiting_human_decision`, submit only one of the persisted offered choices
+through `controller continue --decision ...`, then resume with `controller
+drive`. Human review resolution and approval happen in GitHub; the driver
+observes them and continues automatically.
 
-Historical issue-level scope and completed implementation slices live in GitHub
-and Git history rather than duplicating current operating rules in this tree.
+Low-level `continue`, `push`, `open-pr`, `reconcile`, `merge`,
+`reconcile-linear`, and `cleanup` commands are recovery interfaces, not the
+normal workflow.
+
+## Project Status
+
+The production MVP and the automatic-admission, trusted-feedback, source-sync,
+and recovery implementation slices are complete. The current stabilization
+gate is a second isolated live E2E that proves the entire automatic path after
+the runtime gaps discovered during the first attempt were remediated. Hermes
+runtime integration, a human-facing Web UI, real notification delivery, public
+API/webhook admission, and broader concurrent/multi-repository operation remain
+planned or exploratory rather than implemented.
+
+See [Roadmap](docs/roadmap.md) for status categories and current tracking.
+
+## Documentation
+
+- [Architecture](docs/architecture.md): components, domain invariants, state
+  machine, persistence, authority, and recovery design.
+- [Operations](docs/operations.md): installation, configuration, every
+  human-facing command, normal flow, recovery, supervision, and troubleshooting.
+- [Development](docs/development.md): repository layout, tests, fixtures, E2E,
+  migrations, extension rules, and contribution checks.
+- [Roadmap](docs/roadmap.md): product direction, completed milestones, current
+  stabilization work, and longer-term goals.
+- [GitHub App runbook](docs/runbooks/github-app.md) and
+  [live-E2E runbook](docs/runbooks/live-e2e.md): high-risk credential/permission
+  setup and destructive isolated acceptance procedures.
+- [ADR 0001](docs/decisions/0001-controller-and-executor-boundary.md): accepted
+  controller/executor boundary.
