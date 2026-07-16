@@ -74,6 +74,16 @@ func TestAcceptedMergeMethodsRemainNarrow(t *testing.T) {
 	}
 }
 
+func TestCleanupGateAcceptsCompletedExternalMerge(t *testing.T) {
+	now := time.Unix(10, 0).UTC()
+	run := Run{ID: "run", CandidateHead: "head"}
+	merge := MergeRecord{RunID: run.ID, PreMergeSHA: run.CandidateHead, Method: "external", MergeSHA: "merge", MergedAt: now}
+	inspection := RunInspection{Merge: &merge, LinearCompletion: []LinearCompletionObservation{{RunID: run.ID, MergeSHA: merge.MergeSHA, Status: LinearCompletionCompleted, ObservedAt: now}}}
+	if err := validateCleanupGate(run, inspection); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAcceptExternalMergePersistsEvidenceThenResumesLinearCompletion(t *testing.T) {
 	head := "1111111111111111111111111111111111111111"
 	mergeSHA := "2222222222222222222222222222222222222222"

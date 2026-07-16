@@ -432,8 +432,8 @@ func (c *ProductionCoordinator) Cleanup(ctx context.Context, command ProductionC
 }
 
 func validateCleanupGate(run Run, inspection RunInspection) error {
-	if inspection.Merge == nil || inspection.Merge.RunID != run.ID || inspection.Merge.PreMergeSHA != run.CandidateHead || inspection.Merge.Method != "squash" || inspection.Merge.MergeSHA == "" || inspection.Merge.MergedAt.IsZero() {
-		return errors.New("exact squash merge evidence is required")
+	if inspection.Merge == nil || inspection.Merge.RunID != run.ID || inspection.Merge.PreMergeSHA != run.CandidateHead || !acceptedMergeMethod(inspection.Merge.Method) || inspection.Merge.MergeSHA == "" || inspection.Merge.MergedAt.IsZero() {
+		return errors.New("exact accepted merge evidence is required")
 	}
 	if len(inspection.LinearCompletion) == 0 {
 		return errors.New("Linear completion evidence is required")
