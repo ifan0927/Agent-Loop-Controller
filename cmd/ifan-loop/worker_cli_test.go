@@ -19,6 +19,7 @@ import (
 	sqlitestore "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/fixtureevidence"
 )
 
 func TestBoundWorkerLogStreamTruncatesOnlyPrivateRegularFileAtLimit(t *testing.T) {
@@ -176,6 +177,15 @@ func TestControllerWorkerSubprocessSIGTERMClosesCompleteRuntime(t *testing.T) {
 		t.Fatalf("replacement lease=%+v acquired=%t err=%v", lease, acquired, err)
 	}
 	_, _ = store.ReleaseLinearTodoAdmissionLease(context.Background(), lease)
+	fixtureevidence.Emit(t, fixtureevidence.Evidence{
+		Scenario:               "indefinite_restart",
+		RunIDs:                 []string{runs[0].ID},
+		IssueIdentifiers:       []string{runs[0].IssueID},
+		StateSequence:          []string{"driving", "sigterm", "awaiting_human_decision", "restart_ready"},
+		LeaseEvidence:          []string{"released_on_shutdown", "replacement_acquired"},
+		ExactCandidateBindings: []string{"same_persisted_run"},
+		FinalWorkerState:       "stopped",
+	})
 }
 
 func TestControllerWorkerSubprocessHelper(t *testing.T) {

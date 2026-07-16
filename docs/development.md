@@ -110,6 +110,25 @@ The scanner detects private-key blocks and common credential/header patterns.
 It supplements code review; it is not proof that arbitrary sensitive personal
 data is absent.
 
+### Continuous supervisor fixture matrix
+
+```sh
+./scripts/verify-continuous-supervisor-fixture.sh
+```
+
+The matrix binds the real-SQLite production-composition fixtures for indefinite
+worker lifetime and restart, parked retry/resume, complete and residue-bearing
+abandonment, deterministic serial candidate handoff, and notification/action
+provenance safety. Its versioned machine-readable summary is
+`testdata/continuous-supervisor-fixture-summary.json`. The summary contains only
+sanitized stable fixture identities and evidence classes. The gate regenerates
+that summary only from evidence emitted by tests that actually passed, compares
+the result with the versioned expectation, and scans it for credential-like
+material. The retry scenario invokes the production `controller retry` CLI and
+proves that the command records intent without directly driving the run.
+The canonical repository gate runs the complete normal and race suites before
+validating this matrix.
+
 ### Fixture delivery
 
 `local fixture-deliver` drives post-approval behavior only against a disposable

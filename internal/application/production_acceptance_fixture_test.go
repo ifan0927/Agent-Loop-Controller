@@ -20,6 +20,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/verifier"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/fixtureevidence"
 )
 
 func TestOfflineAcceptanceMissingVerifierCannotAuthorizeCandidateWithDurableEvidence(t *testing.T) {
@@ -329,6 +330,7 @@ func TestOfflineAcceptanceProductionAbandonTerminalizesWithResidueAndReplaysClea
 	if err != nil || restarted.Run.State != domain.StateFailed || len(restarted.Timeline) == 0 {
 		t.Fatalf("restarted abandoned run=%+v err=%v", restarted, err)
 	}
+	fixtureevidence.Emit(t, fixtureevidence.Evidence{Scenario: "abandon_residue", RunIDs: []string{run.ID}, IssueIdentifiers: []string{run.IssueID}, EventActionKeys: []string{attention[0].EventKey, attention[1].EventKey}, StateSequence: []string{"received", "operator_abandoned", "restarted"}, RetryAbandonOutcomes: []string{"terminal_with_residue", "cleanup_replay_idempotent"}, LeaseEvidence: []string{"admission_lease_released"}, CleanupResultClasses: []string{"failed", "deleted_on_replay"}, FinalWorkerState: "stopped"})
 }
 
 func TestOfflineAcceptanceProductionRepairRebindsFindingsVerificationAndReviewToNewHead(t *testing.T) {

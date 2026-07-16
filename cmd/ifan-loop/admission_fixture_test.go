@@ -18,6 +18,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/verifier"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/fixtureevidence"
 )
 
 // This fixture is deliberately offline. Two --once workers share the real
@@ -189,6 +190,104 @@ func TestOfflineSQLiteAdmissionSelectsTotalOrderFromThreeCandidates(t *testing.T
 	if err != nil || run.IssueID != second.Identifier {
 		t.Fatalf("run=%+v err=%v", run, err)
 	}
+	firstRun := run
+	completeFixtureRun(t, store, firstRun.ID, firstRun.State)
+
+	scanner.scan = application.LinearTodoCandidateScan{Candidates: []application.LinearTodoCandidate{third, first}, Digest: offlineAdmissionDigest("two-candidate-scan"), ObservedAt: first.UpdatedAt}
+	result, err = dispatcher.Dispatch(ctx)
+	commands = driver.commands()
+	if err != nil || result.Outcome != application.LinearTodoDispatchDriven || len(commands) != 2 || result.QueueDecision == nil || result.QueueDecision.SelectedIssueUUID != first.IssueID {
+		t.Fatalf("second result=%+v commands=%+v err=%v", result, commands, err)
+	}
+	secondRun, err := store.GetRun(ctx, commands[1].RunID)
+	if err != nil || secondRun.IssueID != first.Identifier {
+		t.Fatalf("second run=%+v err=%v", secondRun, err)
+	}
+	if err := store.Transition(ctx, secondRun.ID, domain.StateAwaitingHumanDecision, domain.StateExecuting, "fixture accepted", "fixture:serial_handoff", ""); err != nil {
+		t.Fatal(err)
+	}
+	if acquired, acquireErr := store.AcquireLease(ctx, secondRun.ID, "serial-abandon-owner", time.Now().UTC().Add(time.Minute)); acquireErr != nil || !acquired {
+		t.Fatalf("abandon lease acquired=%t err=%v", acquired, acquireErr)
+	}
+	secondRun, err = store.GetRun(ctx, secondRun.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	abandoned, replay, err := store.AbandonAutomaticAdmission(ctx, application.AutomaticAdmissionAbandonment{
+		Requester:              application.Requester{ID: "operator", Kind: "github_login"},
+		RunID:                  secondRun.ID,
+		Repository:             secondRun.Repository,
+		RawIssueHash:           secondRun.RawIssueHash,
+		TaskHash:               secondRun.TaskHash,
+		ProfileDigest:          secondRun.ProfileDigest,
+		RepositoryConfigDigest: application.AutomaticAdmissionRepositoryConfigDigest(secondRun.RepositoryConfigJSON),
+		LeaseOwner:             secondRun.LeaseOwner,
+		ExpectedState:          domain.StateExecuting,
+		IdempotencyKey:         secondRun.IdempotencyKey,
+	})
+	if err != nil || replay || abandoned.State != domain.StateFailed {
+		t.Fatalf("abandoned=%+v replay=%t err=%v", abandoned, replay, err)
+	}
+
+	scanner.scan = application.LinearTodoCandidateScan{Candidates: []application.LinearTodoCandidate{third}, Digest: offlineAdmissionDigest("last-candidate-scan"), ObservedAt: third.UpdatedAt}
+	result, err = dispatcher.Dispatch(ctx)
+	commands = driver.commands()
+	if err != nil || result.Outcome != application.LinearTodoDispatchDriven || len(commands) != 3 || result.QueueDecision == nil || result.QueueDecision.SelectedIssueUUID != third.IssueID {
+		t.Fatalf("third result=%+v commands=%+v err=%v", result, commands, err)
+	}
+	thirdRun, err := store.GetRun(ctx, commands[2].RunID)
+	if err != nil || thirdRun.IssueID != third.Identifier {
+		t.Fatalf("third run=%+v err=%v", thirdRun, err)
+	}
+	if err := store.Transition(ctx, thirdRun.ID, domain.StateAwaitingHumanDecision, domain.StateFailed, "fixture stopped", "fixture:serial_handoff", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	contradictory := first
+	contradictory.IssueID, contradictory.Identifier, contradictory.IssueSequence, contradictory.SourceDigest = "123e4567-e89b-42d3-a456-426614174109", "IFAN-041", 41, offlineAdmissionDigest("contradictory-source")
+	scanner.scan = application.LinearTodoCandidateScan{Candidates: []application.LinearTodoCandidate{first, contradictory}, Digest: offlineAdmissionDigest("contradictory-scan"), ObservedAt: first.UpdatedAt}
+	result, err = dispatcher.Dispatch(ctx)
+	if err != nil || result.Outcome != application.LinearTodoDispatchAttention || len(driver.commands()) != 3 {
+		t.Fatalf("contradictory result=%+v commands=%+v err=%v", result, driver.commands(), err)
+	}
+	fixtureevidence.Emit(t, fixtureevidence.Evidence{
+		Scenario:                   "candidate_ordering_handoff",
+		RunIDs:                     []string{firstRun.ID, secondRun.ID, thirdRun.ID},
+		IssueIdentifiers:           []string{firstRun.IssueID, secondRun.IssueID, thirdRun.IssueID},
+		EventActionKeys:            []string{"contradictory_scan_attention"},
+		StateSequence:              []string{"first_completed", "second_abandoned", "third_selected", "ambiguous_scan_stopped"},
+		RetryAbandonOutcomes:       []string{"serial_handoff", "operator_abandoned"},
+		LeaseEvidence:              []string{"abandon_lease_acquired"},
+		CandidateOrderingDecisions: []string{"priority", "numeric_sequence", "issue_uuid", "permutation_independent"},
+		ExactCandidateBindings:     []string{"three_distinct_runs"},
+		FinalWorkerState:           "stopped",
+	})
+}
+
+func completeFixtureRun(t *testing.T, store *sqlitestore.Store, runID string, current domain.State) {
+	t.Helper()
+	states := []domain.State{
+		domain.StateExecuting,
+		domain.StateVerifying,
+		domain.StateFreshReview,
+		domain.StateApprovalReady,
+		domain.StatePushingBranch,
+		domain.StateBranchPushed,
+		domain.StateOpeningPR,
+		domain.StatePROpen,
+		domain.StateReconcilingReviews,
+		domain.StateAwaitingHumanApproval,
+		domain.StateMerging,
+		domain.StateAwaitingLinearCompletion,
+		domain.StateCleaning,
+		domain.StateCompleted,
+	}
+	for _, next := range states {
+		if err := store.Transition(context.Background(), runID, current, next, "fixture serial completion", "fixture:serial_handoff", ""); err != nil {
+			t.Fatalf("transition %s -> %s: %v", current, next, err)
+		}
+		current = next
+	}
 }
 
 type offlineAdmissionObserved struct {
@@ -311,7 +410,7 @@ func (s *offlineAdmissionStarter) mutations() []application.LinearIssueStartMuta
 type offlineAdmissionResolver struct{ repository application.LocalRepository }
 
 func (r offlineAdmissionResolver) ResolveLinearAdmissionRepository(label string) (application.LocalRepository, bool) {
-	return r.repository, label == "repo:test"
+	return r.repository, label == "repo:test" || label == "repo:"+r.repository.CanonicalRepository
 }
 
 // These fakes are only the process, Git, verifier, and worktree ports that a

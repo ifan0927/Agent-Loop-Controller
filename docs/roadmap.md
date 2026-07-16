@@ -83,7 +83,8 @@ This milestone is recorded by the closed
   and verified external merge acceptance.
 - Typed exhausted-retry recovery with durable operator intent and automatic
   worker resume through the normal driver.
-- Deterministic restart/fault fixtures for these boundaries.
+- Deterministic continuous-supervisor restart/fault matrix with a sanitized,
+  machine-readable evidence summary for these boundaries.
 
 The implementation child work under the open
 [automatic-admission roadmap](https://github.com/ifan0927/Agent-Loop-Controller/issues/21)

@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "fixture_id": "continuous-supervisor-v1",
+  "configuration_digest": "2a7f999c5a63127044b4cbc487f3584eb4fad950afa1dce7d52b254ea51bf381",
+  "final_worker_state": "stopped",
+  "external_boundaries": "deterministic_fakes",
+  "scenarios": [
+    {
+      "scenario": "abandon_complete",
+      "configuration_digest": "2a7f999c5a63127044b4cbc487f3584eb4fad950afa1dce7d52b254ea51bf381",
+      "run_ids": ["run-abandon", "run-after-abandon"],
+      "issue_identifiers": ["IFAN-98", "IFAN-99"],
+      "event_action_keys": ["operator_abandon"],
+      "state_sequence": ["distinct_issue_reserved", "failed", "received"],
+      "retry_abandon_outcomes": ["abandoned_uuid_blocked", "operator_abandoned", "replay_idempotent"],
+      "lease_evidence": ["released", "replacement_acquired"],
+      "cleanup_result_classes": ["complete"],
+      "candidate_ordering_decisions": null,
+      "exact_candidate_bindings": null,
+      "final_worker_state": "stopped"
+    },
+    {
+      "scenario": "abandon_residue",
+      "configuration_digest": "2a7f999c5a63127044b4cbc487f3584eb4fad950afa1dce7d52b254ea51bf381",
+      "run_ids": ["run-8e5e3fcc05cbf826"],
+      "issue_identifiers": ["IFAN-ABANDON"],
+      "event_action_keys": [
+        "automation:run-8e5e3fcc05cbf826:automatic_retry_attention:9312e8997d0006cf4f58b6310f43dee8790fff361dbe418a4859d29d2043a7e8",
+        "automation:run-8e5e3fcc05cbf826:cleanup_residue_attention:2"
+      ],
+      "state_sequence": ["operator_abandoned", "received", "restarted"],
+      "retry_abandon_outcomes": ["cleanup_replay_idempotent", "terminal_with_residue"],
+      "lease_evidence": ["admission_lease_released"],
+      "cleanup_result_classes": ["deleted_on_replay", "failed"],
+      "candidate_ordering_decisions": null,
+      "exact_candidate_bindings": null,
+      "final_worker_state": "stopped"
+    },
+    {
+      "scenario": "candidate_ordering_handoff",
+      "configuration_digest": "2a7f999c5a63127044b4cbc487f3584eb4fad950afa1dce7d52b254ea51bf381",
+      "run_ids": ["run-6c91940690784f5a", "run-c4fd792ff8be6259", "run-fbb74e792e8f4f45"],
+      "issue_identifiers": ["IFAN-2", "IFAN-41", "IFAN-7"],
+      "event_action_keys": ["contradictory_scan_attention"],
+      "state_sequence": ["ambiguous_scan_stopped", "first_completed", "second_abandoned", "third_selected"],
+      "retry_abandon_outcomes": ["operator_abandoned", "serial_handoff"],
+      "lease_evidence": ["abandon_lease_acquired"],
+      "cleanup_result_classes": null,
+      "candidate_ordering_decisions": ["issue_uuid", "numeric_sequence", "permutation_independent", "priority"],
+      "exact_candidate_bindings": ["three_distinct_runs"],
+      "final_worker_state": "stopped"
+    },
+    {
+      "scenario": "indefinite_restart",
+      "configuration_digest": "2a7f999c5a63127044b4cbc487f3584eb4fad950afa1dce7d52b254ea51bf381",
+      "run_ids": ["run-c4fd792ff8be6259"],
+      "issue_identifiers": ["IFAN-41"],
+      "event_action_keys": null,
+      "state_sequence": ["awaiting_human_decision", "canceled", "driving", "driving_beyond_7d", "restart_ready", "sigterm"],
+      "retry_abandon_outcomes": null,
+      "lease_evidence": ["released_on_shutdown", "replacement_acquired"],
+      "cleanup_result_classes": null,
+      "candidate_ordering_decisions": null,
+      "exact_candidate_bindings": ["same_persisted_run"],
+      "final_worker_state": "stopped"
+    },
+    {
+      "scenario": "notification_provenance_safety",
+      "configuration_digest": "2a7f999c5a63127044b4cbc487f3584eb4fad950afa1dce7d52b254ea51bf381",
+      "run_ids": ["run-c4fd792ff8be6259"],
+      "issue_identifiers": ["IFAN-41"],
+      "event_action_keys": ["automation:run-c4fd792ff8be6259:human_decision_attention:5"],
+      "state_sequence": ["awaiting_human_decision", "executing", "restarted"],
+      "retry_abandon_outcomes": ["notification_deduplicated"],
+      "lease_evidence": ["parked_lease_released"],
+      "cleanup_result_classes": null,
+      "candidate_ordering_decisions": null,
+      "exact_candidate_bindings": null,
+      "final_worker_state": "stopped"
+    },
+    {
+      "scenario": "park_notify_retry_resume",
+      "configuration_digest": "2a7f999c5a63127044b4cbc487f3584eb4fad950afa1dce7d52b254ea51bf381",
+      "run_ids": ["run-c4fd792ff8be6259"],
+      "issue_identifiers": ["IFAN-41"],
+      "event_action_keys": [
+        "automation:run-c4fd792ff8be6259:automatic_retry_attention:ada87ff660bfa2a65b3ccfc9de8670003b2926511bbe418aa5f049efaae0a260",
+        "operator-action-283c2313fb2a7889df813dcd"
+      ],
+      "state_sequence": ["automatic_resume", "executing", "operator_retry", "retry_attention"],
+      "retry_abandon_outcomes": ["retry_observed", "retry_replay_idempotent", "worker_resumed"],
+      "lease_evidence": ["reacquired_after_restart", "released_on_restart"],
+      "cleanup_result_classes": null,
+      "candidate_ordering_decisions": null,
+      "exact_candidate_bindings": ["same_persisted_run"],
+      "final_worker_state": "stopped"
+    }
+  ]
+}

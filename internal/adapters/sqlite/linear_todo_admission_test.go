@@ -12,6 +12,7 @@ import (
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/fixtureevidence"
 )
 
 func TestAutomaticAdmissionLeaseUsesTTLAndVersionCAS(t *testing.T) {
@@ -526,6 +527,7 @@ func TestAutomaticAdmissionAbandonReleasesSlotAndReplaysIdempotently(t *testing.
 	if _, _, reserved, err := store.ReserveLinearTodoAdmission(ctx, automaticAdmissionReservation("123e4567-e89b-42d3-a456-426614174099", "run-after-abandon", "IFAN-99", newLease)); err != nil || !reserved {
 		t.Fatalf("slot was not released reserved=%v err=%v", reserved, err)
 	}
+	fixtureevidence.Emit(t, fixtureevidence.Evidence{Scenario: "abandon_complete", RunIDs: []string{run.ID, "run-after-abandon"}, IssueIdentifiers: []string{run.IssueID, "IFAN-99"}, EventActionKeys: []string{"operator_abandon"}, StateSequence: []string{"received", "failed", "distinct_issue_reserved"}, RetryAbandonOutcomes: []string{"operator_abandoned", "replay_idempotent", "abandoned_uuid_blocked"}, LeaseEvidence: []string{"released", "replacement_acquired"}, CleanupResultClasses: []string{"complete"}, FinalWorkerState: "stopped"})
 }
 
 func TestAutomaticAdmissionAbandonCleanupFailureDetailsSurviveReopen(t *testing.T) {

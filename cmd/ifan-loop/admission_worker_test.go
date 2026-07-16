@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/fixtureevidence"
 )
 
 func TestAdmissionWorkerOnceDispatchesExactlyOneCycle(t *testing.T) {
@@ -181,6 +182,28 @@ func TestAdmissionWorkerHasNoSevenDayProcessExpiry(t *testing.T) {
 	if err != nil || result.Cycles != 8 || result.Stopped != "canceled" || now.Sub(started) != 8*24*time.Hour {
 		t.Fatalf("result=%+v elapsed=%s err=%v", result, now.Sub(started), err)
 	}
+}
+
+func TestAdmissionWorkerHasNoSevenDayExpiryWhileDriverPolls(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	now := time.Date(2026, 7, 15, 0, 0, 0, 0, time.UTC)
+	started := now
+	dispatches := 0
+	result, err := runAdmissionWorkerAt(ctx, false, 24*time.Hour, func(context.Context) (application.LinearTodoDispatchResult, error) {
+		dispatches++
+		return application.LinearTodoDispatchResult{Outcome: application.LinearTodoDispatchWaiting}, nil
+	}, func(context.Context, time.Duration) error {
+		now = now.Add(24 * time.Hour)
+		if now.Sub(started) > 7*24*time.Hour {
+			cancel()
+			return context.Canceled
+		}
+		return nil
+	}, func() time.Time { return now })
+	if err != nil || dispatches != 8 || result.Cycles != 8 || result.Stopped != "canceled" || now.Sub(started) != 8*24*time.Hour {
+		t.Fatalf("result=%+v dispatches=%d elapsed=%s err=%v", result, dispatches, now.Sub(started), err)
+	}
+	fixtureevidence.Emit(t, fixtureevidence.Evidence{Scenario: "indefinite_restart", StateSequence: []string{"driving_beyond_7d", "canceled"}, FinalWorkerState: "stopped"})
 }
 
 func TestAdmissionWorkerCancellationInterruptsPollWait(t *testing.T) {
