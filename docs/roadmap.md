@@ -113,12 +113,13 @@ Exit criteria:
 
 ## Near-Term Goals
 
-### Planned: stabilize operator ergonomics
+### In progress: stabilize operator ergonomics
 
-After the live gate, consolidate the practical lessons into fewer operator
-attention reasons, clearer status/inspection summaries, and safer guided
-recovery selection. This should improve the existing CLI/application contracts,
-not expose arbitrary state mutation.
+The worker now remains alive while runs are parked, status exposes the current
+parked reason, and explicit authenticated recovery answers have a durable
+provenance boundary separate from automatic workflow evidence. Continue toward
+fewer operator-attention reasons, clearer inspection summaries, and safer guided
+recovery selection without exposing arbitrary state mutation.
 
 ### Planned: notification and operator interface
 

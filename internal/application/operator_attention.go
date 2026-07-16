@@ -80,6 +80,13 @@ type OperatorAttentionQuery interface {
 	ListOperatorAttention(context.Context, OperatorAttentionQueryInput) ([]OperatorAttentionEvent, error)
 }
 
+// CurrentOperatorAttentionQuery is an authority read, not a presentation
+// projection. Implementations must return only the newest durably published
+// run-scoped event so historical display records cannot authorize an action.
+type CurrentOperatorAttentionQuery interface {
+	CurrentOperatorAttention(context.Context, string) (OperatorAttentionEvent, bool, error)
+}
+
 type OperatorAttentionQueryInput struct {
 	RunID string
 	Limit int

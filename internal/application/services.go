@@ -395,6 +395,7 @@ type InspectionResult struct {
 	Cleanup                 []CleanupResult                 `json:"cleanup_progress"`
 	RetrySchedules          []RetrySchedule                 `json:"retry_schedules"`
 	OperatorAttentionEvents []OperatorAttentionEventResult  `json:"operator_attention_events"`
+	OperatorActions         []OperatorActionResult          `json:"operator_actions"`
 	Checks                  []CheckResult                   `json:"checks"`
 	Findings                []FindingResult                 `json:"review_findings"`
 	TrustedFeedback         []TrustedFeedbackResult         `json:"trusted_review_feedback"`
@@ -500,6 +501,33 @@ type OperatorAttentionEventResult struct {
 	OccurredAt            time.Time                   `json:"occurred_at"`
 	ObservedAt            time.Time                   `json:"observed_at"`
 }
+
+// OperatorActionResult exposes provenance and digests without replay
+// authority, raw command arguments, or run idempotency keys.
+type OperatorActionResult struct {
+	ActionID                    string             `json:"action_id"`
+	ActionType                  OperatorActionType `json:"action_type"`
+	Repository                  string             `json:"repository"`
+	ExpectedState               domain.State       `json:"expected_state"`
+	TransitionSequence          int64              `json:"transition_sequence"`
+	RequesterLogin              string             `json:"requester_login"`
+	RequesterDatabaseID         int64              `json:"requester_database_id"`
+	RequesterNodeID             string             `json:"requester_node_id"`
+	RequesterActorType          string             `json:"requester_actor_type"`
+	ReasonCode                  string             `json:"reason_code"`
+	AttentionEventKey           string             `json:"attention_event_key"`
+	Status                      string             `json:"status"`
+	ResultStatus                string             `json:"result_status"`
+	ResultingState              domain.State       `json:"resulting_state,omitempty"`
+	ResultingTransitionSequence int64              `json:"resulting_transition_sequence,omitempty"`
+	PayloadDigest               string             `json:"payload_digest"`
+	EvidenceDigest              string             `json:"evidence_digest,omitempty"`
+	OutcomeDigest               string             `json:"outcome_digest,omitempty"`
+	ReceivedAt                  time.Time          `json:"received_at"`
+	ValidatedAt                 time.Time          `json:"validated_at"`
+	AppliedAt                   time.Time          `json:"applied_at,omitempty"`
+	ObservedAt                  time.Time          `json:"observed_at,omitempty"`
+}
 type CheckResult struct {
 	Name        string    `json:"name"`
 	Required    bool      `json:"required"`
@@ -593,7 +621,7 @@ type PullRequestResult struct {
 
 func projectInspection(value RunInspection) InspectionResult {
 	result := InspectionResult{SchemaVersion: querySchemaVersion, Run: projectRunResult(value.Run), RepositoryBinding: projectRepositoryBinding(value.RepositoryBinding), Merge: value.Merge,
-		Timeline: []TransitionResult{}, Attempts: []AttemptResult{}, Verifications: []VerificationResult{}, Reviews: []ReviewResult{}, Resources: []ResourceResult{}, LinearCompletion: append([]LinearCompletionObservation(nil), value.LinearCompletion...), Cleanup: []CleanupResult{}, RetrySchedules: append([]RetrySchedule(nil), value.RetrySchedules...), OperatorAttentionEvents: []OperatorAttentionEventResult{}, Checks: []CheckResult{}, Findings: []FindingResult{}, TrustedFeedback: []TrustedFeedbackResult{}, FeedbackConflicts: []TrustedFeedbackConflictResult{}, Telemetry: []TelemetryResult{}}
+		Timeline: []TransitionResult{}, Attempts: []AttemptResult{}, Verifications: []VerificationResult{}, Reviews: []ReviewResult{}, Resources: []ResourceResult{}, LinearCompletion: append([]LinearCompletionObservation(nil), value.LinearCompletion...), Cleanup: []CleanupResult{}, RetrySchedules: append([]RetrySchedule(nil), value.RetrySchedules...), OperatorAttentionEvents: []OperatorAttentionEventResult{}, OperatorActions: []OperatorActionResult{}, Checks: []CheckResult{}, Findings: []FindingResult{}, TrustedFeedback: []TrustedFeedbackResult{}, FeedbackConflicts: []TrustedFeedbackConflictResult{}, Telemetry: []TelemetryResult{}}
 	if value.Approval != nil {
 		result.Approval = &HumanApprovalResult{Approver: sanitizeUntrustedContent(value.Approval.Approver), ApprovedSHA: value.Approval.ApprovedSHA, SourceAt: value.Approval.ApprovedAt, ObservedAt: value.Approval.ObservedAt}
 	}
@@ -633,6 +661,9 @@ func projectInspection(value RunInspection) InspectionResult {
 	for _, event := range value.OperatorAttention {
 		profile := projectedOperatorAttentionProfile(event)
 		result.OperatorAttentionEvents = append(result.OperatorAttentionEvents, OperatorAttentionEventResult{SchemaVersion: event.SchemaVersion, EventKey: event.EventKey, EventType: event.EventType, RunID: event.RunID, LinearIdentifier: event.LinearIdentifier, RepositoryProfileID: profile.ID, RepositoryProfileName: profile.Name, ControllerState: event.ControllerState, Severity: event.Severity, ReasonCode: event.ReasonCode, AllowedActions: append([]OperatorAttentionActionID{}, event.AllowedActions...), PayloadDigest: event.PayloadDigest, EvidenceDigest: event.EvidenceDigest, OccurredAt: event.OccurredAt, ObservedAt: event.ObservedAt})
+	}
+	for _, action := range value.OperatorActions {
+		result.OperatorActions = append(result.OperatorActions, OperatorActionResult{ActionID: action.ActionID, ActionType: action.ActionType, Repository: action.Repository, ExpectedState: action.ExpectedState, TransitionSequence: action.TransitionSequence, RequesterLogin: sanitizeUntrustedContent(action.Requester.ID), RequesterDatabaseID: action.Requester.DatabaseID, RequesterNodeID: sanitizeUntrustedContent(action.Requester.NodeID), RequesterActorType: sanitizeUntrustedContent(action.Requester.ActorType), ReasonCode: action.ReasonCode, AttentionEventKey: action.AttentionEventKey, Status: action.Status, ResultStatus: action.ResultStatus, ResultingState: action.ResultingState, ResultingTransitionSequence: action.ResultingTransitionSequence, PayloadDigest: action.PayloadDigest, EvidenceDigest: action.EvidenceDigest, OutcomeDigest: action.OutcomeDigest, ReceivedAt: action.ReceivedAt, ValidatedAt: action.ValidatedAt, AppliedAt: action.AppliedAt, ObservedAt: action.ObservedAt})
 	}
 	for _, finding := range value.Findings {
 		result.Findings = append(result.Findings, FindingResult{Source: finding.Source, SourceID: finding.SourceID,

@@ -633,7 +633,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 23; migration history is code, not a
+inspection. The current schema is version 24; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees
@@ -737,6 +737,28 @@ parked-outcome events. Missing or drifting transition evidence remains parked
 behind a stable authority-conflict event. Lease timestamp changes do not alter
 event identity.
 
+An explicit operator recovery answer crosses a separate authenticated
+application boundary. Before any later retry or abandon mutation, the
+controller records an immutable intent bound to the run, repository, expected
+state, run idempotency key, transition sequence, parked attention key, typed
+reason/action, and the configured requester's immutable GitHub identity. Only
+an action advertised by that exact current attention event is eligible. The
+same idempotency key and payload return the existing lifecycle record after a
+restart or subsequent state advance; payload drift fails closed. A run,
+transition, and parked attention event can own only one validated answer, so
+concurrent contradictory actions fail closed.
+
+The operator-action lifecycle is monotonic: `validated` records authority
+before mutation, `applied` binds the resulting state and transition sequence,
+and `observed` records a typed terminal result. Timestamps and sanitized
+payload/applied-evidence/outcome digests make incomplete or ambiguous outcomes
+inspectable without storing command arguments, paths, prose, or secrets. This
+journal is distinct from automatic state transitions and side effects, so notification
+delivery or an automatic controller step cannot be mistaken for human
+authorization. Schema 24 supplies this shared persistence and application
+composition foundation; typed retry and abandon execution remain separate
+command use cases.
+
 ### Hermes integration boundary
 
 Hermes has no runtime adapter today. Its planned role is an authenticated
@@ -763,6 +785,7 @@ around it. The principal table groups are:
 | `merge_results` | Controller squash or explicitly accepted external merge evidence |
 | Linear request/completion and Todo admission tables | Linear observations, singleton scheduler lease, reservation/mutation journal |
 | `automatic_retry_schedules`, `operator_attention_outbox` | Restart-stable retry policy and immutable versioned operator-attention events; legacy delivery fields are storage-only evidence |
+| `operator_actions` | Explicit authenticated recovery intent and its validated/applied/observed provenance, separate from automatic workflow evidence |
 
 ### Current state versus evidence
 

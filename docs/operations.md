@@ -1815,7 +1815,8 @@ Important fields in the safe inspection projection include:
 - fresh reviews and normalized findings;
 - side-effect intent/result, owned PR, polls, GitHub/Linear observations;
 - trusted feedback lifecycle/conflicts/reply evidence and human approval;
-- merge, source sync, cleanup, retry schedule, and operator attention.
+- merge, source sync, cleanup, retry schedule, operator attention, and explicit
+  operator-action provenance.
 
 `operator_attention_events` is the normalized bounded projection. Each event
 shows its envelope `schema_version`, stable key, sanitized reason/state,
@@ -1829,6 +1830,16 @@ only their typed valid actions. GitHub approval publishes no attention event:
 the production driver remains its bounded polling authority. Repeated parked
 cycles replay the same event key, and authority drift stays parked behind a
 stable fail-closed reason.
+
+`operator_actions` is a separate ordered projection for authenticated recovery
+answers. It shows the allowlisted action, immutable requester identity, exact
+attention/reason and transition binding, lifecycle/result, resulting
+state/sequence, separate sanitized applied-evidence/outcome digests, and
+received/validated/applied/observed times. It never exposes the action or run
+idempotency key, raw CLI arguments, paths, prose, or credentials. An entry is
+human-action provenance; ordinary timeline transitions and external side
+effects remain automatic/controller evidence. The journal is currently a shared foundation for the typed recovery
+commands, not a generic state-mutation interface.
 
 The persisted idempotency key is controller authority for an authenticated
 recovery command, not a credential for an external service. Keep it run-scoped

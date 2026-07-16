@@ -233,6 +233,7 @@ type RunInspection struct {
 	Cleanup             []CleanupRecord                  `json:"cleanup_progress"`
 	RetrySchedules      []RetrySchedule                  `json:"retry_schedules"`
 	OperatorAttention   []OperatorAttentionEvent         `json:"operator_attention_events"`
+	OperatorActions     []OperatorActionRecord           `json:"operator_actions"`
 	GitHubInstallation  *GitHubInstallationMetadata      `json:"github_installation,omitempty"`
 	GitHubRequests      []GitHubRequestObservation       `json:"github_request_observations"`
 	GitHubEvidence      *domain.GitHubReadEvidence       `json:"github_read_evidence,omitempty"`

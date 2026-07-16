@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -41,6 +42,17 @@ func (s *Store) AppendOperatorAttention(ctx context.Context, event application.O
 // deliver, acknowledge, retry, delete, or otherwise mutate any event.
 func (s *Store) ListOperatorAttention(ctx context.Context, input application.OperatorAttentionQueryInput) ([]application.OperatorAttentionEvent, error) {
 	return s.listOperatorAttention(ctx, input.RunID, input.Limit)
+}
+
+func (s *Store) CurrentOperatorAttention(ctx context.Context, runID string) (application.OperatorAttentionEvent, bool, error) {
+	if runID == "" {
+		return application.OperatorAttentionEvent{}, false, errors.New("operator attention run is required")
+	}
+	event, err := scanOperatorAttention(s.db.QueryRowContext(ctx, operatorAttentionSelect+` WHERE run_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1`, runID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return application.OperatorAttentionEvent{}, false, nil
+	}
+	return event, err == nil, err
 }
 
 func (s *Store) listOperatorAttention(ctx context.Context, runID string, limit int) ([]application.OperatorAttentionEvent, error) {

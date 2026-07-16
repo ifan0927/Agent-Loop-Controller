@@ -20,7 +20,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 23
+const schemaVersion = 24
 
 type Store struct{ db *sql.DB }
 
@@ -135,6 +135,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV22
 		case 23:
 			statements = migrationV23
+		case 24:
+			statements = migrationV24
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -444,6 +446,40 @@ var migrationV23 = []string{
 	)`,
 	`CREATE INDEX operator_attention_outbox_projection ON operator_attention_outbox(occurred_at,event_key)`,
 	`CREATE INDEX operator_attention_outbox_run ON operator_attention_outbox(run_id,occurred_at,event_key)`,
+}
+
+// migrationV24 persists explicit operator recovery provenance independently
+// from automatic transitions and external side-effect records.
+var migrationV24 = []string{
+	`CREATE TABLE operator_actions (
+		action_id TEXT PRIMARY KEY,
+		idempotency_key TEXT NOT NULL UNIQUE,
+		payload_digest TEXT NOT NULL,
+		run_id TEXT NOT NULL REFERENCES runs(run_id),
+		repository TEXT NOT NULL,
+		expected_state TEXT NOT NULL,
+		run_idempotency_key TEXT NOT NULL,
+		transition_sequence INTEGER NOT NULL,
+		action_type TEXT NOT NULL CHECK(action_type IN ('retry','abandon')),
+		requester_login TEXT NOT NULL,
+		requester_database_id INTEGER NOT NULL,
+		requester_node_id TEXT NOT NULL,
+		requester_actor_type TEXT NOT NULL,
+		reason_code TEXT NOT NULL,
+		attention_event_key TEXT NOT NULL,
+		status TEXT NOT NULL CHECK(status IN ('validated','applied','observed')),
+		result_status TEXT NOT NULL CHECK(result_status IN ('pending','applied','succeeded','failed','ambiguous')),
+		resulting_state TEXT NOT NULL DEFAULT '',
+		resulting_transition_sequence INTEGER NOT NULL DEFAULT 0,
+		evidence_digest TEXT NOT NULL DEFAULT '',
+		outcome_digest TEXT NOT NULL DEFAULT '',
+		received_at TEXT NOT NULL,
+		validated_at TEXT NOT NULL,
+		applied_at TEXT NOT NULL DEFAULT '',
+		observed_at TEXT NOT NULL DEFAULT '',
+		UNIQUE(run_id,transition_sequence,attention_event_key)
+	)`,
+	`CREATE INDEX operator_actions_run ON operator_actions(run_id,transition_sequence,action_id)`,
 }
 
 func migrateOperatorAttentionV23Tx(ctx context.Context, tx *sql.Tx) error {
@@ -2233,6 +2269,10 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 	}
 	inspection := application.RunInspection{Run: run}
 	inspection.RetrySchedules, err = s.listRetrySchedulesForRun(ctx, id)
+	if err != nil {
+		return application.RunInspection{}, err
+	}
+	inspection.OperatorActions, err = s.listOperatorActions(ctx, id)
 	if err != nil {
 		return application.RunInspection{}, err
 	}

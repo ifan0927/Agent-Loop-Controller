@@ -63,7 +63,8 @@ the state machine.
   and narrow GitHub App authorities.
 - Manual Linear admission and disabled-by-default automatic Todo admission.
 - Priority-only single-run worker scheduling, durable leases, retry schedules,
-  restart-stable parked states, and local operator-attention records.
+  restart-stable parked states, local operator-attention records, and durable
+  provenance for explicit authenticated recovery answers.
 - Isolated worktrees, resumable Codex implementation sessions, structured
   outcomes, repository-owned verifier commands, and fresh read-only review.
 - Exact-HEAD branch push, owned PR creation/adoption, required-check and review
