@@ -15,6 +15,12 @@ type ProductionRunReader interface {
 	GetRun(context.Context, string) (Run, error)
 }
 
+// ProductionAttentionEvidenceReader supplies the transition timeline needed
+// to bind a manual stop event to exact durable evidence.
+type ProductionAttentionEvidenceReader interface {
+	Inspect(context.Context, string) (RunInspection, error)
+}
+
 // ProductionDriverCoordinator is the set of state-bound actions that the
 // automatic driver may invoke. ProductionCoordinator is its implementation;
 // the interface keeps transport and adapter construction outside application
@@ -94,14 +100,16 @@ type ProductionDriveResult struct {
 type ProductionDriver struct {
 	coordinator ProductionDriverCoordinator
 	runs        ProductionRunReader
+	attention   ProductionAttentionEvidenceReader
+	publisher   OperatorAttentionPublisher
 	ports       ProductionDriverPorts
 	policy      ProductionDriverPolicy
 	wait        ProductionWait
 }
 
-func NewProductionDriver(coordinator ProductionDriverCoordinator, runs ProductionRunReader, ports ProductionDriverPorts, policy ProductionDriverPolicy, wait ProductionWait) (*ProductionDriver, error) {
-	if coordinator == nil || runs == nil {
-		return nil, errors.New("production driver coordinator and run reader are required")
+func NewProductionDriver(coordinator ProductionDriverCoordinator, runs ProductionRunReader, attention ProductionAttentionEvidenceReader, publisher OperatorAttentionPublisher, ports ProductionDriverPorts, policy ProductionDriverPolicy, wait ProductionWait) (*ProductionDriver, error) {
+	if coordinator == nil || runs == nil || attention == nil || publisher == nil {
+		return nil, errors.New("production driver coordinator, run reader, attention evidence reader, and publisher are required")
 	}
 	if err := policy.validate(); err != nil {
 		return nil, err
@@ -109,7 +117,7 @@ func NewProductionDriver(coordinator ProductionDriverCoordinator, runs Productio
 	if wait == nil {
 		wait = waitForProductionPoll
 	}
-	return &ProductionDriver{coordinator: coordinator, runs: runs, ports: ports, policy: policy, wait: wait}, nil
+	return &ProductionDriver{coordinator: coordinator, runs: runs, attention: attention, publisher: publisher, ports: ports, policy: policy, wait: wait}, nil
 }
 
 func waitForProductionPoll(ctx context.Context, interval time.Duration) error {
@@ -149,11 +157,11 @@ func (d *ProductionDriver) Drive(ctx context.Context, command ProductionDriveCom
 		}
 
 		if run.State == domain.StateAwaitingHumanDecision {
-			return d.stop(run, ProductionStop, "durable human decision is required", actions), nil
+			return d.stop(ctx, run, ProductionStop, "durable human decision is required", actions)
 		}
 		action, reason := productionNextAction(run.State)
 		if action == ProductionStop {
-			return d.stop(run, action, reason, actions), nil
+			return d.stop(ctx, run, action, reason, actions)
 		}
 		if immediate >= d.policy.MaxImmediateAction {
 			if err := d.wait(ctx, d.policy.PollInterval); err != nil {
@@ -168,8 +176,8 @@ func (d *ProductionDriver) Drive(ctx context.Context, command ProductionDriveCom
 		poll, err := d.apply(ctx, command, run, action)
 		if err != nil {
 			if !retryableProductionDriverError(err) {
-				if result, stopped := d.durableStop(ctx, command, actions); stopped {
-					return result, nil
+				if result, stopped, stopErr := d.durableStop(ctx, command, actions); stopped {
+					return result, stopErr
 				}
 				return ProductionDriveResult{}, err
 			}
@@ -191,26 +199,39 @@ func (d *ProductionDriver) Drive(ctx context.Context, command ProductionDriveCom
 // durableStop turns an action that persisted a manual/terminal transition into
 // the driver's normal result rather than forcing the caller to issue a second
 // status command merely to discover that the run has already stopped.
-func (d *ProductionDriver) durableStop(ctx context.Context, command ProductionDriveCommand, actions int) (ProductionDriveResult, bool) {
+func (d *ProductionDriver) durableStop(ctx context.Context, command ProductionDriveCommand, actions int) (ProductionDriveResult, bool, error) {
 	run, err := d.runs.GetRun(ctx, command.RunID)
 	if err != nil || run.Repository != command.Repository || run.IdempotencyKey != command.IdempotencyKey {
-		return ProductionDriveResult{}, false
+		return ProductionDriveResult{}, false, nil
 	}
 	if err := authorizePersistedRequester(run, command.Requester); err != nil {
-		return ProductionDriveResult{}, false
+		return ProductionDriveResult{}, false, nil
 	}
 	if run.State == domain.StateAwaitingHumanDecision {
-		return d.stop(run, ProductionStop, "durable human decision is required", actions), true
+		result, stopErr := d.stop(ctx, run, ProductionStop, "durable human decision is required", actions)
+		return result, true, stopErr
 	}
 	action, reason := productionNextAction(run.State)
 	if action != ProductionStop {
-		return ProductionDriveResult{}, false
+		return ProductionDriveResult{}, false, nil
 	}
-	return d.stop(run, action, reason, actions), true
+	result, stopErr := d.stop(ctx, run, action, reason, actions)
+	return result, true, stopErr
 }
 
-func (d *ProductionDriver) stop(run Run, action ProductionAction, reason string, actions int) ProductionDriveResult {
-	return ProductionDriveResult{Run: projectRunResult(run), Action: action, Reason: reason, ActionsRun: actions}
+func (d *ProductionDriver) stop(ctx context.Context, run Run, action ProductionAction, reason string, actions int) (ProductionDriveResult, error) {
+	result := ProductionDriveResult{Run: projectRunResult(run), Action: action, Reason: reason, ActionsRun: actions}
+	if run.State != domain.StateManualIntervention {
+		return result, nil
+	}
+	inspection, err := d.attention.Inspect(ctx, run.ID)
+	if err != nil {
+		return ProductionDriveResult{}, classifyServiceError(err)
+	}
+	if err := publishManualInterventionAttention(ctx, run, inspection, d.publisher); err != nil {
+		return ProductionDriveResult{}, classifyServiceError(err)
+	}
+	return result, nil
 }
 
 func (d *ProductionDriver) apply(ctx context.Context, command ProductionDriveCommand, run Run, action ProductionAction) (bool, error) {

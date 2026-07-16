@@ -237,7 +237,7 @@ func ValidateRetryControllerState(state domain.State) error {
 
 func automaticRetryStateStop(state domain.State) (RetryFailureClass, string, bool) {
 	switch state {
-	case domain.StateFailed, domain.StateCompleted, domain.StateRejected:
+	case domain.StateFailed, domain.StateRejected:
 		return RetryFailureTerminal, RetryReasonTerminal, true
 	case domain.StateAwaitingHumanDecision, domain.StateAwaitingHumanApproval, domain.StateManualIntervention:
 		return RetryFailureManual, RetryReasonManual, true

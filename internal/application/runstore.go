@@ -232,7 +232,7 @@ type RunInspection struct {
 	LinearCompletion    []LinearCompletionObservation    `json:"linear_completion_observations"`
 	Cleanup             []CleanupRecord                  `json:"cleanup_progress"`
 	RetrySchedules      []RetrySchedule                  `json:"retry_schedules"`
-	OperatorAttention   []OperatorAttentionEvent         `json:"operator_attention_outbox"`
+	OperatorAttention   []OperatorAttentionEvent         `json:"operator_attention_events"`
 	GitHubInstallation  *GitHubInstallationMetadata      `json:"github_installation,omitempty"`
 	GitHubRequests      []GitHubRequestObservation       `json:"github_request_observations"`
 	GitHubEvidence      *domain.GitHubReadEvidence       `json:"github_read_evidence,omitempty"`

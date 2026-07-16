@@ -367,7 +367,7 @@ func driveProductionRun(ctx context.Context, loaded bootstrap.Bootstrap, store *
 	}
 	validator := newLocalController(store, loaded.Controller.CodexBinary, filepath.Dir(run.WorktreePath))
 	github := githubReadAdapter{client: readClient, observations: &observations}
-	driver, err := application.NewProductionDriver(coordinator, store, application.ProductionDriverPorts{
+	driver, err := application.NewProductionDriver(coordinator, store, store, store, application.ProductionDriverPorts{
 		GitHubReader:       github,
 		ReviewCommentReply: githubReplyAdapter{client: replyClient, observations: &replyObservations, mu: &replyMu},
 		ApprovalValidator:  validator,

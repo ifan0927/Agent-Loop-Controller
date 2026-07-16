@@ -76,7 +76,7 @@ The strict JSON document contains:
 | `linear` | Allowed GraphQL endpoint, credential source reference, team key, and bounded request settings |
 | `github_app_profiles` | App/installation/repository identities, PEM reference, request bounds, and narrow write switches |
 | `repositories` | Canonical owner/name, origins and local roots, base branch, verifier IDs, profile reference, and trusted actors |
-| `automation.linear_todo_admission` | Disabled/enabled authority, exact workflow states, scan/lease bounds, fixed requester, local outbox mode, and credential reference |
+| `automation.linear_todo_admission` | Disabled/enabled authority, exact workflow states, scan/lease bounds, fixed requester, durable local event adapter mode, and credential reference |
 
 Repository profiles are selectable one at a time per run. They may coexist in
 one configuration, but paths must not overlap and a run freezes the selected
@@ -1790,6 +1790,15 @@ Important fields in the safe inspection projection include:
 - side-effect intent/result, owned PR, polls, GitHub/Linear observations;
 - trusted feedback lifecycle/conflicts/reply evidence and human approval;
 - merge, source sync, cleanup, retry schedule, and operator attention.
+
+`operator_attention_events` is the normalized bounded projection. Each event
+shows its envelope `schema_version`, stable key, sanitized reason/state,
+payload/evidence digests, timestamps, and typed `allowed_actions`. Those actions
+are display hints only; an authenticated state-changing command must
+independently revalidate current run authority. Transport delivery state and
+legacy local outbox fields are never exposed by `status` or `inspect`.
+Automatic admission reports `waiting` without publishing an attention event
+while an active run is awaiting a human decision or GitHub approval.
 
 The persisted idempotency key is controller authority for an authenticated
 recovery command, not a credential for an external service. Keep it run-scoped

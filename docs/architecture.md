@@ -599,7 +599,8 @@ observations, and ownership nonces.
 
 **Outputs**
 
-Per-resource results, optional operator attention, and `completed`.
+Per-resource results, a durable operator-attention event when required, and
+`completed`.
 
 **Authoritative state/evidence**
 
@@ -627,7 +628,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 22; migration history is code, not a
+inspection. The current schema is version 23; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees
@@ -685,6 +686,30 @@ static validation, bounded `launchctl` control, and sanitized results. launchd
 supervises one logged-in user's worker process; SQLite leases and journals—not
 launchd—remain workflow authority.
 
+### Operator-attention boundary
+
+Application services publish immutable versioned attention events through a
+narrow append-only port. CLI inspection and future presentation adapters use a
+separate bounded query port. The envelope contains only typed event, state,
+severity, reason, repository profile, scope, digests, timestamps, and permitted
+presentation action IDs. An advertised `retry` or `abandon` action is metadata;
+it is never authentication or permission to mutate controller state.
+
+SQLite is the initial durable adapter. Same-key same-payload publication is an
+idempotent replay and a conflicting payload fails closed. Schema 23 preserves
+the former local-delivery digest and status as legacy database evidence while
+removing transport lifecycle from the application event and safe inspection
+projection. Migrated rows remain immutable schema-0 events with their original
+payload digest; current presentation actions are not backfilled into their
+identity. Publication failure cannot authorize or advance workflow state.
+Polling, human approval waiting, and successful terminal states do not emit
+operator-error events. Every delivery-loop coordinator action re-reads its
+final durable state and publishes the transition-bound manual-intervention
+event before returning; the production driver repeats that publication
+idempotently at its stop boundary. A restarted automatic dispatcher publishes
+the same event key, so foreground and worker recovery cannot create duplicate
+parked-outcome events. Lease timestamp changes do not alter event identity.
+
 ### Hermes integration boundary
 
 Hermes has no runtime adapter today. Its planned role is an authenticated
@@ -710,7 +735,7 @@ around it. The principal table groups are:
 | `trusted_review_feedback`, conflict and reply tables | Immutable trusted feedback lifecycle, drift conflicts, and one reply proof |
 | `merge_results` | Controller squash or explicitly accepted external merge evidence |
 | Linear request/completion and Todo admission tables | Linear observations, singleton scheduler lease, reservation/mutation journal |
-| `automatic_retry_schedules`, `operator_attention_outbox` | Restart-stable retry policy and local sanitized human-attention projection |
+| `automatic_retry_schedules`, `operator_attention_outbox` | Restart-stable retry policy and immutable versioned operator-attention events; legacy delivery fields are storage-only evidence |
 
 ### Current state versus evidence
 

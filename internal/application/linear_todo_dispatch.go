@@ -18,6 +18,7 @@ const (
 	LinearTodoDispatchNoCandidate    = "no_candidate"
 	LinearTodoDispatchDriven         = "driven"
 	LinearTodoDispatchAttention      = "attention_required"
+	LinearTodoDispatchWaiting        = "waiting"
 	LinearTodoDispatchRetryWait      = "retry_wait"
 	LinearTodoDispatchRetryScheduled = "retry_scheduled"
 )
@@ -85,7 +86,7 @@ type LinearTodoDispatchDriver interface {
 type linearTodoDispatchStore interface {
 	LinearTodoAdmissionStore
 	linearIssueStartStore
-	OperatorAttentionStore
+	OperatorAttentionPublisher
 	RetryScheduleStore
 }
 
@@ -356,8 +357,11 @@ func (d *LinearTodoDispatcher) reserveStartAndDrive(ctx context.Context, lease *
 }
 
 func (d *LinearTodoDispatcher) resume(ctx context.Context, lease *LinearTodoAdmissionLease, run Run) (LinearTodoDispatchResult, error) {
-	if run.State == domain.StateManualIntervention || run.State == domain.StateAwaitingHumanDecision || run.State == domain.StateAwaitingHumanApproval {
-		return d.runAttention(ctx, run, "admission_authority_conflict", dispatchEvidence("manual_or_human_run", run.ID))
+	if run.State == domain.StateManualIntervention {
+		return d.manualInterventionAttention(ctx, run)
+	}
+	if run.State == domain.StateAwaitingHumanDecision || run.State == domain.StateAwaitingHumanApproval {
+		return LinearTodoDispatchResult{Outcome: LinearTodoDispatchWaiting, Run: projectRunResult(run)}, nil
 	}
 	journal, found, err := d.store.GetLinearTodoAdmissionJournal(ctx, run.ID)
 	if err != nil {
@@ -580,6 +584,17 @@ func (d *LinearTodoDispatcher) runAttention(ctx context.Context, run Run, reason
 	return d.appendAttention(ctx, event, "")
 }
 
+func (d *LinearTodoDispatcher) manualInterventionAttention(ctx context.Context, run Run) (LinearTodoDispatchResult, error) {
+	inspection, err := d.store.Inspect(ctx, run.ID)
+	if err != nil {
+		return LinearTodoDispatchResult{}, classifyServiceError(err)
+	}
+	if err := publishManualInterventionAttention(ctx, run, inspection, d.store); err != nil {
+		return LinearTodoDispatchResult{}, classifyServiceError(err)
+	}
+	return LinearTodoDispatchResult{Outcome: LinearTodoDispatchAttention, Run: projectRunResult(run)}, nil
+}
+
 func (d *LinearTodoDispatcher) appendAttention(ctx context.Context, event OperatorAttentionEvent, scanDigest string) (LinearTodoDispatchResult, error) {
 	if _, err := d.store.AppendOperatorAttention(ctx, event); err != nil {
 		return LinearTodoDispatchResult{}, classifyServiceError(err)
@@ -606,6 +621,16 @@ func (d *LinearTodoDispatcher) blockingRetry(ctx context.Context) (LinearTodoDis
 		run, runErr := d.store.GetRun(ctx, schedule.RunID)
 		if runErr != nil {
 			return LinearTodoDispatchResult{}, false, classifyServiceError(runErr)
+		}
+		if run.State == domain.StateManualIntervention {
+			result, attentionErr := d.manualInterventionAttention(ctx, run)
+			return result, true, attentionErr
+		}
+		if run.State == domain.StateAwaitingHumanDecision || run.State == domain.StateAwaitingHumanApproval {
+			return LinearTodoDispatchResult{Outcome: LinearTodoDispatchWaiting, Run: projectRunResult(run)}, true, nil
+		}
+		if run.State == domain.StateCompleted {
+			continue
 		}
 		if schedule.Status == RetryScheduleAttention {
 			if retainedTerminalRetryAttention(run, schedule) {
@@ -660,6 +685,15 @@ func (d *LinearTodoDispatcher) handleRunFailure(ctx context.Context, run Run, ph
 	if ctx.Err() != nil {
 		return LinearTodoDispatchResult{}, cause
 	}
+	if run.State == domain.StateManualIntervention {
+		return d.manualInterventionAttention(ctx, run)
+	}
+	if run.State == domain.StateAwaitingHumanDecision || run.State == domain.StateAwaitingHumanApproval {
+		return LinearTodoDispatchResult{Outcome: LinearTodoDispatchWaiting, Run: projectRunResult(run)}, nil
+	}
+	if run.State == domain.StateCompleted {
+		return LinearTodoDispatchResult{Outcome: LinearTodoDispatchDriven, Run: projectRunResult(run)}, nil
+	}
 	class, reason := ClassifyAutomaticRetryFailure(cause)
 	if stoppedClass, stoppedReason, stop := automaticRetryStateStop(run.State); stop {
 		class, reason = stoppedClass, stoppedReason
@@ -693,6 +727,16 @@ func (d *LinearTodoDispatcher) orphanRetryAttention(ctx context.Context) (Linear
 		run, runErr := d.store.GetRun(ctx, schedule.RunID)
 		if runErr != nil {
 			return LinearTodoDispatchResult{}, false, classifyServiceError(runErr)
+		}
+		if run.State == domain.StateManualIntervention {
+			result, attentionErr := d.manualInterventionAttention(ctx, run)
+			return result, true, attentionErr
+		}
+		if run.State == domain.StateAwaitingHumanDecision || run.State == domain.StateAwaitingHumanApproval {
+			return LinearTodoDispatchResult{Outcome: LinearTodoDispatchWaiting, Run: projectRunResult(run)}, true, nil
+		}
+		if run.State == domain.StateCompleted {
+			continue
 		}
 		if schedule.Status == RetryScheduleAttention {
 			if retainedTerminalRetryAttention(run, schedule) {

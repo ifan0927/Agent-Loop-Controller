@@ -242,9 +242,16 @@ type runSummaryCursor struct {
 	RunID     string    `json:"run_id"`
 }
 
-type QueryService struct{ store RunStore }
+type QueryStore interface {
+	GetRun(context.Context, string) (Run, error)
+	ListRuns(context.Context, string, time.Time, string, int) ([]Run, error)
+	Inspect(context.Context, string) (RunInspection, error)
+	OperatorAttentionQuery
+}
 
-func NewQueryService(store RunStore) QueryService { return QueryService{store: store} }
+type QueryService struct{ store QueryStore }
+
+func NewQueryService(store QueryStore) QueryService { return QueryService{store: store} }
 
 func (s QueryService) Status(ctx context.Context, input QueryInput) (InspectionResult, error) {
 	return s.Inspect(ctx, input)
@@ -258,6 +265,11 @@ func (s QueryService) Inspect(ctx context.Context, input QueryInput) (Inspection
 	if err != nil {
 		return InspectionResult{}, classifyServiceError(err)
 	}
+	attention, err := s.store.ListOperatorAttention(ctx, OperatorAttentionQueryInput{RunID: input.RunID, Limit: maxOperatorAttentionProjection})
+	if err != nil {
+		return InspectionResult{}, classifyServiceError(err)
+	}
+	inspection.OperatorAttention = attention
 	return projectInspection(inspection), nil
 }
 
@@ -382,8 +394,7 @@ type InspectionResult struct {
 	LinearCompletion        []LinearCompletionObservation   `json:"linear_completion_observations"`
 	Cleanup                 []CleanupResult                 `json:"cleanup_progress"`
 	RetrySchedules          []RetrySchedule                 `json:"retry_schedules"`
-	OperatorAttention       []OperatorAttentionResult       `json:"operator_attention"`
-	OperatorAttentionOutbox []OperatorAttentionOutboxResult `json:"operator_attention_outbox"`
+	OperatorAttentionEvents []OperatorAttentionEventResult  `json:"operator_attention_events"`
 	Checks                  []CheckResult                   `json:"checks"`
 	Findings                []FindingResult                 `json:"review_findings"`
 	TrustedFeedback         []TrustedFeedbackResult         `json:"trusted_review_feedback"`
@@ -470,34 +481,24 @@ type CleanupResult struct {
 	UpdatedAt  time.Time `json:"updated_at"`
 }
 
-// OperatorAttentionResult is an advisory, read-only projection of durable
-// cleanup evidence. It neither changes a run's lifecycle nor authorizes a
-// source checkout write.
-type OperatorAttentionResult struct {
-	Code       string    `json:"code"`
-	Component  string    `json:"component"`
-	Severity   string    `json:"severity"`
-	Status     string    `json:"status"`
-	ReasonCode string    `json:"reason_code"`
-	ObservedAt time.Time `json:"observed_at"`
-}
-
-// OperatorAttentionOutboxResult is a bounded read-only projection of the
-// local delivery placeholder. It carries only the #34 allowlisted payload.
-type OperatorAttentionOutboxResult struct {
-	EventKey              string    `json:"event_key"`
-	EventType             string    `json:"event_type"`
-	RunID                 string    `json:"run_id,omitempty"`
-	LinearIdentifier      string    `json:"linear_identifier,omitempty"`
-	RepositoryProfileID   string    `json:"repository_profile_id"`
-	RepositoryProfileName string    `json:"repository_profile_name"`
-	ControllerState       string    `json:"controller_state"`
-	Severity              string    `json:"severity"`
-	ReasonCode            string    `json:"reason_code"`
-	EvidenceDigest        string    `json:"evidence_digest"`
-	OccurredAt            time.Time `json:"occurred_at"`
-	ObservedAt            time.Time `json:"observed_at"`
-	DeliveryStatus        string    `json:"delivery_status"`
+// OperatorAttentionEventResult is a bounded read-only projection of the
+// transport-neutral, sanitized attention envelope.
+type OperatorAttentionEventResult struct {
+	SchemaVersion         int                         `json:"schema_version"`
+	EventKey              string                      `json:"event_key"`
+	EventType             string                      `json:"event_type"`
+	RunID                 string                      `json:"run_id,omitempty"`
+	LinearIdentifier      string                      `json:"linear_identifier,omitempty"`
+	RepositoryProfileID   string                      `json:"repository_profile_id"`
+	RepositoryProfileName string                      `json:"repository_profile_name"`
+	ControllerState       string                      `json:"controller_state"`
+	Severity              string                      `json:"severity"`
+	ReasonCode            string                      `json:"reason_code"`
+	AllowedActions        []OperatorAttentionActionID `json:"allowed_actions"`
+	PayloadDigest         string                      `json:"payload_digest"`
+	EvidenceDigest        string                      `json:"evidence_digest"`
+	OccurredAt            time.Time                   `json:"occurred_at"`
+	ObservedAt            time.Time                   `json:"observed_at"`
 }
 type CheckResult struct {
 	Name        string    `json:"name"`
@@ -592,7 +593,7 @@ type PullRequestResult struct {
 
 func projectInspection(value RunInspection) InspectionResult {
 	result := InspectionResult{SchemaVersion: querySchemaVersion, Run: projectRunResult(value.Run), RepositoryBinding: projectRepositoryBinding(value.RepositoryBinding), Merge: value.Merge,
-		Timeline: []TransitionResult{}, Attempts: []AttemptResult{}, Verifications: []VerificationResult{}, Reviews: []ReviewResult{}, Resources: []ResourceResult{}, LinearCompletion: append([]LinearCompletionObservation(nil), value.LinearCompletion...), Cleanup: []CleanupResult{}, RetrySchedules: append([]RetrySchedule(nil), value.RetrySchedules...), OperatorAttention: []OperatorAttentionResult{}, OperatorAttentionOutbox: []OperatorAttentionOutboxResult{}, Checks: []CheckResult{}, Findings: []FindingResult{}, TrustedFeedback: []TrustedFeedbackResult{}, FeedbackConflicts: []TrustedFeedbackConflictResult{}, Telemetry: []TelemetryResult{}}
+		Timeline: []TransitionResult{}, Attempts: []AttemptResult{}, Verifications: []VerificationResult{}, Reviews: []ReviewResult{}, Resources: []ResourceResult{}, LinearCompletion: append([]LinearCompletionObservation(nil), value.LinearCompletion...), Cleanup: []CleanupResult{}, RetrySchedules: append([]RetrySchedule(nil), value.RetrySchedules...), OperatorAttentionEvents: []OperatorAttentionEventResult{}, Checks: []CheckResult{}, Findings: []FindingResult{}, TrustedFeedback: []TrustedFeedbackResult{}, FeedbackConflicts: []TrustedFeedbackConflictResult{}, Telemetry: []TelemetryResult{}}
 	if value.Approval != nil {
 		result.Approval = &HumanApprovalResult{Approver: sanitizeUntrustedContent(value.Approval.Approver), ApprovedSHA: value.Approval.ApprovedSHA, SourceAt: value.Approval.ApprovedAt, ObservedAt: value.Approval.ObservedAt}
 	}
@@ -629,9 +630,9 @@ func projectInspection(value RunInspection) InspectionResult {
 	for _, v := range value.Cleanup {
 		result.Cleanup = append(result.Cleanup, CleanupResult{v.Kind, v.Status, sanitizedCleanupErrorClass(v), v.UpdatedAt})
 	}
-	result.OperatorAttention = projectOperatorAttention(value.Cleanup)
 	for _, event := range value.OperatorAttention {
-		result.OperatorAttentionOutbox = append(result.OperatorAttentionOutbox, OperatorAttentionOutboxResult{EventKey: event.EventKey, EventType: event.EventType, RunID: event.RunID, LinearIdentifier: event.LinearIdentifier, RepositoryProfileID: event.RepositoryProfileID, RepositoryProfileName: event.RepositoryProfileName, ControllerState: event.ControllerState, Severity: event.Severity, ReasonCode: event.ReasonCode, EvidenceDigest: event.EvidenceDigest, OccurredAt: event.OccurredAt, ObservedAt: event.ObservedAt, DeliveryStatus: event.DeliveryStatus})
+		profile := projectedOperatorAttentionProfile(event)
+		result.OperatorAttentionEvents = append(result.OperatorAttentionEvents, OperatorAttentionEventResult{SchemaVersion: event.SchemaVersion, EventKey: event.EventKey, EventType: event.EventType, RunID: event.RunID, LinearIdentifier: event.LinearIdentifier, RepositoryProfileID: profile.ID, RepositoryProfileName: profile.Name, ControllerState: event.ControllerState, Severity: event.Severity, ReasonCode: event.ReasonCode, AllowedActions: append([]OperatorAttentionActionID{}, event.AllowedActions...), PayloadDigest: event.PayloadDigest, EvidenceDigest: event.EvidenceDigest, OccurredAt: event.OccurredAt, ObservedAt: event.ObservedAt})
 	}
 	for _, finding := range value.Findings {
 		result.Findings = append(result.Findings, FindingResult{Source: finding.Source, SourceID: finding.SourceID,
@@ -649,38 +650,7 @@ func projectInspection(value RunInspection) InspectionResult {
 	return result
 }
 
-const (
-	sourceCheckoutAttentionCode      = "source_checkout_sync_required"
-	sourceCheckoutAttentionComponent = "source_checkout"
-	sourceCheckoutAttentionReason    = "source_checkout_requires_manual_sync"
-)
-
-// projectOperatorAttention intentionally recognizes only terminal source-sync
-// attention evidence. A cleanup row is an implementation record, so its name,
-// raw error, and arbitrary persisted reason are never projected here.
-func projectOperatorAttention(cleanup []CleanupRecord) []OperatorAttentionResult {
-	var selected *OperatorAttentionResult
-	for _, record := range cleanup {
-		if record.Kind != "source_checkout" || record.Status != "skipped_attention" {
-			continue
-		}
-		candidate := OperatorAttentionResult{
-			Code:       sourceCheckoutAttentionCode,
-			Component:  sourceCheckoutAttentionComponent,
-			Severity:   "warning",
-			Status:     "pending",
-			ReasonCode: sourceCheckoutAttentionReasonCode(record.ErrorClass),
-			ObservedAt: record.UpdatedAt,
-		}
-		if selected == nil || candidate.ObservedAt.After(selected.ObservedAt) || (candidate.ObservedAt.Equal(selected.ObservedAt) && candidate.ReasonCode < selected.ReasonCode) {
-			selected = &candidate
-		}
-	}
-	if selected == nil {
-		return []OperatorAttentionResult{}
-	}
-	return []OperatorAttentionResult{*selected}
-}
+const sourceCheckoutAttentionReason = "source_checkout_requires_manual_sync"
 
 func sanitizedCleanupErrorClass(record CleanupRecord) string {
 	if record.Kind == "source_checkout" && record.Status == "skipped_attention" {

@@ -25,6 +25,8 @@ type serviceStore struct {
 	approvalSaved    **domain.HumanApproval
 	approvalObserved **domain.HumanApprovalObservation
 	nextState        *domain.State
+	attentionEvents  *[]OperatorAttentionEvent
+	attentionErr     error
 }
 
 type runListCall struct {
@@ -38,6 +40,26 @@ func (s serviceStore) GetRunByIdempotency(context.Context, string) (Run, bool, e
 }
 func (s serviceStore) Inspect(context.Context, string) (RunInspection, error) {
 	return s.inspection, nil
+}
+func (s serviceStore) ListOperatorAttention(_ context.Context, input OperatorAttentionQueryInput) ([]OperatorAttentionEvent, error) {
+	if input.Limit < 1 || input.Limit > maxOperatorAttentionProjection {
+		return nil, errors.New("operator attention projection limit is out of bounds")
+	}
+	return append([]OperatorAttentionEvent(nil), s.inspection.OperatorAttention...), nil
+}
+func (s serviceStore) AppendOperatorAttention(_ context.Context, event OperatorAttentionEvent) (bool, error) {
+	if s.attentionErr != nil {
+		return false, s.attentionErr
+	}
+	if s.attentionEvents != nil {
+		for _, current := range *s.attentionEvents {
+			if current.EventKey == event.EventKey {
+				return false, nil
+			}
+		}
+		*s.attentionEvents = append(*s.attentionEvents, event)
+	}
+	return true, nil
 }
 func (s serviceStore) ListRuns(_ context.Context, _ string, before time.Time, beforeID string, limit int) ([]Run, error) {
 	if s.listCall != nil {
@@ -126,11 +148,11 @@ func (c *serviceController) RepairFindings(_ context.Context, _ string, _ []Find
 }
 
 func authorizeTestRun(run Run) Run {
-	raw, _ := json.Marshal(LocalRepository{AllowedOperatorLogins: []string{"operator"}})
-	run.RepositoryConfigJSON = string(raw)
 	if run.ProfileSnapshotVersion == 0 {
 		run.ProfileID, run.ProfileSnapshotVersion, run.ProfileDigest, run.ProfileSnapshotJSON = "repository-profile:owner/repo", 1, "profile", `{}`
 	}
+	raw, _ := json.Marshal(LocalRepository{CanonicalRepository: run.Repository, ProfileID: run.ProfileID, AllowedOperatorLogins: []string{"operator"}})
+	run.RepositoryConfigJSON = string(raw)
 	return run
 }
 
@@ -213,11 +235,15 @@ func TestQueryServiceSanitizesInspectionAndProjectsIdempotencyKey(t *testing.T) 
 func TestQueryServiceProjectsDeterministicSourceCheckoutOperatorAttention(t *testing.T) {
 	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateCompleted})
 	observed := time.Date(2026, 7, 14, 0, 0, 0, 0, time.UTC)
+	event, err := newOperatorAttentionEvent(operatorAttentionEventInput{ScopeID: run.ID, RunID: run.ID, EventType: OperatorAttentionSourceCheckoutSkipped, Profile: OperatorAttentionProfile{ID: "repository-profile:owner/repo", Name: "owner/repo"}, State: domain.StateCleaning, Severity: "warning", ReasonCode: string(SourceSyncReasonDirtySource), EvidenceDigest: strings.Repeat("a", 64), OccurredAt: observed, ObservedAt: observed})
+	if err != nil {
+		t.Fatal(err)
+	}
 	inspection := RunInspection{Run: run, Cleanup: []CleanupRecord{
 		{Kind: "source_checkout", Name: "/private/source", Status: "skipped_attention", ErrorClass: string(SourceSyncReasonWrongBranch), LastError: "token=not-for-output", UpdatedAt: observed},
 		{Kind: "source_checkout", Name: "/private/source", Status: "skipped_attention", ErrorClass: string(SourceSyncReasonDirtySource), LastError: "Authorization: Bearer not-for-output", UpdatedAt: observed},
 		{Kind: "worktree", Name: "/private/worktree", Status: "deleted", UpdatedAt: observed},
-	}}
+	}, OperatorAttention: []OperatorAttentionEvent{event}}
 	service := NewQueryService(serviceStore{run: run, inspection: inspection})
 	status, err := service.Status(context.Background(), QueryInput{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository})
 	if err != nil {
@@ -227,14 +253,14 @@ func TestQueryServiceProjectsDeterministicSourceCheckoutOperatorAttention(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(status.OperatorAttention, inspect.OperatorAttention) {
-		t.Fatalf("status/inspect attention mismatch: status=%+v inspect=%+v", status.OperatorAttention, inspect.OperatorAttention)
+	if !reflect.DeepEqual(status.OperatorAttentionEvents, inspect.OperatorAttentionEvents) {
+		t.Fatalf("status/inspect attention mismatch: status=%+v inspect=%+v", status.OperatorAttentionEvents, inspect.OperatorAttentionEvents)
 	}
-	if status.Run.State != domain.StateCompleted || len(status.OperatorAttention) != 1 {
-		t.Fatalf("state=%s attention=%+v", status.Run.State, status.OperatorAttention)
+	if status.Run.State != domain.StateCompleted || len(status.OperatorAttentionEvents) != 1 {
+		t.Fatalf("state=%s attention=%+v", status.Run.State, status.OperatorAttentionEvents)
 	}
-	attention := status.OperatorAttention[0]
-	if attention.Code != sourceCheckoutAttentionCode || attention.Component != sourceCheckoutAttentionComponent || attention.Severity != "warning" || attention.Status != "pending" || attention.ReasonCode != string(SourceSyncReasonDirtySource) || !attention.ObservedAt.Equal(observed) {
+	attention := status.OperatorAttentionEvents[0]
+	if attention.EventType != OperatorAttentionSourceCheckoutSkipped || attention.Severity != "warning" || attention.ReasonCode != string(SourceSyncReasonDirtySource) || !attention.ObservedAt.Equal(observed) {
 		t.Fatalf("attention=%+v", attention)
 	}
 	raw, _ := json.Marshal(status)
@@ -250,8 +276,8 @@ func TestQueryServiceSourceCheckoutAttentionUsesEmptyArrayAndGenericUnknownReaso
 	if err != nil {
 		t.Fatal(err)
 	}
-	if withoutAttention.OperatorAttention == nil || len(withoutAttention.OperatorAttention) != 0 {
-		t.Fatalf("missing empty operator attention array: %+v", withoutAttention.OperatorAttention)
+	if withoutAttention.OperatorAttentionEvents == nil || len(withoutAttention.OperatorAttentionEvents) != 0 {
+		t.Fatalf("missing empty operator attention array: %+v", withoutAttention.OperatorAttentionEvents)
 	}
 
 	inspection := RunInspection{Run: run, Cleanup: []CleanupRecord{{Kind: "source_checkout", Name: "/secret/checkout", Status: "skipped_attention", ErrorClass: "unexpected /secret/path token=not-for-output", UpdatedAt: time.Now().UTC()}}}
@@ -259,8 +285,8 @@ func TestQueryServiceSourceCheckoutAttentionUsesEmptyArrayAndGenericUnknownReaso
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(withUnknownReason.OperatorAttention) != 1 || withUnknownReason.OperatorAttention[0].ReasonCode != sourceCheckoutAttentionReason || withUnknownReason.Cleanup[0].ErrorClass != sourceCheckoutAttentionReason {
-		t.Fatalf("unknown source reason was not sanitized: attention=%+v cleanup=%+v", withUnknownReason.OperatorAttention, withUnknownReason.Cleanup)
+	if len(withUnknownReason.OperatorAttentionEvents) != 0 || withUnknownReason.Cleanup[0].ErrorClass != sourceCheckoutAttentionReason {
+		t.Fatalf("unknown source reason was not sanitized: attention=%+v cleanup=%+v", withUnknownReason.OperatorAttentionEvents, withUnknownReason.Cleanup)
 	}
 	raw, _ := json.Marshal(withUnknownReason)
 	if strings.Contains(string(raw), "/secret/") || strings.Contains(string(raw), "not-for-output") {

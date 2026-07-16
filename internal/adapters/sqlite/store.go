@@ -20,7 +20,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 22
+const schemaVersion = 23
 
 type Store struct{ db *sql.DB }
 
@@ -133,6 +133,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV21
 		case 22:
 			statements = migrationV22
+		case 23:
+			statements = migrationV23
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -143,6 +145,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 		if version == 18 {
 			if err := backfillAutomaticAdmissionLeaseExpiryTx(ctx, tx); err != nil {
+				return err
+			}
+		}
+		if version == 23 {
+			if err := migrateOperatorAttentionV23Tx(ctx, tx); err != nil {
 				return err
 			}
 		}
@@ -406,6 +413,81 @@ var migrationV22 = []string{
 	`CREATE TABLE merge_results (run_id TEXT PRIMARY KEY REFERENCES runs(run_id), pr_number INTEGER NOT NULL, pre_merge_head_sha TEXT NOT NULL, base_sha TEXT NOT NULL, merge_method TEXT NOT NULL CHECK(merge_method IN ('squash','external')), merge_sha TEXT NOT NULL, merged_at TEXT NOT NULL)`,
 	`INSERT INTO merge_results(run_id,pr_number,pre_merge_head_sha,base_sha,merge_method,merge_sha,merged_at) SELECT run_id,pr_number,pre_merge_head_sha,base_sha,merge_method,merge_sha,merged_at FROM merge_results_v22`,
 	`DROP TABLE merge_results_v22`,
+}
+
+// migrationV23 removes transport lifecycle state from the canonical event
+// table. Legacy payload and delivery fields remain immutable evidence while
+// the application reads only the versioned transport-neutral envelope.
+var migrationV23 = []string{
+	`ALTER TABLE operator_attention_outbox RENAME TO operator_attention_outbox_v22`,
+	`DROP INDEX operator_attention_outbox_projection`,
+	`DROP INDEX operator_attention_outbox_run`,
+	`CREATE TABLE operator_attention_outbox (
+		event_key TEXT PRIMARY KEY,
+		payload_digest TEXT NOT NULL,
+		schema_version INTEGER NOT NULL,
+		event_type TEXT NOT NULL,
+		run_id TEXT NOT NULL DEFAULT '',
+		linear_identifier TEXT NOT NULL DEFAULT '',
+		repository_profile_id TEXT NOT NULL,
+		repository_profile_name TEXT NOT NULL,
+		controller_state TEXT NOT NULL,
+		severity TEXT NOT NULL,
+		reason_code TEXT NOT NULL,
+		allowed_actions_json TEXT NOT NULL,
+		evidence_digest TEXT NOT NULL,
+		occurred_at TEXT NOT NULL,
+		observed_at TEXT NOT NULL,
+		legacy_payload_digest TEXT NOT NULL DEFAULT '',
+		legacy_delivery_status TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL
+	)`,
+	`CREATE INDEX operator_attention_outbox_projection ON operator_attention_outbox(occurred_at,event_key)`,
+	`CREATE INDEX operator_attention_outbox_run ON operator_attention_outbox(run_id,occurred_at,event_key)`,
+}
+
+func migrateOperatorAttentionV23Tx(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `SELECT event_key,payload_digest,event_type,run_id,linear_identifier,repository_profile_id,repository_profile_name,controller_state,severity,reason_code,evidence_digest,occurred_at,observed_at,delivery_status,created_at FROM operator_attention_outbox_v22 ORDER BY event_key`)
+	if err != nil {
+		return err
+	}
+	type legacyAttention struct {
+		event                                    application.OperatorAttentionEvent
+		legacyPayload, legacyDelivery, createdAt string
+	}
+	var events []legacyAttention
+	for rows.Next() {
+		var item legacyAttention
+		var occurredAt, observedAt string
+		if err := rows.Scan(&item.event.EventKey, &item.legacyPayload, &item.event.EventType, &item.event.RunID, &item.event.LinearIdentifier, &item.event.RepositoryProfileID, &item.event.RepositoryProfileName, &item.event.ControllerState, &item.event.Severity, &item.event.ReasonCode, &item.event.EvidenceDigest, &occurredAt, &observedAt, &item.legacyDelivery, &item.createdAt); err != nil {
+			rows.Close()
+			return err
+		}
+		item.event.SchemaVersion = application.OperatorAttentionLegacySchemaVersion
+		item.event.AllowedActions = []application.OperatorAttentionActionID{}
+		item.event.OccurredAt, item.event.ObservedAt = parseTime(occurredAt), parseTime(observedAt)
+		item.event.PayloadDigest = item.legacyPayload
+		if item.legacyDelivery != "pending_local" || legacyOperatorAttentionPayloadDigest(item.event, item.legacyDelivery) != item.legacyPayload || application.ValidateLegacyOperatorAttentionEvent(item.event) != nil {
+			rows.Close()
+			return errors.New("legacy operator attention outbox record is corrupt")
+		}
+		events = append(events, item)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, item := range events {
+		actions, err := json.Marshal(item.event.AllowedActions)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO operator_attention_outbox(event_key,payload_digest,schema_version,event_type,run_id,linear_identifier,repository_profile_id,repository_profile_name,controller_state,severity,reason_code,allowed_actions_json,evidence_digest,occurred_at,observed_at,legacy_payload_digest,legacy_delivery_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, item.event.EventKey, item.event.PayloadDigest, item.event.SchemaVersion, item.event.EventType, item.event.RunID, item.event.LinearIdentifier, item.event.RepositoryProfileID, item.event.RepositoryProfileName, item.event.ControllerState, item.event.Severity, item.event.ReasonCode, string(actions), item.event.EvidenceDigest, formatTime(item.event.OccurredAt), formatTime(item.event.ObservedAt), item.legacyPayload, item.legacyDelivery, item.createdAt)
+		if err != nil {
+			return err
+		}
+	}
+	_, err = tx.ExecContext(ctx, `DROP TABLE operator_attention_outbox_v22`)
+	return err
 }
 
 func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput) (application.Run, bool, error) {
@@ -2411,11 +2493,6 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 		inspection.Cleanup = append(inspection.Cleanup, v)
 	}
 	rows.Close()
-	attention, err := s.listOperatorAttention(ctx, id, 100)
-	if err != nil {
-		return inspection, err
-	}
-	inspection.OperatorAttention = attention
 	var installation application.GitHubInstallationMetadata
 	var tokenExpiry, installationObserved string
 	if err := s.db.QueryRowContext(ctx, `SELECT app_id,installation_id,repository_id,repository_node_id,repository_owner,repository_name,token_expires_at,permissions_digest,observed_at FROM github_installations WHERE run_id=? ORDER BY observation_id DESC LIMIT 1`, id).Scan(&installation.AppID, &installation.InstallationID, &installation.Repository.ID, &installation.Repository.NodeID, &installation.Repository.Owner, &installation.Repository.Name, &tokenExpiry, &installation.PermissionsDigest, &installationObserved); err == nil {

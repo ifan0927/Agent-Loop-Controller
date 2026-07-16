@@ -44,7 +44,8 @@ type linearCompletionStore interface {
 // ReconcileLinearCompletion performs exactly one bounded, read-only observation.
 // It deliberately does not use admission revalidation: a successful automation
 // changes Linear's source revision as part of the completion evidence.
-func (c *ProductionCoordinator) ReconcileLinearCompletion(ctx context.Context, command ProductionLinearCompletionCommand) (ProductionLinearCompletionResult, error) {
+func (c *ProductionCoordinator) ReconcileLinearCompletion(ctx context.Context, command ProductionLinearCompletionCommand) (_result ProductionLinearCompletionResult, _err error) {
+	defer c.publishManualInterventionOnReturn(ctx, command.RunID, &_err)
 	if command.RunID == "" || command.Repository == "" || command.ExpectedState == "" || command.IdempotencyKey == "" {
 		return ProductionLinearCompletionResult{}, serviceError(ErrorInvalidInput, "run, expected state, repository, and idempotency key are required", nil)
 	}

@@ -71,7 +71,8 @@ type pullRequestStore interface {
 // OpenPullRequest persists an immutable create intent before any GitHub write.
 // On restart, a stored PR is revalidated locally; otherwise the adapter first
 // searches for the exact ownership marker and digest before creating anything.
-func (c *ProductionCoordinator) OpenPullRequest(ctx context.Context, command ProductionOpenPullRequestCommand, validator ApprovalValidator, opener PullRequestOpener) (ProductionOpenPullRequestResult, error) {
+func (c *ProductionCoordinator) OpenPullRequest(ctx context.Context, command ProductionOpenPullRequestCommand, validator ApprovalValidator, opener PullRequestOpener) (_result ProductionOpenPullRequestResult, _err error) {
+	defer c.publishManualInterventionOnReturn(ctx, command.RunID, &_err)
 	if validator == nil || opener == nil {
 		return ProductionOpenPullRequestResult{}, serviceError(ErrorInvalidInput, "pull request validator and opener are required", nil)
 	}

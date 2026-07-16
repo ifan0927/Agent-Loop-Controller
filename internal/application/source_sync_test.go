@@ -12,12 +12,16 @@ import (
 
 type sourceSyncStore struct {
 	deliveryMemoryStore
-	upserts      []CleanupRecord
-	failUpsertAt int
-	attention    []OperatorAttentionEvent
+	upserts       []CleanupRecord
+	failUpsertAt  int
+	failAttention bool
+	attention     []OperatorAttentionEvent
 }
 
 func (s *sourceSyncStore) AppendOperatorAttention(_ context.Context, event OperatorAttentionEvent) (bool, error) {
+	if s.failAttention {
+		return false, errors.New("attention persistence unavailable")
+	}
 	for _, existing := range s.attention {
 		if existing.EventKey != event.EventKey {
 			continue
@@ -29,6 +33,16 @@ func (s *sourceSyncStore) AppendOperatorAttention(_ context.Context, event Opera
 	}
 	s.attention = append(s.attention, event)
 	return true, nil
+}
+
+func TestSyncSourceCheckoutAttentionPublicationFailureDoesNotAdvanceCleanup(t *testing.T) {
+	run, merge := sourceSyncFixture(t)
+	store := &sourceSyncStore{failAttention: true}
+	port := &recordingSourceSync{store: store, result: SourceSyncResult{Status: SourceSyncSkippedAttention, Outcome: SourceSyncNotApplied, Reason: SourceSyncReasonDirtySource, MergeSHA: merge.MergeSHA}}
+	err := SyncSourceCheckout(context.Background(), store, port, run, merge)
+	if err == nil || len(store.cleanup) != 1 || store.cleanup[0].Status != "skipped_attention" || len(store.attention) != 0 {
+		t.Fatalf("err=%v cleanup=%+v attention=%+v", err, store.cleanup, store.attention)
+	}
 }
 
 func (s *sourceSyncStore) UpsertCleanup(_ context.Context, value CleanupRecord) error {
@@ -109,7 +123,7 @@ func TestSyncSourceCheckoutRestartsIntentAndMapsAttentionAndRetryableResults(t *
 	if len(port.calls) != 1 || store.cleanup[0].Status != "skipped_attention" || store.cleanup[0].ErrorClass != string(SourceSyncReasonDirtySource) {
 		t.Fatalf("calls=%+v cleanup=%+v", port.calls, store.cleanup)
 	}
-	if len(store.attention) != 1 || store.attention[0].EventType != OperatorAttentionSourceCheckoutSkipped || store.attention[0].ReasonCode != string(SourceSyncReasonDirtySource) || store.attention[0].DeliveryStatus != OperatorAttentionDeliveryPendingLocal {
+	if len(store.attention) != 1 || store.attention[0].SchemaVersion != OperatorAttentionSchemaVersion || store.attention[0].EventType != OperatorAttentionSourceCheckoutSkipped || store.attention[0].ReasonCode != string(SourceSyncReasonDirtySource) || store.attention[0].AllowedActions == nil {
 		t.Fatalf("attention=%+v", store.attention)
 	}
 	if err := SyncSourceCheckout(context.Background(), store, port, run, merge); err != nil || len(port.calls) != 1 || len(store.attention) != 1 {

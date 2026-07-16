@@ -96,7 +96,8 @@ type mergeStore interface {
 // GitHub gates immediately before persisting intent and issuing a conditional
 // squash merge, then records observed GitHub state rather than trusting a write
 // response alone.
-func (c *ProductionCoordinator) MergePullRequest(ctx context.Context, command ProductionMergeCommand, validator ApprovalValidator, reader GitHubReadPort, merger SquashMerger) (ProductionMergeResult, error) {
+func (c *ProductionCoordinator) MergePullRequest(ctx context.Context, command ProductionMergeCommand, validator ApprovalValidator, reader GitHubReadPort, merger SquashMerger) (_result ProductionMergeResult, _err error) {
+	defer c.publishManualInterventionOnReturn(ctx, command.RunID, &_err)
 	if validator == nil || reader == nil || merger == nil {
 		return ProductionMergeResult{}, serviceError(ErrorInvalidInput, "merge validator, reader, and merger are required", nil)
 	}

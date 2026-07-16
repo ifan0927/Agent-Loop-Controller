@@ -149,6 +149,8 @@ type pushTestStore struct {
 	cleanup           []CleanupRecord
 	cleanupWrites     int
 	cleanupFailAt     int
+	attention         []OperatorAttentionEvent
+	attentionErr      error
 	requestErr        error
 	genericReadErr    error
 	manualTargetErr   error
@@ -191,8 +193,9 @@ func (s *pushTestStore) Transition(_ context.Context, _ string, from, to domain.
 	if s.run.State != from {
 		return errors.New("unexpected transition source")
 	}
-	s.run.State = to
-	s.transitions = append(s.transitions, Transition{From: from, To: to, Reason: reason, EvidenceReference: evidence, BoundHead: head})
+	now := time.Date(2026, 7, 16, 2, 0, 0, 0, time.UTC).Add(time.Duration(len(s.transitions)) * time.Second)
+	s.run.State, s.run.UpdatedAt = to, now
+	s.transitions = append(s.transitions, Transition{Sequence: int64(len(s.transitions) + 1), From: from, To: to, Reason: reason, EvidenceReference: evidence, BoundHead: head, CreatedAt: now})
 	return nil
 }
 func (s *pushTestStore) SetLastError(_ context.Context, _ string, value string) error {
@@ -225,6 +228,9 @@ func (s *pushTestStore) Inspect(context.Context, string) (RunInspection, error) 
 	}
 	if len(result.Cleanup) == 0 {
 		result.Cleanup = append([]CleanupRecord(nil), s.cleanup...)
+	}
+	if len(result.Timeline) == 0 {
+		result.Timeline = append([]Transition(nil), s.transitions...)
 	}
 	return result, nil
 }
@@ -438,6 +444,19 @@ func (s *pushTestStore) UpsertCleanup(_ context.Context, value CleanupRecord) er
 	return nil
 }
 
+func (s *pushTestStore) AppendOperatorAttention(_ context.Context, event OperatorAttentionEvent) (bool, error) {
+	if s.attentionErr != nil {
+		return false, s.attentionErr
+	}
+	for _, current := range s.attention {
+		if current.EventKey == event.EventKey {
+			return false, nil
+		}
+	}
+	s.attention = append(s.attention, event)
+	return true, nil
+}
+
 func (s *pushTestStore) UpsertAutomaticAdmissionCleanup(ctx context.Context, owner string, value CleanupRecord) error {
 	ok, err := s.RenewLease(ctx, value.RunID, owner, time.Now().UTC().Add(localLeaseTTL))
 	if err != nil {
@@ -509,13 +528,14 @@ func (p *pushPublisher) Push(_ context.Context, _ string, _ string, _ string, ex
 
 func newPushCoordinator(t *testing.T, state domain.State) (*ProductionCoordinator, *pushTestStore, Run) {
 	t.Helper()
-	repository := LocalRepository{CanonicalRepository: "owner/repo", SourcePath: "/owned/source", OriginPath: "/owned/origin", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
+	repository := LocalRepository{ProfileID: "repository-profile:owner/repo", CanonicalRepository: "owner/repo", SourcePath: "/owned/source", OriginPath: "/owned/origin", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
 	reader := &admissionReader{source: validLinearSource()}
 	snapshot, _, err := admitLinearTask(reader.source, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), RawIssueHash: snapshot.RawHash, Repository: snapshot.Task.Repository, RepositoryConfigJSON: mustJSON(t, repository), WorkingBranch: snapshot.Task.WorkingBranch, BaseBranch: "main", BaseSHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", NormalizedTaskJSON: mustJSON(t, snapshot.Task), TaskHash: snapshot.TaskHash, State: state, CandidateHead: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", WorktreePath: "/owned/worktree", ArtifactRoot: "/owned/artifacts"})
+	now := time.Date(2026, 7, 16, 1, 0, 0, 0, time.UTC)
+	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), RawIssueHash: snapshot.RawHash, Repository: snapshot.Task.Repository, RepositoryConfigJSON: mustJSON(t, repository), WorkingBranch: snapshot.Task.WorkingBranch, BaseBranch: "main", BaseSHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", NormalizedTaskJSON: mustJSON(t, snapshot.Task), TaskHash: snapshot.TaskHash, State: state, CandidateHead: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", WorktreePath: "/owned/worktree", ArtifactRoot: "/owned/artifacts", CreatedAt: now, UpdatedAt: now})
 	run.RepositoryConfigJSON = mustJSON(t, repository)
 	store := &pushTestStore{run: run}
 	branchEvidence := `{"source_path":"/owned/source","origin_path":"/owned/origin","path":"` + run.WorktreePath + `","branch":"` + run.WorkingBranch + `","base_branch":"` + run.BaseBranch + `","base_sha":"` + run.BaseSHA + `","nonce":"nonce"}`
@@ -1352,8 +1372,18 @@ func TestProductionPushRejectsDivergentRemoteSHA(t *testing.T) {
 	coordinator, store, run := newPushCoordinator(t, domain.StateApprovalReady)
 	publisher := &pushPublisher{remotes: []string{"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}
 	_, err := coordinator.Push(context.Background(), ProductionPushCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, &pushValidator{}, publisher)
-	if err == nil || publisher.pushes != 0 || store.run.State != domain.StateManualIntervention || store.side.Status != "failed" {
+	if err == nil || publisher.pushes != 0 || store.run.State != domain.StateManualIntervention || store.side.Status != "failed" || len(store.attention) != 1 || store.attention[0].EventType != OperatorAttentionManualIntervention {
 		t.Fatalf("err=%v pushes=%d state=%s side=%+v", err, publisher.pushes, store.run.State, store.side)
+	}
+}
+
+func TestProductionManualInterventionPublicationFailureDoesNotAdvanceState(t *testing.T) {
+	coordinator, store, run := newPushCoordinator(t, domain.StateApprovalReady)
+	store.attentionErr = errors.New("attention persistence unavailable")
+	publisher := &pushPublisher{remotes: []string{"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}
+	_, err := coordinator.Push(context.Background(), ProductionPushCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, &pushValidator{}, publisher)
+	if err == nil || !strings.Contains(err.Error(), "attention publication failed") || store.run.State != domain.StateManualIntervention || len(store.attention) != 0 {
+		t.Fatalf("err=%v state=%s attention=%+v", err, store.run.State, store.attention)
 	}
 }
 

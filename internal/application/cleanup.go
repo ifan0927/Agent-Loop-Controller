@@ -24,11 +24,16 @@ const sourceCheckoutCleanupIdentity = "configured_source_checkout"
 
 var errSourceSyncRetryable = errors.New("source checkout synchronization is retryable")
 
+type cleanupAttentionStore interface {
+	DeliveryStore
+	OperatorAttentionPublisher
+}
+
 // SyncSourceCheckout persists a source-sync intent before the narrow Git port
 // is invoked. Source checkout state is deliberately separate from owned
 // resources: it is an operator checkout, never a controller-owned deletion
 // target.
-func SyncSourceCheckout(ctx context.Context, store DeliveryStore, port SourceSyncPort, run Run, merge MergeRecord) error {
+func SyncSourceCheckout(ctx context.Context, store cleanupAttentionStore, port SourceSyncPort, run Run, merge MergeRecord) error {
 	if port == nil {
 		return errors.New("source synchronization port is required")
 	}
@@ -81,14 +86,7 @@ func SyncSourceCheckout(ctx context.Context, store DeliveryStore, port SourceSyn
 	return nil
 }
 
-func persistSourceCheckoutAttention(ctx context.Context, store DeliveryStore, run Run, merge MergeRecord, reason string, observedAt time.Time) error {
-	if run.ProfileID == "" {
-		return nil
-	}
-	outbox, ok := store.(OperatorAttentionAppender)
-	if !ok {
-		return nil
-	}
+func persistSourceCheckoutAttention(ctx context.Context, store cleanupAttentionStore, run Run, merge MergeRecord, reason string, observedAt time.Time) error {
 	if observedAt.IsZero() {
 		progress, err := store.CleanupProgress(ctx, run.ID)
 		if err != nil {
@@ -109,7 +107,7 @@ func persistSourceCheckoutAttention(ctx context.Context, store DeliveryStore, ru
 	if err != nil {
 		return err
 	}
-	_, err = outbox.AppendOperatorAttention(ctx, event)
+	_, err = store.AppendOperatorAttention(ctx, event)
 	return err
 }
 
@@ -384,7 +382,8 @@ type ProductionCleanupResult struct {
 // Cleanup performs no Linear re-read. Linear completion is the preceding,
 // separately persisted gate and its expected automation revision would make a
 // normal admission revalidation reject a legitimate completed run.
-func (c *ProductionCoordinator) Cleanup(ctx context.Context, command ProductionCleanupCommand, port CleanupPort, sourceSync SourceSyncPort) (ProductionCleanupResult, error) {
+func (c *ProductionCoordinator) Cleanup(ctx context.Context, command ProductionCleanupCommand, port CleanupPort, sourceSync SourceSyncPort) (_result ProductionCleanupResult, _err error) {
+	defer c.publishManualInterventionOnReturn(ctx, command.RunID, &_err)
 	if port == nil || sourceSync == nil || command.RunID == "" || command.Repository == "" || command.ExpectedState == "" || command.IdempotencyKey == "" {
 		return ProductionCleanupResult{}, serviceError(ErrorInvalidInput, "cleanup command and adapter are required", nil)
 	}
@@ -401,9 +400,9 @@ func (c *ProductionCoordinator) Cleanup(ctx context.Context, command ProductionC
 	if action, reason := productionNextAction(run.State); action != ProductionCleanup {
 		return ProductionCleanupResult{Action: action, Run: projectRunResult(run)}, serviceError(ErrorConflict, reason, nil)
 	}
-	delivery, ok := c.store.(DeliveryStore)
+	delivery, ok := c.store.(cleanupAttentionStore)
 	if !ok {
-		return ProductionCleanupResult{}, serviceError(ErrorInternal, "configured store cannot persist cleanup evidence", nil)
+		return ProductionCleanupResult{}, serviceError(ErrorInternal, "configured store cannot persist cleanup and attention evidence", nil)
 	}
 	inspection, err := c.store.Inspect(ctx, run.ID)
 	if err != nil {

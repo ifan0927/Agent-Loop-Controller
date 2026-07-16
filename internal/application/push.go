@@ -55,7 +55,8 @@ type pushStore interface {
 // Push publishes only a revalidated, exact-HEAD candidate. Its durable intent
 // is committed before Git is invoked; retries reconcile the remote before any
 // new push and therefore never overwrite a divergent branch.
-func (c *ProductionCoordinator) Push(ctx context.Context, command ProductionPushCommand, validator ApprovalValidator, publisher BranchPublisher) (ProductionPushResult, error) {
+func (c *ProductionCoordinator) Push(ctx context.Context, command ProductionPushCommand, validator ApprovalValidator, publisher BranchPublisher) (_result ProductionPushResult, _err error) {
+	defer c.publishManualInterventionOnReturn(ctx, command.RunID, &_err)
 	if validator == nil || publisher == nil {
 		return ProductionPushResult{}, serviceError(ErrorInvalidInput, "push validator and publisher are required", nil)
 	}

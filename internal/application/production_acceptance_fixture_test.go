@@ -304,7 +304,7 @@ func TestOfflineAcceptanceProductionRepairRebindsFindingsVerificationAndReviewTo
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	driver, err := application.NewProductionDriver(stack.coordinator, stack.store, application.ProductionDriverPorts{}, application.ProductionDriverPolicy{PollInterval: time.Second, MaxImmediateAction: 1}, func(context.Context, time.Duration) error {
+	driver, err := application.NewProductionDriver(stack.coordinator, stack.store, stack.store, stack.store, application.ProductionDriverPorts{}, application.ProductionDriverPolicy{PollInterval: time.Second, MaxImmediateAction: 1}, func(context.Context, time.Duration) error {
 		cancel()
 		return context.Canceled
 	})

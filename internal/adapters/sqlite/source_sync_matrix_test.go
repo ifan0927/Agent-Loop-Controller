@@ -410,15 +410,15 @@ func (f *sourceSyncMatrixFixture) assertProjection(t *testing.T, run application
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(status.OperatorAttention, inspect.OperatorAttention) {
-		t.Fatalf("status/inspect attention mismatch: status=%+v inspect=%+v", status.OperatorAttention, inspect.OperatorAttention)
+	if !reflect.DeepEqual(status.OperatorAttentionEvents, inspect.OperatorAttentionEvents) {
+		t.Fatalf("status/inspect attention mismatch: status=%+v inspect=%+v", status.OperatorAttentionEvents, inspect.OperatorAttentionEvents)
 	}
 	if reason == nil {
-		if status.OperatorAttention == nil || len(status.OperatorAttention) != 0 {
-			t.Fatalf("unexpected attention=%+v", status.OperatorAttention)
+		if status.OperatorAttentionEvents == nil || len(status.OperatorAttentionEvents) != 0 {
+			t.Fatalf("unexpected attention=%+v", status.OperatorAttentionEvents)
 		}
-	} else if len(status.OperatorAttention) != 1 || status.OperatorAttention[0].ReasonCode != *reason || status.OperatorAttention[0].Code != "source_checkout_sync_required" {
-		t.Fatalf("attention=%+v want=%s", status.OperatorAttention, *reason)
+	} else if len(status.OperatorAttentionEvents) != 1 || status.OperatorAttentionEvents[0].ReasonCode != *reason || status.OperatorAttentionEvents[0].EventType != application.OperatorAttentionSourceCheckoutSkipped {
+		t.Fatalf("attention=%+v want=%s", status.OperatorAttentionEvents, *reason)
 	}
 	raw, err := json.Marshal(inspect)
 	if err != nil {

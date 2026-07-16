@@ -293,6 +293,19 @@ func (s *dispatchStore) GetRun(_ context.Context, runID string) (Run, error) {
 	return s.run, nil
 }
 
+func (s *dispatchStore) Inspect(_ context.Context, runID string) (RunInspection, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.run.ID != runID {
+		return RunInspection{}, ErrRunNotFound
+	}
+	inspection := RunInspection{Run: s.run}
+	if s.run.State == domain.StateManualIntervention {
+		inspection.Timeline = []Transition{{Sequence: 2, From: domain.StateReceived, To: domain.StateManualIntervention, Reason: "operator decision required", EvidenceReference: "linear_issue_start", CreatedAt: s.run.UpdatedAt}}
+	}
+	return inspection, nil
+}
+
 func (s *dispatchStore) GetRunByIdempotency(_ context.Context, key string) (Run, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -345,21 +358,23 @@ func (s *dispatchStore) Transition(_ context.Context, runID string, from, to dom
 	if s.run.ID != runID || s.run.State != from {
 		return errors.New("state transition conflict")
 	}
-	s.run.State = to
+	s.run.State, s.run.UpdatedAt = to, s.now
 	return nil
 }
 
 func (s *dispatchStore) AppendOperatorAttention(_ context.Context, event OperatorAttentionEvent) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for _, current := range s.attention {
+		if current.EventKey == event.EventKey {
+			if current.PayloadDigest != event.PayloadDigest {
+				return false, FormatOperatorAttentionConflict(event)
+			}
+			return false, nil
+		}
+	}
 	s.attention = append(s.attention, event)
 	return true, nil
-}
-
-func (s *dispatchStore) ListOperatorAttention(context.Context, int) ([]OperatorAttentionEvent, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]OperatorAttentionEvent(nil), s.attention...), nil
 }
 
 func (s *dispatchStore) GetRetrySchedule(_ context.Context, runID, phase string) (RetrySchedule, bool, error) {
@@ -668,14 +683,21 @@ func TestLinearTodoDispatcherAdoptsReservedRunOnRestartWithoutScanning(t *testin
 }
 
 func TestLinearTodoDispatcherStopsForManualAndDriverConflict(t *testing.T) {
-	for _, state := range []domain.State{domain.StateManualIntervention, domain.StateAwaitingHumanDecision, domain.StateAwaitingHumanApproval} {
-		t.Run(string(state), func(t *testing.T) {
+	for _, test := range []struct {
+		state      domain.State
+		outcome    string
+		attentions int
+	}{{domain.StateManualIntervention, LinearTodoDispatchAttention, 1}, {domain.StateAwaitingHumanDecision, LinearTodoDispatchWaiting, 0}, {domain.StateAwaitingHumanApproval, LinearTodoDispatchWaiting, 0}} {
+		t.Run(string(test.state), func(t *testing.T) {
 			candidate := dispatchCandidate("manual", "IFAN-14", 1)
 			dispatcher, store, scanner, _, _, driver := newDispatchLab(t, candidate)
-			store.run = authorizeDispatchRun(Run{ID: "run-manual", IssueID: candidate.Identifier, IdempotencyKey: "manual-key", Repository: "owner/repo", State: state})
+			store.run = authorizeDispatchRun(Run{ID: "run-manual", IssueID: candidate.Identifier, IdempotencyKey: "manual-key", Repository: "owner/repo", State: test.state})
 			result, err := dispatcher.Dispatch(context.Background())
-			if err != nil || result.Outcome != LinearTodoDispatchAttention || scanner.calls != 0 || len(driver.calls) != 0 || len(store.attention) != 1 {
+			if err != nil || result.Outcome != test.outcome || scanner.calls != 0 || len(driver.calls) != 0 || len(store.attention) != test.attentions {
 				t.Fatalf("result=%+v scanner=%d driver=%+v attention=%+v err=%v", result, scanner.calls, driver.calls, store.attention, err)
+			}
+			if test.state == domain.StateManualIntervention && store.attention[0].EventType != OperatorAttentionManualIntervention {
+				t.Fatalf("attention=%+v", store.attention)
 			}
 		})
 	}
@@ -776,7 +798,7 @@ func TestLinearTodoDispatcherMutationAndPostStartConflictsStopWithoutAnotherCand
 		dispatcher, store, _, _, starter, driver := newDispatchLab(t, first, second)
 		starter.err = &LinearIssueStartMutationError{Class: "graphql"}
 		result, err := dispatcher.Dispatch(context.Background())
-		if err != nil || result.Outcome != LinearTodoDispatchAttention || store.reserveCalls != 1 || store.run.IssueID != first.Identifier || len(starter.calls) != 1 || len(driver.calls) != 0 || len(store.attention) != 1 || store.attention[0].EventType != OperatorAttentionRetry || store.journal.Status != "manual_intervention" {
+		if err != nil || result.Outcome != LinearTodoDispatchAttention || store.reserveCalls != 1 || store.run.IssueID != first.Identifier || len(starter.calls) != 1 || len(driver.calls) != 0 || len(store.attention) != 1 || store.attention[0].EventType != OperatorAttentionManualIntervention || store.journal.Status != "manual_intervention" {
 			t.Fatalf("result=%+v reserve=%d run=%+v starter=%+v driver=%+v journal=%+v attention=%+v err=%v", result, store.reserveCalls, store.run, starter.calls, driver.calls, store.journal, store.attention, err)
 		}
 	})
@@ -926,5 +948,9 @@ func authorizeDispatchRun(run Run) Run {
 	repository, _ := json.Marshal(LocalRepository{CanonicalRepository: run.Repository, ProfileID: "profile-owner-repo", AllowedOperatorLogins: []string{"operator"}})
 	run.RepositoryConfigJSON = string(repository)
 	run.ProfileID = "profile-owner-repo"
+	if run.UpdatedAt.IsZero() {
+		run.CreatedAt = time.Date(2026, 7, 15, 0, 0, 0, 0, time.UTC)
+		run.UpdatedAt = run.CreatedAt
+	}
 	return run
 }

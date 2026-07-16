@@ -9,9 +9,35 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-type driverRunReader struct{ run Run }
+type driverRunReader struct {
+	run       Run
+	attention []OperatorAttentionEvent
+	appendErr error
+}
 
 func (r *driverRunReader) GetRun(context.Context, string) (Run, error) { return r.run, nil }
+func (r *driverRunReader) Inspect(context.Context, string) (RunInspection, error) {
+	inspection := RunInspection{Run: r.run}
+	if r.run.State == domain.StateManualIntervention {
+		inspection.Timeline = []Transition{{Sequence: 7, From: domain.StateMerging, To: domain.StateManualIntervention, Reason: "authority conflict", EvidenceReference: "controller_evidence", BoundHead: r.run.CandidateHead, CreatedAt: time.Date(2026, 7, 16, 1, 0, 0, 0, time.UTC)}}
+	}
+	return inspection, nil
+}
+func (r *driverRunReader) AppendOperatorAttention(_ context.Context, event OperatorAttentionEvent) (bool, error) {
+	if r.appendErr != nil {
+		return false, r.appendErr
+	}
+	for _, current := range r.attention {
+		if current.EventKey == event.EventKey {
+			if current.PayloadDigest != event.PayloadDigest {
+				return false, FormatOperatorAttentionConflict(event)
+			}
+			return false, nil
+		}
+	}
+	r.attention = append(r.attention, event)
+	return true, nil
+}
 
 type driverCoordinator struct {
 	runs            *driverRunReader
@@ -120,12 +146,13 @@ func (driverSourceSyncPort) Sync(context.Context, SourceSyncRequest) (SourceSync
 }
 
 func driverRun(state domain.State) Run {
-	return authorizeTestRun(Run{ID: "run", Repository: "owner/repo", IdempotencyKey: "key", State: state})
+	now := time.Date(2026, 7, 16, 1, 0, 0, 0, time.UTC)
+	return authorizeTestRun(Run{ID: "run", Repository: "owner/repo", IdempotencyKey: "key", State: state, CreatedAt: now, UpdatedAt: now})
 }
 
 func newDriverForTest(t *testing.T, reader *driverRunReader, coordinator *driverCoordinator, wait ProductionWait) *ProductionDriver {
 	t.Helper()
-	driver, err := NewProductionDriver(coordinator, reader, ProductionDriverPorts{
+	driver, err := NewProductionDriver(coordinator, reader, reader, reader, ProductionDriverPorts{
 		GitHubReader:      driverGitHubReader{},
 		ApprovalValidator: driverApprovalValidator{},
 		SquashMerger:      driverMerger{},
@@ -224,7 +251,7 @@ func TestProductionDriverDispatchesPushAndPullRequestPortsInOrder(t *testing.T) 
 	}
 	publisher := &driverBranchPublisher{}
 	opener := &driverPullRequestOpener{}
-	driver, err := NewProductionDriver(coordinator, reader, ProductionDriverPorts{
+	driver, err := NewProductionDriver(coordinator, reader, reader, reader, ProductionDriverPorts{
 		GitHubReader:      driverGitHubReader{},
 		ApprovalValidator: driverApprovalValidator{},
 		BranchPublisher:   publisher,
@@ -249,6 +276,9 @@ func TestProductionDriverDispatchesPushAndPullRequestPortsInOrder(t *testing.T) 
 	}
 	if coordinator.branchPublisher != publisher || coordinator.pullRequestOpen != opener {
 		t.Fatalf("ports were not dispatched: publisher=%T opener=%T", coordinator.branchPublisher, coordinator.pullRequestOpen)
+	}
+	if len(reader.attention) != 1 || reader.attention[0].EventType != OperatorAttentionManualIntervention {
+		t.Fatalf("attention=%+v", reader.attention)
 	}
 }
 
@@ -295,8 +325,28 @@ func TestProductionDriverReturnsDurableManualStopAfterConflict(t *testing.T) {
 	})
 
 	result, err := driver.Drive(context.Background(), driverCommand())
-	if err != nil || result.Run.State != domain.StateManualIntervention || result.Action != ProductionStop || result.ActionsRun != 1 {
+	if err != nil || result.Run.State != domain.StateManualIntervention || result.Action != ProductionStop || result.ActionsRun != 1 || len(reader.attention) != 1 {
 		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+func TestProductionDriverManualStopPublicationIsIdempotentAndRequired(t *testing.T) {
+	reader := &driverRunReader{run: driverRun(domain.StateManualIntervention)}
+	coordinator := &driverCoordinator{runs: reader}
+	driver := newDriverForTest(t, reader, coordinator, nil)
+	for attempt := 0; attempt < 2; attempt++ {
+		result, err := driver.Drive(context.Background(), driverCommand())
+		if err != nil || result.Run.State != domain.StateManualIntervention {
+			t.Fatalf("attempt=%d result=%+v err=%v", attempt, result, err)
+		}
+	}
+	if len(reader.attention) != 1 || reader.attention[0].EventType != OperatorAttentionManualIntervention {
+		t.Fatalf("attention=%+v", reader.attention)
+	}
+
+	reader.attention, reader.appendErr = nil, errors.New("publisher unavailable")
+	if _, err := driver.Drive(context.Background(), driverCommand()); err == nil || reader.run.State != domain.StateManualIntervention {
+		t.Fatalf("state=%s err=%v", reader.run.State, err)
 	}
 }
 
@@ -337,7 +387,7 @@ func TestProductionDriverRequiresPersistedRequesterAuthorization(t *testing.T) {
 func TestNewProductionDriverRejectsBusyLoopPolicy(t *testing.T) {
 	reader := &driverRunReader{run: driverRun(domain.StateCompleted)}
 	coordinator := &driverCoordinator{runs: reader}
-	_, err := NewProductionDriver(coordinator, reader, ProductionDriverPorts{}, ProductionDriverPolicy{MaxImmediateAction: 1}, nil)
+	_, err := NewProductionDriver(coordinator, reader, reader, reader, ProductionDriverPorts{}, ProductionDriverPolicy{MaxImmediateAction: 1}, nil)
 	if err == nil {
 		t.Fatal("expected non-positive poll interval to be rejected")
 	}
@@ -349,7 +399,7 @@ func TestProductionDriverWaitsAfterImmediateActionLimit(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	waits := 0
-	driver, err := NewProductionDriver(coordinator, reader, ProductionDriverPorts{}, ProductionDriverPolicy{PollInterval: time.Second, MaxImmediateAction: 1}, func(context.Context, time.Duration) error {
+	driver, err := NewProductionDriver(coordinator, reader, reader, reader, ProductionDriverPorts{}, ProductionDriverPolicy{PollInterval: time.Second, MaxImmediateAction: 1}, func(context.Context, time.Duration) error {
 		waits++
 		cancel()
 		return context.Canceled

@@ -88,8 +88,8 @@ func TestOfflineAcceptanceWorkerRestartPreservesRetryAndStopsAtDurableAttention(
 	if schedule.RunID != runs[0].ID || schedule.AttemptCount != 2 || schedule.Status != application.RetryScheduleAttention || schedule.ReasonCode != application.RetryReasonBudgetExhausted || schedule.FailureClass != application.RetryFailureProcessStart || !schedule.AttentionAt.After(schedule.CreatedAt) || !schedule.NextEligibleAt.IsZero() {
 		t.Fatalf("durable attention=%+v", schedule)
 	}
-	inspection, err := store.Inspect(ctx, runs[0].ID)
-	if err != nil || len(inspection.OperatorAttention) != 1 || len(inspection.RetrySchedules) != 1 || inspection.RetrySchedules[0].AttemptCount != 2 || inspection.Run.State != domain.StateExecuting {
+	inspection, err := application.NewQueryService(store).Inspect(ctx, application.QueryInput{Requester: application.Requester{ID: "operator", Kind: "github_login"}, RunID: runs[0].ID, Repository: runs[0].Repository})
+	if err != nil || len(inspection.OperatorAttentionEvents) != 1 || len(inspection.RetrySchedules) != 1 || inspection.RetrySchedules[0].AttemptCount != 2 || inspection.Run.State != domain.StateExecuting {
 		t.Fatalf("restart evidence=%+v err=%v", inspection, err)
 	}
 	journal, found, err := store.GetLinearTodoAdmissionJournal(ctx, runs[0].ID)

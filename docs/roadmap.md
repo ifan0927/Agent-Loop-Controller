@@ -71,7 +71,8 @@ This milestone is recorded by the closed
 - Disabled-by-default priority-only Linear Todo admission.
 - Singleton scheduling lease, reservation/mutation journal, one-active-run
   policy, durable retry schedule, worker, and macOS LaunchAgent controls.
-- Sanitized local operator-attention outbox and queue-decision projection.
+- Sanitized transport-neutral operator-attention events and queue-decision
+  projection.
 - Trusted I-Fan inline review feedback lifecycle, same-session repair, fresh
   review, idempotent GitHub App reply, and conversation-resolution wait.
 - Exact merge-SHA source checkout synchronization and partial cleanup recovery.
@@ -121,9 +122,9 @@ not expose arbitrary state mutation.
 
 ### Planned: notification and operator interface
 
-Deliver operator-attention and status notifications beyond the current local
-outbox. The transport must be idempotent, sanitized, and subordinate to SQLite;
-delivery acknowledgement must not become workflow authority.
+Deliver the current versioned operator-attention events beyond the SQLite
+adapter. The transport must remain idempotent, sanitized, and subordinate to
+controller state; delivery acknowledgement must not become workflow authority.
 
 ### Planned: Hermes application integration
 

@@ -56,6 +56,12 @@ type ProductionCoordinator struct {
 	controller LocalRunController
 	commands   CommandService
 	store      RunStore
+	publisher  OperatorAttentionPublisher
+}
+
+type productionStore interface {
+	RunStore
+	OperatorAttentionPublisher
 }
 
 type findingRepairController interface {
@@ -66,14 +72,15 @@ type freshReviewFindingHandoff interface {
 	HandoffFreshReviewFindings(context.Context, string) (Run, error)
 }
 
-func NewProductionCoordinator(admission *LinearAdmissionService, controller LocalRunController, store RunStore) (*ProductionCoordinator, error) {
+func NewProductionCoordinator(admission *LinearAdmissionService, controller LocalRunController, store productionStore) (*ProductionCoordinator, error) {
 	if admission == nil || controller == nil || store == nil {
 		return nil, errors.New("production coordinator dependencies are required")
 	}
-	return &ProductionCoordinator{admission: admission, controller: controller, commands: NewCommandService(controller, store), store: store}, nil
+	return &ProductionCoordinator{admission: admission, controller: controller, commands: NewCommandService(controller, store), store: store, publisher: store}, nil
 }
 
-func (c *ProductionCoordinator) Continue(ctx context.Context, command ProductionContinueCommand) (ProductionResult, error) {
+func (c *ProductionCoordinator) Continue(ctx context.Context, command ProductionContinueCommand) (_result ProductionResult, _err error) {
+	defer c.publishManualInterventionOnReturn(ctx, command.RunID, &_err)
 	var cancelAction context.CancelFunc = func() {}
 	defer func() { cancelAction() }()
 	if command.RunID != "" {
@@ -155,7 +162,8 @@ func (c *ProductionCoordinator) Continue(ctx context.Context, command Production
 	return ProductionResult{Action: next, Run: result.Run, Reason: reason}, nil
 }
 
-func (c *ProductionCoordinator) ReconcileGitHub(ctx context.Context, command ProductionReconcileCommand, reader GitHubReadPort) (ProductionResult, error) {
+func (c *ProductionCoordinator) ReconcileGitHub(ctx context.Context, command ProductionReconcileCommand, reader GitHubReadPort) (_result ProductionResult, _err error) {
+	defer c.publishManualInterventionOnReturn(ctx, command.RunID, &_err)
 	run, linearCompleted, err := c.admission.RevalidateForGitHubReconcile(ctx, LinearRevalidateCommand{Requester: command.Requester, RunID: command.RunID, Repository: command.Repository, ExpectedState: command.ExpectedState, IdempotencyKey: command.IdempotencyKey})
 	if err != nil {
 		return ProductionResult{}, err
@@ -184,6 +192,27 @@ func (c *ProductionCoordinator) ReconcileGitHub(ctx context.Context, command Pro
 		reason = result.Reason
 	}
 	return ProductionResult{Action: next, Run: projectRunResult(run), Head: result.Head, Reason: reason}, nil
+}
+
+func (c *ProductionCoordinator) publishManualInterventionOnReturn(ctx context.Context, runID string, resultErr *error) {
+	if c == nil || c.store == nil || c.publisher == nil || runID == "" {
+		return
+	}
+	run, err := c.store.GetRun(ctx, runID)
+	if err != nil {
+		*resultErr = errors.Join(*resultErr, classifyServiceError(err))
+		return
+	}
+	if run.State != domain.StateManualIntervention {
+		return
+	}
+	inspection, err := c.store.Inspect(ctx, run.ID)
+	if err == nil {
+		err = publishManualInterventionAttention(ctx, run, inspection, c.publisher)
+	}
+	if err != nil {
+		*resultErr = errors.Join(*resultErr, serviceError(ErrorInternal, "manual intervention attention publication failed", err))
+	}
 }
 
 func productionNextAction(state domain.State) (ProductionAction, string) {

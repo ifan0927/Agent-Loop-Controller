@@ -1113,7 +1113,7 @@ func TestProductionDriverRoutesFreshReviewFindingsIntoBoundedSameSessionRepair(t
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	driver, err := application.NewProductionDriver(coordinator, store, application.ProductionDriverPorts{}, application.ProductionDriverPolicy{PollInterval: time.Second, MaxImmediateAction: 2}, func(context.Context, time.Duration) error {
+	driver, err := application.NewProductionDriver(coordinator, store, store, store, application.ProductionDriverPorts{}, application.ProductionDriverPolicy{PollInterval: time.Second, MaxImmediateAction: 2}, func(context.Context, time.Duration) error {
 		cancel()
 		return context.Canceled
 	})

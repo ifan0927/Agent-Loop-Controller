@@ -88,7 +88,7 @@ func TestLinearTodoDispatcherUsesPersistedStateAfterInitialStartFailure(t *testi
 	}
 }
 
-func TestLinearTodoDispatcherStopsRetryForTerminalRun(t *testing.T) {
+func TestLinearTodoDispatcherDoesNotEmitAttentionForSuccessfulTerminalRun(t *testing.T) {
 	dispatcher, store, _, _, _, _ := newDispatchLab(t)
 	run := authorizeDispatchRun(Run{ID: "run-terminal-retry", IssueID: "IFAN-50", IdempotencyKey: "terminal-key", Repository: "owner/repo", State: domain.StateCompleted})
 	store.run = run
@@ -97,7 +97,7 @@ func TestLinearTodoDispatcherStopsRetryForTerminalRun(t *testing.T) {
 	store.retrySchedules = []RetrySchedule{{RunID: run.ID, Phase: AutomaticRetryPhaseForRun(run), ControllerState: string(run.State), AttemptCount: 1, MaxAttempts: 2, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: RetryFailureUnavailable, ReasonCode: RetryReasonUnavailable, Status: RetryScheduleScheduled, NextEligibleAt: now.Add(time.Minute), CreatedAt: now, UpdatedAt: now}}
 
 	result, err := dispatcher.Dispatch(context.Background())
-	if err != nil || result.Outcome != LinearTodoDispatchAttention || result.Retry == nil || result.Retry.Status != RetryScheduleAttention || result.Retry.ReasonCode != RetryReasonTerminal {
+	if err != nil || result.Outcome != LinearTodoDispatchNoCandidate || result.Retry != nil || len(store.attention) != 0 {
 		t.Fatalf("result=%+v schedule=%+v err=%v", result, store.retrySchedules, err)
 	}
 }

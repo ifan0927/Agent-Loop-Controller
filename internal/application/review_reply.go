@@ -94,7 +94,8 @@ type ReviewReplyCompletion struct {
 
 // ReplyReviewFeedback performs at most one root-comment action. It always
 // re-reads remote replies before posting and persists intent before that post.
-func (c *ProductionCoordinator) ReplyReviewFeedback(ctx context.Context, command ProductionReplyCommand, validator ApprovalValidator, reader GitHubReadPort, replies ReviewCommentReplyPort) (ProductionReplyResult, error) {
+func (c *ProductionCoordinator) ReplyReviewFeedback(ctx context.Context, command ProductionReplyCommand, validator ApprovalValidator, reader GitHubReadPort, replies ReviewCommentReplyPort) (_result ProductionReplyResult, _err error) {
+	defer c.publishManualInterventionOnReturn(ctx, command.RunID, &_err)
 	if validator == nil || reader == nil || replies == nil {
 		return ProductionReplyResult{}, serviceError(ErrorInvalidInput, "approval validator, GitHub reader, and review reply port are required", nil)
 	}

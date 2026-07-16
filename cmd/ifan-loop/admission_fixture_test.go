@@ -83,7 +83,7 @@ waitForDriver:
 			break waitForDriver
 		case result := <-results:
 			if loserObserved || result.err != nil || result.result.LastOutcome != application.LinearTodoDispatchAttention || result.result.Stopped != "once" {
-				attention, _ := store.ListOperatorAttention(context.Background(), 10)
+				attention, _ := store.ListOperatorAttention(context.Background(), application.OperatorAttentionQueryInput{Limit: 10})
 				reasons := make([]string, 0, len(attention))
 				for _, event := range attention {
 					reasons = append(reasons, event.EventType+":"+event.ReasonCode)
@@ -144,7 +144,7 @@ waitForDriver:
 	if err != nil || !found || journal.RunID != run.ID || journal.IssueUUID != candidate.IssueID || journal.Status != "started" {
 		t.Fatalf("journal=%+v found=%t err=%v", journal, found, err)
 	}
-	attention, err := store.ListOperatorAttention(ctx, 10)
+	attention, err := store.ListOperatorAttention(ctx, application.OperatorAttentionQueryInput{Limit: 10})
 	if err != nil || len(attention) != 1 || attention[0].ReasonCode != "lease_conflict" {
 		t.Fatalf("attention=%+v err=%v", attention, err)
 	}
