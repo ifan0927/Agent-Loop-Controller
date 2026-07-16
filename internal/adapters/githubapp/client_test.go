@@ -17,6 +17,10 @@ import (
 	"time"
 )
 
+type adjustableClock struct{ value time.Time }
+
+func (c *adjustableClock) Now() time.Time { return c.value }
+
 func TestVersionedFixtureScenarioIndex(t *testing.T) {
 	raw, err := os.ReadFile("testdata/v1/scenarios.json")
 	if err != nil {
@@ -162,6 +166,29 @@ func replayAuthScenario(t *testing.T, name string) {
 	}
 	if err != nil || mints.Load() != 2 || reads.Load() != 2 {
 		t.Fatalf("single refresh err=%v mints=%d reads=%d", err, mints.Load(), reads.Load())
+	}
+}
+
+func TestInstallationTokenRefreshContinuesBeyondSevenDays(t *testing.T) {
+	_, key := testKey(t)
+	clock := &adjustableClock{value: time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC)}
+	var mints atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/app/installations/2/access_tokens", func(w http.ResponseWriter, _ *http.Request) {
+		n := mints.Add(1)
+		fmt.Fprintf(w, `{"token":"token-%d","expires_at":"%s","permissions":{"metadata":"read","contents":"read","pull_requests":"read","checks":"read","statuses":"read","administration":"read"},"repositories":[{"id":99,"name":"repo","owner":{"login":"owner"}}]}`, n, clock.Now().Add(time.Hour).Format(time.RFC3339))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	client := &Client{cfg: Config{APIBaseURL: server.URL, AppID: 1, InstallationID: 2, RepositoryOwner: "owner", RepositoryName: "repo", RepositoryID: 99, PrivateKeyFile: key, TokenRefreshSkew: 5 * time.Minute, APIVersion: "2022-11-28"}, http: server.Client(), clock: clock}
+	for day := 0; day <= 8; day++ {
+		if err := client.ensureToken(context.Background(), false); err != nil {
+			t.Fatalf("day=%d: %v", day, err)
+		}
+		clock.value = clock.value.Add(24 * time.Hour)
+	}
+	if got := mints.Load(); got != 9 {
+		t.Fatalf("token mints=%d", got)
 	}
 }
 

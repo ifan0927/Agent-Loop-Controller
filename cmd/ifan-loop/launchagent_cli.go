@@ -27,8 +27,10 @@ const (
 var launchAgentTemplate string
 
 type launchAgentDoctorOutput struct {
-	Ready   bool     `json:"ready"`
-	Reasons []string `json:"reasons"`
+	Ready           bool     `json:"ready"`
+	Reasons         []string `json:"reasons"`
+	ProcessLifetime string   `json:"process_lifetime"`
+	LogPolicy       string   `json:"log_policy"`
 }
 
 func controllerLaunchAgent(args []string) error {
@@ -157,7 +159,7 @@ func launchAgentDoctor(args []string, installValidation bool) error {
 		return err
 	}
 	reasons := launchAgentReasons(options, installValidation)
-	return printJSON(launchAgentDoctorOutput{Ready: len(reasons) == 0, Reasons: reasons})
+	return printJSON(launchAgentDoctorOutput{Ready: len(reasons) == 0, Reasons: reasons, ProcessLifetime: workerProcessLifetime, LogPolicy: workerLogPolicy})
 }
 
 // launchAgentReasons is intentionally read-only. Its finite reason codes are

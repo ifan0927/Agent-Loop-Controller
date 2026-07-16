@@ -188,9 +188,9 @@ ifan-loop controller drive '<run-id>' <requester flags>
 ```
 
 Use `drive` when the prior foreground process ended because of a host restart,
-signal, or `--max-runtime`, and the persisted state remains a normal resumable
-state. Do not decompose the workflow into recovery-only commands merely because
-the process stopped.
+signal, or the diagnostic `controller run`/`controller drive --max-runtime`,
+and the persisted state remains a normal resumable state. Do not decompose the
+workflow into recovery-only commands merely because the process stopped.
 
 ## 7. Command Reference
 
@@ -474,13 +474,14 @@ For normal automatic operation, directly or under LaunchAgent supervision.
 **Syntax**
 
 ```sh
-ifan-loop controller worker [--config <controller.json>] [--once] [--max-runtime <duration>]
+ifan-loop controller worker [--config <controller.json>] [--once]
 ```
 
 **Required arguments and flags**
 
 No positional argument. `--once` performs one resume or scan/dispatch cycle.
-`--max-runtime` defaults to `24h` and must be positive and no more than `168h`.
+Normal worker operation has no process-lifetime expiry; operation-specific
+network, process, verification, and control timeouts remain bounded.
 
 **Example**
 
@@ -492,17 +493,23 @@ ifan-loop controller worker --once
 
 Validates automation authority and credential topology, acquires the singleton
 scheduler lease, resumes a nonterminal run or scans/adopts one eligible Todo,
-then drives it. It reports bounded worker and queue-decision evidence.
+then drives it. Attention parks admission but does not terminate the worker; a
+later cycle keeps observing the same durable authority without admitting a
+second run. It reports bounded worker and queue-decision evidence.
 
 **Possible durable stop states**
 
-Human decision, manual intervention, terminal run, retry wait/attention,
-priority tie, no candidate, disabled policy, signal, or runtime limit.
+Disabled policy, `--once`, SIGINT, or SIGTERM. Human decision, manual
+intervention, retry attention, priority tie, no candidate, and terminal run are
+durable outcomes observed by the continuing worker, not process expiry.
 
 **Safety notes**
 
-Never pass an issue identifier. A successful process exit can mean a deliberate
-operator-attention stop; inspect output before restarting blindly.
+Never pass an issue identifier. SIGINT/SIGTERM cancels the active driver and its
+children, stops lease renewal, performs bounded lease cleanup, closes SQLite,
+and emits a sanitized `stopped: canceled` result. It does not rewrite the run
+as failed or abandoned. An unexpected failure exits nonzero so LaunchAgent can
+restart and resume from persisted state without duplicate admission.
 
 **Related commands**
 
@@ -1350,6 +1357,13 @@ after unsuccessful exit, 30-second throttle, umask `0077`, and private stdout/
 stderr files. No token, requester, issue, branch, shell, checkout, or environment
 entry is rendered into the plist.
 
+The supervised worker is indefinite: the plist never supplies `--once` or a
+process lifetime. Binary and configuration changes are restart-to-reload; boot
+out the service, perform the validated replacement, then bootstrap it again.
+Bootout is process control only and does not mark a run failed or abandoned.
+`doctor` and LaunchAgent control results advertise
+`process_lifetime: indefinite` and `log_policy: startup_truncate_8_mib`.
+
 All LaunchAgent commands share:
 
 ```text
@@ -1829,8 +1843,13 @@ stores private paths plus hashes/sizes and the sanitized evidence needed for
 authorization and inspection.
 
 LaunchAgent logs contain controller-sanitized stdout/stderr but remain private.
-Rotate only while booted out: retain a bounded number/size of generations and
-recreate mode-`0600` leaves before bootstrap.
+At every worker start, each current-user-owned, single-link mode-`0600` regular
+stdout/stderr leaf is truncated when it has reached 8 MiB. Unsafe regular log
+streams fail closed. The healthy worker emits no per-cycle log line, so an
+indefinite process does not continuously grow these files. This startup bound
+is the unattended policy; for retained history, rotate only while booted out,
+retain an operator-chosen bounded number and size of generations, and recreate
+mode-`0600` leaves before bootstrap.
 
 Use the sensitive-output scanner before retaining or sharing evidence:
 

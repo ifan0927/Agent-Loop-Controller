@@ -121,6 +121,8 @@ GitHub write capability.
 For the supported automatic path, validate configuration and credentials,
 enable the bounded Linear Todo admission policy, then run
 `ifan-loop controller worker` directly or under the provided LaunchAgent.
+The normal worker runs until SIGINT/SIGTERM rather than expiring on a global
+timer; durable recovery and operation-specific timeouts remain authoritative.
 Observe a run with `controller status` or `controller inspect`. If the run stops
 at `awaiting_human_decision`, submit only one of the persisted offered choices
 through `controller continue --decision ...`, then resume with `controller

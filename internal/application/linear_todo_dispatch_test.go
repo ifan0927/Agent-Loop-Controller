@@ -152,26 +152,27 @@ func (d *dispatchDriver) Drive(ctx context.Context, command ProductionDriveComma
 
 type dispatchStore struct {
 	RunStore
-	mu             sync.Mutex
-	now            time.Time
-	lease          LinearTodoAdmissionLease
-	releasedLease  LinearTodoAdmissionLease
-	held           bool
-	run            Run
-	journal        LinearTodoAdmissionJournal
-	journalFound   bool
-	reserveCalls   int
-	adoptCalls     int
-	continues      int
-	side           SideEffectRecord
-	attention      []OperatorAttentionEvent
-	retrySchedules []RetrySchedule
-	leaseLost      bool
-	renewCalls     int
-	failRenewAt    int
-	renewed        chan int
-	postProofDrift bool
-	reserveBlocked chan struct{}
+	mu              sync.Mutex
+	now             time.Time
+	lease           LinearTodoAdmissionLease
+	releasedLease   LinearTodoAdmissionLease
+	releaseDeadline time.Time
+	held            bool
+	run             Run
+	journal         LinearTodoAdmissionJournal
+	journalFound    bool
+	reserveCalls    int
+	adoptCalls      int
+	continues       int
+	side            SideEffectRecord
+	attention       []OperatorAttentionEvent
+	retrySchedules  []RetrySchedule
+	leaseLost       bool
+	renewCalls      int
+	failRenewAt     int
+	renewed         chan int
+	postProofDrift  bool
+	reserveBlocked  chan struct{}
 }
 
 func (s *dispatchStore) AcquireLinearTodoAdmissionLease(_ context.Context, owner string, ttl time.Duration, now time.Time) (LinearTodoAdmissionLease, bool, error) {
@@ -203,10 +204,11 @@ func (s *dispatchStore) RenewLinearTodoAdmissionLease(_ context.Context, lease L
 	return s.lease, true, nil
 }
 
-func (s *dispatchStore) ReleaseLinearTodoAdmissionLease(_ context.Context, lease LinearTodoAdmissionLease) (bool, error) {
+func (s *dispatchStore) ReleaseLinearTodoAdmissionLease(ctx context.Context, lease LinearTodoAdmissionLease) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.releasedLease = lease
+	s.releaseDeadline, _ = ctx.Deadline()
 	if !s.held || lease.OwnerNonce != s.lease.OwnerNonce || lease.Version != s.lease.Version {
 		return false, nil
 	}
@@ -941,6 +943,59 @@ func TestLinearTodoDispatcherCancelsDriveWhenScopedLeaseRenewalIsLost(t *testing
 	defer store.mu.Unlock()
 	if len(store.attention) != 1 || store.attention[0].EventType != OperatorAttentionSchedulerLease || store.attention[0].ReasonCode != "lease_lost" || store.held || store.releasedLease.Version != store.lease.Version {
 		t.Fatalf("attention=%+v held=%t released=%+v lease=%+v", store.attention, store.held, store.releasedLease, store.lease)
+	}
+	if remaining := time.Until(store.releaseDeadline); remaining <= 0 || remaining > 5*time.Second {
+		t.Fatalf("lease cleanup deadline remaining=%s", remaining)
+	}
+}
+
+func TestLinearTodoDispatcherCancellationJoinsRenewerAndReleasesLeaseWithoutRewritingRun(t *testing.T) {
+	candidate := dispatchCandidate("operator-stop", "IFAN-37", 1)
+	dispatcher, store, _, _, _, driver := newDispatchLab(t, candidate)
+	driver.started, driver.allow = make(chan struct{}), make(chan struct{})
+	ticks := make(chan time.Time)
+	tickerStopped := make(chan struct{})
+	dispatcher.leaseTicks = func(time.Duration) (<-chan time.Time, func()) {
+		return ticks, func() { close(tickerStopped) }
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := dispatcher.Dispatch(ctx)
+		done <- err
+	}()
+	select {
+	case <-driver.started:
+	case <-time.After(time.Second):
+		t.Fatal("cycle did not reach active driver")
+	}
+	store.mu.Lock()
+	stateBefore := store.run.State
+	store.mu.Unlock()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("dispatch cancellation error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active driver did not stop after cancellation")
+	}
+	select {
+	case <-tickerStopped:
+	default:
+		t.Fatal("lease renewal ticker was not joined and stopped")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.held || store.releasedLease.Version != store.lease.Version {
+		t.Fatalf("held=%t released=%+v lease=%+v", store.held, store.releasedLease, store.lease)
+	}
+	if remaining := time.Until(store.releaseDeadline); remaining <= 0 || remaining > 5*time.Second {
+		t.Fatalf("lease cleanup deadline remaining=%s", remaining)
+	}
+	if store.run.State != stateBefore || store.run.State != domain.StateExecuting || len(store.retrySchedules) != 0 || len(store.attention) != 0 {
+		t.Fatalf("state before=%s after=%s retries=%+v attention=%+v", stateBefore, store.run.State, store.retrySchedules, store.attention)
 	}
 }
 

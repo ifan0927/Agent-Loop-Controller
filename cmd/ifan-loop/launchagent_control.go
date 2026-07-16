@@ -20,14 +20,16 @@ const (
 )
 
 type launchAgentControlResult struct {
-	Step           string `json:"step"`
-	Label          string `json:"label"`
-	ObservedState  string `json:"observed_state"`
-	RunAtLoad      bool   `json:"run_at_load"`
-	Outcome        string `json:"outcome"`
-	NextSafeAction string `json:"next_safe_action"`
-	Reason         string `json:"reason,omitempty"`
-	TimedOut       bool   `json:"timed_out,omitempty"`
+	Step            string `json:"step"`
+	Label           string `json:"label"`
+	ObservedState   string `json:"observed_state"`
+	RunAtLoad       bool   `json:"run_at_load"`
+	Outcome         string `json:"outcome"`
+	NextSafeAction  string `json:"next_safe_action"`
+	Reason          string `json:"reason,omitempty"`
+	TimedOut        bool   `json:"timed_out,omitempty"`
+	ProcessLifetime string `json:"process_lifetime"`
+	LogPolicy       string `json:"log_policy"`
 }
 
 type launchAgentObservation struct {
@@ -572,7 +574,7 @@ func launchAgentTarget(options launchAgentOptions) string {
 }
 
 func launchAgentControlResultFor(options launchAgentOptions, step, state, outcome, next, reason string, runAtLoad bool, timedOut bool) launchAgentControlResult {
-	return launchAgentControlResult{Step: step, Label: launchAgentLabel, ObservedState: state, RunAtLoad: runAtLoad, Outcome: outcome, NextSafeAction: next, Reason: reason, TimedOut: timedOut}
+	return launchAgentControlResult{Step: step, Label: launchAgentLabel, ObservedState: state, RunAtLoad: runAtLoad, Outcome: outcome, NextSafeAction: next, Reason: reason, TimedOut: timedOut, ProcessLifetime: workerProcessLifetime, LogPolicy: workerLogPolicy}
 }
 
 func launchAgentControlErrorCode(err error) (string, bool) {

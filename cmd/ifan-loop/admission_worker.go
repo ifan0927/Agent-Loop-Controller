@@ -54,10 +54,6 @@ func runAdmissionWorkerAt(ctx context.Context, once bool, poll time.Duration, di
 			result.Stopped = "once"
 			return result, nil
 		}
-		if cycle.Outcome == application.LinearTodoDispatchAttention {
-			result.Stopped = "attention_required"
-			return result, nil
-		}
 		delay := poll
 		if cycle.Outcome == application.LinearTodoDispatchRetryWait || cycle.Outcome == application.LinearTodoDispatchRetryScheduled {
 			if cycle.Retry == nil || cycle.Retry.NextEligibleAt.IsZero() {

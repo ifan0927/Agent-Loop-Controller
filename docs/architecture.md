@@ -686,6 +686,17 @@ static validation, bounded `launchctl` control, and sanitized results. launchd
 supervises one logged-in user's worker process; SQLite leases and journals—not
 launchd—remain workflow authority.
 
+The normal worker has no wall-clock expiry. SIGINT/SIGTERM stops new cadence,
+cancels the active production driver and child processes, joins lease renewal,
+releases the scheduler lease with a bounded cleanup context, and closes SQLite
+without changing the durable run into failure or abandonment. A restart
+re-enters persisted recovery before scanning, so process supervision cannot
+authorize duplicate admission. Per-operation timeouts remain independent of
+process lifetime, and GitHub App installation tokens refresh from their own
+expiry metadata. LaunchAgent configuration and binaries use restart-to-reload.
+Private stdout/stderr leaves use a fixed startup truncation threshold; normal
+cadence does not produce per-cycle log records.
+
 ### Operator-attention boundary
 
 Application services publish immutable versioned attention events through a

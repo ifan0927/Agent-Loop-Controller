@@ -18,7 +18,7 @@ func TestLaunchAgentTemplateRendersOnlyExactWorkerArguments(t *testing.T) {
 			t.Fatalf("template missing %q: %s", required, rendered)
 		}
 	}
-	for _, forbidden := range []string{"/project/", "go run", "EnvironmentVariables", "IFAN_LOOP_LINEAR_TOKEN", "secret://", "github", "Authorization", "--once"} {
+	for _, forbidden := range []string{"/project/", "go run", "EnvironmentVariables", "IFAN_LOOP_LINEAR_TOKEN", "secret://", "github", "Authorization", "--once", "--max-runtime"} {
 		if strings.Contains(rendered, forbidden) {
 			t.Fatalf("template contains forbidden %q: %s", forbidden, rendered)
 		}
@@ -58,6 +58,9 @@ func TestLaunchAgentDoctorUsesOnlyReasonCodesAndDoesNotOverwriteExistingPlist(t 
 	})
 	if err != nil || !strings.Contains(output, `"ready": false`) || !strings.Contains(output, `"plist_exists"`) {
 		t.Fatalf("output=%s err=%v", output, err)
+	}
+	if !strings.Contains(output, `"process_lifetime": "indefinite"`) || !strings.Contains(output, `"log_policy": "startup_truncate_8_mib"`) {
+		t.Fatalf("doctor omitted worker lifetime/log contract: %s", output)
 	}
 	for _, forbidden := range []string{root, binary, config, plist, "unrelated existing plist", "secret://"} {
 		if strings.Contains(output, forbidden) {

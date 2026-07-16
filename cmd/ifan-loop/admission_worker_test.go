@@ -43,16 +43,17 @@ func TestAdmissionWorkerProjectsSanitizedQueueDecision(t *testing.T) {
 	}
 }
 
-func TestAdmissionWorkerStopsOnAttentionBeforeAnotherAdmission(t *testing.T) {
+func TestAdmissionWorkerKeepsPollingWhileAttentionParksAdmission(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
 	calls := 0
-	result, err := runAdmissionWorker(context.Background(), false, time.Minute, func(context.Context) (application.LinearTodoDispatchResult, error) {
+	result, err := runAdmissionWorker(ctx, false, time.Minute, func(context.Context) (application.LinearTodoDispatchResult, error) {
 		calls++
 		return application.LinearTodoDispatchResult{Outcome: application.LinearTodoDispatchAttention}, nil
 	}, func(context.Context, time.Duration) error {
-		t.Fatal("attention must not enter another poll")
-		return nil
+		cancel()
+		return context.Canceled
 	})
-	if err != nil || calls != 1 || result.Stopped != "attention_required" {
+	if err != nil || calls != 1 || result.Stopped != "canceled" || result.LastOutcome != application.LinearTodoDispatchAttention {
 		t.Fatalf("result=%+v calls=%d err=%v", result, calls, err)
 	}
 }
@@ -83,13 +84,35 @@ func TestAdmissionWorkerWaitsForDurableRetryEligibility(t *testing.T) {
 			schedule := application.RetrySchedule{RunID: "run", Phase: "state_executing", ControllerState: "executing", AttemptCount: 1, MaxAttempts: 3, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: application.RetryFailureProcessStart, ReasonCode: application.RetryReasonProcessStart, Status: application.RetryScheduleScheduled, NextEligibleAt: now.Add(4 * time.Second), CreatedAt: now, UpdatedAt: now}
 			return application.LinearTodoDispatchResult{Outcome: application.LinearTodoDispatchRetryScheduled, Retry: &schedule}, nil
 		}
-		return application.LinearTodoDispatchResult{Outcome: application.LinearTodoDispatchAttention}, nil
+		return application.LinearTodoDispatchResult{Outcome: application.LinearTodoDispatchNoCandidate}, nil
 	}, func(_ context.Context, delay time.Duration) error {
 		waits = append(waits, delay)
+		if len(waits) == 2 {
+			return context.Canceled
+		}
 		return nil
 	}, func() time.Time { return now })
-	if err != nil || calls != 2 || len(waits) != 1 || waits[0] != 4*time.Second || result.Stopped != "attention_required" {
+	if err != nil || calls != 2 || len(waits) != 2 || waits[0] != 4*time.Second || waits[1] != time.Minute || result.Stopped != "canceled" {
 		t.Fatalf("result=%+v calls=%d waits=%v err=%v", result, calls, waits, err)
+	}
+}
+
+func TestAdmissionWorkerHasNoSevenDayProcessExpiry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	now := time.Date(2026, 7, 15, 0, 0, 0, 0, time.UTC)
+	started := now
+	result, err := runAdmissionWorkerAt(ctx, false, 24*time.Hour, func(context.Context) (application.LinearTodoDispatchResult, error) {
+		return application.LinearTodoDispatchResult{Outcome: application.LinearTodoDispatchNoCandidate}, nil
+	}, func(context.Context, time.Duration) error {
+		now = now.Add(24 * time.Hour)
+		if now.Sub(started) > 7*24*time.Hour {
+			cancel()
+			return context.Canceled
+		}
+		return nil
+	}, func() time.Time { return now })
+	if err != nil || result.Cycles != 8 || result.Stopped != "canceled" || now.Sub(started) != 8*24*time.Hour {
+		t.Fatalf("result=%+v elapsed=%s err=%v", result, now.Sub(started), err)
 	}
 }
 
@@ -122,7 +145,7 @@ func TestAdmissionWorkerCancellationReturnedByOnceDispatchIsAStatusNotAnError(t 
 	}
 }
 
-func TestAdmissionWorkerMaxRuntimeCancellationDuringOnceDispatchIsAStatus(t *testing.T) {
+func TestAdmissionWorkerCancellationDuringOnceDispatchIsAStatus(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	result, err := runAdmissionWorker(ctx, true, time.Minute, func(ctx context.Context) (application.LinearTodoDispatchResult, error) {

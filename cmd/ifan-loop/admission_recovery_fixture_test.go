@@ -16,7 +16,7 @@ import (
 // reopens the real SQLite store, then uses a fresh worker and adapter
 // composition to recover. The Linear ports and driver are controlled offline
 // adapters; no external service is contacted.
-func TestOfflineAcceptanceWorkerRestartPreservesRetryAndStopsAtDurableAttention(t *testing.T) {
+func TestOfflineAcceptanceWorkerRestartPreservesRetryAndParksAtDurableAttention(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -62,14 +62,24 @@ func TestOfflineAcceptanceWorkerRestartPreservesRetryAndStopsAtDurableAttention(
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondResult, err := runAdmissionWorker(ctx, false, time.Minute, second.dispatcher.Dispatch, wait)
+	secondCtx, stopSecond := context.WithCancel(ctx)
+	secondWait := func(waitCtx context.Context, delay time.Duration) error {
+		waits = append(waits, delay)
+		if len(waits) == 2 {
+			stopSecond()
+			return context.Canceled
+		}
+		return waitAdmissionWorker(waitCtx, delay)
+	}
+	secondResult, err := runAdmissionWorker(secondCtx, false, time.Minute, second.dispatcher.Dispatch, secondWait)
+	stopSecond()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if secondResult.Cycles != 2 || secondResult.LastOutcome != application.LinearTodoDispatchAttention || secondResult.Stopped != "attention_required" {
+	if secondResult.Cycles != 2 || secondResult.LastOutcome != application.LinearTodoDispatchAttention || secondResult.Stopped != "canceled" {
 		t.Fatalf("second worker=%+v err=%v", secondResult, err)
 	}
-	if len(waits) != 1 || waits[0] <= 0 || waits[0] > application.DefaultAutomaticRetryInitialDelay {
+	if len(waits) != 2 || waits[0] <= 0 || waits[0] > application.DefaultAutomaticRetryInitialDelay || waits[1] != time.Minute {
 		t.Fatalf("durable retry waits=%v", waits)
 	}
 	if first.scanner.calls()+second.scanner.calls() != 1 || len(first.starter.mutations())+len(second.starter.mutations()) != 1 || first.driver.calls()+second.driver.calls() != 1 || first.worktrees.calls()+second.worktrees.calls() != 1 {
