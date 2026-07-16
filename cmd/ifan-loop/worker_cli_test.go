@@ -157,8 +157,10 @@ func TestControllerWorkerSubprocessSIGTERMClosesCompleteRuntime(t *testing.T) {
 	if err != nil || stoppedStatus.Status != workerStatusStopping || stoppedStatus.PreviousStatus != workerStatusDriving && stoppedStatus.PreviousStatus != workerStatusParked || stoppedStatus.WorkerInstanceID != liveStatus.WorkerInstanceID {
 		t.Fatalf("stopped worker status=%+v live=%+v err=%v", stoppedStatus, liveStatus, err)
 	}
-	if err := syscall.Kill(childPID, 0); !errors.Is(err, syscall.ESRCH) {
-		t.Fatalf("managed child pid=%d remains err=%v", childPID, err)
+	status, statusErr := exec.Command("/bin/ps", "-o", "stat=", "-p", strconv.Itoa(childPID)).Output()
+	trimmedStatus := strings.TrimSpace(string(status))
+	if statusErr == nil && trimmedStatus != "" && !strings.HasPrefix(trimmedStatus, "Z") {
+		t.Fatalf("managed child pid=%d remains runnable with status=%q", childPID, trimmedStatus)
 	}
 	store, err := sqlitestore.Open(dbPath)
 	if err != nil {

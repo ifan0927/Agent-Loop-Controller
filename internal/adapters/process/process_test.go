@@ -226,7 +226,7 @@ func TestManagedChildDoesNotInheritProcessLockDescriptor(t *testing.T) {
 	directory := t.TempDir()
 	control := filepath.Join(directory, "implementation.process-control.json")
 	result, err := (OSRunner{}).Run(context.Background(), Spec{
-		Program: os.Args[0], Args: []string{"-test.run=TestProcessHelper", "--", "write-control-fd"},
+		Program: os.Args[0], Args: []string{"-test.run=TestProcessHelper", "--", "check-lock-fd", processControlLockPath(control)},
 		StdoutPath: filepath.Join(directory, "stdout"), StderrPath: filepath.Join(directory, "stderr"), ControlPath: control, ControlKey: []byte(testProcessControlKey),
 	})
 	if err != nil || !result.Succeeded() {
@@ -637,12 +637,27 @@ func TestProcessHelper(t *testing.T) {
 			signal.Ignore(os.Interrupt)
 			time.Sleep(10 * time.Second)
 			os.Exit(0)
-		case "write-control-fd":
-			var stat syscall.Stat_t
-			if err := syscall.Fstat(3, &stat); err != nil {
-				fmt.Println("missing")
-			} else {
+		case "check-lock-fd":
+			if index+2 >= len(os.Args) {
+				os.Exit(2)
+			}
+			info, err := os.Stat(os.Args[index+2])
+			expected, ok := info.Sys().(*syscall.Stat_t)
+			if err != nil || !ok {
+				os.Exit(2)
+			}
+			inherited := false
+			for descriptor := 3; descriptor < 256; descriptor++ {
+				var observed syscall.Stat_t
+				if syscall.Fstat(descriptor, &observed) == nil && observed.Dev == expected.Dev && observed.Ino == expected.Ino {
+					inherited = true
+					break
+				}
+			}
+			if inherited {
 				fmt.Println("inherited")
+			} else {
+				fmt.Println("missing")
 			}
 			os.Exit(0)
 		case "unlock-and-ignore":
