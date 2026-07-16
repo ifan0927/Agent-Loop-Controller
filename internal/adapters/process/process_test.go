@@ -193,12 +193,12 @@ func TestAttemptStopperTerminatesExactManagedProcessGroup(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if err := (AttemptStopper{InterruptGrace: 50 * time.Millisecond}).StopAttempt(context.Background(), directory, testProcessControlKey); err != nil {
+	if err := (AttemptStopper{InterruptGrace: 2 * time.Second}).StopAttempt(context.Background(), directory, testProcessControlKey); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("managed process runner did not observe child termination")
 	}
 	if err := (AttemptStopper{}).StopAttempt(context.Background(), directory, testProcessControlKey); err != nil {

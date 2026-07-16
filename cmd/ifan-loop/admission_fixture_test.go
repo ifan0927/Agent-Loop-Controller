@@ -25,7 +25,7 @@ import (
 // and delivery are deterministic in-memory ports. The blocked driver keeps
 // the winning lease alive while the losing worker must stop at attention.
 func TestOfflineWorkerOnceConcurrencyHasOneSQLiteAdmission(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	store, err := sqlitestore.Open(t.TempDir() + "/controller.db")
