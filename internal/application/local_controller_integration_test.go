@@ -143,6 +143,7 @@ type durableFakeProcess struct {
 	needsDecision                                 bool
 	failFirstReview                               bool
 	reviewFindings                                bool
+	decisionOnFirstResume                         bool
 	noChangeOnResume                              bool
 	blockResumeUntilContextDone                   bool
 	resumeStarted                                 chan struct{}
@@ -179,7 +180,11 @@ func (p *durableFakeProcess) Run(ctx context.Context, s processadapter.Spec) (pr
 				mustWriteFile(filepath.Join(s.WorkingDir, "mathutil", "clamp.go"), "package mathutil\n\nfunc Clamp(value, min, max int) int { if value < min { return min }; if value > max { return max }; return value }\n")
 				mustWriteFile(filepath.Join(s.WorkingDir, "mathutil", "clamp_test.go"), "package mathutil\n\nimport \"testing\"\n\nfunc TestClamp(t *testing.T) { tests := []struct{ v, min, max, want int }{{-1,0,5,0},{3,0,5,3},{9,0,5,5}}; for _, tt := range tests { if got := Clamp(tt.v,tt.min,tt.max); got != tt.want { t.Fatalf(\"got %d want %d\",got,tt.want) } } }\n")
 			}
-			writeLastMessage(s.Args, completedOutcome)
+			outcome := completedOutcome
+			if p.decisionOnFirstResume && p.resumeCalls == 1 {
+				outcome = decisionOutcome
+			}
+			writeLastMessage(s.Args, outcome)
 			sessionID := "implementation-session"
 			if slices.Contains(s.Args, "recovered-session") {
 				sessionID = "recovered-session"
@@ -942,6 +947,66 @@ func TestFreshReviewFindingsPersistAndResumeBoundedRepairWithSameSession(t *test
 	}
 	if process.resumeCalls != 1 || process.reviewCalls != 2 {
 		t.Fatalf("resumes=%d reviews=%d", process.resumeCalls, process.reviewCalls)
+	}
+}
+
+func TestRepairHumanDecisionResumesInsteadOfReplayingDecisionRequest(t *testing.T) {
+	lab := newLocalLab(t)
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	process := &durableFakeProcess{reviewFindings: true, decisionOnFirstResume: true}
+	controller := newController(t, store, lab, process, gitadapter.Workspace{})
+	input := startInput(lab)
+	input.Task.Policy.MaxRepairAttempts = domain.DefaultMaxRepairAttempts
+	input.NormalizedJSON, err = json.Marshal(input.Task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(input.NormalizedJSON)
+	input.TaskHash = hex.EncodeToString(digest[:])
+	run, err := controller.Start(context.Background(), input)
+	if err != nil || run.State != domain.StateFreshReview {
+		t.Fatalf("run=%+v err=%v", run, err)
+	}
+	run, err = controller.HandoffFreshReviewFindings(context.Background(), run.ID)
+	if err != nil || run.State != domain.StateRepairing {
+		t.Fatalf("handoff run=%+v err=%v", run, err)
+	}
+	inspection, err := store.Inspect(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err = controller.RepairFindings(context.Background(), run.ID, inspection.Findings)
+	if err != nil || run.State != domain.StateAwaitingHumanDecision || process.resumeCalls != 1 {
+		t.Fatalf("decision run=%+v resumes=%d err=%v", run, process.resumeCalls, err)
+	}
+	wrapper := &failAfterTransitionStore{RunStore: store, from: domain.StateAwaitingHumanDecision, to: domain.StateExecuting, remaining: 1}
+	run, err = newController(t, wrapper, lab, process, gitadapter.Workspace{}).Continue(context.Background(), run.ID, &application.Decision{ChoiceID: "inclusive", Instructions: "Use inclusive min and max bounds."})
+	if err == nil || run.State != domain.StateExecuting || process.resumeCalls != 1 {
+		t.Fatalf("persist decision run=%+v resumes=%d err=%v", run, process.resumeCalls, err)
+	}
+	run, err = newController(t, store, lab, process, gitadapter.Workspace{}).Continue(context.Background(), run.ID, nil)
+	if err != nil || run.State != domain.StateApprovalReady {
+		t.Fatalf("completed run=%+v err=%v", run, err)
+	}
+	if process.resumeCalls != 2 || process.reviewCalls != 2 {
+		t.Fatalf("resumes=%d reviews=%d", process.resumeCalls, process.reviewCalls)
+	}
+	inspection, err = store.Inspect(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decisionRequests := 0
+	for _, transition := range inspection.Timeline {
+		if transition.From == domain.StateExecuting && transition.To == domain.StateAwaitingHumanDecision {
+			decisionRequests++
+		}
+	}
+	if decisionRequests != 1 {
+		t.Fatalf("decision request transitions=%d timeline=%+v", decisionRequests, inspection.Timeline)
 	}
 }
 

@@ -787,6 +787,10 @@ func (c *LocalController) execute(ctx context.Context, run Run, decision *Decisi
 		ctx, cancel = context.WithDeadline(ctx, deadline)
 		defer cancel()
 	}
+	resumeDecisionAnchor := repairStartedAt
+	if acceptedAt := latestAcceptedDecisionAt(inspection.Timeline); acceptedAt.After(resumeDecisionAnchor) {
+		resumeDecisionAnchor = acceptedAt
+	}
 	if run.ImplementationSession != "" && decision == nil {
 		persisted, found, loadErr := findPersistedDecision(inspection)
 		if loadErr != nil {
@@ -860,7 +864,7 @@ func (c *LocalController) execute(ctx context.Context, run Run, decision *Decisi
 			recoveryResume = true
 			break
 		}
-		if attempt.Status == "succeeded" && (decision == nil || hasPersistedRepair && !attempt.StartedAt.Before(repairStartedAt)) {
+		if attempt.Status == "succeeded" && (decision == nil || hasPersistedRepair && !attempt.StartedAt.Before(resumeDecisionAnchor)) {
 			outcome, err := readOutcome[domain.AgentOutcome](attempt.OutcomePath, attempt.OutcomeHash)
 			if err != nil {
 				return err
@@ -1979,6 +1983,16 @@ func latestRepairStartedAt(timeline []Transition) time.Time {
 	for index := len(timeline) - 1; index >= 0; index-- {
 		item := timeline[index]
 		if item.From == domain.StateRepairing && item.To == domain.StateExecuting {
+			return item.CreatedAt
+		}
+	}
+	return time.Time{}
+}
+
+func latestAcceptedDecisionAt(timeline []Transition) time.Time {
+	for index := len(timeline) - 1; index >= 0; index-- {
+		item := timeline[index]
+		if item.From == domain.StateAwaitingHumanDecision && item.To == domain.StateExecuting {
 			return item.CreatedAt
 		}
 	}
