@@ -94,7 +94,7 @@ func TestOfflineParkedDecisionSurvivesRestartAndAutomaticallyReturnsToDriver(t *
 	if err != nil || resumed.LastOutcome != application.LinearTodoDispatchDriven || len(finalDriver.commands()) != 1 || finalDriver.commands()[0].RunID != updated.ID {
 		t.Fatalf("resumed=%+v driver=%+v err=%v", resumed, finalDriver.commands(), err)
 	}
-	fixtureevidence.Emit(t, fixtureevidence.Evidence{Scenario: "notification_provenance_safety", RunIDs: []string{updated.ID}, IssueIdentifiers: []string{updated.IssueID}, EventActionKeys: []string{eventKey}, StateSequence: []string{"awaiting_human_decision", "restarted", "executing"}, LeaseEvidence: []string{"parked_lease_released"}, RetryAbandonOutcomes: []string{"notification_deduplicated"}, FinalWorkerState: "stopped"})
+	fixtureevidence.Emit(t, fixtureevidence.Evidence{Scenario: "notification_provenance_safety", RunIDs: []string{updated.ID}, IssueIdentifiers: []string{updated.IssueID}, EventActionKeys: []string{eventKey}, StateSequence: []string{"awaiting_human_decision", "restarted", "executing"}, LeaseEvidence: []string{"parked_lease_released"}, RetryAbandonOutcomes: []string{"notification_deduplicated"}, CleanupResultClasses: []string{"artifacts_scanned", "cli_output_scanned", "database_projection_scanned", "logs_scanned"}, ExactCandidateBindings: []string{"stable_event_key"}, FinalWorkerState: "stopped"})
 }
 
 func parkingDispatcher(t *testing.T, store *storeadapter.Store, repository application.LocalRepository, candidate application.LinearTodoCandidate, process *offlineAdmissionCodex, driver application.LinearTodoDispatchDriver, owner string) *application.LinearTodoDispatcher {

@@ -31,9 +31,11 @@ func completeEvidenceMatrix() []Evidence {
 		return Evidence{Scenario: scenario, ConfigurationDigest: ConfigurationDigest, RunIDs: []string{"run-1"}, IssueIdentifiers: []string{"IFAN-1"}, StateSequence: []string{"stopped"}, FinalWorkerState: "stopped"}
 	}
 	restart := common("indefinite_restart")
+	restart.StateSequence = []string{"polling", "driving", "deadline", "sigterm", "stopped", "restarted"}
 	restart.LeaseEvidence, restart.ExactCandidateBindings = []string{"released"}, []string{"same_run"}
 	retry := common("park_notify_retry_resume")
-	retry.EventActionKeys, retry.RetryAbandonOutcomes, retry.LeaseEvidence, retry.ExactCandidateBindings = []string{"event-1", "action-1"}, []string{"observed", "replayed", "resumed"}, []string{"reacquired"}, []string{"same_run"}
+	retry.StateSequence = []string{"parked", "notified", "retried", "resumed", "verified", "reviewed", "stopped"}
+	retry.EventActionKeys, retry.RetryAbandonOutcomes, retry.LeaseEvidence, retry.ExactCandidateBindings = []string{"event-1", "action-1"}, []string{"observed", "replayed", "resumed"}, []string{"reacquired"}, []string{"same_run", "auth_required", "exact_head"}
 	complete := common("abandon_complete")
 	complete.EventActionKeys, complete.RetryAbandonOutcomes, complete.LeaseEvidence, complete.CleanupResultClasses = []string{"action-1"}, []string{"abandoned"}, []string{"released"}, []string{"complete"}
 	residue := common("abandon_residue")
@@ -44,5 +46,6 @@ func completeEvidenceMatrix() []Evidence {
 	ordering.CandidateOrderingDecisions, ordering.ExactCandidateBindings = []string{"priority", "sequence", "uuid", "permutation"}, []string{"distinct_runs"}
 	safety := common("notification_provenance_safety")
 	safety.EventActionKeys, safety.RetryAbandonOutcomes, safety.LeaseEvidence = []string{"event-1"}, []string{"deduplicated"}, []string{"released"}
+	safety.CleanupResultClasses, safety.ExactCandidateBindings = []string{"database", "logs", "cli", "artifacts"}, []string{"stable_key"}
 	return []Evidence{restart, retry, complete, residue, ordering, safety}
 }

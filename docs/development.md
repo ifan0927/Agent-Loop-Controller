@@ -123,9 +123,12 @@ provenance safety. Its versioned machine-readable summary is
 `testdata/continuous-supervisor-fixture-summary.json`. The summary contains only
 sanitized stable fixture identities and evidence classes. The gate regenerates
 that summary only from evidence emitted by tests that actually passed, compares
-the result with the versioned expectation, and scans it for credential-like
-material. The retry scenario invokes the production `controller retry` CLI and
-proves that the command records intent without directly driving the run.
+the result with the versioned expectation, and scans both the summary and raw
+test event stream for credential-like material. The retry scenario invokes the
+production `controller retry` CLI, rejects incomplete requester authority
+without mutation, scans its sanitized CLI and database projections, and proves
+automatic resume through exact-head verification and fresh review without a
+follow-up drive command.
 The canonical repository gate runs the complete normal and race suites before
 validating this matrix.
 

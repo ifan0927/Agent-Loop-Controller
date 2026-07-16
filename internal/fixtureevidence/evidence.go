@@ -10,7 +10,7 @@ import (
 
 const (
 	Marker              = "IFAN_FIXTURE_EVIDENCE "
-	ConfigurationDigest = "2a7f999c5a63127044b4cbc487f3584eb4fad950afa1dce7d52b254ea51bf381"
+	ConfigurationDigest = "de01621c17c5d7e03a3ce490bb9d18a8748d51dc4479e9179e635cecd7b48e44"
 )
 
 var safeValue = regexp.MustCompile(`^[A-Za-z0-9_.:@-]{1,160}$`)
@@ -129,15 +129,15 @@ func validateCompleteScenario(record Evidence) error {
 	}
 	switch record.Scenario {
 	case "indefinite_restart":
-		return require(len(record.LeaseEvidence) > 0 && len(record.ExactCandidateBindings) > 0)
+		return require(len(record.StateSequence) >= 6 && len(record.LeaseEvidence) > 0 && len(record.ExactCandidateBindings) > 0)
 	case "park_notify_retry_resume":
-		return require(len(record.EventActionKeys) >= 2 && len(record.RetryAbandonOutcomes) >= 3 && len(record.LeaseEvidence) > 0 && len(record.ExactCandidateBindings) > 0)
+		return require(len(record.EventActionKeys) >= 2 && len(record.StateSequence) >= 7 && len(record.RetryAbandonOutcomes) >= 3 && len(record.LeaseEvidence) > 0 && len(record.ExactCandidateBindings) >= 3)
 	case "abandon_complete", "abandon_residue":
 		return require(len(record.EventActionKeys) > 0 && len(record.RetryAbandonOutcomes) > 0 && len(record.LeaseEvidence) > 0 && len(record.CleanupResultClasses) > 0)
 	case "candidate_ordering_handoff":
 		return require(len(record.RunIDs) >= 3 && len(record.IssueIdentifiers) >= 3 && len(record.EventActionKeys) > 0 && len(record.RetryAbandonOutcomes) > 0 && len(record.LeaseEvidence) > 0 && len(record.CandidateOrderingDecisions) >= 4 && len(record.ExactCandidateBindings) > 0)
 	case "notification_provenance_safety":
-		return require(len(record.EventActionKeys) > 0 && len(record.RetryAbandonOutcomes) > 0 && len(record.LeaseEvidence) > 0)
+		return require(len(record.EventActionKeys) > 0 && len(record.RetryAbandonOutcomes) > 0 && len(record.LeaseEvidence) > 0 && len(record.CleanupResultClasses) >= 4 && len(record.ExactCandidateBindings) > 0)
 	default:
 		return errors.New("unknown fixture scenario")
 	}

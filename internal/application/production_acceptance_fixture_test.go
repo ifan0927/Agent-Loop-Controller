@@ -333,6 +333,97 @@ func TestOfflineAcceptanceProductionAbandonTerminalizesWithResidueAndReplaysClea
 	fixtureevidence.Emit(t, fixtureevidence.Evidence{Scenario: "abandon_residue", RunIDs: []string{run.ID}, IssueIdentifiers: []string{run.IssueID}, EventActionKeys: []string{attention[0].EventKey, attention[1].EventKey}, StateSequence: []string{"received", "operator_abandoned", "restarted"}, RetryAbandonOutcomes: []string{"terminal_with_residue", "cleanup_replay_idempotent"}, LeaseEvidence: []string{"admission_lease_released"}, CleanupResultClasses: []string{"failed", "deleted_on_replay"}, FinalWorkerState: "stopped"})
 }
 
+func TestOfflineAcceptanceProductionAbandonCompletesOwnedCleanup(t *testing.T) {
+	lab := newLocalLab(t)
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	repository := lab.repository
+	repository.CanonicalRepository = "owner/repo"
+	repository.ProfileID = "profile-test"
+	repository.ProfileSnapshotVersion = 1
+	repository.ProfileDigest = acceptanceDigest([]byte("profile"))
+	repository.ProfileSnapshotJSON = `{}`
+	repository.RegistryVersion = 1
+	repository.RegistryDigest = acceptanceDigest([]byte("registry"))
+	repository.RepositoryBindingDigest = acceptanceDigest([]byte("binding"))
+	repository.AllowedOperatorLogins = []string{"operator"}
+	source := productionLinearSource()
+	source.IssueID = "123e4567-e89b-42d3-a456-426614174151"
+	source.Identifier = "IFAN-ABANDON-COMPLETE"
+	reader := &productionLinearReader{source: source}
+	controller := &acceptancePersistingController{store: store, persist: false}
+	admission, err := application.NewLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, controller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err := application.NewProductionCoordinator(admission, controller, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requester := application.Requester{ID: "operator", Kind: "github_login", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
+	if _, _, err := admission.Start(context.Background(), application.LinearStartCommand{Requester: requester, Identifier: source.Identifier}); err != nil {
+		t.Fatal(err)
+	}
+	lease, acquired, err := store.AcquireLinearTodoAdmissionLease(context.Background(), "abandon-complete-fixture", time.Minute, time.Now().UTC())
+	if err != nil || !acquired {
+		t.Fatalf("admission lease=%+v acquired=%t err=%v", lease, acquired, err)
+	}
+	run, _, reserved, err := store.ReserveLinearTodoAdmission(context.Background(), application.LinearTodoAdmissionReservation{Lease: lease, ScanDigest: acceptanceDigest([]byte("abandon-complete-scan")), IssueUUID: source.IssueID, Input: controller.input})
+	if err != nil || !reserved || run.State != domain.StateReceived {
+		t.Fatalf("received reservation run=%+v reserved=%t err=%v", run, reserved, err)
+	}
+	if _, err := store.ReleaseLinearTodoAdmissionLease(context.Background(), lease); err != nil {
+		t.Fatal(err)
+	}
+	ownership, err := json.Marshal(map[string]string{"source_path": repository.SourcePath, "origin_path": repository.OriginPath, "path": run.WorktreePath, "branch": run.WorkingBranch, "base_branch": run.BaseBranch, "nonce": "abandon-complete-fixture"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddOwnedResource(context.Background(), application.OwnedResource{RunID: run.ID, Kind: "branch", Name: run.WorkingBranch, CreationEvidence: string(ownership), Status: "reserved"}); err != nil {
+		t.Fatal(err)
+	}
+	attempt, err := store.BeginAttempt(context.Background(), run.ID, "implementation", run.ImplementationModel, filepath.Join(run.ArtifactRoot, "attempt-complete"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed, err := store.CommitAttemptProcessLaunch(context.Background(), attempt.ID); err != nil || !committed {
+		t.Fatalf("commit process launch: committed=%t err=%v", committed, err)
+	}
+	now := time.Now().UTC()
+	schedule := application.RetrySchedule{RunID: run.ID, Phase: application.AutomaticRetryPhaseForRun(run), ControllerState: string(run.State), AttemptCount: 4, MaxAttempts: 3, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: application.RetryFailureProcessStart, FailureEvidenceRef: "attempt:1", ReasonCode: application.RetryReasonBudgetExhausted, Status: application.RetryScheduleAttention, AttentionAt: now, CreatedAt: now.Add(-time.Minute), UpdatedAt: now}
+	event, err := application.AutomaticRetryAttentionEvent(run, schedule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AppendOperatorAttention(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+	cleanup := &acceptanceCleanupPort{}
+	result, err := coordinator.Abandon(context.Background(), application.ProductionAbandonCommand{Requester: requester, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, cleanup, &acceptanceChildStopper{})
+	if err != nil || result.Action != application.ProductionAbandon || result.Run.State != domain.StateFailed || result.Idempotent || result.ResidueAttention || len(cleanup.calls) != 1 || cleanup.calls[0] != "branch" {
+		t.Fatalf("result=%+v cleanup=%v err=%v", result, cleanup.calls, err)
+	}
+	inspection, err := store.Inspect(context.Background(), run.ID)
+	if err != nil || len(inspection.OperatorActions) != 1 || inspection.OperatorActions[0].Status != application.OperatorActionStatusObserved || len(inspection.Cleanup) != 1 || inspection.Cleanup[0].Status != "deleted" || len(inspection.Resources) != 1 || inspection.Resources[0].Status != "deleted" {
+		t.Fatalf("complete abandon inspection=%+v err=%v", inspection, err)
+	}
+	if runs, err := store.ListNonterminalRuns(context.Background()); err != nil || len(runs) != 0 {
+		t.Fatalf("complete abandon left active runs=%+v err=%v", runs, err)
+	}
+	replacement, acquired, err := store.AcquireLinearTodoAdmissionLease(context.Background(), "abandon-complete-replacement", time.Minute, time.Now().UTC())
+	if err != nil || !acquired {
+		t.Fatalf("replacement lease=%+v acquired=%t err=%v", replacement, acquired, err)
+	}
+	if _, err := store.ReleaseLinearTodoAdmissionLease(context.Background(), replacement); err != nil {
+		t.Fatal(err)
+	}
+	fixtureevidence.Emit(t, fixtureevidence.Evidence{Scenario: "abandon_complete", RunIDs: []string{run.ID}, IssueIdentifiers: []string{run.IssueID}, EventActionKeys: []string{event.EventKey, inspection.OperatorActions[0].ActionID}, StateSequence: []string{"received", "operator_abandoned", "terminal"}, RetryAbandonOutcomes: []string{"production_coordinator_abandon", "action_observed"}, LeaseEvidence: []string{"admission_lease_released", "replacement_acquired"}, CleanupResultClasses: []string{"deleted"}, ExactCandidateBindings: []string{"persisted_authority_revalidated"}, FinalWorkerState: "stopped"})
+}
+
 func TestOfflineAcceptanceProductionRepairRebindsFindingsVerificationAndReviewToNewHead(t *testing.T) {
 	stack := newAcceptanceProductionStack(t, true)
 	requester := stack.requester

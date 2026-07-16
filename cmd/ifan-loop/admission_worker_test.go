@@ -182,6 +182,7 @@ func TestAdmissionWorkerHasNoSevenDayProcessExpiry(t *testing.T) {
 	if err != nil || result.Cycles != 8 || result.Stopped != "canceled" || now.Sub(started) != 8*24*time.Hour {
 		t.Fatalf("result=%+v elapsed=%s err=%v", result, now.Sub(started), err)
 	}
+	fixtureevidence.Emit(t, fixtureevidence.Evidence{Scenario: "indefinite_restart", StateSequence: []string{"no_candidate_beyond_7d", "canceled"}, FinalWorkerState: "stopped"})
 }
 
 func TestAdmissionWorkerHasNoSevenDayExpiryWhileDriverPolls(t *testing.T) {
@@ -245,4 +246,5 @@ func TestAdmissionWorkerCancellationDuringOnceDispatchIsAStatus(t *testing.T) {
 	if err != nil || result.Cycles != 1 || result.Stopped != "canceled" {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
+	fixtureevidence.Emit(t, fixtureevidence.Evidence{Scenario: "indefinite_restart", StateSequence: []string{"operation_deadline_fired", "canceled"}, FinalWorkerState: "stopped"})
 }
