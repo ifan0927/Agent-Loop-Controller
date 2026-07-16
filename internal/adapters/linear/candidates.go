@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -64,6 +65,7 @@ func (c *Client) ListTodoCandidates(ctx context.Context, authority application.L
 	seenCursors := make(map[string]struct{})
 	seenIDs := make(map[string]struct{})
 	seenIdentifiers := make(map[string]struct{})
+	seenSequences := make(map[int]struct{})
 	candidates := make([]application.LinearTodoCandidate, 0, authority.MaxCandidates)
 	for page := 0; page < authority.MaxPages; page++ {
 		response, observation, readErr := c.fetchCandidates(ctx, token, authority, after, page+1)
@@ -99,8 +101,12 @@ func (c *Client) ListTodoCandidates(ctx context.Context, authority application.L
 			if _, found := seenIdentifiers[candidate.Identifier]; found {
 				return application.LinearTodoCandidateScan{}, observations, errors.New("Linear candidate identifier appeared more than once")
 			}
+			if _, found := seenSequences[candidate.IssueSequence]; found {
+				return application.LinearTodoCandidateScan{}, observations, errors.New("Linear candidate normalized sequence appeared more than once")
+			}
 			seenIDs[candidate.IssueID] = struct{}{}
 			seenIdentifiers[candidate.Identifier] = struct{}{}
+			seenSequences[candidate.IssueSequence] = struct{}{}
 			candidates = append(candidates, candidate)
 			if len(candidates) > authority.MaxCandidates {
 				return application.LinearTodoCandidateScan{}, observations, errors.New("Linear candidate limit exceeded")
@@ -316,15 +322,34 @@ func normalizeCandidate(raw rawCandidate, authority application.LinearTodoCandid
 	if !hasCodex || hasHermes || len(repositoryLabels) == 0 {
 		return application.LinearTodoCandidate{}, errors.New("Linear candidate response is outside configured filters")
 	}
+	teamKey, issueSequence, ok := normalizedCandidateIdentifier(raw.Identifier)
+	if !ok || teamKey != authority.TeamKey {
+		return application.LinearTodoCandidate{}, errors.New("Linear candidate identifier does not match configured team")
+	}
 	sort.Slice(labels, func(i, j int) bool { return labels[i].ID < labels[j].ID })
 	sort.Slice(repositoryLabels, func(i, j int) bool { return repositoryLabels[i].ID < repositoryLabels[j].ID })
-	candidate := application.LinearTodoCandidate{IssueID: raw.ID, Identifier: raw.Identifier, Priority: *raw.Priority,
+	candidate := application.LinearTodoCandidate{IssueID: raw.ID, Identifier: raw.Identifier, TeamKey: teamKey, IssueSequence: issueSequence, Priority: *raw.Priority,
 		State:  application.LinearState{ID: raw.State.ID, Name: raw.State.Name, Type: raw.State.Type},
 		Cycle:  application.LinearCycle{ID: raw.Cycle.ID, Number: raw.Cycle.Number, StartsAt: raw.Cycle.StartsAt.UTC(), EndsAt: raw.Cycle.EndsAt.UTC(), IsActive: *raw.Cycle.IsActive},
 		Labels: labels, RepositoryLabels: repositoryLabels, BranchName: raw.BranchName,
 		SourceRevision: raw.UpdatedAt.UTC().Format(time.RFC3339Nano), CreatedAt: raw.CreatedAt.UTC(), UpdatedAt: raw.UpdatedAt.UTC()}
 	candidate.SourceDigest = digestCandidate(candidate)
 	return candidate, nil
+}
+
+func normalizedCandidateIdentifier(identifier string) (string, int, bool) {
+	separator := strings.LastIndexByte(identifier, '-')
+	if separator < 1 || separator == len(identifier)-1 {
+		return "", 0, false
+	}
+	teamKey, rawSequence := identifier[:separator], identifier[separator+1:]
+	for _, digit := range rawSequence {
+		if digit < '0' || digit > '9' {
+			return "", 0, false
+		}
+	}
+	sequence, err := strconv.Atoi(rawSequence)
+	return teamKey, sequence, err == nil && sequence > 0
 }
 
 func finalizedCandidateScan(candidates []application.LinearTodoCandidate, observedAt time.Time) application.LinearTodoCandidateScan {

@@ -83,10 +83,15 @@ one configuration, but paths must not overlap and a run freezes the selected
 profile digest and private authority binding. Changing configuration never
 retargets an active run.
 
-Automatic admission is priority-only: Linear priorities 1, 2, 3, and 4 rank in
-that order; unprioritized 0 ranks last. One nonterminal run blocks scanning and
-is never preempted. An equal best priority admits nothing and emits operator
-attention; resolve the priority ambiguity in Linear and wait for the next poll.
+Automatic admission uses a deterministic total order. Linear priorities 1, 2,
+3, and 4 rank first in that order, and unprioritized 0 ranks last. Equal
+priorities use the numeric sequence from the validated `IFAN-<sequence>`
+identifier, ascending, with immutable issue UUID as a defensive final
+comparator. The worker scans and revalidates the complete bounded set before
+selection; response order, timestamps, title, assignee, and issue prose do not
+affect the result. One nonterminal run blocks scanning and is never preempted.
+Duplicate or contradictory identities and incomplete bounded scans still fail
+closed for operator attention.
 
 ## 5. Credentials and Permissions
 
@@ -510,7 +515,7 @@ previous worker instance, including after PID reuse.
 **Possible durable stop states**
 
 Disabled policy, `--once`, SIGINT, or SIGTERM. Human decision, manual
-intervention, retry attention, priority tie, no candidate, and terminal run are
+intervention, retry attention, incomplete scan, no candidate, and terminal run are
 durable outcomes observed by the continuing worker, not process expiry.
 
 **Safety notes**
@@ -2044,7 +2049,7 @@ There is no automatic backup command or migration rollback command.
 | Linear completion pending | Verify external Linear automation/state. The controller only observes; keep driving or use one `reconcile-linear` diagnostic read. |
 | Dirty source checkout | The controller leaves it untouched and emits attention. The operator decides how to clean/synchronize it, then retries cleanup if appropriate. |
 | Cleanup partial failure | Inspect per-resource results and actual ownership. Retry `drive`/`cleanup`; only unfinished owned resources are retried. |
-| Worker priority tie | Resolve the highest-priority tie in Linear; the controller intentionally has no FIFO fallback. |
+| Worker candidate scan incomplete | Inspect pagination and identity authority. The controller admits none from a truncated, duplicate, contradictory, or otherwise ambiguous scan. |
 | Retry attention | Inspect failure class, phase, count, and reason. Terminal audit schedules do not authorize evidence deletion. |
 | LaunchAgent not running | Run LaunchAgent `status`, inspect finite reason codes and private logs, correct binary/config/log permissions, then kickstart only when status recommends it. |
 | LaunchAgent control timeout | Treat as unknown/attention. Run `status`; never assume success and issue an immediate duplicate control operation. |

@@ -125,8 +125,9 @@ func CleanupResidueAttentionEvent(run Run, transitionSequence int64, evidenceDig
 	})
 }
 
-// CandidatePriorityTieAttentionEvent maps a deterministic, top-priority tie
-// without selecting a candidate or mutating Linear.
+// CandidatePriorityTieAttentionEvent remains only for validation of durable
+// events written before deterministic total ordering was introduced. Current
+// dispatch cycles never emit this event.
 func CandidatePriorityTieAttentionEvent(scanID, linearIdentifier string, profile OperatorAttentionProfile, evidenceDigest string, observedAt time.Time) (OperatorAttentionEvent, error) {
 	return newOperatorAttentionEvent(operatorAttentionEventInput{
 		ScopeID: scanID, EventType: OperatorAttentionCandidatePriorityTie, LinearIdentifier: linearIdentifier,

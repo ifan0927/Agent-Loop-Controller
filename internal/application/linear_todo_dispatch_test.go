@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -497,7 +498,11 @@ func dispatchCandidate(seed, identifier string, priority int) LinearTodoCandidat
 	created := time.Date(2026, 7, 14, 0, 0, 0, 0, time.UTC)
 	updated := created.Add(time.Hour)
 	labels := []LinearLabel{{ID: dispatchUUID(seed + "-agent"), Name: "agent:codex"}, {ID: dispatchUUID(seed + "-repo"), Name: "repo:test"}}
-	return LinearTodoCandidate{IssueID: dispatchUUID(seed), Identifier: identifier, Priority: priority, State: dispatchAuthority().TodoState, Cycle: LinearCycle{ID: dispatchUUID(seed + "-cycle"), Number: 1, StartsAt: created, EndsAt: created.Add(24 * time.Hour), IsActive: true}, Labels: labels, RepositoryLabels: []LinearLabel{labels[1]}, BranchName: "ifan/" + stringsToBranch(identifier), SourceRevision: updated.Format(time.RFC3339Nano), SourceDigest: dispatchDigest(seed + "-source"), CreatedAt: created, UpdatedAt: updated}
+	teamKey, sequence, ok := normalizedLinearIdentifier(identifier)
+	if !ok {
+		panic("invalid dispatch candidate identifier")
+	}
+	return LinearTodoCandidate{IssueID: dispatchUUID(seed), Identifier: identifier, TeamKey: teamKey, IssueSequence: sequence, Priority: priority, State: dispatchAuthority().TodoState, Cycle: LinearCycle{ID: dispatchUUID(seed + "-cycle"), Number: 1, StartsAt: created, EndsAt: created.Add(24 * time.Hour), IsActive: true}, Labels: labels, RepositoryLabels: []LinearLabel{labels[1]}, BranchName: "ifan/" + stringsToBranch(identifier), SourceRevision: updated.Format(time.RFC3339Nano), SourceDigest: dispatchDigest(seed + "-source"), CreatedAt: created, UpdatedAt: updated}
 }
 
 func dispatchSource(candidate LinearTodoCandidate) LinearTaskSource {
@@ -528,7 +533,7 @@ func TestLinearTodoDispatcherSelectsOnePriorityCandidateThenStartsAndDrives(t *t
 	if err != nil || result.Outcome != LinearTodoDispatchDriven || scanner.calls != 1 || store.reserveCalls != 1 || store.run.IssueID != high.Identifier || len(starter.calls) != 1 || starter.calls[0].IssueID != high.IssueID || len(driver.calls) != 1 || driver.calls[0].RunID != store.run.ID || len(store.attention) != 0 {
 		t.Fatalf("result=%+v scanner=%d reserve=%d run=%+v starter=%+v driver=%+v attention=%+v err=%v", result, scanner.calls, store.reserveCalls, store.run, starter.calls, driver.calls, store.attention, err)
 	}
-	if result.QueueDecision == nil || result.QueueDecision.Reason != LinearTodoQueueDecisionSelectedPriority || result.QueueDecision.CandidateCount != 2 || result.QueueDecision.SelectedPriority == nil || *result.QueueDecision.SelectedPriority != 1 || result.QueueDecision.ExistingRunPreventedScan {
+	if result.QueueDecision == nil || result.QueueDecision.Reason != LinearTodoQueueDecisionSelectedPriority || result.QueueDecision.CandidateCount != 2 || result.QueueDecision.SelectedPriority == nil || *result.QueueDecision.SelectedPriority != 1 || result.QueueDecision.SelectedTeamKey != "IFAN" || result.QueueDecision.SelectedIssueSequence == nil || *result.QueueDecision.SelectedIssueSequence != 12 || result.QueueDecision.SelectedIssueUUID != high.IssueID || result.QueueDecision.ExistingRunPreventedScan {
 		t.Fatalf("queue decision=%+v", result.QueueDecision)
 	}
 	if len(reader.calls) != 4 || reader.calls[0] != low.Identifier || reader.calls[1] != high.Identifier || store.journal.Status != "started" || store.continues != 1 || store.renewCalls != 9 || store.releasedLease.Version != store.lease.Version || store.held {
@@ -559,16 +564,52 @@ func TestLinearTodoDispatcherRenewalFailureStopsBeforeEachLongBoundary(t *testin
 	}
 }
 
-func TestLinearTodoDispatcherPriorityTieAppendsAttentionWithoutMutation(t *testing.T) {
+func TestLinearTodoDispatcherEqualPrioritySelectsLowestSequence(t *testing.T) {
 	first, second := dispatchCandidate("first", "IFAN-12", 1), dispatchCandidate("second", "IFAN-11", 1)
 	dispatcher, store, scanner, _, starter, driver := newDispatchLab(t, first, second)
 
 	result, err := dispatcher.Dispatch(context.Background())
-	if err != nil || result.Outcome != LinearTodoDispatchAttention || scanner.calls != 1 || store.reserveCalls != 0 || len(starter.calls) != 0 || len(driver.calls) != 0 || len(store.attention) != 1 || store.attention[0].EventType != OperatorAttentionCandidatePriorityTie || store.attention[0].LinearIdentifier != "IFAN-11" {
+	if err != nil || result.Outcome != LinearTodoDispatchDriven || scanner.calls != 1 || store.reserveCalls != 1 || store.run.IssueID != second.Identifier || len(starter.calls) != 1 || starter.calls[0].IssueID != second.IssueID || len(driver.calls) != 1 || len(store.attention) != 0 {
 		t.Fatalf("result=%+v reserve=%d starter=%+v driver=%+v attention=%+v err=%v", result, store.reserveCalls, starter.calls, driver.calls, store.attention, err)
 	}
-	if result.QueueDecision == nil || result.QueueDecision.Reason != LinearTodoQueueDecisionPriorityTie || result.QueueDecision.CandidateCount != 2 || result.QueueDecision.TieReason != LinearTodoQueueTieReasonTopPriority || result.QueueDecision.SelectedPriority != nil || result.QueueDecision.ExistingRunPreventedScan {
+	if result.QueueDecision == nil || result.QueueDecision.Reason != LinearTodoQueueDecisionSelectedPriority || result.QueueDecision.CandidateCount != 2 || result.QueueDecision.SelectedIssueSequence == nil || *result.QueueDecision.SelectedIssueSequence != 11 || result.QueueDecision.SelectedIssueUUID != second.IssueID || result.QueueDecision.ExistingRunPreventedScan {
 		t.Fatalf("queue decision=%+v", result.QueueDecision)
+	}
+}
+
+func TestLinearTodoDispatcherSelectionIsIndependentOfCandidateOrder(t *testing.T) {
+	first := dispatchCandidate("permutation-first", "IFAN-31", 2)
+	selected := dispatchCandidate("permutation-selected", "IFAN-7", 1)
+	third := dispatchCandidate("permutation-third", "IFAN-19", 1)
+	permutations := [][]LinearTodoCandidate{
+		{first, selected, third}, {first, third, selected}, {selected, first, third},
+		{selected, third, first}, {third, first, selected}, {third, selected, first},
+	}
+	for index, candidates := range permutations {
+		dispatcher, store, _, _, _, _ := newDispatchLab(t, candidates...)
+		result, err := dispatcher.Dispatch(context.Background())
+		if err != nil || result.Outcome != LinearTodoDispatchDriven || store.run.IssueID != selected.Identifier || result.QueueDecision == nil || result.QueueDecision.SelectedIssueUUID != selected.IssueID {
+			t.Fatalf("permutation=%d candidates=%v result=%+v run=%+v err=%v", index, candidates, result, store.run, err)
+		}
+	}
+}
+
+func TestLinearTodoCandidateComparatorUsesUUIDAsDefensiveFinalRank(t *testing.T) {
+	left, right := dispatchCandidate("uuid-left", "IFAN-8", 1), dispatchCandidate("uuid-right", "IFAN-9", 1)
+	right.IssueSequence = left.IssueSequence
+	if got := compareLinearTodoCandidates(left, right); got != strings.Compare(left.IssueID, right.IssueID) {
+		t.Fatalf("comparison=%d left=%s right=%s", got, left.IssueID, right.IssueID)
+	}
+}
+
+func TestLinearTodoDispatcherRejectsContradictoryNormalizedSequence(t *testing.T) {
+	first, contradictory := dispatchCandidate("sequence-first", "IFAN-11", 1), dispatchCandidate("sequence-contradiction", "IFAN-12", 1)
+	contradictory.Identifier, contradictory.IssueSequence = "IFAN-011", 11
+	dispatcher, store, scanner, _, starter, driver := newDispatchLab(t, first, contradictory)
+
+	result, err := dispatcher.Dispatch(context.Background())
+	if err != nil || result.Outcome != LinearTodoDispatchAttention || scanner.calls != 1 || store.reserveCalls != 0 || len(starter.calls) != 0 || len(driver.calls) != 0 || len(store.attention) != 1 || store.attention[0].EventType != OperatorAttentionCandidateScan {
+		t.Fatalf("result=%+v scans=%d reserve=%d starter=%+v driver=%+v attention=%+v err=%v", result, scanner.calls, store.reserveCalls, starter.calls, driver.calls, store.attention, err)
 	}
 }
 
@@ -621,7 +662,7 @@ func TestLinearTodoDispatcherCompletedRunAllowsNextPollSelection(t *testing.T) {
 	if err != nil || secondResult.Outcome != LinearTodoDispatchDriven || scanner.calls != 2 || store.reserveCalls != 2 || len(starter.calls) != 2 || len(driver.calls) != 2 || store.run.ID == firstRunID || store.run.IssueID != second.Identifier {
 		t.Fatalf("second result=%+v scanner=%d reserve=%d starter=%+v driver=%+v run=%+v err=%v", secondResult, scanner.calls, store.reserveCalls, starter.calls, driver.calls, store.run, err)
 	}
-	if secondResult.QueueDecision == nil || secondResult.QueueDecision.Reason != LinearTodoQueueDecisionSelectedPriority || secondResult.QueueDecision.CandidateCount != 1 || secondResult.QueueDecision.SelectedPriority == nil || *secondResult.QueueDecision.SelectedPriority != 3 {
+	if secondResult.QueueDecision == nil || secondResult.QueueDecision.Reason != LinearTodoQueueDecisionSelectedPriority || secondResult.QueueDecision.CandidateCount != 1 || secondResult.QueueDecision.SelectedPriority == nil || *secondResult.QueueDecision.SelectedPriority != 3 || secondResult.QueueDecision.SelectedIssueSequence == nil || *secondResult.QueueDecision.SelectedIssueSequence != 44 {
 		t.Fatalf("queue decision=%+v", secondResult.QueueDecision)
 	}
 }
@@ -633,19 +674,19 @@ func TestLinearTodoDispatcherNoCandidateProjectsQueueDecision(t *testing.T) {
 	if err != nil || result.Outcome != LinearTodoDispatchNoCandidate || scanner.calls != 1 {
 		t.Fatalf("result=%+v scanner=%d err=%v", result, scanner.calls, err)
 	}
-	if result.QueueDecision == nil || result.QueueDecision.Reason != LinearTodoQueueDecisionNoCandidate || result.QueueDecision.CandidateCount != 0 || result.QueueDecision.SelectedPriority != nil || result.QueueDecision.TieReason != "" || result.QueueDecision.ExistingRunPreventedScan {
+	if result.QueueDecision == nil || result.QueueDecision.Reason != LinearTodoQueueDecisionNoCandidate || result.QueueDecision.CandidateCount != 0 || result.QueueDecision.SelectedPriority != nil || result.QueueDecision.SelectedIssueSequence != nil || result.QueueDecision.ExistingRunPreventedScan {
 		t.Fatalf("queue decision=%+v", result.QueueDecision)
 	}
 }
 
 func TestLinearTodoQueueDecisionValidationIsAllowlisted(t *testing.T) {
 	priority := 0
+	sequence := 42
 	valid := []LinearTodoQueueDecision{
-		queueDecision(LinearTodoQueueDecisionNoCandidate, 0, nil, "", false),
-		queueDecision(LinearTodoQueueDecisionActiveRun, 0, nil, "", true),
-		queueDecision(LinearTodoQueueDecisionIncompleteScan, 2, nil, "", false),
-		queueDecision(LinearTodoQueueDecisionPriorityTie, 2, nil, LinearTodoQueueTieReasonTopPriority, false),
-		queueDecision(LinearTodoQueueDecisionSelectedPriority, 3, &priority, "", false),
+		queueDecision(LinearTodoQueueDecisionNoCandidate, 0, false),
+		queueDecision(LinearTodoQueueDecisionActiveRun, 0, true),
+		queueDecision(LinearTodoQueueDecisionIncompleteScan, 2, false),
+		{Reason: LinearTodoQueueDecisionSelectedPriority, CandidateCount: 3, SelectedPriority: &priority, SelectedTeamKey: "IFAN", SelectedIssueSequence: &sequence, SelectedIssueUUID: dispatchUUID("decision")},
 	}
 	for _, decision := range valid {
 		if err := decision.Validate(); err != nil {
@@ -655,8 +696,13 @@ func TestLinearTodoQueueDecisionValidationIsAllowlisted(t *testing.T) {
 	invalid := []LinearTodoQueueDecision{
 		{Reason: "external-text", CandidateCount: 1},
 		{Reason: LinearTodoQueueDecisionSelectedPriority, CandidateCount: 1},
-		{Reason: LinearTodoQueueDecisionPriorityTie, CandidateCount: 1, TieReason: "fifo"},
+		{Reason: LinearTodoQueueDecisionNoCandidate, CandidateCount: 1, SelectedPriority: &priority},
 		{Reason: LinearTodoQueueDecisionNoCandidate, CandidateCount: -1},
+		{Reason: LinearTodoQueueDecisionSelectedPriority, CandidateCount: 0, SelectedPriority: &priority, SelectedTeamKey: "IFAN", SelectedIssueSequence: &sequence, SelectedIssueUUID: dispatchUUID("zero-candidates")},
+		{Reason: LinearTodoQueueDecisionSelectedPriority, CandidateCount: 1, SelectedPriority: &priority, SelectedTeamKey: "prose\n", SelectedIssueSequence: &sequence, SelectedIssueUUID: dispatchUUID("unsafe-team")},
+		{Reason: LinearTodoQueueDecisionSelectedPriority, CandidateCount: 1, SelectedPriority: &priority, SelectedTeamKey: "IFAN", SelectedIssueSequence: &sequence, SelectedIssueUUID: dispatchUUID("selected-active"), ExistingRunPreventedScan: true},
+		{Reason: LinearTodoQueueDecisionActiveRun, CandidateCount: 0, ExistingRunPreventedScan: false},
+		{Reason: LinearTodoQueueDecisionActiveRun, CandidateCount: 1, ExistingRunPreventedScan: true},
 	}
 	for _, decision := range invalid {
 		if err := decision.Validate(); err == nil {

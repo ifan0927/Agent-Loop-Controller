@@ -82,7 +82,7 @@ Important integration boundaries include:
 - implementation interruption and explicit session resume;
 - exact-head verifier/review authorization and invalidation;
 - intent-before-write plus post-interruption reconciliation;
-- automatic scheduler lease, one-active-run, priority tie, and durable retry;
+- automatic scheduler lease, one-active-run, deterministic total ordering, and durable retry;
 - trusted review feedback identity/lifecycle/reply idempotency;
 - source sync and partial ownership-safe cleanup;
 - CLI restart using a second process and the same SQLite database.

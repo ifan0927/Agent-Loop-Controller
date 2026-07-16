@@ -520,6 +520,9 @@ func TestAutomaticAdmissionAbandonReleasesSlotAndReplaysIdempotently(t *testing.
 		t.Fatalf("replacement lease acquired=%v err=%v", acquired, err)
 	}
 	defer store.ReleaseLinearTodoAdmissionLease(ctx, newLease)
+	if _, _, reserved, err := store.ReserveLinearTodoAdmission(ctx, automaticAdmissionReservation(journal.IssueUUID, "run-same-after-abandon", run.IssueID, newLease)); err == nil || reserved {
+		t.Fatalf("abandoned issue was re-admitted reserved=%v err=%v", reserved, err)
+	}
 	if _, _, reserved, err := store.ReserveLinearTodoAdmission(ctx, automaticAdmissionReservation("123e4567-e89b-42d3-a456-426614174099", "run-after-abandon", "IFAN-99", newLease)); err != nil || !reserved {
 		t.Fatalf("slot was not released reserved=%v err=%v", reserved, err)
 	}

@@ -68,7 +68,8 @@ This milestone is recorded by the closed
 
 ### Completed: local automatic admission and trusted feedback implementation
 
-- Disabled-by-default priority-only Linear Todo admission.
+- Disabled-by-default Linear Todo admission with deterministic
+  priority/identifier/UUID ordering and serial handoff.
 - Singleton scheduling lease, reservation/mutation journal, one-active-run
   policy, durable retry schedule, worker, and macOS LaunchAgent controls.
 - Sanitized transport-neutral operator-attention events and queue-decision

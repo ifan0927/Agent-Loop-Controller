@@ -72,6 +72,8 @@ type LinearTodoCandidateAuthority struct {
 type LinearTodoCandidate struct {
 	IssueID          string        `json:"issue_id"`
 	Identifier       string        `json:"identifier"`
+	TeamKey          string        `json:"team_key"`
+	IssueSequence    int           `json:"issue_sequence"`
 	Priority         int           `json:"priority"`
 	State            LinearState   `json:"state"`
 	Cycle            LinearCycle   `json:"cycle"`

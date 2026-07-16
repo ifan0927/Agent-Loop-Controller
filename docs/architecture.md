@@ -291,8 +291,8 @@ operator-attention event.
 
 **Authoritative state/evidence**
 
-Singleton admission lease, journal, run state, priority-only selection evidence,
-and retry schedule.
+Singleton admission lease, journal, run state, deterministic priority/team
+sequence/UUID selection evidence, and retry schedule.
 
 **External side effects**
 
@@ -301,8 +301,10 @@ One Linear state mutation and the existing driver's narrow side effects.
 **Failure and recovery behavior**
 
 One nonterminal run prevents scanning and is resumed first. Only typed process
-start/temporary-unavailable failures receive bounded durable retries. Equal top
-priority, incomplete scans, conflicts, and exhaustion stop for attention.
+start/temporary-unavailable failures receive bounded durable retries. A
+complete valid bounded scan selects by priority, numeric Linear sequence, then
+immutable UUID, independent of response order. Incomplete or contradictory
+scans, conflicts, and exhaustion stop for attention.
 Human-decision and manual-intervention states are parked with transition-bound
 attention; GitHub approval remains inside the production driver's bounded poll
 loop. Every dispatch cycle releases its short scheduler lease before waiting.
@@ -323,7 +325,8 @@ attempt and produces a new stable attention event instead of looping.
 
 **Key invariants**
 
-No preemption, FIFO fallback, arbitrary tie-break, or more than one active run.
+No preemption, timestamp/FIFO ordering, or more than one active run. The total
+order is controller policy and never derives from issue prose.
 Retry cannot answer a human decision, approve or merge a PR, abandon a run, or
 adopt unrelated external state.
 
@@ -938,7 +941,7 @@ resolution is not approval, and an approval for an old head is stale.
 
 ## 14. Known Constraints
 
-- One automatic nonterminal run; no preemption or priority tie-break.
+- One automatic nonterminal run; no preemption or concurrent queue execution.
 - Local macOS-oriented operation and LaunchAgent supervision; no server mode.
 - One repository and one owned PR per run; configuration may contain multiple
   selectable repository profiles, but there are no cross-repository

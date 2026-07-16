@@ -26,11 +26,12 @@ func TestAdmissionWorkerOnceDispatchesExactlyOneCycle(t *testing.T) {
 
 func TestAdmissionWorkerProjectsSanitizedQueueDecision(t *testing.T) {
 	priority := 0
-	decision := &application.LinearTodoQueueDecision{Reason: application.LinearTodoQueueDecisionSelectedPriority, CandidateCount: 3, SelectedPriority: &priority}
+	sequence := 42
+	decision := &application.LinearTodoQueueDecision{Reason: application.LinearTodoQueueDecisionSelectedPriority, CandidateCount: 3, SelectedPriority: &priority, SelectedTeamKey: "IFAN", SelectedIssueSequence: &sequence, SelectedIssueUUID: "123e4567-e89b-42d3-a456-426614174042"}
 	result, err := runAdmissionWorker(context.Background(), true, time.Minute, func(context.Context) (application.LinearTodoDispatchResult, error) {
 		return application.LinearTodoDispatchResult{Outcome: application.LinearTodoDispatchDriven, QueueDecision: decision}, nil
 	}, func(context.Context, time.Duration) error { t.Fatal("once worker must not wait"); return nil })
-	if err != nil || result.QueueDecision == nil || result.QueueDecision.Reason != application.LinearTodoQueueDecisionSelectedPriority || result.QueueDecision.CandidateCount != 3 || result.QueueDecision.SelectedPriority == nil || *result.QueueDecision.SelectedPriority != 0 {
+	if err != nil || result.QueueDecision == nil || result.QueueDecision.Reason != application.LinearTodoQueueDecisionSelectedPriority || result.QueueDecision.CandidateCount != 3 || result.QueueDecision.SelectedPriority == nil || *result.QueueDecision.SelectedPriority != 0 || result.QueueDecision.SelectedIssueSequence == nil || *result.QueueDecision.SelectedIssueSequence != 42 {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 	raw, err := json.Marshal(workerOutput{QueueDecision: result.QueueDecision, Stopped: result.Stopped})
@@ -38,7 +39,7 @@ func TestAdmissionWorkerProjectsSanitizedQueueDecision(t *testing.T) {
 		t.Fatal(err)
 	}
 	var projected workerOutput
-	if err := json.Unmarshal(raw, &projected); err != nil || projected.QueueDecision == nil || projected.QueueDecision.SelectedPriority == nil || *projected.QueueDecision.SelectedPriority != 0 {
+	if err := json.Unmarshal(raw, &projected); err != nil || projected.QueueDecision == nil || projected.QueueDecision.SelectedPriority == nil || *projected.QueueDecision.SelectedPriority != 0 || projected.QueueDecision.SelectedTeamKey != "IFAN" || projected.QueueDecision.SelectedIssueSequence == nil || *projected.QueueDecision.SelectedIssueSequence != 42 {
 		t.Fatalf("projected=%+v raw=%s err=%v", projected, raw, err)
 	}
 }

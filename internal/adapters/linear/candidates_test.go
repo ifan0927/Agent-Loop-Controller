@@ -78,7 +78,7 @@ func TestListTodoCandidatesReturnsSanitizedBoundedSnapshot(t *testing.T) {
 	if calls != 2 || len(scan.Candidates) != 2 || scan.Candidates[0].IssueID != fixtureUUID("issue-b") || scan.Candidates[1].IssueID != fixtureUUID("issue-a") || scan.Digest == "" || scan.ObservedAt.IsZero() {
 		t.Fatalf("unexpected scan: %+v calls=%d", scan, calls)
 	}
-	if scan.Candidates[1].Priority != 1 || len(scan.Candidates[1].RepositoryLabels) != 2 || scan.Candidates[1].SourceRevision != "2026-07-14T00:00:00Z" || scan.Candidates[1].SourceDigest == "" {
+	if scan.Candidates[1].Priority != 1 || scan.Candidates[1].TeamKey != "IFAN" || scan.Candidates[1].IssueSequence != 7 || len(scan.Candidates[1].RepositoryLabels) != 2 || scan.Candidates[1].SourceRevision != "2026-07-14T00:00:00Z" || scan.Candidates[1].SourceDigest == "" {
 		t.Fatalf("candidate did not preserve normalized metadata: %+v", scan.Candidates[1])
 	}
 	if strings.Contains(fmtObservation(scan), candidateUntrustedText) {
@@ -177,6 +177,12 @@ func TestListTodoCandidatesFailsClosed(t *testing.T) {
 			value["data"].(map[string]any)["team"].(map[string]any)["issues"].(map[string]any)["nodes"].([]map[string]any)[0]["id"] = "invalid-issue-id"
 			return value
 		}, want: "incomplete or outside"},
+		{name: "identifier team mismatch", authority: candidateAuthority(2, 1), response: func() map[string]any {
+			return candidateResponse([]map[string]any{candidateNode("issue", "OTHER-1", 1, requiredLabels())}, false, "")
+		}, want: "identifier does not match configured team"},
+		{name: "identifier sequence invalid", authority: candidateAuthority(2, 1), response: func() map[string]any {
+			return candidateResponse([]map[string]any{candidateNode("issue", "IFAN-not-a-number", 1, requiredLabels())}, false, "")
+		}, want: "identifier does not match configured team"},
 		{name: "invalid cycle id", authority: candidateAuthority(2, 1), response: func() map[string]any {
 			value := candidateResponse([]map[string]any{candidateNode("issue", "IFAN-1", 1, requiredLabels())}, false, "")
 			value["data"].(map[string]any)["team"].(map[string]any)["issues"].(map[string]any)["nodes"].([]map[string]any)[0]["cycle"].(map[string]any)["id"] = "invalid-cycle-id"
@@ -237,6 +243,10 @@ func TestListTodoCandidatesRejectsPaginationOverlapCursorAndAuthorityDrift(t *te
 			value["data"].(map[string]any)["team"].(map[string]any)["issues"].(map[string]any)["nodes"] = []map[string]any{candidateNode("issue-a", "IFAN-1", 1, requiredLabels())}
 			return value
 		}, want: "appeared more than once"},
+		{name: "normalized sequence overlap", second: func(value map[string]any) map[string]any {
+			value["data"].(map[string]any)["team"].(map[string]any)["issues"].(map[string]any)["nodes"] = []map[string]any{candidateNode("issue-b", "IFAN-01", 1, requiredLabels())}
+			return value
+		}, want: "normalized sequence appeared more than once"},
 		{name: "repeated cursor", second: func(value map[string]any) map[string]any {
 			value["data"].(map[string]any)["team"].(map[string]any)["issues"].(map[string]any)["pageInfo"].(map[string]any)["endCursor"] = "cursor-1"
 			return value

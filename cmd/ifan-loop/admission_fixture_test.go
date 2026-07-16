@@ -150,6 +150,47 @@ waitForDriver:
 	}
 }
 
+func TestOfflineSQLiteAdmissionSelectsTotalOrderFromThreeCandidates(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlitestore.Open(t.TempDir() + "/controller.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	first := offlineAdmissionCandidate()
+	first.Identifier, first.IssueSequence = "IFAN-41", 41
+	second := first
+	second.IssueID, second.Identifier, second.IssueSequence, second.BranchName, second.SourceDigest = "123e4567-e89b-42d3-a456-426614174107", "IFAN-7", 7, "ifan/ifan-7-total-order", offlineAdmissionDigest("second-source")
+	third := first
+	third.IssueID, third.Identifier, third.IssueSequence, third.Priority, third.BranchName, third.SourceDigest = "123e4567-e89b-42d3-a456-426614174108", "IFAN-2", 2, 3, "ifan/ifan-2-total-order", offlineAdmissionDigest("third-source")
+
+	repository := offlineAdmissionRepository(t)
+	reader := newOfflineAdmissionReaders(offlineAdmissionSource(first), offlineAdmissionSource(second), offlineAdmissionSource(third))
+	scanner := &offlineAdmissionScanner{scan: application.LinearTodoCandidateScan{Candidates: []application.LinearTodoCandidate{third, first, second}, Digest: offlineAdmissionDigest("three-candidate-scan"), ObservedAt: first.UpdatedAt}}
+	starter := &offlineAdmissionStarter{reader: reader}
+	driver := newOfflineAdmissionDriver()
+	driver.release()
+	controller := application.NewLocalController(store, &offlineAdmissionWorktrees{}, &offlineAdmissionCodex{}, offlineAdmissionVerifier{}, offlineAdmissionGit{}, "fixture-codex", repository.WorktreeRoot)
+	dispatcher, err := newOfflineAdmissionDispatcher(scanner, reader, starter, store, controller, driver, repository, "three-candidate-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := dispatcher.Dispatch(ctx)
+	if err != nil || result.Outcome != application.LinearTodoDispatchDriven || result.QueueDecision == nil || result.QueueDecision.SelectedPriority == nil || *result.QueueDecision.SelectedPriority != 1 || result.QueueDecision.SelectedIssueSequence == nil || *result.QueueDecision.SelectedIssueSequence != 7 || result.QueueDecision.SelectedIssueUUID != second.IssueID {
+		t.Fatalf("result=%+v decision=%+v err=%v", result, result.QueueDecision, err)
+	}
+	commands, mutations := driver.commands(), starter.mutations()
+	if scanner.calls() != 1 || len(commands) != 1 || len(mutations) != 1 || mutations[0].IssueID != second.IssueID {
+		t.Fatalf("scans=%d commands=%+v mutations=%+v", scanner.calls(), commands, mutations)
+	}
+	run, err := store.GetRun(ctx, commands[0].RunID)
+	if err != nil || run.IssueID != second.Identifier {
+		t.Fatalf("run=%+v err=%v", run, err)
+	}
+}
+
 type offlineAdmissionObserved struct {
 	result admissionWorkerResult
 	err    error
@@ -192,22 +233,31 @@ func (s *offlineAdmissionScanner) calls() int {
 
 type offlineAdmissionReader struct {
 	mu      sync.Mutex
-	source  application.LinearTaskSource
-	started bool
+	sources map[string]application.LinearTaskSource
+	started map[string]bool
 }
 
 func newOfflineAdmissionReader(source application.LinearTaskSource) *offlineAdmissionReader {
-	return &offlineAdmissionReader{source: source}
+	return newOfflineAdmissionReaders(source)
+
+}
+
+func newOfflineAdmissionReaders(sources ...application.LinearTaskSource) *offlineAdmissionReader {
+	reader := &offlineAdmissionReader{sources: make(map[string]application.LinearTaskSource, len(sources)), started: make(map[string]bool, len(sources))}
+	for _, source := range sources {
+		reader.sources[source.Identifier] = source
+	}
+	return reader
 }
 
 func (r *offlineAdmissionReader) ReadIssue(_ context.Context, identifier string) (application.LinearTaskSource, []application.LinearRequestObservation, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if identifier != r.source.Identifier {
+	source, found := r.sources[identifier]
+	if !found {
 		return application.LinearTaskSource{}, nil, errors.New("offline fixture received an unexpected issue")
 	}
-	source := r.source
-	if r.started {
+	if r.started[identifier] {
 		source.State = offlineAdmissionInProgressState
 		source.UpdatedAt = source.UpdatedAt.Add(time.Second)
 		source.SourceRevision = source.UpdatedAt.UTC().Format(time.RFC3339Nano)
@@ -219,10 +269,17 @@ func (r *offlineAdmissionReader) ReadIssue(_ context.Context, identifier string)
 func (r *offlineAdmissionReader) markStarted(issueID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if issueID != r.source.IssueID || r.started {
+	var identifier string
+	for candidateIdentifier, source := range r.sources {
+		if source.IssueID == issueID {
+			identifier = candidateIdentifier
+			break
+		}
+	}
+	if identifier == "" || r.started[identifier] {
 		return errors.New("offline fixture start mutation was not unique")
 	}
-	r.started = true
+	r.started[identifier] = true
 	return nil
 }
 
@@ -419,7 +476,7 @@ func offlineAdmissionCandidate() application.LinearTodoCandidate {
 	created := time.Date(2026, 7, 14, 0, 0, 0, 0, time.UTC)
 	updated := created.Add(time.Hour)
 	labels := []application.LinearLabel{{ID: "123e4567-e89b-42d3-a456-426614174105", Name: "agent:codex"}, {ID: "123e4567-e89b-42d3-a456-426614174106", Name: "repo:test"}}
-	return application.LinearTodoCandidate{IssueID: "123e4567-e89b-42d3-a456-426614174103", Identifier: "IFAN-41", Priority: 1, State: offlineAdmissionTodoState, Cycle: application.LinearCycle{ID: "123e4567-e89b-42d3-a456-426614174104", Number: 1, StartsAt: created, EndsAt: created.Add(24 * time.Hour), IsActive: true}, Labels: labels, RepositoryLabels: []application.LinearLabel{labels[1]}, BranchName: "ifan/ifan-41-admission-fixtures", SourceRevision: updated.Format(time.RFC3339Nano), SourceDigest: offlineAdmissionDigest("source"), CreatedAt: created, UpdatedAt: updated}
+	return application.LinearTodoCandidate{IssueID: "123e4567-e89b-42d3-a456-426614174103", Identifier: "IFAN-41", TeamKey: "IFAN", IssueSequence: 41, Priority: 1, State: offlineAdmissionTodoState, Cycle: application.LinearCycle{ID: "123e4567-e89b-42d3-a456-426614174104", Number: 1, StartsAt: created, EndsAt: created.Add(24 * time.Hour), IsActive: true}, Labels: labels, RepositoryLabels: []application.LinearLabel{labels[1]}, BranchName: "ifan/ifan-41-admission-fixtures", SourceRevision: updated.Format(time.RFC3339Nano), SourceDigest: offlineAdmissionDigest("source"), CreatedAt: created, UpdatedAt: updated}
 }
 
 func offlineAdmissionSource(candidate application.LinearTodoCandidate) application.LinearTaskSource {
