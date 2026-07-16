@@ -102,6 +102,24 @@ func TestLinearTodoDispatcherStopsRetryForTerminalRun(t *testing.T) {
 	}
 }
 
+func TestLinearTodoDispatcherIgnoresRetainedTerminalRetryAttention(t *testing.T) {
+	candidate := dispatchCandidate("fresh-after-terminal", "IFAN-54", 1)
+	dispatcher, store, scanner, _, _, driver := newDispatchLab(t, candidate)
+	terminal := authorizeDispatchRun(Run{ID: "run-abandoned", IssueID: "IFAN-53", IdempotencyKey: "abandoned-key", Repository: "owner/repo", State: domain.StateFailed})
+	store.run = terminal
+	now := time.Date(2026, 7, 15, 7, 30, 0, 0, time.UTC)
+	dispatcher.now = func() time.Time { return now }
+	store.retrySchedules = []RetrySchedule{{RunID: terminal.ID, Phase: AutomaticRetryPhaseForRun(terminal), ControllerState: string(domain.StateManualIntervention), AttemptCount: 1, MaxAttempts: 2, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: RetryFailureManual, ReasonCode: RetryReasonManual, Status: RetryScheduleAttention, AttentionAt: now.Add(-time.Minute), CreatedAt: now.Add(-time.Minute), UpdatedAt: now.Add(-time.Minute)}}
+
+	result, err := dispatcher.Dispatch(context.Background())
+	if err != nil || result.Outcome != LinearTodoDispatchDriven || scanner.calls != 1 || len(driver.calls) != 1 {
+		t.Fatalf("result=%+v scanner=%d driver=%d err=%v", result, scanner.calls, len(driver.calls), err)
+	}
+	if len(store.retrySchedules) != 1 || store.retrySchedules[0].Status != RetryScheduleAttention {
+		t.Fatalf("terminal retry audit evidence changed: %+v", store.retrySchedules)
+	}
+}
+
 func TestLinearTodoDispatcherBoundsTypedProcessStartRetry(t *testing.T) {
 	dispatcher, store, scanner, _, _, driver := newDispatchLab(t)
 	run := authorizeDispatchRun(Run{ID: "run-process-start", IssueID: "IFAN-51", IdempotencyKey: "process-start-key", Repository: "owner/repo", State: domain.StateExecuting})

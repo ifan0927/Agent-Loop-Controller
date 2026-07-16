@@ -608,6 +608,9 @@ func (d *LinearTodoDispatcher) blockingRetry(ctx context.Context) (LinearTodoDis
 			return LinearTodoDispatchResult{}, false, classifyServiceError(runErr)
 		}
 		if schedule.Status == RetryScheduleAttention {
+			if retainedTerminalRetryAttention(run, schedule) {
+				continue
+			}
 			result, attentionErr := d.retryAttention(ctx, run, schedule)
 			return result, true, attentionErr
 		}
@@ -692,6 +695,9 @@ func (d *LinearTodoDispatcher) orphanRetryAttention(ctx context.Context) (Linear
 			return LinearTodoDispatchResult{}, false, classifyServiceError(runErr)
 		}
 		if schedule.Status == RetryScheduleAttention {
+			if retainedTerminalRetryAttention(run, schedule) {
+				continue
+			}
 			result, attentionErr := d.retryAttention(ctx, run, schedule)
 			return result, true, attentionErr
 		}
@@ -703,6 +709,13 @@ func (d *LinearTodoDispatcher) orphanRetryAttention(ctx context.Context) (Linear
 		return result, true, attentionErr
 	}
 	return LinearTodoDispatchResult{}, false, nil
+}
+
+func retainedTerminalRetryAttention(run Run, schedule RetrySchedule) bool {
+	if schedule.Status != RetryScheduleAttention {
+		return false
+	}
+	return run.State == domain.StateFailed || run.State == domain.StateCompleted || run.State == domain.StateRejected
 }
 
 func (d *LinearTodoDispatcher) currentRetryRun(ctx context.Context, fallback Run) (Run, error) {
