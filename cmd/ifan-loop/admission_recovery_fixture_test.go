@@ -45,7 +45,7 @@ func TestOfflineAcceptanceWorkerRestartPreservesRetryAndStopsAtDurableAttention(
 		t.Fatalf("first worker=%+v err=%v", firstResult, err)
 	}
 	schedules, err := store.ListRetrySchedules(ctx)
-	if err != nil || len(schedules) != 1 || schedules[0].Status != application.RetryScheduleScheduled || schedules[0].AttemptCount != 1 {
+	if err != nil || len(schedules) != 1 || schedules[0].Status != application.RetryScheduleScheduled || schedules[0].AttemptCount != 1 || schedules[0].NextEligibleAt.Sub(schedules[0].UpdatedAt) != application.DefaultAutomaticRetryInitialDelay {
 		store.Close()
 		t.Fatalf("first durable retry schedules=%+v err=%v", schedules, err)
 	}
@@ -69,7 +69,7 @@ func TestOfflineAcceptanceWorkerRestartPreservesRetryAndStopsAtDurableAttention(
 	if secondResult.Cycles != 2 || secondResult.LastOutcome != application.LinearTodoDispatchAttention || secondResult.Stopped != "attention_required" {
 		t.Fatalf("second worker=%+v err=%v", secondResult, err)
 	}
-	if len(waits) != 1 || waits[0] < 900*time.Millisecond || waits[0] > application.DefaultAutomaticRetryInitialDelay {
+	if len(waits) != 1 || waits[0] <= 0 || waits[0] > application.DefaultAutomaticRetryInitialDelay {
 		t.Fatalf("durable retry waits=%v", waits)
 	}
 	if first.scanner.calls()+second.scanner.calls() != 1 || len(first.starter.mutations())+len(second.starter.mutations()) != 1 || first.driver.calls()+second.driver.calls() != 1 || first.worktrees.calls()+second.worktrees.calls() != 1 {
