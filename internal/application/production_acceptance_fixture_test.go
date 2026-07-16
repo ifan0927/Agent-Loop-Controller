@@ -117,6 +117,8 @@ func TestOfflineAcceptanceSparseEnvironmentUsesManagedVerifierAndGitPaths(t *tes
 	t.Setenv("PATH", strings.Join(paths, string(os.PathListSeparator)))
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GOTOOLCHAIN", "local")
+	t.Setenv("GOFLAGS", "-modcacherw")
 
 	store, err := storeadapter.Open(lab.db)
 	if err != nil {
