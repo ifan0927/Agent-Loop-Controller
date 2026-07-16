@@ -1001,11 +1001,39 @@ func (c *LocalController) acceptDecision(ctx context.Context, run Run, decision 
 	}
 	data, _ := json.MarshalIndent(decision, "", "  ")
 	path := filepath.Join(run.ArtifactRoot, fmt.Sprintf("decision-%d.json", len(inspection.Attempts)))
+	evidence := persistedDecisionEvidence{Path: path, Hash: bytesHash(data), Decision: decision, RequestOutcomePath: sourceAttempt.OutcomePath, RequestOutcomeHash: sourceAttempt.OutcomeHash}
 	if err := writeExclusive(path, data); err != nil {
-		return err
+		if !errors.Is(err, os.ErrExist) {
+			return err
+		}
+		if err := validatePersistedDecisionReplay(ctx, inspection.Timeline, evidence, data); err != nil {
+			return err
+		}
 	}
-	evidenceData, _ := json.Marshal(persistedDecisionEvidence{Path: path, Hash: bytesHash(data), Decision: decision, RequestOutcomePath: sourceAttempt.OutcomePath, RequestOutcomeHash: sourceAttempt.OutcomeHash})
+	evidenceData, _ := json.Marshal(evidence)
 	return c.store.Transition(ctx, run.ID, domain.StateAwaitingHumanDecision, domain.StateExecuting, "accepted simulated human decision", string(evidenceData), "")
+}
+
+func validatePersistedDecisionReplay(ctx context.Context, timeline []Transition, expected persistedDecisionEvidence, expectedData []byte) error {
+	for index := len(timeline) - 1; index >= 0; index-- {
+		transition := timeline[index]
+		if transition.From != domain.StateAwaitingHumanDecision || transition.To != domain.StateExecuting {
+			continue
+		}
+		var persisted persistedDecisionEvidence
+		if err := json.Unmarshal([]byte(transition.EvidenceReference), &persisted); err != nil || persisted != expected {
+			continue
+		}
+		data, err := readBoundedFile(ctx, persisted.Path, maxStructuredOutcomeBytes)
+		if err != nil {
+			return err
+		}
+		if bytesHash(data) != persisted.Hash || !bytes.Equal(data, expectedData) {
+			return errors.New("persisted decision replay artifact changed")
+		}
+		return nil
+	}
+	return errors.New("decision artifact already exists without exact persisted authority")
 }
 
 func (c *LocalController) verifyCandidate(ctx context.Context, run Run) error {

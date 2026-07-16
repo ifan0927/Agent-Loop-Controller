@@ -988,7 +988,10 @@ func TestRepairHumanDecisionResumesInsteadOfReplayingDecisionRequest(t *testing.
 	if err == nil || run.State != domain.StateExecuting || process.resumeCalls != 1 {
 		t.Fatalf("persist decision run=%+v resumes=%d err=%v", run, process.resumeCalls, err)
 	}
-	run, err = newController(t, store, lab, process, gitadapter.Workspace{}).Continue(context.Background(), run.ID, nil)
+	if err := store.Transition(context.Background(), run.ID, domain.StateExecuting, domain.StateAwaitingHumanDecision, "simulate stale decision outcome replay", inspection.Reviews[0].OutcomePath, ""); err != nil {
+		t.Fatal(err)
+	}
+	run, err = newController(t, store, lab, process, gitadapter.Workspace{}).Continue(context.Background(), run.ID, &application.Decision{ChoiceID: "inclusive", Instructions: "Use inclusive min and max bounds."})
 	if err != nil || run.State != domain.StateApprovalReady {
 		t.Fatalf("completed run=%+v err=%v", run, err)
 	}
@@ -1005,7 +1008,7 @@ func TestRepairHumanDecisionResumesInsteadOfReplayingDecisionRequest(t *testing.
 			decisionRequests++
 		}
 	}
-	if decisionRequests != 1 {
+	if decisionRequests != 2 {
 		t.Fatalf("decision request transitions=%d timeline=%+v", decisionRequests, inspection.Timeline)
 	}
 }
