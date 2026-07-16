@@ -249,7 +249,7 @@ func (s *LinearReservedIssueStartService) proveTodoReservation(run Run, reservat
 	if !sameLinearReservationMetadata(reservation, source) {
 		return errors.New("Linear Todo reservation metadata drifted")
 	}
-	snapshot, repository, err := normalizeLinearTask(source, s.resolver, false, false)
+	snapshot, repository, err := normalizeLinearTask(source, s.resolver, false, false, false)
 	if err != nil || repository.CanonicalRepository != run.Repository || snapshot.TaskHash != run.TaskHash || snapshot.Task.WorkingBranch != run.WorkingBranch {
 		return errors.New("Linear Todo task no longer matches the reservation")
 	}
@@ -263,7 +263,7 @@ func (s *LinearReservedIssueStartService) proveStartedReservation(run Run, reser
 	if !sameLinearReservationMetadata(reservation, source) {
 		return errors.New("Linear started reservation metadata drifted")
 	}
-	snapshot, repository, err := normalizeLinearTask(source, s.resolver, true, false)
+	snapshot, repository, err := normalizeLinearTask(source, s.resolver, true, false, false)
 	if err != nil || repository.CanonicalRepository != run.Repository || snapshot.Task.WorkingBranch != run.WorkingBranch || stableTaskDigest(run.NormalizedTaskJSON) != stableTaskDigestFromTask(snapshot.Task) {
 		return errors.New("Linear started task no longer matches the reservation")
 	}

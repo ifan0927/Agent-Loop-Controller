@@ -891,22 +891,25 @@ type ReconcileCommand struct {
 	TrustedFeedback     []TrustedReviewFeedbackRecord `json:"-"`
 	FeedbackUnsupported bool                          `json:"-"`
 	FeedbackDrift       bool                          `json:"-"`
+	LinearCompleted     bool                          `json:"-"`
 }
 
 type ReconcileResult struct {
 	Head   string                      `json:"reconciled_head"`
 	Status domain.ReconciliationStatus `json:"reconciliation_status"`
 	State  domain.State                `json:"current_state"`
+	Reason string                      `json:"-"`
 }
 
 type GitHubReconcileCommand struct {
-	Requester      Requester    `json:"requester"`
-	RunID          string       `json:"run_id"`
-	Repository     string       `json:"repository"`
-	ExpectedState  domain.State `json:"expected_state"`
-	IdempotencyKey string       `json:"idempotency_key"`
-	PullRequest    int64        `json:"pull_request"`
-	ExpectedHead   string       `json:"expected_head"`
+	Requester       Requester    `json:"requester"`
+	RunID           string       `json:"run_id"`
+	Repository      string       `json:"repository"`
+	ExpectedState   domain.State `json:"expected_state"`
+	IdempotencyKey  string       `json:"idempotency_key"`
+	PullRequest     int64        `json:"pull_request"`
+	ExpectedHead    string       `json:"expected_head"`
+	LinearCompleted bool         `json:"-"`
 }
 
 func (s CommandService) ReconcileFromGitHub(ctx context.Context, command GitHubReconcileCommand, reader GitHubReadPort) (ReconcileResult, error) {
@@ -914,8 +917,8 @@ func (s CommandService) ReconcileFromGitHub(ctx context.Context, command GitHubR
 		return ReconcileResult{}, serviceError(ErrorInvalidInput, "GitHub reader, pull request, and expected head are required", nil)
 	}
 	return s.withReconcileLease(ctx, ReconcileCommand{Requester: command.Requester, RunID: command.RunID, Repository: command.Repository,
-		ExpectedState: command.ExpectedState, IdempotencyKey: command.IdempotencyKey}, func(leaseCtx context.Context, inspection RunInspection, owner string) (ReconcileResult, error) {
-		if err := validateReconcileInspection(ReconcileCommand{Requester: command.Requester, RunID: command.RunID, Repository: command.Repository, ExpectedState: command.ExpectedState, IdempotencyKey: command.IdempotencyKey}, inspection); err != nil {
+		ExpectedState: command.ExpectedState, IdempotencyKey: command.IdempotencyKey, LinearCompleted: command.LinearCompleted}, func(leaseCtx context.Context, inspection RunInspection, owner string) (ReconcileResult, error) {
+		if err := validateReconcileInspection(ReconcileCommand{Requester: command.Requester, RunID: command.RunID, Repository: command.Repository, ExpectedState: command.ExpectedState, IdempotencyKey: command.IdempotencyKey, LinearCompleted: command.LinearCompleted}, inspection); err != nil {
 			return ReconcileResult{}, err
 		}
 		if inspection.PullRequest == nil || inspection.PullRequest.Number != command.PullRequest || inspection.Run.CandidateHead != command.ExpectedHead {
@@ -984,7 +987,7 @@ func (s CommandService) ReconcileFromGitHub(ctx context.Context, command GitHubR
 		}
 		drift := domain.TrustedFeedbackDrift(existingFeedback, evidence.PullRequest, evidence.Reviews, evidence.ReviewThreads, handoff)
 		full := ReconcileCommand{Requester: command.Requester, RunID: command.RunID, Repository: command.Repository, ExpectedState: command.ExpectedState,
-			IdempotencyKey: command.IdempotencyKey, Evidence: evidence, Observations: observations, Metadata: metadata, TrustedFeedback: feedback, FeedbackUnsupported: normalized.Unsupported, FeedbackDrift: drift}
+			IdempotencyKey: command.IdempotencyKey, Evidence: evidence, Observations: observations, Metadata: metadata, TrustedFeedback: feedback, FeedbackUnsupported: normalized.Unsupported, FeedbackDrift: drift, LinearCompleted: command.LinearCompleted}
 		full.Evidence.Findings = normalized.Findings
 		return s.reconcileLocked(leaseCtx, full, inspection, owner)
 	})
@@ -1183,6 +1186,9 @@ func (s CommandService) reconcileLocked(ctx context.Context, command ReconcileCo
 	if command.FeedbackUnsupported || command.FeedbackDrift || trustedFeedbackConflicts(inspection.TrustedFeedback, command.TrustedFeedback) {
 		next, reason = domain.StateManualIntervention, "trusted inline change request requires manual intervention"
 	}
+	if command.LinearCompleted && !command.Evidence.PullRequest.Merged {
+		next, reason = domain.StateManualIntervention, "Linear issue completed before a controller-owned merge was observed"
+	}
 	if len(command.TrustedFeedback) > 0 && next != domain.StateManualIntervention && (run.State == domain.StateReconcilingReviews || run.State == domain.StateAwaitingHumanApproval || run.State == domain.StateAwaitingGitHubMergeability) {
 		next, reason = domain.StateRepairing, "trusted exact-head inline change request requires repair"
 	}
@@ -1192,10 +1198,10 @@ func (s CommandService) reconcileLocked(ctx context.Context, command ReconcileCo
 			reason = "GitHub evidence has unsupported actionable findings"
 		}
 	}
-	if shouldEnterReviewReply(run.State, status, inspection.TrustedFeedback, run.CandidateHead) {
+	if next != domain.StateManualIntervention && shouldEnterReviewReply(run.State, status, inspection.TrustedFeedback, run.CandidateHead) {
 		next, reason = domain.StateReplyingReviewFeedback, "verified trusted inline repair requires a controller reply"
 	}
-	if next != domain.StateReplyingReviewFeedback && run.State == domain.StateAwaitingHumanApproval && status == domain.ReconciliationPass && approvalObservation != nil && approvalObservation.Status == domain.HumanApprovalApproved && approval != nil {
+	if !command.LinearCompleted && next != domain.StateReplyingReviewFeedback && run.State == domain.StateAwaitingHumanApproval && status == domain.ReconciliationPass && approvalObservation != nil && approvalObservation.Status == domain.HumanApprovalApproved && approval != nil {
 		if err := approval.Authorizes(command.Evidence.PullRequest, run.CandidateHead); err != nil {
 			return ReconcileResult{}, serviceError(ErrorConflict, "human approval is not bound to the exact final head", err)
 		}
@@ -1210,7 +1216,7 @@ func (s CommandService) reconcileLocked(ctx context.Context, command ReconcileCo
 	if err := persister.SaveGitHubReadSuccess(ctx, run.ID, owner, command.ExpectedState, command.IdempotencyKey, command.Observations, command.Evidence.PullRequest, command.Metadata, command.Evidence, command.TrustedFeedback, approvalObservation, approval, next, reason); err != nil {
 		return ReconcileResult{}, classifyServiceError(err)
 	}
-	return ReconcileResult{Head: run.CandidateHead, Status: status, State: next}, nil
+	return ReconcileResult{Head: run.CandidateHead, Status: status, State: next, Reason: reason}, nil
 }
 
 func trustedFeedbackConflicts(existing, observed []TrustedReviewFeedbackRecord) bool {

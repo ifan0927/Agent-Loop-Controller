@@ -887,6 +887,38 @@ func TestProductionMergeabilityWaitPollsWithoutMergeAndRetriesOnlyAfterResolutio
 	}
 }
 
+func TestProductionReconcileCompletedLinearSourceFailsClosedWithGitHubEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		merged     bool
+		wantReason string
+	}{
+		{name: "externally merged", merged: true, wantReason: "GitHub pull request closed or merged outside the controller gate"},
+		{name: "completed while open", wantReason: "Linear issue completed before a controller-owned merge was observed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			coordinator, store, run, reader, writer := newMergeCoordinator(t)
+			run.State, store.run.State = domain.StateAwaitingHumanApproval, domain.StateAwaitingHumanApproval
+			store.inspection.Run = store.run
+			source := validLinearSource()
+			source.State = LinearState{ID: "done", Name: "Done", Type: "completed"}
+			source.SourceRevision = "2026-07-13T03:00:00Z"
+			coordinator.admission.reader = &admissionReader{source: source}
+			if tc.merged {
+				reader.evidence.PullRequest = writer.response
+			}
+
+			result, err := coordinator.ReconcileGitHub(context.Background(), ProductionReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, reader)
+			if err != nil || result.Action != ProductionStop || result.Reason != tc.wantReason || store.run.State != domain.StateManualIntervention || reader.calls != 1 {
+				t.Fatalf("result=%+v err=%v state=%s reads=%d", result, err, store.run.State, reader.calls)
+			}
+			if store.pr == nil || store.pr.Merged != tc.merged || len(store.github) != 1 || store.merge != nil || len(store.linearCompletion) != 0 || len(store.cleanup) != 0 {
+				t.Fatalf("pr=%+v github=%d merge=%+v linear=%+v cleanup=%+v", store.pr, len(store.github), store.merge, store.linearCompletion, store.cleanup)
+			}
+		})
+	}
+}
+
 func TestProductionMergePolicyResolutionWithAdvancedObservationRestartsAndRetriesOnce(t *testing.T) {
 	coordinator, store, run, reader, writer := newMergeCoordinator(t)
 	configureMergeabilityFixture(t, store, run, reader)

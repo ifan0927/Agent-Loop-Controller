@@ -239,6 +239,41 @@ func TestLinearRevalidateAllowsUnchangedStartedStateDuringRepairExecution(t *tes
 	}
 }
 
+func TestLinearGitHubRevalidateAllowsOnlyUnchangedCompletedObservation(t *testing.T) {
+	repository := LocalRepository{CanonicalRepository: "owner/repo", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
+	original := validLinearSource()
+	snapshot, _, err := admitLinearTask(original, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: mustJSON(t, snapshot.Task), State: domain.StateAwaitingHumanApproval})
+	completed := original
+	completed.State = LinearState{ID: "done", Name: "Done", Type: "completed"}
+	completed.SourceRevision = "2026-07-13T00:01:00Z"
+	store := &admissionStore{serviceStore: serviceStore{run: run}}
+	service, err := NewLinearAdmissionService(&admissionReader{source: completed}, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, store, &admissionController{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := LinearRevalidateCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}
+	if _, err := service.Revalidate(context.Background(), command); err == nil {
+		t.Fatal("ordinary revalidation accepted completed Linear source")
+	}
+	got, observedCompleted, err := service.RevalidateForGitHubReconcile(context.Background(), command)
+	if err != nil || got.ID != run.ID || !observedCompleted || store.marked {
+		t.Fatalf("run=%+v completed=%t marked=%t err=%v", got, observedCompleted, store.marked, err)
+	}
+
+	completed.Description += "\n\nMaterial task drift."
+	drifted, err := NewLinearAdmissionService(&admissionReader{source: completed}, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, &admissionStore{serviceStore: serviceStore{run: run}}, &admissionController{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := drifted.RevalidateForGitHubReconcile(context.Background(), command); err == nil {
+		t.Fatal("GitHub observation accepted completed Linear task drift")
+	}
+}
+
 func TestLinearRevalidateRejectsStartedStateWithTaskChange(t *testing.T) {
 	repository := LocalRepository{CanonicalRepository: "owner/repo", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
 	original := validLinearSource()

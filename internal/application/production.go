@@ -156,7 +156,7 @@ func (c *ProductionCoordinator) Continue(ctx context.Context, command Production
 }
 
 func (c *ProductionCoordinator) ReconcileGitHub(ctx context.Context, command ProductionReconcileCommand, reader GitHubReadPort) (ProductionResult, error) {
-	run, err := c.admission.Revalidate(ctx, LinearRevalidateCommand{Requester: command.Requester, RunID: command.RunID, Repository: command.Repository, ExpectedState: command.ExpectedState, IdempotencyKey: command.IdempotencyKey})
+	run, linearCompleted, err := c.admission.RevalidateForGitHubReconcile(ctx, LinearRevalidateCommand{Requester: command.Requester, RunID: command.RunID, Repository: command.Repository, ExpectedState: command.ExpectedState, IdempotencyKey: command.IdempotencyKey})
 	if err != nil {
 		return ProductionResult{}, err
 	}
@@ -174,12 +174,15 @@ func (c *ProductionCoordinator) ReconcileGitHub(ctx context.Context, command Pro
 	if inspection.PullRequest == nil {
 		return ProductionResult{}, serviceError(ErrorConflict, "persisted pull request identity is required", nil)
 	}
-	result, err := c.commands.ReconcileFromGitHub(ctx, GitHubReconcileCommand{Requester: command.Requester, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey, PullRequest: inspection.PullRequest.Number, ExpectedHead: run.CandidateHead}, reader)
+	result, err := c.commands.ReconcileFromGitHub(ctx, GitHubReconcileCommand{Requester: command.Requester, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey, PullRequest: inspection.PullRequest.Number, ExpectedHead: run.CandidateHead, LinearCompleted: linearCompleted}, reader)
 	if err != nil {
 		return ProductionResult{}, err
 	}
 	run.State = result.State
 	next, reason := productionNextAction(run.State)
+	if result.Reason != "" && run.State == domain.StateManualIntervention {
+		reason = result.Reason
+	}
 	return ProductionResult{Action: next, Run: projectRunResult(run), Head: result.Head, Reason: reason}, nil
 }
 
