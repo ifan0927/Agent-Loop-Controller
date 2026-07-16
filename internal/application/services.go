@@ -1192,7 +1192,7 @@ func (s CommandService) reconcileLocked(ctx context.Context, command ReconcileCo
 			reason = "GitHub evidence has unsupported actionable findings"
 		}
 	}
-	if status == domain.ReconciliationPass && hasOutstandingReviewReply(inspection.TrustedFeedback, run.CandidateHead) {
+	if shouldEnterReviewReply(run.State, status, inspection.TrustedFeedback, run.CandidateHead) {
 		next, reason = domain.StateReplyingReviewFeedback, "verified trusted inline repair requires a controller reply"
 	}
 	if next != domain.StateReplyingReviewFeedback && run.State == domain.StateAwaitingHumanApproval && status == domain.ReconciliationPass && approvalObservation != nil && approvalObservation.Status == domain.HumanApprovalApproved && approval != nil {
@@ -1241,6 +1241,10 @@ func hasOutstandingReviewReply(items []TrustedReviewFeedbackRecord, head string)
 		}
 	}
 	return false
+}
+
+func shouldEnterReviewReply(current domain.State, status domain.ReconciliationStatus, items []TrustedReviewFeedbackRecord, head string) bool {
+	return status == domain.ReconciliationPass && domain.CanTransition(current, domain.StateReplyingReviewFeedback) && hasOutstandingReviewReply(items, head)
 }
 
 func trustedHumanActors(inspection RunInspection) ([]domain.ActorIdentity, error) {
