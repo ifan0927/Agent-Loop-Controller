@@ -59,10 +59,10 @@ func (blockingLaunchAgentRunner) Run(ctx context.Context, _ []string) (launchAge
 }
 
 func TestLaunchctlControlUsesExplicitArgvAndNormalizesState(t *testing.T) {
-	runner := &recordingLaunchAgentRunner{result: launchAgentCommandResult{ExitCode: 0, Stdout: []byte("state = running\nsecret-token\n")}}
+	runner := &recordingLaunchAgentRunner{result: launchAgentCommandResult{ExitCode: 0, Stdout: []byte("state = running\npid = 123\nsecret-token\n")}}
 	control := launchctlControl{runner: runner, timeout: time.Second}
 	status, err := control.Status(context.Background(), "gui/501/"+launchAgentLabel)
-	if err != nil || status.State != "running" {
+	if err != nil || status.State != "running" || status.ProcessID != 123 {
 		t.Fatalf("status=%+v err=%v", status, err)
 	}
 	if err := control.Bootstrap(context.Background(), "gui/501", "/tmp/worker.plist"); err != nil {
@@ -133,6 +133,43 @@ func TestLaunchAgentKickstartRestartsStoppedRunAtLoadService(t *testing.T) {
 	}
 	if strings.Join(fake.calls, ",") != "status,kickstart,status" {
 		t.Fatalf("calls=%v", fake.calls)
+	}
+}
+
+func TestLaunchAgentStatusProjectsLiveSanitizedWorkerSnapshot(t *testing.T) {
+	root := resolvedTempDir(t)
+	config := filepath.Join(root, "controller.json")
+	binary := filepath.Join(root, "ifan-loop")
+	plist := filepath.Join(root, "worker.plist")
+	writeLaunchAgentFixture(t, binary, config, plist, true)
+	reporter, err := newWorkerStatusReporter(config, "worker-status-fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reporter.now = func() time.Time { return time.Date(2026, 7, 16, 12, 30, 0, 0, time.UTC) }
+	if err := reporter.Observe(admissionWorkerResult{Status: workerStatusParked, PreviousStatus: workerStatusDriving, Cycles: 2}); err != nil {
+		t.Fatal(err)
+	}
+	oldFactory := launchAgentControlFactory
+	defer func() { launchAgentControlFactory = oldFactory }()
+	fake := &scriptedLaunchAgentControl{statuses: []launchAgentObservation{{State: "running", ProcessID: os.Getpid()}}}
+	launchAgentControlFactory = func(time.Duration) launchAgentControl { return fake }
+	output, err := captureConfigOutput(func() error {
+		return launchAgentStatus([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
+	})
+	if err != nil || !strings.Contains(output, `"worker_status": "parked"`) || !strings.Contains(output, `"worker_previous_status": "driving"`) || !strings.Contains(output, `"worker_status_observed_at": "2026-07-16T12:30:00Z"`) {
+		t.Fatalf("output=%s err=%v", output, err)
+	}
+	reporter.processStartID = "1"
+	if err := reporter.Observe(admissionWorkerResult{Status: workerStatusParked, PreviousStatus: workerStatusDriving, Cycles: 2}); err != nil {
+		t.Fatal(err)
+	}
+	fake.statuses = []launchAgentObservation{{State: "running", ProcessID: os.Getpid()}}
+	stale, err := captureConfigOutput(func() error {
+		return launchAgentStatus([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
+	})
+	if err != nil || !strings.Contains(stale, `"worker_status": "running"`) || strings.Contains(stale, `"worker_status_observed_at"`) || strings.Contains(stale, `"worker_status": "parked"`) {
+		t.Fatalf("stale output=%s err=%v", stale, err)
 	}
 }
 

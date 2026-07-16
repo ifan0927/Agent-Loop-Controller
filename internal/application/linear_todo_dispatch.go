@@ -362,8 +362,8 @@ func (d *LinearTodoDispatcher) resume(ctx context.Context, lease *LinearTodoAdmi
 	if run.State == domain.StateManualIntervention {
 		return d.manualInterventionAttention(ctx, run)
 	}
-	if run.State == domain.StateAwaitingHumanDecision || run.State == domain.StateAwaitingHumanApproval {
-		return LinearTodoDispatchResult{Outcome: LinearTodoDispatchWaiting, Run: projectRunResult(run)}, nil
+	if run.State == domain.StateAwaitingHumanDecision {
+		return d.humanDecisionAttention(ctx, run)
 	}
 	journal, found, err := d.store.GetLinearTodoAdmissionJournal(ctx, run.ID)
 	if err != nil {
@@ -597,6 +597,17 @@ func (d *LinearTodoDispatcher) manualInterventionAttention(ctx context.Context, 
 	return LinearTodoDispatchResult{Outcome: LinearTodoDispatchAttention, Run: projectRunResult(run)}, nil
 }
 
+func (d *LinearTodoDispatcher) humanDecisionAttention(ctx context.Context, run Run) (LinearTodoDispatchResult, error) {
+	inspection, err := d.store.Inspect(ctx, run.ID)
+	if err != nil {
+		return LinearTodoDispatchResult{}, classifyServiceError(err)
+	}
+	if err := publishHumanDecisionAttention(ctx, run, inspection, d.store); err != nil {
+		return d.runAttention(ctx, run, "admission_authority_conflict", dispatchEvidence("human_decision_evidence_conflict", run.ID))
+	}
+	return LinearTodoDispatchResult{Outcome: LinearTodoDispatchAttention, Run: projectRunResult(run)}, nil
+}
+
 func (d *LinearTodoDispatcher) appendAttention(ctx context.Context, event OperatorAttentionEvent, scanDigest string) (LinearTodoDispatchResult, error) {
 	if _, err := d.store.AppendOperatorAttention(ctx, event); err != nil {
 		return LinearTodoDispatchResult{}, classifyServiceError(err)
@@ -628,8 +639,9 @@ func (d *LinearTodoDispatcher) blockingRetry(ctx context.Context) (LinearTodoDis
 			result, attentionErr := d.manualInterventionAttention(ctx, run)
 			return result, true, attentionErr
 		}
-		if run.State == domain.StateAwaitingHumanDecision || run.State == domain.StateAwaitingHumanApproval {
-			return LinearTodoDispatchResult{Outcome: LinearTodoDispatchWaiting, Run: projectRunResult(run)}, true, nil
+		if run.State == domain.StateAwaitingHumanDecision {
+			result, attentionErr := d.humanDecisionAttention(ctx, run)
+			return result, true, attentionErr
 		}
 		if run.State == domain.StateCompleted {
 			continue
@@ -690,7 +702,10 @@ func (d *LinearTodoDispatcher) handleRunFailure(ctx context.Context, run Run, ph
 	if run.State == domain.StateManualIntervention {
 		return d.manualInterventionAttention(ctx, run)
 	}
-	if run.State == domain.StateAwaitingHumanDecision || run.State == domain.StateAwaitingHumanApproval {
+	if run.State == domain.StateAwaitingHumanDecision {
+		return d.humanDecisionAttention(ctx, run)
+	}
+	if run.State == domain.StateAwaitingHumanApproval {
 		return LinearTodoDispatchResult{Outcome: LinearTodoDispatchWaiting, Run: projectRunResult(run)}, nil
 	}
 	if run.State == domain.StateCompleted {
@@ -734,8 +749,9 @@ func (d *LinearTodoDispatcher) orphanRetryAttention(ctx context.Context) (Linear
 			result, attentionErr := d.manualInterventionAttention(ctx, run)
 			return result, true, attentionErr
 		}
-		if run.State == domain.StateAwaitingHumanDecision || run.State == domain.StateAwaitingHumanApproval {
-			return LinearTodoDispatchResult{Outcome: LinearTodoDispatchWaiting, Run: projectRunResult(run)}, true, nil
+		if run.State == domain.StateAwaitingHumanDecision {
+			result, attentionErr := d.humanDecisionAttention(ctx, run)
+			return result, true, attentionErr
 		}
 		if run.State == domain.StateCompleted {
 			continue

@@ -20,6 +20,8 @@ func (r *driverRunReader) Inspect(context.Context, string) (RunInspection, error
 	inspection := RunInspection{Run: r.run}
 	if r.run.State == domain.StateManualIntervention {
 		inspection.Timeline = []Transition{{Sequence: 7, From: domain.StateMerging, To: domain.StateManualIntervention, Reason: "authority conflict", EvidenceReference: "controller_evidence", BoundHead: r.run.CandidateHead, CreatedAt: time.Date(2026, 7, 16, 1, 0, 0, 0, time.UTC)}}
+	} else if r.run.State == domain.StateAwaitingHumanDecision {
+		inspection.Timeline = []Transition{{Sequence: 3, From: domain.StateExecuting, To: domain.StateAwaitingHumanDecision, Reason: "decision required", EvidenceReference: "decision_request", CreatedAt: time.Date(2026, 7, 16, 1, 0, 0, 0, time.UTC)}}
 	}
 	return inspection, nil
 }
@@ -178,7 +180,7 @@ func TestProductionDriverStopsAtHumanDecisionWithoutInvokingAction(t *testing.T)
 	})
 
 	result, err := driver.Drive(context.Background(), driverCommand())
-	if err != nil || result.Action != ProductionStop || result.Run.State != domain.StateAwaitingHumanDecision || len(coordinator.calls) != 0 {
+	if err != nil || result.Action != ProductionStop || result.Run.State != domain.StateAwaitingHumanDecision || len(coordinator.calls) != 0 || len(reader.attention) != 1 || reader.attention[0].EventType != OperatorAttentionHumanDecision || !equalOperatorAttentionActions(reader.attention[0].AllowedActions, []OperatorAttentionActionID{OperatorAttentionActionDecide}) {
 		t.Fatalf("result=%+v calls=%v err=%v", result, coordinator.calls, err)
 	}
 }

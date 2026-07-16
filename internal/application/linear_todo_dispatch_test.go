@@ -152,27 +152,28 @@ func (d *dispatchDriver) Drive(ctx context.Context, command ProductionDriveComma
 
 type dispatchStore struct {
 	RunStore
-	mu              sync.Mutex
-	now             time.Time
-	lease           LinearTodoAdmissionLease
-	releasedLease   LinearTodoAdmissionLease
-	releaseDeadline time.Time
-	held            bool
-	run             Run
-	journal         LinearTodoAdmissionJournal
-	journalFound    bool
-	reserveCalls    int
-	adoptCalls      int
-	continues       int
-	side            SideEffectRecord
-	attention       []OperatorAttentionEvent
-	retrySchedules  []RetrySchedule
-	leaseLost       bool
-	renewCalls      int
-	failRenewAt     int
-	renewed         chan int
-	postProofDrift  bool
-	reserveBlocked  chan struct{}
+	mu                     sync.Mutex
+	now                    time.Time
+	lease                  LinearTodoAdmissionLease
+	releasedLease          LinearTodoAdmissionLease
+	releaseDeadline        time.Time
+	held                   bool
+	run                    Run
+	journal                LinearTodoAdmissionJournal
+	journalFound           bool
+	reserveCalls           int
+	adoptCalls             int
+	continues              int
+	side                   SideEffectRecord
+	attention              []OperatorAttentionEvent
+	retrySchedules         []RetrySchedule
+	leaseLost              bool
+	renewCalls             int
+	failRenewAt            int
+	renewed                chan int
+	postProofDrift         bool
+	omitDecisionTransition bool
+	reserveBlocked         chan struct{}
 }
 
 func (s *dispatchStore) AcquireLinearTodoAdmissionLease(_ context.Context, owner string, ttl time.Duration, now time.Time) (LinearTodoAdmissionLease, bool, error) {
@@ -304,6 +305,8 @@ func (s *dispatchStore) Inspect(_ context.Context, runID string) (RunInspection,
 	inspection := RunInspection{Run: s.run}
 	if s.run.State == domain.StateManualIntervention {
 		inspection.Timeline = []Transition{{Sequence: 2, From: domain.StateReceived, To: domain.StateManualIntervention, Reason: "operator decision required", EvidenceReference: "linear_issue_start", CreatedAt: s.run.UpdatedAt}}
+	} else if s.run.State == domain.StateAwaitingHumanDecision && !s.omitDecisionTransition {
+		inspection.Timeline = []Transition{{Sequence: 3, From: domain.StateExecuting, To: domain.StateAwaitingHumanDecision, Reason: "decision required", EvidenceReference: "decision_request", CreatedAt: s.run.UpdatedAt}}
 	}
 	return inspection, nil
 }
@@ -689,20 +692,39 @@ func TestLinearTodoDispatcherStopsForManualAndDriverConflict(t *testing.T) {
 		state      domain.State
 		outcome    string
 		attentions int
-	}{{domain.StateManualIntervention, LinearTodoDispatchAttention, 1}, {domain.StateAwaitingHumanDecision, LinearTodoDispatchWaiting, 0}, {domain.StateAwaitingHumanApproval, LinearTodoDispatchWaiting, 0}} {
+		drives     int
+	}{{domain.StateManualIntervention, LinearTodoDispatchAttention, 1, 0}, {domain.StateAwaitingHumanDecision, LinearTodoDispatchAttention, 1, 0}, {domain.StateAwaitingHumanApproval, LinearTodoDispatchDriven, 0, 1}} {
 		t.Run(string(test.state), func(t *testing.T) {
 			candidate := dispatchCandidate("manual", "IFAN-14", 1)
 			dispatcher, store, scanner, _, _, driver := newDispatchLab(t, candidate)
 			store.run = authorizeDispatchRun(Run{ID: "run-manual", IssueID: candidate.Identifier, IdempotencyKey: "manual-key", Repository: "owner/repo", State: test.state})
 			result, err := dispatcher.Dispatch(context.Background())
-			if err != nil || result.Outcome != test.outcome || scanner.calls != 0 || len(driver.calls) != 0 || len(store.attention) != test.attentions {
+			if err != nil || result.Outcome != test.outcome || scanner.calls != 0 || len(driver.calls) != test.drives || len(store.attention) != test.attentions {
 				t.Fatalf("result=%+v scanner=%d driver=%+v attention=%+v err=%v", result, scanner.calls, driver.calls, store.attention, err)
 			}
 			if test.state == domain.StateManualIntervention && store.attention[0].EventType != OperatorAttentionManualIntervention {
 				t.Fatalf("attention=%+v", store.attention)
 			}
+			if test.state == domain.StateAwaitingHumanDecision && store.attention[0].EventType != OperatorAttentionHumanDecision {
+				t.Fatalf("attention=%+v", store.attention)
+			}
 		})
 	}
+	t.Run("decision evidence drift stays parked with stable fail-closed attention", func(t *testing.T) {
+		candidate := dispatchCandidate("decision-drift", "IFAN-14", 1)
+		dispatcher, store, scanner, _, _, driver := newDispatchLab(t, candidate)
+		store.run = authorizeDispatchRun(Run{ID: "run-decision-drift", IssueID: candidate.Identifier, IdempotencyKey: "decision-drift-key", Repository: "owner/repo", State: domain.StateAwaitingHumanDecision})
+		store.omitDecisionTransition = true
+
+		first, firstErr := dispatcher.Dispatch(context.Background())
+		second, secondErr := dispatcher.Dispatch(context.Background())
+		if firstErr != nil || secondErr != nil || first.Outcome != LinearTodoDispatchAttention || second.Outcome != LinearTodoDispatchAttention || scanner.calls != 0 || len(driver.calls) != 0 || store.run.State != domain.StateAwaitingHumanDecision || len(store.attention) != 1 {
+			t.Fatalf("first=%+v second=%+v scanner=%d driver=%+v run=%+v attention=%+v firstErr=%v secondErr=%v", first, second, scanner.calls, driver.calls, store.run, store.attention, firstErr, secondErr)
+		}
+		if store.attention[0].EventType != OperatorAttentionAdmissionAuthority || store.attention[0].ReasonCode != "admission_authority_conflict" {
+			t.Fatalf("attention=%+v", store.attention)
+		}
+	})
 	t.Run("driver conflict", func(t *testing.T) {
 		candidate := dispatchCandidate("conflict", "IFAN-15", 1)
 		dispatcher, store, _, _, _, driver := newDispatchLab(t, candidate)

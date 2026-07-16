@@ -26,6 +26,7 @@ type OperatorAttentionActionID string
 const (
 	OperatorAttentionActionRetry   OperatorAttentionActionID = "retry"
 	OperatorAttentionActionAbandon OperatorAttentionActionID = "abandon"
+	OperatorAttentionActionDecide  OperatorAttentionActionID = "decide"
 )
 
 const (
@@ -36,6 +37,7 @@ const (
 	OperatorAttentionAdmissionAuthority    = "admission_authority_conflict"
 	OperatorAttentionRetry                 = "automatic_retry_attention"
 	OperatorAttentionManualIntervention    = "manual_intervention_attention"
+	OperatorAttentionHumanDecision         = "human_decision_attention"
 	operatorAttentionUnknown               = "unknown"
 )
 
@@ -184,7 +186,37 @@ func ManualInterventionAttentionEvent(run Run, transition Transition) (OperatorA
 	})
 }
 
+// HumanDecisionAttentionEvent binds the presentation action to the exact
+// transition that persisted the offered decision. Re-observation after a
+// worker restart therefore replays one immutable event key.
+func HumanDecisionAttentionEvent(run Run, transition Transition) (OperatorAttentionEvent, error) {
+	if run.State != domain.StateAwaitingHumanDecision || transition.Sequence < 1 || transition.To != domain.StateAwaitingHumanDecision || transition.CreatedAt.IsZero() {
+		return OperatorAttentionEvent{}, errors.New("human decision attention evidence is invalid")
+	}
+	profile, err := operatorAttentionProfileForRun(run)
+	if err != nil {
+		return OperatorAttentionEvent{}, err
+	}
+	evidence := humanDecisionAttentionDigest(run, transition)
+	return newOperatorAttentionEvent(operatorAttentionEventInput{
+		ScopeID: run.ID, RunID: run.ID, EventType: OperatorAttentionHumanDecision,
+		Profile: profile, State: run.State, Severity: "warning", ReasonCode: "human_decision_required",
+		EvidenceDigest: evidence, TransitionSequence: transition.Sequence,
+		OccurredAt: transition.CreatedAt, ObservedAt: transition.CreatedAt,
+	})
+}
+
 func manualInterventionAttentionDigest(run Run, transition Transition) string {
+	payload := struct {
+		RunID, From, To, Reason, EvidenceReference, BoundHead, CreatedAt string
+		Sequence                                                         int64
+	}{run.ID, string(transition.From), string(transition.To), transition.Reason, transition.EvidenceReference, transition.BoundHead, transition.CreatedAt.UTC().Format(time.RFC3339Nano), transition.Sequence}
+	raw, _ := json.Marshal(payload)
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+func humanDecisionAttentionDigest(run Run, transition Transition) string {
 	payload := struct {
 		RunID, From, To, Reason, EvidenceReference, BoundHead, CreatedAt string
 		Sequence                                                         int64
@@ -203,6 +235,15 @@ func latestManualInterventionTransition(inspection RunInspection) (Transition, e
 	return Transition{}, errors.New("manual intervention transition evidence is missing")
 }
 
+func latestHumanDecisionTransition(inspection RunInspection) (Transition, error) {
+	for index := len(inspection.Timeline) - 1; index >= 0; index-- {
+		if inspection.Timeline[index].To == domain.StateAwaitingHumanDecision {
+			return inspection.Timeline[index], nil
+		}
+	}
+	return Transition{}, errors.New("human decision transition evidence is missing")
+}
+
 func publishManualInterventionAttention(ctx context.Context, run Run, inspection RunInspection, publisher OperatorAttentionPublisher) error {
 	if publisher == nil || inspection.Run.ID != "" && inspection.Run.ID != run.ID {
 		return errors.New("manual intervention attention dependencies are invalid")
@@ -212,6 +253,22 @@ func publishManualInterventionAttention(ctx context.Context, run Run, inspection
 		return err
 	}
 	event, err := ManualInterventionAttentionEvent(run, transition)
+	if err != nil {
+		return err
+	}
+	_, err = publisher.AppendOperatorAttention(ctx, event)
+	return err
+}
+
+func publishHumanDecisionAttention(ctx context.Context, run Run, inspection RunInspection, publisher OperatorAttentionPublisher) error {
+	if publisher == nil || inspection.Run.ID != "" && inspection.Run.ID != run.ID {
+		return errors.New("human decision attention dependencies are invalid")
+	}
+	transition, err := latestHumanDecisionTransition(inspection)
+	if err != nil {
+		return err
+	}
+	event, err := HumanDecisionAttentionEvent(run, transition)
 	if err != nil {
 		return err
 	}
@@ -296,6 +353,9 @@ func allowedOperatorAttentionActions(eventType, state, reason string) []Operator
 	if eventType == OperatorAttentionManualIntervention && state == string(domain.StateManualIntervention) && reason == "manual_intervention" {
 		return []OperatorAttentionActionID{OperatorAttentionActionAbandon}
 	}
+	if eventType == OperatorAttentionHumanDecision && state == string(domain.StateAwaitingHumanDecision) && reason == "human_decision_required" {
+		return []OperatorAttentionActionID{OperatorAttentionActionDecide}
+	}
 	return []OperatorAttentionActionID{}
 }
 
@@ -312,7 +372,7 @@ func operatorAttentionProfileForRun(run Run) (OperatorAttentionProfile, error) {
 
 func sanitizedOperatorAttentionEventType(value string) string {
 	switch value {
-	case OperatorAttentionSourceCheckoutSkipped, OperatorAttentionCandidatePriorityTie, OperatorAttentionCandidateScan, OperatorAttentionSchedulerLease, OperatorAttentionAdmissionAuthority, OperatorAttentionRetry, OperatorAttentionManualIntervention:
+	case OperatorAttentionSourceCheckoutSkipped, OperatorAttentionCandidatePriorityTie, OperatorAttentionCandidateScan, OperatorAttentionSchedulerLease, OperatorAttentionAdmissionAuthority, OperatorAttentionRetry, OperatorAttentionManualIntervention, OperatorAttentionHumanDecision:
 		return value
 	default:
 		return operatorAttentionUnknown
@@ -328,6 +388,7 @@ func sanitizedOperatorAttentionReason(eventType, value string) string {
 		OperatorAttentionAdmissionAuthority:    {"admission_authority_conflict": true, "mutation_authority_conflict": true},
 		OperatorAttentionRetry:                 {RetryReasonProcessStart: true, RetryReasonUnavailable: true, RetryReasonAuthority: true, RetryReasonIntegrity: true, RetryReasonManual: true, RetryReasonTerminal: true, RetryReasonPersistence: true, RetryReasonBudgetExhausted: true},
 		OperatorAttentionManualIntervention:    {"manual_intervention": true},
+		OperatorAttentionHumanDecision:         {"human_decision_required": true},
 	}
 	if allowed[eventType][value] {
 		return value

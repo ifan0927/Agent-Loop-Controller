@@ -24,6 +24,8 @@ type workerOutput struct {
 	LastOutcome         string                               `json:"last_outcome,omitempty"`
 	QueueDecision       *application.LinearTodoQueueDecision `json:"queue_decision,omitempty"`
 	Stopped             string                               `json:"stopped"`
+	Status              string                               `json:"status"`
+	PreviousStatus      string                               `json:"previous_status,omitempty"`
 }
 
 const (
@@ -76,10 +78,10 @@ func controllerWorker(args []string) error {
 		return err
 	}
 	instanceID := uuid.NewString()
-	output := workerOutput{WorkerInstanceID: instanceID, ConfigurationDigest: loaded.Digest}
+	output := workerOutput{WorkerInstanceID: instanceID, ConfigurationDigest: loaded.Digest, Status: workerStatusRunning}
 	configured := loaded.Automation.LinearTodoAdmission
 	if !configured.Enabled {
-		output.Disabled, output.Stopped = true, "disabled"
+		output.Disabled, output.Stopped, output.PreviousStatus, output.Status = true, "disabled", workerStatusRunning, workerStatusStopping
 		return emitAutomaticWorkerOutput(output)
 	}
 	runtime, err := buildAutomaticWorkerRuntime(loaded, instanceID)
@@ -97,13 +99,17 @@ func controllerWorker(args []string) error {
 		}
 	}()
 	fprintfWorkerStart(instanceID, loaded.Digest)
+	reporter, err := newWorkerStatusReporter(path, instanceID)
+	if err != nil {
+		return errors.New("automatic admission worker status is unavailable")
+	}
 	ctx, stop := workerSignalContext()
 	defer stop()
-	result, err := runAdmissionWorker(ctx, *once, configured.PollInterval, runtime.dispatch, waitAdmissionWorker)
+	result, err := runAdmissionWorkerObserved(ctx, *once, configured.PollInterval, runtime.dispatch, waitAdmissionWorker, reporter.Observe)
 	if err != nil {
 		return application.ClassifyError(err)
 	}
-	output.Cycles, output.LastOutcome, output.QueueDecision, output.Stopped = result.Cycles, result.LastOutcome, result.QueueDecision, result.Stopped
+	output.Cycles, output.LastOutcome, output.QueueDecision, output.Stopped, output.Status, output.PreviousStatus = result.Cycles, result.LastOutcome, result.QueueDecision, result.Stopped, result.Status, result.PreviousStatus
 	if err := closeWorkerStateStore(store); err != nil {
 		return err
 	}
@@ -191,5 +197,5 @@ func fprintfWorkerStart(instanceID, configurationDigest string) {
 	// Both values are controller-generated or a SHA-256 configuration digest.
 	// No source reference, token, requester, path, issue body, or run key is
 	// projected while a long-lived driver is running.
-	fmt.Fprintf(os.Stderr, "automatic admission worker started instance=%s configuration=%s\n", instanceID, configurationDigest)
+	fmt.Fprintf(os.Stderr, "automatic admission worker started status=%s instance=%s configuration=%s\n", workerStatusRunning, instanceID, configurationDigest)
 }

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -368,7 +369,17 @@ func launchAgentStatus(args []string) error {
 			next = "bootstrap"
 		}
 	}
-	return writeLaunchAgentControlResult(launchAgentControlResultFor(options, "status", observed.State, outcome, next, "", runAtLoad, false), nil)
+	result := launchAgentControlResultFor(options, "status", observed.State, outcome, next, "", runAtLoad, false)
+	if observed.State == "running" {
+		result.WorkerStatus = workerStatusRunning
+		started, identityErr := processStartIdentity(observed.ProcessID)
+		if snapshot, snapshotErr := readWorkerStatusSnapshot(options.config); identityErr == nil && snapshotErr == nil && snapshot.ProcessID == observed.ProcessID && snapshot.ProcessStartID == started && observed.ProcessID > 0 {
+			result.WorkerStatus = snapshot.Status
+			result.WorkerPreviousStatus = snapshot.PreviousStatus
+			result.WorkerStatusObservedAt = snapshot.ObservedAt.UTC().Format(time.RFC3339Nano)
+		}
+	}
+	return writeLaunchAgentControlResult(result, nil)
 }
 
 func launchAgentBootout(args []string) error {

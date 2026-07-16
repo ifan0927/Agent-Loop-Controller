@@ -63,7 +63,7 @@ the state machine.
   and narrow GitHub App authorities.
 - Manual Linear admission and disabled-by-default automatic Todo admission.
 - Priority-only single-run worker scheduling, durable leases, retry schedules,
-  and local operator-attention records.
+  restart-stable parked states, and local operator-attention records.
 - Isolated worktrees, resumable Codex implementation sessions, structured
   outcomes, repository-owned verifier commands, and fresh read-only review.
 - Exact-HEAD branch push, owned PR creation/adoption, required-check and review
@@ -125,9 +125,10 @@ The normal worker runs until SIGINT/SIGTERM rather than expiring on a global
 timer; durable recovery and operation-specific timeouts remain authoritative.
 Observe a run with `controller status` or `controller inspect`. If the run stops
 at `awaiting_human_decision`, submit only one of the persisted offered choices
-through `controller continue --decision ...`, then resume with `controller
-drive`. Human review resolution and approval happen in GitHub; the driver
-observes them and continues automatically.
+through `controller continue --decision ...`; the running worker resumes it on
+the next cycle without a separate drive command. Human review resolution and
+approval happen in GitHub; the driver observes them and continues
+automatically.
 
 Low-level `continue`, `push`, `open-pr`, `reconcile`, `merge`,
 `reconcile-linear`, and `cleanup` commands are recovery interfaces, not the

@@ -85,6 +85,20 @@ func TestManualInterventionAttentionIsStableAndAdvertisesAbandonOnly(t *testing.
 	}
 }
 
+func TestHumanDecisionAttentionIsStableAndAdvertisesDecideOnly(t *testing.T) {
+	run := operatorAttentionTestRun(t, domain.StateAwaitingHumanDecision)
+	now := time.Date(2026, 7, 16, 2, 0, 0, 0, time.UTC)
+	transition := Transition{Sequence: 4, From: domain.StateExecuting, To: domain.StateAwaitingHumanDecision, Reason: "decision required", EvidenceReference: "decision_request", CreatedAt: now}
+	first, err := HumanDecisionAttentionEvent(run, transition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := HumanDecisionAttentionEvent(run, transition)
+	if err != nil || first.EventKey != second.EventKey || first.PayloadDigest != second.PayloadDigest || !equalOperatorAttentionActions(first.AllowedActions, []OperatorAttentionActionID{OperatorAttentionActionDecide}) {
+		t.Fatalf("first=%+v second=%+v err=%v", first, second, err)
+	}
+}
+
 func TestOperatorAttentionUnknownInputsMapToGenericWithoutLeakage(t *testing.T) {
 	now := time.Date(2026, 7, 15, 1, 2, 3, 0, time.UTC)
 	secret := "Authorization: Bearer not-for-output"

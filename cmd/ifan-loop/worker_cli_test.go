@@ -126,6 +126,10 @@ func TestControllerWorkerSubprocessSIGTERMClosesCompleteRuntime(t *testing.T) {
 		workerError, _ := os.ReadFile(stderrPath)
 		t.Fatalf("managed child did not start stdout=%s stderr=%s", workerOutput, workerError)
 	}
+	liveStatus, err := readWorkerStatusSnapshot(configPath)
+	if err != nil || liveStatus.Cycles != 1 || liveStatus.Status != workerStatusDriving && liveStatus.Status != workerStatusParked {
+		t.Fatalf("live worker status=%+v err=%v", liveStatus, err)
+	}
 	if err := command.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
@@ -148,6 +152,10 @@ func TestControllerWorkerSubprocessSIGTERMClosesCompleteRuntime(t *testing.T) {
 	}
 	if closed, err := os.ReadFile(closeMarker); err != nil || string(closed) != "closed" {
 		t.Fatalf("explicit SQLite close marker=%q err=%v", closed, err)
+	}
+	stoppedStatus, err := readWorkerStatusSnapshot(configPath)
+	if err != nil || stoppedStatus.Status != workerStatusStopping || stoppedStatus.PreviousStatus != workerStatusDriving && stoppedStatus.PreviousStatus != workerStatusParked || stoppedStatus.WorkerInstanceID != liveStatus.WorkerInstanceID {
+		t.Fatalf("stopped worker status=%+v live=%+v err=%v", stoppedStatus, liveStatus, err)
 	}
 	if err := syscall.Kill(childPID, 0); !errors.Is(err, syscall.ESRCH) {
 		t.Fatalf("managed child pid=%d remains err=%v", childPID, err)

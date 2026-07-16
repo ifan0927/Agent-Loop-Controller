@@ -19,7 +19,7 @@ func TestAdmissionWorkerOnceDispatchesExactlyOneCycle(t *testing.T) {
 		waits++
 		return nil
 	})
-	if err != nil || calls != 1 || waits != 0 || result.Cycles != 1 || result.LastOutcome != application.LinearTodoDispatchNoCandidate || result.Stopped != "once" {
+	if err != nil || calls != 1 || waits != 0 || result.Cycles != 1 || result.LastOutcome != application.LinearTodoDispatchNoCandidate || result.Stopped != "once" || result.Status != workerStatusRunning {
 		t.Fatalf("result=%+v calls=%d waits=%d err=%v", result, calls, waits, err)
 	}
 }
@@ -53,8 +53,51 @@ func TestAdmissionWorkerKeepsPollingWhileAttentionParksAdmission(t *testing.T) {
 		cancel()
 		return context.Canceled
 	})
-	if err != nil || calls != 1 || result.Stopped != "canceled" || result.LastOutcome != application.LinearTodoDispatchAttention {
+	if err != nil || calls != 1 || result.Stopped != "canceled" || result.LastOutcome != application.LinearTodoDispatchAttention || result.Status != workerStatusStopping || result.PreviousStatus != workerStatusParked {
 		t.Fatalf("result=%+v calls=%d err=%v", result, calls, err)
+	}
+}
+
+func TestAdmissionWorkerObservesLiveStatusTransitions(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var statuses []string
+	result, err := runAdmissionWorkerObserved(ctx, false, time.Minute, func(context.Context) (application.LinearTodoDispatchResult, error) {
+		return application.LinearTodoDispatchResult{Outcome: application.LinearTodoDispatchAttention}, nil
+	}, func(context.Context, time.Duration) error {
+		cancel()
+		return context.Canceled
+	}, func(result admissionWorkerResult) error {
+		statuses = append(statuses, result.Status)
+		return nil
+	})
+	want := []string{workerStatusRunning, workerStatusDriving, workerStatusParked, workerStatusStopping}
+	if err != nil || result.Status != workerStatusStopping || len(statuses) != len(want) {
+		t.Fatalf("result=%+v statuses=%v err=%v", result, statuses, err)
+	}
+	for index := range want {
+		if statuses[index] != want[index] {
+			t.Fatalf("statuses=%v want=%v", statuses, want)
+		}
+	}
+}
+
+func TestAdmissionWorkerProjectsDrivingAndParkedStatuses(t *testing.T) {
+	decision := application.LinearTodoDispatchResult{
+		Outcome: application.LinearTodoDispatchDriven,
+		Run:     application.RunResult{State: "awaiting_human_decision"},
+		Drive:   &application.ProductionDriveResult{},
+	}
+	if status := admissionWorkerStatus(decision); status != workerStatusParked {
+		t.Fatalf("decision status=%q", status)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result, err := runAdmissionWorker(ctx, false, time.Minute, func(context.Context) (application.LinearTodoDispatchResult, error) {
+		cancel()
+		return application.LinearTodoDispatchResult{}, context.Canceled
+	}, func(context.Context, time.Duration) error { t.Fatal("canceled dispatch must not wait"); return nil })
+	if err != nil || result.Status != workerStatusStopping || result.PreviousStatus != workerStatusDriving {
+		t.Fatalf("result=%+v err=%v", result, err)
 	}
 }
 

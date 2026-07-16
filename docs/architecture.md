@@ -302,6 +302,11 @@ One Linear state mutation and the existing driver's narrow side effects.
 One nonterminal run prevents scanning and is resumed first. Only typed process
 start/temporary-unavailable failures receive bounded durable retries. Equal top
 priority, incomplete scans, conflicts, and exhaustion stop for attention.
+Human-decision and manual-intervention states are parked with transition-bound
+attention; GitHub approval remains inside the production driver's bounded poll
+loop. Every dispatch cycle releases its short scheduler lease before waiting.
+After an authorized operator mutation, the next worker cycle resumes the same
+run through the normal production driver without a separate drive command.
 
 **Key invariants**
 
@@ -696,6 +701,13 @@ process lifetime, and GitHub App installation tokens refresh from their own
 expiry metadata. LaunchAgent configuration and binaries use restart-to-reload.
 Private stdout/stderr leaves use a fixed startup truncation threshold; normal
 cadence does not produce per-cycle log records.
+Sanitized worker output reports `running`, `driving`, `parked`, or `stopping`;
+the final stopping record also identifies the immediately previous state. A
+private atomically replaced status snapshot next to the controller config makes
+the current state observable without appending one log record per poll;
+LaunchAgent status projects it only while launchd observes the worker running
+and the snapshot's PID plus OS process-start identity match launchd's current
+process, so restart races and PID reuse cannot adopt a previous worker's state.
 
 ### Operator-attention boundary
 
@@ -717,9 +729,13 @@ Polling, human approval waiting, and successful terminal states do not emit
 operator-error events. Every delivery-loop coordinator action re-reads its
 final durable state and publishes the transition-bound manual-intervention
 event before returning; the production driver repeats that publication
-idempotently at its stop boundary. A restarted automatic dispatcher publishes
-the same event key, so foreground and worker recovery cannot create duplicate
-parked-outcome events. Lease timestamp changes do not alter event identity.
+idempotently at its stop boundary. Human-decision stops similarly publish only
+the typed `decide` presentation action. A restarted automatic dispatcher
+reconstructs either event from durable transition evidence and publishes the
+same event key, so foreground and worker recovery cannot create duplicate
+parked-outcome events. Missing or drifting transition evidence remains parked
+behind a stable authority-conflict event. Lease timestamp changes do not alter
+event identity.
 
 ### Hermes integration boundary
 

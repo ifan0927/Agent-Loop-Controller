@@ -495,7 +495,17 @@ Validates automation authority and credential topology, acquires the singleton
 scheduler lease, resumes a nonterminal run or scans/adopts one eligible Todo,
 then drives it. Attention parks admission but does not terminate the worker; a
 later cycle keeps observing the same durable authority without admitting a
-second run. It reports bounded worker and queue-decision evidence.
+second run. The short scheduler lease is released after every cycle rather than
+renewed while parked. It reports bounded worker and queue-decision evidence;
+`status` is `running`, `driving`, `parked`, or `stopping`, and a stopping result
+includes `previous_status`. The worker atomically replaces the private
+`<controller-config>.worker-status.json` snapshot on each transition rather
+than appending cadence logs. `controller launchagent status` projects its
+`worker_status`, `worker_previous_status`, and observation timestamp while the
+LaunchAgent process is observed running and its launchctl PID matches the
+snapshot PID and OS process-start identity. A missing or stale snapshot falls
+back to launchd's sanitized `running` observation rather than projecting the
+previous worker instance, including after PID reuse.
 
 **Possible durable stop states**
 
@@ -746,6 +756,8 @@ ifan-loop controller continue '<run-id>' <requester flags> \
 
 Revalidates Linear, binds the selected offered choice to its exact originating
 outcome, persists the decision, and advances/resumes the local controller.
+When the long-running worker is active, its next poll automatically returns the
+same run to the production driver; do not issue a separate `controller drive`.
 
 **Possible durable stop states**
 
@@ -1811,8 +1823,12 @@ payload/evidence digests, timestamps, and typed `allowed_actions`. Those actions
 are display hints only; an authenticated state-changing command must
 independently revalidate current run authority. Transport delivery state and
 legacy local outbox fields are never exposed by `status` or `inspect`.
-Automatic admission reports `waiting` without publishing an attention event
-while an active run is awaiting a human decision or GitHub approval.
+Automatic admission publishes one restart-stable `decide` attention event for
+an active human-decision gate. Manual intervention and exhausted retry expose
+only their typed valid actions. GitHub approval publishes no attention event:
+the production driver remains its bounded polling authority. Repeated parked
+cycles replay the same event key, and authority drift stays parked behind a
+stable fail-closed reason.
 
 The persisted idempotency key is controller authority for an authenticated
 recovery command, not a credential for an external service. Keep it run-scoped

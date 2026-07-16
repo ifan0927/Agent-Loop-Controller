@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -20,20 +21,24 @@ const (
 )
 
 type launchAgentControlResult struct {
-	Step            string `json:"step"`
-	Label           string `json:"label"`
-	ObservedState   string `json:"observed_state"`
-	RunAtLoad       bool   `json:"run_at_load"`
-	Outcome         string `json:"outcome"`
-	NextSafeAction  string `json:"next_safe_action"`
-	Reason          string `json:"reason,omitempty"`
-	TimedOut        bool   `json:"timed_out,omitempty"`
-	ProcessLifetime string `json:"process_lifetime"`
-	LogPolicy       string `json:"log_policy"`
+	Step                   string `json:"step"`
+	Label                  string `json:"label"`
+	ObservedState          string `json:"observed_state"`
+	RunAtLoad              bool   `json:"run_at_load"`
+	Outcome                string `json:"outcome"`
+	NextSafeAction         string `json:"next_safe_action"`
+	Reason                 string `json:"reason,omitempty"`
+	TimedOut               bool   `json:"timed_out,omitempty"`
+	ProcessLifetime        string `json:"process_lifetime"`
+	LogPolicy              string `json:"log_policy"`
+	WorkerStatus           string `json:"worker_status,omitempty"`
+	WorkerPreviousStatus   string `json:"worker_previous_status,omitempty"`
+	WorkerStatusObservedAt string `json:"worker_status_observed_at,omitempty"`
 }
 
 type launchAgentObservation struct {
-	State string
+	State     string
+	ProcessID int
 }
 
 type launchAgentCommandResult struct {
@@ -146,7 +151,7 @@ func (c launchctlControl) Status(ctx context.Context, target string) (launchAgen
 		}
 		return launchAgentObservation{State: "unknown"}, &launchAgentControlError{Code: "status_failed"}
 	}
-	return launchAgentObservation{State: normalizeLaunchAgentState(result.Stdout)}, nil
+	return launchAgentObservation{State: normalizeLaunchAgentState(result.Stdout), ProcessID: launchAgentProcessID(result.Stdout)}, nil
 }
 
 func (c launchctlControl) Bootstrap(ctx context.Context, domain, plist string) error {
@@ -226,6 +231,21 @@ func normalizeLaunchAgentState(output []byte) string {
 		}
 	}
 	return "loaded"
+}
+
+func launchAgentProcessID(output []byte) int {
+	for _, line := range strings.Split(string(output), "\n") {
+		value, found := strings.CutPrefix(strings.TrimSpace(line), "pid = ")
+		if !found {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(value))
+		if err == nil && pid > 0 {
+			return pid
+		}
+		return 0
+	}
+	return 0
 }
 
 type launchAgentPlistInspection struct {

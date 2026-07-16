@@ -221,14 +221,19 @@ func (d *ProductionDriver) durableStop(ctx context.Context, command ProductionDr
 
 func (d *ProductionDriver) stop(ctx context.Context, run Run, action ProductionAction, reason string, actions int) (ProductionDriveResult, error) {
 	result := ProductionDriveResult{Run: projectRunResult(run), Action: action, Reason: reason, ActionsRun: actions}
-	if run.State != domain.StateManualIntervention {
+	if run.State != domain.StateManualIntervention && run.State != domain.StateAwaitingHumanDecision {
 		return result, nil
 	}
 	inspection, err := d.attention.Inspect(ctx, run.ID)
 	if err != nil {
 		return ProductionDriveResult{}, classifyServiceError(err)
 	}
-	if err := publishManualInterventionAttention(ctx, run, inspection, d.publisher); err != nil {
+	if run.State == domain.StateAwaitingHumanDecision {
+		err = publishHumanDecisionAttention(ctx, run, inspection, d.publisher)
+	} else {
+		err = publishManualInterventionAttention(ctx, run, inspection, d.publisher)
+	}
+	if err != nil {
 		return ProductionDriveResult{}, classifyServiceError(err)
 	}
 	return result, nil
