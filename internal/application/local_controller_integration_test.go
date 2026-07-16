@@ -149,6 +149,7 @@ type durableFakeProcess struct {
 	resumeStarted                                 chan struct{}
 	implementationCalls, resumeCalls, reviewCalls int
 	resumeArgs                                    []string
+	reviewStdin                                   []string
 }
 
 func (p *durableFakeProcess) Run(ctx context.Context, s processadapter.Spec) (processadapter.Result, error) {
@@ -192,6 +193,7 @@ func (p *durableFakeProcess) Run(ctx context.Context, s processadapter.Spec) (pr
 			stdout = fmt.Sprintf("{\"type\":\"thread.started\",\"thread_id\":%q}\n", sessionID)
 		} else if argument(s.Args, "--sandbox") == "read-only" {
 			p.reviewCalls++
+			p.reviewStdin = append(p.reviewStdin, s.Stdin)
 			head := gitHead(s.WorkingDir)
 			verdict, summary, findings := "pass", "ready", "[]"
 			if p.failFirstReview && p.reviewCalls == 1 {
@@ -997,6 +999,9 @@ func TestRepairHumanDecisionResumesInsteadOfReplayingDecisionRequest(t *testing.
 	}
 	if process.resumeCalls != 2 || process.reviewCalls != 2 {
 		t.Fatalf("resumes=%d reviews=%d", process.resumeCalls, process.reviewCalls)
+	}
+	if len(process.reviewStdin) != 2 || strings.Contains(process.reviewStdin[0], "Controller-authorized human decision") || !strings.Contains(process.reviewStdin[1], "Controller-authorized human decision") || !strings.Contains(process.reviewStdin[1], `"choice_id":"inclusive"`) || !strings.Contains(process.reviewStdin[1], "Use inclusive min and max bounds.") {
+		t.Fatalf("review prompts did not bind the decision contract: %+v", process.reviewStdin)
 	}
 	inspection, err = store.Inspect(context.Background(), run.ID)
 	if err != nil {
