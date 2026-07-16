@@ -596,7 +596,7 @@ func TestAutomaticAdmissionCleanupAuditRejectsStaleLeaseOwner(t *testing.T) {
 }
 
 func TestAutomaticAdmissionAbandonRejectsRetainedDeliveryEvidence(t *testing.T) {
-	for _, name := range []string{"pull_request", "approval_observation", "push", "merge", "reply_intent", "reply_evidence", "remote_cleanup_intent", "deleted_remote_branch", "deleted_pull_request", "human_decision"} {
+	for _, name := range []string{"pull_request", "approval_observation", "push", "merge", "reply_intent", "reply_evidence", "remote_cleanup_intent", "deleted_remote_branch", "deleted_pull_request"} {
 		t.Run(name, func(t *testing.T) {
 			store, run, _ := prepareAutomaticAbandonmentRun(t, domain.StateManualIntervention)
 			defer store.Close()
@@ -635,14 +635,6 @@ func TestAutomaticAdmissionAbandonRejectsRetainedDeliveryEvidence(t *testing.T) 
 				if err := store.AddOwnedResource(ctx, application.OwnedResource{RunID: run.ID, Kind: map[string]string{"deleted_remote_branch": "remote_branch", "deleted_pull_request": "pull_request"}[name], Name: name, CreationEvidence: "retained external delivery evidence", Status: "deleted"}); err != nil {
 					t.Fatal(err)
 				}
-			case "human_decision":
-				var sequence int64
-				if err := store.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM transitions WHERE run_id=?`, run.ID).Scan(&sequence); err != nil {
-					t.Fatal(err)
-				}
-				if _, err := store.db.ExecContext(ctx, `INSERT INTO transitions(run_id,sequence,from_state,to_state,reason,evidence_reference,bound_head,created_at) VALUES(?,?,?,?,?,?,?,?)`, run.ID, sequence, domain.StateAwaitingHumanDecision, domain.StateExecuting, "accepted simulated human decision", "decision-evidence", run.CandidateHead, formatTime(time.Now().UTC())); err != nil {
-					t.Fatal(err)
-				}
 			}
 			_, _, err := store.AbandonAutomaticAdmission(ctx, automaticAbandonmentRequest(run, domain.StateManualIntervention, run.LeaseOwner))
 			if err == nil {
@@ -653,6 +645,36 @@ func TestAutomaticAdmissionAbandonRejectsRetainedDeliveryEvidence(t *testing.T) 
 				t.Fatalf("state changed after rejection current=%+v err=%v", current, getErr)
 			}
 		})
+	}
+}
+
+func TestAutomaticAdmissionAbandonRetainsHumanDecisionEvidence(t *testing.T) {
+	store, run, _ := prepareAutomaticAbandonmentRun(t, domain.StateManualIntervention)
+	defer store.Close()
+	ctx := context.Background()
+	var sequence int64
+	if err := store.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM transitions WHERE run_id=?`, run.ID).Scan(&sequence); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO transitions(run_id,sequence,from_state,to_state,reason,evidence_reference,bound_head,created_at) VALUES(?,?,?,?,?,?,?,?)`, run.ID, sequence, domain.StateAwaitingHumanDecision, domain.StateExecuting, "accepted simulated human decision", "decision-evidence", run.CandidateHead, formatTime(time.Now().UTC())); err != nil {
+		t.Fatal(err)
+	}
+	abandoned, idempotent, err := store.AbandonAutomaticAdmission(ctx, automaticAbandonmentRequest(run, domain.StateManualIntervention, run.LeaseOwner))
+	if err != nil || idempotent || abandoned.State != domain.StateFailed {
+		t.Fatalf("abandoned=%+v idempotent=%v err=%v", abandoned, idempotent, err)
+	}
+	inspection, err := store.Inspect(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, transition := range inspection.Timeline {
+		if transition.From == domain.StateAwaitingHumanDecision && transition.To == domain.StateExecuting && transition.EvidenceReference == "decision-evidence" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("human decision evidence was not retained: %+v", inspection.Timeline)
 	}
 }
 

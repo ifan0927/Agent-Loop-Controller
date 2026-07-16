@@ -305,9 +305,6 @@ func (s *Store) AbandonAutomaticAdmission(ctx context.Context, request applicati
 		if err := verifyAbandonmentTransitionTx(ctx, tx, request); err != nil {
 			return application.Run{}, false, err
 		}
-		if err := rejectAbandonmentHumanDecisionEvidenceTx(ctx, tx, run); err != nil {
-			return application.Run{}, false, err
-		}
 		if err := rejectAbandonmentDeliveryEvidenceTx(ctx, tx, run); err != nil {
 			return application.Run{}, false, err
 		}
@@ -335,9 +332,6 @@ func (s *Store) AbandonAutomaticAdmission(ctx context.Context, request applicati
 	}
 	if journal.Status == "mutation_intent" {
 		return application.Run{}, false, errors.New("automatic admission abandonment is blocked by a pending Linear mutation")
-	}
-	if err := rejectAbandonmentHumanDecisionEvidenceTx(ctx, tx, run); err != nil {
-		return application.Run{}, false, err
 	}
 	if err := rejectAbandonmentDeliveryEvidenceTx(ctx, tx, run); err != nil {
 		return application.Run{}, false, err
@@ -407,17 +401,6 @@ func verifyAbandonmentTransitionTx(ctx context.Context, tx *sql.Tx, request appl
 	}
 	if request.ExpectedState != domain.StateFailed && from != string(request.ExpectedState) {
 		return errors.New("automatic admission abandonment idempotency state does not match")
-	}
-	return nil
-}
-
-func rejectAbandonmentHumanDecisionEvidenceTx(ctx context.Context, tx *sql.Tx, run application.Run) error {
-	var count int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM transitions WHERE run_id=? AND (from_state=? OR to_state=?)`, run.ID, domain.StateAwaitingHumanDecision, domain.StateAwaitingHumanDecision).Scan(&count); err != nil {
-		return err
-	}
-	if count != 0 {
-		return errors.New("automatic admission abandonment is blocked by retained human decision evidence")
 	}
 	return nil
 }
