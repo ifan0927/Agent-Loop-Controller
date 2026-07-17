@@ -13,11 +13,13 @@ import (
 
 type ciWaitRecoveryStoreFixture struct {
 	RunStore
-	inspection RunInspection
-	events     []OperatorAttentionEvent
-	actions    []OperatorActionRecord
-	beginErr   error
-	applyCalls int
+	inspection          RunInspection
+	events              []OperatorAttentionEvent
+	actions             []OperatorActionRecord
+	beginErr            error
+	applyCalls          int
+	applyInput          CIWaitRecoveryApply
+	validatedAtOverride time.Time
 }
 
 func (s *ciWaitRecoveryStoreFixture) Inspect(context.Context, string) (RunInspection, error) {
@@ -62,6 +64,10 @@ func (s *ciWaitRecoveryStoreFixture) BeginOperatorAction(_ context.Context, acti
 			return current, false, nil
 		}
 	}
+	if !s.validatedAtOverride.IsZero() {
+		action.ReceivedAt = s.validatedAtOverride
+		action.ValidatedAt = s.validatedAtOverride
+	}
 	s.actions = append(s.actions, action)
 	return action, true, nil
 }
@@ -93,6 +99,7 @@ func (s *ciWaitRecoveryStoreFixture) ObserveOperatorActionResult(_ context.Conte
 
 func (s *ciWaitRecoveryStoreFixture) ApplyCIWaitRecovery(_ context.Context, input CIWaitRecoveryApply) (OperatorActionRecord, RetrySchedule, bool, error) {
 	s.applyCalls++
+	s.applyInput = input
 	for index := range s.actions {
 		if s.actions[index].ActionID != input.ActionID {
 			continue
@@ -204,12 +211,16 @@ func TestCIWaitRecoveryServiceSuccessAndAuthorityRejections(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		fixture.store.validatedAtOverride = time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)
 		result, err := service.Recover(context.Background(), command(fixture), fixture.reader, fixture.local)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if result.Action.Status != OperatorActionStatusObserved || fixture.store.applyCalls != 1 || len(fixture.store.events) != 1 || fixture.store.inspection.RetrySchedules[0].Status != RetryScheduleSuperseded {
 			t.Fatalf("result=%+v apply=%d events=%d schedule=%s", result, fixture.store.applyCalls, len(fixture.store.events), fixture.store.inspection.RetrySchedules[0].Status)
+		}
+		if !fixture.store.applyInput.AppliedAt.Equal(fixture.store.actions[0].ValidatedAt) {
+			t.Fatalf("applied_at=%s validated_at=%s", fixture.store.applyInput.AppliedAt, fixture.store.actions[0].ValidatedAt)
 		}
 	})
 
@@ -253,7 +264,6 @@ func TestCIWaitRecoveryAttentionReplayIsStableAfterAppendBeforePrepareFailure(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	service.now = func() time.Time { return time.Date(2026, 7, 17, 2, 0, 0, 0, time.UTC) }
 	command := CIWaitRecoveryCommand{Requester: fixture.requester, RunID: fixture.store.inspection.Run.ID}
 	if _, err := service.Recover(context.Background(), command, fixture.reader, fixture.local); err == nil {
 		t.Fatal("injected prepare failure was ignored")
@@ -262,7 +272,6 @@ func TestCIWaitRecoveryAttentionReplayIsStableAfterAppendBeforePrepareFailure(t 
 		t.Fatalf("events=%d", len(fixture.store.events))
 	}
 	first := fixture.store.events[0]
-	service.now = func() time.Time { return time.Date(2026, 7, 17, 5, 0, 0, 0, time.UTC) }
 	result, err := service.Recover(context.Background(), command, fixture.reader, fixture.local)
 	if err != nil {
 		t.Fatal(err)

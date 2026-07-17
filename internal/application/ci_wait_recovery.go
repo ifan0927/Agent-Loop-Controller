@@ -38,7 +38,6 @@ type CIWaitRecoveryService struct {
 	store       CIWaitRecoveryStore
 	revalidator CIWaitRecoveryLinearRevalidator
 	actions     *OperatorActionService
-	now         func() time.Time
 }
 
 type CIWaitLocalAuthorityPort interface {
@@ -59,7 +58,7 @@ func NewCIWaitRecoveryService(store CIWaitRecoveryStore, revalidator CIWaitRecov
 	if err != nil {
 		return nil, err
 	}
-	return &CIWaitRecoveryService{store: store, revalidator: revalidator, actions: actions, now: func() time.Time { return time.Now().UTC() }}, nil
+	return &CIWaitRecoveryService{store: store, revalidator: revalidator, actions: actions}, nil
 }
 
 func (s *CIWaitRecoveryService) Recover(ctx context.Context, command CIWaitRecoveryCommand, reader GitHubReadPort, local CIWaitLocalAuthorityPort) (OperatorRetryResult, error) {
@@ -129,7 +128,6 @@ func (s *CIWaitRecoveryService) Recover(ctx context.Context, command CIWaitRecov
 			return OperatorRetryResult{}, serviceError(ErrorConflict, "fresh CI wait recovery read is incomplete", nil)
 		}
 	}
-	now := s.now()
 	event, err := CIWaitRecoveryAttentionEvent(run, schedule)
 	if err != nil {
 		return OperatorRetryResult{}, serviceError(ErrorInternal, "CI wait recovery attention is invalid", err)
@@ -143,7 +141,7 @@ func (s *CIWaitRecoveryService) Recover(ctx context.Context, command CIWaitRecov
 	}
 	digest := ciWaitRecoveryEvidenceDigest(run, action, schedule, metadata, evidence, observations)
 	if action.Status == OperatorActionStatusValidated {
-		action, schedule, _, err = s.store.ApplyCIWaitRecovery(ctx, CIWaitRecoveryApply{ActionID: action.ActionID, Phase: schedule.Phase, ExpectedAttempt: schedule.AttemptCount, AppliedAt: now, EvidenceDigest: digest, Observations: observations, Metadata: metadata, GitHubEvidence: evidence})
+		action, schedule, _, err = s.store.ApplyCIWaitRecovery(ctx, CIWaitRecoveryApply{ActionID: action.ActionID, Phase: schedule.Phase, ExpectedAttempt: schedule.AttemptCount, AppliedAt: action.ValidatedAt, EvidenceDigest: digest, Observations: observations, Metadata: metadata, GitHubEvidence: evidence})
 		if err != nil {
 			return OperatorRetryResult{}, classifyServiceError(err)
 		}
