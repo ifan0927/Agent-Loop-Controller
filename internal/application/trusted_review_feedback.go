@@ -9,6 +9,11 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
+const (
+	TrustedReviewFeedbackDriftReason    = "trusted_review_feedback_drift"
+	TrustedReviewFeedbackConflictReason = "trusted_review_feedback_conflict"
+)
+
 // TrustedReviewFeedbackRecord binds a single immutable root comment to one run.
 // Body is only returned to controller-owned callers; public projections omit it.
 type TrustedReviewFeedbackRecord struct {

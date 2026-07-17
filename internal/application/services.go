@@ -890,18 +890,19 @@ func projectRunResult(run Run) RunResult {
 }
 
 type ReconcileCommand struct {
-	Requester           Requester                     `json:"requester"`
-	RunID               string                        `json:"run_id"`
-	Repository          string                        `json:"repository"`
-	ExpectedState       domain.State                  `json:"expected_state"`
-	IdempotencyKey      string                        `json:"idempotency_key"`
-	Evidence            domain.GitHubReadEvidence     `json:"evidence"`
-	Observations        []GitHubRequestObservation    `json:"-"`
-	Metadata            GitHubInstallationMetadata    `json:"-"`
-	TrustedFeedback     []TrustedReviewFeedbackRecord `json:"-"`
-	FeedbackUnsupported bool                          `json:"-"`
-	FeedbackDrift       bool                          `json:"-"`
-	LinearCompleted     bool                          `json:"-"`
+	Requester                 Requester                          `json:"requester"`
+	RunID                     string                             `json:"run_id"`
+	Repository                string                             `json:"repository"`
+	ExpectedState             domain.State                       `json:"expected_state"`
+	IdempotencyKey            string                             `json:"idempotency_key"`
+	Evidence                  domain.GitHubReadEvidence          `json:"evidence"`
+	Observations              []GitHubRequestObservation         `json:"-"`
+	Metadata                  GitHubInstallationMetadata         `json:"-"`
+	TrustedFeedback           []TrustedReviewFeedbackRecord      `json:"-"`
+	FeedbackUnsupported       bool                               `json:"-"`
+	FeedbackUnsupportedReason domain.TrustedReviewTopologyReason `json:"-"`
+	FeedbackDrift             bool                               `json:"-"`
+	LinearCompleted           bool                               `json:"-"`
 }
 
 type ReconcileResult struct {
@@ -997,7 +998,7 @@ func (s CommandService) ReconcileFromGitHub(ctx context.Context, command GitHubR
 		}
 		drift := domain.TrustedFeedbackDrift(existingFeedback, evidence.PullRequest, evidence.Reviews, evidence.ReviewThreads, handoff)
 		full := ReconcileCommand{Requester: command.Requester, RunID: command.RunID, Repository: command.Repository, ExpectedState: command.ExpectedState,
-			IdempotencyKey: command.IdempotencyKey, Evidence: evidence, Observations: observations, Metadata: metadata, TrustedFeedback: feedback, FeedbackUnsupported: normalized.Unsupported, FeedbackDrift: drift, LinearCompleted: command.LinearCompleted}
+			IdempotencyKey: command.IdempotencyKey, Evidence: evidence, Observations: observations, Metadata: metadata, TrustedFeedback: feedback, FeedbackUnsupported: normalized.Unsupported, FeedbackUnsupportedReason: normalized.UnsupportedReason, FeedbackDrift: drift, LinearCompleted: command.LinearCompleted}
 		full.Evidence.Findings = normalized.Findings
 		return s.reconcileLocked(leaseCtx, full, inspection, owner)
 	})
@@ -1026,7 +1027,7 @@ func (s CommandService) reconcileMergeabilityChangesRequested(ctx context.Contex
 	}
 	full := ReconcileCommand{Requester: command.Requester, RunID: command.RunID, Repository: command.Repository, ExpectedState: command.ExpectedState,
 		IdempotencyKey: command.IdempotencyKey, Evidence: evidence, Observations: observations, Metadata: metadata, TrustedFeedback: feedback,
-		FeedbackUnsupported: normalized.Unsupported, FeedbackDrift: domain.TrustedFeedbackDrift(existingFeedback, evidence.PullRequest, evidence.Reviews, evidence.ReviewThreads, handoff)}
+		FeedbackUnsupported: normalized.Unsupported, FeedbackUnsupportedReason: normalized.UnsupportedReason, FeedbackDrift: domain.TrustedFeedbackDrift(existingFeedback, evidence.PullRequest, evidence.Reviews, evidence.ReviewThreads, handoff)}
 	full.Evidence.Findings = normalized.Findings
 	return s.reconcileLocked(ctx, full, inspection, owner)
 }
@@ -1193,11 +1194,24 @@ func (s CommandService) reconcileLocked(ctx context.Context, command ReconcileCo
 		}
 	}
 	next, reason := nextGitHubReconciliationState(run.State, command.Evidence, status)
-	if command.FeedbackUnsupported || command.FeedbackDrift || trustedFeedbackConflicts(inspection.TrustedFeedback, command.TrustedFeedback) {
-		next, reason = domain.StateManualIntervention, "trusted inline change request requires manual intervention"
-	}
 	if command.LinearCompleted && !command.Evidence.PullRequest.Merged {
 		next, reason = domain.StateManualIntervention, "Linear issue completed before a controller-owned merge was observed"
+	}
+	// Trusted-review evidence is the more specific diagnosis when multiple
+	// manual-stop conditions are observed together. Precedence is immutable
+	// conflict, admitted-feedback drift, unsupported topology, then other stops.
+	if command.FeedbackUnsupported {
+		reasonCode := domain.TrustedReviewTopologyUnsupported
+		if command.FeedbackUnsupportedReason == domain.TrustedReviewTopologySplitReview {
+			reasonCode = domain.TrustedReviewTopologySplitReview
+		}
+		next, reason = domain.StateManualIntervention, string(reasonCode)
+	}
+	if command.FeedbackDrift {
+		next, reason = domain.StateManualIntervention, TrustedReviewFeedbackDriftReason
+	}
+	if trustedFeedbackConflicts(inspection.TrustedFeedback, command.TrustedFeedback) {
+		next, reason = domain.StateManualIntervention, TrustedReviewFeedbackConflictReason
 	}
 	if len(command.TrustedFeedback) > 0 && next != domain.StateManualIntervention && (run.State == domain.StateReconcilingReviews || run.State == domain.StateAwaitingHumanApproval || run.State == domain.StateAwaitingGitHubMergeability) {
 		next, reason = domain.StateRepairing, "trusted exact-head inline change request requires repair"

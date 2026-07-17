@@ -167,6 +167,9 @@ func TestTrustedFeedbackDriftPersistsConflictAndManualTransitionAtomically(t *te
 	if err != nil || inspection.Run.State != domain.StateManualIntervention || inspection.GitHubEvidence == nil || len(inspection.GitHubRequests) != 1 || len(inspection.FeedbackConflicts) != 1 || inspection.FeedbackConflicts[0].RootCommentNodeID != record.RootCommentNodeID || inspection.FeedbackConflicts[0].ObservedDigest != observed {
 		t.Fatalf("inspection=%+v err=%v", inspection, err)
 	}
+	if got := inspection.Timeline[len(inspection.Timeline)-1].Reason; got != application.TrustedReviewFeedbackDriftReason {
+		t.Fatalf("drift reason=%q", got)
+	}
 	if err := store.RequireManualInterventionForTrustedFeedbackDrift(ctx, record.RunID, owner, domain.StateReceived, record.RunID, observations, pr, metadata, evidence, record.RootCommentNodeID, domain.TrustedReviewFeedbackDigest("second edit")); err == nil {
 		t.Fatal("stale drift write was accepted")
 	}

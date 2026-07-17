@@ -117,6 +117,16 @@ func TestManualInterventionAttentionIsStableAndAdvertisesAbandonOnly(t *testing.
 	}
 }
 
+func TestManualInterventionAttentionProjectsTrustedReviewTopologyReason(t *testing.T) {
+	now := time.Date(2026, 7, 17, 1, 2, 3, 0, time.UTC)
+	run := operatorAttentionTestRun(t, domain.StateManualIntervention)
+	transition := Transition{Sequence: 10, From: domain.StateReconcilingReviews, To: domain.StateManualIntervention, Reason: string(domain.TrustedReviewTopologySplitReview), EvidenceReference: "github_read_evidence:" + strings.Repeat("a", 64), BoundHead: strings.Repeat("b", 40), CreatedAt: now}
+	event, err := ManualInterventionAttentionEvent(run, transition)
+	if err != nil || event.ReasonCode != string(domain.TrustedReviewTopologySplitReview) || !equalOperatorAttentionActions(event.AllowedActions, []OperatorAttentionActionID{OperatorAttentionActionAbandon}) {
+		t.Fatalf("event=%+v err=%v", event, err)
+	}
+}
+
 func TestCleanupResidueAttentionIsTerminalAndAdvertisesNoWorkflowAction(t *testing.T) {
 	now := time.Date(2026, 7, 16, 2, 0, 0, 0, time.UTC)
 	run := operatorAttentionTestRun(t, domain.StateFailed)

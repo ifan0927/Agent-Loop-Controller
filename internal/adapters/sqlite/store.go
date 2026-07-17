@@ -2040,7 +2040,7 @@ func (s *Store) RequireManualInterventionForTrustedFeedbackDrift(ctx context.Con
 	if count, _ := result.RowsAffected(); count != 1 {
 		return errors.New("trusted feedback drift state update lost")
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO transitions(run_id,sequence,from_state,to_state,reason,evidence_reference,bound_head,created_at) VALUES(?,?,?,?,?,?,?,?)`, runID, sequence, expectedState, domain.StateManualIntervention, "trusted inline feedback authority drift", "trusted_feedback_conflict:"+observedDigest, "", nowText()); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO transitions(run_id,sequence,from_state,to_state,reason,evidence_reference,bound_head,created_at) VALUES(?,?,?,?,?,?,?,?)`, runID, sequence, expectedState, domain.StateManualIntervention, application.TrustedReviewFeedbackDriftReason, "trusted_feedback_conflict:"+observedDigest, "", nowText()); err != nil {
 		return err
 	}
 	return tx.Commit()

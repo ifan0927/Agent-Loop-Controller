@@ -577,7 +577,15 @@ Reads only; reply and merge are separate narrow coordinator operations.
 **Failure and recovery behavior**
 
 Pagination overflow, partial GraphQL results, actor/topology drift, or ownership
-conflict fails closed. Pending states remain read-only polls.
+conflict fails closed. Unsupported trusted-review topology is retained as a
+finite sanitized reason: the split shape where an inline root belongs to a
+`COMMENTED` review while a separate trusted exact-head review requests changes
+is distinct from the generic unsupported-topology fallback. Feedback authority
+drift and immutable conflicts also retain separate finite reasons. These reason
+fields never contain review bodies or actor-controlled prose. When a trusted
+review failure and premature Linear completion are observed together, the more
+specific trusted-review reason remains authoritative. Pending states remain
+read-only polls.
 
 **Key invariants**
 

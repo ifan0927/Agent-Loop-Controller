@@ -25,6 +25,7 @@ type serviceStore struct {
 	approvalSaved    **domain.HumanApproval
 	approvalObserved **domain.HumanApprovalObservation
 	nextState        *domain.State
+	transitionReason *string
 	attentionEvents  *[]OperatorAttentionEvent
 	attentionErr     error
 }
@@ -67,7 +68,7 @@ func (s serviceStore) ListRuns(_ context.Context, _ string, before time.Time, be
 	}
 	return s.runs, nil
 }
-func (s serviceStore) SaveGitHubReadSuccess(_ context.Context, _ string, _ string, _ domain.State, _ string, _ []GitHubRequestObservation, _ domain.PullRequest, _ GitHubInstallationMetadata, _ domain.GitHubReadEvidence, _ []TrustedReviewFeedbackRecord, observed *domain.HumanApprovalObservation, approval *domain.HumanApproval, next domain.State, _ string) error {
+func (s serviceStore) SaveGitHubReadSuccess(_ context.Context, _ string, _ string, _ domain.State, _ string, _ []GitHubRequestObservation, _ domain.PullRequest, _ GitHubInstallationMetadata, _ domain.GitHubReadEvidence, _ []TrustedReviewFeedbackRecord, observed *domain.HumanApprovalObservation, approval *domain.HumanApproval, next domain.State, reason string) error {
 	if s.approvalSaved != nil {
 		*s.approvalSaved = approval
 	}
@@ -76,6 +77,9 @@ func (s serviceStore) SaveGitHubReadSuccess(_ context.Context, _ string, _ strin
 	}
 	if s.nextState != nil {
 		*s.nextState = next
+	}
+	if s.transitionReason != nil {
+		*s.transitionReason = reason
 	}
 	return nil
 }
@@ -388,6 +392,45 @@ func TestReconcileUsesPersistedAuthority(t *testing.T) {
 	evidence.PullRequest.HeadSHA = "other"
 	if _, err := service.Reconcile(context.Background(), ReconcileCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: "run", Repository: "owner/repo", ExpectedState: domain.StatePROpen, IdempotencyKey: "key", Evidence: evidence, Metadata: metadata}); err == nil {
 		t.Fatal("expected evidence detached from persisted head to be rejected")
+	}
+}
+
+func TestReconcilePersistsFiniteUnsupportedTrustedReviewTopologyReason(t *testing.T) {
+	pr := domain.PullRequest{Number: 1, URL: "https://example.invalid/1", NodeID: "PR", HeadBranch: "feature", BaseBranch: "main", HeadSHA: "head", BaseSHA: "base", BodyDigest: "body", OwnershipKey: "key", State: "open"}
+	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateReconcilingReviews, IdempotencyKey: "key", WorkingBranch: "feature", BaseBranch: "main", CandidateHead: "head", BaseSHA: "base"})
+	binding := &SanitizedRepositoryBinding{CanonicalRepository: "owner/repo", ExpectedRepositoryID: 99, GitHubAppID: 1, GitHubInstallationID: 2}
+	evidence := domain.GitHubReadEvidence{Repository: domain.RepositoryIdentity{ID: 99, NodeID: "REPO", Owner: "owner", Name: "repo"}, PullRequest: pr}
+	metadata := GitHubInstallationMetadata{AppID: 1, InstallationID: 2, Repository: evidence.Repository}
+	conflictExisting := TrustedReviewFeedbackRecord{RunID: run.ID, TrustedReviewFeedback: domain.TrustedReviewFeedback{RootCommentNodeID: "COMMENT_1", Body: "original"}}
+	conflictObserved := TrustedReviewFeedbackRecord{RunID: run.ID, TrustedReviewFeedback: domain.TrustedReviewFeedback{RootCommentNodeID: "COMMENT_1", Body: "changed"}}
+	for _, tc := range []struct {
+		name     string
+		command  ReconcileCommand
+		existing []TrustedReviewFeedbackRecord
+		want     string
+	}{
+		{name: "split review overrides Linear completion", command: ReconcileCommand{LinearCompleted: true, FeedbackUnsupported: true, FeedbackUnsupportedReason: domain.TrustedReviewTopologySplitReview}, want: string(domain.TrustedReviewTopologySplitReview)},
+		{name: "generic unsupported overrides Linear completion", command: ReconcileCommand{LinearCompleted: true, FeedbackUnsupported: true}, want: string(domain.TrustedReviewTopologyUnsupported)},
+		{name: "unknown unsupported subtype remains finite", command: ReconcileCommand{LinearCompleted: true, FeedbackUnsupported: true, FeedbackUnsupportedReason: domain.TrustedReviewTopologyReason("actor controlled raw prose")}, want: string(domain.TrustedReviewTopologyUnsupported)},
+		{name: "feedback drift overrides Linear completion", command: ReconcileCommand{LinearCompleted: true, FeedbackDrift: true}, want: TrustedReviewFeedbackDriftReason},
+		{name: "feedback conflict overrides Linear completion", command: ReconcileCommand{LinearCompleted: true, TrustedFeedback: []TrustedReviewFeedbackRecord{conflictObserved}}, existing: []TrustedReviewFeedbackRecord{conflictExisting}, want: TrustedReviewFeedbackConflictReason},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var next domain.State
+			var reason string
+			store := serviceStore{run: run, inspection: RunInspection{Run: run, RepositoryBinding: binding, PullRequest: &pr, TrustedFeedback: tc.existing}, nextState: &next, transitionReason: &reason}
+			command := tc.command
+			command.Requester, command.RunID, command.Repository = Requester{ID: "operator", Kind: "github_login"}, run.ID, run.Repository
+			command.ExpectedState, command.IdempotencyKey, command.Evidence, command.Metadata = run.State, run.IdempotencyKey, evidence, metadata
+
+			result, err := NewCommandService(nil, store).Reconcile(context.Background(), command)
+			if err != nil || result.State != domain.StateManualIntervention || next != domain.StateManualIntervention || reason != tc.want {
+				t.Fatalf("result=%+v next=%s reason=%q err=%v", result, next, reason, err)
+			}
+			if strings.Contains(reason, "operator") || strings.Contains(reason, "actor controlled") || strings.Contains(reason, "review body") {
+				t.Fatalf("untrusted prose entered reason=%q", reason)
+			}
+		})
 	}
 }
 

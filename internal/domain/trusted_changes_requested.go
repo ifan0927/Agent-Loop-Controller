@@ -11,10 +11,20 @@ import (
 // topology. It deliberately contains no remote capability: comment bodies are
 // quoted data that can only enter the controller-owned repair prompt.
 type TrustedChangesRequested struct {
-	Feedback    []TrustedReviewFeedback
-	Findings    []NormalizedFinding
-	Unsupported bool
+	Feedback          []TrustedReviewFeedback
+	Findings          []NormalizedFinding
+	Unsupported       bool
+	UnsupportedReason TrustedReviewTopologyReason
 }
+
+// TrustedReviewTopologyReason is a finite, prose-free classification for
+// trusted review shapes that cannot authorize an automatic repair.
+type TrustedReviewTopologyReason string
+
+const (
+	TrustedReviewTopologyUnsupported TrustedReviewTopologyReason = "trusted_review_topology_unsupported"
+	TrustedReviewTopologySplitReview TrustedReviewTopologyReason = "trusted_review_topology_split_review"
+)
 
 // NormalizeTrustedChangesRequested accepts only an unresolved inline root
 // comment made by the same configured User that submitted an exact-head
@@ -49,6 +59,21 @@ func NormalizeTrustedChangesRequested(pr PullRequest, reviews []GitHubReview, th
 		}
 	}
 	trustedExactReview := len(trustedExactReviews) > 0
+	for _, thread := range threads {
+		for _, comment := range thread.Comments {
+			if comment.Author == nil || comment.Review.State != "COMMENTED" || comment.Review.CommitSHA != pr.HeadSHA || !sameTrustedActor(*comment.Author, trustedByLogin) || !sameTrustedActor(comment.Review.Actor, trustedByLogin) || !sameActor(*comment.Author, comment.Review.Actor) {
+				continue
+			}
+			if _, valid := trustedInlineRootObservation(pr, thread, comment, bodyByComment, observedAt); !valid {
+				continue
+			}
+			for _, review := range trustedExactReviews {
+				if review.NodeID != comment.Review.NodeID && sameActor(review.Actor, comment.Review.Actor) {
+					markUnsupportedTrustedReviewTopology(&result, TrustedReviewTopologySplitReview)
+				}
+			}
+		}
+	}
 	admittedByReview := make(map[string]bool, len(trustedExactReviews))
 	for _, thread := range threads {
 		for _, comment := range thread.Comments {
@@ -56,18 +81,9 @@ func NormalizeTrustedChangesRequested(pr PullRequest, reviews []GitHubReview, th
 			if !linkedFound || comment.Review.DatabaseID != linked.DatabaseID || comment.Review.State != linked.State || comment.Review.CommitSHA != linked.CommitSHA || comment.Author == nil || !sameTrustedActor(*comment.Author, trustedByLogin) || !sameActor(*comment.Author, linked.Actor) {
 				continue
 			}
-			if thread.Resolved || thread.Outdated || comment.ReplyToDatabaseID != 0 || comment.ReplyToNodeID != "" || comment.DatabaseID < 1 || !validTrustedReviewFeedbackNodeID(comment.NodeID) || comment.CreatedAt.IsZero() || comment.UpdatedAt.IsZero() || comment.Review.DatabaseID < 1 || !validTrustedReviewFeedbackNodeID(comment.Review.NodeID) || comment.Review.SourceAt.IsZero() || !validTrustedReviewFeedbackNodeID(thread.NodeID) || !validTrustedReviewFeedbackNodeID(thread.OriginalCommitSHA) || thread.OriginalCommitSHA != pr.HeadSHA {
-				result.Unsupported = true
-				continue
-			}
-			body, found := bodyByComment[comment.NodeID]
-			if !found || body.ThreadNodeID != thread.NodeID || body.BodyDigest != comment.BodyDigest {
-				result.Unsupported = true
-				continue
-			}
-			feedback := TrustedReviewFeedback{PRNumber: pr.Number, PRDatabaseID: pr.DatabaseID, PRNodeID: pr.NodeID, ReviewDatabaseID: comment.Review.DatabaseID, ReviewNodeID: comment.Review.NodeID, ThreadNodeID: thread.NodeID, RootCommentDatabaseID: comment.DatabaseID, RootCommentNodeID: comment.NodeID, Author: *comment.Author, OriginalReviewHeadSHA: pr.HeadSHA, Path: thread.Path, Line: thread.Line, Body: body.Body, BodyDigest: body.BodyDigest, SourceAt: comment.CreatedAt.UTC(), ObservedAt: observedAt.UTC()}
-			if err := feedback.ValidateObservation(); err != nil {
-				result.Unsupported = true
+			feedback, valid := trustedInlineRootObservation(pr, thread, comment, bodyByComment, observedAt)
+			if !valid {
+				markUnsupportedTrustedReviewTopology(&result, TrustedReviewTopologyUnsupported)
 				continue
 			}
 			result.Feedback = append(result.Feedback, feedback)
@@ -75,16 +91,16 @@ func NormalizeTrustedChangesRequested(pr PullRequest, reviews []GitHubReview, th
 			if thread.Line != nil {
 				line = *thread.Line
 			}
-			result.Findings = append(result.Findings, NormalizedFinding{Source: "github_human_review_comment", SourceID: comment.NodeID, ThreadID: thread.NodeID, File: thread.Path, Line: line, Classification: "trusted_changes_requested", BodyDigest: body.BodyDigest, Body: body.Body, HeadSHA: pr.HeadSHA, SourceAt: comment.CreatedAt.UTC(), ObservedAt: observedAt.UTC()})
+			result.Findings = append(result.Findings, NormalizedFinding{Source: "github_human_review_comment", SourceID: comment.NodeID, ThreadID: thread.NodeID, File: thread.Path, Line: line, Classification: "trusted_changes_requested", BodyDigest: feedback.BodyDigest, Body: feedback.Body, HeadSHA: pr.HeadSHA, SourceAt: comment.CreatedAt.UTC(), ObservedAt: observedAt.UTC()})
 			admittedByReview[comment.Review.NodeID] = true
 		}
 	}
 	if trustedExactReview && len(result.Feedback) == 0 {
-		result.Unsupported = true
+		markUnsupportedTrustedReviewTopology(&result, TrustedReviewTopologyUnsupported)
 	}
 	for reviewID := range trustedExactReviews {
 		if !admittedByReview[reviewID] {
-			result.Unsupported = true
+			markUnsupportedTrustedReviewTopology(&result, TrustedReviewTopologyUnsupported)
 		}
 	}
 	sort.Slice(result.Feedback, func(i, j int) bool {
@@ -92,6 +108,27 @@ func NormalizeTrustedChangesRequested(pr PullRequest, reviews []GitHubReview, th
 	})
 	sort.Slice(result.Findings, func(i, j int) bool { return result.Findings[i].SourceID < result.Findings[j].SourceID })
 	return result, nil
+}
+
+func trustedInlineRootObservation(pr PullRequest, thread GitHubReviewThread, comment GitHubReviewComment, bodies map[string]InlineReviewBody, observedAt time.Time) (TrustedReviewFeedback, bool) {
+	if comment.Author == nil || thread.Resolved || thread.Outdated || comment.ReplyToDatabaseID != 0 || comment.ReplyToNodeID != "" || comment.UpdatedAt.IsZero() || comment.UpdatedAt.Before(comment.CreatedAt) || comment.Review.SourceAt.IsZero() || comment.Review.CommitSHA != pr.HeadSHA || thread.OriginalCommitSHA != pr.HeadSHA {
+		return TrustedReviewFeedback{}, false
+	}
+	body, found := bodies[comment.NodeID]
+	if !found || body.ThreadNodeID != thread.NodeID || body.BodyDigest != comment.BodyDigest {
+		return TrustedReviewFeedback{}, false
+	}
+	feedback := TrustedReviewFeedback{PRNumber: pr.Number, PRDatabaseID: pr.DatabaseID, PRNodeID: pr.NodeID, ReviewDatabaseID: comment.Review.DatabaseID, ReviewNodeID: comment.Review.NodeID, ThreadNodeID: thread.NodeID, RootCommentDatabaseID: comment.DatabaseID, RootCommentNodeID: comment.NodeID, Author: *comment.Author, OriginalReviewHeadSHA: pr.HeadSHA, Path: thread.Path, Line: thread.Line, Body: body.Body, BodyDigest: body.BodyDigest, SourceAt: comment.CreatedAt.UTC(), ObservedAt: observedAt.UTC()}
+	return feedback, feedback.ValidateObservation() == nil
+}
+
+func markUnsupportedTrustedReviewTopology(result *TrustedChangesRequested, reason TrustedReviewTopologyReason) {
+	result.Unsupported = true
+	// The observed split-review shape is more specific than the generic finite
+	// fallback and must survive other unsupported facts in the same snapshot.
+	if result.UnsupportedReason == "" || reason == TrustedReviewTopologySplitReview {
+		result.UnsupportedReason = reason
+	}
 }
 
 // TrustedFeedbackDrift reports whether the next stable GitHub observation no

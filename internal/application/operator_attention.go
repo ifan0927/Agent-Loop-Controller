@@ -242,10 +242,19 @@ func ManualInterventionAttentionEvent(run Run, transition Transition) (OperatorA
 	evidence := manualInterventionAttentionDigest(run, transition)
 	return newOperatorAttentionEvent(operatorAttentionEventInput{
 		ScopeID: run.ID, RunID: run.ID, EventType: OperatorAttentionManualIntervention,
-		Profile: profile, State: run.State, Severity: "error", ReasonCode: "manual_intervention",
+		Profile: profile, State: run.State, Severity: "error", ReasonCode: manualInterventionReasonCode(transition.Reason),
 		EvidenceDigest: evidence, TransitionSequence: transition.Sequence,
 		OccurredAt: transition.CreatedAt, ObservedAt: transition.CreatedAt,
 	})
+}
+
+func manualInterventionReasonCode(reason string) string {
+	switch reason {
+	case string(domain.TrustedReviewTopologyUnsupported), string(domain.TrustedReviewTopologySplitReview), TrustedReviewFeedbackDriftReason, TrustedReviewFeedbackConflictReason:
+		return reason
+	default:
+		return "manual_intervention"
+	}
 }
 
 // HumanDecisionAttentionEvent binds the presentation action to the exact
@@ -425,7 +434,7 @@ func allowedOperatorAttentionActionsFor(eventType, state, reason string, failure
 		}
 		return actions
 	}
-	if eventType == OperatorAttentionManualIntervention && state == string(domain.StateManualIntervention) && reason == "manual_intervention" {
+	if eventType == OperatorAttentionManualIntervention && state == string(domain.StateManualIntervention) && isManualInterventionReason(reason) {
 		return []OperatorAttentionActionID{OperatorAttentionActionAbandon}
 	}
 	if eventType == OperatorAttentionHumanDecision && state == string(domain.StateAwaitingHumanDecision) && reason == "human_decision_required" {
@@ -438,6 +447,10 @@ func allowedOperatorAttentionActionsFor(eventType, state, reason string, failure
 		return []OperatorAttentionActionID{OperatorAttentionActionRecoverCIWait}
 	}
 	return []OperatorAttentionActionID{}
+}
+
+func isManualInterventionReason(reason string) bool {
+	return reason == "manual_intervention" || reason == string(domain.TrustedReviewTopologyUnsupported) || reason == string(domain.TrustedReviewTopologySplitReview) || reason == TrustedReviewFeedbackDriftReason || reason == TrustedReviewFeedbackConflictReason
 }
 
 // operatorRetryableState is shared by attention projection and the command
@@ -482,7 +495,7 @@ func sanitizedOperatorAttentionReason(eventType, value string) string {
 		OperatorAttentionAdmissionAuthority:    {"admission_authority_conflict": true, "mutation_authority_conflict": true},
 		OperatorAttentionRetry:                 {RetryReasonProcessStart: true, RetryReasonUnavailable: true, RetryReasonAuthority: true, RetryReasonIntegrity: true, RetryReasonManual: true, RetryReasonTerminal: true, RetryReasonPersistence: true, RetryReasonBudgetExhausted: true},
 		OperatorAttentionCleanupResidue:        {"cleanup_residue": true},
-		OperatorAttentionManualIntervention:    {"manual_intervention": true},
+		OperatorAttentionManualIntervention:    {"manual_intervention": true, string(domain.TrustedReviewTopologyUnsupported): true, string(domain.TrustedReviewTopologySplitReview): true, TrustedReviewFeedbackDriftReason: true, TrustedReviewFeedbackConflictReason: true},
 		OperatorAttentionHumanDecision:         {"human_decision_required": true},
 		OperatorAttentionCISlow:                {"ci_wait_slow": true},
 		OperatorAttentionCIWaitRecovery:        {"legacy_ci_topology_drift": true},

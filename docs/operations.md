@@ -1985,6 +1985,15 @@ the production driver remains its bounded polling authority. Repeated parked
 cycles replay the same event key, and authority drift stays parked behind a
 stable fail-closed reason.
 
+Trusted-review manual stops expose one of the finite reasons
+`trusted_review_topology_split_review`,
+`trusted_review_topology_unsupported`, `trusted_review_feedback_drift`, or
+`trusted_review_feedback_conflict` in the transition timeline and attention
+event. The split reason means an inline root belonged to a `COMMENTED` review
+while a separate trusted exact-head review supplied `CHANGES_REQUESTED`; the
+controller does not combine those reviews. Reason fields contain no review body
+or other actor-controlled prose.
+
 `operator_actions` is a separate ordered projection for authenticated recovery
 answers. It shows the allowlisted action, immutable requester identity, exact
 attention/reason and transition binding, lifecycle/result, resulting

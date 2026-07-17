@@ -29,6 +29,72 @@ func TestNormalizeTrustedChangesRequestedAdmitsOnlyExactTrustedRoot(t *testing.T
 	}
 }
 
+func TestNormalizeTrustedChangesRequestedClassifiesSplitReviewTopology(t *testing.T) {
+	pr, threads, handoff, trusted := trustedChangesFixture()
+	changesRequested := threads[0].Comments[0].Review
+	changesRequested.DatabaseID, changesRequested.NodeID = 6, "REVIEW_6"
+	threads[0].Comments[0].Review.State = "COMMENTED"
+
+	result, err := NormalizeTrustedChangesRequested(pr, []GitHubReview{threads[0].Comments[0].Review, changesRequested}, threads, handoff, trusted, time.Now().UTC())
+	if err != nil || !result.Unsupported || result.UnsupportedReason != TrustedReviewTopologySplitReview || len(result.Feedback) != 0 || len(result.Findings) != 0 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+func TestNormalizeTrustedChangesRequestedRejectsMalformedSplitReviewTopology(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*GitHubReviewThread, *InlineReviewBodyHandoff)
+	}{
+		{name: "reply", mutate: func(thread *GitHubReviewThread, _ *InlineReviewBodyHandoff) {
+			thread.Comments[0].ReplyToDatabaseID, thread.Comments[0].ReplyToNodeID = 99, "ROOT"
+		}},
+		{name: "resolved", mutate: func(thread *GitHubReviewThread, _ *InlineReviewBodyHandoff) { thread.Resolved = true }},
+		{name: "outdated", mutate: func(thread *GitHubReviewThread, _ *InlineReviewBodyHandoff) { thread.Outdated = true }},
+		{name: "invalid thread identity", mutate: func(thread *GitHubReviewThread, _ *InlineReviewBodyHandoff) { thread.NodeID = "" }},
+		{name: "invalid comment identity", mutate: func(thread *GitHubReviewThread, _ *InlineReviewBodyHandoff) {
+			thread.Comments[0].DatabaseID, thread.Comments[0].NodeID = 0, ""
+		}},
+		{name: "invalid review identity", mutate: func(thread *GitHubReviewThread, _ *InlineReviewBodyHandoff) {
+			thread.Comments[0].Review.DatabaseID, thread.Comments[0].Review.NodeID = 0, ""
+		}},
+		{name: "missing review timestamp", mutate: func(thread *GitHubReviewThread, _ *InlineReviewBodyHandoff) {
+			thread.Comments[0].Review.SourceAt = time.Time{}
+		}},
+		{name: "missing comment created timestamp", mutate: func(thread *GitHubReviewThread, _ *InlineReviewBodyHandoff) {
+			thread.Comments[0].CreatedAt = time.Time{}
+		}},
+		{name: "missing comment updated timestamp", mutate: func(thread *GitHubReviewThread, _ *InlineReviewBodyHandoff) {
+			thread.Comments[0].UpdatedAt = time.Time{}
+		}},
+		{name: "comment update predates creation", mutate: func(thread *GitHubReviewThread, _ *InlineReviewBodyHandoff) {
+			thread.Comments[0].UpdatedAt = thread.Comments[0].CreatedAt.Add(-time.Second)
+		}},
+		{name: "stale original head", mutate: func(thread *GitHubReviewThread, _ *InlineReviewBodyHandoff) {
+			thread.OriginalCommitSHA = strings.Repeat("b", 40)
+		}},
+		{name: "body handoff mismatch", mutate: func(_ *GitHubReviewThread, handoff *InlineReviewBodyHandoff) {
+			handoff.Comments[0].ThreadNodeID = "OTHER_THREAD"
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pr, threads, handoff, trusted := trustedChangesFixture()
+			thread := threads[0]
+			thread.Comments = append([]GitHubReviewComment(nil), thread.Comments...)
+			changesRequested := thread.Comments[0].Review
+			changesRequested.DatabaseID, changesRequested.NodeID = 6, "REVIEW_6"
+			thread.Comments[0].Review.State = "COMMENTED"
+			handoff.Comments = append([]InlineReviewBody(nil), handoff.Comments...)
+			tc.mutate(&thread, &handoff)
+
+			result, err := NormalizeTrustedChangesRequested(pr, []GitHubReview{thread.Comments[0].Review, changesRequested}, []GitHubReviewThread{thread}, handoff, trusted, time.Now().UTC())
+			if err != nil || !result.Unsupported || result.UnsupportedReason != TrustedReviewTopologyUnsupported || len(result.Feedback) != 0 || len(result.Findings) != 0 {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+		})
+	}
+}
+
 func TestNormalizeTrustedChangesRequestedFailsClosedForTopologyAndLookalikes(t *testing.T) {
 	pr, threads, handoff, trusted := trustedChangesFixture()
 	cases := []struct {
@@ -55,7 +121,7 @@ func TestNormalizeTrustedChangesRequestedFailsClosedForTopologyAndLookalikes(t *
 			tc.mutate(&copyThreads, &copyHandoff)
 			reviews := []GitHubReview{threads[0].Comments[0].Review}
 			result, err := NormalizeTrustedChangesRequested(pr, reviews, copyThreads, copyHandoff, trusted, time.Now().UTC())
-			if err != nil || result.Unsupported != tc.want || len(result.Feedback) != 0 {
+			if err != nil || result.Unsupported != tc.want || result.UnsupportedReason != TrustedReviewTopologyUnsupported || len(result.Feedback) != 0 {
 				t.Fatalf("result=%+v err=%v", result, err)
 			}
 		})
