@@ -819,6 +819,9 @@ func (d *LinearTodoDispatcher) orphanRetryAttention(ctx context.Context) (Linear
 		return LinearTodoDispatchResult{}, false, classifyServiceError(err)
 	}
 	for _, schedule := range schedules {
+		if schedule.Status == RetryScheduleSuperseded {
+			continue
+		}
 		run, runErr := d.store.GetRun(ctx, schedule.RunID)
 		if runErr != nil {
 			return LinearTodoDispatchResult{}, false, classifyServiceError(runErr)
