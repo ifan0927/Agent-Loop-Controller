@@ -74,7 +74,7 @@ func TestProductionContinueRunsRepairDeadlinePreflightBeforeLinear(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, State: domain.StateExecuting})
+	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), RawIssueHash: snapshot.RawHash, NormalizedTaskJSON: string(snapshot.NormalizedJSON), Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, State: domain.StateExecuting})
 	store := &admissionStore{serviceStore: serviceStore{run: run}}
 	admission, err := NewLinearAdmissionService(reader, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, store, &admissionController{})
 	if err != nil {
@@ -99,7 +99,7 @@ func TestProductionContinueBoundsLinearAuthorityReadByRepairDeadline(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, State: domain.StateExecuting})
+	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), RawIssueHash: snapshot.RawHash, NormalizedTaskJSON: string(snapshot.NormalizedJSON), Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, State: domain.StateExecuting})
 	store := &admissionStore{serviceStore: serviceStore{run: run}}
 	admission, err := NewLinearAdmissionService(reader, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, store, &admissionController{})
 	if err != nil {
@@ -163,11 +163,14 @@ type pushTestStore struct {
 	leaseMu           sync.Mutex
 	leaseHeld         bool
 	leaseLost         bool
+	leaseAcquires     int
+	leaseReleases     int
 }
 
 func (s *pushTestStore) AcquireLease(context.Context, string, string, time.Time) (bool, error) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
+	s.leaseAcquires++
 	if s.leaseHeld {
 		return false, nil
 	}
@@ -178,6 +181,7 @@ func (s *pushTestStore) AcquireLease(context.Context, string, string, time.Time)
 func (s *pushTestStore) ReleaseLease(context.Context, string, string) error {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
+	s.leaseReleases++
 	s.leaseHeld = false
 	return nil
 }
@@ -737,7 +741,7 @@ func TestProductionLinearCompletionPersistsExactMergeBoundCompletedEvidence(t *t
 		t.Fatalf("result=%+v err=%v state=%s observations=%+v", result, err, store.run.State, store.linearCompletion)
 	}
 	got := store.linearCompletion[0]
-	if got.MergeSHA != "merge" || got.LinearIssueID != "linear-id" || got.Status != LinearCompletionCompleted || got.SourceRevision != source.SourceRevision {
+	if got.MergeSHA != "merge" || got.LinearIssueID != "123e4567-e89b-42d3-a456-426614174042" || got.Status != LinearCompletionCompleted || got.SourceRevision != source.SourceRevision {
 		t.Fatalf("completion observation=%+v", got)
 	}
 }
@@ -848,7 +852,7 @@ func TestProductionLinearCompletionRejectsWrongPersistedIssueIdentity(t *testing
 	mergedAt := time.Date(2026, 7, 13, 3, 0, 0, 0, time.UTC)
 	store.merge = &MergeRecord{RunID: run.ID, PRNumber: 7, PreMergeSHA: run.CandidateHead, BaseSHA: run.BaseSHA, Method: "squash", MergeSHA: "merge", MergedAt: mergedAt}
 	source := validLinearSource()
-	source.IssueID = "different-linear-id"
+	source.IssueID = "123e4567-e89b-42d3-a456-426614174099"
 	source.State = LinearState{ID: "done", Name: "Done", Type: "completed"}
 	source.UpdatedAt, source.ObservedAt = mergedAt.Add(time.Minute), mergedAt.Add(time.Minute)
 	source.SourceRevision = source.UpdatedAt.Format(time.RFC3339Nano)
@@ -1434,7 +1438,7 @@ func TestProductionContinueRevalidatesLinearBeforeLocalController(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, State: domain.StateExecuting})
+	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), RawIssueHash: snapshot.RawHash, NormalizedTaskJSON: string(snapshot.NormalizedJSON), Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, State: domain.StateExecuting})
 	store := &admissionStore{serviceStore: serviceStore{run: run}}
 	admissionController := &admissionController{}
 	admission, err := NewLinearAdmissionService(reader, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, store, admissionController)
@@ -1459,7 +1463,7 @@ func TestProductionContinueStopsOnLinearDriftBeforeLocalController(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, State: domain.StateExecuting})
+	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), RawIssueHash: snapshot.RawHash, NormalizedTaskJSON: string(snapshot.NormalizedJSON), Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, State: domain.StateExecuting})
 	reader.source.SourceRevision = "changed"
 	store := &admissionStore{serviceStore: serviceStore{run: run}}
 	admission, err := NewLinearAdmissionService(reader, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, store, &admissionController{})

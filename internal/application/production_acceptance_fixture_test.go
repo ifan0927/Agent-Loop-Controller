@@ -290,9 +290,9 @@ func TestOfflineAcceptanceProductionAbandonTerminalizesWithResidueAndReplaysClea
 		store.Close()
 		t.Fatalf("third=%+v cleanup=%v err=%v", third, cleanup.calls, err)
 	}
-	if reader.reads != 4 {
+	if reader.reads != 7 {
 		store.Close()
-		t.Fatalf("Linear reads=%d want initial admission plus three abandon revalidations", reader.reads)
+		t.Fatalf("Linear reads=%d want 7: initial admission (1), active abandon pre/post lease (2), and two failed-residue replays pre/post lease (4)", reader.reads)
 	}
 	inspection, err := store.Inspect(context.Background(), run.ID)
 	if err != nil {

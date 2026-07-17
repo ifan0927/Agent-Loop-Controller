@@ -110,16 +110,23 @@ func TestLinearAdmissionFreezesControllerOwnedTask(t *testing.T) {
 
 func TestLinearAdmissionSourceDriftRequiresManualDecision(t *testing.T) {
 	repository := LocalRepository{CanonicalRepository: "owner/repo", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
-	reader := &admissionReader{source: validLinearSource()}
-	reader.source.SourceRevision = "2026-07-13T00:00:00Z"
-	store := &admissionStore{issue: Run{ID: "run-existing", IssueID: "IFAN-42", SourceRevision: "2026-07-12T00:00:00Z", Repository: "owner/repo", WorkingBranch: "ifan/ifan-42-linear-admission", TaskHash: "old", State: domain.StateExecuting}, found: true}
+	original := validLinearSource()
+	snapshot, _, err := admitLinearTask(original, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := original
+	fresh.SourceRevision = "2026-07-13T00:00:00Z"
+	reader := &admissionReader{source: fresh}
+	existing := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), RawIssueHash: snapshot.RawHash, NormalizedTaskJSON: string(snapshot.NormalizedJSON), TaskHash: snapshot.TaskHash, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, State: domain.StateExecuting})
+	store := &admissionStore{issue: existing, found: true}
 	controller := &admissionController{}
 	service, err := NewLinearAdmissionService(reader, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, store, controller)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, _, err = service.Start(context.Background(), LinearStartCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, Identifier: "IFAN-42"})
-	if err == nil || !strings.Contains(err.Error(), "human decision") || !store.marked || store.markedRunID != "run-existing" || store.markedState != domain.StateExecuting || store.markedSource != "2026-07-12T00:00:00Z" || controller.started != 0 {
+	if err == nil || !strings.Contains(err.Error(), "human decision") || !store.marked || store.markedRunID != existing.ID || store.markedState != domain.StateExecuting || store.markedSource != existing.SourceRevision || controller.started != 0 {
 		t.Fatalf("err=%v marked=%t run=%s state=%s source=%s started=%d", err, store.marked, store.markedRunID, store.markedState, store.markedSource, controller.started)
 	}
 }
@@ -142,7 +149,7 @@ func TestLinearRevalidateAllowsAutomatedStartedStateWithUnchangedTask(t *testing
 	progressed := original
 	progressed.State = LinearState{ID: "started", Name: "In Progress", Type: "started"}
 	progressed.SourceRevision = "2026-07-13T00:00:00Z"
-	existing := Run{ID: "run-existing", IssueID: original.Identifier, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: repository.CanonicalRepository, RepositoryConfigJSON: string(repositoryJSON), WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: string(storedTask), CandidateHead: "candidate", State: domain.StatePROpen}
+	existing := Run{ID: snapshot.Task.RunID, IssueID: original.Identifier, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), RawIssueHash: snapshot.RawHash, Repository: repository.CanonicalRepository, RepositoryConfigJSON: string(repositoryJSON), WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: string(storedTask), CandidateHead: "candidate", State: domain.StatePROpen}
 	store := &admissionStore{serviceStore: serviceStore{run: existing}}
 	service, err := NewLinearAdmissionService(&admissionReader{source: progressed}, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, store, &admissionController{})
 	if err != nil {
@@ -161,7 +168,7 @@ func TestLinearRevalidateManualInterventionRequiresExplicitOwnedPushRecovery(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: mustJSON(t, snapshot.Task), CandidateHead: "candidate", State: domain.StateManualIntervention})
+	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), RawIssueHash: snapshot.RawHash, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: mustJSON(t, snapshot.Task), CandidateHead: "candidate", State: domain.StateManualIntervention})
 	store := &admissionStore{serviceStore: serviceStore{run: run}}
 	service, err := NewLinearAdmissionService(&admissionReader{source: source}, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, store, &admissionController{})
 	if err != nil {
@@ -183,7 +190,7 @@ func TestLinearAbandonRevalidationAllowsOnlyUnchangedCanceledSource(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: mustJSON(t, snapshot.Task), State: domain.StateManualIntervention})
+	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), RawIssueHash: snapshot.RawHash, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: mustJSON(t, snapshot.Task), State: domain.StateManualIntervention})
 	canceled := original
 	canceled.State = LinearState{ID: "canceled", Name: "Canceled", Type: "canceled"}
 	canceled.SourceRevision = "2026-07-13T00:00:00Z"
@@ -210,6 +217,116 @@ func TestLinearAbandonRevalidationAllowsOnlyUnchangedCanceledSource(t *testing.T
 	}
 }
 
+func TestLinearAbandonRevalidationAllowsRecognizedPRAutomationProgress(t *testing.T) {
+	repository := LocalRepository{CanonicalRepository: "owner/repo", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
+	resolver := admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}
+	original := validLinearSource()
+	snapshot, _, err := admitLinearTask(original, resolver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), RawIssueHash: snapshot.RawHash, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: mustJSON(t, snapshot.Task), State: domain.StateManualIntervention})
+	progressed := original
+	progressed.State = LinearState{ID: "in-review", Name: "In Review", Type: "started"}
+	progressed.SourceRevision = "2026-07-13T00:00:00Z"
+	command := LinearRevalidateCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}
+
+	store := &admissionStore{serviceStore: serviceStore{run: run}}
+	service, err := NewLinearAdmissionService(&admissionReader{source: progressed}, resolver, store, &admissionController{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := service.RevalidateForAbandon(context.Background(), command)
+	if err != nil || got.ID != run.ID || store.marked {
+		t.Fatalf("abandon revalidation run=%+v err=%v marked=%t", got, err, store.marked)
+	}
+}
+
+func TestLinearAbandonRevalidationRejectsStartedTaskAndBranchDrift(t *testing.T) {
+	repository := LocalRepository{CanonicalRepository: "owner/repo", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
+	resolver := admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}
+	original := validLinearSource()
+	snapshot, _, err := admitLinearTask(original, resolver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), RawIssueHash: snapshot.RawHash, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: mustJSON(t, snapshot.Task), State: domain.StateManualIntervention})
+	command := LinearRevalidateCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}
+
+	tests := []struct {
+		name   string
+		mutate func(*LinearTaskSource)
+	}{
+		{name: "source UUID", mutate: func(source *LinearTaskSource) { source.IssueID = "123e4567-e89b-42d3-a456-426614174099" }},
+		{name: "task content", mutate: func(source *LinearTaskSource) { source.Description += "\n\nMaterial task drift." }},
+		{name: "working branch", mutate: func(source *LinearTaskSource) { source.BranchName = "ifan/other-branch" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			progressed := original
+			progressed.State = LinearState{ID: "in-review", Name: "In Review", Type: "started"}
+			progressed.SourceRevision = "2026-07-13T00:00:00Z"
+			test.mutate(&progressed)
+			store := &admissionStore{serviceStore: serviceStore{run: run}}
+			service, err := NewLinearAdmissionService(&admissionReader{source: progressed}, resolver, store, &admissionController{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := service.RevalidateForAbandon(context.Background(), command); err == nil || !strings.Contains(err.Error(), "graceful abandonment requires unchanged Linear task authority") {
+				t.Fatalf("abandon drift err=%v", err)
+			}
+			if store.marked {
+				t.Fatal("read-only abandon revalidation marked Linear drift")
+			}
+		})
+	}
+}
+
+func TestPersistedLinearIssueIDRequiresSealedValidAuthority(t *testing.T) {
+	source := validLinearSource()
+	raw, err := json.Marshal(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idempotencyKey, runID := deriveLinearAdmissionIdentity(source.Identifier, source.SourceRevision)
+	valid := Run{ID: runID, IssueID: source.Identifier, IdempotencyKey: idempotencyKey, SourceRevision: source.SourceRevision, RawIssueJSON: string(raw), RawIssueHash: digestLinear(raw)}
+	if got, err := persistedLinearIssueID(valid); err != nil || got != source.IssueID {
+		t.Fatalf("persisted issue ID=%q err=%v", got, err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Run)
+	}{
+		{name: "missing JSON", mutate: func(run *Run) { run.RawIssueJSON = ""; run.RawIssueHash = digestLinear(nil) }},
+		{name: "corrupt JSON", mutate: func(run *Run) { run.RawIssueJSON = "{"; run.RawIssueHash = digestLinear([]byte(run.RawIssueJSON)) }},
+		{name: "missing hash", mutate: func(run *Run) { run.RawIssueHash = "" }},
+		{name: "mismatched hash", mutate: func(run *Run) { run.RawIssueHash = strings.Repeat("0", 64) }},
+		{name: "source revision mismatch", mutate: func(run *Run) { run.SourceRevision = "2026-07-13T00:00:00Z" }},
+		{name: "idempotency key mismatch", mutate: func(run *Run) { run.IdempotencyKey = strings.Repeat("0", 64) }},
+		{name: "derived run ID mismatch", mutate: func(run *Run) { run.ID = "run-wrong" }},
+		{name: "invalid source UUID", mutate: func(run *Run) {
+			invalid := source
+			invalid.IssueID = "linear-id"
+			invalidRaw, marshalErr := json.Marshal(invalid)
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			run.RawIssueJSON = string(invalidRaw)
+			run.RawIssueHash = digestLinear(invalidRaw)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			run := valid
+			test.mutate(&run)
+			if got, err := persistedLinearIssueID(run); err == nil || got != "" {
+				t.Fatalf("unsealed persisted issue ID=%q err=%v", got, err)
+			}
+		})
+	}
+}
+
 func TestLinearRevalidateAllowsUnchangedStartedStateDuringRepairExecution(t *testing.T) {
 	repository := LocalRepository{CanonicalRepository: "owner/repo", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
 	original := validLinearSource()
@@ -228,7 +345,7 @@ func TestLinearRevalidateAllowsUnchangedStartedStateDuringRepairExecution(t *tes
 	progressed := original
 	progressed.State = LinearState{ID: "started", Name: "In Progress", Type: "started"}
 	progressed.SourceRevision = "2026-07-13T00:00:00Z"
-	existing := Run{ID: "run-existing", IssueID: original.Identifier, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: repository.CanonicalRepository, RepositoryConfigJSON: string(repositoryJSON), WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: string(storedTask), State: domain.StateExecuting}
+	existing := Run{ID: snapshot.Task.RunID, IssueID: original.Identifier, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), RawIssueHash: snapshot.RawHash, Repository: repository.CanonicalRepository, RepositoryConfigJSON: string(repositoryJSON), WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: string(storedTask), State: domain.StateExecuting}
 	store := &admissionStore{serviceStore: serviceStore{run: existing}}
 	service, err := NewLinearAdmissionService(&admissionReader{source: progressed}, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, store, &admissionController{})
 	if err != nil {
@@ -254,7 +371,7 @@ func TestLinearCIWaitRecoveryReadOnlyRevalidationAllowsOnlyStableStartedProgress
 	if err != nil {
 		t.Fatal(err)
 	}
-	existing := Run{ID: "run-existing", IssueID: original.Identifier, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: repository.CanonicalRepository, RepositoryConfigJSON: string(repositoryJSON), WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: mustJSON(t, snapshot.Task), CandidateHead: "candidate", State: domain.StatePROpen}
+	existing := Run{ID: snapshot.Task.RunID, IssueID: original.Identifier, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), RawIssueHash: snapshot.RawHash, Repository: repository.CanonicalRepository, RepositoryConfigJSON: string(repositoryJSON), WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: mustJSON(t, snapshot.Task), CandidateHead: "candidate", State: domain.StatePROpen}
 	command := LinearRevalidateCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: existing.ID, Repository: existing.Repository, ExpectedState: existing.State, IdempotencyKey: existing.IdempotencyKey}
 
 	tests := []struct {
@@ -310,7 +427,7 @@ func TestLinearGitHubRevalidateAllowsOnlyUnchangedCompletedObservation(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: mustJSON(t, snapshot.Task), State: domain.StateAwaitingHumanApproval})
+	run := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), RawIssueHash: snapshot.RawHash, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: mustJSON(t, snapshot.Task), State: domain.StateAwaitingHumanApproval})
 	completed := original
 	completed.State = LinearState{ID: "done", Name: "Done", Type: "completed"}
 	completed.SourceRevision = "2026-07-13T00:01:00Z"
@@ -357,7 +474,7 @@ func TestLinearRevalidateRejectsStartedStateWithTaskChange(t *testing.T) {
 	changed.State = LinearState{ID: "started", Name: "In Progress", Type: "started"}
 	changed.SourceRevision = "2026-07-13T00:00:00Z"
 	changed.Description += "\n\n- Changed after admission."
-	existing := Run{ID: "run-existing", IssueID: original.Identifier, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: repository.CanonicalRepository, RepositoryConfigJSON: string(repositoryJSON), WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: string(storedTask), CandidateHead: "candidate", State: domain.StatePROpen}
+	existing := Run{ID: snapshot.Task.RunID, IssueID: original.Identifier, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), RawIssueHash: snapshot.RawHash, Repository: repository.CanonicalRepository, RepositoryConfigJSON: string(repositoryJSON), WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: string(storedTask), CandidateHead: "candidate", State: domain.StatePROpen}
 	store := &admissionStore{serviceStore: serviceStore{run: existing}}
 	service, err := NewLinearAdmissionService(&admissionReader{source: changed}, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, store, &admissionController{})
 	if err != nil {
@@ -380,16 +497,22 @@ func TestLinearRevalidateRejectsStartedStateWithTaskChange(t *testing.T) {
 
 func TestLinearAdmissionConcurrentSourceDriftIsDurablyHalted(t *testing.T) {
 	repository := LocalRepository{CanonicalRepository: "owner/repo", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
-	reader := &admissionReader{source: validLinearSource()}
-	reader.source.SourceRevision = "2026-07-13T00:00:00Z"
-	existing := Run{ID: "run-existing", IssueID: "IFAN-42", SourceRevision: "2026-07-12T00:00:00Z", Repository: "owner/repo", WorkingBranch: "ifan/ifan-42-linear-admission", TaskHash: "old", State: domain.StateExecuting}
+	original := validLinearSource()
+	snapshot, _, err := admitLinearTask(original, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := original
+	fresh.SourceRevision = "2026-07-13T00:00:00Z"
+	reader := &admissionReader{source: fresh}
+	existing := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), RawIssueHash: snapshot.RawHash, NormalizedTaskJSON: string(snapshot.NormalizedJSON), TaskHash: snapshot.TaskHash, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, State: domain.StateExecuting})
 	store := &admissionStore{serviceStore: serviceStore{run: existing}, lateIssue: &existing}
 	service, err := NewLinearAdmissionService(reader, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, store, failingAdmissionController{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, _, err = service.Start(context.Background(), LinearStartCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, Identifier: "IFAN-42"})
-	if err == nil || !strings.Contains(err.Error(), "human decision") || !store.marked || store.markedRunID != "run-existing" {
+	if err == nil || !strings.Contains(err.Error(), "human decision") || !store.marked || store.markedRunID != existing.ID || store.markedSource != existing.SourceRevision {
 		t.Fatalf("err=%v marked=%t run=%s", err, store.marked, store.markedRunID)
 	}
 }
@@ -401,7 +524,7 @@ func TestLinearAdmissionConcurrentIdenticalTriggerReturnsExistingRun(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	existing := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, State: domain.StateReceived})
+	existing := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), RawIssueHash: snapshot.RawHash, NormalizedTaskJSON: string(snapshot.NormalizedJSON), Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, State: domain.StateReceived})
 	store := &admissionStore{serviceStore: serviceStore{run: existing}, lateIssue: &existing}
 	controller := concurrentAdmissionController{}
 	service, err := NewLinearAdmissionService(reader, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, store, controller)
@@ -421,7 +544,7 @@ func TestLinearAdmissionDoesNotMaskExistingRunContinuationFailure(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	existing := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, State: domain.StateReceived})
+	existing := authorizeTestRun(Run{ID: snapshot.Task.RunID, IssueID: snapshot.Task.IssueID, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), RawIssueHash: snapshot.RawHash, NormalizedTaskJSON: string(snapshot.NormalizedJSON), Repository: snapshot.Task.Repository, WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, State: domain.StateReceived})
 	store := &admissionStore{serviceStore: serviceStore{run: existing}, issue: existing, found: true, idempotency: &existing}
 	service, err := NewLinearAdmissionService(reader, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, store, failingAdmissionController{})
 	if err != nil {
@@ -504,7 +627,7 @@ func TestLinearAdmissionRejectsIneligibleAndAmbiguousRepository(t *testing.T) {
 func validLinearSource() LinearTaskSource {
 	created := time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC)
 	updated := created.Add(24 * time.Hour)
-	return LinearTaskSource{Provider: "linear", IssueID: "linear-id", Identifier: "IFAN-42", URL: "https://linear.app/ifan/issue/IFAN-42/test", Title: "Admit Linear task",
+	return LinearTaskSource{Provider: "linear", IssueID: "123e4567-e89b-42d3-a456-426614174042", Identifier: "IFAN-42", URL: "https://linear.app/ifan/issue/IFAN-42/test", Title: "Admit Linear task",
 		Description: "## Outcome\n\nFreeze one trusted task snapshot.\n\n## Acceptance Criteria\n\n- Repeating the trigger is idempotent.\n- `echo untrusted` is never a verifier command.\n\n## Out of Scope\n\n- External writes.",
 		Team:        LinearTeam{ID: "team", Key: "IFAN", Name: "I-Fan"}, State: LinearState{ID: "todo", Name: "Todo", Type: "backlog"},
 		Labels: []LinearLabel{{ID: "agent", Name: "agent:codex"}, {ID: "repository", Name: "owner/repo"}}, Cycle: LinearCycle{ID: "cycle", Number: 1, StartsAt: created, EndsAt: updated.Add(24 * time.Hour), IsActive: true},

@@ -94,7 +94,7 @@ func productionLinearSource() application.LinearTaskSource {
 	updated := created.Add(time.Hour)
 	return application.LinearTaskSource{
 		Provider:       "linear",
-		IssueID:        "linear-fixture-id",
+		IssueID:        "123e4567-e89b-42d3-a456-426614174042",
 		Identifier:     "IFAN-FIXTURE",
 		URL:            "https://linear.example.invalid/IFAN-FIXTURE",
 		Title:          "Add Clamp",

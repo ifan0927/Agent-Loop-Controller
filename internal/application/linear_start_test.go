@@ -327,6 +327,39 @@ func TestMoveReservedIssueToStartedHaltsOnEveryReservationAuthorityDrift(t *test
 	}
 }
 
+func TestMoveReservedIssueToStartedRequiresSealedPersistedSourceAuthority(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Run)
+	}{
+		{name: "missing raw hash", mutate: func(run *Run) { run.RawIssueHash = "" }},
+		{name: "mismatched raw hash", mutate: func(run *Run) { run.RawIssueHash = strings.Repeat("0", 64) }},
+		{name: "sealed wrong source UUID", mutate: func(run *Run) {
+			var source LinearTaskSource
+			if err := json.Unmarshal([]byte(run.RawIssueJSON), &source); err != nil {
+				t.Fatal(err)
+			}
+			source.IssueID = "123e4567-e89b-42d3-a456-426614174199"
+			raw, err := json.Marshal(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			run.RawIssueJSON = string(raw)
+			run.RawIssueHash = digestLinear(raw)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, service := newLinearStartService(t, []LinearTaskSource{validStartSource()}, nil, nil)
+			test.mutate(&store.run)
+			_, err := service.MoveReservedIssueToStarted(context.Background(), MoveReservedIssueToStartedCommand{RunID: store.run.ID})
+			if err == nil || store.run.State != domain.StateManualIntervention || len(store.effects) != 0 || len(service.starter.(*linearStartMover).calls) != 0 {
+				t.Fatalf("err=%v run=%+v effects=%+v calls=%d", err, store.run, store.effects, len(service.starter.(*linearStartMover).calls))
+			}
+		})
+	}
+}
+
 func TestMoveReservedIssueToStartedRejectsSameNameWrongUUIDMutationResponse(t *testing.T) {
 	todo := validStartSource()
 	wrong := startAuthority().InProgressState
@@ -346,7 +379,7 @@ func newLinearStartService(t *testing.T, sources []LinearTaskSource, results []L
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := Run{ID: "run-linear-start", IssueID: source.Identifier, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: source.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), NormalizedTaskJSON: string(snapshot.NormalizedJSON), TaskHash: snapshot.TaskHash, Repository: repository.CanonicalRepository, WorkingBranch: source.BranchName, State: domain.StateReceived}
+	run := Run{ID: snapshot.Task.RunID, IssueID: source.Identifier, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: source.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), RawIssueHash: snapshot.RawHash, NormalizedTaskJSON: string(snapshot.NormalizedJSON), TaskHash: snapshot.TaskHash, Repository: repository.CanonicalRepository, WorkingBranch: source.BranchName, State: domain.StateReceived}
 	store := &linearStartStore{run: run, effects: make(map[string]SideEffectRecord)}
 	service, err := NewLinearReservedIssueStartService(&linearStartReader{sources: sources}, &linearStartMover{results: results, errors: errors}, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, store, startAuthority())
 	if err != nil {

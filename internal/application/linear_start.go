@@ -231,12 +231,12 @@ func sideEffectFromIntent(runID string, intent linearIssueStartIntentRecord, att
 }
 
 func reservedLinearIssue(run Run) (LinearTaskSource, error) {
-	var source LinearTaskSource
-	if json.Unmarshal([]byte(run.RawIssueJSON), &source) != nil || source.Provider != "linear" || !validLinearUUID(source.IssueID) || source.Identifier != run.IssueID || source.SourceRevision != run.SourceRevision {
+	source, err := sealedPersistedLinearSource(run)
+	if err != nil {
 		return LinearTaskSource{}, errors.New("persisted Linear reservation is invalid")
 	}
 	var task domain.CodingTask
-	if json.Unmarshal([]byte(run.NormalizedTaskJSON), &task) != nil || task.IssueID != run.IssueID || stableTaskDigest(run.NormalizedTaskJSON) == "" {
+	if json.Unmarshal([]byte(run.NormalizedTaskJSON), &task) != nil || task.IssueID != run.IssueID || sealedStableTaskDigest(run) == "" {
 		return LinearTaskSource{}, errors.New("persisted normalized task is invalid")
 	}
 	return source, nil
@@ -264,7 +264,7 @@ func (s *LinearReservedIssueStartService) proveStartedReservation(run Run, reser
 		return errors.New("Linear started reservation metadata drifted")
 	}
 	snapshot, repository, err := normalizeLinearTask(source, s.resolver, true, false, false)
-	if err != nil || repository.CanonicalRepository != run.Repository || snapshot.Task.WorkingBranch != run.WorkingBranch || stableTaskDigest(run.NormalizedTaskJSON) != stableTaskDigestFromTask(snapshot.Task) {
+	if err != nil || repository.CanonicalRepository != run.Repository || snapshot.Task.WorkingBranch != run.WorkingBranch || sealedStableTaskDigest(run) != stableTaskDigestFromTask(snapshot.Task) {
 		return errors.New("Linear started task no longer matches the reservation")
 	}
 	return nil

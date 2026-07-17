@@ -484,6 +484,75 @@ func TestProductionAbandonRevalidatesBeforeDurableMutationAndCleansLocally(t *te
 	}
 }
 
+func TestProductionAbandonExecutesAdvertisedActionAfterLinearPRAutomationProgress(t *testing.T) {
+	tests := []struct {
+		name       string
+		mutateRun  func(*Run)
+		mutateRead func(*LinearTaskSource)
+		wantAccept bool
+	}{
+		{name: "unchanged source UUID", wantAccept: true},
+		{name: "source UUID drift", mutateRead: func(source *LinearTaskSource) { source.IssueID = "123e4567-e89b-42d3-a456-426614174099" }},
+		{name: "corrupted persisted hash", mutateRun: func(run *Run) { run.RawIssueHash = strings.Repeat("0", 64) }},
+		{name: "persisted idempotency key drift", mutateRun: func(run *Run) { run.IdempotencyKey = strings.Repeat("0", 64) }},
+		{name: "unsealed normalized task matching fresh drift", mutateRun: func(run *Run) {
+			run.NormalizedTaskJSON = strings.ReplaceAll(run.NormalizedTaskJSON, "Freeze one trusted task snapshot.", "Changed after admission.")
+		}, mutateRead: func(source *LinearTaskSource) {
+			source.Description = strings.ReplaceAll(source.Description, "Freeze one trusted task snapshot.", "Changed after admission.")
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			coordinator, store, run := newPushCoordinator(t, domain.StateManualIntervention)
+			if test.mutateRun != nil {
+				test.mutateRun(&run)
+				store.run = run
+			}
+			wrapped := newAbandonCoordinatorStore(t, store, run)
+			if !slices.Contains(wrapped.attention.AllowedActions, OperatorAttentionActionAbandon) {
+				t.Fatalf("manual intervention attention actions=%v", wrapped.attention.AllowedActions)
+			}
+			coordinator.store = wrapped
+
+			var repository LocalRepository
+			if err := json.Unmarshal([]byte(run.RepositoryConfigJSON), &repository); err != nil {
+				t.Fatal(err)
+			}
+			progressed := validLinearSource()
+			progressed.State = LinearState{ID: "in-review", Name: "In Review", Type: "started"}
+			progressed.SourceRevision = "2026-07-17T01:43:20Z"
+			if test.mutateRead != nil {
+				test.mutateRead(&progressed)
+			}
+			admission, err := NewLinearAdmissionService(
+				&admissionReader{source: progressed},
+				admissionResolver{repositories: map[string]LocalRepository{run.Repository: repository}},
+				wrapped,
+				&serviceController{run: run},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			coordinator.admission = admission
+
+			cleanup := &abandonCleanupFake{}
+			result, err := coordinator.Abandon(context.Background(), ProductionAbandonCommand{Requester: abandonRequester(), RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}, cleanup, &abandonChildStopperFake{})
+			if test.wantAccept {
+				if err != nil || result.Action != ProductionAbandon || result.Run.State != domain.StateFailed || result.Idempotent || wrapped.abandonCalls != 1 {
+					t.Fatalf("result=%+v err=%v abandonCalls=%d", result, err, wrapped.abandonCalls)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "graceful abandonment requires unchanged Linear task authority") {
+				t.Fatalf("untrusted Linear authority result=%+v err=%v", result, err)
+			}
+			if wrapped.abandonCalls != 0 || wrapped.action.ActionID != "" || len(cleanup.calls) != 0 || store.leaseAcquires != 0 || store.leaseReleases != 0 {
+				t.Fatalf("untrusted Linear authority mutated abandon=%d action=%+v cleanup=%v lease_acquires=%d lease_releases=%d", wrapped.abandonCalls, wrapped.action, cleanup.calls, store.leaseAcquires, store.leaseReleases)
+			}
+		})
+	}
+}
+
 func TestProductionAbandonDoesNotRequireStopProofForPreparedAttempt(t *testing.T) {
 	coordinator, store, run := newPushCoordinator(t, domain.StateManualIntervention)
 	store.inspection.Attempts = []Attempt{{ID: 1, RunID: run.ID, Status: "prepared", ArtifactDir: "/owned/artifacts/attempt-1", ProcessControlKey: "control-key"}}
@@ -566,6 +635,66 @@ func TestProductionAbandonTerminalReplayWithoutResidueAttentionIsNoop(t *testing
 	result, err := coordinator.Abandon(context.Background(), ProductionAbandonCommand{Requester: abandonRequester(), RunID: run.ID, Repository: run.Repository, ExpectedState: domain.StateFailed, IdempotencyKey: run.IdempotencyKey}, cleanup, &abandonChildStopperFake{}, reader)
 	if err != nil || !result.Idempotent || result.Run.State != domain.StateFailed || reader.calls != 0 || len(cleanup.reconcileCalls) != 0 || len(cleanup.calls) != 0 {
 		t.Fatalf("result=%+v reads=%d cleanup=%v reconcile=%v err=%v", result, reader.calls, cleanup.calls, cleanup.reconcileCalls, err)
+	}
+}
+
+func TestProductionAbandonTerminalReplayRejectsUnsealedLinearAuthorityBeforeAction(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Run)
+	}{
+		{name: "missing raw issue JSON", mutate: func(run *Run) { run.RawIssueJSON = ""; run.RawIssueHash = digestLinear(nil) }},
+		{name: "corrupt raw issue JSON", mutate: func(run *Run) { run.RawIssueJSON = "{"; run.RawIssueHash = digestLinear([]byte(run.RawIssueJSON)) }},
+		{name: "missing raw issue hash", mutate: func(run *Run) { run.RawIssueHash = "" }},
+		{name: "mismatched raw issue hash", mutate: func(run *Run) { run.RawIssueHash = strings.Repeat("0", 64) }},
+		{name: "missing normalized task JSON", mutate: func(run *Run) { run.NormalizedTaskJSON = ""; run.TaskHash = digestLinear(nil) }},
+		{name: "corrupt normalized task JSON", mutate: func(run *Run) {
+			run.NormalizedTaskJSON = "{"
+			run.TaskHash = digestLinear([]byte(run.NormalizedTaskJSON))
+		}},
+		{name: "missing task hash", mutate: func(run *Run) { run.TaskHash = "" }},
+		{name: "mismatched task hash", mutate: func(run *Run) { run.TaskHash = strings.Repeat("0", 64) }},
+		{name: "persisted idempotency key drift", mutate: func(run *Run) { run.IdempotencyKey = strings.Repeat("0", 64) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			coordinator, store, run := newPushCoordinator(t, domain.StateFailed)
+			test.mutate(&run)
+			store.run = run
+			wrapped := &abandonCoordinatorStore{pushTestStore: store}
+			coordinator.store = wrapped
+			cleanup := &abandonCleanupFake{}
+
+			result, err := coordinator.Abandon(context.Background(), ProductionAbandonCommand{Requester: abandonRequester(), RunID: run.ID, Repository: run.Repository, ExpectedState: domain.StateFailed, IdempotencyKey: run.IdempotencyKey}, cleanup, &abandonChildStopperFake{})
+			if err == nil || !strings.Contains(err.Error(), "graceful abandonment requires unchanged Linear task authority") {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+			if wrapped.action.ActionID != "" || wrapped.abandonCalls != 0 || len(cleanup.calls) != 0 || store.leaseHeld || store.leaseAcquires != 0 || store.leaseReleases != 0 {
+				t.Fatalf("unsealed replay mutated action=%+v abandon=%d cleanup=%v lease=%t acquires=%d releases=%d", wrapped.action, wrapped.abandonCalls, cleanup.calls, store.leaseHeld, store.leaseAcquires, store.leaseReleases)
+			}
+		})
+	}
+}
+
+func TestProductionAbandonFailedResidueReplayRejectsCorruptAuthorityBeforeLease(t *testing.T) {
+	coordinator, store, run := newPushCoordinator(t, domain.StateFailed)
+	run.NormalizedTaskJSON = "{"
+	run.TaskHash = digestLinear([]byte(run.NormalizedTaskJSON))
+	store.run = run
+	attention, err := CleanupResidueAttentionEvent(run, 1, strings.Repeat("a", 64), run.UpdatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapped := &abandonCoordinatorStore{pushTestStore: store, attention: attention}
+	coordinator.store = wrapped
+	cleanup := &abandonCleanupFake{}
+
+	result, err := coordinator.Abandon(context.Background(), ProductionAbandonCommand{Requester: abandonRequester(), RunID: run.ID, Repository: run.Repository, ExpectedState: domain.StateFailed, IdempotencyKey: run.IdempotencyKey}, cleanup, &abandonChildStopperFake{})
+	if err == nil || !strings.Contains(err.Error(), "graceful abandonment requires unchanged Linear task authority") {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if wrapped.action.ActionID != "" || wrapped.abandonCalls != 0 || len(cleanup.calls) != 0 || store.leaseAcquires != 0 || store.leaseReleases != 0 || store.leaseHeld {
+		t.Fatalf("corrupt residue replay mutated action=%+v abandon=%d cleanup=%v acquires=%d releases=%d held=%t", wrapped.action, wrapped.abandonCalls, cleanup.calls, store.leaseAcquires, store.leaseReleases, store.leaseHeld)
 	}
 }
 

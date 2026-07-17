@@ -85,20 +85,25 @@ func (c *ProductionCoordinator) Abandon(ctx context.Context, command ProductionA
 	if err := authorizePersistedRequester(preflight, command.Requester); err != nil {
 		return ProductionAbandonResult{}, err
 	}
+	revalidatedPreflight, err := c.admission.RevalidateForAbandon(ctx, LinearRevalidateCommand{Requester: command.Requester, RunID: command.RunID, Repository: command.Repository, ExpectedState: command.ExpectedState, IdempotencyKey: command.IdempotencyKey})
+	if err != nil {
+		return ProductionAbandonResult{}, err
+	}
+	preflight = revalidatedPreflight
 	if preflight.State == domain.StateFailed && command.ExpectedState == domain.StateFailed {
 		terminalInspection, err := c.store.Inspect(ctx, command.RunID)
 		if err != nil {
 			return ProductionAbandonResult{}, classifyServiceError(err)
-		}
-		action, err := prepareGracefulAbandonAction(ctx, actions, terminalInspection, command.Requester)
-		if err != nil {
-			return ProductionAbandonResult{}, err
 		}
 		residueAttention, err := hasAbandonResidueAttention(ctx, c.store, command.RunID)
 		if err != nil {
 			return ProductionAbandonResult{}, classifyServiceError(err)
 		}
 		if !residueAttention {
+			action, err := prepareGracefulAbandonAction(ctx, actions, terminalInspection, command.Requester)
+			if err != nil {
+				return ProductionAbandonResult{}, err
+			}
 			action, err = recordGracefulAbandonApplied(ctx, actions, c.store, action, preflight)
 			if err != nil {
 				return ProductionAbandonResult{}, err

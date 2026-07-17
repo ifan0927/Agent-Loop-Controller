@@ -1325,8 +1325,11 @@ ifan-loop controller abandon '<run-id>' <requester flags>
 
 **What it does**
 
-Revalidates the immutable Linear and repository authority plus the exact parked
-attention, records the typed operator action intent, and classifies durable
+Revalidates the immutable Linear task and repository authority plus the exact
+parked attention. A recognized Linear PR-automation move into another
+`started` workflow state is accepted only when the issue identity, task
+content, repository, working branch, and requester authority remain unchanged.
+The command then records the typed operator action intent and classifies durable
 ownership evidence. A `prepared` attempt is durable evidence that no process
 launch was authorized; abandon can terminalize it without inventing missing
 process evidence. Under the acquired run lease the controller authenticates

@@ -105,7 +105,7 @@ func (s *LinearAdmissionService) Start(ctx context.Context, command LinearStartC
 }
 
 func (s *LinearAdmissionService) Revalidate(ctx context.Context, command LinearRevalidateCommand) (Run, error) {
-	run, _, err := s.revalidate(ctx, command, false, false, false, true, true)
+	run, _, err := s.revalidate(ctx, command, false, false, false, true, true, "")
 	return run, err
 }
 
@@ -113,7 +113,7 @@ func (s *LinearAdmissionService) Revalidate(ctx context.Context, command LinearR
 // ordinary recovery without changing run state on drift. A retry action must
 // record its own intent before its one permitted schedule mutation.
 func (s *LinearAdmissionService) RevalidateForOperatorRetry(ctx context.Context, command LinearRevalidateCommand) (Run, error) {
-	run, _, err := s.revalidate(ctx, command, false, false, false, false, false)
+	run, _, err := s.revalidate(ctx, command, false, false, false, false, false, "")
 	return run, err
 }
 
@@ -122,7 +122,7 @@ func (s *LinearAdmissionService) RevalidateForOperatorRetry(ctx context.Context,
 // automated continuation, but never marks drift or accepts completed,
 // canceled, or manual-recovery authority.
 func (s *LinearAdmissionService) RevalidateForCIWaitRecovery(ctx context.Context, command LinearRevalidateCommand) (Run, error) {
-	run, _, err := s.revalidate(ctx, command, false, false, false, true, false)
+	run, _, err := s.revalidate(ctx, command, false, false, false, true, false, "")
 	return run, err
 }
 
@@ -135,30 +135,31 @@ func (s *LinearAdmissionService) RevalidateForGitHubReconcile(ctx context.Contex
 	default:
 		return Run{}, false, serviceError(ErrorInvalidInput, "GitHub reconciliation requires an active pull request state", nil)
 	}
-	return s.revalidate(ctx, command, false, false, true, true, true)
+	return s.revalidate(ctx, command, false, false, true, true, true, "")
 }
 
 // RevalidateOwnedPushRecovery is deliberately narrower than ordinary
 // revalidation. It is used only by the explicit operator recovery that may
 // return a halted owned-PR fast-forward to its already-verified push gate.
 func (s *LinearAdmissionService) RevalidateOwnedPushRecovery(ctx context.Context, command LinearRevalidateCommand) (Run, error) {
-	run, _, err := s.revalidate(ctx, command, true, false, false, true, true)
+	run, _, err := s.revalidate(ctx, command, true, false, false, true, true, "owned push recovery requires an unchanged Linear source")
 	return run, err
 }
 
 // RevalidateForAbandon is the read-only Linear authority gate for the narrow
 // automatic-run abandon action. Failed is accepted only for an idempotent
-// replay; it still performs the same source and requester checks before any
-// unfinished local cleanup is retried.
+// replay. Recognized started-state automation is accepted only while the
+// stable task and requester authority remain unchanged, before any unfinished
+// local cleanup is retried.
 func (s *LinearAdmissionService) RevalidateForAbandon(ctx context.Context, command LinearRevalidateCommand) (Run, error) {
 	if !GracefulAbandonState(command.ExpectedState) {
 		return Run{}, serviceError(ErrorInvalidInput, "run state is not eligible for graceful abandonment", nil)
 	}
-	run, _, err := s.revalidate(ctx, command, true, true, false, false, false)
+	run, _, err := s.revalidate(ctx, command, true, true, false, true, false, "graceful abandonment requires unchanged Linear task authority")
 	return run, err
 }
 
-func (s *LinearAdmissionService) revalidate(ctx context.Context, command LinearRevalidateCommand, allowManualRecovery, allowCanceledAbandon, allowCompletedObservation, allowAutomatedProgress, markDrift bool) (Run, bool, error) {
+func (s *LinearAdmissionService) revalidate(ctx context.Context, command LinearRevalidateCommand, allowManualRecovery, allowCanceledAbandon, allowCompletedObservation, allowAutomatedProgress, markDrift bool, manualRecoveryConflict string) (Run, bool, error) {
 	if command.RunID == "" || command.Repository == "" || command.ExpectedState == "" || command.IdempotencyKey == "" {
 		return Run{}, false, serviceError(ErrorInvalidInput, "run, expected state, repository, and idempotency key are required", nil)
 	}
@@ -176,6 +177,13 @@ func (s *LinearAdmissionService) revalidate(ctx context.Context, command LinearR
 	if err != nil {
 		return Run{}, false, classifyServiceError(err)
 	}
+	persistedIssueID, err := persistedLinearIssueID(run)
+	if err != nil || source.IssueID != persistedIssueID {
+		if manualRecoveryConflict != "" {
+			return Run{}, false, serviceError(ErrorConflict, manualRecoveryConflict, nil)
+		}
+		return Run{}, false, serviceError(ErrorConflict, "Linear source does not match the persisted run", nil)
+	}
 	snapshot, repository, err := revalidateLinearTask(source, s.resolver, allowCanceledAbandon, allowCompletedObservation)
 	if err != nil {
 		return Run{}, false, classifyServiceError(err)
@@ -186,19 +194,25 @@ func (s *LinearAdmissionService) revalidate(ctx context.Context, command LinearR
 	if snapshot.Task.IssueID != run.IssueID {
 		return Run{}, false, serviceError(ErrorConflict, "Linear source does not match the persisted run", nil)
 	}
-	if err := s.requireStableLinearSourceForRecovery(ctx, run, snapshot, repository, allowManualRecovery, allowCanceledAbandon, allowCompletedObservation, allowAutomatedProgress, markDrift); err != nil {
+	if err := s.requireStableLinearSourceForRecovery(ctx, run, snapshot, repository, allowManualRecovery, allowCanceledAbandon, allowCompletedObservation, allowAutomatedProgress, markDrift, manualRecoveryConflict); err != nil {
 		return Run{}, false, err
 	}
 	return run, strings.EqualFold(strings.TrimSpace(source.State.Type), "completed"), nil
 }
 
 func (s *LinearAdmissionService) requireStableLinearSource(ctx context.Context, existing Run, snapshot linearAdmissionSnapshot, repository LocalRepository) error {
-	return s.requireStableLinearSourceForRecovery(ctx, existing, snapshot, repository, false, false, false, true, true)
+	return s.requireStableLinearSourceForRecovery(ctx, existing, snapshot, repository, false, false, false, true, true, "")
 }
 
-func (s *LinearAdmissionService) requireStableLinearSourceForRecovery(ctx context.Context, existing Run, snapshot linearAdmissionSnapshot, repository LocalRepository, allowManualRecovery, allowCanceledAbandon, allowCompletedObservation, allowAutomatedProgress, markDrift bool) error {
+func (s *LinearAdmissionService) requireStableLinearSourceForRecovery(ctx context.Context, existing Run, snapshot linearAdmissionSnapshot, repository LocalRepository, allowManualRecovery, allowCanceledAbandon, allowCompletedObservation, allowAutomatedProgress, markDrift bool, manualRecoveryConflict string) error {
 	if existing.State == domain.StateManualIntervention && !allowManualRecovery {
 		return serviceError(ErrorConflict, "existing run requires a human decision", nil)
+	}
+	if sealedStableTaskDigest(existing) == "" {
+		if manualRecoveryConflict != "" {
+			return serviceError(ErrorConflict, manualRecoveryConflict, nil)
+		}
+		return serviceError(ErrorConflict, "persisted Linear task authority is invalid", nil)
 	}
 	if existing.SourceRevision == snapshot.Task.SourceRevision && existing.Repository == repository.CanonicalRepository && existing.WorkingBranch == snapshot.Task.WorkingBranch && existing.TaskHash == snapshot.TaskHash {
 		return nil
@@ -213,7 +227,10 @@ func (s *LinearAdmissionService) requireStableLinearSourceForRecovery(ctx contex
 		return nil
 	}
 	if existing.State == domain.StateManualIntervention && allowManualRecovery {
-		return serviceError(ErrorConflict, "owned push recovery requires an unchanged Linear source", nil)
+		if manualRecoveryConflict == "" {
+			manualRecoveryConflict = "manual recovery requires an unchanged Linear source"
+		}
+		return serviceError(ErrorConflict, manualRecoveryConflict, nil)
 	}
 	if !markDrift {
 		return serviceError(ErrorConflict, "Linear source conflicts with an existing run", nil)
@@ -288,9 +305,8 @@ func normalizeLinearTask(source LinearTaskSource, resolver LinearAdmissionReposi
 	if err != nil {
 		return linearAdmissionSnapshot{}, LocalRepository{}, errors.New("encode sanitized Linear source")
 	}
-	keyHash := sha256.Sum256([]byte(source.Identifier + "\x00" + source.SourceRevision))
-	idempotencyKey := hex.EncodeToString(keyHash[:])
-	task := domain.CodingTask{RunID: "run-" + idempotencyKey[:16], IssueID: source.Identifier, IssueURL: source.URL,
+	idempotencyKey, runID := deriveLinearAdmissionIdentity(source.Identifier, source.SourceRevision)
+	task := domain.CodingTask{RunID: runID, IssueID: source.Identifier, IssueURL: source.URL,
 		Title: source.Title, Description: source.Description, Repository: repository.CanonicalRepository, BaseBranch: repository.BaseBranch,
 		WorkingBranch: source.BranchName, Goal: goal, AcceptanceCriteria: acceptance, OutOfScope: outOfScope,
 		VerifierIDs: append([]string(nil), repository.VerifierIDs...), Policy: domain.TaskPolicy{HumanApprovalRequired: true, MergeMethod: "squash", MaxRepairAttempts: domain.DefaultMaxRepairAttempts},
@@ -303,6 +319,12 @@ func normalizeLinearTask(source LinearTaskSource, resolver LinearAdmissionReposi
 		return linearAdmissionSnapshot{}, LocalRepository{}, errors.New("encode normalized Linear task")
 	}
 	return linearAdmissionSnapshot{Task: task, State: source.State, RawJSON: raw, RawHash: digestLinear(raw), NormalizedJSON: normalized, TaskHash: digestLinear(normalized), IdempotencyKey: idempotencyKey}, repository, nil
+}
+
+func deriveLinearAdmissionIdentity(identifier, sourceRevision string) (string, string) {
+	keyHash := sha256.Sum256([]byte(identifier + "\x00" + sourceRevision))
+	idempotencyKey := hex.EncodeToString(keyHash[:])
+	return idempotencyKey, "run-" + idempotencyKey[:16]
 }
 
 func linearStateIsCodingReady(state LinearState, allowStarted, allowCanceled, allowCompleted bool) bool {
@@ -325,7 +347,7 @@ func allowsAutomatedLinearProgress(existing Run, snapshot linearAdmissionSnapsho
 	if !strings.EqualFold(strings.TrimSpace(snapshot.State.Type), "started") || existing.Repository != repository.CanonicalRepository || existing.WorkingBranch != snapshot.Task.WorkingBranch {
 		return false
 	}
-	existingDigest := stableTaskDigest(existing.NormalizedTaskJSON)
+	existingDigest := sealedStableTaskDigest(existing)
 	return existingDigest != "" && existingDigest == stableTaskDigestFromTask(snapshot.Task)
 }
 
@@ -333,7 +355,7 @@ func allowsAutomatedLinearCompletionObservation(existing Run, snapshot linearAdm
 	if !strings.EqualFold(strings.TrimSpace(snapshot.State.Type), "completed") || existing.Repository != repository.CanonicalRepository || existing.WorkingBranch != snapshot.Task.WorkingBranch {
 		return false
 	}
-	existingDigest := stableTaskDigest(existing.NormalizedTaskJSON)
+	existingDigest := sealedStableTaskDigest(existing)
 	return existingDigest != "" && existingDigest == stableTaskDigestFromTask(snapshot.Task)
 }
 
@@ -344,16 +366,33 @@ func allowsOperatorCanceledAbandon(existing Run, snapshot linearAdmissionSnapsho
 	if !strings.EqualFold(strings.TrimSpace(snapshot.State.Name), "Canceled") || !strings.EqualFold(strings.TrimSpace(snapshot.State.Type), "canceled") || existing.Repository != repository.CanonicalRepository || existing.WorkingBranch != snapshot.Task.WorkingBranch {
 		return false
 	}
-	existingDigest := stableTaskDigest(existing.NormalizedTaskJSON)
+	existingDigest := sealedStableTaskDigest(existing)
 	return existingDigest != "" && existingDigest == stableTaskDigestFromTask(snapshot.Task)
 }
 
-func stableTaskDigest(raw string) string {
+func sealedStableTaskDigest(run Run) string {
+	raw := []byte(run.NormalizedTaskJSON)
+	if strings.TrimSpace(run.TaskHash) == "" || digestLinear(raw) != run.TaskHash {
+		return ""
+	}
 	var task domain.CodingTask
-	if json.Unmarshal([]byte(raw), &task) != nil {
+	if json.Unmarshal(raw, &task) != nil || task.Validate() != nil || task.RunID != run.ID || task.IssueID != run.IssueID || task.SourceRevision != run.SourceRevision || task.Repository != run.Repository || task.WorkingBranch != run.WorkingBranch {
 		return ""
 	}
 	return stableTaskDigestFromTask(task)
+}
+
+func sealedPersistedLinearSource(run Run) (LinearTaskSource, error) {
+	raw := []byte(run.RawIssueJSON)
+	var source LinearTaskSource
+	if strings.TrimSpace(run.RawIssueHash) == "" || digestLinear(raw) != run.RawIssueHash || json.Unmarshal(raw, &source) != nil || source.Provider != "linear" || source.Identifier != run.IssueID || source.SourceRevision != run.SourceRevision || !validLinearUUID(source.IssueID) {
+		return LinearTaskSource{}, errors.New("persisted Linear source identity is incomplete")
+	}
+	idempotencyKey, runID := deriveLinearAdmissionIdentity(source.Identifier, source.SourceRevision)
+	if run.IdempotencyKey != idempotencyKey || run.ID != runID {
+		return LinearTaskSource{}, errors.New("persisted Linear admission identity is invalid")
+	}
+	return source, nil
 }
 
 func stableTaskDigestFromTask(task domain.CodingTask) string {

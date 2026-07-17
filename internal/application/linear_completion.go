@@ -2,7 +2,6 @@ package application
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -109,9 +108,9 @@ func linearCompletionErrorClass(requests []LinearRequestObservation) string {
 }
 
 func persistedLinearIssueID(run Run) (string, error) {
-	var source LinearTaskSource
-	if err := json.Unmarshal([]byte(run.RawIssueJSON), &source); err != nil || source.Provider != "linear" || source.Identifier != run.IssueID || strings.TrimSpace(source.IssueID) == "" {
-		return "", errors.New("persisted Linear source identity is incomplete")
+	source, err := sealedPersistedLinearSource(run)
+	if err != nil {
+		return "", err
 	}
 	return source.IssueID, nil
 }
