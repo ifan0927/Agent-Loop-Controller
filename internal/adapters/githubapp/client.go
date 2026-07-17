@@ -475,8 +475,8 @@ func (c *Client) readChecksSnapshot(ctx context.Context, sha, base string) (chec
 		Strict   bool     `json:"strict"`
 		Contexts []string `json:"contexts"`
 		Checks   []struct {
-			Context string `json:"context"`
-			AppID   int64  `json:"app_id"`
+			Context string          `json:"context"`
+			AppID   json.RawMessage `json:"app_id"`
 		} `json:"checks"`
 	}
 	if err := c.rest(ctx, "required_checks", "GET", fmt.Sprintf("/repos/%s/%s/branches/%s/protection/required_status_checks", c.cfg.RepositoryOwner, c.cfg.RepositoryName, url.PathEscape(base)), nil, &protection, true); err != nil {
@@ -492,14 +492,21 @@ func (c *Client) readChecksSnapshot(ctx context.Context, sha, base string) (chec
 		}
 		required[name] = 0
 	}
+	checkBindings := make(map[string]struct{}, len(protection.Checks))
 	for _, check := range protection.Checks {
-		if !canonicalCheckContext(check.Context) || check.AppID < 1 {
+		appID := int64(0)
+		rawAppID := bytes.TrimSpace(check.AppID)
+		if !canonicalCheckContext(check.Context) || len(rawAppID) == 0 || !bytes.Equal(rawAppID, []byte("null")) && (json.Unmarshal(rawAppID, &appID) != nil || appID < 1) {
 			return checkReadSnapshot{}, errors.New("required check protection app binding is invalid")
 		}
-		if _, duplicate := required[check.Context]; duplicate {
-			return checkReadSnapshot{}, errors.New("required check protection binding conflicts")
+		if _, duplicate := checkBindings[check.Context]; duplicate {
+			return checkReadSnapshot{}, errors.New("required check protection binding is duplicated")
 		}
-		required[check.Context] = check.AppID
+		checkBindings[check.Context] = struct{}{}
+		// GitHub mirrors every required check context in the deprecated
+		// contexts array. The checks entry is authoritative for its optional
+		// App binding; a null app_id deliberately means any App.
+		required[check.Context] = appID
 	}
 	requiredPairs := make([]string, 0, len(required))
 	for name, appID := range required {

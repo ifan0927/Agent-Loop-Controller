@@ -333,8 +333,9 @@ func TestRequiredCheckIdentityValidationRejectsMalformed2xxEvidence(t *testing.T
 	}{
 		{"empty protection context", `{"contexts":[""],"checks":[]}`, `{"total_count":0,"check_runs":[]}`, validStatuses},
 		{"noncanonical protection context", `{"contexts":[" test"],"checks":[]}`, `{"total_count":0,"check_runs":[]}`, validStatuses},
-		{"conflicting context app binding", `{"contexts":["test"],"checks":[{"context":"test","app_id":8}]}`, validCheck, validStatuses},
+		{"duplicate legacy context", `{"contexts":["test","test"],"checks":[]}`, validCheck, validStatuses},
 		{"duplicate app binding", `{"contexts":[],"checks":[{"context":"test","app_id":8},{"context":"test","app_id":8}]}`, validCheck, validStatuses},
+		{"missing app binding", `{"contexts":[],"checks":[{"context":"test"}]}`, validCheck, validStatuses},
 		{"invalid app binding", `{"contexts":[],"checks":[{"context":"test","app_id":0}]}`, validCheck, validStatuses},
 		{"check run id zero", validProtection, `{"total_count":1,"check_runs":[{"id":0,"name":"test","status":"queued","app":{"id":8}}]}`, validStatuses},
 		{"check run name empty", validProtection, `{"total_count":1,"check_runs":[{"id":1,"name":"","status":"queued","app":{"id":8}}]}`, validStatuses},
@@ -488,6 +489,8 @@ func TestUnboundRequiredContextAggregatesCheckRunAndCommitStatus(t *testing.T) {
 		{"check pending status success", `{"contexts":["test"],"checks":[]}`, "in_progress", "", "success", domain.ReconciliationPending, 2},
 		{"both success", `{"contexts":["test"],"checks":[]}`, "completed", "success", "success", domain.ReconciliationPass, 2},
 		{"both unknown", `{"contexts":["test"],"checks":[]}`, "completed", "new_state", "new_state", domain.ReconciliationInfrastructure, 2},
+		{"mirrored null binding", `{"contexts":["test"],"checks":[{"context":"test","app_id":null}]}`, "completed", "success", "success", domain.ReconciliationPass, 2},
+		{"mirrored app binding excludes status", `{"contexts":["test"],"checks":[{"context":"test","app_id":8}]}`, "completed", "success", "failure", domain.ReconciliationPass, 1},
 		{"app bound excludes status", `{"contexts":[],"checks":[{"context":"test","app_id":8}]}`, "completed", "success", "failure", domain.ReconciliationPass, 1},
 	}
 	for _, test := range tests {
