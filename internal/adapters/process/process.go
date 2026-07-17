@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"testing"
 	"time"
 )
 
@@ -89,6 +90,10 @@ func (r OSRunner) Run(ctx context.Context, spec Spec) (Result, error) {
 }
 
 func (r OSRunner) run(ctx context.Context, spec Spec, environment []string) (Result, error) {
+	return r.runWithTestParentLifetime(ctx, spec, environment, goTestRuntimeActive())
+}
+
+func (r OSRunner) runWithTestParentLifetime(ctx context.Context, spec Spec, environment []string, testParentLifetime bool) (Result, error) {
 	initial := Result{Outcome: OutcomeNotStarted, FailureCategory: FailureUnknown, ExitCode: -1, StdoutPath: spec.StdoutPath, StderrPath: spec.StderrPath}
 	if err := ctx.Err(); err != nil {
 		initial.FailureCategory = FailureNotStarted
@@ -113,7 +118,7 @@ func (r OSRunner) run(ctx context.Context, spec Spec, environment []string) (Res
 	}
 	defer stderrFile.Close()
 
-	excludedEnvironment := append(append([]string(nil), spec.ExcludedEnv...), managedLaunchEnvironment)
+	excludedEnvironment := append(append([]string(nil), spec.ExcludedEnv...), managedLaunchEnvironment, managedTestParentLifetimeEnvironment)
 	baseEnvironment := environment
 	if len(spec.EnvironmentAllowlist) > 0 {
 		baseEnvironment = restrictEnvironment(environment, spec.EnvironmentAllowlist, excludedEnvironment)
@@ -134,7 +139,7 @@ func (r OSRunner) run(ctx context.Context, spec Spec, environment []string) (Res
 		defer control.Close()
 	}
 	command := exec.Command(program, spec.Args...)
-	var launchGateReader, launchGateWriter *os.File
+	var launchGateReader, launchGateWriter, testParentLifetimeReader, testParentLifetimeWriter *os.File
 	if control != nil {
 		executable, executableErr := os.Executable()
 		if executableErr != nil {
@@ -148,9 +153,22 @@ func (r OSRunner) run(ctx context.Context, spec Spec, environment []string) (Res
 		}
 		defer launchGateReader.Close()
 		defer launchGateWriter.Close()
+		if testParentLifetime {
+			testParentLifetimeReader, testParentLifetimeWriter, err = os.Pipe()
+			if err != nil {
+				initial.FailureCategory = FailureArtifactSetup
+				return initial, FailureError{Category: FailureArtifactSetup}
+			}
+			defer testParentLifetimeReader.Close()
+			defer testParentLifetimeWriter.Close()
+		}
 		command = exec.Command(executable, append([]string{managedLaunchArgument, program}, spec.Args...)...)
 		command.ExtraFiles = []*os.File{launchGateReader}
-		commandEnvironment = append(withoutEnvironment(commandEnvironment, []string{managedLaunchEnvironment}), managedLaunchEnvironment+"=1")
+		commandEnvironment = append(withoutEnvironment(commandEnvironment, []string{managedLaunchEnvironment, managedTestParentLifetimeEnvironment}), managedLaunchEnvironment+"=1")
+		if testParentLifetimeReader != nil {
+			command.ExtraFiles = append(command.ExtraFiles, testParentLifetimeReader)
+			commandEnvironment = append(commandEnvironment, managedTestParentLifetimeEnvironment+"=1")
+		}
 	}
 	command.Dir = spec.WorkingDir
 	command.Stdin = bytes.NewBufferString(spec.Stdin)
@@ -164,6 +182,9 @@ func (r OSRunner) run(ctx context.Context, spec Spec, environment []string) (Res
 	}
 	if launchGateReader != nil {
 		_ = launchGateReader.Close()
+	}
+	if testParentLifetimeReader != nil {
+		_ = testParentLifetimeReader.Close()
 	}
 	runtimeControl, err := newRuntimeProcessControl(command.Process.Pid, "", nil, nil)
 	if control != nil {
@@ -227,6 +248,13 @@ func (r OSRunner) run(ctx context.Context, spec Spec, environment []string) (Res
 		}
 		return Result{Outcome: OutcomeInterrupted, FailureCategory: FailureInterrupted, ExitCode: -1, StdoutPath: spec.StdoutPath, StderrPath: spec.StderrPath}, failure
 	}
+}
+
+// goTestRuntimeActive uses the linker-provided testing runtime marker. Command
+// arguments, flag registration, executable names, and environment variables
+// cannot enable the test-only parent-lifetime contract in production binaries.
+func goTestRuntimeActive() bool {
+	return testing.Testing()
 }
 
 func runnerInterruptGrace(value time.Duration) time.Duration {

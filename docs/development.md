@@ -68,6 +68,14 @@ evidence-gate tests. Changes to command construction require exact argv,
 stdin/environment, artifact-path, and forbidden-flag coverage. Changes to JSON
 contracts require schema and cross-field domain validation tests.
 
+Managed process tests use an automatic test-parent lifetime pipe. A dedicated
+subprocess fixture interrupts its exact test-runner parent only after
+authenticated control evidence and target execution are proven, then verifies
+that the supervisor drains its complete process group without name-based
+matching. Production-mode coverage omits that pipe and retains authenticated
+crash adoption. Failure cleanup may use `AttemptStopper` only with the fixture's
+exact artifact directory and control key.
+
 ## Integration Tests
 
 SQLite-backed tests should use a new temporary database and exercise real

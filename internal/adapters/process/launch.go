@@ -16,6 +16,9 @@ const (
 	managedLaunchArgument    = "--ifan-loop-managed-launch"
 	managedLaunchEnvironment = "IFAN_LOOP_INTERNAL_MANAGED_LAUNCH"
 	managedLaunchGateFD      = 3
+
+	managedTestParentLifetimeEnvironment = "IFAN_LOOP_INTERNAL_TEST_PARENT_LIFETIME"
+	managedTestParentLifetimeFD          = 4
 )
 
 // init implements the controller-owned half of a launch gate. The helper is
@@ -29,7 +32,11 @@ func init() {
 	if !awaitManagedLaunchGate() {
 		os.Exit(126)
 	}
-	environment := withoutEnvironment(os.Environ(), []string{managedLaunchEnvironment})
+	testParentLifetime := openTestParentLifetime()
+	if testParentLifetime != nil {
+		defer testParentLifetime.Close()
+	}
+	environment := withoutEnvironment(os.Environ(), []string{managedLaunchEnvironment, managedTestParentLifetimeEnvironment})
 	program := os.Args[2]
 	supervisorSignals := make(chan os.Signal, 2)
 	signal.Notify(supervisorSignals, os.Interrupt, syscall.SIGTERM)
@@ -43,8 +50,27 @@ func init() {
 	// The supervisor remains the authenticated group leader while the trusted
 	// Codex target and its process-group members run. It exits only after every
 	// other member of that controller-owned process group is gone.
-	waitErr := target.Wait()
-	drainManagedLaunchGroup()
+	targetWait := make(chan error, 1)
+	go func() { targetWait <- target.Wait() }()
+	var waitErr error
+	if testParentLifetime == nil {
+		waitErr = <-targetWait
+		drainManagedLaunchGroup()
+	} else {
+		parentGone := make(chan struct{}, 1)
+		go func() {
+			var probe [1]byte
+			_, _ = testParentLifetime.Read(probe[:])
+			parentGone <- struct{}{}
+		}()
+		select {
+		case waitErr = <-targetWait:
+			drainManagedLaunchGroup()
+		case <-parentGone:
+			drainManagedLaunchGroup()
+			waitErr = <-targetWait
+		}
+	}
 	if waitErr == nil {
 		os.Exit(0)
 	}
@@ -53,6 +79,13 @@ func init() {
 		os.Exit(exitErr.ExitCode())
 	}
 	os.Exit(125)
+}
+
+func openTestParentLifetime() *os.File {
+	if os.Getenv(managedTestParentLifetimeEnvironment) != "1" {
+		return nil
+	}
+	return os.NewFile(managedTestParentLifetimeFD, "managed-test-parent-lifetime")
 }
 
 func awaitManagedLaunchGate() bool {

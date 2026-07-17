@@ -733,6 +733,15 @@ restart may claim its authenticated inode after the prior controller releases
 it. This lets graceful abandon interrupt the exact surviving process group and
 prove it exited without trusting a reusable PID alone.
 
+Managed launches created inside a generated Go test binary add a separate
+test-parent lifetime pipe after the durable launch gate. Abrupt loss of that
+test runner closes the pipe, so the supervisor drains only its own process
+group instead of becoming long-lived test residue. The adapter enables this
+contract only from the linker's Go testing-runtime marker and removes its
+internal marker from inherited environments. Production binaries do not create
+the lifetime pipe; authenticated process adoption after a controller crash
+remains unchanged.
+
 ### Linear
 
 `internal/adapters/linear` validates the official (or loopback fixture) GraphQL

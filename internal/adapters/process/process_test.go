@@ -324,6 +324,8 @@ func TestManagedChildCannotReleaseOrReplaceControllerLifecycleLock(t *testing.T)
 func TestAttemptStopperAdoptsAuthenticatedLockAfterRunnerCrash(t *testing.T) {
 	directory := t.TempDir()
 	controlPath := filepath.Join(directory, "implementation.process-control.json")
+	targetPIDPath := filepath.Join(directory, "target.pid")
+	descendantPIDPath := filepath.Join(directory, "descendant.pid")
 	files, err := openProcessControl(controlPath, []byte(testProcessControlKey))
 	if err != nil {
 		t.Fatal(err)
@@ -333,8 +335,10 @@ func TestAttemptStopperAdoptsAuthenticatedLockAfterRunnerCrash(t *testing.T) {
 		files.Close()
 		t.Fatal(err)
 	}
-	command := exec.Command(os.Args[0], managedLaunchArgument, os.Args[0], "-test.run=TestProcessHelper", "--", "ignore-interrupt")
-	command.Env = append(withoutEnvironment(os.Environ(), []string{managedLaunchEnvironment}), managedLaunchEnvironment+"=1")
+	command := exec.Command(os.Args[0], managedLaunchArgument, os.Args[0], "-test.run=TestProcessHelper", "--", "ignore-with-child-pids", targetPIDPath, descendantPIDPath)
+	// This directly constructed helper deliberately omits the test-only parent
+	// lifetime pipe and covers production crash adoption.
+	command.Env = append(withoutEnvironment(os.Environ(), []string{managedLaunchEnvironment, managedTestParentLifetimeEnvironment}), managedLaunchEnvironment+"=1")
 	command.ExtraFiles = []*os.File{reader}
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := command.Start(); err != nil {
@@ -346,9 +350,25 @@ func TestAttemptStopperAdoptsAuthenticatedLockAfterRunnerCrash(t *testing.T) {
 	reader.Close()
 	done := make(chan error, 1)
 	go func() { done <- command.Wait() }()
-	control, err := newRuntimeProcessControl(command.Process.Pid, filepath.Base(controlPath), files.lock, []byte(testProcessControlKey))
+	stopped := false
+	var runtimeControl processControl
+	t.Cleanup(func() {
+		writer.Close()
+		files.Close()
+		if stopped {
+			return
+		}
+		if err := (AttemptStopper{InterruptGrace: 50 * time.Millisecond}).StopAttempt(context.Background(), directory, testProcessControlKey); err != nil && runtimeControl.ProcessStartToken != "" {
+			_ = signalObservedProcessGroup(runtimeControl, syscall.SIGKILL)
+		}
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	})
+	runtimeControl, err = newRuntimeProcessControl(command.Process.Pid, filepath.Base(controlPath), files.lock, []byte(testProcessControlKey))
 	if err == nil {
-		err = persistProcessControl(controlPath, control)
+		err = persistProcessControl(controlPath, runtimeControl)
 	}
 	if err == nil {
 		_, err = writer.Write([]byte{1})
@@ -356,19 +376,70 @@ func TestAttemptStopperAdoptsAuthenticatedLockAfterRunnerCrash(t *testing.T) {
 	writer.Close()
 	files.Close() // Simulate the originating controller process losing its flock.
 	if err != nil {
-		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
 		t.Fatal(err)
 	}
+	targetPID := waitForPIDMarker(t, targetPIDPath)
+	descendantPID := waitForPIDMarker(t, descendantPIDPath)
+	identity, err := os.OpenFile(controlPath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.OpenFile(processControlLockPath(controlPath), os.O_RDWR|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		identity.Close()
+		t.Fatal(err)
+	}
+	authenticated, err := readProcessControl(identity, lock, []byte(testProcessControlKey))
+	if err != nil {
+		identity.Close()
+		lock.Close()
+		t.Fatal(err)
+	}
+	active, err := managedProcessControlAuthorized(authenticated, lock)
+	if err != nil || !active {
+		identity.Close()
+		lock.Close()
+		t.Fatalf("production crash adoption active=%t err=%v", active, err)
+	}
+	startToken, found, err := observedProcessStartToken(authenticated.ProcessGroupID)
+	if err != nil || !found || startToken != authenticated.ProcessStartToken {
+		identity.Close()
+		lock.Close()
+		t.Fatalf("production kernel start identity found=%t match=%t err=%v", found, startToken == authenticated.ProcessStartToken, err)
+	}
+	members, err := observedProcessGroupMembers(authenticated.ProcessGroupID)
+	if err != nil {
+		identity.Close()
+		lock.Close()
+		t.Fatal(err)
+	}
+	if !containsPID(members, authenticated.ProcessGroupID) || !containsPID(members, targetPID) || !containsPID(members, descendantPID) {
+		identity.Close()
+		lock.Close()
+		t.Fatalf("production adopted pgid=%d members=%v target_pid=%d descendant_pid=%d", authenticated.ProcessGroupID, members, targetPID, descendantPID)
+	}
+	for role, pid := range map[string]int{"target": targetPID, "descendant": descendantPID} {
+		if group, err := syscall.Getpgid(pid); err != nil || group != authenticated.ProcessGroupID {
+			identity.Close()
+			lock.Close()
+			t.Fatalf("production %s pid=%d pgid=%d expected=%d err=%v", role, pid, group, authenticated.ProcessGroupID, err)
+		}
+	}
+	t.Logf("production adoption active pgid=%d target_pid=%d descendant_pid=%d start_identity_match=true members=%v", authenticated.ProcessGroupID, targetPID, descendantPID, members)
+	identity.Close()
+	lock.Close()
 	if err := (AttemptStopper{InterruptGrace: 50 * time.Millisecond}).StopAttempt(context.Background(), directory, testProcessControlKey); err != nil {
-		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
 		t.Fatal(err)
 	}
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
 		t.Fatal("adopted process group did not stop")
 	}
+	if exists, err := processGroupExists(authenticated.ProcessGroupID); err != nil || exists {
+		t.Fatalf("production adopted process group remains: exists=%t err=%v", exists, err)
+	}
+	stopped = true
 }
 
 func TestManagedLaunchGateDoesNotExecTargetAfterParentEOF(t *testing.T) {
@@ -379,7 +450,7 @@ func TestManagedLaunchGateDoesNotExecTargetAfterParentEOF(t *testing.T) {
 		t.Fatal(err)
 	}
 	command := exec.Command(os.Args[0], managedLaunchArgument, os.Args[0], "-test.run=TestProcessHelper", "--", "write-marker", marker)
-	command.Env = append(withoutEnvironment(os.Environ(), []string{managedLaunchEnvironment}), managedLaunchEnvironment+"=1")
+	command.Env = append(withoutEnvironment(os.Environ(), []string{managedLaunchEnvironment, managedTestParentLifetimeEnvironment}), managedLaunchEnvironment+"=1")
 	command.ExtraFiles = []*os.File{reader}
 	if err := command.Start(); err != nil {
 		reader.Close()
@@ -393,6 +464,64 @@ func TestManagedLaunchGateDoesNotExecTargetAfterParentEOF(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("target executed before lifecycle release: %v", err)
+	}
+}
+
+func TestOSRunnerProductionModeIgnoresAmbientTestParentLifetime(t *testing.T) {
+	directory := t.TempDir()
+	controlPath := filepath.Join(directory, "implementation.process-control.json")
+	targetPIDPath := filepath.Join(directory, "target.pid")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	runnerDone := false
+	go func() {
+		_, err := (OSRunner{InterruptGrace: 50 * time.Millisecond}).runWithTestParentLifetime(ctx, Spec{
+			Program: os.Args[0], Args: []string{"-test.run=TestProcessHelper", "--", "ignore-interrupt-pid", targetPIDPath},
+			StdoutPath: filepath.Join(directory, "stdout"), StderrPath: filepath.Join(directory, "stderr"), ControlPath: controlPath, ControlKey: []byte(testProcessControlKey),
+			Environment: []string{managedTestParentLifetimeEnvironment + "=1"},
+		}, append(os.Environ(), managedTestParentLifetimeEnvironment+"=1"), false)
+		done <- err
+	}()
+	t.Cleanup(func() {
+		cancel()
+		if runnerDone {
+			return
+		}
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			_ = (AttemptStopper{InterruptGrace: 50 * time.Millisecond}).StopAttempt(context.Background(), directory, testProcessControlKey)
+		}
+	})
+
+	waitForProcessControl(t, controlPath)
+	waitForPIDMarker(t, targetPIDPath)
+	control, err := readProcessControlFile(controlPath, testProcessControlKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if active, err := managedProcessControlActive(control); err != nil || !active {
+		t.Fatalf("ambient test-parent lifetime changed production mode: active=%t err=%v", active, err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		runnerDone = true
+		if err == nil {
+			t.Fatal("cancelled production-mode runner unexpectedly succeeded")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("production-mode runner did not stop")
+	}
+	if exists, err := processGroupExists(control.ProcessGroupID); err != nil || exists {
+		t.Fatalf("production-mode process group remains: exists=%t err=%v", exists, err)
+	}
+}
+
+func TestOSRunnerUsesLinkerBackedGoTestRuntime(t *testing.T) {
+	if !goTestRuntimeActive() {
+		t.Fatal("linker-backed Go test runtime was not recognized")
 	}
 }
 
