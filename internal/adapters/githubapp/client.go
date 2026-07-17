@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 const maxBody = 4 << 20
@@ -102,10 +103,11 @@ func (c *Client) read(ctx context.Context, pr int64, expectedHead string, handof
 	if e.PullRequest.HeadSHA != expectedHead {
 		return e, errors.New("pull request head SHA mismatch")
 	}
-	checks, unknown, err := c.readChecks(ctx, expectedHead, e.PullRequest.BaseBranch)
+	firstChecks, err := c.readChecksSnapshot(ctx, expectedHead, e.PullRequest.BaseBranch)
 	if err != nil {
 		return e, err
 	}
+	checks, unknown := firstChecks.checks, firstChecks.unknown
 	e.Checks = checks
 	e.UnknownEvents = unknown
 	reviews, unknown2, err := c.readReviews(ctx, pr)
@@ -128,13 +130,19 @@ func (c *Client) read(ctx context.Context, pr int64, expectedHead string, handof
 		return e, errors.New("review topology drifted while collecting GitHub evidence")
 	}
 	reviews, threads, unknown2 = reviews2, threads2, unknown3
-	checks2, unknownChecks2, err := c.readChecks(ctx, expectedHead, e.PullRequest.BaseBranch)
+	secondChecks, err := c.readChecksSnapshot(ctx, expectedHead, e.PullRequest.BaseBranch)
 	if err != nil {
 		return e, err
 	}
-	if checkTopologyDigest(checks, unknown) != checkTopologyDigest(checks2, unknownChecks2) {
-		return e, errors.New("check topology drifted while collecting GitHub evidence")
+	checks2, unknownChecks2 := secondChecks.checks, secondChecks.unknown
+	if firstChecks.protectionDigest != secondChecks.protectionDigest {
+		return e, errors.New("required check protection drifted while collecting GitHub evidence")
 	}
+	// Check runs are expected to appear and advance immediately after a push or
+	// PR creation. Repository, PR, exact head, protection, and completeness are
+	// revalidated by both bounded reads, so use the newer snapshot when only the
+	// check topology moved. Review topology remains immutable within one read
+	// because it can carry human authorization or repair input.
 	checks, unknown = checks2, unknownChecks2
 	e.Checks = checks
 	e.UnknownEvents = unknown
@@ -158,7 +166,7 @@ func (c *Client) read(ctx context.Context, pr int64, expectedHead string, handof
 		return e, err
 	}
 	finalPR := final.normalized()
-	if final.Head.Repo.ID != c.cfg.RepositoryID || final.Base.Repo.ID != c.cfg.RepositoryID || finalPR.Number != e.PullRequest.Number || finalPR.DatabaseID != e.PullRequest.DatabaseID || finalPR.NodeID != e.PullRequest.NodeID || finalPR.HeadSHA != e.PullRequest.HeadSHA || finalPR.BaseSHA != e.PullRequest.BaseSHA || finalPR.HeadBranch != e.PullRequest.HeadBranch || finalPR.BaseBranch != e.PullRequest.BaseBranch || finalPR.BodyDigest != e.PullRequest.BodyDigest {
+	if final.Head.Repo.ID != c.cfg.RepositoryID || final.Base.Repo.ID != c.cfg.RepositoryID || finalPR.Number != e.PullRequest.Number || finalPR.DatabaseID != e.PullRequest.DatabaseID || finalPR.NodeID != e.PullRequest.NodeID || finalPR.HeadSHA != e.PullRequest.HeadSHA || finalPR.BaseSHA != e.PullRequest.BaseSHA || finalPR.HeadBranch != e.PullRequest.HeadBranch || finalPR.BaseBranch != e.PullRequest.BaseBranch || finalPR.BodyDigest != e.PullRequest.BodyDigest || finalPR.State != e.PullRequest.State || finalPR.Merged != e.PullRequest.Merged || finalPR.MergeSHA != e.PullRequest.MergeSHA || !finalPR.MergedAt.UTC().Equal(e.PullRequest.MergedAt.UTC()) {
 		return e, errors.New("pull request drifted while collecting GitHub evidence")
 	}
 	if handoff != nil {
@@ -185,22 +193,6 @@ func reviewTopologyDigest(reviews []domain.GitHubReview, threads []domain.GitHub
 		Threads []domain.GitHubReviewThread
 		Unknown []string
 	}{reviewCopies, threadCopies, unknownCopies})
-	sum := sha256.Sum256(raw)
-	return hex.EncodeToString(sum[:])
-}
-
-func checkTopologyDigest(checks []domain.GitHubCheck, unknown []string) string {
-	copies := append([]domain.GitHubCheck(nil), checks...)
-	for i := range copies {
-		copies[i].ObservedAt = time.Time{}
-	}
-	sort.Slice(copies, func(i, j int) bool { return copies[i].ID < copies[j].ID })
-	events := append([]string(nil), unknown...)
-	sort.Strings(events)
-	raw, _ := json.Marshal(struct {
-		Checks  []domain.GitHubCheck
-		Unknown []string
-	}{copies, events})
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }
@@ -465,10 +457,22 @@ func ownershipMarker(body string) string {
 	return strings.TrimSpace(rest[:end])
 }
 
+type checkReadSnapshot struct {
+	checks           []domain.GitHubCheck
+	unknown          []string
+	protectionDigest string
+}
+
 func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.GitHubCheck, []string, error) {
+	snapshot, err := c.readChecksSnapshot(ctx, sha, base)
+	return snapshot.checks, snapshot.unknown, err
+}
+
+func (c *Client) readChecksSnapshot(ctx context.Context, sha, base string) (checkReadSnapshot, error) {
 	var all []domain.GitHubCheck
 	var unknown []string
 	var protection struct {
+		Strict   bool     `json:"strict"`
 		Contexts []string `json:"contexts"`
 		Checks   []struct {
 			Context string `json:"context"`
@@ -476,15 +480,38 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 		} `json:"checks"`
 	}
 	if err := c.rest(ctx, "required_checks", "GET", fmt.Sprintf("/repos/%s/%s/branches/%s/protection/required_status_checks", c.cfg.RepositoryOwner, c.cfg.RepositoryName, url.PathEscape(base)), nil, &protection, true); err != nil {
-		return nil, nil, err
+		return checkReadSnapshot{}, err
 	}
 	required := map[string]int64{}
 	for _, name := range protection.Contexts {
+		if !canonicalCheckContext(name) {
+			return checkReadSnapshot{}, errors.New("required check protection context is invalid")
+		}
+		if _, duplicate := required[name]; duplicate {
+			return checkReadSnapshot{}, errors.New("required check protection binding is duplicated")
+		}
 		required[name] = 0
 	}
 	for _, check := range protection.Checks {
+		if !canonicalCheckContext(check.Context) || check.AppID < 1 {
+			return checkReadSnapshot{}, errors.New("required check protection app binding is invalid")
+		}
+		if _, duplicate := required[check.Context]; duplicate {
+			return checkReadSnapshot{}, errors.New("required check protection binding conflicts")
+		}
 		required[check.Context] = check.AppID
 	}
+	requiredPairs := make([]string, 0, len(required))
+	for name, appID := range required {
+		requiredPairs = append(requiredPairs, fmt.Sprintf("%s\x00%d", name, appID))
+	}
+	sort.Strings(requiredPairs)
+	protectionRaw, _ := json.Marshal(struct {
+		Strict bool
+		Pairs  []string
+	}{Strict: protection.Strict, Pairs: requiredPairs})
+	protectionSum := sha256.Sum256(protectionRaw)
+	protectionDigest := hex.EncodeToString(protectionSum[:])
 	type checkRun struct {
 		ID          int64     `json:"id"`
 		Name        string    `json:"name"`
@@ -497,77 +524,118 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 		} `json:"app"`
 	}
 	latestRuns := map[string]checkRun{}
+	seenCheckRunIDs := map[int64]struct{}{}
+	expectedCheckRunCount, collectedCheckRuns := -1, 0
 	page := 1
 	for page <= 20 {
 		var raw struct {
-			CheckRuns []checkRun `json:"check_runs"`
+			TotalCount *int       `json:"total_count"`
+			CheckRuns  []checkRun `json:"check_runs"`
 		}
 		path := fmt.Sprintf("/repos/%s/%s/commits/%s/check-runs?per_page=100&page=%d", c.cfg.RepositoryOwner, c.cfg.RepositoryName, sha, page)
 		if err := c.rest(ctx, "check_runs", "GET", path, nil, &raw, true); err != nil {
-			return nil, nil, err
+			return checkReadSnapshot{}, err
+		}
+		if raw.TotalCount == nil || *raw.TotalCount < 0 {
+			return checkReadSnapshot{}, errors.New("check-run total count is invalid")
+		}
+		if expectedCheckRunCount < 0 {
+			expectedCheckRunCount = *raw.TotalCount
+		} else if expectedCheckRunCount != *raw.TotalCount {
+			return checkReadSnapshot{}, errors.New("check-run total count drifted during pagination")
+		}
+		if len(raw.CheckRuns) > 100 || collectedCheckRuns+len(raw.CheckRuns) > expectedCheckRunCount {
+			return checkReadSnapshot{}, errors.New("check-run pagination count is inconsistent")
 		}
 		for _, r := range raw.CheckRuns {
+			if r.ID < 1 || !canonicalCheckContext(r.Name) || r.App.ID < 1 || r.Status == "completed" && r.CompletedAt.IsZero() || r.Status == "in_progress" && r.StartedAt.IsZero() {
+				return checkReadSnapshot{}, errors.New("check-run identity evidence is incomplete")
+			}
+			if _, duplicate := seenCheckRunIDs[r.ID]; duplicate {
+				return checkReadSnapshot{}, errors.New("check-run identity is duplicated")
+			}
+			seenCheckRunIDs[r.ID] = struct{}{}
 			key := fmt.Sprintf("%s\x00%d", r.Name, r.App.ID)
 			previous, ok := latestRuns[key]
 			if !ok || r.ID > previous.ID || r.ID == previous.ID && r.StartedAt.After(previous.StartedAt) || r.ID == previous.ID && r.StartedAt.Equal(previous.StartedAt) && r.CompletedAt.After(previous.CompletedAt) {
 				latestRuns[key] = r
 			}
 		}
-		if len(raw.CheckRuns) < 100 {
+		collectedCheckRuns += len(raw.CheckRuns)
+		if collectedCheckRuns == expectedCheckRunCount {
 			break
+		}
+		if len(raw.CheckRuns) < 100 {
+			return checkReadSnapshot{}, errors.New("check-run pagination ended before total count")
 		}
 		page++
 	}
-	if page > 20 {
-		return nil, nil, errors.New("check-run pagination exceeded bounded limit")
+	if page > 20 || collectedCheckRuns != expectedCheckRunCount {
+		return checkReadSnapshot{}, errors.New("check-run pagination exceeded bounded limit")
 	}
 	for _, r := range latestRuns {
 		state := mapCheck(r.Status, r.Conclusion)
-		if state == domain.CheckUnknown {
-			unknown = append(unknown, "unknown_check_state:"+r.Status+":"+r.Conclusion)
-		}
-		requiredApp, requiredName := required[r.Name]
 		sourceAt := r.CompletedAt
 		if sourceAt.IsZero() {
 			sourceAt = r.StartedAt
 		}
-		all = append(all, domain.GitHubCheck{ID: strconv.FormatInt(r.ID, 10), Name: r.Name, Required: requiredName && (requiredApp == 0 || requiredApp == r.App.ID), Source: "check_run", AppID: r.App.ID, State: state, ObservedSHA: sha, SourceAt: sourceAt, ObservedAt: c.clock.Now().UTC()})
+		all = append(all, domain.GitHubCheck{ID: strconv.FormatInt(r.ID, 10), Name: r.Name, Source: "check_run", AppID: r.App.ID, State: state, ObservedSHA: sha, SourceAt: sourceAt, ObservedAt: c.clock.Now().UTC()})
+	}
+	type commitStatus struct {
+		ID        int64     `json:"id"`
+		Context   string    `json:"context"`
+		State     string    `json:"state"`
+		UpdatedAt time.Time `json:"updated_at"`
 	}
 	type statusPage struct {
-		TotalCount int `json:"total_count"`
-		Statuses   []struct {
-			ID        int64     `json:"id"`
-			Context   string    `json:"context"`
-			State     string    `json:"state"`
-			UpdatedAt time.Time `json:"updated_at"`
-		} `json:"statuses"`
+		TotalCount *int           `json:"total_count"`
+		Statuses   []commitStatus `json:"statuses"`
 	}
-	var statuses statusPage
+	var statuses []commitStatus
+	seenStatusIDs := map[int64]struct{}{}
+	expectedStatusCount := -1
 	for page := 1; page <= 20; page++ {
 		var current statusPage
 		if err := c.rest(ctx, "commit_statuses", "GET", fmt.Sprintf("/repos/%s/%s/commits/%s/status?per_page=100&page=%d", c.cfg.RepositoryOwner, c.cfg.RepositoryName, sha, page), nil, &current, true); err != nil {
-			return nil, nil, err
+			return checkReadSnapshot{}, err
+		}
+		if current.TotalCount == nil || *current.TotalCount < 0 {
+			return checkReadSnapshot{}, errors.New("commit-status total count is invalid")
 		}
 		if page == 1 {
-			statuses.TotalCount = current.TotalCount
+			expectedStatusCount = *current.TotalCount
+		} else if *current.TotalCount != expectedStatusCount {
+			return checkReadSnapshot{}, errors.New("commit-status total count drifted during pagination")
 		}
-		statuses.Statuses = append(statuses.Statuses, current.Statuses...)
-		if len(statuses.Statuses) >= statuses.TotalCount || len(current.Statuses) < 100 {
+		if len(statuses)+len(current.Statuses) > expectedStatusCount {
+			return checkReadSnapshot{}, errors.New("commit-status pagination count is inconsistent")
+		}
+		for _, status := range current.Statuses {
+			if status.ID < 1 || !canonicalCheckContext(status.Context) || status.UpdatedAt.IsZero() {
+				return checkReadSnapshot{}, errors.New("commit-status identity evidence is incomplete")
+			}
+			if _, duplicate := seenStatusIDs[status.ID]; duplicate {
+				return checkReadSnapshot{}, errors.New("commit-status identity is duplicated")
+			}
+			seenStatusIDs[status.ID] = struct{}{}
+		}
+		statuses = append(statuses, current.Statuses...)
+		if len(statuses) >= expectedStatusCount || len(current.Statuses) < 100 {
 			break
 		}
 		if page == 20 {
-			return nil, nil, errors.New("commit-status pagination exceeded bounded limit")
+			return checkReadSnapshot{}, errors.New("commit-status pagination exceeded bounded limit")
 		}
 	}
-	if len(statuses.Statuses) < statuses.TotalCount {
-		return nil, nil, errors.New("commit-status pagination was incomplete")
+	if len(statuses) != expectedStatusCount {
+		return checkReadSnapshot{}, errors.New("commit-status pagination was incomplete")
 	}
 	latestStatuses := map[string]struct {
 		ID             int64
 		Context, State string
 		UpdatedAt      time.Time
 	}{}
-	for _, status := range statuses.Statuses {
+	for _, status := range statuses {
 		previous, ok := latestStatuses[status.Context]
 		if !ok || status.UpdatedAt.After(previous.UpdatedAt) || status.UpdatedAt.Equal(previous.UpdatedAt) && status.ID > previous.ID {
 			latestStatuses[status.Context] = struct {
@@ -582,27 +650,29 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 		if status.State == "pending" {
 			state = domain.CheckPending
 		}
-		if state == domain.CheckUnknown {
-			unknown = append(unknown, "unknown_commit_status:"+status.State)
-		}
-		requiredApp, requiredName := required[status.Context]
-		all = append(all, domain.GitHubCheck{ID: "status:" + strconv.FormatInt(status.ID, 10), Name: status.Context, Required: requiredName && requiredApp == 0, Source: "commit_status", State: state, ObservedSHA: sha, SourceAt: status.UpdatedAt, ObservedAt: c.clock.Now().UTC()})
+		all = append(all, domain.GitHubCheck{ID: "status:" + strconv.FormatInt(status.ID, 10), Name: status.Context, Source: "commit_status", State: state, ObservedSHA: sha, SourceAt: status.UpdatedAt, ObservedAt: c.clock.Now().UTC()})
 	}
 	for i := range all {
 		all[i].Required = false
 	}
 	for name, appID := range required {
-		best := -1
+		bestRun, bestStatus := -1, -1
 		for i := range all {
-			if all[i].Name != name || appID > 0 && all[i].AppID != appID {
+			if all[i].Name != name {
 				continue
 			}
-			if best < 0 || all[i].SourceAt.After(all[best].SourceAt) || all[i].SourceAt.Equal(all[best].SourceAt) && all[i].ID > all[best].ID {
-				best = i
+			if all[i].Source == "check_run" && (appID == 0 || all[i].AppID == appID) && (bestRun < 0 || laterGitHubCheck(all[i], all[bestRun])) {
+				bestRun = i
+			}
+			if appID == 0 && all[i].Source == "commit_status" && (bestStatus < 0 || laterGitHubCheck(all[i], all[bestStatus])) {
+				bestStatus = i
 			}
 		}
-		if best >= 0 {
-			all[best].Required = true
+		if bestRun >= 0 {
+			all[bestRun].Required = true
+		}
+		if bestStatus >= 0 {
+			all[bestStatus].Required = true
 		}
 	}
 	for name := range required {
@@ -616,8 +686,48 @@ func (c *Client) readChecks(ctx context.Context, sha, base string) ([]domain.Git
 			unknown = append(unknown, "missing_required_check:"+name)
 		}
 	}
-	return all, unknown, nil
+	for _, check := range all {
+		if !check.Required || check.State != domain.CheckUnknown {
+			continue
+		}
+		if check.Source == "commit_status" {
+			unknown = append(unknown, "unknown_commit_status:"+check.Name+":"+check.ID)
+		} else {
+			unknown = append(unknown, "unknown_check_state:"+check.Name+":"+strconv.FormatInt(check.AppID, 10)+":"+check.ID)
+		}
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].Name != all[j].Name {
+			return all[i].Name < all[j].Name
+		}
+		if all[i].Source != all[j].Source {
+			return all[i].Source < all[j].Source
+		}
+		if all[i].AppID != all[j].AppID {
+			return all[i].AppID < all[j].AppID
+		}
+		return all[i].ID < all[j].ID
+	})
+	sort.Strings(unknown)
+	return checkReadSnapshot{checks: all, unknown: unknown, protectionDigest: protectionDigest}, nil
 }
+
+func laterGitHubCheck(candidate, current domain.GitHubCheck) bool {
+	if !candidate.SourceAt.Equal(current.SourceAt) {
+		return candidate.SourceAt.After(current.SourceAt)
+	}
+	candidateID, candidateErr := strconv.ParseInt(strings.TrimPrefix(candidate.ID, "status:"), 10, 64)
+	currentID, currentErr := strconv.ParseInt(strings.TrimPrefix(current.ID, "status:"), 10, 64)
+	if candidateErr == nil && currentErr == nil {
+		return candidateID > currentID
+	}
+	return candidate.ID > current.ID
+}
+
+func canonicalCheckContext(value string) bool {
+	return value != "" && value == strings.TrimSpace(value) && strings.IndexFunc(value, unicode.IsControl) < 0
+}
+
 func mapCheck(status, conclusion string) domain.CheckState {
 	if status != "completed" {
 		switch status {

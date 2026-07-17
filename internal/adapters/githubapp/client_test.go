@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -238,17 +240,17 @@ func replayPaginationScenario(t *testing.T) {
 	mux.HandleFunc("/repos/owner/repo/commits/head/check-runs", func(w http.ResponseWriter, r *http.Request) {
 		page := pages.Add(1)
 		if page == 1 {
-			fmt.Fprint(w, `{"check_runs":[`)
+			fmt.Fprint(w, `{"total_count":101,"check_runs":[`)
 			for i := 0; i < 100; i++ {
 				if i > 0 {
 					fmt.Fprint(w, ",")
 				}
-				fmt.Fprintf(w, `{"id":%d,"name":"n%d","status":"completed","conclusion":"success","app":{"id":1}}`, i+1, i)
+				fmt.Fprintf(w, `{"id":%d,"name":"n%d","status":"completed","conclusion":"success","completed_at":"2026-07-11T00:00:00Z","app":{"id":1}}`, i+1, i)
 			}
 			fmt.Fprint(w, `]}`)
 			return
 		}
-		fmt.Fprint(w, `{"check_runs":[]}`)
+		fmt.Fprint(w, `{"total_count":101,"check_runs":[{"id":101,"name":"required","status":"completed","conclusion":"success","completed_at":"2026-07-11T00:01:00Z","app":{"id":1}}]}`)
 	})
 	mux.HandleFunc("/repos/owner/repo/commits/head/status", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `{"total_count":0,"statuses":[]}`) })
 	srv := httptest.NewServer(mux)
@@ -260,6 +262,123 @@ func replayPaginationScenario(t *testing.T) {
 	if pages.Load() != 2 {
 		t.Fatalf("pages=%d", pages.Load())
 	}
+}
+
+func TestCheckRunPaginationFailsClosedOnIncompleteOrDriftingCounts(t *testing.T) {
+	tests := []struct {
+		name string
+		page func(http.ResponseWriter, int)
+	}{
+		{"truncated short page", func(w http.ResponseWriter, page int) { writeCheckRunFixturePage(w, 2, page, 1) }},
+		{"missing newer same-context failure", func(w http.ResponseWriter, page int) {
+			if page == 1 {
+				writeCheckRunFixturePage(w, 101, page, 100)
+				return
+			}
+			fmt.Fprint(w, `{"total_count":101,"check_runs":[]}`)
+		}},
+		{"total count drift", func(w http.ResponseWriter, page int) {
+			if page == 1 {
+				writeCheckRunFixturePage(w, 101, page, 100)
+				return
+			}
+			writeCheckRunFixturePage(w, 102, page, 1)
+		}},
+		{"over twenty pages", func(w http.ResponseWriter, page int) { writeCheckRunFixturePage(w, 2001, page, 100) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/repos/owner/repo/branches/main/protection/required_status_checks", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, `{"contexts":["test"],"checks":[]}`) })
+			mux.HandleFunc("/repos/owner/repo/commits/head/check-runs", func(w http.ResponseWriter, r *http.Request) {
+				page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+				test.page(w, page)
+			})
+			mux.HandleFunc("/repos/owner/repo/commits/head/status", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, `{"total_count":0,"statuses":[]}`) })
+			server := httptest.NewServer(mux)
+			defer server.Close()
+			client := &Client{cfg: Config{APIBaseURL: server.URL, RepositoryOwner: "owner", RepositoryName: "repo", APIVersion: "2022-11-28"}, http: server.Client(), clock: fixedClock{time.Now()}, token: "token"}
+			if _, _, err := client.readChecks(context.Background(), "head", "main"); err == nil {
+				t.Fatal("incomplete check-run pagination was accepted")
+			}
+		})
+	}
+}
+
+func writeCheckRunFixturePage(w http.ResponseWriter, total, page, count int) {
+	fmt.Fprintf(w, `{"total_count":%d,"check_runs":[`, total)
+	for index := 0; index < count; index++ {
+		if index > 0 {
+			fmt.Fprint(w, ",")
+		}
+		id := int64(page-1)*100 + int64(index) + 1
+		name, conclusion := fmt.Sprintf("check-%d", id), "success"
+		if id == 1 || id == 101 {
+			name = "test"
+		}
+		if id == 101 {
+			conclusion = "failure"
+		}
+		fmt.Fprintf(w, `{"id":%d,"name":%q,"status":"completed","conclusion":%q,"completed_at":"2026-07-11T00:01:00Z","app":{"id":8}}`, id, name, conclusion)
+	}
+	fmt.Fprint(w, `]}`)
+}
+
+func TestRequiredCheckIdentityValidationRejectsMalformed2xxEvidence(t *testing.T) {
+	validProtection := `{"contexts":["test"],"checks":[]}`
+	validCheck := `{"total_count":1,"check_runs":[{"id":1,"name":"test","status":"completed","conclusion":"success","completed_at":"2026-07-11T00:01:00Z","app":{"id":8}}]}`
+	validStatuses := `{"total_count":0,"statuses":[]}`
+	tests := []struct {
+		name, protection, checks, statuses string
+	}{
+		{"empty protection context", `{"contexts":[""],"checks":[]}`, `{"total_count":0,"check_runs":[]}`, validStatuses},
+		{"noncanonical protection context", `{"contexts":[" test"],"checks":[]}`, `{"total_count":0,"check_runs":[]}`, validStatuses},
+		{"conflicting context app binding", `{"contexts":["test"],"checks":[{"context":"test","app_id":8}]}`, validCheck, validStatuses},
+		{"duplicate app binding", `{"contexts":[],"checks":[{"context":"test","app_id":8},{"context":"test","app_id":8}]}`, validCheck, validStatuses},
+		{"invalid app binding", `{"contexts":[],"checks":[{"context":"test","app_id":0}]}`, validCheck, validStatuses},
+		{"check run id zero", validProtection, `{"total_count":1,"check_runs":[{"id":0,"name":"test","status":"queued","app":{"id":8}}]}`, validStatuses},
+		{"check run name empty", validProtection, `{"total_count":1,"check_runs":[{"id":1,"name":"","status":"queued","app":{"id":8}}]}`, validStatuses},
+		{"check run app missing", validProtection, `{"total_count":1,"check_runs":[{"id":1,"name":"test","status":"queued","app":{"id":0}}]}`, validStatuses},
+		{"completed check timestamp missing", validProtection, `{"total_count":1,"check_runs":[{"id":1,"name":"test","status":"completed","conclusion":"success","app":{"id":8}}]}`, validStatuses},
+		{"in progress timestamp missing", validProtection, `{"total_count":1,"check_runs":[{"id":1,"name":"test","status":"in_progress","app":{"id":8}}]}`, validStatuses},
+		{"status total count missing despite passing check", validProtection, validCheck, `{"statuses":[]}`},
+		{"status id zero", validProtection, validCheck, `{"total_count":1,"statuses":[{"id":0,"context":"test","state":"success","updated_at":"2026-07-11T00:02:00Z"}]}`},
+		{"status context empty", validProtection, validCheck, `{"total_count":1,"statuses":[{"id":2,"context":"","state":"success","updated_at":"2026-07-11T00:02:00Z"}]}`},
+		{"status timestamp missing", validProtection, validCheck, `{"total_count":1,"statuses":[{"id":2,"context":"test","state":"success"}]}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, closeServer := checkEvidenceFixtureClient(t, test.protection, test.checks, test.statuses)
+			defer closeServer()
+			if _, _, err := client.readChecks(context.Background(), "head", "main"); err == nil {
+				t.Fatal("malformed 2xx check evidence was accepted")
+			}
+		})
+	}
+}
+
+func TestQueuedCheckRunAllowsNullTimestampsWithImmutableIdentity(t *testing.T) {
+	client, closeServer := checkEvidenceFixtureClient(t, `{"contexts":["test"],"checks":[]}`, `{"total_count":1,"check_runs":[{"id":1,"name":"test","status":"queued","started_at":null,"completed_at":null,"app":{"id":8}}]}`, `{"total_count":0,"statuses":[]}`)
+	defer closeServer()
+	checks, unknown, err := client.readChecks(context.Background(), "head", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := domain.GitHubReadEvidence{PullRequest: domain.PullRequest{HeadSHA: "head"}, Checks: checks, UnknownEvents: unknown}
+	if evidence.RequiredChecksStatus() != domain.ReconciliationPending || len(checks) != 1 || checks[0].ID != "1" || checks[0].SourceAt != (time.Time{}) {
+		t.Fatalf("checks=%+v unknown=%v status=%s", checks, unknown, evidence.RequiredChecksStatus())
+	}
+}
+
+func checkEvidenceFixtureClient(t *testing.T, protection, checks, statuses string) (*Client, func()) {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/owner/repo/branches/main/protection/required_status_checks", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, protection) })
+	mux.HandleFunc("/repos/owner/repo/commits/head/check-runs", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, checks) })
+	mux.HandleFunc("/repos/owner/repo/commits/head/status", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, statuses) })
+	server := httptest.NewServer(mux)
+	client := &Client{cfg: Config{APIBaseURL: server.URL, RepositoryOwner: "owner", RepositoryName: "repo", APIVersion: "2022-11-28"}, http: server.Client(), clock: fixedClock{time.Date(2026, 7, 11, 1, 0, 0, 0, time.UTC)}, token: "token"}
+	return client, server.Close
 }
 
 func replayPRScenario(t *testing.T, name string) {
@@ -299,7 +418,7 @@ func replayCheckScenario(t *testing.T, name string) {
 	}
 	e := domain.GitHubReadEvidence{PullRequest: domain.PullRequest{HeadSHA: "head"}, Checks: checks, UnknownEvents: unknown}
 	got := e.RequiredChecksStatus()
-	want := map[string]domain.ReconciliationStatus{"required_checks_pass": domain.ReconciliationPass, "required_checks_pending": domain.ReconciliationPending, "actionable_check_failure": domain.ReconciliationActionable, "missing_required_check": domain.ReconciliationInfrastructure, "unknown_check_state": domain.ReconciliationInfrastructure}[name]
+	want := map[string]domain.ReconciliationStatus{"required_checks_pass": domain.ReconciliationPass, "required_checks_pending": domain.ReconciliationPending, "actionable_check_failure": domain.ReconciliationActionable, "missing_required_check": domain.ReconciliationPending, "unknown_check_state": domain.ReconciliationInfrastructure}[name]
 	if got != want {
 		t.Fatalf("status=%s want=%s", got, want)
 	}
@@ -342,7 +461,7 @@ func TestLatestCheckRunWinsDeterministically(t *testing.T) {
 		fmt.Fprint(w, `{"contexts":[],"checks":[{"context":"test","app_id":8}]}`)
 	})
 	mux.HandleFunc("/repos/owner/repo/commits/head/check-runs", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"check_runs":[{"id":3,"name":"test","status":"in_progress","conclusion":"","started_at":"2026-07-11T00:04:00Z","completed_at":null,"app":{"id":8}},{"id":2,"name":"test","status":"completed","conclusion":"failure","started_at":"2026-07-11T00:02:00Z","completed_at":"2026-07-11T00:03:00Z","app":{"id":8}},{"id":1,"name":"test","status":"completed","conclusion":"success","started_at":"2026-07-11T00:00:00Z","completed_at":"2026-07-11T00:01:00Z","app":{"id":8}}]}`)
+		fmt.Fprint(w, `{"total_count":3,"check_runs":[{"id":3,"name":"test","status":"in_progress","conclusion":"","started_at":"2026-07-11T00:04:00Z","completed_at":null,"app":{"id":8}},{"id":2,"name":"test","status":"completed","conclusion":"failure","started_at":"2026-07-11T00:02:00Z","completed_at":"2026-07-11T00:03:00Z","app":{"id":8}},{"id":1,"name":"test","status":"completed","conclusion":"success","started_at":"2026-07-11T00:00:00Z","completed_at":"2026-07-11T00:01:00Z","app":{"id":8}}]}`)
 	})
 	mux.HandleFunc("/repos/owner/repo/commits/head/status", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `{"total_count":0,"statuses":[]}`) })
 	srv := httptest.NewServer(mux)
@@ -354,6 +473,58 @@ func TestLatestCheckRunWinsDeterministically(t *testing.T) {
 	}
 	if len(checks) != 1 || checks[0].State != domain.CheckInProgress {
 		t.Fatalf("checks=%+v", checks)
+	}
+}
+
+func TestUnboundRequiredContextAggregatesCheckRunAndCommitStatus(t *testing.T) {
+	tests := []struct {
+		name, protection, checkState, checkConclusion, statusState string
+		wantStatus                                                 domain.ReconciliationStatus
+		wantRequired                                               int
+	}{
+		{"check success status failure", `{"contexts":["test"],"checks":[]}`, "completed", "success", "failure", domain.ReconciliationActionable, 2},
+		{"check failure status success", `{"contexts":["test"],"checks":[]}`, "completed", "failure", "success", domain.ReconciliationActionable, 2},
+		{"check pending status pending", `{"contexts":["test"],"checks":[]}`, "in_progress", "", "pending", domain.ReconciliationPending, 2},
+		{"check pending status success", `{"contexts":["test"],"checks":[]}`, "in_progress", "", "success", domain.ReconciliationPending, 2},
+		{"both success", `{"contexts":["test"],"checks":[]}`, "completed", "success", "success", domain.ReconciliationPass, 2},
+		{"both unknown", `{"contexts":["test"],"checks":[]}`, "completed", "new_state", "new_state", domain.ReconciliationInfrastructure, 2},
+		{"app bound excludes status", `{"contexts":[],"checks":[{"context":"test","app_id":8}]}`, "completed", "success", "failure", domain.ReconciliationPass, 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/repos/owner/repo/branches/main/protection/required_status_checks", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, test.protection) })
+			mux.HandleFunc("/repos/owner/repo/commits/head/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+				fmt.Fprintf(w, `{"total_count":1,"check_runs":[{"id":10,"name":"test","status":%q,"conclusion":%q,"started_at":"2026-07-11T00:00:00Z","completed_at":"2026-07-11T00:01:00Z","app":{"id":8}}]}`, test.checkState, test.checkConclusion)
+			})
+			mux.HandleFunc("/repos/owner/repo/commits/head/status", func(w http.ResponseWriter, _ *http.Request) {
+				fmt.Fprintf(w, `{"total_count":1,"statuses":[{"id":20,"context":"test","state":%q,"updated_at":"2026-07-11T00:02:00Z"}]}`, test.statusState)
+			})
+			server := httptest.NewServer(mux)
+			defer server.Close()
+			client := &Client{cfg: Config{APIBaseURL: server.URL, RepositoryOwner: "owner", RepositoryName: "repo", APIVersion: "2022-11-28", InstallationID: 2}, http: server.Client(), clock: fixedClock{time.Date(2026, 7, 11, 1, 0, 0, 0, time.UTC)}, token: "token"}
+			checks, unknown, err := client.readChecks(context.Background(), "head", "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			required := 0
+			for _, check := range checks {
+				if check.Required {
+					required++
+				}
+			}
+			evidence := domain.GitHubReadEvidence{PullRequest: domain.PullRequest{HeadSHA: "head"}, Checks: checks, UnknownEvents: unknown}
+			if evidence.RequiredChecksStatus() != test.wantStatus || required != test.wantRequired {
+				t.Fatalf("checks=%+v unknown=%v status=%s required=%d", checks, unknown, evidence.RequiredChecksStatus(), required)
+			}
+			if test.wantStatus == domain.ReconciliationInfrastructure && len(unknown) != 2 {
+				t.Fatalf("unknown telemetry=%v", unknown)
+			}
+			checks2, unknown2, err := client.readChecks(context.Background(), "head", "main")
+			if err != nil || !reflect.DeepEqual(checks, checks2) || !reflect.DeepEqual(unknown, unknown2) {
+				t.Fatalf("nondeterministic checks: first=%+v/%v second=%+v/%v err=%v", checks, unknown, checks2, unknown2, err)
+			}
+		})
 	}
 }
 
@@ -601,10 +772,10 @@ func TestReadRejectsReviewThreadTopologyDrift(t *testing.T) {
 		write(w, `{"contexts":["test"],"checks":[]}`)
 	})
 	mux.HandleFunc("/repos/owner/repo/commits/headsha/check-runs", func(w http.ResponseWriter, r *http.Request) {
-		write(w, `{"check_runs":[{"id":1,"name":"test","status":"completed","conclusion":"success","completed_at":"2026-07-11T00:00:00Z","app":{"id":8}}]}`)
+		write(w, `{"total_count":1,"check_runs":[{"id":1,"name":"test","status":"completed","conclusion":"success","completed_at":"2026-07-11T00:00:00Z","app":{"id":8}}]}`)
 	})
 	mux.HandleFunc("/repos/owner/repo/commits/headsha/status", func(w http.ResponseWriter, r *http.Request) {
-		write(w, `{"statuses":[]}`)
+		write(w, `{"total_count":0,"statuses":[]}`)
 	})
 	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
 		var request struct {
@@ -634,6 +805,108 @@ func TestReadRejectsReviewThreadTopologyDrift(t *testing.T) {
 	}
 	if _, err := client.Read(context.Background(), 1, "headsha"); err == nil || !strings.Contains(err.Error(), "review topology drifted") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestReadTreatsCheckTopologyMovementAsExactHeadPending(t *testing.T) {
+	_, key := testKey(t)
+	var checkReads atomic.Int32
+	var protectionReads atomic.Int32
+	var driftProtection atomic.Bool
+	var strictOnlyDrift atomic.Bool
+	var pullRequestReads atomic.Int32
+	var pullRequestLifecycle atomic.Int32
+	mux := http.NewServeMux()
+	write := func(w http.ResponseWriter, body string) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, body)
+	}
+	mux.HandleFunc("/app/installations/2/access_tokens", func(w http.ResponseWriter, _ *http.Request) {
+		write(w, `{"token":"fixture-installation-secret","expires_at":"2026-07-11T01:00:00Z","permissions":{"metadata":"read","contents":"read","pull_requests":"read","checks":"read","statuses":"read","administration":"read"},"repositories":[{"id":99,"name":"repo","owner":{"login":"owner"}}]}`)
+	})
+	mux.HandleFunc("/repos/owner/repo", func(w http.ResponseWriter, _ *http.Request) {
+		write(w, `{"id":99,"node_id":"REPO","name":"repo","owner":{"login":"owner"}}`)
+	})
+	mux.HandleFunc("/repos/owner/repo/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		read := pullRequestReads.Add(1)
+		if read > 1 && pullRequestLifecycle.Load() == 1 {
+			write(w, `{"id":101,"number":1,"html_url":"https://example.invalid/pr/1","node_id":"PR","state":"closed","merged":false,"merge_commit_sha":"synthetic-close-sha","body":"body","head":{"ref":"feature","sha":"headsha","repo":{"id":99}},"base":{"ref":"main","sha":"basesha","repo":{"id":99}}}`)
+			return
+		}
+		if read > 1 && pullRequestLifecycle.Load() == 2 {
+			write(w, `{"id":101,"number":1,"html_url":"https://example.invalid/pr/1","node_id":"PR","state":"closed","merged":true,"merge_commit_sha":"merge-sha","merged_at":"2026-07-11T00:30:00Z","body":"body","head":{"ref":"feature","sha":"headsha","repo":{"id":99}},"base":{"ref":"main","sha":"basesha","repo":{"id":99}}}`)
+			return
+		}
+		write(w, `{"id":101,"number":1,"html_url":"https://example.invalid/pr/1","node_id":"PR","state":"open","merged":false,"body":"body","head":{"ref":"feature","sha":"headsha","repo":{"id":99}},"base":{"ref":"main","sha":"basesha","repo":{"id":99}}}`)
+	})
+	mux.HandleFunc("/repos/owner/repo/branches/main/protection/required_status_checks", func(w http.ResponseWriter, _ *http.Request) {
+		read := protectionReads.Add(1)
+		if driftProtection.Load() && read > 1 {
+			if strictOnlyDrift.Load() {
+				write(w, `{"strict":true,"contexts":["test"],"checks":[]}`)
+				return
+			}
+			write(w, `{"contexts":["lint"],"checks":[]}`)
+			return
+		}
+		write(w, `{"contexts":["test"],"checks":[]}`)
+	})
+	mux.HandleFunc("/repos/owner/repo/commits/headsha/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+		if checkReads.Add(1) == 1 {
+			write(w, `{"total_count":0,"check_runs":[]}`)
+			return
+		}
+		write(w, `{"total_count":1,"check_runs":[{"id":1,"name":"test","status":"in_progress","conclusion":null,"started_at":"2026-07-11T00:00:00Z","completed_at":null,"app":{"id":8}}]}`)
+	})
+	mux.HandleFunc("/repos/owner/repo/commits/headsha/status", func(w http.ResponseWriter, _ *http.Request) { write(w, `{"total_count":0,"statuses":[]}`) })
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Query string `json:"query"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			return
+		}
+		if strings.Contains(request.Query, "reviewThreads") {
+			write(w, `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`)
+			return
+		}
+		write(w, `{"data":{"repository":{"pullRequest":{"reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	cfg := validConfig(key)
+	cfg.APIBaseURL, cfg.GraphQLURL, cfg.RepositoryID = server.URL, server.URL+"/graphql", 99
+	client, err := New(cfg, fixedClock{time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := client.Read(context.Background(), 1, "headsha")
+	if err != nil || !evidence.RequiredChecksWaiting() || len(evidence.Checks) != 1 || evidence.Checks[0].State != domain.CheckInProgress {
+		t.Fatalf("evidence=%+v err=%v", evidence, err)
+	}
+	for _, lifecycle := range []int32{1, 2} {
+		pullRequestLifecycle.Store(lifecycle)
+		pullRequestReads.Store(0)
+		protectionReads.Store(0)
+		checkReads.Store(0)
+		if _, err := client.Read(context.Background(), 1, "headsha"); err == nil || !strings.Contains(err.Error(), "pull request drifted") {
+			t.Fatalf("lifecycle=%d err=%v", lifecycle, err)
+		}
+	}
+	pullRequestLifecycle.Store(0)
+	pullRequestReads.Store(0)
+	driftProtection.Store(true)
+	protectionReads.Store(0)
+	checkReads.Store(0)
+	if _, err := client.Read(context.Background(), 1, "headsha"); err == nil || !strings.Contains(err.Error(), "required check protection drifted") {
+		t.Fatalf("protection drift err=%v", err)
+	}
+	strictOnlyDrift.Store(true)
+	protectionReads.Store(0)
+	checkReads.Store(0)
+	if _, err := client.Read(context.Background(), 1, "headsha"); err == nil || !strings.Contains(err.Error(), "required check protection drifted") {
+		t.Fatalf("strict-only protection drift err=%v", err)
 	}
 }
 
@@ -774,10 +1047,10 @@ func fixtureServer(t *testing.T, mint *atomic.Int32, always401 bool) *httptest.S
 		write(w, `{"id":101,"number":1,"html_url":"https://example.invalid/pr/1","node_id":"PR","state":"open","merged":false,"body":"body","head":{"ref":"feature","sha":"headsha","repo":{"id":99}},"base":{"ref":"main","sha":"basesha","repo":{"id":99}}}`)
 	})
 	mux.HandleFunc("/repos/owner/repo/commits/headsha/check-runs", func(w http.ResponseWriter, r *http.Request) {
-		write(w, `{"check_runs":[{"id":1,"name":"test","status":"completed","conclusion":"success","completed_at":"2026-07-11T00:00:00Z","app":{"id":8}}]}`)
+		write(w, `{"total_count":1,"check_runs":[{"id":1,"name":"test","status":"completed","conclusion":"success","completed_at":"2026-07-11T00:00:00Z","app":{"id":8}}]}`)
 	})
 	mux.HandleFunc("/repos/owner/repo/branches/main/protection/required_status_checks", func(w http.ResponseWriter, r *http.Request) { write(w, `{"contexts":["test"],"checks":[]}`) })
-	mux.HandleFunc("/repos/owner/repo/commits/headsha/status", func(w http.ResponseWriter, r *http.Request) { write(w, `{"statuses":[]}`) })
+	mux.HandleFunc("/repos/owner/repo/commits/headsha/status", func(w http.ResponseWriter, r *http.Request) { write(w, `{"total_count":0,"statuses":[]}`) })
 	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
 		var request struct {
 			Query string `json:"query"`

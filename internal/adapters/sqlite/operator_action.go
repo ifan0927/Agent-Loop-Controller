@@ -2,7 +2,10 @@ package sqlite
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -47,6 +50,7 @@ func (s *Store) BeginOperatorAction(ctx context.Context, record application.Oper
 			AND CASE ?
 				WHEN 'retry' THEN allowed_actions_json='["retry","abandon"]'
 				WHEN 'abandon' THEN allowed_actions_json IN ('["retry","abandon"]','["abandon"]')
+				WHEN 'recover_ci_wait' THEN allowed_actions_json='["recover_ci_wait"]'
 				ELSE 0
 			END
 		)
@@ -94,6 +98,95 @@ func (s *Store) ApplyOperatorRetry(ctx context.Context, request application.Oper
 			return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
 		}
 	}
+}
+
+func (s *Store) ApplyCIWaitRecovery(ctx context.Context, request application.CIWaitRecoveryApply) (application.OperatorActionRecord, application.RetrySchedule, bool, error) {
+	if request.ActionID == "" || request.Phase == "" || request.ExpectedAttempt < 1 || request.AppliedAt.IsZero() || !validOperatorActionDigest(request.EvidenceDigest) || request.GitHubEvidence.PullRequest.HeadSHA == "" || request.Metadata.InstallationID < 1 || len(request.Observations) == 0 {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, errors.New("CI wait recovery apply input is invalid")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+	}
+	defer tx.Rollback()
+	action, found, err := getOperatorActionByIDTx(ctx, tx, request.ActionID)
+	if err != nil || !found {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, errors.New("CI wait recovery action was not found")
+	}
+	schedule, scheduleFound, err := retryScheduleTx(ctx, tx, action.RunID, request.Phase)
+	if err != nil || !scheduleFound {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, errors.New("CI wait recovery schedule was not found")
+	}
+	if action.Status == application.OperatorActionStatusApplied || action.Status == application.OperatorActionStatusObserved {
+		return action, schedule, false, tx.Commit()
+	}
+	if action.Status != application.OperatorActionStatusValidated || action.ActionType != application.OperatorActionRecoverCIWait || schedule.Status != application.RetryScheduleAttention || schedule.AttemptCount != request.ExpectedAttempt || schedule.ControllerState != string(action.ExpectedState) || schedule.FailureClass != application.RetryFailureTerminal || schedule.ReasonCode != application.RetryReasonTerminal {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, errors.New("CI wait recovery authority conflicts")
+	}
+	var state string
+	var sequence int64
+	if err := tx.QueryRowContext(ctx, `SELECT current_state,(SELECT COALESCE(MAX(sequence),0) FROM transitions WHERE run_id=runs.run_id) FROM runs WHERE run_id=?`, action.RunID).Scan(&state, &sequence); err != nil || state != string(action.ExpectedState) || sequence != action.TransitionSequence {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, errors.New("CI wait recovery run authority conflicts")
+	}
+	if err := validatePersistedGitHubReadAuthority(ctx, tx, action.RunID, request.Metadata, request.GitHubEvidence, request.Observations, false); err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+	}
+	rawEvidence, err := json.Marshal(request.GitHubEvidence)
+	if err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+	}
+	evidenceSum := sha256.Sum256(rawEvidence)
+	for _, observation := range request.Observations {
+		if observation.RunID != action.RunID {
+			return application.OperatorActionRecord{}, application.RetrySchedule{}, false, errors.New("CI wait recovery observation run mismatch")
+		}
+		if _, err := tx.ExecContext(ctx, githubRequestInsert, githubRequestArgs(observation)...); err != nil {
+			return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+		}
+	}
+	metadata := request.Metadata
+	if _, err := tx.ExecContext(ctx, `INSERT INTO github_installations(run_id,app_id,installation_id,repository_id,repository_node_id,repository_owner,repository_name,token_expires_at,permissions_digest,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,app_id,installation_id,repository_id,token_expires_at,permissions_digest) DO NOTHING`, action.RunID, metadata.AppID, metadata.InstallationID, metadata.Repository.ID, metadata.Repository.NodeID, metadata.Repository.Owner, metadata.Repository.Name, formatTime(metadata.TokenExpiresAt), metadata.PermissionsDigest, formatTime(metadata.ObservedAt)); err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO github_read_evidence(run_id,head_sha,repository_id,evidence_json,evidence_digest,observed_at) VALUES(?,?,?,?,?,?) ON CONFLICT(run_id,head_sha,evidence_digest) DO NOTHING`, action.RunID, request.GitHubEvidence.PullRequest.HeadSHA, request.GitHubEvidence.Repository.ID, string(rawEvidence), hex.EncodeToString(evidenceSum[:]), formatTime(request.GitHubEvidence.ObservedAt)); err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+	}
+	var currentEvent string
+	if err := tx.QueryRowContext(ctx, `SELECT event_key FROM operator_attention_outbox WHERE run_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1`, action.RunID).Scan(&currentEvent); err != nil || currentEvent != action.AttentionEventKey {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, errors.New("CI wait recovery attention authority conflicts")
+	}
+	update, err := tx.ExecContext(ctx, `UPDATE automatic_retry_schedules SET status='superseded',next_eligible_at='',next_eligible_unix_ns=0,updated_at=? WHERE run_id=? AND phase=? AND controller_state=? AND attempt_count=? AND status='attention' AND failure_class='terminal_failure' AND reason_code='terminal_failure'`, formatTime(request.AppliedAt), action.RunID, request.Phase, state, request.ExpectedAttempt)
+	if err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+	}
+	if changed, _ := update.RowsAffected(); changed != 1 {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, errors.New("CI wait recovery schedule compare-and-swap lost")
+	}
+	update, err = tx.ExecContext(ctx, `UPDATE operator_actions SET status='applied',result_status='applied',resulting_state=?,resulting_transition_sequence=?,evidence_digest=?,applied_at=? WHERE action_id=? AND status='validated'`, state, sequence, request.EvidenceDigest, formatTime(request.AppliedAt), action.ActionID)
+	if err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+	}
+	if changed, _ := update.RowsAffected(); changed != 1 {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, errors.New("CI wait recovery action compare-and-swap lost")
+	}
+	action, _, err = getOperatorActionByIDTx(ctx, tx, action.ActionID)
+	if err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+	}
+	schedule, _, err = retryScheduleTx(ctx, tx, action.RunID, request.Phase)
+	if err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+	}
+	if err := application.ValidateOperatorActionRecord(action); err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+	}
+	if err := application.ValidateRetrySchedule(schedule); err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+	}
+	return action, schedule, true, nil
 }
 
 func (s *Store) applyOperatorRetryOnce(ctx context.Context, request application.OperatorRetryApply) (application.OperatorActionRecord, application.RetrySchedule, bool, error) {

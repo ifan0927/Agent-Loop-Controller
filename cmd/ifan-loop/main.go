@@ -68,7 +68,7 @@ func main() {
 
 func controller(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: ifan-loop controller <start|run|drive|worker|launchagent|status|inspect|continue|retry|recover-owned-push|accept-external-merge|abandon|push|open-pr|reconcile|merge|reconcile-linear|cleanup> ...")
+		return errors.New("usage: ifan-loop controller <start|run|drive|worker|launchagent|status|inspect|continue|retry|recover-ci-wait|recover-owned-push|accept-external-merge|abandon|push|open-pr|reconcile|merge|reconcile-linear|cleanup> ...")
 	}
 	switch args[0] {
 	case "start":
@@ -87,6 +87,8 @@ func controller(args []string) error {
 		return controllerContinue(args[1:])
 	case "retry":
 		return controllerRetry(args[1:])
+	case "recover-ci-wait":
+		return controllerRecoverCIWait(args[1:])
 	case "recover-owned-push":
 		return controllerRecoverOwnedPush(args[1:])
 	case "accept-external-merge":
@@ -367,6 +369,7 @@ func driveProductionRun(ctx context.Context, loaded bootstrap.Bootstrap, store *
 	if err := json.Unmarshal([]byte(run.RepositoryConfigJSON), &repository); err != nil {
 		return application.ProductionDriveResult{}, application.ClassifyError(errors.New("persisted repository authority is invalid"))
 	}
+	policy.CISlowThreshold = repository.CISlowThreshold
 	validator := newLocalController(store, loaded.Controller.CodexBinary, filepath.Dir(run.WorktreePath))
 	github := githubReadAdapter{client: readClient, observations: &observations}
 	driver, err := application.NewProductionDriver(coordinator, store, store, store, application.ProductionDriverPorts{
@@ -1181,7 +1184,7 @@ func localRepository(repo localregistry.Binding) application.LocalRepository {
 		OriginPath: repo.OriginPath, SourcePath: repo.SourcePath, RunRoot: repo.RunRoot, WorktreeRoot: repo.WorktreeRoot,
 		BaseBranch: repo.BaseBranch, VerifierRegistryRef: repo.VerifierRegistryRef, VerifierIDs: append([]string(nil), repo.VerifierIDs...),
 		GitHubAppProfileRef: repo.GitHubAppProfileRef, GitHubAppID: repo.GitHubAppID, GitHubInstallationID: repo.GitHubInstallationID,
-		ExpectedRepositoryID: repo.ExpectedRepositoryID, AllowedOperatorLogins: append([]string(nil), repo.OperatorIdentityPolicy.AllowedLogins...),
+		ExpectedRepositoryID: repo.ExpectedRepositoryID, CISlowThreshold: repo.CISlowThreshold, AllowedOperatorLogins: append([]string(nil), repo.OperatorIdentityPolicy.AllowedLogins...),
 		TrustedOperatorActors: applicationActors(repo.OperatorIdentityPolicy.TrustedActors)}
 }
 
@@ -1193,7 +1196,7 @@ func localBinding(repo application.LocalRepository) localregistry.Binding {
 		OriginPath: repo.OriginPath, SourcePath: repo.SourcePath, RunRoot: repo.RunRoot, WorktreeRoot: repo.WorktreeRoot,
 		BaseBranch: repo.BaseBranch, VerifierRegistryRef: repo.VerifierRegistryRef, VerifierIDs: append([]string(nil), repo.VerifierIDs...),
 		GitHubAppProfileRef: repo.GitHubAppProfileRef, GitHubAppID: repo.GitHubAppID, GitHubInstallationID: repo.GitHubInstallationID,
-		ExpectedRepositoryID:   repo.ExpectedRepositoryID,
+		ExpectedRepositoryID: repo.ExpectedRepositoryID, CISlowThreshold: repo.CISlowThreshold,
 		OperatorIdentityPolicy: localregistry.OperatorIdentityPolicy{AllowedLogins: append([]string(nil), repo.AllowedOperatorLogins...), TrustedActors: registryActors(repo.TrustedOperatorActors)}}
 }
 

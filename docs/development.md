@@ -299,7 +299,7 @@ that bypass safety solely to make fault injection easier.
 ## Database Migrations
 
 SQLite migrations are ordered in `internal/adapters/sqlite/store.go`; the current
-schema version is 22. Opening a database applies missing forward migrations in a
+schema version is 28. Opening a database applies missing forward migrations in a
 transaction. A database newer than the binary fails closed.
 
 When adding a migration:
@@ -312,6 +312,14 @@ When adding a migration:
    responsibility or invariant changes. Do not add migration-by-migration
    history to human docs.
 5. Do not provide manual SQL as an operator recovery procedure.
+
+CI wait tests distinguish required-check startup from review/approval waiting:
+absent -> queued -> in-progress -> success retains one exact-head first-seen
+timestamp across restart, emits at most one slow warning, and closes without a
+warning when checks are already green. Compatibility-recovery tests use the
+exact pre-fix sanitized operation sequence and reject shortened, extended,
+reordered, non-2xx, authority-drifted, or response-digest-fingerprint-drifted
+traces.
 
 ## Adding a New State
 

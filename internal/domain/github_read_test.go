@@ -19,6 +19,54 @@ func TestRequiredChecksFailClosed(t *testing.T) {
 	if got := base.RequiredChecksStatus(); got != ReconciliationInfrastructure {
 		t.Fatalf("missing got %s", got)
 	}
+	base.UnknownEvents = []string{"missing_required_check:test"}
+	if !base.RequiredChecksWaiting() {
+		t.Fatal("missing required check was not recognized as workflow-start wait")
+	}
+}
+
+func TestRequiredChecksAggregateIsOrderIndependent(t *testing.T) {
+	base := GitHubReadEvidence{PullRequest: PullRequest{HeadSHA: "head"}}
+	success := GitHubCheck{Name: "success", Required: true, ObservedSHA: "head", State: CheckSuccess}
+	queued := GitHubCheck{Name: "queued", Required: true, ObservedSHA: "head", State: CheckQueued}
+	failed := GitHubCheck{Name: "failed", Required: true, ObservedSHA: "head", State: CheckFailure}
+
+	missing := base
+	missing.Checks = []GitHubCheck{success}
+	missing.UnknownEvents = []string{"missing_required_check:lint"}
+	if missing.RequiredChecksStatus() != ReconciliationPending || !missing.RequiredChecksWaiting() {
+		t.Fatalf("success plus missing status=%s waiting=%v", missing.RequiredChecksStatus(), missing.RequiredChecksWaiting())
+	}
+	for _, checks := range [][]GitHubCheck{{queued, failed}, {failed, queued}} {
+		evidence := base
+		evidence.Checks = checks
+		if evidence.RequiredChecksStatus() != ReconciliationActionable || evidence.RequiredChecksWaiting() {
+			t.Fatalf("checks=%v status=%s waiting=%v", checks, evidence.RequiredChecksStatus(), evidence.RequiredChecksWaiting())
+		}
+	}
+	wrongSHA := failed
+	wrongSHA.ObservedSHA = "other"
+	stale := GitHubCheck{Name: "stale", Required: true, ObservedSHA: "head", State: CheckStale}
+	for _, checks := range [][]GitHubCheck{{failed, wrongSHA}, {wrongSHA, failed}, {failed, stale}, {stale, failed}} {
+		evidence := base
+		evidence.Checks = checks
+		if evidence.RequiredChecksStatus() != ReconciliationInfrastructure || evidence.RequiredChecksWaiting() {
+			t.Fatalf("incomplete permutation=%v status=%s waiting=%v", checks, evidence.RequiredChecksStatus(), evidence.RequiredChecksWaiting())
+		}
+	}
+	for _, checks := range [][]GitHubCheck{{failed, queued}, {queued, failed}} {
+		evidence := base
+		evidence.Checks = checks
+		evidence.UnknownEvents = []string{"future_check_event"}
+		if evidence.RequiredChecksStatus() != ReconciliationInfrastructure {
+			t.Fatalf("unknown permutation=%v status=%s", checks, evidence.RequiredChecksStatus())
+		}
+	}
+	unknown := missing
+	unknown.UnknownEvents = append(unknown.UnknownEvents, "future_check_event")
+	if unknown.RequiredChecksStatus() != ReconciliationInfrastructure || unknown.RequiredChecksWaiting() {
+		t.Fatalf("unknown telemetry status=%s waiting=%v", unknown.RequiredChecksStatus(), unknown.RequiredChecksWaiting())
+	}
 }
 
 func TestDeliveryStatusRequiresOpenPRAndExactRequiredChecks(t *testing.T) {

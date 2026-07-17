@@ -58,6 +58,7 @@ type ProductionDriverPorts struct {
 type ProductionDriverPolicy struct {
 	PollInterval       time.Duration
 	MaxImmediateAction int
+	CISlowThreshold    time.Duration
 }
 
 func (p ProductionDriverPolicy) validate() error {
@@ -67,7 +68,15 @@ func (p ProductionDriverPolicy) validate() error {
 	if p.MaxImmediateAction < 1 {
 		return errors.New("production driver immediate action limit must be positive")
 	}
+	if p.CISlowThreshold != 0 && (p.CISlowThreshold < time.Minute || p.CISlowThreshold > 24*time.Hour) {
+		return errors.New("production driver CI slow threshold must be between 1m and 24h")
+	}
 	return nil
+}
+
+type CIWaitEvidenceStore interface {
+	ObserveCIWait(context.Context, string, int64, string, string, time.Duration, time.Time, time.Time) (CIWaitEvidence, error)
+	CloseCIWaits(context.Context, string, time.Time) error
 }
 
 // ProductionWait is injected so tests and future schedulers control waiting
@@ -105,6 +114,7 @@ type ProductionDriver struct {
 	ports       ProductionDriverPorts
 	policy      ProductionDriverPolicy
 	wait        ProductionWait
+	now         func() time.Time
 }
 
 func NewProductionDriver(coordinator ProductionDriverCoordinator, runs ProductionRunReader, attention ProductionAttentionEvidenceReader, publisher OperatorAttentionPublisher, ports ProductionDriverPorts, policy ProductionDriverPolicy, wait ProductionWait) (*ProductionDriver, error) {
@@ -117,7 +127,10 @@ func NewProductionDriver(coordinator ProductionDriverCoordinator, runs Productio
 	if wait == nil {
 		wait = waitForProductionPoll
 	}
-	return &ProductionDriver{coordinator: coordinator, runs: runs, attention: attention, publisher: publisher, ports: ports, policy: policy, wait: wait}, nil
+	if policy.CISlowThreshold == 0 {
+		policy.CISlowThreshold = 20 * time.Minute
+	}
+	return &ProductionDriver{coordinator: coordinator, runs: runs, attention: attention, publisher: publisher, ports: ports, policy: policy, wait: wait, now: func() time.Time { return time.Now().UTC() }}, nil
 }
 
 func waitForProductionPoll(ctx context.Context, interval time.Duration) error {
@@ -155,6 +168,12 @@ func (d *ProductionDriver) Drive(ctx context.Context, command ProductionDriveCom
 		if err := authorizePersistedRequester(run, command.Requester); err != nil {
 			return ProductionDriveResult{}, err
 		}
+		// Reconcile wait evidence before every dispatch decision, including a
+		// durable stop. This closes a residual wait after a crash that happened
+		// between a state transition and the prior loop's post-action close.
+		if waitErr := d.reconcileCIWait(ctx, command.RunID); waitErr != nil {
+			return ProductionDriveResult{}, classifyServiceError(waitErr)
+		}
 
 		if run.State == domain.StateAwaitingHumanDecision {
 			return d.stop(ctx, run, ProductionStop, "durable human decision is required", actions)
@@ -172,16 +191,25 @@ func (d *ProductionDriver) Drive(ctx context.Context, command ProductionDriveCom
 		}
 		immediate++
 		actions++
-
 		poll, err := d.apply(ctx, command, run, action)
 		if err != nil {
 			if !retryableProductionDriverError(err) {
+				if action == ProductionReconcileGitHub {
+					if closeErr := d.closeCIWait(ctx, command.RunID); closeErr != nil {
+						return ProductionDriveResult{}, classifyServiceError(closeErr)
+					}
+				}
 				if result, stopped, stopErr := d.durableStop(ctx, command, actions); stopped {
 					return result, stopErr
 				}
 				return ProductionDriveResult{}, err
 			}
 			poll = true
+		}
+		if err == nil && action == ProductionReconcileGitHub {
+			if waitErr := d.reconcileCIWait(ctx, command.RunID); waitErr != nil {
+				return ProductionDriveResult{}, classifyServiceError(waitErr)
+			}
 		}
 		if !poll {
 			continue
@@ -194,6 +222,42 @@ func (d *ProductionDriver) Drive(ctx context.Context, command ProductionDriveCom
 		// ever becoming a busy loop.
 		immediate = 0
 	}
+}
+
+func (d *ProductionDriver) reconcileCIWait(ctx context.Context, runID string) error {
+	store, ok := d.publisher.(CIWaitEvidenceStore)
+	if !ok {
+		return nil
+	}
+	inspection, err := d.attention.Inspect(ctx, runID)
+	if err != nil {
+		return err
+	}
+	run := inspection.Run
+	if run.State != domain.StateReconcilingReviews || inspection.PullRequest == nil || inspection.GitHubEvidence == nil || inspection.GitHubEvidence.PullRequest.HeadSHA != run.CandidateHead || !inspection.GitHubEvidence.RequiredChecksWaiting() {
+		return store.CloseCIWaits(ctx, run.ID, d.now())
+	}
+	// The persisted GitHub observation is the deterministic crash/restart
+	// anchor. A crash after evidence persistence but before this upsert cannot
+	// reset the wait to a later wall-clock time.
+	wait, err := store.ObserveCIWait(ctx, run.ID, inspection.PullRequest.Number, run.CandidateHead, run.ProfileDigest, d.policy.CISlowThreshold, inspection.GitHubEvidence.ObservedAt, d.now())
+	if err != nil || wait.WarningAt.IsZero() {
+		return err
+	}
+	event, err := CISlowAttentionEvent(run, wait)
+	if err != nil {
+		return err
+	}
+	_, err = d.publisher.AppendOperatorAttention(ctx, event)
+	return err
+}
+
+func (d *ProductionDriver) closeCIWait(ctx context.Context, runID string) error {
+	store, ok := d.publisher.(CIWaitEvidenceStore)
+	if !ok {
+		return nil
+	}
+	return store.CloseCIWaits(ctx, runID, d.now())
 }
 
 // durableStop turns an action that persisted a manual/terminal transition into

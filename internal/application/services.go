@@ -179,7 +179,15 @@ func samePersistedProfile(run Run, current LocalRepository) bool {
 	return run.ProfileID == current.ProfileID && run.ProfileSnapshotVersion == current.ProfileSnapshotVersion &&
 		run.ProfileDigest == current.ProfileDigest && run.ProfileSnapshotJSON == current.ProfileSnapshotJSON &&
 		persisted.OriginPath == current.OriginPath && persisted.SourcePath == current.SourcePath &&
-		persisted.RunRoot == current.RunRoot && persisted.WorktreeRoot == current.WorktreeRoot
+		persisted.RunRoot == current.RunRoot && persisted.WorktreeRoot == current.WorktreeRoot &&
+		effectiveLocalCISlowThreshold(persisted.CISlowThreshold) == effectiveLocalCISlowThreshold(current.CISlowThreshold)
+}
+
+func effectiveLocalCISlowThreshold(value time.Duration) time.Duration {
+	if value == 0 {
+		return 20 * time.Minute
+	}
+	return value
 }
 
 func (s CommandService) Continue(ctx context.Context, command ContinueCommand) (CommandResult, error) {

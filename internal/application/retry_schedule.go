@@ -19,8 +19,9 @@ import (
 type RetryScheduleStatus string
 
 const (
-	RetryScheduleScheduled RetryScheduleStatus = "scheduled"
-	RetryScheduleAttention RetryScheduleStatus = "attention"
+	RetryScheduleScheduled  RetryScheduleStatus = "scheduled"
+	RetryScheduleAttention  RetryScheduleStatus = "attention"
+	RetryScheduleSuperseded RetryScheduleStatus = "superseded"
 )
 
 // RetryFailureClass is controller-owned classification, never a raw process
@@ -183,8 +184,14 @@ func ValidateRetryFailureRequest(r RetryFailureRequest) error {
 }
 
 func (s RetrySchedule) validate() error {
-	if !validateRetryKey(s.RunID) || !validateRetryKey(s.Phase) || !validRetryControllerState(domain.State(s.ControllerState)) || s.AttemptCount < 1 || s.MaxAttempts < 1 || s.MaxAttempts > 10 || s.InitialDelay <= 0 || s.MaximumDelay < s.InitialDelay || s.MaximumDelay > 24*time.Hour || !validRetryFailureClass(s.FailureClass) || !validRetryReasonCode(s.ReasonCode) || (s.Status != RetryScheduleScheduled && s.Status != RetryScheduleAttention) || s.CreatedAt.IsZero() || s.UpdatedAt.IsZero() || s.UpdatedAt.Before(s.CreatedAt) {
+	if !validateRetryKey(s.RunID) || !validateRetryKey(s.Phase) || !validRetryControllerState(domain.State(s.ControllerState)) || s.AttemptCount < 1 || s.MaxAttempts < 1 || s.MaxAttempts > 10 || s.InitialDelay <= 0 || s.MaximumDelay < s.InitialDelay || s.MaximumDelay > 24*time.Hour || !validRetryFailureClass(s.FailureClass) || !validRetryReasonCode(s.ReasonCode) || (s.Status != RetryScheduleScheduled && s.Status != RetryScheduleAttention && s.Status != RetryScheduleSuperseded) || s.CreatedAt.IsZero() || s.UpdatedAt.IsZero() || s.UpdatedAt.Before(s.CreatedAt) {
 		return errors.New("automatic retry schedule is invalid")
+	}
+	if s.Status == RetryScheduleSuperseded {
+		if !s.NextEligibleAt.IsZero() || s.AttentionAt.IsZero() {
+			return errors.New("superseded retry evidence is incomplete")
+		}
+		return nil
 	}
 	if s.ReasonCode == RetryReasonBudgetExhausted {
 		if s.Status != RetryScheduleAttention || s.AttemptCount <= s.MaxAttempts || !retryFailureIsRetryable(s.FailureClass) {

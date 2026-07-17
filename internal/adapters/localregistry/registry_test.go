@@ -7,7 +7,80 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestDefaultCISlowThresholdPreservesLegacyVersionOneDigests(t *testing.T) {
+	root := t.TempDir()
+	repo := fixtureRepository(t, root, "owner", "repo", 101)
+	registry := loadFixture(t, root, File{Version: CurrentVersion, Repositories: []Repository{repo}})
+	binding, err := registry.Resolve("owner/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyProfile := struct {
+		Version                int                    `json:"version"`
+		ProfileID              string                 `json:"profile_id"`
+		CanonicalRepository    string                 `json:"canonical_repository"`
+		LinearLabel            string                 `json:"linear_label"`
+		BaseBranch             string                 `json:"base_branch"`
+		VerifierRegistryRef    string                 `json:"verifier_registry_ref"`
+		VerifierIDs            []string               `json:"verifier_ids"`
+		GitHubAppProfileRef    string                 `json:"github_app_profile_ref"`
+		GitHubAppID            int64                  `json:"github_app_id"`
+		GitHubInstallationID   int64                  `json:"github_installation_id"`
+		ExpectedRepositoryID   int64                  `json:"expected_repository_id"`
+		OperatorIdentityPolicy OperatorIdentityPolicy `json:"operator_identity_policy"`
+	}{CurrentVersion, binding.ProfileID, binding.CanonicalRepository, binding.LinearLabel, binding.BaseBranch, binding.VerifierRegistryRef, binding.VerifierIDs, binding.GitHubAppProfileRef, binding.GitHubAppID, binding.GitHubInstallationID, binding.ExpectedRepositoryID, binding.OperatorIdentityPolicy}
+	legacyProfileRaw, _ := json.Marshal(legacyProfile)
+	if binding.ProfileSnapshotJSON != string(legacyProfileRaw) || binding.ProfileDigest != digest(legacyProfileRaw) {
+		t.Fatalf("legacy profile digest changed: snapshot=%s", binding.ProfileSnapshotJSON)
+	}
+	type legacyRepository struct {
+		Owner                  string                 `json:"owner"`
+		Name                   string                 `json:"name"`
+		LinearLabel            string                 `json:"linear_label,omitempty"`
+		OriginURL              string                 `json:"origin_url,omitempty"`
+		OriginPath             string                 `json:"origin_path"`
+		SourcePath             string                 `json:"source_path"`
+		RunRoot                string                 `json:"run_root"`
+		WorktreeRoot           string                 `json:"worktree_root"`
+		BaseBranch             string                 `json:"base_branch"`
+		VerifierRegistryRef    string                 `json:"verifier_registry_ref"`
+		VerifierIDs            []string               `json:"verifier_ids"`
+		GitHubAppProfileRef    string                 `json:"github_app_profile_ref"`
+		GitHubAppID            int64                  `json:"github_app_id"`
+		GitHubInstallationID   int64                  `json:"github_installation_id"`
+		ExpectedRepositoryID   int64                  `json:"expected_repository_id"`
+		OperatorIdentityPolicy OperatorIdentityPolicy `json:"operator_identity_policy"`
+	}
+	legacy := legacyRepository{repo.Owner, repo.Name, repo.LinearLabel, "", binding.OriginPath, binding.SourcePath, binding.RunRoot, binding.WorktreeRoot, binding.BaseBranch, binding.VerifierRegistryRef, binding.VerifierIDs, binding.GitHubAppProfileRef, binding.GitHubAppID, binding.GitHubInstallationID, binding.ExpectedRepositoryID, binding.OperatorIdentityPolicy}
+	legacyBindingRaw, _ := json.Marshal(struct {
+		RegistryVersion int              `json:"registry_version"`
+		Repository      legacyRepository `json:"repository"`
+	}{CurrentVersion, legacy})
+	if binding.RepositoryBindingDigest != digest(legacyBindingRaw) || binding.CISlowThreshold != 20*time.Minute {
+		t.Fatalf("legacy binding digest/default mismatch: digest=%s threshold=%s", binding.RepositoryBindingDigest, binding.CISlowThreshold)
+	}
+}
+
+func TestRegistryValidatesExplicitCISlowThreshold(t *testing.T) {
+	root := t.TempDir()
+	repo := fixtureRepository(t, root, "owner", "repo", 101)
+	repo.CISlowThreshold = "45m"
+	registry := loadFixture(t, root, File{Version: CurrentVersion, Repositories: []Repository{repo}})
+	binding, err := registry.Resolve("owner/repo")
+	if err != nil || binding.CISlowThreshold != 45*time.Minute || !strings.Contains(binding.ProfileSnapshotJSON, `"ci_slow_threshold":"45m0s"`) {
+		t.Fatalf("binding=%+v err=%v", binding.Sanitized(), err)
+	}
+	for _, invalid := range []string{"invalid", "59s", "25h"} {
+		value := repo
+		value.CISlowThreshold = invalid
+		if _, err := New([]Repository{value}); err == nil {
+			t.Fatalf("invalid threshold %q accepted", invalid)
+		}
+	}
+}
 
 func TestRegistrySelectsTwoRepositoriesDeterministically(t *testing.T) {
 	root := t.TempDir()
@@ -88,6 +161,16 @@ func TestRegistryRejectsSymlinkAmbiguityAndAuthorityDrift(t *testing.T) {
 	repo := fixtureRepository(t, root, "owner", "repo", 101)
 	registry := loadFixture(t, root, File{Version: 1, Repositories: []Repository{repo}})
 	persisted, _ := registry.Resolve("owner/repo")
+	legacyThreshold := persisted
+	legacyThreshold.CISlowThreshold = 0
+	if err := registry.VerifyPersisted(legacyThreshold); err != nil {
+		t.Fatalf("legacy omitted CI threshold was rejected: %v", err)
+	}
+	tamperedThreshold := persisted
+	tamperedThreshold.CISlowThreshold = 45 * time.Minute
+	if err := registry.VerifyPersisted(tamperedThreshold); err == nil {
+		t.Fatal("tampered CI slow threshold was accepted")
+	}
 
 	repo.ExpectedRepositoryID = 202
 	drifted := loadFixtureAt(t, filepath.Join(root, "drift.json"), File{Version: 1, Repositories: []Repository{repo}})

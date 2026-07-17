@@ -21,7 +21,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 27
+const schemaVersion = 28
 
 type Store struct{ db *sql.DB }
 
@@ -144,8 +144,15 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV26
 		case 27:
 			statements = migrationV27
+		case 28:
+			statements = migrationV28
 		default:
 			return fmt.Errorf("missing migration version %d", version)
+		}
+		if version == 28 {
+			if err := ensureOperatorAttentionRetryFailureClassTx(ctx, tx); err != nil {
+				return err
+			}
 		}
 		for _, statement := range statements {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -159,6 +166,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 		if version == 23 {
 			if err := migrateOperatorAttentionV23Tx(ctx, tx); err != nil {
+				return err
+			}
+		}
+		if version == 28 {
+			if err := migrateOperatorAttentionV28Tx(ctx, tx); err != nil {
 				return err
 			}
 		}
@@ -227,6 +239,48 @@ var migrationV2 = []string{
 
 var migrationV27 = []string{
 	`ALTER TABLE attempts ADD COLUMN process_control_key TEXT NOT NULL DEFAULT ''`,
+}
+
+var migrationV28 = []string{
+	`ALTER TABLE operator_actions RENAME TO operator_actions_v27`,
+	`DROP INDEX operator_actions_run`,
+	`CREATE TABLE operator_actions (
+		action_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, payload_digest TEXT NOT NULL,
+		run_id TEXT NOT NULL REFERENCES runs(run_id), repository TEXT NOT NULL, expected_state TEXT NOT NULL,
+		run_idempotency_key TEXT NOT NULL, transition_sequence INTEGER NOT NULL,
+		action_type TEXT NOT NULL CHECK(action_type IN ('retry','abandon','recover_ci_wait')),
+		requester_login TEXT NOT NULL, requester_database_id INTEGER NOT NULL, requester_node_id TEXT NOT NULL,
+		requester_actor_type TEXT NOT NULL, reason_code TEXT NOT NULL, attention_event_key TEXT NOT NULL,
+		status TEXT NOT NULL CHECK(status IN ('validated','applied','observed')),
+		result_status TEXT NOT NULL CHECK(result_status IN ('pending','applied','succeeded','failed','ambiguous')),
+		resulting_state TEXT NOT NULL DEFAULT '', resulting_transition_sequence INTEGER NOT NULL DEFAULT 0,
+		evidence_digest TEXT NOT NULL DEFAULT '', outcome_digest TEXT NOT NULL DEFAULT '', received_at TEXT NOT NULL,
+		validated_at TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT '', observed_at TEXT NOT NULL DEFAULT '',
+		next_eligible_at TEXT NOT NULL DEFAULT '', UNIQUE(run_id,transition_sequence,attention_event_key))`,
+	`INSERT INTO operator_actions(action_id,idempotency_key,payload_digest,run_id,repository,expected_state,run_idempotency_key,transition_sequence,action_type,requester_login,requester_database_id,requester_node_id,requester_actor_type,reason_code,attention_event_key,status,result_status,resulting_state,resulting_transition_sequence,evidence_digest,outcome_digest,received_at,validated_at,applied_at,observed_at,next_eligible_at)
+		SELECT action_id,idempotency_key,payload_digest,run_id,repository,expected_state,run_idempotency_key,transition_sequence,action_type,requester_login,requester_database_id,requester_node_id,requester_actor_type,reason_code,attention_event_key,status,result_status,resulting_state,resulting_transition_sequence,evidence_digest,outcome_digest,received_at,validated_at,applied_at,observed_at,next_eligible_at FROM operator_actions_v27`,
+	`DROP TABLE operator_actions_v27`,
+	`CREATE INDEX operator_actions_run ON operator_actions(run_id,transition_sequence,action_id)`,
+	`ALTER TABLE automatic_retry_schedules RENAME TO automatic_retry_schedules_v27`,
+	`DROP INDEX automatic_retry_schedules_status`,
+	`CREATE TABLE automatic_retry_schedules (
+		run_id TEXT NOT NULL REFERENCES runs(run_id), phase TEXT NOT NULL,
+		controller_state TEXT NOT NULL, attempt_count INTEGER NOT NULL CHECK(attempt_count > 0),
+		max_attempts INTEGER NOT NULL CHECK(max_attempts > 0), failure_class TEXT NOT NULL,
+		reason_code TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('scheduled','attention','superseded')),
+		next_eligible_at TEXT NOT NULL DEFAULT '', next_eligible_unix_ns INTEGER NOT NULL DEFAULT 0,
+		attention_at TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+		initial_delay_ns INTEGER NOT NULL DEFAULT 1000000000, maximum_delay_ns INTEGER NOT NULL DEFAULT 30000000000,
+		failure_evidence_ref TEXT NOT NULL DEFAULT '', PRIMARY KEY(run_id,phase))`,
+	`INSERT INTO automatic_retry_schedules(run_id,phase,controller_state,attempt_count,max_attempts,failure_class,reason_code,status,next_eligible_at,next_eligible_unix_ns,attention_at,created_at,updated_at,initial_delay_ns,maximum_delay_ns,failure_evidence_ref)
+		SELECT run_id,phase,controller_state,attempt_count,max_attempts,failure_class,reason_code,status,next_eligible_at,next_eligible_unix_ns,attention_at,created_at,updated_at,initial_delay_ns,maximum_delay_ns,failure_evidence_ref FROM automatic_retry_schedules_v27`,
+	`DROP TABLE automatic_retry_schedules_v27`,
+	`CREATE INDEX automatic_retry_schedules_status ON automatic_retry_schedules(status,next_eligible_unix_ns,updated_at)`,
+	`CREATE TABLE IF NOT EXISTS ci_waits (
+		run_id TEXT NOT NULL REFERENCES runs(run_id), pr_number INTEGER NOT NULL,
+		head_sha TEXT NOT NULL, profile_digest TEXT NOT NULL, first_seen_at TEXT NOT NULL,
+		warning_at TEXT NOT NULL DEFAULT '', closed_at TEXT NOT NULL DEFAULT '',
+		PRIMARY KEY(run_id,pr_number,head_sha,profile_digest))`,
 }
 
 var migrationV3 = []string{
@@ -2310,6 +2364,10 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 	if err != nil {
 		return application.RunInspection{}, err
 	}
+	inspection.CIWaits, err = s.listCIWaits(ctx, id)
+	if err != nil {
+		return application.RunInspection{}, err
+	}
 	if run.RegistryVersion > 0 {
 		var binding application.LocalRepository
 		if err := json.Unmarshal([]byte(run.RepositoryConfigJSON), &binding); err != nil {
@@ -2321,6 +2379,7 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 			VerifierRegistryRef: binding.VerifierRegistryRef, VerifierIDs: append([]string(nil), binding.VerifierIDs...),
 			GitHubAppProfileRef: binding.GitHubAppProfileRef, GitHubAppID: binding.GitHubAppID, GitHubInstallationID: binding.GitHubInstallationID,
 			ExpectedRepositoryID: binding.ExpectedRepositoryID, AllowedOperatorLogins: append([]string(nil), binding.AllowedOperatorLogins...),
+			CISlowThreshold:       binding.CISlowThreshold,
 			TrustedOperatorActors: append([]application.TrustedActorIdentity(nil), binding.TrustedOperatorActors...),
 		}
 	}

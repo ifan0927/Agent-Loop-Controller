@@ -213,6 +213,77 @@ func TestOperatorActionIntentReplayReturnsPersistedResultAfterRunAdvances(t *tes
 	}
 }
 
+func TestCIWaitRecoverySupersedesOnlyExactTerminalScheduleAndReplays(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	run := outboxRun(t, "run-ci-recovery")
+	run.ProfileDigest = strings.Repeat("a", 64)
+	bindingRaw, _ := json.Marshal(application.LocalRepository{ProfileID: run.ProfileID, CanonicalRepository: run.Repository, BaseBranch: run.BaseBranch, GitHubAppID: 11, GitHubInstallationID: 22, ExpectedRepositoryID: 99, AllowedOperatorLogins: []string{"operator"}})
+	run.RepositoryConfigJSON = string(bindingRaw)
+	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE runs SET current_state=? WHERE run_id=?`, domain.StatePROpen, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCandidateHead(ctx, run.ID, "head"); err != nil {
+		t.Fatal(err)
+	}
+	pr := domain.PullRequest{Number: 7, DatabaseID: 70, URL: "https://example.invalid/pr/7", NodeID: "PR_7", HeadBranch: run.WorkingBranch, BaseBranch: run.BaseBranch, HeadSHA: "head", BaseSHA: "base", BodyDigest: "body", OwnershipKey: run.IdempotencyKey, State: "open"}
+	if err := store.SavePullRequest(ctx, run.ID, pr); err != nil {
+		t.Fatal(err)
+	}
+	run, err = store.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 17, 3, 0, 0, 0, time.UTC)
+	schedule, changed, err := store.ApplyRetryFailure(ctx, application.RetryFailureRequest{RunID: run.ID, Phase: application.AutomaticRetryPhaseForRun(run), ControllerState: run.State, ExpectedAttempt: 0, FailureClass: application.RetryFailureTerminal, ReasonCode: application.RetryReasonTerminal, Now: now, Policy: application.DefaultAutomaticRetryPolicy()})
+	if err != nil || !changed || schedule.Status != application.RetryScheduleAttention {
+		t.Fatalf("schedule=%+v changed=%v err=%v", schedule, changed, err)
+	}
+	event, err := application.CIWaitRecoveryAttentionEvent(run, schedule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AppendOperatorAttention(ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := store.Inspect(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actions, err := application.NewOperatorActionService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, _, err := actions.Prepare(ctx, operatorActionInput(run, event, inspection.Timeline[len(inspection.Timeline)-1].Sequence, application.OperatorActionRecoverCIWait))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := domain.RepositoryIdentity{ID: 99, NodeID: "REPO", Owner: "owner", Name: "repo"}
+	metadata := application.GitHubInstallationMetadata{AppID: 11, InstallationID: 22, Repository: repository, TokenExpiresAt: now.Add(time.Hour), PermissionsDigest: strings.Repeat("c", 64), ObservedAt: now.Add(time.Second)}
+	evidence := domain.GitHubReadEvidence{Repository: repository, PullRequest: pr, Checks: []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: "head", State: domain.CheckSuccess}}, ObservedAt: now.Add(time.Second)}
+	observations := []application.GitHubRequestObservation{{RunID: run.ID, Operation: "repository", Category: "REST", HTTPStatus: 200, ResponseDigest: strings.Repeat("d", 64), InstallationID: 22, Repository: repository, ObservedAt: now.Add(time.Second)}}
+	request := application.CIWaitRecoveryApply{ActionID: action.ActionID, Phase: schedule.Phase, ExpectedAttempt: schedule.AttemptCount, AppliedAt: action.ValidatedAt.Add(time.Second), EvidenceDigest: strings.Repeat("b", 64), Observations: observations, Metadata: metadata, GitHubEvidence: evidence}
+	applied, superseded, changed, err := store.ApplyCIWaitRecovery(ctx, request)
+	if err != nil || !changed || applied.Status != application.OperatorActionStatusApplied || applied.EvidenceDigest != request.EvidenceDigest || superseded.Status != application.RetryScheduleSuperseded {
+		t.Fatalf("action=%+v schedule=%+v changed=%v err=%v", applied, superseded, changed, err)
+	}
+	replayAction, replaySchedule, changed, err := store.ApplyCIWaitRecovery(ctx, request)
+	if err != nil || changed || replayAction.ActionID != applied.ActionID || replaySchedule.Status != application.RetryScheduleSuperseded {
+		t.Fatalf("action=%+v schedule=%+v changed=%v err=%v", replayAction, replaySchedule, changed, err)
+	}
+	inspection, err = store.Inspect(ctx, run.ID)
+	if err != nil || len(inspection.GitHubRequests) != 1 || inspection.GitHubEvidence == nil || inspection.GitHubEvidence.PullRequest.HeadSHA != run.CandidateHead || inspection.GitHubInstallation == nil || inspection.GitHubInstallation.InstallationID != 22 {
+		t.Fatalf("fresh recovery provenance was not persisted: inspection=%+v err=%v", inspection, err)
+	}
+}
+
 func TestOperatorActionMigrationFromV23CreatesEmptyJournal(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
 	store, err := Open(path)
@@ -228,7 +299,7 @@ func TestOperatorActionMigrationFromV23CreatesEmptyJournal(t *testing.T) {
 	if _, err := store.db.Exec(`ALTER TABLE attempts DROP COLUMN process_control_key`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.Exec(`DELETE FROM schema_migrations WHERE version IN (24,25,26,27)`); err != nil {
+	if _, err := store.db.Exec(`DELETE FROM schema_migrations WHERE version IN (24,25,26,27,28)`); err != nil {
 		t.Fatal(err)
 	}
 	store.Close()

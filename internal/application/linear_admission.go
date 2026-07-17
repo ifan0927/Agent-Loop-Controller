@@ -117,6 +117,15 @@ func (s *LinearAdmissionService) RevalidateForOperatorRetry(ctx context.Context,
 	return run, err
 }
 
+// RevalidateForCIWaitRecovery is a read-only compatibility-recovery gate. It
+// accepts the same immutable Todo-to-started workflow progress as ordinary
+// automated continuation, but never marks drift or accepts completed,
+// canceled, or manual-recovery authority.
+func (s *LinearAdmissionService) RevalidateForCIWaitRecovery(ctx context.Context, command LinearRevalidateCommand) (Run, error) {
+	run, _, err := s.revalidate(ctx, command, false, false, false, true, false)
+	return run, err
+}
+
 // RevalidateForGitHubReconcile permits an unchanged completed Linear issue to
 // authorize one final GitHub observation. Completion never authorizes merge
 // adoption or cleanup; callers must persist a fail-closed GitHub outcome.

@@ -95,6 +95,14 @@ type linearTodoDispatchStore interface {
 	linearIssueStartStore
 	OperatorAttentionPublisher
 	RetryScheduleStore
+	InactiveCIWaitCloser
+}
+
+// InactiveCIWaitCloser repairs the narrow crash window where a run left review
+// reconciliation but its exact-head wait was not yet closed. Dispatchers call
+// it before any stop attention or early return that bypasses the driver.
+type InactiveCIWaitCloser interface {
+	CloseInactiveCIWaits(context.Context, time.Time) error
 }
 
 // LinearTodoDispatchPolicy contains controller-owned authority for one
@@ -201,6 +209,9 @@ func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatch
 		defer cancel()
 		_, _ = d.store.ReleaseLinearTodoAdmissionLease(cleanup, lease)
 	}()
+	if err := d.store.CloseInactiveCIWaits(ctx, now); err != nil {
+		return LinearTodoDispatchResult{}, classifyServiceError(err)
+	}
 	blocking, handled, err := d.blockingRetry(ctx)
 	if err != nil {
 		return LinearTodoDispatchResult{}, err
@@ -635,6 +646,9 @@ func (d *LinearTodoDispatcher) blockingRetry(ctx context.Context) (LinearTodoDis
 		return LinearTodoDispatchResult{}, false, classifyServiceError(err)
 	}
 	for _, schedule := range schedules {
+		if schedule.Status == RetryScheduleSuperseded {
+			continue
+		}
 		run, runErr := d.store.GetRun(ctx, schedule.RunID)
 		if runErr != nil {
 			return LinearTodoDispatchResult{}, false, classifyServiceError(runErr)

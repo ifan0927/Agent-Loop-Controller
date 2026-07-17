@@ -141,7 +141,7 @@ func TestOperatorAttentionMigrationPreservesLegacyEvidenceAndNormalizesEnvelope(
 			t.Fatal(err)
 		}
 	}
-	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (23,24,25,26,27)`); err != nil {
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (23,24,25,26,27,28)`); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 7, 15, 4, 0, 0, 0, time.UTC)
@@ -178,7 +178,9 @@ func TestOperatorAttentionMigrationPreservesLegacyEvidenceAndNormalizesEnvelope(
 	}
 	replay := event
 	replay.SchemaVersion = application.OperatorAttentionSchemaVersion
-	replay.AllowedActions = []application.OperatorAttentionActionID{application.OperatorAttentionActionRetry, application.OperatorAttentionActionAbandon}
+	// Legacy rows did not persist a failure class. A current replay must stay
+	// conservative and cannot infer retry authority from the old presentation.
+	replay.AllowedActions = []application.OperatorAttentionActionID{application.OperatorAttentionActionAbandon}
 	replay.PayloadDigest = application.OperatorAttentionPayloadDigest(replay)
 	if created, err := store.AppendOperatorAttention(ctx, replay); err != nil || created {
 		t.Fatalf("replay created=%v err=%v", created, err)
@@ -215,7 +217,7 @@ func TestOperatorAttentionMigrationAcceptsFrozenLegacyProfileContract(t *testing
 			t.Fatal(err)
 		}
 	}
-	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (23,24,25,26,27)`); err != nil {
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (23,24,25,26,27,28)`); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 7, 15, 5, 0, 0, 0, time.UTC)

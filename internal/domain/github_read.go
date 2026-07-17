@@ -290,35 +290,53 @@ type GitHubReadEvidence struct {
 
 func (e GitHubReadEvidence) RequiredChecksStatus() ReconciliationStatus {
 	required := 0
+	pending, actionable, incomplete := false, false, false
 	for _, check := range e.Checks {
 		if !check.Required {
 			continue
 		}
 		required++
 		if check.ObservedSHA != e.PullRequest.HeadSHA {
-			return ReconciliationInfrastructure
+			incomplete = true
+			continue
 		}
 		switch check.State {
 		case CheckSuccess, CheckNeutral, CheckSkipped:
 		case CheckQueued, CheckInProgress, CheckPending, CheckRequested, CheckWaiting:
-			return ReconciliationPending
-		case CheckFailure, CheckActionRequired:
-			return ReconciliationActionable
-		case CheckCancelled, CheckTimedOut, CheckStale, CheckUnknown:
-			return ReconciliationInfrastructure
+			pending = true
+		case CheckFailure, CheckActionRequired, CheckCancelled, CheckTimedOut:
+			actionable = true
+		case CheckStale, CheckUnknown:
+			incomplete = true
 		default:
-			return ReconciliationInfrastructure
+			incomplete = true
 		}
-	}
-	if required == 0 {
-		return ReconciliationInfrastructure
 	}
 	for _, event := range e.UnknownEvents {
 		if strings.HasPrefix(event, "missing_required_check:") {
-			return ReconciliationInfrastructure
+			pending = true
+		} else {
+			incomplete = true
 		}
 	}
+	// Aggregate every required check before deciding so input ordering cannot
+	// hide a terminal failure or unknown evidence.
+	if incomplete || required == 0 && !pending {
+		return ReconciliationInfrastructure
+	}
+	if actionable {
+		return ReconciliationActionable
+	}
+	if pending {
+		return ReconciliationPending
+	}
 	return ReconciliationPass
+}
+
+// RequiredChecksWaiting distinguishes the normal workflow-start window from
+// malformed check evidence without changing the fail-closed delivery status.
+func (e GitHubReadEvidence) RequiredChecksWaiting() bool {
+	return e.RequiredChecksStatus() == ReconciliationPending
 }
 
 // DeliveryStatus classifies the GitHub evidence that gates the delivery loop.

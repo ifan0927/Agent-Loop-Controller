@@ -238,6 +238,19 @@ type RunInspection struct {
 	GitHubInstallation  *GitHubInstallationMetadata      `json:"github_installation,omitempty"`
 	GitHubRequests      []GitHubRequestObservation       `json:"github_request_observations"`
 	GitHubEvidence      *domain.GitHubReadEvidence       `json:"github_read_evidence,omitempty"`
+	CIWaits             []CIWaitEvidence                 `json:"ci_waits"`
+}
+
+// CIWaitEvidence is restart-stable observability for one exact candidate.
+// WarningAt is an attention boundary, never a terminal deadline.
+type CIWaitEvidence struct {
+	RunID         string    `json:"run_id"`
+	PRNumber      int64     `json:"pull_request"`
+	HeadSHA       string    `json:"head_sha"`
+	ProfileDigest string    `json:"profile_digest"`
+	FirstSeenAt   time.Time `json:"first_seen_at"`
+	WarningAt     time.Time `json:"warning_at,omitempty"`
+	ClosedAt      time.Time `json:"closed_at,omitempty"`
 }
 
 // ReviewReplyEvidence is immutable sanitized evidence of the one permitted
@@ -284,6 +297,7 @@ type SanitizedRepositoryBinding struct {
 	GitHubAppID            int64                  `json:"github_app_id"`
 	GitHubInstallationID   int64                  `json:"github_installation_id"`
 	ExpectedRepositoryID   int64                  `json:"expected_repository_id"`
+	CISlowThreshold        time.Duration          `json:"ci_slow_threshold_ns"`
 	AllowedOperatorLogins  []string               `json:"allowed_operator_logins"`
 	TrustedOperatorActors  []TrustedActorIdentity `json:"trusted_operator_actors"`
 }

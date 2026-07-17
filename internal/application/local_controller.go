@@ -46,6 +46,7 @@ type LocalRepository struct {
 	GitHubAppID             int64                  `json:"github_app_id"`
 	GitHubInstallationID    int64                  `json:"github_installation_id"`
 	ExpectedRepositoryID    int64                  `json:"expected_repository_id"`
+	CISlowThreshold         time.Duration          `json:"ci_slow_threshold_ns"`
 	AllowedOperatorLogins   []string               `json:"allowed_operator_logins"`
 	TrustedOperatorActors   []TrustedActorIdentity `json:"trusted_operator_actors"`
 }

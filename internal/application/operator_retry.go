@@ -141,9 +141,7 @@ func validateOperatorRetryPlan(run Run, inspection RunInspection, schedule Retry
 	if schedule.RunID != run.ID || schedule.Phase != AutomaticRetryPhaseForRun(run) || schedule.ControllerState != string(run.State) || schedule.Status != RetryScheduleAttention || schedule.ReasonCode != RetryReasonBudgetExhausted || (schedule.FailureClass != RetryFailureProcessStart && schedule.FailureClass != RetryFailureUnavailable) {
 		return errors.New("retry schedule authority is unsupported")
 	}
-	switch run.State {
-	case domain.StateReceived, domain.StateAdmitting, domain.StateProvisioning, domain.StateExecuting, domain.StateVerifying, domain.StateFreshReview, domain.StateRepairing, domain.StateApprovalReady:
-	default:
+	if !operatorRetryableState(run.State) {
 		return errors.New("controller state is not pre-delivery operator-retryable")
 	}
 	for _, side := range inspection.SideEffects {
@@ -261,11 +259,15 @@ func digestOperatorRetry(value string) string {
 }
 
 func projectOperatorRetryResult(action OperatorActionRecord, schedule RetrySchedule, found bool) OperatorRetryResult {
-	projected := OperatorActionResult{ActionID: action.ActionID, ActionType: action.ActionType, Repository: action.Repository, ExpectedState: action.ExpectedState, TransitionSequence: action.TransitionSequence, RequesterLogin: sanitizeUntrustedContent(action.Requester.ID), RequesterDatabaseID: action.Requester.DatabaseID, RequesterNodeID: sanitizeUntrustedContent(action.Requester.NodeID), RequesterActorType: sanitizeUntrustedContent(action.Requester.ActorType), ReasonCode: action.ReasonCode, AttentionEventKey: action.AttentionEventKey, Status: action.Status, ResultStatus: action.ResultStatus, ResultingState: action.ResultingState, ResultingTransitionSequence: action.ResultingTransitionSequence, PayloadDigest: action.PayloadDigest, EvidenceDigest: action.EvidenceDigest, OutcomeDigest: action.OutcomeDigest, NextEligibleAt: action.NextEligibleAt, ReceivedAt: action.ReceivedAt, ValidatedAt: action.ValidatedAt, AppliedAt: action.AppliedAt, ObservedAt: action.ObservedAt}
+	projected := projectOperatorActionResult(action)
 	result := OperatorRetryResult{Action: projected, NextEligibleAt: action.NextEligibleAt}
 	if found {
 		copy := schedule
 		result.Retry, result.NextEligibleAt = &copy, schedule.NextEligibleAt
 	}
 	return result
+}
+
+func projectOperatorActionResult(action OperatorActionRecord) OperatorActionResult {
+	return OperatorActionResult{ActionID: action.ActionID, ActionType: action.ActionType, Repository: action.Repository, ExpectedState: action.ExpectedState, TransitionSequence: action.TransitionSequence, RequesterLogin: sanitizeUntrustedContent(action.Requester.ID), RequesterDatabaseID: action.Requester.DatabaseID, RequesterNodeID: sanitizeUntrustedContent(action.Requester.NodeID), RequesterActorType: sanitizeUntrustedContent(action.Requester.ActorType), ReasonCode: action.ReasonCode, AttentionEventKey: action.AttentionEventKey, Status: action.Status, ResultStatus: action.ResultStatus, ResultingState: action.ResultingState, ResultingTransitionSequence: action.ResultingTransitionSequence, PayloadDigest: action.PayloadDigest, EvidenceDigest: action.EvidenceDigest, OutcomeDigest: action.OutcomeDigest, NextEligibleAt: action.NextEligibleAt, ReceivedAt: action.ReceivedAt, ValidatedAt: action.ValidatedAt, AppliedAt: action.AppliedAt, ObservedAt: action.ObservedAt}
 }

@@ -16,8 +16,9 @@ import (
 type OperatorActionType string
 
 const (
-	OperatorActionRetry   OperatorActionType = "retry"
-	OperatorActionAbandon OperatorActionType = "abandon"
+	OperatorActionRetry         OperatorActionType = "retry"
+	OperatorActionAbandon       OperatorActionType = "abandon"
+	OperatorActionRecoverCIWait OperatorActionType = "recover_ci_wait"
 )
 
 const (
@@ -197,7 +198,7 @@ func validateOperatorActionInput(input OperatorActionInput) error {
 	if input.RunID == "" || input.Repository == "" || input.ExpectedState == "" || input.RunIdempotencyKey == "" || input.TransitionSequence < 1 || input.ReasonCode == "" || input.AttentionEventKey == "" {
 		return errors.New("operator action authority is incomplete")
 	}
-	if input.ActionType != OperatorActionRetry && input.ActionType != OperatorActionAbandon {
+	if input.ActionType != OperatorActionRetry && input.ActionType != OperatorActionAbandon && input.ActionType != OperatorActionRecoverCIWait {
 		return errors.New("operator action type is invalid")
 	}
 	if input.Requester.ID == "" || input.Requester.Kind != "github_login" || input.Requester.DatabaseID < 1 || input.Requester.NodeID == "" || input.Requester.ActorType != "User" {

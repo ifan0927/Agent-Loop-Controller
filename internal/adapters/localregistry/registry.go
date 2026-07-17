@@ -14,12 +14,15 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/verifier"
 )
 
 const CurrentVersion = 1
 const ProfileSnapshotVersion = 1
+
+const DefaultCISlowThreshold = 20 * time.Minute
 
 var referencePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$`)
 var githubOwnerPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$`)
@@ -58,6 +61,7 @@ type Repository struct {
 	GitHubAppID            int64                  `json:"github_app_id"`
 	GitHubInstallationID   int64                  `json:"github_installation_id"`
 	ExpectedRepositoryID   int64                  `json:"expected_repository_id"`
+	CISlowThreshold        string                 `json:"ci_slow_threshold,omitempty"`
 	OperatorIdentityPolicy OperatorIdentityPolicy `json:"operator_identity_policy"`
 }
 
@@ -91,6 +95,7 @@ type Binding struct {
 	GitHubAppID             int64                  `json:"github_app_id"`
 	GitHubInstallationID    int64                  `json:"github_installation_id"`
 	ExpectedRepositoryID    int64                  `json:"expected_repository_id"`
+	CISlowThreshold         time.Duration          `json:"ci_slow_threshold_ns"`
 	OperatorIdentityPolicy  OperatorIdentityPolicy `json:"operator_identity_policy"`
 }
 
@@ -109,6 +114,7 @@ type ProfileSnapshot struct {
 	GitHubAppID            int64                  `json:"github_app_id"`
 	GitHubInstallationID   int64                  `json:"github_installation_id"`
 	ExpectedRepositoryID   int64                  `json:"expected_repository_id"`
+	CISlowThreshold        string                 `json:"ci_slow_threshold,omitempty"`
 	OperatorIdentityPolicy OperatorIdentityPolicy `json:"operator_identity_policy"`
 }
 
@@ -128,6 +134,7 @@ type SanitizedBinding struct {
 	GitHubAppID             int64                  `json:"github_app_id"`
 	GitHubInstallationID    int64                  `json:"github_installation_id"`
 	ExpectedRepositoryID    int64                  `json:"expected_repository_id"`
+	CISlowThreshold         time.Duration          `json:"ci_slow_threshold_ns"`
 	AllowedOperatorLogins   []string               `json:"allowed_operator_logins"`
 	TrustedOperatorActors   []TrustedActorIdentity `json:"trusted_operator_actors"`
 }
@@ -139,6 +146,7 @@ func (b Binding) Sanitized() SanitizedBinding {
 		BaseBranch: b.BaseBranch, VerifierRegistryRef: b.VerifierRegistryRef,
 		VerifierIDs: append([]string(nil), b.VerifierIDs...), GitHubAppProfileRef: b.GitHubAppProfileRef,
 		GitHubAppID: b.GitHubAppID, GitHubInstallationID: b.GitHubInstallationID, ExpectedRepositoryID: b.ExpectedRepositoryID,
+		CISlowThreshold:       b.CISlowThreshold,
 		AllowedOperatorLogins: append([]string(nil), b.OperatorIdentityPolicy.AllowedLogins...),
 		TrustedOperatorActors: append([]TrustedActorIdentity(nil), b.OperatorIdentityPolicy.TrustedActors...)}
 }
@@ -229,6 +237,7 @@ func build(file File) (Registry, error) {
 }
 
 func validateRepository(version int, registryDigest string, repo Repository) (Binding, error) {
+	ciSlowThresholdConfigured := repo.CISlowThreshold != ""
 	canonical := repo.CanonicalName()
 	if !validGitHubOwner(repo.Owner) || !validGitHubRepository(repo.Name) || strings.Count(canonical, "/") != 1 {
 		return Binding{}, errors.New("repository entry has invalid canonical owner/name")
@@ -280,6 +289,15 @@ func validateRepository(version int, registryDigest string, repo Repository) (Bi
 	if !referencePattern.MatchString(repo.BaseBranch) || repo.VerifierRegistryRef != "builtin:v1" || !githubAppProfilePattern.MatchString(repo.GitHubAppProfileRef) || repo.GitHubAppID < 1 || repo.GitHubInstallationID < 1 || repo.ExpectedRepositoryID < 1 {
 		return Binding{}, fmt.Errorf("repository %s has incomplete authority binding", canonical)
 	}
+	ciSlowThreshold := DefaultCISlowThreshold
+	if repo.CISlowThreshold != "" {
+		var err error
+		ciSlowThreshold, err = time.ParseDuration(repo.CISlowThreshold)
+		if err != nil || ciSlowThreshold < time.Minute || ciSlowThreshold > 24*time.Hour {
+			return Binding{}, fmt.Errorf("repository %s has invalid CI slow threshold", canonical)
+		}
+	}
+	repo.CISlowThreshold = ciSlowThreshold.String()
 	if len(repo.VerifierIDs) == 0 || len(repo.OperatorIdentityPolicy.AllowedLogins) == 0 || len(repo.OperatorIdentityPolicy.TrustedActors) == 0 {
 		return Binding{}, fmt.Errorf("repository %s has incomplete policy", canonical)
 	}
@@ -329,21 +347,32 @@ func validateRepository(version int, registryDigest string, repo Repository) (Bi
 	slices.Sort(repo.OperatorIdentityPolicy.AllowedLogins)
 	slices.SortFunc(repo.OperatorIdentityPolicy.TrustedActors, func(a, b TrustedActorIdentity) int { return strings.Compare(a.NodeID, b.NodeID) })
 	profileID := "repository-profile:" + canonical
+	profileThreshold := repo.CISlowThreshold
+	if !ciSlowThresholdConfigured {
+		// Preserve the frozen digest of version-1 profiles created before this
+		// optional setting existed. The effective binding still carries the
+		// default so new runs persist the policy without invalidating old runs.
+		profileThreshold = ""
+	}
 	profile := ProfileSnapshot{Version: ProfileSnapshotVersion, ProfileID: profileID, CanonicalRepository: canonical, LinearLabel: linearLabel,
 		BaseBranch: repo.BaseBranch, VerifierRegistryRef: repo.VerifierRegistryRef, VerifierIDs: append([]string(nil), repo.VerifierIDs...),
 		GitHubAppProfileRef: repo.GitHubAppProfileRef, GitHubAppID: repo.GitHubAppID, GitHubInstallationID: repo.GitHubInstallationID,
-		ExpectedRepositoryID: repo.ExpectedRepositoryID, OperatorIdentityPolicy: repo.OperatorIdentityPolicy}
+		ExpectedRepositoryID: repo.ExpectedRepositoryID, CISlowThreshold: profileThreshold, OperatorIdentityPolicy: repo.OperatorIdentityPolicy}
 	profileRaw, _ := json.Marshal(profile)
 	binding := Binding{ProfileID: profileID, ProfileSnapshotVersion: ProfileSnapshotVersion, ProfileDigest: digest(profileRaw), ProfileSnapshotJSON: string(profileRaw),
 		RegistryVersion: version, RegistryDigest: registryDigest, CanonicalRepository: canonical, LinearLabel: linearLabel,
 		OriginPath: repo.OriginPath, SourcePath: repo.SourcePath, RunRoot: repo.RunRoot, WorktreeRoot: repo.WorktreeRoot,
 		BaseBranch: repo.BaseBranch, VerifierRegistryRef: repo.VerifierRegistryRef, VerifierIDs: repo.VerifierIDs,
 		GitHubAppProfileRef: repo.GitHubAppProfileRef, GitHubAppID: repo.GitHubAppID, GitHubInstallationID: repo.GitHubInstallationID,
-		ExpectedRepositoryID: repo.ExpectedRepositoryID, OperatorIdentityPolicy: repo.OperatorIdentityPolicy}
+		ExpectedRepositoryID: repo.ExpectedRepositoryID, CISlowThreshold: ciSlowThreshold, OperatorIdentityPolicy: repo.OperatorIdentityPolicy}
+	digestRepository := repo
+	if !ciSlowThresholdConfigured {
+		digestRepository.CISlowThreshold = ""
+	}
 	raw, _ := json.Marshal(struct {
 		RegistryVersion int        `json:"registry_version"`
 		Repository      Repository `json:"repository"`
-	}{version, repo})
+	}{version, digestRepository})
 	binding.RepositoryBindingDigest = digest(raw)
 	return binding, nil
 }
@@ -540,8 +569,15 @@ func sameBinding(a, b Binding) bool {
 		a.RunRoot == b.RunRoot && a.WorktreeRoot == b.WorktreeRoot && a.BaseBranch == b.BaseBranch &&
 		a.VerifierRegistryRef == b.VerifierRegistryRef && slices.Equal(a.VerifierIDs, b.VerifierIDs) &&
 		a.GitHubAppProfileRef == b.GitHubAppProfileRef && a.GitHubAppID == b.GitHubAppID && a.GitHubInstallationID == b.GitHubInstallationID &&
-		a.ExpectedRepositoryID == b.ExpectedRepositoryID && slices.Equal(a.OperatorIdentityPolicy.AllowedLogins, b.OperatorIdentityPolicy.AllowedLogins) &&
+		a.ExpectedRepositoryID == b.ExpectedRepositoryID && effectiveCISlowThreshold(a.CISlowThreshold) == effectiveCISlowThreshold(b.CISlowThreshold) && slices.Equal(a.OperatorIdentityPolicy.AllowedLogins, b.OperatorIdentityPolicy.AllowedLogins) &&
 		slices.Equal(a.OperatorIdentityPolicy.TrustedActors, b.OperatorIdentityPolicy.TrustedActors)
+}
+
+func effectiveCISlowThreshold(value time.Duration) time.Duration {
+	if value == 0 {
+		return DefaultCISlowThreshold
+	}
+	return value
 }
 
 func BuiltinVerifierCommands() map[string]verifier.Command {

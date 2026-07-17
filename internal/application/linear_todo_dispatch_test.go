@@ -180,6 +180,21 @@ type dispatchStore struct {
 	postProofDrift         bool
 	omitDecisionTransition bool
 	reserveBlocked         chan struct{}
+	ciWaitActive           bool
+	ciWaitClosed           int
+	ciWaitClosedAt         time.Time
+	attentionBeforeCIClose bool
+}
+
+func (s *dispatchStore) CloseInactiveCIWaits(_ context.Context, at time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ciWaitActive && s.run.State != domain.StateReconcilingReviews {
+		s.ciWaitActive = false
+		s.ciWaitClosed++
+		s.ciWaitClosedAt = at
+	}
+	return nil
 }
 
 func (s *dispatchStore) AcquireLinearTodoAdmissionLease(_ context.Context, owner string, ttl time.Duration, now time.Time) (LinearTodoAdmissionLease, bool, error) {
@@ -376,6 +391,9 @@ func (s *dispatchStore) Transition(_ context.Context, runID string, from, to dom
 func (s *dispatchStore) AppendOperatorAttention(_ context.Context, event OperatorAttentionEvent) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.ciWaitActive {
+		s.attentionBeforeCIClose = true
+	}
 	for _, current := range s.attention {
 		if current.EventKey == event.EventKey {
 			if current.PayloadDigest != event.PayloadDigest {
@@ -753,6 +771,18 @@ func TestLinearTodoDispatcherScansNextCandidateAfterAbandonedRunWithRetainedRetr
 	}
 }
 
+func TestLinearTodoDispatcherAutomaticallyResumesRunWithSupersededCIWaitSchedule(t *testing.T) {
+	candidate := dispatchCandidate("ci-resume", "IFAN-77", 1)
+	dispatcher, store, scanner, _, _, driver := newDispatchLab(t, candidate)
+	store.run = authorizeDispatchRun(Run{ID: "run-ci-resume", IssueID: candidate.Identifier, IdempotencyKey: "ci-resume-key", Repository: "owner/repo", State: domain.StatePROpen})
+	now := store.now
+	store.retrySchedules = []RetrySchedule{{RunID: store.run.ID, Phase: AutomaticRetryPhaseForRun(store.run), ControllerState: string(store.run.State), AttemptCount: 1, MaxAttempts: 3, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: RetryFailureTerminal, ReasonCode: RetryReasonTerminal, Status: RetryScheduleSuperseded, AttentionAt: now, CreatedAt: now.Add(-time.Minute), UpdatedAt: now}}
+	result, err := dispatcher.Dispatch(context.Background())
+	if err != nil || scanner.calls != 0 || len(driver.calls) != 1 || result.Outcome != LinearTodoDispatchDriven {
+		t.Fatalf("result=%+v scanner=%d driver=%+v err=%v", result, scanner.calls, driver.calls, err)
+	}
+}
+
 func TestLinearTodoDispatcherStopsForManualAndDriverConflict(t *testing.T) {
 	for _, test := range []struct {
 		state      domain.State
@@ -764,8 +794,9 @@ func TestLinearTodoDispatcherStopsForManualAndDriverConflict(t *testing.T) {
 			candidate := dispatchCandidate("manual", "IFAN-14", 1)
 			dispatcher, store, scanner, _, _, driver := newDispatchLab(t, candidate)
 			store.run = authorizeDispatchRun(Run{ID: "run-manual", IssueID: candidate.Identifier, IdempotencyKey: "manual-key", Repository: "owner/repo", State: test.state})
+			store.ciWaitActive = true
 			result, err := dispatcher.Dispatch(context.Background())
-			if err != nil || result.Outcome != test.outcome || scanner.calls != 0 || len(driver.calls) != test.drives || len(store.attention) != test.attentions {
+			if err != nil || result.Outcome != test.outcome || scanner.calls != 0 || len(driver.calls) != test.drives || len(store.attention) != test.attentions || store.ciWaitClosed != 1 || store.ciWaitClosedAt != store.now || store.attentionBeforeCIClose {
 				t.Fatalf("result=%+v scanner=%d driver=%+v attention=%+v err=%v", result, scanner.calls, driver.calls, store.attention, err)
 			}
 			if test.state == domain.StateManualIntervention && store.attention[0].EventType != OperatorAttentionManualIntervention {
@@ -776,6 +807,17 @@ func TestLinearTodoDispatcherStopsForManualAndDriverConflict(t *testing.T) {
 			}
 		})
 	}
+	t.Run("terminal restart closes residual wait before returning", func(t *testing.T) {
+		for _, state := range []domain.State{domain.StateCompleted, domain.StateFailed, domain.StateRejected} {
+			dispatcher, store, scanner, _, _, driver := newDispatchLab(t)
+			store.run = authorizeDispatchRun(Run{ID: "run-terminal", IssueID: "IFAN-OLD", IdempotencyKey: "terminal-key", Repository: "owner/repo", State: state})
+			store.ciWaitActive = true
+			result, err := dispatcher.Dispatch(context.Background())
+			if err != nil || result.Outcome != LinearTodoDispatchNoCandidate || scanner.calls != 1 || len(driver.calls) != 0 || store.ciWaitClosed != 1 || store.ciWaitClosedAt != store.now || store.attentionBeforeCIClose {
+				t.Fatalf("state=%s result=%+v scanner=%d driver=%v close=%d err=%v", state, result, scanner.calls, driver.calls, store.ciWaitClosed, err)
+			}
+		}
+	})
 	t.Run("decision evidence drift stays parked with stable fail-closed attention", func(t *testing.T) {
 		candidate := dispatchCandidate("decision-drift", "IFAN-14", 1)
 		dispatcher, store, scanner, _, _, driver := newDispatchLab(t, candidate)

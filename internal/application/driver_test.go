@@ -10,20 +10,134 @@ import (
 )
 
 type driverRunReader struct {
-	run       Run
-	attention []OperatorAttentionEvent
-	appendErr error
+	run           Run
+	attention     []OperatorAttentionEvent
+	appendErr     error
+	pr            *domain.PullRequest
+	evidence      *domain.GitHubReadEvidence
+	ciObserved    int
+	ciClosed      int
+	ciAt          time.Time
+	ciEvaluated   time.Time
+	ciWarnWhenDue bool
 }
 
 func (r *driverRunReader) GetRun(context.Context, string) (Run, error) { return r.run, nil }
 func (r *driverRunReader) Inspect(context.Context, string) (RunInspection, error) {
-	inspection := RunInspection{Run: r.run}
+	inspection := RunInspection{Run: r.run, PullRequest: r.pr, GitHubEvidence: r.evidence}
 	if r.run.State == domain.StateManualIntervention {
 		inspection.Timeline = []Transition{{Sequence: 7, From: domain.StateMerging, To: domain.StateManualIntervention, Reason: "authority conflict", EvidenceReference: "controller_evidence", BoundHead: r.run.CandidateHead, CreatedAt: time.Date(2026, 7, 16, 1, 0, 0, 0, time.UTC)}}
 	} else if r.run.State == domain.StateAwaitingHumanDecision {
 		inspection.Timeline = []Transition{{Sequence: 3, From: domain.StateExecuting, To: domain.StateAwaitingHumanDecision, Reason: "decision required", EvidenceReference: "decision_request", CreatedAt: time.Date(2026, 7, 16, 1, 0, 0, 0, time.UTC)}}
 	}
 	return inspection, nil
+}
+func (r *driverRunReader) ObserveCIWait(_ context.Context, runID string, prNumber int64, head, profile string, threshold time.Duration, at, evaluated time.Time) (CIWaitEvidence, error) {
+	r.ciObserved++
+	if r.ciAt.IsZero() {
+		r.ciAt = at
+	}
+	r.ciEvaluated = evaluated
+	wait := CIWaitEvidence{RunID: runID, PRNumber: prNumber, HeadSHA: head, ProfileDigest: profile, FirstSeenAt: r.ciAt}
+	if r.ciWarnWhenDue && !evaluated.Before(r.ciAt.Add(threshold)) {
+		wait.WarningAt = r.ciAt.Add(threshold)
+	}
+	return wait, nil
+}
+
+func TestProductionDriverUsesPersistedGitHubObservationAsCrashStableCIAnchor(t *testing.T) {
+	run := driverRun(domain.StateReconcilingReviews)
+	run.CandidateHead, run.ProfileDigest = "head", "profile"
+	pr := domain.PullRequest{Number: 7, HeadSHA: "head", State: "open"}
+	observed := time.Date(2026, 7, 17, 0, 0, 0, 0, time.UTC)
+	evidence := domain.GitHubReadEvidence{PullRequest: pr, Checks: []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: "head", State: domain.CheckInProgress}}, ObservedAt: observed}
+	reader := &driverRunReader{run: run, pr: &pr, evidence: &evidence}
+	driver := newDriverForTest(t, reader, &driverCoordinator{runs: reader}, nil)
+	driver.now = func() time.Time { return observed.Add(time.Hour) }
+	if err := driver.reconcileCIWait(context.Background(), run.ID); err != nil || reader.ciAt != observed {
+		t.Fatalf("anchor=%s want=%s err=%v", reader.ciAt, observed, err)
+	}
+}
+
+func TestProductionDriverTracksRequiredCheckLifecycleUntilSuccess(t *testing.T) {
+	run := driverRun(domain.StateReconcilingReviews)
+	run.CandidateHead, run.ProfileDigest = "head", "profile"
+	pr := domain.PullRequest{Number: 7, HeadSHA: "head", State: "open"}
+	first := time.Date(2026, 7, 17, 0, 0, 0, 0, time.UTC)
+	evidence := domain.GitHubReadEvidence{PullRequest: pr, UnknownEvents: []string{"missing_required_check:test"}, ObservedAt: first}
+	reader := &driverRunReader{run: run, pr: &pr, evidence: &evidence}
+	driver := newDriverForTest(t, reader, &driverCoordinator{runs: reader}, nil)
+	if err := driver.reconcileCIWait(context.Background(), run.ID); err != nil {
+		t.Fatal(err)
+	}
+	for index, state := range []domain.CheckState{domain.CheckQueued, domain.CheckInProgress} {
+		evidence.UnknownEvents = nil
+		evidence.Checks = []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: "head", State: state}}
+		evidence.ObservedAt = first.Add(time.Duration(index+1) * time.Minute)
+		if err := driver.reconcileCIWait(context.Background(), run.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	evidence.Checks[0].State = domain.CheckSuccess
+	evidence.ObservedAt = first.Add(3 * time.Minute)
+	if err := driver.reconcileCIWait(context.Background(), run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if reader.ciObserved != 3 || reader.ciClosed != 1 || !reader.ciAt.Equal(first) {
+		t.Fatalf("observed=%d closed=%d first=%s want=%s", reader.ciObserved, reader.ciClosed, reader.ciAt, first)
+	}
+}
+
+func TestProductionDriverWarnsFromWallClockDuringGitHubOutage(t *testing.T) {
+	run := driverRun(domain.StateReconcilingReviews)
+	run.CandidateHead, run.ProfileDigest = "head", "profile"
+	pr := domain.PullRequest{Number: 7, HeadSHA: "head", State: "open"}
+	first := time.Date(2026, 7, 17, 0, 0, 0, 0, time.UTC)
+	evidence := domain.GitHubReadEvidence{PullRequest: pr, Checks: []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: "head", State: domain.CheckInProgress}}, ObservedAt: first}
+	reader := &driverRunReader{run: run, pr: &pr, evidence: &evidence, ciWarnWhenDue: true}
+	driver := newDriverForTest(t, reader, &driverCoordinator{runs: reader}, nil)
+	evaluated := first
+	driver.now = func() time.Time { return evaluated }
+	if err := driver.reconcileCIWait(context.Background(), run.ID); err != nil || len(reader.attention) != 0 {
+		t.Fatalf("initial attention=%v err=%v", reader.attention, err)
+	}
+	evaluated = first.Add(21 * time.Minute)
+	if err := driver.reconcileCIWait(context.Background(), run.ID); err != nil || len(reader.attention) != 1 {
+		t.Fatalf("threshold attention=%v err=%v", reader.attention, err)
+	}
+	evaluated = first.Add(time.Hour)
+	if err := driver.reconcileCIWait(context.Background(), run.ID); err != nil || len(reader.attention) != 1 || !reader.ciAt.Equal(first) || !reader.ciEvaluated.Equal(evaluated) {
+		t.Fatalf("replay attention=%v first=%s evaluated=%s err=%v", reader.attention, reader.ciAt, reader.ciEvaluated, err)
+	}
+}
+
+func TestProductionDriverRestartClosesResidualCIWaitBeforeAnyDispatch(t *testing.T) {
+	for _, state := range []domain.State{domain.StateRepairing, domain.StateManualIntervention, domain.StateCompleted} {
+		t.Run(string(state), func(t *testing.T) {
+			reader := &driverRunReader{run: driverRun(state)}
+			coordinator := &driverCoordinator{runs: reader}
+			if state == domain.StateRepairing {
+				coordinator.apply = func(action ProductionAction) error {
+					if action != ProductionContinueLocal {
+						t.Fatalf("action=%s", action)
+					}
+					reader.run.State = domain.StateManualIntervention
+					return nil
+				}
+			}
+			driver := newDriverForTest(t, reader, coordinator, nil)
+			if _, err := driver.Drive(context.Background(), driverCommand()); err != nil {
+				t.Fatal(err)
+			}
+			if reader.ciClosed == 0 {
+				t.Fatal("residual CI wait was not closed before dispatch/stop")
+			}
+		})
+	}
+}
+func (r *driverRunReader) CloseCIWaits(context.Context, string, time.Time) error {
+	r.ciClosed++
+	return nil
 }
 func (r *driverRunReader) AppendOperatorAttention(_ context.Context, event OperatorAttentionEvent) (bool, error) {
 	if r.appendErr != nil {
@@ -182,6 +296,20 @@ func TestProductionDriverStopsAtHumanDecisionWithoutInvokingAction(t *testing.T)
 	result, err := driver.Drive(context.Background(), driverCommand())
 	if err != nil || result.Action != ProductionStop || result.Run.State != domain.StateAwaitingHumanDecision || len(coordinator.calls) != 0 || len(reader.attention) != 1 || reader.attention[0].EventType != OperatorAttentionHumanDecision || !equalOperatorAttentionActions(reader.attention[0].AllowedActions, []OperatorAttentionActionID{OperatorAttentionActionDecide}) {
 		t.Fatalf("result=%+v calls=%v err=%v", result, coordinator.calls, err)
+	}
+}
+
+func TestProductionDriverDoesNotTrackCIWaitAfterChecksPass(t *testing.T) {
+	run := driverRun(domain.StateReconcilingReviews)
+	run.CandidateHead, run.ProfileDigest = "head", "profile"
+	pr := domain.PullRequest{Number: 7, HeadSHA: "head", State: "open"}
+	evidence := domain.GitHubReadEvidence{PullRequest: pr, Checks: []domain.GitHubCheck{{Name: "test", Required: true, ObservedSHA: "head", State: domain.CheckSuccess}}}
+	reader := &driverRunReader{run: run, pr: &pr, evidence: &evidence}
+	coordinator := &driverCoordinator{runs: reader}
+	driver := newDriverForTest(t, reader, coordinator, nil)
+	driver.now = func() time.Time { return time.Date(2026, 7, 17, 0, 0, 0, 0, time.UTC) }
+	if err := driver.reconcileCIWait(context.Background(), run.ID); err != nil || reader.ciObserved != 0 || reader.ciClosed != 1 {
+		t.Fatalf("observed=%d closed=%d err=%v", reader.ciObserved, reader.ciClosed, err)
 	}
 }
 

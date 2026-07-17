@@ -16,17 +16,19 @@ import (
 )
 
 const (
-	OperatorAttentionLegacySchemaVersion = 0
-	OperatorAttentionSchemaVersion       = 1
-	maxOperatorAttentionProjection       = 100
+	OperatorAttentionLegacySchemaVersion   = 0
+	OperatorAttentionPreviousSchemaVersion = 1
+	OperatorAttentionSchemaVersion         = 2
+	maxOperatorAttentionProjection         = 100
 )
 
 type OperatorAttentionActionID string
 
 const (
-	OperatorAttentionActionRetry   OperatorAttentionActionID = "retry"
-	OperatorAttentionActionAbandon OperatorAttentionActionID = "abandon"
-	OperatorAttentionActionDecide  OperatorAttentionActionID = "decide"
+	OperatorAttentionActionRetry         OperatorAttentionActionID = "retry"
+	OperatorAttentionActionAbandon       OperatorAttentionActionID = "abandon"
+	OperatorAttentionActionDecide        OperatorAttentionActionID = "decide"
+	OperatorAttentionActionRecoverCIWait OperatorAttentionActionID = "recover_ci_wait"
 )
 
 const (
@@ -39,6 +41,8 @@ const (
 	OperatorAttentionCleanupResidue        = "cleanup_residue_attention"
 	OperatorAttentionManualIntervention    = "manual_intervention_attention"
 	OperatorAttentionHumanDecision         = "human_decision_attention"
+	OperatorAttentionCISlow                = "ci_wait_slow"
+	OperatorAttentionCIWaitRecovery        = "ci_wait_recovery"
 	operatorAttentionUnknown               = "unknown"
 )
 
@@ -55,6 +59,7 @@ type OperatorAttentionEvent struct {
 	ControllerState       string                      `json:"controller_state"`
 	Severity              string                      `json:"severity"`
 	ReasonCode            string                      `json:"reason_code"`
+	RetryFailureClass     RetryFailureClass           `json:"retry_failure_class,omitempty"`
 	AllowedActions        []OperatorAttentionActionID `json:"allowed_actions"`
 	EvidenceDigest        string                      `json:"evidence_digest"`
 	OccurredAt            time.Time                   `json:"occurred_at"`
@@ -188,8 +193,40 @@ func AutomaticRetryAttentionEvent(run Run, schedule RetrySchedule) (OperatorAtte
 	return newOperatorAttentionEvent(operatorAttentionEventInput{
 		ScopeID: retryAttentionScope(schedule), RunID: run.ID, EventType: OperatorAttentionRetry,
 		Profile: profile, State: schedule.ControllerState, Severity: "error", ReasonCode: schedule.ReasonCode,
-		EvidenceDigest: evidence, OccurredAt: schedule.AttentionAt, ObservedAt: schedule.AttentionAt,
+		EvidenceDigest: evidence, RetryFailureClass: schedule.FailureClass, OccurredAt: schedule.AttentionAt, ObservedAt: schedule.AttentionAt,
 	})
+}
+
+func CISlowAttentionEvent(run Run, wait CIWaitEvidence) (OperatorAttentionEvent, error) {
+	if wait.RunID != run.ID || wait.HeadSHA != run.CandidateHead || wait.ProfileDigest != run.ProfileDigest || wait.PRNumber < 1 || wait.WarningAt.IsZero() || !wait.ClosedAt.IsZero() {
+		return OperatorAttentionEvent{}, errors.New("CI slow attention evidence is invalid")
+	}
+	profile, err := operatorAttentionProfileForRun(run)
+	if err != nil {
+		return OperatorAttentionEvent{}, err
+	}
+	raw, _ := json.Marshal(struct {
+		RunID, HeadSHA, ProfileDigest, WarningAt string
+		PRNumber                                 int64
+	}{run.ID, wait.HeadSHA, wait.ProfileDigest, wait.WarningAt.UTC().Format(time.RFC3339Nano), wait.PRNumber})
+	digest := sha256.Sum256(raw)
+	return newOperatorAttentionEvent(operatorAttentionEventInput{
+		ScopeID: run.ID, RunID: run.ID, EventType: OperatorAttentionCISlow,
+		Profile: profile, State: run.State, Severity: "warning", ReasonCode: "ci_wait_slow",
+		EvidenceDigest: hex.EncodeToString(digest[:]), OccurredAt: wait.WarningAt, ObservedAt: wait.WarningAt,
+	})
+}
+
+func CIWaitRecoveryAttentionEvent(run Run, schedule RetrySchedule) (OperatorAttentionEvent, error) {
+	if (run.State != domain.StatePROpen && run.State != domain.StateReconcilingReviews) || schedule.RunID != run.ID || schedule.Phase != AutomaticRetryPhaseForRun(run) || schedule.Status != RetryScheduleAttention || schedule.FailureClass != RetryFailureTerminal || schedule.ReasonCode != RetryReasonTerminal || schedule.AttentionAt.IsZero() {
+		return OperatorAttentionEvent{}, errors.New("CI wait recovery attention evidence is invalid")
+	}
+	profile, err := operatorAttentionProfileForRun(run)
+	if err != nil {
+		return OperatorAttentionEvent{}, err
+	}
+	evidence := retryAttentionDigest(schedule)
+	return newOperatorAttentionEvent(operatorAttentionEventInput{ScopeID: run.ID, RunID: run.ID, EventType: OperatorAttentionCIWaitRecovery, Profile: profile, State: run.State, Severity: "warning", ReasonCode: "legacy_ci_topology_drift", EvidenceDigest: evidence, OccurredAt: schedule.AttentionAt, ObservedAt: schedule.AttentionAt})
 }
 
 // ManualInterventionAttentionEvent maps one persisted manual stop. Its key and
@@ -311,6 +348,7 @@ type operatorAttentionEventInput struct {
 	Severity           string
 	ReasonCode         string
 	EvidenceDigest     string
+	RetryFailureClass  RetryFailureClass
 	TransitionSequence int64
 	OccurredAt         time.Time
 	ObservedAt         time.Time
@@ -343,7 +381,7 @@ func newOperatorAttentionEvent(input operatorAttentionEventInput) (OperatorAtten
 		EventType:     eventType, RunID: input.RunID, LinearIdentifier: input.LinearIdentifier,
 		RepositoryProfileID: input.Profile.ID, RepositoryProfileName: input.Profile.Name,
 		ControllerState: state, Severity: severity, ReasonCode: reason,
-		AllowedActions: allowedOperatorAttentionActions(eventType, state, reason), EvidenceDigest: input.EvidenceDigest,
+		AllowedActions: allowedOperatorAttentionActionsFor(eventType, state, reason, input.RetryFailureClass), EvidenceDigest: input.EvidenceDigest, RetryFailureClass: input.RetryFailureClass,
 		OccurredAt: input.OccurredAt.UTC(), ObservedAt: input.ObservedAt.UTC(),
 	}
 	event.PayloadDigest = OperatorAttentionPayloadDigest(event)
@@ -372,8 +410,20 @@ func validOperatorAttentionProfile(profile OperatorAttentionProfile) bool {
 }
 
 func allowedOperatorAttentionActions(eventType, state, reason string) []OperatorAttentionActionID {
+	return allowedOperatorAttentionActionsFor(eventType, state, reason, "")
+}
+
+func allowedOperatorAttentionActionsFor(eventType, state, reason string, failureClass RetryFailureClass) []OperatorAttentionActionID {
 	if eventType == OperatorAttentionRetry && reason != operatorAttentionUnknown && knownOperatorAttentionState(domain.State(state)) {
-		return []OperatorAttentionActionID{OperatorAttentionActionRetry, OperatorAttentionActionAbandon}
+		actions := []OperatorAttentionActionID{}
+		if GracefulAbandonState(domain.State(state)) {
+			actions = append(actions, OperatorAttentionActionAbandon)
+		}
+		retryable := failureClass == RetryFailureProcessStart && operatorRetryableState(domain.State(state)) || failureClass == RetryFailureUnavailable && (domain.State(state) == domain.StateReceived || domain.State(state) == domain.StateAdmitting)
+		if retryable && reason == RetryReasonBudgetExhausted {
+			actions = append([]OperatorAttentionActionID{OperatorAttentionActionRetry}, actions...)
+		}
+		return actions
 	}
 	if eventType == OperatorAttentionManualIntervention && state == string(domain.StateManualIntervention) && reason == "manual_intervention" {
 		return []OperatorAttentionActionID{OperatorAttentionActionAbandon}
@@ -381,7 +431,26 @@ func allowedOperatorAttentionActions(eventType, state, reason string) []Operator
 	if eventType == OperatorAttentionHumanDecision && state == string(domain.StateAwaitingHumanDecision) && reason == "human_decision_required" {
 		return []OperatorAttentionActionID{OperatorAttentionActionDecide}
 	}
+	if eventType == OperatorAttentionCISlow && state == string(domain.StateReconcilingReviews) && reason == "ci_wait_slow" {
+		return []OperatorAttentionActionID{OperatorAttentionActionAbandon}
+	}
+	if eventType == OperatorAttentionCIWaitRecovery && (state == string(domain.StatePROpen) || state == string(domain.StateReconcilingReviews)) && reason == "legacy_ci_topology_drift" {
+		return []OperatorAttentionActionID{OperatorAttentionActionRecoverCIWait}
+	}
 	return []OperatorAttentionActionID{}
+}
+
+// operatorRetryableState is shared by attention projection and the command
+// guard so presentation can never advertise a retry the service will reject.
+func operatorRetryableState(state domain.State) bool {
+	switch state {
+	case domain.StateReceived, domain.StateAdmitting, domain.StateProvisioning,
+		domain.StateExecuting, domain.StateVerifying, domain.StateFreshReview,
+		domain.StateRepairing, domain.StateApprovalReady:
+		return true
+	default:
+		return false
+	}
 }
 
 func operatorAttentionProfileForRun(run Run) (OperatorAttentionProfile, error) {
@@ -397,7 +466,7 @@ func operatorAttentionProfileForRun(run Run) (OperatorAttentionProfile, error) {
 
 func sanitizedOperatorAttentionEventType(value string) string {
 	switch value {
-	case OperatorAttentionSourceCheckoutSkipped, OperatorAttentionCandidatePriorityTie, OperatorAttentionCandidateScan, OperatorAttentionSchedulerLease, OperatorAttentionAdmissionAuthority, OperatorAttentionRetry, OperatorAttentionCleanupResidue, OperatorAttentionManualIntervention, OperatorAttentionHumanDecision:
+	case OperatorAttentionSourceCheckoutSkipped, OperatorAttentionCandidatePriorityTie, OperatorAttentionCandidateScan, OperatorAttentionSchedulerLease, OperatorAttentionAdmissionAuthority, OperatorAttentionRetry, OperatorAttentionCleanupResidue, OperatorAttentionManualIntervention, OperatorAttentionHumanDecision, OperatorAttentionCISlow, OperatorAttentionCIWaitRecovery:
 		return value
 	default:
 		return operatorAttentionUnknown
@@ -415,6 +484,8 @@ func sanitizedOperatorAttentionReason(eventType, value string) string {
 		OperatorAttentionCleanupResidue:        {"cleanup_residue": true},
 		OperatorAttentionManualIntervention:    {"manual_intervention": true},
 		OperatorAttentionHumanDecision:         {"human_decision_required": true},
+		OperatorAttentionCISlow:                {"ci_wait_slow": true},
+		OperatorAttentionCIWaitRecovery:        {"legacy_ci_topology_drift": true},
 	}
 	if allowed[eventType][value] {
 		return value
@@ -474,9 +545,10 @@ func OperatorAttentionPayloadDigest(event OperatorAttentionEvent) string {
 	payload := struct {
 		SchemaVersion                                                                                                                         int
 		EventType, RunID, LinearIdentifier, RepositoryProfileID, RepositoryProfileName, ControllerState, Severity, ReasonCode, EvidenceDigest string
+		RetryFailureClass                                                                                                                     RetryFailureClass
 		AllowedActions                                                                                                                        []OperatorAttentionActionID
 		OccurredAt, ObservedAt                                                                                                                string
-	}{event.SchemaVersion, event.EventType, event.RunID, event.LinearIdentifier, event.RepositoryProfileID, event.RepositoryProfileName, event.ControllerState, event.Severity, event.ReasonCode, event.EvidenceDigest, event.AllowedActions, event.OccurredAt.UTC().Format(time.RFC3339Nano), event.ObservedAt.UTC().Format(time.RFC3339Nano)}
+	}{event.SchemaVersion, event.EventType, event.RunID, event.LinearIdentifier, event.RepositoryProfileID, event.RepositoryProfileName, event.ControllerState, event.Severity, event.ReasonCode, event.EvidenceDigest, event.RetryFailureClass, event.AllowedActions, event.OccurredAt.UTC().Format(time.RFC3339Nano), event.ObservedAt.UTC().Format(time.RFC3339Nano)}
 	raw, _ := json.Marshal(payload)
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
@@ -501,7 +573,7 @@ func ValidateOperatorAttentionEvent(event OperatorAttentionEvent) error {
 	if event.SchemaVersion != OperatorAttentionSchemaVersion || event.PayloadDigest == "" || event.AllowedActions == nil {
 		return errors.New("operator attention event record is corrupt")
 	}
-	input := operatorAttentionEventInput{ScopeID: operatorAttentionScopeFromKey(event.EventKey), RunID: event.RunID, EventType: event.EventType, LinearIdentifier: event.LinearIdentifier, Profile: OperatorAttentionProfile{ID: event.RepositoryProfileID, Name: event.RepositoryProfileName}, State: event.ControllerState, Severity: event.Severity, ReasonCode: event.ReasonCode, EvidenceDigest: event.EvidenceDigest, OccurredAt: event.OccurredAt, ObservedAt: event.ObservedAt}
+	input := operatorAttentionEventInput{ScopeID: operatorAttentionScopeFromKey(event.EventKey), RunID: event.RunID, EventType: event.EventType, LinearIdentifier: event.LinearIdentifier, Profile: OperatorAttentionProfile{ID: event.RepositoryProfileID, Name: event.RepositoryProfileName}, State: event.ControllerState, Severity: event.Severity, ReasonCode: event.ReasonCode, EvidenceDigest: event.EvidenceDigest, RetryFailureClass: event.RetryFailureClass, OccurredAt: event.OccurredAt, ObservedAt: event.ObservedAt}
 	parts := strings.Split(event.EventKey, ":")
 	if len(parts) != 4 || parts[0] != "automation" || parts[1] == "" || parts[2] != event.EventType {
 		return errors.New("operator attention event record is corrupt")
@@ -514,6 +586,51 @@ func ValidateOperatorAttentionEvent(event OperatorAttentionEvent) error {
 		return errors.New("operator attention event record is corrupt")
 	}
 	return nil
+}
+
+// ValidatePreviousOperatorAttentionEvent preserves immutable schema-1 rows
+// while schema 2 narrows retry presentation. It never grants their historical
+// actions to a new command; command services still validate current policy.
+func ValidatePreviousOperatorAttentionEvent(event OperatorAttentionEvent) error {
+	if event.SchemaVersion != OperatorAttentionPreviousSchemaVersion || event.PayloadDigest == "" || event.AllowedActions == nil || previousOperatorAttentionPayloadDigest(event) != event.PayloadDigest {
+		return errors.New("previous operator attention event record is corrupt")
+	}
+	parts := strings.Split(event.EventKey, ":")
+	if len(parts) != 4 || parts[0] != "automation" || parts[1] == "" || parts[2] != event.EventType || event.EventType == OperatorAttentionCISlow {
+		return errors.New("previous operator attention event record is corrupt")
+	}
+	wantActions := allowedOperatorAttentionActions(event.EventType, event.ControllerState, event.ReasonCode)
+	if event.EventType == OperatorAttentionRetry && event.ReasonCode != operatorAttentionUnknown && knownOperatorAttentionState(domain.State(event.ControllerState)) {
+		wantActions = []OperatorAttentionActionID{OperatorAttentionActionRetry, OperatorAttentionActionAbandon}
+	}
+	if !equalOperatorAttentionActions(wantActions, event.AllowedActions) {
+		return errors.New("previous operator attention event record is corrupt")
+	}
+	return nil
+}
+
+func previousOperatorAttentionPayloadDigest(event OperatorAttentionEvent) string {
+	payload := struct {
+		SchemaVersion                                                                                                                         int
+		EventType, RunID, LinearIdentifier, RepositoryProfileID, RepositoryProfileName, ControllerState, Severity, ReasonCode, EvidenceDigest string
+		AllowedActions                                                                                                                        []OperatorAttentionActionID
+		OccurredAt, ObservedAt                                                                                                                string
+	}{event.SchemaVersion, event.EventType, event.RunID, event.LinearIdentifier, event.RepositoryProfileID, event.RepositoryProfileName, event.ControllerState, event.Severity, event.ReasonCode, event.EvidenceDigest, event.AllowedActions, event.OccurredAt.UTC().Format(time.RFC3339Nano), event.ObservedAt.UTC().Format(time.RFC3339Nano)}
+	raw, _ := json.Marshal(payload)
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+func UpgradePreviousOperatorAttentionEvent(event OperatorAttentionEvent) (OperatorAttentionEvent, error) {
+	if err := ValidatePreviousOperatorAttentionEvent(event); err != nil {
+		return OperatorAttentionEvent{}, err
+	}
+	input := operatorAttentionEventInput{ScopeID: operatorAttentionScopeFromKey(event.EventKey), RunID: event.RunID, EventType: event.EventType, LinearIdentifier: event.LinearIdentifier, Profile: OperatorAttentionProfile{ID: event.RepositoryProfileID, Name: event.RepositoryProfileName}, State: event.ControllerState, Severity: event.Severity, ReasonCode: event.ReasonCode, EvidenceDigest: event.EvidenceDigest, RetryFailureClass: event.RetryFailureClass, OccurredAt: event.OccurredAt, ObservedAt: event.ObservedAt}
+	parts := strings.Split(event.EventKey, ":")
+	if sequence, err := strconv.ParseInt(parts[3], 10, 64); err == nil && sequence > 0 {
+		input.TransitionSequence = sequence
+	}
+	return newOperatorAttentionEvent(input)
 }
 
 // ValidateLegacyOperatorAttentionEvent validates the sanitized projection of

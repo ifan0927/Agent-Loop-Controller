@@ -323,6 +323,16 @@ the next worker cycle resumes the same run through the normal production driver
 without a separate drive command. A repeated failure increments the retained
 attempt and produces a new stable attention event instead of looping.
 
+GitHub required-check startup is a durable poll, not a retry failure. The
+controller binds the first absent/queued/in-progress observation to the exact
+run, repository profile digest, PR, and candidate head. A profile-owned slow-CI
+threshold (20 minutes by default) emits one restart-stable `ci_wait_slow`
+attention event but does not stop polling. Passing/actionable checks, a new
+candidate head, or leaving review reconciliation closes the matching wait.
+Check topology may advance during one bounded read; the later complete snapshot
+is accepted only while repository, PR, head/base, protection, pagination, and
+review authority remain unchanged.
+
 **Key invariants**
 
 No preemption, timestamp/FIFO ordering, or more than one active run. The total
@@ -651,7 +661,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 27; migration history is code, not a
+inspection. The current schema is version 28; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees

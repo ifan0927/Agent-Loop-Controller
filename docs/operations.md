@@ -83,6 +83,14 @@ one configuration, but paths must not overlap and a run freezes the selected
 profile digest and private authority binding. Changing configuration never
 retargets an active run.
 
+Each repository may set `ci_slow_threshold` between `1m` and `24h`; omission
+uses `20m`. This is an observability threshold, not a timeout. Required checks
+that are absent, queued, or running continue to poll after one idempotent
+`ci_wait_slow` event. The first persisted GitHub observation anchors the wait;
+the controller wall clock evaluates the threshold even while GitHub reads are
+temporarily unavailable. Existing version-1 profile digests created before this
+optional field remain valid when the field is omitted.
+
 Automatic admission uses a deterministic total order. Linear priorities 1, 2,
 3, and 4 rank first in that order, and unprioritized 0 ranks last. Equal
 priorities use the numeric sequence from the validated `IFAN-<sequence>`
@@ -863,6 +871,26 @@ states. Exact replay returns the same journaled result.
 **Related commands**
 
 `controller inspect`, `controller worker`, `controller drive`.
+
+### `controller recover-ci-wait`
+
+This one-purpose compatibility recovery applies only to a pre-fix run parked at
+`pr_open` or `reconciling_reviews` by the historical check-topology-drift read.
+
+```sh
+ifan-loop controller recover-ci-wait '<run-id>' [--config <file>] \
+  --requester '<login>' --requester-database-id '<id>' \
+  --requester-node-id '<node-id>' --requester-type User
+```
+
+It requires the exact 13-observation incident fingerprint (including token
+mint), successful read transport, unchanged Linear/requester/profile/App/PR/
+head/base/local ownership, and no unresolved side-effect intent. Fresh GitHub
+evidence must contain complete required-check authority. It performs fresh
+read-only Linear and GitHub validation, records typed operator-action provenance,
+supersedes only the matching terminal schedule, and lets the running worker
+resume on its next poll. It never pushes, opens or adopts a PR, replies,
+approves, resolves, merges, or invokes the driver.
 
 ### `controller continue`
 
