@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/localregistry"
 )
@@ -212,7 +213,7 @@ func TestLoadVersionThreeEnabledAutomationValidatesAuthorityAndSanitizesInspect(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !loaded.Automation.LinearTodoAdmission.Enabled || loaded.Automation.LinearTodoAdmission.MaxActiveRuns != 1 {
+	if !loaded.Automation.LinearTodoAdmission.Enabled || loaded.Automation.LinearTodoAdmission.MaxActiveRuns != 1 || loaded.Automation.LinearTodoAdmission.DeliveryPollInterval != 30*time.Second {
 		t.Fatalf("automation=%+v", loaded.Automation.LinearTodoAdmission)
 	}
 	first, err := json.Marshal(loaded.Readiness())
@@ -232,7 +233,7 @@ func TestLoadVersionThreeEnabledAutomationValidatesAuthorityAndSanitizesInspect(
 			t.Fatalf("inspect leaked %q: %s", forbidden, first)
 		}
 	}
-	for _, required := range []string{`"enabled":true`, `"max_active_runs":1`, `"login":"ifan0927"`, `"profile_digest"`, `"credential_source_type":"environment"`} {
+	for _, required := range []string{`"enabled":true`, `"poll_interval":"5m0s"`, `"delivery_poll_interval":"30s"`, `"max_active_runs":1`, `"login":"ifan0927"`, `"profile_digest"`, `"credential_source_type":"environment"`} {
 		if !strings.Contains(string(first), required) {
 			t.Fatalf("inspect omitted %q: %s", required, first)
 		}
@@ -263,6 +264,11 @@ func TestLoadVersionThreeEnabledAutomationRejectsMissingInvalidAndUnknownFields(
 		},
 		func(a map[string]any) { a["poll_interval"] = "10s" },
 		func(a map[string]any) { a["poll_interval"] = "2h" },
+		func(a map[string]any) { a["delivery_poll_interval"] = nil },
+		func(a map[string]any) { a["delivery_poll_interval"] = "not-a-duration" },
+		func(a map[string]any) { a["delivery_poll_interval"] = "0s" },
+		func(a map[string]any) { a["delivery_poll_interval"] = "29s" },
+		func(a map[string]any) { a["delivery_poll_interval"] = "5m1s" },
 		func(a map[string]any) { a["scheduler_lease_ttl"] = "20s" },
 		func(a map[string]any) { a["scheduler_lease_renewal_interval"] = "3s" },
 		func(a map[string]any) { a["scheduler_lease_renewal_interval"] = "45s" },
@@ -304,6 +310,51 @@ func TestLoadVersionThreeEnabledAutomationRejectsMissingInvalidAndUnknownFields(
 	writeJSONFixture(t, configPath, config)
 	if _, err := Load(configPath); err == nil || !strings.Contains(err.Error(), "identity_conflict") {
 		t.Fatalf("Linear profile team mismatch error=%v", err)
+	}
+}
+
+func TestLoadVersionThreeDefaultsOmittedLegacyDeliveryPollInterval(t *testing.T) {
+	configPath, config := enabledAutomationConfig(t)
+	delete(config["automation"].(map[string]any)["linear_todo_admission"].(map[string]any), "delivery_poll_interval")
+	writeJSONFixture(t, configPath, config)
+
+	loaded, err := Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Version != CurrentVersion || loaded.Automation.LinearTodoAdmission.DeliveryPollInterval != 30*time.Second {
+		t.Fatalf("version=%d automation=%+v", loaded.Version, loaded.Automation.LinearTodoAdmission)
+	}
+	readiness, err := json.Marshal(loaded.Readiness())
+	if err != nil || !strings.Contains(string(readiness), `"delivery_poll_interval":"30s"`) {
+		t.Fatalf("readiness=%s err=%v", readiness, err)
+	}
+}
+
+func TestLoadVersionThreeRejectsExplicitEmptyDeliveryPollInterval(t *testing.T) {
+	configPath, config := enabledAutomationConfig(t)
+	config["automation"].(map[string]any)["linear_todo_admission"].(map[string]any)["delivery_poll_interval"] = ""
+	writeJSONFixture(t, configPath, config)
+	if _, err := Load(configPath); err == nil || !strings.Contains(err.Error(), "invalid_config") {
+		t.Fatalf("explicit empty delivery interval error=%v", err)
+	}
+}
+
+func TestLoadVersionThreeAcceptsDeliveryPollIntervalBounds(t *testing.T) {
+	for _, interval := range []string{"30s", "5m"} {
+		t.Run(interval, func(t *testing.T) {
+			configPath, config := enabledAutomationConfig(t)
+			config["automation"].(map[string]any)["linear_todo_admission"].(map[string]any)["delivery_poll_interval"] = interval
+			writeJSONFixture(t, configPath, config)
+			loaded, err := Load(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, _ := time.ParseDuration(interval)
+			if loaded.Automation.LinearTodoAdmission.DeliveryPollInterval != want {
+				t.Fatalf("delivery interval=%s want=%s", loaded.Automation.LinearTodoAdmission.DeliveryPollInterval, want)
+			}
+		})
 	}
 }
 
@@ -355,7 +406,7 @@ func validAdmissionFixture() map[string]any {
 		"enabled": true, "team_id": "123e4567-e89b-42d3-a456-426614174000", "team_key": "IFAN",
 		"todo_state":        map[string]any{"id": "123e4567-e89b-42d3-a456-426614174001", "name": "Todo", "type": "unstarted"},
 		"in_progress_state": map[string]any{"id": "123e4567-e89b-42d3-a456-426614174002", "name": "In Progress", "type": "started"},
-		"poll_interval":     "5m", "scheduler_lease_ttl": "1m", "scheduler_lease_renewal_interval": "20s",
+		"poll_interval":     "5m", "delivery_poll_interval": "30s", "scheduler_lease_ttl": "1m", "scheduler_lease_renewal_interval": "20s",
 		"max_candidates": 20, "max_pages": 5, "max_active_runs": 1,
 		"requester":         map[string]any{"database_id": 1, "node_id": "node", "login": "ifan0927", "type": "User"},
 		"notification_mode": "local_outbox", "credential_source_ref": "secret://env/IFAN_LOOP_LINEAR_TOKEN",

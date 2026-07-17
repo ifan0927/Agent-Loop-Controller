@@ -82,6 +82,9 @@ func TestConfigInitCreatesExclusiveSecretFreeV3Template(t *testing.T) {
 	if template.Controller.DatabasePath != filepath.Join(filepath.Dir(path), "controller.db") {
 		t.Fatalf("database path=%q", template.Controller.DatabasePath)
 	}
+	if template.Automation.LinearTodoAdmission.PollInterval != "5m" || template.Automation.LinearTodoAdmission.DeliveryPollInterval != "30s" {
+		t.Fatalf("polling defaults=%+v", template.Automation.LinearTodoAdmission)
+	}
 	for _, forbidden := range []string{"private_key", "BEGIN PRIVATE KEY", "github_pat_", "ghp_"} {
 		if strings.Contains(string(raw), forbidden) || strings.Contains(output, forbidden) {
 			t.Fatalf("template or output contains secret material marker %q", forbidden)

@@ -47,6 +47,14 @@ func TestBoundWorkerLogStreamTruncatesOnlyPrivateRegularFileAtLimit(t *testing.T
 	}
 }
 
+func TestAutomaticWorkerKeepsAdmissionAndDeliveryCadencesIndependent(t *testing.T) {
+	configured := bootstrap.LinearTodoAdmission{PollInterval: 5 * time.Minute, DeliveryPollInterval: 30 * time.Second}
+	policy := automaticWorkerDriverPolicy(configured)
+	if configured.PollInterval != 5*time.Minute || policy.PollInterval != 30*time.Second || policy.MaxImmediateAction != 32 {
+		t.Fatalf("configured=%+v policy=%+v", configured, policy)
+	}
+}
+
 func TestControllerWorkerSubprocessSIGTERMClosesCompleteRuntime(t *testing.T) {
 	root := resolvedTempDir(t)
 	configPath, dbPath := writeControllerStatusConfig(t, root)
@@ -74,7 +82,7 @@ func TestControllerWorkerSubprocessSIGTERMClosesCompleteRuntime(t *testing.T) {
 		"enabled": true, "team_id": "123e4567-e89b-42d3-a456-426614174100", "team_key": "IFAN",
 		"todo_state":        map[string]any{"id": offlineAdmissionTodoState.ID, "name": offlineAdmissionTodoState.Name, "type": offlineAdmissionTodoState.Type},
 		"in_progress_state": map[string]any{"id": offlineAdmissionInProgressState.ID, "name": offlineAdmissionInProgressState.Name, "type": offlineAdmissionInProgressState.Type},
-		"poll_interval":     "1m", "scheduler_lease_ttl": "1m", "scheduler_lease_renewal_interval": "20s",
+		"poll_interval":     "1m", "delivery_poll_interval": "30s", "scheduler_lease_ttl": "1m", "scheduler_lease_renewal_interval": "20s",
 		"max_candidates": 10, "max_pages": 1, "max_active_runs": 1,
 		"requester":         map[string]any{"database_id": 33, "node_id": "MDQ6VXNlcjMz", "login": "ifan0927", "type": "User"},
 		"notification_mode": "local_outbox", "credential_source_ref": "secret://env/IFAN_LOOP_LINEAR_TOKEN",

@@ -127,6 +127,7 @@ type configTemplateAutomation struct {
 type configTemplateLinearTodoAdmission struct {
 	Enabled                       bool   `json:"enabled"`
 	PollInterval                  string `json:"poll_interval"`
+	DeliveryPollInterval          string `json:"delivery_poll_interval"`
 	SchedulerLeaseTTL             string `json:"scheduler_lease_ttl"`
 	SchedulerLeaseRenewalInterval string `json:"scheduler_lease_renewal_interval"`
 	MaxCandidates                 int    `json:"max_candidates"`
@@ -263,7 +264,7 @@ func newConfigTemplate(root string) configTemplate {
 		GitHubAppProfiles: []json.RawMessage{},
 		Repositories:      []json.RawMessage{},
 		Automation: configTemplateAutomation{LinearTodoAdmission: configTemplateLinearTodoAdmission{
-			Enabled: false, PollInterval: "5m", SchedulerLeaseTTL: "1m", SchedulerLeaseRenewalInterval: "20s",
+			Enabled: false, PollInterval: "5m", DeliveryPollInterval: "30s", SchedulerLeaseTTL: "1m", SchedulerLeaseRenewalInterval: "20s",
 			MaxCandidates: 20, MaxPages: 5, MaxActiveRuns: 1, NotificationMode: "local_outbox",
 		}},
 	}

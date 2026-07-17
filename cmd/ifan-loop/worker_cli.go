@@ -138,7 +138,7 @@ func newAutomaticWorkerRuntime(loaded bootstrap.Bootstrap, instanceID string) (a
 		return automaticWorkerRuntime{}, errors.New("automatic admission state store is unavailable")
 	}
 	requester := application.Requester{ID: configured.Requester.Login, Kind: "github_login", DatabaseID: configured.Requester.DatabaseID, NodeID: configured.Requester.NodeID, ActorType: configured.Requester.Type}
-	dispatcher, err := application.NewLinearTodoDispatcher(client, client, linearRegistryResolver{registry: loaded.Registry}, client, store, newLocalController(store, loaded.Controller.CodexBinary, ""), automaticWorkerDriver{loaded: loaded, store: store, policy: application.ProductionDriverPolicy{PollInterval: configured.PollInterval, MaxImmediateAction: 32}}, application.LinearTodoDispatchPolicy{
+	dispatcher, err := application.NewLinearTodoDispatcher(client, client, linearRegistryResolver{registry: loaded.Registry}, client, store, newLocalController(store, loaded.Controller.CodexBinary, ""), automaticWorkerDriver{loaded: loaded, store: store, policy: automaticWorkerDriverPolicy(configured)}, application.LinearTodoDispatchPolicy{
 		CandidateAuthority: application.LinearTodoCandidateAuthority{TeamID: configured.TeamID, TeamKey: configured.TeamKey, TodoState: application.LinearState{ID: configured.TodoState.ID, Name: configured.TodoState.Name, Type: configured.TodoState.Type}, InProgressState: application.LinearState{ID: configured.InProgressState.ID, Name: configured.InProgressState.Name, Type: configured.InProgressState.Type}, MaxCandidates: configured.MaxCandidates, MaxPages: configured.MaxPages},
 		StartAuthority:     application.LinearIssueStartAuthority{TeamID: configured.TeamID, TeamKey: configured.TeamKey, TodoState: application.LinearState{ID: configured.TodoState.ID, Name: configured.TodoState.Name, Type: configured.TodoState.Type}, InProgressState: application.LinearState{ID: configured.InProgressState.ID, Name: configured.InProgressState.Name, Type: configured.InProgressState.Type}},
 		LeaseTTL:           configured.SchedulerLeaseTTL,
@@ -151,6 +151,10 @@ func newAutomaticWorkerRuntime(loaded bootstrap.Bootstrap, instanceID string) (a
 		return automaticWorkerRuntime{}, errors.New("automatic admission worker is unavailable")
 	}
 	return automaticWorkerRuntime{store: store, dispatch: dispatcher.Dispatch}, nil
+}
+
+func automaticWorkerDriverPolicy(configured bootstrap.LinearTodoAdmission) application.ProductionDriverPolicy {
+	return application.ProductionDriverPolicy{PollInterval: configured.DeliveryPollInterval, MaxImmediateAction: 32}
 }
 
 func closeWorkerStateStore(store *sqlitestore.Store) error {

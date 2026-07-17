@@ -198,12 +198,44 @@ idempotent GitHub reply step after a verified trusted-feedback repair.
 
 ### Polling and waiting states
 
-- `pr_open`, `reconciling_reviews`, and `awaiting_human_approval` re-read GitHub.
-- `awaiting_github_mergeability` waits for GitHub protection, especially human
-  conversation resolution, then returns to reconciliation or merge.
-- `awaiting_linear_completion` re-reads Linear after a recorded merge.
-- Scheduled automatic retries are separate durable records; they do not invent
-  a new domain state or reset after restart.
+- The admission worker's admission interval gates idle scans of Linear Todo
+  authority. A durable retry schedule instead waits until its SQLite
+  `next_eligible_at`; scheduler lease renewal observes SQLite ownership while a
+  dispatch is active. Neither timer sets delivery cadence.
+- Action-scoped reconciliation, reply, cleanup, and local-controller lease
+  tickers also observe only SQLite lease ownership. Their intervals derive from
+  fixed lease TTLs; they do not poll GitHub or Linear and are not delivery
+  readiness cadence.
+- The production driver's independent delivery interval gates GitHub rereads in
+  `pr_open`, `reconciling_reviews`, `awaiting_human_approval`, and
+  `awaiting_github_mergeability`. Those reads observe PR/head/base, required CI,
+  stable CI snapshots, review threads, exact-head approval, protection, and
+  mergeability authority.
+- The same delivery interval gates Linear completion rereads in
+  `awaiting_linear_completion`, every retryable unavailable production action,
+  and the no-wait immediate-action guard. Linear remains completion authority;
+  the guard is internal loop-safety authority and cannot manufacture progress.
+- Every configured wait is positive and bounded. Context cancellation interrupts
+  admission and delivery timers promptly. A pending CI snapshot continues
+  polling rather than becoming a failure; its durable evidence and slow-CI
+  attention threshold remain independent of polling cadence.
+
+Every retryable `unavailable` result from a production action uses the same
+fixed delivery interval before another attempt:
+
+| Production action | Authority revalidated by each attempt |
+| --- | --- |
+| Continue local | Persisted run/requester/state plus local Git, worktree, Codex process, verifier, and artifact evidence |
+| Reconcile GitHub | Owned PR/head/base, required CI stable reads, review topology, exact-head approval, protection, and mergeability |
+| Reply to review feedback | Persisted feedback/reply intent plus fresh GitHub comment/reply authority |
+| Push branch | Exact-head approval, local candidate, configured remote, and restart-safe push evidence |
+| Create or adopt PR | Exact-head approval, branch/head/base ownership, persisted create intent, and GitHub PR identity |
+| Merge PR | Exact-head verification/review/check/approval evidence, current GitHub protection, and conditional squash-merge intent |
+| Reconcile Linear completion | Recorded merge binding and fresh Linear issue completion state |
+| Cleanup and source sync | Recorded merge/completion, owned local/remote resources, exact source state, and cleanup evidence |
+
+This retry cadence is loop scheduling, not new authority. Each action retains
+its existing compare-and-swap, fresh-read, lease, and idempotency gates.
 
 ### Human decision states
 

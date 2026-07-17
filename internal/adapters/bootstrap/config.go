@@ -24,6 +24,9 @@ const (
 	LegacyVersion  = 1
 	VersionTwo     = 2
 	CurrentVersion = 3
+
+	minimumDeliveryPollInterval = 30 * time.Second
+	maximumDeliveryPollInterval = 5 * time.Minute
 )
 
 var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
@@ -66,8 +69,8 @@ type Bootstrap struct {
 	Automation          Automation
 }
 
-// Automation contains only validated local admission authority. It does not
-// create an admission source or perform any external operation.
+// Automation contains validated local worker authority and cadence. It does
+// not create an admission source, delivery driver, or external operation.
 type Automation struct {
 	LinearTodoAdmission LinearTodoAdmission
 }
@@ -79,6 +82,7 @@ type LinearTodoAdmission struct {
 	TodoState             WorkflowState
 	InProgressState       WorkflowState
 	PollInterval          time.Duration
+	DeliveryPollInterval  time.Duration
 	SchedulerLeaseTTL     time.Duration
 	SchedulerLeaseRenewal time.Duration
 	MaxCandidates         int
@@ -136,6 +140,7 @@ type readinessAutomation struct {
 type readinessLinearTodoAdmission struct {
 	Enabled               bool                `json:"enabled"`
 	PollInterval          string              `json:"poll_interval,omitempty"`
+	DeliveryPollInterval  string              `json:"delivery_poll_interval,omitempty"`
 	SchedulerLeaseTTL     string              `json:"scheduler_lease_ttl,omitempty"`
 	SchedulerLeaseRenewal string              `json:"scheduler_lease_renewal_interval,omitempty"`
 	MaxCandidates         int                 `json:"max_candidates,omitempty"`
@@ -172,6 +177,7 @@ func (b Bootstrap) Readiness() any {
 	admission := readinessLinearTodoAdmission{Enabled: b.Automation.LinearTodoAdmission.Enabled}
 	if configured := b.Automation.LinearTodoAdmission; configured.Enabled {
 		admission.PollInterval = configured.PollInterval.String()
+		admission.DeliveryPollInterval = configured.DeliveryPollInterval.String()
 		admission.SchedulerLeaseTTL = configured.SchedulerLeaseTTL.String()
 		admission.SchedulerLeaseRenewal = configured.SchedulerLeaseRenewal.String()
 		admission.MaxCandidates = configured.MaxCandidates
@@ -219,6 +225,7 @@ type linearTodoAdmissionFile struct {
 	TodoState                     workflowStateFile `json:"todo_state"`
 	InProgressState               workflowStateFile `json:"in_progress_state"`
 	PollInterval                  string            `json:"poll_interval"`
+	DeliveryPollInterval          json.RawMessage   `json:"delivery_poll_interval"`
 	SchedulerLeaseTTL             string            `json:"scheduler_lease_ttl"`
 	SchedulerLeaseRenewalInterval string            `json:"scheduler_lease_renewal_interval"`
 	MaxCandidates                 int               `json:"max_candidates"`
@@ -351,8 +358,8 @@ func decodeRegistry(raw configFile) (localregistry.Registry, string, error) {
 }
 
 // decodeAutomation intentionally has no dependency on a client, database, or
-// credential source. The configuration is authority only until a later feature
-// explicitly composes an admission mechanism.
+// credential source. The configuration remains inert until the worker composes
+// its admission and delivery mechanisms.
 func decodeAutomation(raw configFile, registry localregistry.Registry) (Automation, error) {
 	if raw.Version != CurrentVersion {
 		if len(raw.Automation) != 0 {
@@ -398,6 +405,18 @@ func validateLinearTodoAdmission(raw linearTodoAdmissionFile, registry localregi
 	if err != nil || poll < time.Minute || poll > time.Hour {
 		return Automation{}, invalid("automatic admission poll interval is invalid")
 	}
+	deliveryPoll := minimumDeliveryPollInterval
+	if len(raw.DeliveryPollInterval) != 0 {
+		var value string
+		if decodeErr := json.Unmarshal(raw.DeliveryPollInterval, &value); decodeErr != nil {
+			return Automation{}, invalid("automatic delivery poll interval is invalid")
+		}
+		configured, parseErr := time.ParseDuration(value)
+		if parseErr != nil || configured < minimumDeliveryPollInterval || configured > maximumDeliveryPollInterval {
+			return Automation{}, invalid("automatic delivery poll interval is invalid")
+		}
+		deliveryPoll = configured
+	}
 	leaseTTL, err := time.ParseDuration(raw.SchedulerLeaseTTL)
 	if err != nil || leaseTTL < 30*time.Second || leaseTTL > 10*time.Minute {
 		return Automation{}, invalid("automatic admission scheduler lease is invalid")
@@ -422,7 +441,7 @@ func validateLinearTodoAdmission(raw linearTodoAdmissionFile, registry localregi
 	return Automation{LinearTodoAdmission: LinearTodoAdmission{Enabled: true, TeamID: raw.TeamID, TeamKey: raw.TeamKey,
 		TodoState:       WorkflowState{ID: raw.TodoState.ID, Name: raw.TodoState.Name, Type: raw.TodoState.Type},
 		InProgressState: WorkflowState{ID: raw.InProgressState.ID, Name: raw.InProgressState.Name, Type: raw.InProgressState.Type},
-		PollInterval:    poll, SchedulerLeaseTTL: leaseTTL, SchedulerLeaseRenewal: leaseRenewal, MaxCandidates: raw.MaxCandidates,
+		PollInterval:    poll, DeliveryPollInterval: deliveryPoll, SchedulerLeaseTTL: leaseTTL, SchedulerLeaseRenewal: leaseRenewal, MaxCandidates: raw.MaxCandidates,
 		MaxPages: raw.MaxPages, MaxActiveRuns: raw.MaxActiveRuns, Requester: requester, NotificationMode: raw.NotificationMode,
 		CredentialSourceRef: raw.CredentialSourceRef}}, nil
 }

@@ -239,6 +239,15 @@ func (*driverPullRequestOpener) OpenPullRequest(context.Context, PullRequestOpen
 	return domain.PullRequest{}, nil
 }
 
+type driverReviewReplyPort struct{}
+
+func (driverReviewReplyPort) FindReviewCommentReplies(context.Context, int64, int64) ([]domain.ReviewReply, error) {
+	return nil, nil
+}
+func (driverReviewReplyPort) ReplyToReviewComment(context.Context, ReplyToReviewCommentRequest) (domain.ReviewReply, error) {
+	return domain.ReviewReply{}, nil
+}
+
 type driverMerger struct{}
 
 func (driverMerger) SquashMerge(context.Context, SquashMergeRequest) (domain.PullRequest, []GitHubRequestObservation, GitHubInstallationMetadata, error) {
@@ -342,16 +351,16 @@ func TestProductionDriverPollsForApprovalThenContinuesThroughCleanup(t *testing.
 		}
 		return nil
 	}
-	waits := 0
-	driver := newDriverForTest(t, reader, coordinator, func(context.Context, time.Duration) error {
-		waits++
+	waits := []time.Duration{}
+	driver := newDriverForTest(t, reader, coordinator, func(_ context.Context, interval time.Duration) error {
+		waits = append(waits, interval)
 		return nil
 	})
 
 	result, err := driver.Drive(context.Background(), driverCommand())
 	want := []ProductionAction{ProductionReconcileGitHub, ProductionReconcileGitHub, ProductionReconcileGitHub, ProductionMerge, ProductionReconcileLinear, ProductionCleanup}
-	if err != nil || result.Run.State != domain.StateCompleted || result.Action != ProductionStop || waits != 2 || len(coordinator.calls) != len(want) {
-		t.Fatalf("result=%+v calls=%v waits=%d err=%v", result, coordinator.calls, waits, err)
+	if err != nil || result.Run.State != domain.StateCompleted || result.Action != ProductionStop || len(waits) != 2 || waits[0] != time.Second || waits[1] != time.Second || len(coordinator.calls) != len(want) {
+		t.Fatalf("result=%+v calls=%v waits=%v err=%v", result, coordinator.calls, waits, err)
 	}
 	for index, action := range want {
 		if coordinator.calls[index] != action {
@@ -360,6 +369,48 @@ func TestProductionDriverPollsForApprovalThenContinuesThroughCleanup(t *testing.
 	}
 	if coordinator.sourceSync == nil {
 		t.Fatal("driver did not compose the source synchronization port")
+	}
+}
+
+func TestProductionDriverUsesDeliveryCadenceForEveryPendingAuthority(t *testing.T) {
+	for _, state := range []domain.State{
+		domain.StatePROpen,
+		domain.StateReconcilingReviews,
+		domain.StateAwaitingHumanApproval,
+		domain.StateAwaitingGitHubMergeability,
+		domain.StateAwaitingLinearCompletion,
+	} {
+		t.Run(string(state), func(t *testing.T) {
+			reader := &driverRunReader{run: driverRun(state)}
+			coordinator := &driverCoordinator{runs: reader}
+			calls := 0
+			coordinator.apply = func(action ProductionAction) error {
+				calls++
+				if state == domain.StateAwaitingLinearCompletion && action != ProductionReconcileLinear {
+					t.Fatalf("action=%s", action)
+				}
+				if state != domain.StateAwaitingLinearCompletion && action != ProductionReconcileGitHub {
+					t.Fatalf("action=%s", action)
+				}
+				if calls == 2 {
+					reader.run.State = domain.StateManualIntervention
+				}
+				return nil
+			}
+			const deliveryCadence = 37 * time.Second
+			waits := []time.Duration{}
+			driver, err := NewProductionDriver(coordinator, reader, reader, reader, ProductionDriverPorts{GitHubReader: driverGitHubReader{}}, ProductionDriverPolicy{PollInterval: deliveryCadence, MaxImmediateAction: 8}, func(_ context.Context, interval time.Duration) error {
+				waits = append(waits, interval)
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := driver.Drive(context.Background(), driverCommand())
+			if err != nil || result.Run.State != domain.StateManualIntervention || calls != 2 || len(waits) != 1 || waits[0] != deliveryCadence {
+				t.Fatalf("result=%+v calls=%d waits=%v err=%v", result, calls, waits, err)
+			}
+		})
 	}
 }
 
@@ -412,30 +463,79 @@ func TestProductionDriverDispatchesPushAndPullRequestPortsInOrder(t *testing.T) 
 	}
 }
 
-func TestProductionDriverRetriesUnavailableReconciliationOnlyAfterWait(t *testing.T) {
-	reader := &driverRunReader{run: driverRun(domain.StateReconcilingReviews)}
-	coordinator := &driverCoordinator{runs: reader}
-	reads := 0
-	coordinator.apply = func(action ProductionAction) error {
-		if action != ProductionReconcileGitHub {
-			t.Fatalf("unexpected action %s", action)
-		}
-		reads++
-		if reads == 1 {
-			return serviceError(ErrorUnavailable, "temporary GitHub read failure", errors.New("transport"))
-		}
-		reader.run.State = domain.StateManualIntervention
-		return nil
+func TestProductionDriverRetriesEveryUnavailableActionAtDeliveryCadence(t *testing.T) {
+	cases := []struct {
+		name   string
+		state  domain.State
+		action ProductionAction
+	}{
+		{"continue local", domain.StateExecuting, ProductionContinueLocal},
+		{"GitHub reconcile", domain.StateReconcilingReviews, ProductionReconcileGitHub},
+		{"review reply", domain.StateReplyingReviewFeedback, ProductionReplyReviewFeedback},
+		{"push", domain.StateApprovalReady, ProductionPush},
+		{"pull request creation", domain.StateBranchPushed, ProductionOpenPullRequest},
+		{"merge", domain.StateMerging, ProductionMerge},
+		{"Linear completion", domain.StateAwaitingLinearCompletion, ProductionReconcileLinear},
+		{"cleanup and source sync", domain.StateCleaning, ProductionCleanup},
 	}
-	waits := 0
-	driver := newDriverForTest(t, reader, coordinator, func(context.Context, time.Duration) error {
-		waits++
-		return nil
-	})
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := &driverRunReader{run: driverRun(tc.state)}
+			coordinator := &driverCoordinator{runs: reader}
+			attempts := 0
+			coordinator.apply = func(action ProductionAction) error {
+				if action != tc.action {
+					t.Fatalf("action=%s want=%s", action, tc.action)
+				}
+				attempts++
+				if attempts == 1 {
+					return serviceError(ErrorUnavailable, "temporary action failure", errors.New("transport"))
+				}
+				reader.run.State = domain.StateManualIntervention
+				return nil
+			}
+			const deliveryCadence = 41 * time.Second
+			waits := []time.Duration{}
+			driver, err := NewProductionDriver(coordinator, reader, reader, reader, ProductionDriverPorts{
+				GitHubReader:       driverGitHubReader{},
+				ReviewCommentReply: driverReviewReplyPort{},
+				ApprovalValidator:  driverApprovalValidator{},
+				BranchPublisher:    &driverBranchPublisher{},
+				PullRequestOpener:  &driverPullRequestOpener{},
+				SquashMerger:       driverMerger{},
+				CleanupPort:        driverCleanupPort{},
+				SourceSyncPort:     driverSourceSyncPort{},
+			}, ProductionDriverPolicy{PollInterval: deliveryCadence, MaxImmediateAction: 8}, func(_ context.Context, interval time.Duration) error {
+				waits = append(waits, interval)
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := driver.Drive(context.Background(), driverCommand())
+			if err != nil || attempts != 2 || len(waits) != 1 || waits[0] != deliveryCadence || result.Run.State != domain.StateManualIntervention {
+				t.Fatalf("result=%+v attempts=%d waits=%v err=%v", result, attempts, waits, err)
+			}
+		})
+	}
+}
 
-	result, err := driver.Drive(context.Background(), driverCommand())
-	if err != nil || reads != 2 || waits != 1 || result.Run.State != domain.StateManualIntervention || result.Action != ProductionStop {
-		t.Fatalf("result=%+v reads=%d waits=%d err=%v", result, reads, waits, err)
+func TestProductionDriverUnavailableRetryHonorsCancellation(t *testing.T) {
+	reader := &driverRunReader{run: driverRun(domain.StateReconcilingReviews)}
+	coordinator := &driverCoordinator{runs: reader, apply: func(ProductionAction) error {
+		return serviceError(ErrorUnavailable, "temporary GitHub read failure", errors.New("transport"))
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	driver := newDriverForTest(t, reader, coordinator, func(_ context.Context, interval time.Duration) error {
+		if interval != time.Second {
+			t.Fatalf("interval=%s", interval)
+		}
+		cancel()
+		return context.Canceled
+	})
+	_, err := driver.Drive(ctx, driverCommand())
+	if !errors.Is(err, context.Canceled) || len(coordinator.calls) != 1 {
+		t.Fatalf("err=%v calls=%v", err, coordinator.calls)
 	}
 }
 
@@ -529,7 +629,10 @@ func TestProductionDriverWaitsAfterImmediateActionLimit(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	waits := 0
-	driver, err := NewProductionDriver(coordinator, reader, reader, reader, ProductionDriverPorts{}, ProductionDriverPolicy{PollInterval: time.Second, MaxImmediateAction: 1}, func(context.Context, time.Duration) error {
+	driver, err := NewProductionDriver(coordinator, reader, reader, reader, ProductionDriverPorts{}, ProductionDriverPolicy{PollInterval: time.Second, MaxImmediateAction: 1}, func(_ context.Context, interval time.Duration) error {
+		if interval != time.Second {
+			t.Fatalf("interval=%s", interval)
+		}
 		waits++
 		cancel()
 		return context.Canceled
@@ -540,5 +643,15 @@ func TestProductionDriverWaitsAfterImmediateActionLimit(t *testing.T) {
 	_, err = driver.Drive(ctx, driverCommand())
 	if !errors.Is(err, context.Canceled) || waits != 1 || len(coordinator.calls) != 1 || coordinator.calls[0] != ProductionContinueLocal {
 		t.Fatalf("err=%v waits=%d calls=%v", err, waits, coordinator.calls)
+	}
+}
+
+func TestProductionPollWaitReturnsPromptlyWhenContextIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	started := time.Now()
+	err := waitForProductionPoll(ctx, time.Minute)
+	if !errors.Is(err, context.Canceled) || time.Since(started) > 100*time.Millisecond {
+		t.Fatalf("err=%v elapsed=%s", err, time.Since(started))
 	}
 }

@@ -321,6 +321,14 @@ exact pre-fix sanitized operation sequence and reject shortened, extended,
 reordered, non-2xx, authority-drifted, or response-digest-fingerprint-drifted
 traces.
 
+Polling-policy tests keep the worker's idle Linear admission interval separate
+from the production driver's delivery interval. Cover the legacy version-3
+omission default separately from explicit empty, null, malformed, zero, below-
+minimum, and above-maximum delivery configuration. Assert the exact cadence for
+pending authority rereads, every retryable unavailable production action, and
+the immediate-action guard, plus prompt context cancellation without real-time
+long sleeps.
+
 ## Adding a New State
 
 1. Prove that an existing state plus typed evidence cannot represent the

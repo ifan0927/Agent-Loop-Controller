@@ -76,7 +76,7 @@ The strict JSON document contains:
 | `linear` | Allowed GraphQL endpoint, credential source reference, team key, and bounded request settings |
 | `github_app_profiles` | App/installation/repository identities, PEM reference, request bounds, and narrow write switches |
 | `repositories` | Canonical owner/name, origins and local roots, base branch, verifier IDs, profile reference, and trusted actors |
-| `automation.linear_todo_admission` | Disabled/enabled authority, exact workflow states, scan/lease bounds, fixed requester, durable local event adapter mode, and credential reference |
+| `automation.linear_todo_admission` | Disabled/enabled authority, exact workflow states, independent admission/delivery poll bounds, lease bounds, fixed requester, durable local event adapter mode, and credential reference |
 
 Repository profiles are selectable one at a time per run. They may coexist in
 one configuration, but paths must not overlap and a run freezes the selected
@@ -100,6 +100,27 @@ selection; response order, timestamps, title, assignee, and issue prose do not
 affect the result. One nonterminal run blocks scanning and is never preempted.
 Duplicate or contradictory identities and incomplete bounded scans still fail
 closed for operator attention.
+
+`automation.linear_todo_admission.poll_interval` controls only idle Linear Todo
+admission scans and remains bounded from `1m` through `1h` (`5m` in the starter
+configuration). `delivery_poll_interval` independently controls active-run
+GitHub and Linear delivery observations and the driver's immediate-action
+guard. It is bounded from `30s` through `5m`, with a `30s` default. This fixed
+30-second strategy is the smallest deterministic MVP policy: one active run
+makes at most roughly two delivery attempts or observations per minute while
+avoiding the five-minute ready-state latency caused by inheriting admission
+cadence. This bound includes retryable unavailable side-effect attempts; each
+attempt still performs its normal fresh authority validation and idempotency
+checks. Pending CI remains pending and is reread at this cadence; durable wait
+evidence and the repository's 20-minute default slow-CI threshold are unchanged.
+
+Enabled version-3 configurations created before this field existed remain
+readable when `delivery_poll_interval` is omitted; the effective compatibility
+default is `30s`, and `config inspect` projects that value. Operators should add
+`"delivery_poll_interval": "30s"` explicitly on the next configuration update
+so intent remains discoverable. An explicitly empty, `null`, malformed, below-
+minimum, or above-maximum value is not an omission and fails validation. New
+`config init` output always includes the explicit field.
 
 ## 5. Credentials and Permissions
 
