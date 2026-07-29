@@ -703,7 +703,12 @@ external observations, and safe recovery fields. `pull_request_aggregate` is
 the explicitly mutable controller aggregate. Immutable creation-journal and
 GitHub read history appears under `pull_request_observations`; the separate
 `pull_request` field is the effective status derived from typed terminal
-evidence. Trusted feedback similarly separates its initial snapshot and
+evidence. The GitHub portion is limited to the deterministic latest 100 rows;
+`pull_request_observations_total` reports the durable count and
+`pull_request_observations_truncated` reports whether older rows were omitted.
+All rows are still integrity-checked, and effective feedback retains its latest
+matching candidate even when that row predates the output window. Trusted
+feedback similarly separates its initial snapshot and
 controller lifecycle from `effective_thread_status`, selected from the latest
 repository-, PR-, and strict-thread-matching immutable observation. An
 effective `unknown` or `conflict` means the persisted evidence is missing or

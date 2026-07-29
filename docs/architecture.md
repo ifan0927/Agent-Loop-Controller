@@ -512,8 +512,11 @@ same version 2 detail projection contract:
 - `pull_request_aggregate` is explicitly labelled as the mutable controller
   aggregate used by delivery commands. It is not historical evidence.
 - `pull_request_observations` contains immutable creation-journal and GitHub
-  read observations in deterministic persisted order. These retain the
-  historical PR facts without rewriting the aggregate.
+  read observations in deterministic persisted order. GitHub history is a
+  bounded latest-100 window; `pull_request_observations_total` and
+  `pull_request_observations_truncated` disclose the durable total and whether
+  older rows were omitted. These retain queryable historical PR facts without
+  rewriting the aggregate.
 - `pull_request` is the effective status. A valid immutable `merge_result`
   projects `merged` even when the aggregate remains open. Missing aggregate or
   incomplete persisted repository binding or terminal merge authority projects
@@ -546,6 +549,11 @@ agent claims are not projection authority. SQLite verifies each GitHub evidence
 digest and requires its SQL head SHA, repository ID, and canonical UTC
 observation time to match the digest-bound JSON. Equivalent legacy JSON timezone
 offsets remain valid, and equal instants are ordered by persisted evidence ID.
+Every durable row is audited even when it falls outside the output window.
+Inspection retains only that window, the global latest row, and one
+application-selected candidate per feedback root, so memory is bounded while an
+older matching thread remains effective behind arbitrarily many unrelated
+polls.
 
 **External side effects**
 

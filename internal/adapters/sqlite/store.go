@@ -2684,7 +2684,27 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 		id       int64
 		evidence domain.GitHubReadEvidence
 	}
-	var evidenceHistory []orderedGitHubEvidence
+	orderedBefore := func(left, right orderedGitHubEvidence) bool {
+		if left.evidence.ObservedAt.Equal(right.evidence.ObservedAt) {
+			return left.id < right.id
+		}
+		return left.evidence.ObservedAt.Before(right.evidence.ObservedAt)
+	}
+	insertBounded := func(window []orderedGitHubEvidence, item orderedGitHubEvidence) []orderedGitHubEvidence {
+		index := sort.Search(len(window), func(index int) bool {
+			return !orderedBefore(window[index], item)
+		})
+		window = append(window, orderedGitHubEvidence{})
+		copy(window[index+1:], window[index:])
+		window[index] = item
+		if len(window) > application.GitHubEvidenceProjectionLimit {
+			window = window[1:]
+		}
+		return window
+	}
+	var evidenceWindow []orderedGitHubEvidence
+	var latestEvidence *orderedGitHubEvidence
+	feedbackSelections := map[string]orderedGitHubEvidence{}
 	for rows.Next() {
 		var evidenceID int64
 		var repositoryID int64
@@ -2715,24 +2735,41 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 			rows.Close()
 			return inspection, errors.New("persisted GitHub evidence metadata mismatch")
 		}
-		evidenceHistory = append(evidenceHistory, orderedGitHubEvidence{id: evidenceID, evidence: e})
+		item := orderedGitHubEvidence{id: evidenceID, evidence: e}
+		inspection.GitHubEvidenceTotal++
+		evidenceWindow = insertBounded(evidenceWindow, item)
+		if latestEvidence == nil || orderedBefore(*latestEvidence, item) {
+			copy := item
+			latestEvidence = &copy
+		}
+		for _, feedback := range inspection.TrustedFeedback {
+			if !application.FeedbackEvidenceAffectsProjection(inspection, feedback, e) {
+				continue
+			}
+			current, found := feedbackSelections[feedback.RootCommentNodeID]
+			if !found || orderedBefore(current, item) {
+				feedbackSelections[feedback.RootCommentNodeID] = item
+			}
+		}
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
 		return inspection, err
 	}
 	rows.Close()
-	sort.SliceStable(evidenceHistory, func(i, j int) bool {
-		left, right := evidenceHistory[i], evidenceHistory[j]
-		if left.evidence.ObservedAt.Equal(right.evidence.ObservedAt) {
-			return left.id < right.id
-		}
-		return left.evidence.ObservedAt.Before(right.evidence.ObservedAt)
-	})
-	for _, item := range evidenceHistory {
+	inspection.GitHubEvidenceTruncated = inspection.GitHubEvidenceTotal > len(evidenceWindow)
+	for _, item := range evidenceWindow {
 		inspection.GitHubEvidenceHistory = append(inspection.GitHubEvidenceHistory, item.evidence)
-		evidence := item.evidence
+	}
+	if latestEvidence != nil {
+		evidence := latestEvidence.evidence
 		inspection.GitHubEvidence = &evidence
+	}
+	if len(feedbackSelections) > 0 {
+		inspection.GitHubFeedbackEvidence = make(map[string]domain.GitHubReadEvidence, len(feedbackSelections))
+		for root, item := range feedbackSelections {
+			inspection.GitHubFeedbackEvidence[root] = item.evidence
+		}
 	}
 	return inspection, nil
 }

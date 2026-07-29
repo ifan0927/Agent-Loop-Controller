@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -505,17 +507,15 @@ func TestGitHubEvidenceEqualTimesUseEvidenceIDOrderAcrossSQLiteRestart(t *testin
 	}
 	observedAt := time.Date(2026, 7, 29, 9, 0, 0, 0, time.UTC)
 	evidence := domain.GitHubReadEvidence{
-		Repository:    domain.RepositoryIdentity{ID: 99, NodeID: "REPO_99", Owner: "owner", Name: "repo"},
-		PullRequest:   domain.PullRequest{HeadSHA: strings.Repeat("a", 40)},
-		ObservedAt:    observedAt,
-		UnknownEvents: []string{"first"},
+		Repository:  domain.RepositoryIdentity{ID: 99, NodeID: "REPO_99", Owner: "owner", Name: "repo"},
+		PullRequest: domain.PullRequest{HeadSHA: strings.Repeat("a", 40)},
+		ObservedAt:  observedAt,
 	}
-	if err := store.SaveGitHubEvidence(ctx, run.ID, evidence); err != nil {
-		t.Fatal(err)
-	}
-	evidence.UnknownEvents = []string{"second"}
-	if err := store.SaveGitHubEvidence(ctx, run.ID, evidence); err != nil {
-		t.Fatal(err)
+	for index := 0; index < 105; index++ {
+		evidence.UnknownEvents = []string{fmt.Sprintf("tie-%03d", index)}
+		if err := store.SaveGitHubEvidence(ctx, run.ID, evidence); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -530,9 +530,10 @@ func TestGitHubEvidenceEqualTimesUseEvidenceIDOrderAcrossSQLiteRestart(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(inspection.GitHubEvidenceHistory) != 2 ||
-		len(inspection.GitHubEvidenceHistory[0].UnknownEvents) != 1 || inspection.GitHubEvidenceHistory[0].UnknownEvents[0] != "first" ||
-		len(inspection.GitHubEvidenceHistory[1].UnknownEvents) != 1 || inspection.GitHubEvidenceHistory[1].UnknownEvents[0] != "second" {
+	if inspection.GitHubEvidenceTotal != 105 || !inspection.GitHubEvidenceTruncated ||
+		len(inspection.GitHubEvidenceHistory) != application.GitHubEvidenceProjectionLimit ||
+		len(inspection.GitHubEvidenceHistory[0].UnknownEvents) != 1 || inspection.GitHubEvidenceHistory[0].UnknownEvents[0] != "tie-005" ||
+		len(inspection.GitHubEvidenceHistory[99].UnknownEvents) != 1 || inspection.GitHubEvidenceHistory[99].UnknownEvents[0] != "tie-104" {
 		t.Fatalf("equal-time evidence did not retain evidence-ID order: %+v", inspection.GitHubEvidenceHistory)
 	}
 }
@@ -632,5 +633,124 @@ func TestCorruptMergeSHAFailsClosedAcrossSQLiteRestart(t *testing.T) {
 				t.Fatal("corrupt persisted merge SHA was accepted")
 			}
 		})
+	}
+}
+
+func TestLargeGitHubHistoryUsesBoundedProjectionAndFeedbackSelectionAcrossRestart(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "controller.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 29, 11, 0, 0, 0, time.UTC)
+	head := strings.Repeat("a", 40)
+	base := strings.Repeat("b", 40)
+	repository := domain.RepositoryIdentity{ID: 99, NodeID: "REPO_99", Owner: "owner", Name: "repo"}
+	repositoryJSON, _ := json.Marshal(application.LocalRepository{CanonicalRepository: "owner/repo", ExpectedRepositoryID: repository.ID, AllowedOperatorLogins: []string{"operator"}})
+	run := application.Run{
+		ID: "large-github-history", IssueID: "IFAN-86", IdempotencyKey: "large-history-key",
+		SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task",
+		Repository: "owner/repo", RepositoryConfigJSON: string(repositoryJSON), RegistryVersion: 1,
+		BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: "/private/artifacts",
+	}
+	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE runs SET current_state=?,base_sha=?,candidate_head=? WHERE run_id=?`, domain.StatePROpen, base, head, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	pr := domain.PullRequest{
+		Number: 7, DatabaseID: 70, URL: "https://example.invalid/pull/7", NodeID: "PR_7",
+		HeadBranch: run.WorkingBranch, BaseBranch: run.BaseBranch, HeadSHA: head, BaseSHA: base,
+		BodyDigest: "body-digest", OwnershipKey: run.IdempotencyKey, State: "open",
+	}
+	if err := store.SavePullRequest(ctx, run.ID, pr); err != nil {
+		t.Fatal(err)
+	}
+	author := domain.ActorIdentity{DatabaseID: 33, NodeID: "USER_33", Login: "operator", Type: "User"}
+	body := "Please fix this."
+	line := 12
+	feedback := application.TrustedReviewFeedbackRecord{RunID: run.ID, TrustedReviewFeedback: domain.TrustedReviewFeedback{
+		PRNumber: pr.Number, PRDatabaseID: pr.DatabaseID, PRNodeID: pr.NodeID,
+		ReviewDatabaseID: 80, ReviewNodeID: "REVIEW_80", ThreadNodeID: "THREAD_90",
+		RootCommentDatabaseID: 100, RootCommentNodeID: "COMMENT_100", Author: author,
+		OriginalReviewHeadSHA: head, Path: "internal/example.go", Line: &line, Body: body,
+		BodyDigest: domain.TrustedReviewFeedbackDigest(body), SourceAt: now, ObservedAt: now,
+	}}
+	if _, created, err := store.SaveTrustedReviewFeedback(ctx, feedback); err != nil || !created {
+		t.Fatalf("feedback created=%v err=%v", created, err)
+	}
+	thread := domain.GitHubReviewThread{
+		NodeID: feedback.ThreadNodeID, Resolved: true, OriginalCommitSHA: head, Path: feedback.Path, Line: feedback.Line,
+		Comments: []domain.GitHubReviewComment{{
+			DatabaseID: feedback.RootCommentDatabaseID, NodeID: feedback.RootCommentNodeID,
+			Author: &author, BodyDigest: feedback.BodyDigest,
+			Review: domain.GitHubReview{
+				DatabaseID: feedback.ReviewDatabaseID, NodeID: feedback.ReviewNodeID,
+				State: "CHANGES_REQUESTED", CommitSHA: head, Actor: author,
+			},
+		}},
+	}
+	if err := store.SaveGitHubEvidence(ctx, run.ID, domain.GitHubReadEvidence{
+		Repository: repository, PullRequest: pr, ReviewThreads: []domain.GitHubReviewThread{thread}, ObservedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for index := 1; index <= 150; index++ {
+		if err := store.SaveGitHubEvidence(ctx, run.ID, domain.GitHubReadEvidence{
+			Repository: repository, PullRequest: pr, UnknownEvents: []string{fmt.Sprintf("poll-%03d", index)},
+			ObservedAt: now.Add(time.Duration(index) * time.Second),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	inspection, err := store.Inspect(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.GitHubEvidenceTotal != 151 || !inspection.GitHubEvidenceTruncated || len(inspection.GitHubEvidenceHistory) != application.GitHubEvidenceProjectionLimit {
+		t.Fatalf("bounded evidence retention shape is wrong: total=%d truncated=%v retained=%d", inspection.GitHubEvidenceTotal, inspection.GitHubEvidenceTruncated, len(inspection.GitHubEvidenceHistory))
+	}
+	if first := inspection.GitHubEvidenceHistory[0]; len(first.UnknownEvents) != 1 || first.UnknownEvents[0] != "poll-051" {
+		t.Fatalf("latest-N history window is not deterministic: %+v", first.UnknownEvents)
+	}
+	selected, found := inspection.GitHubFeedbackEvidence[feedback.RootCommentNodeID]
+	if !found || !selected.ObservedAt.Equal(now) || len(selected.ReviewThreads) != 1 {
+		t.Fatalf("older matching feedback evidence disappeared beyond output window: %+v", inspection.GitHubFeedbackEvidence)
+	}
+
+	service := application.NewQueryService(store)
+	query := application.QueryInput{
+		Requester: application.Requester{ID: "operator", Kind: "github_login"},
+		RunID:     run.ID, Repository: run.Repository,
+	}
+	status, err := service.Status(ctx, query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspect, err := service.Inspect(ctx, query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(status, inspect) {
+		t.Fatalf("status and inspect bounded projections differ:\nstatus=%+v\ninspect=%+v", status, inspect)
+	}
+	if len(status.PullRequestObservations) != application.GitHubEvidenceProjectionLimit ||
+		status.PullRequestObservationsTotal != 151 || !status.PullRequestObservationsTruncated {
+		t.Fatalf("bounded observation metadata is wrong: retained=%d total=%d truncated=%v", len(status.PullRequestObservations), status.PullRequestObservationsTotal, status.PullRequestObservationsTruncated)
+	}
+	if len(status.TrustedFeedback) != 1 || status.TrustedFeedback[0].EffectiveThreadStatus.Status != "resolved" ||
+		status.TrustedFeedback[0].EffectiveThreadStatus.EvidenceSource != "github_read_observation" {
+		t.Fatalf("feedback projection lost evidence beyond the output window: %+v", status.TrustedFeedback)
 	}
 }

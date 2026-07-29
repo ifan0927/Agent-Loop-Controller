@@ -390,30 +390,32 @@ func AuthorizePersistedRequester(run Run, requester Requester) error {
 }
 
 type InspectionResult struct {
-	SchemaVersion           string                          `json:"schema_version"`
-	Run                     RunResult                       `json:"run"`
-	RepositoryBinding       *RepositoryBindingResult        `json:"repository_binding,omitempty"`
-	Timeline                []TransitionResult              `json:"state_timeline"`
-	Attempts                []AttemptResult                 `json:"attempts"`
-	Verifications           []VerificationResult            `json:"verifications"`
-	Reviews                 []ReviewResult                  `json:"reviews"`
-	Resources               []ResourceResult                `json:"owned_resources"`
-	PullRequestAggregate    *PullRequestAggregateResult     `json:"pull_request_aggregate,omitempty"`
-	PullRequestObservations []PullRequestObservationResult  `json:"pull_request_observations"`
-	PullRequest             *EffectivePullRequestResult     `json:"pull_request,omitempty"`
-	Approval                *HumanApprovalResult            `json:"human_approval,omitempty"`
-	ApprovalStatus          *HumanApprovalStatusResult      `json:"human_approval_status,omitempty"`
-	Merge                   *MergeRecord                    `json:"merge_result,omitempty"`
-	LinearCompletion        []LinearCompletionObservation   `json:"linear_completion_observations"`
-	Cleanup                 []CleanupResult                 `json:"cleanup_progress"`
-	RetrySchedules          []RetrySchedule                 `json:"retry_schedules"`
-	OperatorAttentionEvents []OperatorAttentionEventResult  `json:"operator_attention_events"`
-	OperatorActions         []OperatorActionResult          `json:"operator_actions"`
-	Checks                  []CheckResult                   `json:"checks"`
-	Findings                []FindingResult                 `json:"review_findings"`
-	TrustedFeedback         []TrustedFeedbackResult         `json:"trusted_review_feedback"`
-	FeedbackConflicts       []TrustedFeedbackConflictResult `json:"trusted_review_feedback_conflicts"`
-	Telemetry               []TelemetryResult               `json:"unknown_telemetry"`
+	SchemaVersion                    string                          `json:"schema_version"`
+	Run                              RunResult                       `json:"run"`
+	RepositoryBinding                *RepositoryBindingResult        `json:"repository_binding,omitempty"`
+	Timeline                         []TransitionResult              `json:"state_timeline"`
+	Attempts                         []AttemptResult                 `json:"attempts"`
+	Verifications                    []VerificationResult            `json:"verifications"`
+	Reviews                          []ReviewResult                  `json:"reviews"`
+	Resources                        []ResourceResult                `json:"owned_resources"`
+	PullRequestAggregate             *PullRequestAggregateResult     `json:"pull_request_aggregate,omitempty"`
+	PullRequestObservations          []PullRequestObservationResult  `json:"pull_request_observations"`
+	PullRequestObservationsTotal     int                             `json:"pull_request_observations_total"`
+	PullRequestObservationsTruncated bool                            `json:"pull_request_observations_truncated"`
+	PullRequest                      *EffectivePullRequestResult     `json:"pull_request,omitempty"`
+	Approval                         *HumanApprovalResult            `json:"human_approval,omitempty"`
+	ApprovalStatus                   *HumanApprovalStatusResult      `json:"human_approval_status,omitempty"`
+	Merge                            *MergeRecord                    `json:"merge_result,omitempty"`
+	LinearCompletion                 []LinearCompletionObservation   `json:"linear_completion_observations"`
+	Cleanup                          []CleanupResult                 `json:"cleanup_progress"`
+	RetrySchedules                   []RetrySchedule                 `json:"retry_schedules"`
+	OperatorAttentionEvents          []OperatorAttentionEventResult  `json:"operator_attention_events"`
+	OperatorActions                  []OperatorActionResult          `json:"operator_actions"`
+	Checks                           []CheckResult                   `json:"checks"`
+	Findings                         []FindingResult                 `json:"review_findings"`
+	TrustedFeedback                  []TrustedFeedbackResult         `json:"trusted_review_feedback"`
+	FeedbackConflicts                []TrustedFeedbackConflictResult `json:"trusted_review_feedback_conflicts"`
+	Telemetry                        []TelemetryResult               `json:"unknown_telemetry"`
 }
 type RunSummaryPage struct {
 	SchemaVersion string       `json:"schema_version"`
@@ -679,8 +681,19 @@ type ThreadStatusResult struct {
 }
 
 func projectInspection(value RunInspection) InspectionResult {
+	pullRequestObservations := projectPullRequestObservations(value)
+	githubTotal := value.GitHubEvidenceTotal
+	if githubTotal < len(githubEvidenceHistory(value)) {
+		githubTotal = len(githubEvidenceHistory(value))
+	}
+	creationTotal := 0
+	for _, observation := range pullRequestObservations {
+		if observation.ObservationKind == "creation_journal" {
+			creationTotal++
+		}
+	}
 	result := InspectionResult{SchemaVersion: inspectionSchemaVersion, Run: projectRunResult(value.Run), RepositoryBinding: projectRepositoryBinding(value.RepositoryBinding), Merge: value.Merge,
-		Timeline: []TransitionResult{}, Attempts: []AttemptResult{}, Verifications: []VerificationResult{}, Reviews: []ReviewResult{}, Resources: []ResourceResult{}, PullRequestObservations: projectPullRequestObservations(value), LinearCompletion: append([]LinearCompletionObservation(nil), value.LinearCompletion...), Cleanup: []CleanupResult{}, RetrySchedules: append([]RetrySchedule(nil), value.RetrySchedules...), OperatorAttentionEvents: []OperatorAttentionEventResult{}, OperatorActions: []OperatorActionResult{}, Checks: []CheckResult{}, Findings: []FindingResult{}, TrustedFeedback: []TrustedFeedbackResult{}, FeedbackConflicts: []TrustedFeedbackConflictResult{}, Telemetry: []TelemetryResult{}}
+		Timeline: []TransitionResult{}, Attempts: []AttemptResult{}, Verifications: []VerificationResult{}, Reviews: []ReviewResult{}, Resources: []ResourceResult{}, PullRequestObservations: pullRequestObservations, PullRequestObservationsTotal: creationTotal + githubTotal, PullRequestObservationsTruncated: value.GitHubEvidenceTruncated || githubTotal > len(githubEvidenceHistory(value)), LinearCompletion: append([]LinearCompletionObservation(nil), value.LinearCompletion...), Cleanup: []CleanupResult{}, RetrySchedules: append([]RetrySchedule(nil), value.RetrySchedules...), OperatorAttentionEvents: []OperatorAttentionEventResult{}, OperatorActions: []OperatorActionResult{}, Checks: []CheckResult{}, Findings: []FindingResult{}, TrustedFeedback: []TrustedFeedbackResult{}, FeedbackConflicts: []TrustedFeedbackConflictResult{}, Telemetry: []TelemetryResult{}}
 	if value.Approval != nil {
 		result.Approval = &HumanApprovalResult{Approver: sanitizeUntrustedContent(value.Approval.Approver), ApprovedSHA: value.Approval.ApprovedSHA, SourceAt: value.Approval.ApprovedAt, ObservedAt: value.Approval.ObservedAt}
 	}
@@ -936,7 +949,7 @@ func projectEffectiveThreadStatus(value RunInspection, feedback TrustedReviewFee
 			return ThreadStatusResult{Status: "conflict", EvidenceSource: "trusted_review_feedback_conflict", ObservedAt: conflict.ObservedAt}
 		}
 	}
-	history := githubEvidenceHistory(value)
+	history := feedbackEvidenceHistory(value, feedback)
 	for index := len(history) - 1; index >= 0; index-- {
 		evidence := history[index]
 		if evidence.ObservedAt.IsZero() {
@@ -990,6 +1003,23 @@ func projectEffectiveThreadStatus(value RunInspection, feedback TrustedReviewFee
 		return ThreadStatusResult{Status: status, Resolved: &resolved, Outdated: &outdated, EvidenceSource: "controller_resolution_observation", ObservedAt: feedback.UpdatedAt}
 	}
 	return ThreadStatusResult{Status: "unknown", EvidenceSource: "no_authoritative_final_thread_observation"}
+}
+
+func feedbackEvidenceHistory(value RunInspection, feedback TrustedReviewFeedbackRecord) []domain.GitHubReadEvidence {
+	if evidence, found := value.GitHubFeedbackEvidence[feedback.RootCommentNodeID]; found {
+		return []domain.GitHubReadEvidence{evidence}
+	}
+	return githubEvidenceHistory(value)
+}
+
+// FeedbackEvidenceAffectsProjection keeps storage adapters unaware of feedback
+// authority semantics while allowing them to retain one bounded candidate.
+func FeedbackEvidenceAffectsProjection(value RunInspection, feedback TrustedReviewFeedbackRecord, evidence domain.GitHubReadEvidence) bool {
+	if feedback.ValidatePersistedAuthority(value.Run.ID) != nil {
+		return false
+	}
+	bound, relatedConflict := feedbackEvidenceAuthority(value, feedback, evidence)
+	return relatedConflict || (bound && containsReviewThread(evidence.ReviewThreads, feedback.ThreadNodeID))
 }
 
 func githubEvidenceHistoryHasInvalidTime(value RunInspection) bool {
