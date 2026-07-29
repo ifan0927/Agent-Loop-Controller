@@ -477,7 +477,7 @@ func (d *LinearTodoDispatcher) startAndDrive(ctx context.Context, lease *LinearT
 		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_before_local_start", run.ID))
 	}
 	leaseScope := d.startLeaseRenewal(ctx, lease)
-	defer leaseScope.stop()
+	defer leaseScope.stopAndJoin()
 	startedRun, err := command.Start(leaseScope.ctx, StartCommand{Requester: d.policy.Requester, RepositorySelection: input.Task.Repository, IdempotencyKey: input.IdempotencyKey, Input: input})
 	if leaseScope.lost() {
 		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_during_local_start", run.ID))
@@ -500,7 +500,7 @@ func (d *LinearTodoDispatcher) drive(ctx context.Context, lease *LinearTodoAdmis
 		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_before_driver", run.ID))
 	}
 	leaseScope := d.startLeaseRenewal(ctx, lease)
-	defer leaseScope.stop()
+	defer leaseScope.stopAndJoin()
 	return d.driveWithLeaseScope(ctx, leaseScope, run)
 }
 
@@ -509,6 +509,7 @@ type dispatchLeaseScope struct {
 	cancel    context.CancelCauseFunc
 	done      chan struct{}
 	leaseLost chan struct{}
+	stop      chan struct{}
 	stopTicks func()
 	stopOnce  sync.Once
 }
@@ -521,6 +522,7 @@ func (d *LinearTodoDispatcher) startLeaseRenewal(ctx context.Context, lease *Lin
 		cancel:    cancel,
 		done:      make(chan struct{}),
 		leaseLost: make(chan struct{}),
+		stop:      make(chan struct{}),
 		stopTicks: stopTicks,
 	}
 	go func() {
@@ -528,6 +530,8 @@ func (d *LinearTodoDispatcher) startLeaseRenewal(ctx context.Context, lease *Lin
 		for {
 			select {
 			case <-leaseCtx.Done():
+				return
+			case <-scope.stop:
 				return
 			case <-ticks:
 				if !d.renewLease(leaseCtx, lease) {
@@ -550,11 +554,12 @@ func (s *dispatchLeaseScope) lost() bool {
 	}
 }
 
-func (s *dispatchLeaseScope) stop() {
+func (s *dispatchLeaseScope) stopAndJoin() {
 	s.stopOnce.Do(func() {
 		s.stopTicks()
-		s.cancel(nil)
+		close(s.stop)
 		<-s.done
+		s.cancel(nil)
 	})
 }
 
@@ -566,6 +571,10 @@ func (d *LinearTodoDispatcher) driveWithLeaseScope(ctx context.Context, leaseSco
 		return LinearTodoDispatchResult{}, err
 	}
 	result, err := d.driver.Drive(leaseScope.ctx, ProductionDriveCommand{Requester: d.policy.Requester, RunID: run.ID, Repository: run.Repository, IdempotencyKey: run.IdempotencyKey})
+	// Stop new ticks and join an already-running renewal before accepting the
+	// driver outcome. Lease loss is authoritative even when Drive returned
+	// success or an unrelated error while the final CAS was still in flight.
+	leaseScope.stopAndJoin()
 	if leaseScope.lost() {
 		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_during_driver", run.ID))
 	}

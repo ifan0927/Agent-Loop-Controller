@@ -149,10 +149,14 @@ type dispatchDriver struct {
 	err         error
 	beforeError func(ProductionDriveCommand)
 	started     chan struct{}
+	returned    chan struct{}
 	allow       chan struct{}
 }
 
 func (d *dispatchDriver) Drive(ctx context.Context, command ProductionDriveCommand) (ProductionDriveResult, error) {
+	if d.returned != nil {
+		defer close(d.returned)
+	}
 	d.mu.Lock()
 	d.calls = append(d.calls, command)
 	started, allow := d.started, d.allow
@@ -198,6 +202,8 @@ type dispatchStore struct {
 	renewCalls             int
 	failRenewAt            int
 	renewErrAt             int
+	renewEntered           chan struct{}
+	renewAllow             chan struct{}
 	renewed                chan int
 	postProofDrift         bool
 	omitDecisionTransition bool
@@ -236,6 +242,12 @@ func (s *dispatchStore) RenewLinearTodoAdmissionLease(_ context.Context, lease L
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.renewCalls++
+	if s.renewEntered != nil {
+		close(s.renewEntered)
+	}
+	if s.renewAllow != nil {
+		<-s.renewAllow
+	}
 	if s.renewErrAt == s.renewCalls {
 		return LinearTodoAdmissionLease{}, false, errors.New("lease persistence unavailable")
 	}
@@ -1129,6 +1141,85 @@ func TestLinearTodoDispatcherFailsClosedWhenLeaseRenewalFailsDuringBlockedStart(
 			defer store.mu.Unlock()
 			if len(driver.calls) != 0 || len(store.attention) != 1 || store.attention[0].EventType != OperatorAttentionSchedulerLease || store.attention[0].ReasonCode != "lease_lost" {
 				t.Fatalf("driver=%+v attention=%+v", driver.calls, store.attention)
+			}
+		})
+	}
+}
+
+func TestLinearTodoDispatcherJoinsInflightRenewalBeforeAcceptingDriverOutcome(t *testing.T) {
+	driverFailure := errors.New("driver failed while lease renewal was in flight")
+	for _, test := range []struct {
+		name      string
+		driverErr error
+		setup     func(*dispatchStore)
+	}{
+		{name: "takeover after driver success", setup: func(store *dispatchStore) { store.leaseLost = true }},
+		{name: "stale owner after driver success", setup: func(store *dispatchStore) { store.lease.OwnerNonce = "takeover-owner" }},
+		{name: "persistence failure after driver success", setup: func(store *dispatchStore) { store.renewErrAt = store.renewCalls + 1 }},
+		{name: "lease loss takes precedence over driver error", driverErr: driverFailure, setup: func(store *dispatchStore) { store.failRenewAt = store.renewCalls + 1 }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := dispatchCandidate("inflight-renew-"+test.name, "IFAN-40", 1)
+			dispatcher, store, _, _, _, driver := newDispatchLab(t, candidate)
+			driver.started, driver.returned, driver.allow = make(chan struct{}), make(chan struct{}), make(chan struct{})
+			driver.err = test.driverErr
+			ticks := make(chan time.Time)
+			dispatcher.leaseTicks = func(time.Duration) (<-chan time.Time, func()) {
+				return ticks, func() {}
+			}
+			done := make(chan struct {
+				result LinearTodoDispatchResult
+				err    error
+			}, 1)
+			go func() {
+				result, err := dispatcher.Dispatch(context.Background())
+				done <- struct {
+					result LinearTodoDispatchResult
+					err    error
+				}{result, err}
+			}()
+			select {
+			case <-driver.started:
+			case <-time.After(time.Second):
+				t.Fatal("cycle did not reach exact-run driver")
+			}
+
+			store.mu.Lock()
+			store.renewEntered, store.renewAllow = make(chan struct{}), make(chan struct{})
+			test.setup(store)
+			renewEntered, renewAllow := store.renewEntered, store.renewAllow
+			store.mu.Unlock()
+			ticks <- time.Now()
+			select {
+			case <-renewEntered:
+			case <-time.After(time.Second):
+				t.Fatal("lease renewal did not enter persistence CAS")
+			}
+			close(driver.allow)
+			select {
+			case <-driver.returned:
+			case <-time.After(time.Second):
+				t.Fatal("driver did not return while lease renewal was blocked")
+			}
+			select {
+			case observed := <-done:
+				t.Fatalf("dispatch accepted driver outcome before renewal joined: result=%+v err=%v", observed.result, observed.err)
+			default:
+			}
+
+			close(renewAllow)
+			select {
+			case observed := <-done:
+				if observed.err != nil || observed.result.Outcome != LinearTodoDispatchAttention {
+					t.Fatalf("result=%+v err=%v", observed.result, observed.err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("dispatch did not report lease attention after final CAS failed")
+			}
+			store.mu.Lock()
+			defer store.mu.Unlock()
+			if len(store.attention) != 1 || store.attention[0].EventType != OperatorAttentionSchedulerLease || store.attention[0].ReasonCode != "lease_lost" {
+				t.Fatalf("attention=%+v", store.attention)
 			}
 		})
 	}

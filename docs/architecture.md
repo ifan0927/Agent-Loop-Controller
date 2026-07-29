@@ -342,6 +342,9 @@ attention; GitHub approval remains inside the production driver's bounded poll
 loop. A single configured-interval renewer fences the potentially long initial
 local start and continues without a gap through production-driver handoff;
 renewal ownership loss or persistence failure cancels the in-flight work.
+After the driver returns, dispatch stops new renewal ticks and joins any
+in-flight renewal before accepting the driver outcome; lease loss takes
+precedence over a concurrent driver success or error.
 Every dispatch cycle releases its short scheduler lease before waiting.
 An authenticated `retry` action is deliberately narrower than general recovery:
 it accepts only a current `retry_budget_exhausted` attention whose retained

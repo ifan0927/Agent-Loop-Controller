@@ -531,11 +531,13 @@ scheduler lease, resumes a nonterminal run or scans/adopts one eligible Todo,
 then drives it. The configured scheduler renewal interval keeps the same
 versioned lease owner alive continuously across initial local start and the
 production-driver handoff. A failed renewal cancels that in-flight work before
-the cycle reports scheduler attention. Attention parks admission but does not
-terminate the worker; a later cycle keeps observing the same durable authority
-without admitting a second run. The short scheduler lease is released after
-every cycle rather than renewed while parked. It reports bounded worker and
-queue-decision evidence;
+the cycle reports scheduler attention. The cycle joins an in-flight final
+renewal before accepting driver success or failure, so concurrent lease loss
+takes precedence over the driver outcome. Attention parks admission but does
+not terminate the worker; a later cycle keeps observing the same durable
+authority without admitting a second run. The short scheduler lease is released
+after every cycle rather than renewed while parked. It reports bounded worker
+and queue-decision evidence;
 `status` is `running`, `driving`, `parked`, or `stopping`, and a stopping result
 includes `previous_status`. The worker atomically replaces the private
 `<controller-config>.worker-status.json` snapshot on each transition rather
