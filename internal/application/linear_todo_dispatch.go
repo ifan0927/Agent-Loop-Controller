@@ -26,6 +26,8 @@ const (
 	LinearTodoDispatchRetryScheduled = "retry_scheduled"
 )
 
+var errDispatchLeaseRenewalSettled = errors.New("automatic admission lease renewal settled")
+
 const (
 	LinearTodoQueueDecisionNoCandidate        = "no_candidate"
 	LinearTodoQueueDecisionActiveRun          = "active_run"
@@ -477,19 +479,19 @@ func (d *LinearTodoDispatcher) startAndDrive(ctx context.Context, lease *LinearT
 		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_before_local_start", run.ID))
 	}
 	leaseScope := d.startLeaseRenewal(ctx, lease)
-	defer leaseScope.stopAndJoin()
+	defer leaseScope.settle()
 	startedRun, err := command.Start(leaseScope.ctx, StartCommand{Requester: d.policy.Requester, RepositorySelection: input.Task.Repository, IdempotencyKey: input.IdempotencyKey, Input: input})
-	if leaseScope.lost() {
-		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_during_local_start", run.ID))
-	}
 	if err != nil {
+		if result, handled, settleErr := d.settleLeaseScope(ctx, leaseScope, run, "lease_lost_during_local_start"); handled {
+			return result, settleErr
+		}
 		return LinearTodoDispatchResult{}, err
 	}
 	persisted, err := d.store.GetRun(leaseScope.ctx, run.ID)
-	if leaseScope.lost() {
-		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_after_local_start", run.ID))
-	}
 	if err != nil || persisted.ID != run.ID || persisted.Repository != run.Repository || persisted.IdempotencyKey != run.IdempotencyKey || startedRun.Run.RunID != run.ID {
+		if result, handled, settleErr := d.settleLeaseScope(ctx, leaseScope, run, "lease_lost_after_local_start"); handled {
+			return result, settleErr
+		}
 		return d.runAttention(ctx, run, "admission_authority_conflict", dispatchEvidence("post_start_proof_conflict", run.ID))
 	}
 	return d.driveWithLeaseScope(ctx, leaseScope, persisted)
@@ -500,45 +502,57 @@ func (d *LinearTodoDispatcher) drive(ctx context.Context, lease *LinearTodoAdmis
 		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_before_driver", run.ID))
 	}
 	leaseScope := d.startLeaseRenewal(ctx, lease)
-	defer leaseScope.stopAndJoin()
+	defer leaseScope.settle()
 	return d.driveWithLeaseScope(ctx, leaseScope, run)
 }
 
 type dispatchLeaseScope struct {
-	ctx       context.Context
-	cancel    context.CancelCauseFunc
-	done      chan struct{}
-	leaseLost chan struct{}
-	stop      chan struct{}
-	stopTicks func()
-	stopOnce  sync.Once
+	ctx         context.Context
+	cancelWork  context.CancelCauseFunc
+	cancelRenew context.CancelCauseFunc
+	done        chan struct{}
+	leaseLost   chan struct{}
+	stopTicks   func()
+	settleOnce  sync.Once
+	settled     bool
+	leaseMu     sync.Mutex
+	lease       LinearTodoAdmissionLease
+	targetLease *LinearTodoAdmissionLease
 }
 
 func (d *LinearTodoDispatcher) startLeaseRenewal(ctx context.Context, lease *LinearTodoAdmissionLease) *dispatchLeaseScope {
-	leaseCtx, cancel := context.WithCancelCause(ctx)
+	workCtx, cancelWork := context.WithCancelCause(ctx)
+	renewCtx, cancelRenew := context.WithCancelCause(workCtx)
 	ticks, stopTicks := d.leaseTicks(d.policy.LeaseRenewal)
 	scope := &dispatchLeaseScope{
-		ctx:       leaseCtx,
-		cancel:    cancel,
-		done:      make(chan struct{}),
-		leaseLost: make(chan struct{}),
-		stop:      make(chan struct{}),
-		stopTicks: stopTicks,
+		ctx:         workCtx,
+		cancelWork:  cancelWork,
+		cancelRenew: cancelRenew,
+		done:        make(chan struct{}),
+		leaseLost:   make(chan struct{}),
+		stopTicks:   stopTicks,
+		lease:       *lease,
+		targetLease: lease,
 	}
 	go func() {
 		defer close(scope.done)
 		for {
 			select {
-			case <-leaseCtx.Done():
-				return
-			case <-scope.stop:
+			case <-renewCtx.Done():
 				return
 			case <-ticks:
-				if !d.renewLease(leaseCtx, lease) {
-					close(scope.leaseLost)
-					cancel(errors.New("automatic admission lease renewal was lost"))
+				attemptCtx, cancelAttempt := context.WithTimeout(renewCtx, d.policy.LeaseRenewal)
+				next, renewed, err := d.renewLeaseAttempt(attemptCtx, scope.currentLease())
+				cancelAttempt()
+				if err != nil && context.Cause(renewCtx) == errDispatchLeaseRenewalSettled && errors.Is(err, context.Canceled) {
 					return
 				}
+				if err != nil || !renewed {
+					close(scope.leaseLost)
+					cancelWork(errors.New("automatic admission lease renewal was lost"))
+					return
+				}
+				scope.updateLease(next)
 			}
 		}
 	}()
@@ -554,29 +568,55 @@ func (s *dispatchLeaseScope) lost() bool {
 	}
 }
 
-func (s *dispatchLeaseScope) stopAndJoin() {
-	s.stopOnce.Do(func() {
+func (s *dispatchLeaseScope) currentLease() LinearTodoAdmissionLease {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	return s.lease
+}
+
+func (s *dispatchLeaseScope) updateLease(lease LinearTodoAdmissionLease) {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	s.lease = lease
+}
+
+func (s *dispatchLeaseScope) settle() bool {
+	s.settleOnce.Do(func() {
 		s.stopTicks()
-		close(s.stop)
+		s.cancelRenew(errDispatchLeaseRenewalSettled)
 		<-s.done
-		s.cancel(nil)
+		s.leaseMu.Lock()
+		*s.targetLease = s.lease
+		s.leaseMu.Unlock()
+		s.settled = true
 	})
+	return s.settled
+}
+
+func (d *LinearTodoDispatcher) settleLeaseScope(ctx context.Context, leaseScope *dispatchLeaseScope, run Run, evidence string) (LinearTodoDispatchResult, bool, error) {
+	settled := leaseScope.settle()
+	if err := ctx.Err(); err != nil {
+		return LinearTodoDispatchResult{}, true, err
+	}
+	if !settled || leaseScope.lost() {
+		result, err := d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence(evidence, run.ID))
+		return result, true, err
+	}
+	return LinearTodoDispatchResult{}, false, nil
 }
 
 func (d *LinearTodoDispatcher) driveWithLeaseScope(ctx context.Context, leaseScope *dispatchLeaseScope, run Run) (LinearTodoDispatchResult, error) {
-	if leaseScope.lost() {
-		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_before_driver", run.ID))
-	}
-	if err := leaseScope.ctx.Err(); err != nil {
-		return LinearTodoDispatchResult{}, err
+	if leaseScope.lost() || leaseScope.ctx.Err() != nil {
+		if result, handled, settleErr := d.settleLeaseScope(ctx, leaseScope, run, "lease_lost_before_driver"); handled {
+			return result, settleErr
+		}
 	}
 	result, err := d.driver.Drive(leaseScope.ctx, ProductionDriveCommand{Requester: d.policy.Requester, RunID: run.ID, Repository: run.Repository, IdempotencyKey: run.IdempotencyKey})
 	// Stop new ticks and join an already-running renewal before accepting the
 	// driver outcome. Lease loss is authoritative even when Drive returned
 	// success or an unrelated error while the final CAS was still in flight.
-	leaseScope.stopAndJoin()
-	if leaseScope.lost() {
-		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_during_driver", run.ID))
+	if settled, handled, settleErr := d.settleLeaseScope(ctx, leaseScope, run, "lease_lost_during_driver"); handled {
+		return settled, settleErr
 	}
 	if err != nil {
 		return LinearTodoDispatchResult{}, err
@@ -607,12 +647,20 @@ func (d *LinearTodoDispatcher) renewLease(ctx context.Context, lease *LinearTodo
 	if lease == nil {
 		return false
 	}
-	next, renewed, err := d.store.RenewLinearTodoAdmissionLease(ctx, *lease, d.policy.LeaseTTL, d.clock())
-	if err != nil || !renewed || next.Namespace != LinearTodoAdmissionLeaseNamespace || next.OwnerNonce != lease.OwnerNonce || next.Version <= lease.Version {
+	next, renewed, err := d.renewLeaseAttempt(ctx, *lease)
+	if err != nil || !renewed {
 		return false
 	}
 	*lease = next
 	return true
+}
+
+func (d *LinearTodoDispatcher) renewLeaseAttempt(ctx context.Context, lease LinearTodoAdmissionLease) (LinearTodoAdmissionLease, bool, error) {
+	next, renewed, err := d.store.RenewLinearTodoAdmissionLease(ctx, lease, d.policy.LeaseTTL, d.clock())
+	if err != nil || !renewed || next.Namespace != LinearTodoAdmissionLeaseNamespace || next.OwnerNonce != lease.OwnerNonce || next.Version <= lease.Version {
+		return LinearTodoAdmissionLease{}, false, err
+	}
+	return next, true, nil
 }
 
 func (d *LinearTodoDispatcher) advanceJournal(ctx context.Context, lease LinearTodoAdmissionLease, runID, from, to, intent, reason string) bool {

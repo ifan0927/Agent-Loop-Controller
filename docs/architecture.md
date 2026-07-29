@@ -344,7 +344,11 @@ local start and continues without a gap through production-driver handoff;
 renewal ownership loss or persistence failure cancels the in-flight work.
 After the driver returns, dispatch stops new renewal ticks and joins any
 in-flight renewal before accepting the driver outcome; lease loss takes
-precedence over a concurrent driver success or error.
+precedence over a concurrent driver success or error. Normal settlement cancels
+only the bounded renewal I/O context, not the completed work context. Lease
+persistence honors context cancellation so settlement joins the renewal
+goroutine without relying on a database busy timeout; any non-cancellation
+failure or unknown CAS result remains fail-closed lease loss.
 Every dispatch cycle releases its short scheduler lease before waiting.
 An authenticated `retry` action is deliberately narrower than general recovery:
 it accepts only a current `retry_budget_exhausted` attention whose retained

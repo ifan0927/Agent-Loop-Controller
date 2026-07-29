@@ -92,6 +92,9 @@ func (r dispatchResolver) ResolveLinearAdmissionRepository(label string) (LocalR
 type dispatchController struct{ store *dispatchStore }
 
 func (c *dispatchController) StartAuthorized(ctx context.Context, _ LocalStartInput, _ func(Run) error) (Run, error) {
+	if c.store.startReturned != nil {
+		defer close(c.store.startReturned)
+	}
 	if c.store.startEntered != nil {
 		close(c.store.startEntered)
 	}
@@ -101,6 +104,9 @@ func (c *dispatchController) StartAuthorized(ctx context.Context, _ LocalStartIn
 		case <-ctx.Done():
 			return Run{}, ctx.Err()
 		}
+	}
+	if c.store.startErr != nil {
+		return Run{}, c.store.startErr
 	}
 	c.store.mu.Lock()
 	defer c.store.mu.Unlock()
@@ -110,6 +116,9 @@ func (c *dispatchController) StartAuthorized(ctx context.Context, _ LocalStartIn
 }
 
 func (c *dispatchController) ContinueExpected(ctx context.Context, runID string, expected domain.State, key string, _ *Decision) (Run, error) {
+	if c.store.startReturned != nil {
+		defer close(c.store.startReturned)
+	}
 	if c.store.startEntered != nil {
 		close(c.store.startEntered)
 	}
@@ -119,6 +128,9 @@ func (c *dispatchController) ContinueExpected(ctx context.Context, runID string,
 		case <-ctx.Done():
 			return Run{}, ctx.Err()
 		}
+	}
+	if c.store.startErr != nil {
+		return Run{}, c.store.startErr
 	}
 	c.store.mu.Lock()
 	defer c.store.mu.Unlock()
@@ -204,12 +216,16 @@ type dispatchStore struct {
 	renewErrAt             int
 	renewEntered           chan struct{}
 	renewAllow             chan struct{}
+	renewWaitForCancel     bool
+	renewCanceled          chan struct{}
 	renewed                chan int
 	postProofDrift         bool
 	omitDecisionTransition bool
 	reserveBlocked         chan struct{}
 	startEntered           chan struct{}
+	startReturned          chan struct{}
 	startAllow             chan struct{}
+	startErr               error
 	ciWaitActive           bool
 	ciWaitClosed           int
 	ciWaitClosedAt         time.Time
@@ -238,20 +254,32 @@ func (s *dispatchStore) AcquireLinearTodoAdmissionLease(_ context.Context, owner
 	return s.lease, true, nil
 }
 
-func (s *dispatchStore) RenewLinearTodoAdmissionLease(_ context.Context, lease LinearTodoAdmissionLease, ttl time.Duration, now time.Time) (LinearTodoAdmissionLease, bool, error) {
+func (s *dispatchStore) RenewLinearTodoAdmissionLease(ctx context.Context, lease LinearTodoAdmissionLease, ttl time.Duration, now time.Time) (LinearTodoAdmissionLease, bool, error) {
+	s.mu.Lock()
+	s.renewCalls++
+	call := s.renewCalls
+	renewEntered, renewAllow := s.renewEntered, s.renewAllow
+	renewWaitForCancel, renewCanceled := s.renewWaitForCancel, s.renewCanceled
+	s.mu.Unlock()
+	if renewEntered != nil {
+		close(renewEntered)
+	}
+	if renewWaitForCancel {
+		<-ctx.Done()
+		if renewCanceled != nil {
+			close(renewCanceled)
+		}
+		return LinearTodoAdmissionLease{}, false, ctx.Err()
+	}
+	if renewAllow != nil {
+		<-renewAllow
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.renewCalls++
-	if s.renewEntered != nil {
-		close(s.renewEntered)
-	}
-	if s.renewAllow != nil {
-		<-s.renewAllow
-	}
-	if s.renewErrAt == s.renewCalls {
+	if s.renewErrAt == call {
 		return LinearTodoAdmissionLease{}, false, errors.New("lease persistence unavailable")
 	}
-	if s.failRenewAt == s.renewCalls || !s.held || s.leaseLost || lease.Namespace != s.lease.Namespace || lease.OwnerNonce != s.lease.OwnerNonce || lease.Version != s.lease.Version {
+	if s.failRenewAt == call || !s.held || s.leaseLost || lease.Namespace != s.lease.Namespace || lease.OwnerNonce != s.lease.OwnerNonce || lease.Version != s.lease.Version {
 		return LinearTodoAdmissionLease{}, false, nil
 	}
 	if now.After(s.lease.ExpiresAt) {
@@ -261,7 +289,7 @@ func (s *dispatchStore) RenewLinearTodoAdmissionLease(_ context.Context, lease L
 	s.lease.RenewedAt, s.lease.ExpiresAt = now.UTC(), now.UTC().Add(ttl)
 	if s.renewed != nil {
 		select {
-		case s.renewed <- s.renewCalls:
+		case s.renewed <- call:
 		default:
 		}
 	}
@@ -1220,6 +1248,146 @@ func TestLinearTodoDispatcherJoinsInflightRenewalBeforeAcceptingDriverOutcome(t 
 			defer store.mu.Unlock()
 			if len(store.attention) != 1 || store.attention[0].EventType != OperatorAttentionSchedulerLease || store.attention[0].ReasonCode != "lease_lost" {
 				t.Fatalf("attention=%+v", store.attention)
+			}
+		})
+	}
+}
+
+func TestLinearTodoDispatcherSettlesContextAwareRenewalWithoutFabricatingLeaseLoss(t *testing.T) {
+	candidate := dispatchCandidate("context-aware-settle", "IFAN-41", 1)
+	dispatcher, store, _, _, _, driver := newDispatchLab(t, candidate)
+	driver.started, driver.allow = make(chan struct{}), make(chan struct{})
+	ticks := make(chan time.Time)
+	tickerStopped := make(chan struct{})
+	dispatcher.leaseTicks = func(time.Duration) (<-chan time.Time, func()) {
+		return ticks, func() { close(tickerStopped) }
+	}
+	done := make(chan struct {
+		result LinearTodoDispatchResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := dispatcher.Dispatch(context.Background())
+		done <- struct {
+			result LinearTodoDispatchResult
+			err    error
+		}{result, err}
+	}()
+	select {
+	case <-driver.started:
+	case <-time.After(time.Second):
+		t.Fatal("cycle did not reach exact-run driver")
+	}
+	store.mu.Lock()
+	store.renewEntered, store.renewCanceled = make(chan struct{}), make(chan struct{})
+	store.renewWaitForCancel = true
+	renewEntered, renewCanceled := store.renewEntered, store.renewCanceled
+	store.mu.Unlock()
+	ticks <- time.Now()
+	select {
+	case <-renewEntered:
+	case <-time.After(time.Second):
+		t.Fatal("context-aware renewal did not enter persistence")
+	}
+	close(driver.allow)
+	select {
+	case <-renewCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("normal settlement did not cancel context-aware renewal")
+	}
+	select {
+	case observed := <-done:
+		if observed.err != nil || observed.result.Outcome != LinearTodoDispatchDriven {
+			t.Fatalf("result=%+v err=%v", observed.result, observed.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("context-aware renewal settlement deadlocked")
+	}
+	select {
+	case <-tickerStopped:
+	default:
+		t.Fatal("lease ticker did not terminate after normal settlement")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.attention) != 0 || store.held {
+		t.Fatalf("attention=%+v held=%t", store.attention, store.held)
+	}
+}
+
+func TestLinearTodoDispatcherSettlesStartOutcomesBeforeAcceptingThem(t *testing.T) {
+	startFailure := errors.New("initial start failed while renewal was in flight")
+	for _, test := range []struct {
+		name              string
+		startErr          error
+		postProofConflict bool
+		setup             func(*dispatchStore)
+	}{
+		{name: "start error racing takeover", startErr: startFailure, setup: func(store *dispatchStore) { store.leaseLost = true }},
+		{name: "start error racing stale owner", startErr: startFailure, setup: func(store *dispatchStore) { store.lease.OwnerNonce = "takeover-owner" }},
+		{name: "start error racing persistence loss", startErr: startFailure, setup: func(store *dispatchStore) { store.renewErrAt = store.renewCalls + 1 }},
+		{name: "post start proof conflict racing lease loss", postProofConflict: true, setup: func(store *dispatchStore) { store.failRenewAt = store.renewCalls + 1 }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := dispatchCandidate("settled-start-"+test.name, "IFAN-42", 1)
+			dispatcher, store, _, _, _, driver := newDispatchLab(t, candidate)
+			store.startEntered, store.startReturned, store.startAllow = make(chan struct{}), make(chan struct{}), make(chan struct{})
+			store.startErr, store.postProofDrift = test.startErr, test.postProofConflict
+			ticks := make(chan time.Time)
+			dispatcher.leaseTicks = func(time.Duration) (<-chan time.Time, func()) {
+				return ticks, func() {}
+			}
+			done := make(chan struct {
+				result LinearTodoDispatchResult
+				err    error
+			}, 1)
+			go func() {
+				result, err := dispatcher.Dispatch(context.Background())
+				done <- struct {
+					result LinearTodoDispatchResult
+					err    error
+				}{result, err}
+			}()
+			select {
+			case <-store.startEntered:
+			case <-time.After(time.Second):
+				t.Fatal("cycle did not reach initial start")
+			}
+			store.mu.Lock()
+			store.renewEntered, store.renewAllow = make(chan struct{}), make(chan struct{})
+			test.setup(store)
+			renewEntered, renewAllow := store.renewEntered, store.renewAllow
+			store.mu.Unlock()
+			ticks <- time.Now()
+			select {
+			case <-renewEntered:
+			case <-time.After(time.Second):
+				t.Fatal("lease renewal did not enter persistence CAS")
+			}
+			close(store.startAllow)
+			select {
+			case <-store.startReturned:
+			case <-time.After(time.Second):
+				t.Fatal("initial start did not return while renewal was blocked")
+			}
+			select {
+			case observed := <-done:
+				t.Fatalf("dispatch accepted start outcome before renewal joined: result=%+v err=%v", observed.result, observed.err)
+			default:
+			}
+			close(renewAllow)
+			select {
+			case observed := <-done:
+				if observed.err != nil || observed.result.Outcome != LinearTodoDispatchAttention {
+					t.Fatalf("result=%+v err=%v", observed.result, observed.err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("dispatch did not report lease attention after start outcome race")
+			}
+			store.mu.Lock()
+			defer store.mu.Unlock()
+			if len(driver.calls) != 0 || len(store.attention) != 1 || store.attention[0].EventType != OperatorAttentionSchedulerLease || store.attention[0].ReasonCode != "lease_lost" {
+				t.Fatalf("driver=%+v attention=%+v", driver.calls, store.attention)
 			}
 		})
 	}

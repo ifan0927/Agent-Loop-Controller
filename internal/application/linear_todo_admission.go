@@ -156,6 +156,8 @@ type AutomaticAdmissionChildStopper interface {
 
 // LinearTodoAdmissionStore is intentionally narrow. Future scheduling code
 // cannot turn it into a generic Linear mutation or controller-driving port.
+// Lease persistence methods must honor context cancellation so a dispatcher
+// can join renewal I/O without relying on an adapter-specific busy timeout.
 type LinearTodoAdmissionStore interface {
 	AcquireLinearTodoAdmissionLease(context.Context, string, time.Duration, time.Time) (LinearTodoAdmissionLease, bool, error)
 	RenewLinearTodoAdmissionLease(context.Context, LinearTodoAdmissionLease, time.Duration, time.Time) (LinearTodoAdmissionLease, bool, error)
