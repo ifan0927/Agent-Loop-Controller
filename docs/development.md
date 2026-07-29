@@ -19,6 +19,10 @@ the composition adapter; it must not create an alternate workflow policy.
 
 ## Build and Local Verification
 
+Local verification requires the Go version declared by `go.mod`, Git, and
+`ripgrep` with PCRE2 support. CI provisions the same scanner dependency before
+running the canonical gate.
+
 ```sh
 go build ./cmd/ifan-loop
 gofmt -w cmd internal

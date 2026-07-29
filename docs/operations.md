@@ -6,6 +6,7 @@ Production operation currently targets one local macOS user. Prepare:
 
 - Go version declared by [`go.mod`](../go.mod);
 - Git and a clean local source checkout for every configured repository;
+- `ripgrep` with PCRE2 support for repository and retained-evidence scans;
 - a compatible authenticated Codex CLI available by a fixed executable name or
   canonical absolute path;
 - a Linear token with the configured IFAN read/state-transition access;
