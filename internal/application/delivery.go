@@ -67,6 +67,22 @@ type MergeRecord struct {
 	MergedAt    time.Time `json:"merged_at"`
 }
 
+func (r MergeRecord) ValidateAuthority() error {
+	if strings.TrimSpace(r.RunID) == "" || r.PRNumber < 1 {
+		return errors.New("merge evidence identity is incomplete")
+	}
+	if !validFullSHA(r.PreMergeSHA) || !validFullSHA(r.BaseSHA) || !validFullSHA(r.MergeSHA) {
+		return errors.New("merge evidence requires full lowercase commit SHAs")
+	}
+	if r.Method != "squash" && r.Method != "external" {
+		return errors.New("unsupported merge evidence method")
+	}
+	if r.MergedAt.IsZero() {
+		return errors.New("merge evidence timestamp is required")
+	}
+	return nil
+}
+
 type CleanupRecord struct {
 	ID         int64     `json:"cleanup_id"`
 	RunID      string    `json:"run_id"`

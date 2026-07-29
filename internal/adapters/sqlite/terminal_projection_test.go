@@ -2,6 +2,8 @@ package sqlite
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"path/filepath"
 	"strings"
@@ -385,9 +387,23 @@ func TestZeroTimeGitHubObservationFailsClosedAcrossSQLiteRestart(t *testing.T) {
 	if err := store.SavePullRequest(ctx, run.ID, pr); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.SaveGitHubEvidence(ctx, run.ID, domain.GitHubReadEvidence{
-		Repository:  domain.RepositoryIdentity{ID: 99, NodeID: "REPO_99", Owner: "owner", Name: "repo"},
+	repository := domain.RepositoryIdentity{ID: 99, NodeID: "REPO_99", Owner: "owner", Name: "repo"}
+	zeroEvidence := domain.GitHubReadEvidence{
+		Repository:  repository,
 		PullRequest: pr,
+	}
+	rawZeroEvidence, err := json.Marshal(zeroEvidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeroDigest := sha256.Sum256(rawZeroEvidence)
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO github_read_evidence(run_id,head_sha,repository_id,evidence_json,evidence_digest,observed_at) VALUES(?,?,?,?,?,?)`, run.ID, head, repository.ID, string(rawZeroEvidence), hex.EncodeToString(zeroDigest[:]), ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveGitHubEvidence(ctx, run.ID, domain.GitHubReadEvidence{
+		Repository:  repository,
+		PullRequest: pr,
+		ObservedAt:  time.Date(2026, 7, 29, 7, 30, 0, 0, time.UTC),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -406,14 +422,215 @@ func TestZeroTimeGitHubObservationFailsClosedAcrossSQLiteRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	result, err := application.NewQueryService(store).GetRunDetail(ctx, application.RunDetailQuery{
+	if _, err := application.NewQueryService(store).GetRunDetail(ctx, application.RunDetailQuery{
 		Requester: application.Requester{ID: "operator", Kind: "github_login"},
 		RunID:     run.ID,
-	})
+	}); err == nil {
+		t.Fatal("later valid GitHub read masked zero-time persisted evidence")
+	}
+}
+
+func TestGitHubEvidenceSQLAuthorityColumnsFailClosedAcrossSQLiteRestart(t *testing.T) {
+	observedAt := time.Date(2026, 7, 29, 8, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name   string
+		column string
+		value  any
+	}{
+		{"head SHA mismatch", "head_sha", strings.Repeat("d", 40)},
+		{"repository ID mismatch", "repository_id", int64(100)},
+		{"observation time mismatch", "observed_at", formatTime(observedAt.Add(time.Second))},
+		{"noncanonical equivalent observation time", "observed_at", "2026-07-29T08:00:00+00:00"},
+		{"invalid observation time", "observed_at", "not-a-time"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			path := filepath.Join(t.TempDir(), "controller.db")
+			store, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			run := application.Run{
+				ID: "github-metadata", IssueID: "IFAN-86", IdempotencyKey: "github-metadata-key",
+				SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task",
+				Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: "/private/artifacts",
+			}
+			if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+				t.Fatal(err)
+			}
+			evidence := domain.GitHubReadEvidence{
+				Repository: domain.RepositoryIdentity{ID: 99, NodeID: "REPO_99", Owner: "owner", Name: "repo"},
+				PullRequest: domain.PullRequest{
+					Number: 7, DatabaseID: 70, URL: "https://example.invalid/pull/7", NodeID: "PR_7",
+					HeadBranch: "feature", BaseBranch: "main", HeadSHA: strings.Repeat("a", 40), BaseSHA: strings.Repeat("b", 40),
+					BodyDigest: "body", OwnershipKey: run.IdempotencyKey, State: "open",
+				},
+				ObservedAt: observedAt,
+			}
+			if err := store.SaveGitHubEvidence(ctx, run.ID, evidence); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.db.ExecContext(ctx, `UPDATE github_read_evidence SET `+test.column+`=? WHERE run_id=?`, test.value, run.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			store, err = Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			if _, err := store.Inspect(ctx, run.ID); err == nil {
+				t.Fatal("corrupt GitHub evidence SQL authority was accepted")
+			}
+		})
+	}
+}
+
+func TestGitHubEvidenceEqualTimesUseEvidenceIDOrderAcrossSQLiteRestart(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "controller.db")
+	store, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.PullRequest == nil || result.PullRequest.Status != "conflict" || result.PullRequest.Merged != nil || result.PullRequest.EvidenceSource != "github_read_observation_time_conflict" {
-		t.Fatalf("zero-time GitHub read was treated as earlier terminal history after restart: %+v", result.PullRequest)
+	run := application.Run{
+		ID: "github-equal-time", IssueID: "IFAN-86", IdempotencyKey: "github-equal-time-key",
+		SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task",
+		Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: "/private/artifacts",
+	}
+	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	observedAt := time.Date(2026, 7, 29, 9, 0, 0, 0, time.UTC)
+	evidence := domain.GitHubReadEvidence{
+		Repository:    domain.RepositoryIdentity{ID: 99, NodeID: "REPO_99", Owner: "owner", Name: "repo"},
+		PullRequest:   domain.PullRequest{HeadSHA: strings.Repeat("a", 40)},
+		ObservedAt:    observedAt,
+		UnknownEvents: []string{"first"},
+	}
+	if err := store.SaveGitHubEvidence(ctx, run.ID, evidence); err != nil {
+		t.Fatal(err)
+	}
+	evidence.UnknownEvents = []string{"second"}
+	if err := store.SaveGitHubEvidence(ctx, run.ID, evidence); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	inspection, err := store.Inspect(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inspection.GitHubEvidenceHistory) != 2 ||
+		len(inspection.GitHubEvidenceHistory[0].UnknownEvents) != 1 || inspection.GitHubEvidenceHistory[0].UnknownEvents[0] != "first" ||
+		len(inspection.GitHubEvidenceHistory[1].UnknownEvents) != 1 || inspection.GitHubEvidenceHistory[1].UnknownEvents[0] != "second" {
+		t.Fatalf("equal-time evidence did not retain evidence-ID order: %+v", inspection.GitHubEvidenceHistory)
+	}
+}
+
+func TestGitHubEvidenceLegacyOffsetTimeMatchesCanonicalSQLAcrossRestart(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "controller.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := application.Run{
+		ID: "github-offset-time", IssueID: "IFAN-86", IdempotencyKey: "github-offset-time-key",
+		SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task",
+		Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: "/private/artifacts",
+	}
+	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	legacyTime := time.Date(2026, 7, 29, 17, 0, 0, 0, time.FixedZone("legacy-offset", 8*60*60))
+	evidence := domain.GitHubReadEvidence{
+		Repository:  domain.RepositoryIdentity{ID: 99},
+		PullRequest: domain.PullRequest{HeadSHA: strings.Repeat("a", 40)},
+		ObservedAt:  legacyTime,
+	}
+	raw, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(raw)
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO github_read_evidence(run_id,head_sha,repository_id,evidence_json,evidence_digest,observed_at) VALUES(?,?,?,?,?,?)`, run.ID, evidence.PullRequest.HeadSHA, evidence.Repository.ID, string(raw), hex.EncodeToString(digest[:]), formatTime(legacyTime)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	inspection, err := store.Inspect(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inspection.GitHubEvidenceHistory) != 1 || !inspection.GitHubEvidenceHistory[0].ObservedAt.Equal(legacyTime) {
+		t.Fatalf("legacy offset evidence did not match canonical SQL time: %+v", inspection.GitHubEvidenceHistory)
+	}
+}
+
+func TestCorruptMergeSHAFailsClosedAcrossSQLiteRestart(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		column string
+		value  string
+	}{
+		{"short pre-merge SHA", "pre_merge_head_sha", "short"},
+		{"nonhex pre-merge SHA", "pre_merge_head_sha", strings.Repeat("g", 40)},
+		{"short base SHA", "base_sha", "short"},
+		{"nonhex base SHA", "base_sha", strings.Repeat("g", 40)},
+		{"short merge SHA", "merge_sha", "short"},
+		{"nonhex merge SHA", "merge_sha", strings.Repeat("g", 40)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			path := filepath.Join(t.TempDir(), "controller.db")
+			store, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			run := application.Run{
+				ID: "corrupt-merge", IssueID: "IFAN-86", IdempotencyKey: "corrupt-merge-key",
+				SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task",
+				Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: "/private/artifacts",
+			}
+			if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.SaveMerge(ctx, application.MergeRecord{
+				RunID: run.ID, PRNumber: 7, PreMergeSHA: strings.Repeat("a", 40), BaseSHA: strings.Repeat("b", 40),
+				Method: "squash", MergeSHA: strings.Repeat("c", 40), MergedAt: time.Date(2026, 7, 29, 10, 0, 0, 0, time.UTC),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.db.ExecContext(ctx, `UPDATE merge_results SET `+test.column+`=? WHERE run_id=?`, test.value, run.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			store, err = Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			if _, err := store.Inspect(ctx, run.ID); err == nil {
+				t.Fatal("corrupt persisted merge SHA was accepted")
+			}
+		})
 	}
 }

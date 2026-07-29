@@ -852,9 +852,29 @@ func TestMergeMethodMigrationAcceptsOnlySquashAndExternal(t *testing.T) {
 	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
 		t.Fatal(err)
 	}
-	record := application.MergeRecord{RunID: run.ID, PRNumber: 1, PreMergeSHA: "head", BaseSHA: "base", Method: "external", MergeSHA: "merge", MergedAt: time.Now().UTC()}
+	record := application.MergeRecord{RunID: run.ID, PRNumber: 1, PreMergeSHA: strings.Repeat("a", 40), BaseSHA: strings.Repeat("b", 40), Method: "external", MergeSHA: strings.Repeat("c", 40), MergedAt: time.Now().UTC()}
 	if err := store.SaveMerge(ctx, record); err != nil {
 		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*application.MergeRecord)
+	}{
+		{"short pre-merge SHA", func(value *application.MergeRecord) { value.PreMergeSHA = "short" }},
+		{"nonhex pre-merge SHA", func(value *application.MergeRecord) { value.PreMergeSHA = strings.Repeat("g", 40) }},
+		{"short base SHA", func(value *application.MergeRecord) { value.BaseSHA = "short" }},
+		{"nonhex base SHA", func(value *application.MergeRecord) { value.BaseSHA = strings.Repeat("g", 40) }},
+		{"short merge SHA", func(value *application.MergeRecord) { value.MergeSHA = "short" }},
+		{"nonhex merge SHA", func(value *application.MergeRecord) { value.MergeSHA = strings.Repeat("g", 40) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			invalid := record
+			invalid.RunID = "invalid-" + strings.ReplaceAll(test.name, " ", "-")
+			test.mutate(&invalid)
+			if err := store.SaveMerge(ctx, invalid); err == nil {
+				t.Fatal("malformed merge SHA was persisted")
+			}
+		})
 	}
 	record.RunID = "other"
 	record.Method = "merge"
@@ -1001,7 +1021,7 @@ func TestApprovalAndMergeEvidenceAreImmutable(t *testing.T) {
 	if err != nil || inspection.Approval == nil || inspection.Approval.ApprovedSHA != "h2" {
 		t.Fatalf("current approval=%+v err=%v", inspection.Approval, err)
 	}
-	merge := application.MergeRecord{RunID: "run-1", PRNumber: 1, PreMergeSHA: "h1", BaseSHA: "b1", Method: "squash", MergeSHA: "m1", MergedAt: now}
+	merge := application.MergeRecord{RunID: "run-1", PRNumber: 1, PreMergeSHA: strings.Repeat("a", 40), BaseSHA: strings.Repeat("b", 40), Method: "squash", MergeSHA: strings.Repeat("c", 40), MergedAt: now}
 	if err := store.SaveMerge(ctx, merge); err != nil {
 		t.Fatal(err)
 	}
@@ -1009,7 +1029,7 @@ func TestApprovalAndMergeEvidenceAreImmutable(t *testing.T) {
 		t.Fatal(err)
 	}
 	changedMerge := merge
-	changedMerge.MergeSHA = "m2"
+	changedMerge.MergeSHA = strings.Repeat("d", 40)
 	if err := store.SaveMerge(ctx, changedMerge); err == nil {
 		t.Fatal("conflicting merge must fail closed")
 	}

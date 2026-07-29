@@ -934,6 +934,10 @@ func (s *Store) SaveReviewReplyObservations(ctx context.Context, runID, leaseOwn
 }
 
 func (s *Store) SaveGitHubReadSuccess(ctx context.Context, runID, leaseOwner string, expectedState domain.State, idempotencyKey string, observations []application.GitHubRequestObservation, pr domain.PullRequest, m application.GitHubInstallationMetadata, e domain.GitHubReadEvidence, feedback []application.TrustedReviewFeedbackRecord, approvalObservation *domain.HumanApprovalObservation, approval *domain.HumanApproval, nextState domain.State, transitionReason string) error {
+	if e.ObservedAt.IsZero() {
+		return errors.New("GitHub evidence observation time is required")
+	}
+	e.ObservedAt = e.ObservedAt.UTC()
 	if len(e.Findings) > application.MaxNormalizedFindings {
 		return errors.New("GitHub finding count exceeds controller bounds")
 	}
@@ -1133,6 +1137,10 @@ func (s *Store) SaveGitHubManualPRTargetDrift(ctx context.Context, runID, leaseO
 	if expectedState != domain.StateAwaitingGitHubMergeability || !samePullRequestIdentity(persisted, evidence.PullRequest) || !pullRequestTargetDrift(persisted, evidence.PullRequest) || strings.TrimSpace(reason) == "" {
 		return errors.New("manual GitHub target-drift evidence is incomplete")
 	}
+	if evidence.ObservedAt.IsZero() {
+		return errors.New("GitHub evidence observation time is required")
+	}
+	evidence.ObservedAt = evidence.ObservedAt.UTC()
 	raw, err := json.Marshal(evidence)
 	if err != nil {
 		return err
@@ -1285,6 +1293,10 @@ func persistedGitHubAuthorityTx(ctx context.Context, tx *sql.Tx, runID string, r
 }
 
 func (s *Store) SaveGitHubEvidence(ctx context.Context, runID string, e domain.GitHubReadEvidence) error {
+	if strings.TrimSpace(runID) == "" || e.ObservedAt.IsZero() {
+		return errors.New("GitHub evidence identity and observation time are required")
+	}
+	e.ObservedAt = e.ObservedAt.UTC()
 	raw, err := json.Marshal(e)
 	if err != nil {
 		return err
@@ -1982,6 +1994,10 @@ func (s *Store) RequireManualInterventionForTrustedFeedbackDrift(ctx context.Con
 	if strings.TrimSpace(runID) == "" || !validTrustedReviewFeedbackNodeID(rootCommentNodeID) || strings.TrimSpace(observedDigest) == "" {
 		return errors.New("trusted feedback drift identity is incomplete")
 	}
+	if evidence.ObservedAt.IsZero() {
+		return errors.New("GitHub evidence observation time is required")
+	}
+	evidence.ObservedAt = evidence.ObservedAt.UTC()
 	raw, err := json.Marshal(evidence)
 	if err != nil {
 		return err
@@ -2275,8 +2291,8 @@ func sameHumanApprovalAuthority(left, right domain.HumanApproval) bool {
 }
 
 func (s *Store) SaveMerge(ctx context.Context, record application.MergeRecord) error {
-	if record.Method != "squash" && record.Method != "external" {
-		return errors.New("unsupported merge evidence method")
+	if err := record.ValidateAuthority(); err != nil {
+		return err
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO merge_results(run_id,pr_number,pre_merge_head_sha,base_sha,merge_method,merge_sha,merged_at) VALUES(?,?,?,?,?,?,?)`, record.RunID, record.PRNumber, record.PreMergeSHA, record.BaseSHA, record.Method, record.MergeSHA, formatTime(record.MergedAt))
 	if err == nil {
@@ -2592,7 +2608,14 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 	var merge application.MergeRecord
 	var mergeAt string
 	if err := s.db.QueryRowContext(ctx, `SELECT run_id,pr_number,pre_merge_head_sha,base_sha,merge_method,merge_sha,merged_at FROM merge_results WHERE run_id=?`, id).Scan(&merge.RunID, &merge.PRNumber, &merge.PreMergeSHA, &merge.BaseSHA, &merge.Method, &merge.MergeSHA, &mergeAt); err == nil {
-		merge.MergedAt = parseTime(mergeAt)
+		var parseErr error
+		merge.MergedAt, parseErr = parseCanonicalRequiredTime(mergeAt)
+		if parseErr != nil {
+			return inspection, errors.New("persisted merge timestamp is invalid")
+		}
+		if err := merge.ValidateAuthority(); err != nil {
+			return inspection, errors.New("persisted merge authority is invalid")
+		}
 		inspection.Merge = &merge
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return inspection, err
@@ -2653,7 +2676,7 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 		inspection.GitHubRequests = append(inspection.GitHubRequests, o)
 	}
 	rows.Close()
-	rows, err = s.db.QueryContext(ctx, `SELECT evidence_id,evidence_json,evidence_digest FROM github_read_evidence WHERE run_id=?`, id)
+	rows, err = s.db.QueryContext(ctx, `SELECT evidence_id,head_sha,repository_id,evidence_json,evidence_digest,observed_at FROM github_read_evidence WHERE run_id=?`, id)
 	if err != nil {
 		return inspection, err
 	}
@@ -2664,8 +2687,9 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 	var evidenceHistory []orderedGitHubEvidence
 	for rows.Next() {
 		var evidenceID int64
-		var evidenceJSON, evidenceDigest string
-		if err := rows.Scan(&evidenceID, &evidenceJSON, &evidenceDigest); err != nil {
+		var repositoryID int64
+		var headSHA, evidenceJSON, evidenceDigest, observedAt string
+		if err := rows.Scan(&evidenceID, &headSHA, &repositoryID, &evidenceJSON, &evidenceDigest, &observedAt); err != nil {
 			rows.Close()
 			return inspection, err
 		}
@@ -2678,6 +2702,18 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 		if err := json.Unmarshal([]byte(evidenceJSON), &e); err != nil {
 			rows.Close()
 			return inspection, err
+		}
+		sqlObservedAt, err := parseCanonicalRequiredTime(observedAt)
+		if err != nil {
+			rows.Close()
+			return inspection, errors.New("persisted GitHub evidence timestamp is invalid")
+		}
+		if headSHA != e.PullRequest.HeadSHA ||
+			repositoryID != e.Repository.ID ||
+			e.ObservedAt.IsZero() ||
+			!e.ObservedAt.Equal(sqlObservedAt) {
+			rows.Close()
+			return inspection, errors.New("persisted GitHub evidence metadata mismatch")
 		}
 		evidenceHistory = append(evidenceHistory, orderedGitHubEvidence{id: evidenceID, evidence: e})
 	}
@@ -2722,4 +2758,12 @@ func nowText() string { return formatTime(time.Now().UTC()) }
 func parseTime(value string) time.Time {
 	parsed, _ := time.Parse(time.RFC3339Nano, strings.TrimSpace(value))
 	return parsed
+}
+
+func parseCanonicalRequiredTime(value string) (time.Time, error) {
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil || parsed.IsZero() || formatTime(parsed) != value {
+		return time.Time{}, errors.New("timestamp is missing, invalid, or noncanonical")
+	}
+	return parsed, nil
 }

@@ -520,8 +520,10 @@ same version 2 detail projection contract:
   `unknown`; an aggregate must have complete PR identity and match the run's
   branch, base branch, candidate head, base SHA, and ownership key before it can
   support that result. Mismatched repository/PR/topology/merge evidence projects
-  `conflict`. A GitHub read without an observation timestamp also projects
-  `conflict`; it cannot be ordered before terminal evidence.
+  `conflict`. Merge authority requires full lowercase hexadecimal pre-merge,
+  base, and merge commit SHAs. The complete retained GitHub-read history is
+  checked before projection; any read without an observation timestamp projects
+  `conflict` and cannot be hidden by a later valid read.
 - each trusted feedback item labels its initial change-request snapshot,
   exposes controller lifecycle fields separately, and derives
   `effective_thread_status` from the latest repository-, PR-, and strict
@@ -540,7 +542,10 @@ same version 2 detail projection contract:
 SQLite inspection joined from the run-scoped evidence tables. Effective
 terminal facts are derived only from typed merge results, trusted feedback
 lifecycle evidence, and sanitized GitHub read evidence; transition prose and
-agent claims are not projection authority.
+agent claims are not projection authority. SQLite verifies each GitHub evidence
+digest and requires its SQL head SHA, repository ID, and canonical UTC
+observation time to match the digest-bound JSON. Equivalent legacy JSON timezone
+offsets remain valid, and equal instants are ordered by persisted evidence ID.
 
 **External side effects**
 

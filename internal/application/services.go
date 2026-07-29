@@ -763,6 +763,10 @@ func projectEffectivePullRequest(value RunInspection) *EffectivePullRequestResul
 		Status:         "unknown",
 		EvidenceSource: "pull_request_aggregate",
 	}
+	if githubEvidenceHistoryHasInvalidTime(value) {
+		result.Status, result.State, result.EvidenceSource = "conflict", "conflict", "github_read_observation_time_conflict"
+		return result
+	}
 	if !validProjectionRepositoryBinding(value) {
 		result.State, result.EvidenceSource = "unknown", "missing_or_invalid_repository_binding"
 		return result
@@ -879,15 +883,14 @@ func githubEvidenceHistory(value RunInspection) []domain.GitHubReadEvidence {
 }
 
 func validMergeProjectionAuthority(value RunInspection, aggregate domain.PullRequest, merge MergeRecord) bool {
-	return merge.RunID == value.Run.ID &&
+	return merge.ValidateAuthority() == nil &&
+		merge.RunID == value.Run.ID &&
 		merge.PRNumber == aggregate.Number &&
 		merge.PreMergeSHA == value.Run.CandidateHead &&
 		merge.PreMergeSHA == aggregate.HeadSHA &&
 		merge.BaseSHA == value.Run.BaseSHA &&
 		merge.BaseSHA == aggregate.BaseSHA &&
-		(merge.Method == "squash" || merge.Method == "external") &&
-		strings.TrimSpace(merge.MergeSHA) != "" &&
-		!merge.MergedAt.IsZero()
+		(merge.Method == "squash" || merge.Method == "external")
 }
 
 func validPullRequestProjectionAuthority(value RunInspection, aggregate domain.PullRequest) bool {
@@ -915,6 +918,9 @@ func sameProjectedPullRequest(expected, observed *domain.PullRequest) bool {
 func projectEffectiveThreadStatus(value RunInspection, feedback TrustedReviewFeedbackRecord) ThreadStatusResult {
 	if feedback.ValidatePersistedAuthority(value.Run.ID) != nil {
 		return ThreadStatusResult{Status: "conflict", EvidenceSource: "trusted_review_feedback_authority_conflict"}
+	}
+	if githubEvidenceHistoryHasInvalidTime(value) {
+		return ThreadStatusResult{Status: "conflict", EvidenceSource: "github_read_observation_time_conflict"}
 	}
 	if value.PullRequest == nil || !validProjectionRepositoryBinding(value) {
 		return ThreadStatusResult{Status: "unknown", EvidenceSource: "missing_feedback_pull_request_authority"}
@@ -984,6 +990,15 @@ func projectEffectiveThreadStatus(value RunInspection, feedback TrustedReviewFee
 		return ThreadStatusResult{Status: status, Resolved: &resolved, Outdated: &outdated, EvidenceSource: "controller_resolution_observation", ObservedAt: feedback.UpdatedAt}
 	}
 	return ThreadStatusResult{Status: "unknown", EvidenceSource: "no_authoritative_final_thread_observation"}
+}
+
+func githubEvidenceHistoryHasInvalidTime(value RunInspection) bool {
+	for _, evidence := range githubEvidenceHistory(value) {
+		if evidence.ObservedAt.IsZero() {
+			return true
+		}
+	}
+	return false
 }
 
 func feedbackEvidenceAuthority(value RunInspection, feedback TrustedReviewFeedbackRecord, evidence domain.GitHubReadEvidence) (bool, bool) {

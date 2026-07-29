@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
@@ -22,7 +23,7 @@ func TestGenericGitHubEvidenceStoreCannotSerializeInlineReviewBodies(t *testing.
 		t.Fatal(err)
 	}
 	createFeedbackRun(t, store, "generic-evidence-run")
-	evidence := domain.GitHubReadEvidence{ReviewThreads: []domain.GitHubReviewThread{{NodeID: "THREAD", Comments: []domain.GitHubReviewComment{{NodeID: "COMMENT", BodyDigest: handoff.Comments[0].BodyDigest}}}}}
+	evidence := domain.GitHubReadEvidence{ReviewThreads: []domain.GitHubReviewThread{{NodeID: "THREAD", Comments: []domain.GitHubReviewComment{{NodeID: "COMMENT", BodyDigest: handoff.Comments[0].BodyDigest}}}}, ObservedAt: time.Date(2026, 7, 29, 8, 0, 0, 0, time.UTC)}
 	if err := store.SaveGitHubEvidence(context.Background(), "generic-evidence-run", evidence); err != nil {
 		t.Fatal(err)
 	}

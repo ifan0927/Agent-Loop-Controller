@@ -466,6 +466,28 @@ func TestTerminalProjectionFailsClosedForMissingOrConflictingMergeEvidence(t *te
 			}
 		})
 	}
+	validMerge := MergeRecord{
+		RunID: run.ID, PRNumber: snapshot.Number, PreMergeSHA: head, BaseSHA: base,
+		Method: "squash", MergeSHA: strings.Repeat("c", 40), MergedAt: now,
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*MergeRecord)
+	}{
+		{"short pre-merge SHA", func(value *MergeRecord) { value.PreMergeSHA = "short" }},
+		{"nonhex base SHA", func(value *MergeRecord) { value.BaseSHA = strings.Repeat("g", 40) }},
+		{"short merge SHA", func(value *MergeRecord) { value.MergeSHA = "short" }},
+		{"nonhex merge SHA", func(value *MergeRecord) { value.MergeSHA = strings.Repeat("z", 40) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			corrupt := validMerge
+			test.mutate(&corrupt)
+			got := projectEffectivePullRequest(RunInspection{Run: run, RepositoryBinding: binding, PullRequest: &snapshot, Merge: &corrupt})
+			if got == nil || got.Status != "conflict" || got.Merged != nil || got.EvidenceSource != "merge_result_conflict" {
+				t.Fatalf("malformed merge SHA was projected as terminal truth: %+v", got)
+			}
+		})
+	}
 }
 
 func TestEffectivePullRequestBindsRepositoryAndEqualTimeTerminalEvidence(t *testing.T) {
@@ -529,6 +551,18 @@ func TestEffectivePullRequestBindsRepositoryAndEqualTimeTerminalEvidence(t *test
 	})
 	if zeroTime == nil || zeroTime.Status != "conflict" || zeroTime.EvidenceSource != "github_read_observation_time_conflict" {
 		t.Fatalf("zero-time GitHub observation was treated as historical: %+v", zeroTime)
+	}
+	laterEvidence := domain.GitHubReadEvidence{Repository: repository, PullRequest: pr, ObservedAt: now.Add(time.Minute)}
+	maskedZeroTime := projectEffectivePullRequest(RunInspection{
+		Run: run, RepositoryBinding: binding, PullRequest: &pr, Merge: merge,
+		GitHubEvidence: &laterEvidence,
+		GitHubEvidenceHistory: []domain.GitHubReadEvidence{
+			{Repository: repository, PullRequest: pr},
+			laterEvidence,
+		},
+	})
+	if maskedZeroTime == nil || maskedZeroTime.Status != "conflict" || maskedZeroTime.EvidenceSource != "github_read_observation_time_conflict" {
+		t.Fatalf("later GitHub read masked an unorderable observation: %+v", maskedZeroTime)
 	}
 }
 
@@ -613,6 +647,16 @@ func TestTrustedFeedbackProjectionSeparatesInitialSnapshotFromFinalThreadEvidenc
 	resolvedFeedback.Lifecycle = domain.TrustedReviewFeedbackResolved
 	resolvedFeedback.Resolved = true
 	resolvedFeedback.UpdatedAt = now.Add(5 * time.Minute)
+	maskedThreadInspection := inspection
+	maskedThreadInspection.GitHubEvidence = evidence
+	maskedThreadInspection.GitHubEvidenceHistory = []domain.GitHubReadEvidence{
+		{Repository: repository, PullRequest: pr, ReviewThreads: []domain.GitHubReviewThread{thread}},
+		*evidence,
+	}
+	conflict = projectEffectiveThreadStatus(maskedThreadInspection, resolvedFeedback)
+	if conflict.Status != "conflict" || conflict.EvidenceSource != "github_read_observation_time_conflict" {
+		t.Fatalf("later thread read masked an unorderable observation: %+v", conflict)
+	}
 	corruptControllerInspection := corruptInspection
 	corruptControllerInspection.GitHubEvidence = nil
 	corruptControllerInspection.GitHubEvidenceHistory = nil

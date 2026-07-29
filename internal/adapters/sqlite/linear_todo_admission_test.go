@@ -624,7 +624,7 @@ func TestAutomaticAdmissionAbandonRetainsNonMergeDeliveryEvidence(t *testing.T) 
 					t.Fatal(err)
 				}
 			case "merge":
-				if err := store.SaveMerge(ctx, application.MergeRecord{RunID: run.ID, PRNumber: 7, PreMergeSHA: "head", BaseSHA: run.BaseSHA, Method: "squash", MergeSHA: "merge", MergedAt: time.Now().UTC()}); err != nil {
+				if err := store.SaveMerge(ctx, application.MergeRecord{RunID: run.ID, PRNumber: 7, PreMergeSHA: strings.Repeat("a", 40), BaseSHA: strings.Repeat("b", 40), Method: "squash", MergeSHA: strings.Repeat("c", 40), MergedAt: time.Now().UTC()}); err != nil {
 					t.Fatal(err)
 				}
 			case "reply_intent":

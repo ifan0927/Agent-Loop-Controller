@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -106,18 +107,19 @@ func fixtureRunAwaitingLinearCompletion(t *testing.T) (*sqlitestore.Store, appli
 		RepositoryConfigJSON: "{}",
 		BaseBranch:           "main",
 		WorkingBranch:        "ifan/ifan-lab-1-clamp",
-		BaseSHA:              "base",
+		BaseSHA:              strings.Repeat("b", 40),
 		ArtifactRoot:         filepath.Join(t.TempDir(), "artifacts"),
 	}}
 	if _, _, err := store.CreateRun(ctx, input); err != nil {
 		store.Close()
 		t.Fatal(err)
 	}
-	if err := store.SetWorkspace(ctx, input.ID, "base", filepath.Join(t.TempDir(), "worktree")); err != nil {
+	if err := store.SetWorkspace(ctx, input.ID, input.BaseSHA, filepath.Join(t.TempDir(), "worktree")); err != nil {
 		store.Close()
 		t.Fatal(err)
 	}
-	if err := store.SetCandidateHead(ctx, input.ID, "candidate"); err != nil {
+	candidate := strings.Repeat("a", 40)
+	if err := store.SetCandidateHead(ctx, input.ID, candidate); err != nil {
 		store.Close()
 		t.Fatal(err)
 	}
@@ -137,19 +139,19 @@ func fixtureRunAwaitingLinearCompletion(t *testing.T) (*sqlitestore.Store, appli
 		domain.StateAwaitingHumanApproval,
 		domain.StateMerging,
 	} {
-		if err := store.Transition(ctx, input.ID, state, next, "fixture test progression", "", "candidate"); err != nil {
+		if err := store.Transition(ctx, input.ID, state, next, "fixture test progression", "", candidate); err != nil {
 			store.Close()
 			t.Fatal(err)
 		}
 		state = next
 	}
 	mergedAt := time.Now().UTC().Add(-time.Second)
-	merge := application.MergeRecord{RunID: input.ID, PRNumber: 1, PreMergeSHA: "candidate", BaseSHA: "base", Method: "squash", MergeSHA: "merge", MergedAt: mergedAt}
+	merge := application.MergeRecord{RunID: input.ID, PRNumber: 1, PreMergeSHA: candidate, BaseSHA: input.BaseSHA, Method: "squash", MergeSHA: strings.Repeat("c", 40), MergedAt: mergedAt}
 	if err := store.SaveMerge(ctx, merge); err != nil {
 		store.Close()
 		t.Fatal(err)
 	}
-	if err := store.Transition(ctx, input.ID, state, domain.StateAwaitingLinearCompletion, "fixture merge observed", merge.MergeSHA, "candidate"); err != nil {
+	if err := store.Transition(ctx, input.ID, state, domain.StateAwaitingLinearCompletion, "fixture merge observed", merge.MergeSHA, candidate); err != nil {
 		store.Close()
 		t.Fatal(err)
 	}

@@ -717,6 +717,10 @@ feedback, an earlier unresolved GitHub read remains historical, while an
 equal-time or later unresolved read projects `conflict`. A missing GitHub
 observation time, a feedback row detached from the run/PR authority, or an
 invalid feedback identity, lifecycle, or timestamp also projects `conflict`.
+Inspection rejects GitHub evidence when its SQL head, repository ID, or
+canonical observation time disagrees with its digest-bound JSON; equal
+observation instants retain insertion order. Merge evidence likewise requires
+full lowercase hexadecimal pre-merge, base, and merge commit SHAs.
 
 **Possible durable stop states**
 
