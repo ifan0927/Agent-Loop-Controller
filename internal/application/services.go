@@ -763,16 +763,26 @@ func projectEffectivePullRequest(value RunInspection) *EffectivePullRequestResul
 		Status:         "unknown",
 		EvidenceSource: "pull_request_aggregate",
 	}
-	if value.GitHubEvidence != nil && !sameProjectedPullRequest(aggregate, &value.GitHubEvidence.PullRequest) {
-		result.Status, result.State, result.EvidenceSource, result.ObservedAt = "conflict", "conflict", "github_read_identity_conflict", value.GitHubEvidence.ObservedAt
+	if !validProjectionRepositoryBinding(value) {
+		result.State, result.EvidenceSource = "unknown", "missing_or_invalid_repository_binding"
 		return result
+	}
+	if value.GitHubEvidence != nil {
+		if !repositoryIdentityMatches(value, value.GitHubEvidence.Repository) {
+			result.Status, result.State, result.EvidenceSource, result.ObservedAt = "conflict", "conflict", "github_repository_authority_conflict", value.GitHubEvidence.ObservedAt
+			return result
+		}
+		if !sameProjectedPullRequest(aggregate, &value.GitHubEvidence.PullRequest) {
+			result.Status, result.State, result.EvidenceSource, result.ObservedAt = "conflict", "conflict", "github_read_identity_conflict", value.GitHubEvidence.ObservedAt
+			return result
+		}
 	}
 	if value.Merge != nil {
 		if !validMergeProjectionAuthority(value, *aggregate, *value.Merge) {
 			result.Status, result.State, result.EvidenceSource = "conflict", "conflict", "merge_result_conflict"
 			return result
 		}
-		if value.GitHubEvidence != nil && value.GitHubEvidence.ObservedAt.After(value.Merge.MergedAt) {
+		if value.GitHubEvidence != nil && !value.GitHubEvidence.ObservedAt.Before(value.Merge.MergedAt) {
 			observed := value.GitHubEvidence.PullRequest
 			if !observed.Merged || !strings.EqualFold(observed.State, "closed") || observed.MergeSHA != value.Merge.MergeSHA {
 				result.Status, result.State, result.EvidenceSource, result.ObservedAt = "conflict", "conflict", "github_read_state_conflicts_with_merge_result", value.GitHubEvidence.ObservedAt
@@ -956,14 +966,21 @@ func feedbackEvidenceAuthority(value RunInspection, feedback TrustedReviewFeedba
 }
 
 func repositoryIdentityMatches(value RunInspection, observed domain.RepositoryIdentity) bool {
-	parts := strings.Split(value.Run.Repository, "/")
-	if len(parts) != 2 || !strings.EqualFold(parts[0], observed.Owner) || !strings.EqualFold(parts[1], observed.Name) {
+	if !validProjectionRepositoryBinding(value) {
 		return false
 	}
-	if value.RepositoryBinding != nil && value.RepositoryBinding.ExpectedRepositoryID > 0 {
-		return observed.ID == value.RepositoryBinding.ExpectedRepositoryID
+	parts := strings.Split(value.RepositoryBinding.CanonicalRepository, "/")
+	return observed.ID == value.RepositoryBinding.ExpectedRepositoryID &&
+		strings.EqualFold(parts[0], observed.Owner) &&
+		strings.EqualFold(parts[1], observed.Name)
+}
+
+func validProjectionRepositoryBinding(value RunInspection) bool {
+	if value.RepositoryBinding == nil || value.RepositoryBinding.ExpectedRepositoryID < 1 || value.RepositoryBinding.CanonicalRepository != value.Run.Repository {
+		return false
 	}
-	return observed.ID > 0
+	parts := strings.Split(value.RepositoryBinding.CanonicalRepository, "/")
+	return len(parts) == 2 && strings.TrimSpace(parts[0]) != "" && strings.TrimSpace(parts[1]) != ""
 }
 
 func containsReviewThread(threads []domain.GitHubReviewThread, nodeID string) bool {

@@ -516,7 +516,8 @@ same version 2 detail projection contract:
   historical PR facts without rewriting the aggregate.
 - `pull_request` is the effective status. A valid immutable `merge_result`
   projects `merged` even when the aggregate remains open. Missing aggregate or
-  terminal merge authority projects `unknown`; mismatched
+  complete persisted repository binding or terminal merge authority projects
+  `unknown`; mismatched
   repository/PR/head/base/merge evidence projects `conflict`.
 - each trusted feedback item labels its initial change-request snapshot,
   exposes controller lifecycle fields separately, and derives

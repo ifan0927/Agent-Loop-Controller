@@ -23,7 +23,7 @@ func TestTerminalProjectionSurvivesSQLiteRestart(t *testing.T) {
 	base := strings.Repeat("b", 40)
 	mergeSHA := strings.Repeat("c", 40)
 	now := time.Date(2026, 7, 29, 3, 0, 0, 0, time.UTC)
-	repository := application.LocalRepository{CanonicalRepository: "owner/repo", AllowedOperatorLogins: []string{"operator"}}
+	repository := application.LocalRepository{CanonicalRepository: "owner/repo", ExpectedRepositoryID: 99, AllowedOperatorLogins: []string{"operator"}}
 	repositoryJSON, err := json.Marshal(repository)
 	if err != nil {
 		t.Fatal(err)
@@ -32,7 +32,8 @@ func TestTerminalProjectionSurvivesSQLiteRestart(t *testing.T) {
 		ID: "terminal-projection", IssueID: "IFAN-86", IdempotencyKey: "terminal-projection-key",
 		SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}",
 		TaskHash: "task", Repository: repository.CanonicalRepository, RepositoryConfigJSON: string(repositoryJSON),
-		BaseBranch: "main", WorkingBranch: "feature", BaseSHA: base, ArtifactRoot: "/private/artifacts",
+		RegistryVersion: 1,
+		BaseBranch:      "main", WorkingBranch: "feature", BaseSHA: base, ArtifactRoot: "/private/artifacts",
 		State: domain.StateCompleted, CandidateHead: head,
 	}
 	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
@@ -144,8 +145,8 @@ func TestCompletedMergeWithoutPullRequestAggregateProjectsUnknownAfterRestart(t 
 	}
 	head := strings.Repeat("a", 40)
 	base := strings.Repeat("b", 40)
-	repositoryJSON, _ := json.Marshal(application.LocalRepository{CanonicalRepository: "owner/repo", AllowedOperatorLogins: []string{"operator"}})
-	run := application.Run{ID: "missing-pr-aggregate", IssueID: "IFAN-86", IdempotencyKey: "missing-pr-key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: string(repositoryJSON), BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: "/private/artifacts"}
+	repositoryJSON, _ := json.Marshal(application.LocalRepository{CanonicalRepository: "owner/repo", ExpectedRepositoryID: 99, AllowedOperatorLogins: []string{"operator"}})
+	run := application.Run{ID: "missing-pr-aggregate", IssueID: "IFAN-86", IdempotencyKey: "missing-pr-key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: string(repositoryJSON), RegistryVersion: 1, BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: "/private/artifacts"}
 	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
 		t.Fatal(err)
 	}

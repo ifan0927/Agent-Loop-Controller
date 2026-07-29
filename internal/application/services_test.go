@@ -374,7 +374,8 @@ func TestTerminalProjectionSeparatesHistoricalPullRequestSnapshotFromEffectiveMe
 	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateCompleted, CandidateHead: head, BaseSHA: base})
 	snapshot := domain.PullRequest{Number: 7, DatabaseID: 70, URL: "https://example.invalid/pull/7", NodeID: "PR_7", HeadBranch: "feature", BaseBranch: "main", HeadSHA: head, BaseSHA: base, BodyDigest: "body", OwnershipKey: "owner", State: "open"}
 	merge := &MergeRecord{RunID: run.ID, PRNumber: snapshot.Number, PreMergeSHA: head, BaseSHA: base, Method: "squash", MergeSHA: mergeSHA, MergedAt: now}
-	store := serviceStore{run: run, inspection: RunInspection{Run: run, PullRequest: &snapshot, Merge: merge}}
+	binding := &SanitizedRepositoryBinding{CanonicalRepository: run.Repository, ExpectedRepositoryID: 99}
+	store := serviceStore{run: run, inspection: RunInspection{Run: run, RepositoryBinding: binding, PullRequest: &snapshot, Merge: merge}}
 
 	status, err := NewQueryService(store).Status(context.Background(), QueryInput{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository})
 	if err != nil {
@@ -399,8 +400,8 @@ func TestTerminalProjectionSeparatesHistoricalPullRequestSnapshotFromEffectiveMe
 	for _, observedAt := range []time.Time{now.Add(-time.Minute), now} {
 		mismatched := snapshot
 		mismatched.NodeID = "PR_WRONG"
-		evidence := &domain.GitHubReadEvidence{PullRequest: mismatched, ObservedAt: observedAt}
-		conflict := projectEffectivePullRequest(RunInspection{Run: run, PullRequest: &snapshot, Merge: merge, GitHubEvidence: evidence})
+		evidence := &domain.GitHubReadEvidence{Repository: domain.RepositoryIdentity{ID: 99, Owner: "owner", Name: "repo"}, PullRequest: mismatched, ObservedAt: observedAt}
+		conflict := projectEffectivePullRequest(RunInspection{Run: run, RepositoryBinding: binding, PullRequest: &snapshot, Merge: merge, GitHubEvidence: evidence})
 		if conflict == nil || conflict.Status != "conflict" || conflict.EvidenceSource != "github_read_identity_conflict" {
 			t.Fatalf("identity mismatch at %s did not fail closed: %+v", observedAt, conflict)
 		}
@@ -413,7 +414,8 @@ func TestTerminalProjectionFailsClosedForMissingOrConflictingMergeEvidence(t *te
 	base := strings.Repeat("b", 40)
 	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateCompleted, CandidateHead: head, BaseSHA: base})
 	snapshot := domain.PullRequest{Number: 7, DatabaseID: 70, URL: "https://example.invalid/pull/7", NodeID: "PR_7", HeadBranch: "feature", BaseBranch: "main", HeadSHA: head, BaseSHA: base, BodyDigest: "body", OwnershipKey: "owner", State: "open"}
-	service := NewQueryService(serviceStore{run: run, inspection: RunInspection{Run: run, PullRequest: &snapshot}})
+	binding := &SanitizedRepositoryBinding{CanonicalRepository: run.Repository, ExpectedRepositoryID: 99}
+	service := NewQueryService(serviceStore{run: run, inspection: RunInspection{Run: run, RepositoryBinding: binding, PullRequest: &snapshot}})
 	missing, err := service.GetRunDetail(context.Background(), RunDetailQuery{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID})
 	if err != nil {
 		t.Fatal(err)
@@ -423,7 +425,7 @@ func TestTerminalProjectionFailsClosedForMissingOrConflictingMergeEvidence(t *te
 	}
 
 	conflictingMerge := &MergeRecord{RunID: run.ID, PRNumber: snapshot.Number + 1, PreMergeSHA: head, BaseSHA: base, Method: "squash", MergeSHA: strings.Repeat("c", 40), MergedAt: now}
-	service = NewQueryService(serviceStore{run: run, inspection: RunInspection{Run: run, PullRequest: &snapshot, Merge: conflictingMerge}})
+	service = NewQueryService(serviceStore{run: run, inspection: RunInspection{Run: run, RepositoryBinding: binding, PullRequest: &snapshot, Merge: conflictingMerge}})
 	conflict, err := service.GetRunDetail(context.Background(), RunDetailQuery{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID})
 	if err != nil {
 		t.Fatal(err)
@@ -439,6 +441,63 @@ func TestTerminalProjectionFailsClosedForMissingOrConflictingMergeEvidence(t *te
 	}
 	if missingAggregate.PullRequest == nil || missingAggregate.PullRequest.Status != "unknown" || missingAggregate.PullRequest.EvidenceSource != "missing_pull_request_aggregate" || missingAggregate.PullRequest.Merged != nil {
 		t.Fatalf("missing terminal PR aggregate was omitted or guessed: %+v", missingAggregate.PullRequest)
+	}
+}
+
+func TestEffectivePullRequestBindsRepositoryAndEqualTimeTerminalEvidence(t *testing.T) {
+	now := time.Date(2026, 7, 29, 2, 0, 0, 0, time.UTC)
+	head := strings.Repeat("a", 40)
+	base := strings.Repeat("b", 40)
+	mergeSHA := strings.Repeat("c", 40)
+	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateCompleted, CandidateHead: head, BaseSHA: base})
+	pr := domain.PullRequest{Number: 7, DatabaseID: 70, URL: "https://example.invalid/pull/7", NodeID: "PR_7", HeadBranch: "feature", BaseBranch: "main", HeadSHA: head, BaseSHA: base, BodyDigest: "body", OwnershipKey: "owner", State: "open"}
+	merge := &MergeRecord{RunID: run.ID, PRNumber: pr.Number, PreMergeSHA: head, BaseSHA: base, Method: "squash", MergeSHA: mergeSHA, MergedAt: now}
+	binding := &SanitizedRepositoryBinding{CanonicalRepository: run.Repository, ExpectedRepositoryID: 99}
+	repository := domain.RepositoryIdentity{ID: 99, Owner: "owner", Name: "repo"}
+
+	for _, test := range []struct {
+		name       string
+		binding    *SanitizedRepositoryBinding
+		repo       domain.RepositoryIdentity
+		pr         domain.PullRequest
+		observed   time.Time
+		want       string
+		wantSource string
+	}{
+		{"matching authority without read", binding, domain.RepositoryIdentity{}, domain.PullRequest{}, time.Time{}, "merged", "merge_result"},
+		{"missing binding", nil, domain.RepositoryIdentity{}, domain.PullRequest{}, time.Time{}, "unknown", "missing_or_invalid_repository_binding"},
+		{"invalid binding", &SanitizedRepositoryBinding{CanonicalRepository: run.Repository}, domain.RepositoryIdentity{}, domain.PullRequest{}, time.Time{}, "unknown", "missing_or_invalid_repository_binding"},
+		{"wrong owner", binding, domain.RepositoryIdentity{ID: 99, Owner: "other", Name: "repo"}, pr, now.Add(-time.Minute), "conflict", "github_repository_authority_conflict"},
+		{"wrong repository id", binding, domain.RepositoryIdentity{ID: 100, Owner: "owner", Name: "repo"}, pr, now.Add(-time.Minute), "conflict", "github_repository_authority_conflict"},
+		{"earlier open is historical", binding, repository, pr, now.Add(-time.Minute), "merged", "merge_result"},
+		{"equal open conflicts", binding, repository, pr, now, "conflict", "github_read_state_conflicts_with_merge_result"},
+		{"later open conflicts", binding, repository, pr, now.Add(time.Minute), "conflict", "github_read_state_conflicts_with_merge_result"},
+		{"equal wrong merge SHA conflicts", binding, repository, func() domain.PullRequest {
+			value := pr
+			value.State, value.Merged, value.MergeSHA, value.MergedAt = "closed", true, strings.Repeat("d", 40), now
+			return value
+		}(), now, "conflict", "github_read_state_conflicts_with_merge_result"},
+		{"equal merged matches", binding, repository, func() domain.PullRequest {
+			value := pr
+			value.State, value.Merged, value.MergeSHA, value.MergedAt = "closed", true, mergeSHA, now
+			return value
+		}(), now, "merged", "merge_result"},
+		{"later merged matches", binding, repository, func() domain.PullRequest {
+			value := pr
+			value.State, value.Merged, value.MergeSHA, value.MergedAt = "closed", true, mergeSHA, now
+			return value
+		}(), now.Add(time.Minute), "merged", "merge_result"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			inspection := RunInspection{Run: run, RepositoryBinding: test.binding, PullRequest: &pr, Merge: merge}
+			if !test.observed.IsZero() {
+				inspection.GitHubEvidence = &domain.GitHubReadEvidence{Repository: test.repo, PullRequest: test.pr, ObservedAt: test.observed}
+			}
+			got := projectEffectivePullRequest(inspection)
+			if got == nil || got.Status != test.want || got.EvidenceSource != test.wantSource {
+				t.Fatalf("effective PR=%+v want status=%s source=%s", got, test.want, test.wantSource)
+			}
+		})
 	}
 }
 
@@ -465,7 +524,7 @@ func TestTrustedFeedbackProjectionSeparatesInitialSnapshotFromFinalThreadEvidenc
 	shadow := *evidence
 	shadow.ReviewThreads = nil
 	shadow.ObservedAt = now.Add(3 * time.Minute)
-	inspection := RunInspection{Run: run, RepositoryBinding: &SanitizedRepositoryBinding{ExpectedRepositoryID: repository.ID}, PullRequest: &pr, TrustedFeedback: []TrustedReviewFeedbackRecord{feedback}, GitHubEvidence: &shadow, GitHubEvidenceHistory: []domain.GitHubReadEvidence{*evidence, shadow}}
+	inspection := RunInspection{Run: run, RepositoryBinding: &SanitizedRepositoryBinding{CanonicalRepository: run.Repository, ExpectedRepositoryID: repository.ID}, PullRequest: &pr, TrustedFeedback: []TrustedReviewFeedbackRecord{feedback}, GitHubEvidence: &shadow, GitHubEvidenceHistory: []domain.GitHubReadEvidence{*evidence, shadow}}
 	got, err := NewQueryService(serviceStore{run: run, inspection: inspection}).GetRunDetail(context.Background(), RunDetailQuery{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID})
 	if err != nil {
 		t.Fatal(err)

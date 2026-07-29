@@ -708,7 +708,9 @@ controller lifecycle from `effective_thread_status`, selected from the latest
 repository-, PR-, and strict-thread-matching immutable observation. An
 effective `unknown` or `conflict` means the persisted evidence is missing or
 inconsistent and must not be interpreted as open, closed, merged, resolved, or
-unresolved.
+unresolved. In particular, a missing or invalid persisted repository binding
+projects `unknown`; a GitHub observation from a different repository owner,
+name, or database ID projects `conflict`.
 
 **Possible durable stop states**
 
