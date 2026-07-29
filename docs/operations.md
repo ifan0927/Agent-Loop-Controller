@@ -2067,9 +2067,15 @@ mode-`0600` leaves before bootstrap.
 Use the sensitive-output scanner before retaining or sharing evidence:
 
 ```sh
-./scripts/scan-sensitive-output.sh /absolute/artifact/root /absolute/controller/state/root
+./scripts/scan-sensitive-output.sh "$ARTIFACT_ROOT" "$CONTROLLER_DB" \
+  "$WORKER_STDOUT_LOG" "$WORKER_STDERR_LOG"
+"$BIN" config doctor --config "$CONFIG"
 ```
 
+The scanner accepts only output and non-secret state evidence. It reports fixed
+reason codes without matched bytes, lines, file names, or paths. Never pass the
+controller root, credential directory, or credential leaf to it; `config
+doctor` checks the intentional credential source's secure topology separately.
 Do not print credential files, use `sqlite3` to patch state, or copy private
 artifacts into GitHub/Linear comments.
 

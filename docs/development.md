@@ -111,12 +111,25 @@ It is part of the verification gate.
 
 ```sh
 ./scripts/scan-sensitive-output.sh .
-./scripts/scan-sensitive-output.sh /absolute/private/evidence-root
+./scripts/scan-sensitive-output.sh "$ARTIFACT_ROOT" "$CONTROLLER_DB" \
+  "$WORKER_STDOUT_LOG" "$WORKER_STDERR_LOG"
 ```
 
 The scanner detects private-key blocks and common credential/header patterns.
+It emits no matched bytes, lines, file names, or input paths. Exit status `1`
+reports only the fixed `prohibited_material_detected` reason code; scanner
+failures use a separate fixed reason code and exit status `2`. Credential-source
+files are intentionally not scanner inputs. Check their ownership, type, link,
+size, and permission topology with `ifan-loop config doctor` instead.
 It supplements code review; it is not proof that arbitrary sensitive personal
 data is absent.
+
+The deterministic scanner regression covers every recognized private-key,
+authorization-header, GitHub-token, and Linear-token form:
+
+```sh
+./scripts/test-scan-sensitive-output.sh
+```
 
 ### Continuous supervisor fixture matrix
 

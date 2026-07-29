@@ -169,12 +169,25 @@ After `completed`:
    expected controller-owned worktree/local/remote branch resources are gone.
 4. Keep SQLite, artifacts, audit evidence, and private logs long enough for
    review; do not erase evidence to make the run appear clean.
-5. Scan both artifact and controller state roots:
+5. Scan only output and non-secret state evidence. Scan the artifact root,
+   SQLite database, and bounded worker logs directly; retained sanitized
+   `status` or `inspect` projections belong under the artifact root:
 
 ```sh
-./scripts/scan-sensitive-output.sh /absolute/run-artifacts /absolute/controller-state
+./scripts/scan-sensitive-output.sh "$RUN_ARTIFACT_ROOT" "$CONTROLLER_DB" \
+  "$WORKER_STDOUT_LOG" "$WORKER_STDERR_LOG"
 ```
 
+   Do not pass the controller root, credential directory, or credential leaf to
+   the scanner. Check the intentional credential source separately without
+   printing its path or contents:
+
+```sh
+"$BIN" config doctor --config "$CONFIG"
+```
+
+   The scanner reports only a fixed reason code on detection or scanner failure.
+   It never prints matched bytes, lines, file names, or input paths.
 6. Record the pass/failure outcome in issue #42 without credentials or private
    evidence.
 
