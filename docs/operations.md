@@ -710,7 +710,11 @@ effective `unknown` or `conflict` means the persisted evidence is missing or
 inconsistent and must not be interpreted as open, closed, merged, resolved, or
 unresolved. In particular, a missing or invalid persisted repository binding
 projects `unknown`; a GitHub observation from a different repository owner,
-name, or database ID projects `conflict`.
+name, or database ID projects `conflict`. A merge result also requires the
+stored PR aggregate to have complete identity and to match the run's branch,
+base branch, candidate head, base SHA, and ownership key. For resolved
+feedback, an earlier unresolved GitHub read remains historical, while an
+equal-time or later unresolved read projects `conflict`.
 
 **Possible durable stop states**
 

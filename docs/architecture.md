@@ -516,15 +516,20 @@ same version 2 detail projection contract:
   historical PR facts without rewriting the aggregate.
 - `pull_request` is the effective status. A valid immutable `merge_result`
   projects `merged` even when the aggregate remains open. Missing aggregate or
-  complete persisted repository binding or terminal merge authority projects
-  `unknown`; mismatched
-  repository/PR/head/base/merge evidence projects `conflict`.
+  incomplete persisted repository binding or terminal merge authority projects
+  `unknown`; an aggregate must have complete PR identity and match the run's
+  branch, base branch, candidate head, base SHA, and ownership key before it can
+  support that result. Mismatched repository/PR/topology/merge evidence projects
+  `conflict`.
 - each trusted feedback item labels its initial change-request snapshot,
   exposes controller lifecycle fields separately, and derives
   `effective_thread_status` from the latest repository-, PR-, and strict
   thread-topology-matching immutable GitHub read across the retained evidence
   history, or from a controller-recorded resolution observation. Missing or
-  authority-conflicting evidence projects `unknown` or `conflict`.
+  authority-conflicting evidence projects `unknown` or `conflict`. An
+  unresolved GitHub read earlier than a controller resolution remains history;
+  an equal-time or later unresolved read conflicts because neither source
+  establishes a safe final resolved state at that ordering boundary.
 
 **Authoritative state/evidence**
 

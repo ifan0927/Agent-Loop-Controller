@@ -778,6 +778,10 @@ func projectEffectivePullRequest(value RunInspection) *EffectivePullRequestResul
 		}
 	}
 	if value.Merge != nil {
+		if !validPullRequestProjectionAuthority(value, *aggregate) {
+			result.Status, result.State, result.EvidenceSource = "conflict", "conflict", "pull_request_aggregate_authority_conflict"
+			return result
+		}
 		if !validMergeProjectionAuthority(value, *aggregate, *value.Merge) {
 			result.Status, result.State, result.EvidenceSource = "conflict", "conflict", "merge_result_conflict"
 			return result
@@ -882,6 +886,15 @@ func validMergeProjectionAuthority(value RunInspection, aggregate domain.PullReq
 		!merge.MergedAt.IsZero()
 }
 
+func validPullRequestProjectionAuthority(value RunInspection, aggregate domain.PullRequest) bool {
+	if aggregate.ValidateOwnership(value.Run.WorkingBranch, value.Run.BaseBranch, value.Run.CandidateHead, value.Run.IdempotencyKey) != nil {
+		return false
+	}
+	return aggregate.DatabaseID > 0 &&
+		strings.TrimSpace(aggregate.URL) != "" &&
+		aggregate.BaseSHA == value.Run.BaseSHA
+}
+
 func sameProjectedPullRequest(expected, observed *domain.PullRequest) bool {
 	return expected != nil && observed != nil &&
 		expected.Number == observed.Number &&
@@ -921,8 +934,11 @@ func projectEffectiveThreadStatus(value RunInspection, feedback TrustedReviewFee
 		if !valid {
 			return ThreadStatusResult{Status: "conflict", EvidenceSource: "github_read_thread_topology_conflict", ObservedAt: evidence.ObservedAt}
 		}
-		if feedback.Resolved && !resolved && evidence.ObservedAt.After(feedback.UpdatedAt) {
-			return ThreadStatusResult{Status: "conflict", EvidenceSource: "github_read_conflicts_with_controller_lifecycle", ObservedAt: evidence.ObservedAt}
+		if feedback.Resolved && !resolved {
+			if !evidence.ObservedAt.Before(feedback.UpdatedAt) {
+				return ThreadStatusResult{Status: "conflict", EvidenceSource: "github_read_conflicts_with_controller_lifecycle", ObservedAt: evidence.ObservedAt}
+			}
+			break
 		}
 		status := "open"
 		switch {

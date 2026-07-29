@@ -371,7 +371,7 @@ func TestTerminalProjectionSeparatesHistoricalPullRequestSnapshotFromEffectiveMe
 	head := strings.Repeat("a", 40)
 	base := strings.Repeat("b", 40)
 	mergeSHA := strings.Repeat("c", 40)
-	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateCompleted, CandidateHead: head, BaseSHA: base})
+	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateCompleted, IdempotencyKey: "owner", WorkingBranch: "feature", BaseBranch: "main", CandidateHead: head, BaseSHA: base})
 	snapshot := domain.PullRequest{Number: 7, DatabaseID: 70, URL: "https://example.invalid/pull/7", NodeID: "PR_7", HeadBranch: "feature", BaseBranch: "main", HeadSHA: head, BaseSHA: base, BodyDigest: "body", OwnershipKey: "owner", State: "open"}
 	merge := &MergeRecord{RunID: run.ID, PRNumber: snapshot.Number, PreMergeSHA: head, BaseSHA: base, Method: "squash", MergeSHA: mergeSHA, MergedAt: now}
 	binding := &SanitizedRepositoryBinding{CanonicalRepository: run.Repository, ExpectedRepositoryID: 99}
@@ -412,7 +412,7 @@ func TestTerminalProjectionFailsClosedForMissingOrConflictingMergeEvidence(t *te
 	now := time.Date(2026, 7, 29, 2, 0, 0, 0, time.UTC)
 	head := strings.Repeat("a", 40)
 	base := strings.Repeat("b", 40)
-	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateCompleted, CandidateHead: head, BaseSHA: base})
+	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateCompleted, IdempotencyKey: "owner", WorkingBranch: "feature", BaseBranch: "main", CandidateHead: head, BaseSHA: base})
 	snapshot := domain.PullRequest{Number: 7, DatabaseID: 70, URL: "https://example.invalid/pull/7", NodeID: "PR_7", HeadBranch: "feature", BaseBranch: "main", HeadSHA: head, BaseSHA: base, BodyDigest: "body", OwnershipKey: "owner", State: "open"}
 	binding := &SanitizedRepositoryBinding{CanonicalRepository: run.Repository, ExpectedRepositoryID: 99}
 	service := NewQueryService(serviceStore{run: run, inspection: RunInspection{Run: run, RepositoryBinding: binding, PullRequest: &snapshot}})
@@ -442,6 +442,30 @@ func TestTerminalProjectionFailsClosedForMissingOrConflictingMergeEvidence(t *te
 	if missingAggregate.PullRequest == nil || missingAggregate.PullRequest.Status != "unknown" || missingAggregate.PullRequest.EvidenceSource != "missing_pull_request_aggregate" || missingAggregate.PullRequest.Merged != nil {
 		t.Fatalf("missing terminal PR aggregate was omitted or guessed: %+v", missingAggregate.PullRequest)
 	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*domain.PullRequest)
+	}{
+		{"copied ownership", func(value *domain.PullRequest) { value.OwnershipKey = "another-run" }},
+		{"wrong head branch", func(value *domain.PullRequest) { value.HeadBranch = "another-feature" }},
+		{"wrong base branch", func(value *domain.PullRequest) { value.BaseBranch = "release" }},
+		{"missing database identity", func(value *domain.PullRequest) { value.DatabaseID = 0 }},
+		{"missing URL identity", func(value *domain.PullRequest) { value.URL = "" }},
+		{"wrong base SHA", func(value *domain.PullRequest) { value.BaseSHA = strings.Repeat("d", 40) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			corrupt := snapshot
+			test.mutate(&corrupt)
+			got := projectEffectivePullRequest(RunInspection{Run: run, RepositoryBinding: binding, PullRequest: &corrupt, Merge: &MergeRecord{
+				RunID: run.ID, PRNumber: corrupt.Number, PreMergeSHA: head, BaseSHA: base,
+				Method: "squash", MergeSHA: strings.Repeat("c", 40), MergedAt: now,
+			}})
+			if got == nil || got.Status != "conflict" || got.State != "conflict" || got.Merged != nil || got.EvidenceSource != "pull_request_aggregate_authority_conflict" {
+				t.Fatalf("corrupt PR aggregate was projected as terminal truth: %+v", got)
+			}
+		})
+	}
 }
 
 func TestEffectivePullRequestBindsRepositoryAndEqualTimeTerminalEvidence(t *testing.T) {
@@ -449,7 +473,7 @@ func TestEffectivePullRequestBindsRepositoryAndEqualTimeTerminalEvidence(t *test
 	head := strings.Repeat("a", 40)
 	base := strings.Repeat("b", 40)
 	mergeSHA := strings.Repeat("c", 40)
-	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateCompleted, CandidateHead: head, BaseSHA: base})
+	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateCompleted, IdempotencyKey: "owner", WorkingBranch: "feature", BaseBranch: "main", CandidateHead: head, BaseSHA: base})
 	pr := domain.PullRequest{Number: 7, DatabaseID: 70, URL: "https://example.invalid/pull/7", NodeID: "PR_7", HeadBranch: "feature", BaseBranch: "main", HeadSHA: head, BaseSHA: base, BodyDigest: "body", OwnershipKey: "owner", State: "open"}
 	merge := &MergeRecord{RunID: run.ID, PRNumber: pr.Number, PreMergeSHA: head, BaseSHA: base, Method: "squash", MergeSHA: mergeSHA, MergedAt: now}
 	binding := &SanitizedRepositoryBinding{CanonicalRepository: run.Repository, ExpectedRepositoryID: 99}
@@ -518,7 +542,7 @@ func TestTrustedFeedbackProjectionSeparatesInitialSnapshotFromFinalThreadEvidenc
 		DatabaseID: feedback.RootCommentDatabaseID, NodeID: feedback.RootCommentNodeID, Author: &author, BodyDigest: feedback.BodyDigest,
 		Review: domain.GitHubReview{DatabaseID: feedback.ReviewDatabaseID, NodeID: feedback.ReviewNodeID, State: "CHANGES_REQUESTED", CommitSHA: head, Actor: author},
 	}}}
-	run := authorizeTestRun(Run{ID: feedback.RunID, Repository: "owner/repo", State: domain.StateCompleted, CandidateHead: head, BaseSHA: pr.BaseSHA})
+	run := authorizeTestRun(Run{ID: feedback.RunID, Repository: "owner/repo", State: domain.StateCompleted, IdempotencyKey: "owner", WorkingBranch: "feature", BaseBranch: "main", CandidateHead: head, BaseSHA: pr.BaseSHA})
 	repository := domain.RepositoryIdentity{ID: 99, Owner: "owner", Name: "repo"}
 	evidence := &domain.GitHubReadEvidence{Repository: repository, PullRequest: pr, ReviewThreads: []domain.GitHubReviewThread{thread}, ObservedAt: now.Add(2 * time.Minute)}
 	shadow := *evidence
@@ -559,6 +583,41 @@ func TestTrustedFeedbackProjectionSeparatesInitialSnapshotFromFinalThreadEvidenc
 	conflict = projectEffectiveThreadStatus(inspection, feedback)
 	if conflict.Status != "conflict" || conflict.Resolved != nil || conflict.Outdated != nil {
 		t.Fatalf("wrong repository/PR authority was presented as resolved: %+v", conflict)
+	}
+
+	resolvedFeedback := feedback
+	resolvedFeedback.Lifecycle = domain.TrustedReviewFeedbackResolved
+	resolvedFeedback.Resolved = true
+	resolvedFeedback.UpdatedAt = now.Add(5 * time.Minute)
+	for _, test := range []struct {
+		name       string
+		observedAt time.Time
+		resolved   bool
+		outdated   bool
+		wantStatus string
+		wantSource string
+	}{
+		{"earlier unresolved is historical", resolvedFeedback.UpdatedAt.Add(-time.Second), false, false, "resolved", "controller_resolution_observation"},
+		{"equal unresolved conflicts", resolvedFeedback.UpdatedAt, false, false, "conflict", "github_read_conflicts_with_controller_lifecycle"},
+		{"later unresolved conflicts", resolvedFeedback.UpdatedAt.Add(time.Second), false, false, "conflict", "github_read_conflicts_with_controller_lifecycle"},
+		{"earlier resolved outdated remains final evidence", resolvedFeedback.UpdatedAt.Add(-time.Second), true, true, "resolved_outdated", "github_read_observation"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			matrixThread := thread
+			matrixThread.Resolved = test.resolved
+			matrixThread.Outdated = test.outdated
+			matrixThread.Line = feedback.Line
+			matrixEvidence := *evidence
+			matrixEvidence.ReviewThreads = []domain.GitHubReviewThread{matrixThread}
+			matrixEvidence.ObservedAt = test.observedAt
+			matrixInspection := inspection
+			matrixInspection.GitHubEvidence = &matrixEvidence
+			matrixInspection.GitHubEvidenceHistory = []domain.GitHubReadEvidence{matrixEvidence}
+			got := projectEffectiveThreadStatus(matrixInspection, resolvedFeedback)
+			if got.Status != test.wantStatus || got.EvidenceSource != test.wantSource {
+				t.Fatalf("effective thread status=%+v want status=%s source=%s", got, test.wantStatus, test.wantSource)
+			}
+		})
 	}
 }
 

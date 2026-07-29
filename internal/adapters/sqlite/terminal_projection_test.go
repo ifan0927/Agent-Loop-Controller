@@ -172,3 +172,175 @@ func TestCompletedMergeWithoutPullRequestAggregateProjectsUnknownAfterRestart(t 
 		t.Fatalf("missing PR aggregate was omitted or guessed after restart: %+v", result.PullRequest)
 	}
 }
+
+func TestResolvedFeedbackProjectionOrdersGitHubEvidenceAcrossSQLiteRestart(t *testing.T) {
+	resolutionAt := time.Date(2026, 7, 29, 5, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name       string
+		observedAt time.Time
+		wantStatus string
+		wantSource string
+	}{
+		{"earlier unresolved is historical", resolutionAt.Add(-time.Second), "resolved", "controller_resolution_observation"},
+		{"equal unresolved conflicts", resolutionAt, "conflict", "github_read_conflicts_with_controller_lifecycle"},
+		{"later unresolved conflicts", resolutionAt.Add(time.Second), "conflict", "github_read_conflicts_with_controller_lifecycle"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			path := filepath.Join(t.TempDir(), "controller.db")
+			store, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			head := strings.Repeat("a", 40)
+			base := strings.Repeat("b", 40)
+			repositoryJSON, _ := json.Marshal(application.LocalRepository{CanonicalRepository: "owner/repo", ExpectedRepositoryID: 99, AllowedOperatorLogins: []string{"operator"}})
+			run := application.Run{
+				ID: "feedback-order", IssueID: "IFAN-86", IdempotencyKey: "feedback-order-key",
+				SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task",
+				Repository: "owner/repo", RepositoryConfigJSON: string(repositoryJSON), RegistryVersion: 1,
+				BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: "/private/artifacts",
+			}
+			if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.db.ExecContext(ctx, `UPDATE runs SET current_state=?,base_sha=?,candidate_head=? WHERE run_id=?`, domain.StatePROpen, base, head, run.ID); err != nil {
+				t.Fatal(err)
+			}
+			pr := domain.PullRequest{
+				Number: 7, DatabaseID: 70, URL: "https://example.invalid/pull/7", NodeID: "PR_7",
+				HeadBranch: run.WorkingBranch, BaseBranch: run.BaseBranch, HeadSHA: head, BaseSHA: base,
+				BodyDigest: "body-digest", OwnershipKey: run.IdempotencyKey, State: "open",
+			}
+			if err := store.SavePullRequest(ctx, run.ID, pr); err != nil {
+				t.Fatal(err)
+			}
+			author := domain.ActorIdentity{DatabaseID: 33, NodeID: "USER_33", Login: "operator", Type: "User"}
+			body := "Please fix this."
+			line := 12
+			feedback := application.TrustedReviewFeedbackRecord{RunID: run.ID, TrustedReviewFeedback: domain.TrustedReviewFeedback{
+				PRNumber: pr.Number, PRDatabaseID: pr.DatabaseID, PRNodeID: pr.NodeID,
+				ReviewDatabaseID: 80, ReviewNodeID: "REVIEW_80", ThreadNodeID: "THREAD_90",
+				RootCommentDatabaseID: 100, RootCommentNodeID: "COMMENT_100", Author: author,
+				OriginalReviewHeadSHA: head, Path: "internal/example.go", Line: &line, Body: body,
+				BodyDigest: domain.TrustedReviewFeedbackDigest(body), SourceAt: resolutionAt.Add(-time.Minute),
+				ObservedAt: resolutionAt.Add(-time.Minute), UpdatedAt: resolutionAt.Add(-time.Minute),
+			}}
+			if _, created, err := store.SaveTrustedReviewFeedback(ctx, feedback); err != nil || !created {
+				t.Fatalf("feedback created=%v err=%v", created, err)
+			}
+			if _, err := store.db.ExecContext(ctx, `UPDATE trusted_review_feedback SET lifecycle=?,resolved=1,outdated=0,updated_at=? WHERE run_id=? AND root_comment_node_id=?`, domain.TrustedReviewFeedbackResolved, formatTime(resolutionAt), run.ID, feedback.RootCommentNodeID); err != nil {
+				t.Fatal(err)
+			}
+			thread := domain.GitHubReviewThread{
+				NodeID: feedback.ThreadNodeID, OriginalCommitSHA: head, Path: feedback.Path, Line: &line,
+				Comments: []domain.GitHubReviewComment{{
+					DatabaseID: feedback.RootCommentDatabaseID, NodeID: feedback.RootCommentNodeID,
+					Author: &author, BodyDigest: feedback.BodyDigest,
+					Review: domain.GitHubReview{
+						DatabaseID: feedback.ReviewDatabaseID, NodeID: feedback.ReviewNodeID,
+						State: "CHANGES_REQUESTED", CommitSHA: head, Actor: author,
+					},
+				}},
+			}
+			if err := store.SaveGitHubEvidence(ctx, run.ID, domain.GitHubReadEvidence{
+				Repository:  domain.RepositoryIdentity{ID: 99, NodeID: "REPO_99", Owner: "owner", Name: "repo"},
+				PullRequest: pr, ReviewThreads: []domain.GitHubReviewThread{thread}, ObservedAt: test.observedAt,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			store, err = Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			result, err := application.NewQueryService(store).GetRunDetail(ctx, application.RunDetailQuery{
+				Requester: application.Requester{ID: "operator", Kind: "github_login"},
+				RunID:     run.ID,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := result.TrustedFeedback[0].EffectiveThreadStatus
+			if got.Status != test.wantStatus || got.EvidenceSource != test.wantSource {
+				t.Fatalf("effective thread status after restart=%+v want status=%s source=%s", got, test.wantStatus, test.wantSource)
+			}
+		})
+	}
+}
+
+func TestCorruptPullRequestAggregateFailsClosedAcrossSQLiteRestart(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		column string
+		value  any
+	}{
+		{"copied ownership", "ownership_key", "another-run"},
+		{"corrupt head branch", "head_branch", "another-feature"},
+		{"missing database identity", "database_id", int64(0)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			path := filepath.Join(t.TempDir(), "controller.db")
+			store, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			head := strings.Repeat("a", 40)
+			base := strings.Repeat("b", 40)
+			repositoryJSON, _ := json.Marshal(application.LocalRepository{CanonicalRepository: "owner/repo", ExpectedRepositoryID: 99, AllowedOperatorLogins: []string{"operator"}})
+			run := application.Run{
+				ID: "corrupt-pr", IssueID: "IFAN-86", IdempotencyKey: "corrupt-pr-key",
+				SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task",
+				Repository: "owner/repo", RepositoryConfigJSON: string(repositoryJSON), RegistryVersion: 1,
+				BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: "/private/artifacts",
+			}
+			if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.db.ExecContext(ctx, `UPDATE runs SET current_state=?,base_sha=?,candidate_head=? WHERE run_id=?`, domain.StateCompleted, base, head, run.ID); err != nil {
+				t.Fatal(err)
+			}
+			pr := domain.PullRequest{
+				Number: 7, DatabaseID: 70, URL: "https://example.invalid/pull/7", NodeID: "PR_7",
+				HeadBranch: run.WorkingBranch, BaseBranch: run.BaseBranch, HeadSHA: head, BaseSHA: base,
+				BodyDigest: "body-digest", OwnershipKey: run.IdempotencyKey, State: "open",
+			}
+			if err := store.SavePullRequest(ctx, run.ID, pr); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.SaveMerge(ctx, application.MergeRecord{
+				RunID: run.ID, PRNumber: pr.Number, PreMergeSHA: head, BaseSHA: base,
+				Method: "squash", MergeSHA: strings.Repeat("c", 40), MergedAt: time.Date(2026, 7, 29, 6, 0, 0, 0, time.UTC),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.db.ExecContext(ctx, `UPDATE pull_requests SET `+test.column+`=? WHERE run_id=?`, test.value, run.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			store, err = Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			result, err := application.NewQueryService(store).GetRunDetail(ctx, application.RunDetailQuery{
+				Requester: application.Requester{ID: "operator", Kind: "github_login"},
+				RunID:     run.ID,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.PullRequest == nil || result.PullRequest.Status != "conflict" || result.PullRequest.Merged != nil || result.PullRequest.EvidenceSource != "pull_request_aggregate_authority_conflict" {
+				t.Fatalf("corrupt PR aggregate was projected as terminal truth after restart: %+v", result.PullRequest)
+			}
+		})
+	}
+}
