@@ -523,6 +523,13 @@ func TestEffectivePullRequestBindsRepositoryAndEqualTimeTerminalEvidence(t *test
 			}
 		})
 	}
+	zeroTime := projectEffectivePullRequest(RunInspection{
+		Run: run, RepositoryBinding: binding, PullRequest: &pr, Merge: merge,
+		GitHubEvidence: &domain.GitHubReadEvidence{Repository: repository, PullRequest: pr},
+	})
+	if zeroTime == nil || zeroTime.Status != "conflict" || zeroTime.EvidenceSource != "github_read_observation_time_conflict" {
+		t.Fatalf("zero-time GitHub observation was treated as historical: %+v", zeroTime)
+	}
 }
 
 func TestTrustedFeedbackProjectionSeparatesInitialSnapshotFromFinalThreadEvidence(t *testing.T) {
@@ -535,7 +542,9 @@ func TestTrustedFeedbackProjectionSeparatesInitialSnapshotFromFinalThreadEvidenc
 		PRNumber: 7, PRDatabaseID: 70, PRNodeID: "PR_7", ReviewDatabaseID: 80, ReviewNodeID: "REVIEW_80",
 		ThreadNodeID: "THREAD_90", RootCommentDatabaseID: 100, RootCommentNodeID: "COMMENT_100", Author: author,
 		OriginalReviewHeadSHA: head, Path: "internal/example.go", Line: &line, BodyDigest: domain.TrustedReviewFeedbackDigest(body),
-		SourceAt: now, ObservedAt: now, Lifecycle: domain.TrustedReviewFeedbackReplied, UpdatedAt: now.Add(time.Minute),
+		Body: body, SourceAt: now, ObservedAt: now, Lifecycle: domain.TrustedReviewFeedbackReplied,
+		BoundRepairHead: strings.Repeat("d", 40), ReplyIntentKey: "reply-intent",
+		ReplyDatabaseID: 110, ReplyNodeID: "COMMENT_110", UpdatedAt: now.Add(time.Minute),
 	}}
 	pr := domain.PullRequest{Number: feedback.PRNumber, DatabaseID: feedback.PRDatabaseID, NodeID: feedback.PRNodeID, URL: "https://example.invalid/pull/7", HeadBranch: "feature", BaseBranch: "main", HeadSHA: head, BaseSHA: strings.Repeat("b", 40), BodyDigest: "body", OwnershipKey: "owner", State: "open"}
 	thread := domain.GitHubReviewThread{NodeID: feedback.ThreadNodeID, Resolved: true, Outdated: true, OriginalCommitSHA: head, Path: feedback.Path, Line: nil, Comments: []domain.GitHubReviewComment{{
@@ -560,7 +569,10 @@ func TestTrustedFeedbackProjectionSeparatesInitialSnapshotFromFinalThreadEvidenc
 	if projected.EffectiveThreadStatus.Status != "resolved_outdated" || projected.EffectiveThreadStatus.Resolved == nil || !*projected.EffectiveThreadStatus.Resolved || projected.EffectiveThreadStatus.Outdated == nil || !*projected.EffectiveThreadStatus.Outdated || projected.EffectiveThreadStatus.EvidenceSource != "github_read_observation" {
 		t.Fatalf("final thread evidence was not projected: %+v", projected.EffectiveThreadStatus)
 	}
-	if unknown := projectEffectiveThreadStatus(RunInspection{}, feedback); unknown.Status != "unknown" || unknown.Resolved != nil || unknown.Outdated != nil {
+	withoutFinalEvidence := inspection
+	withoutFinalEvidence.GitHubEvidence = nil
+	withoutFinalEvidence.GitHubEvidenceHistory = nil
+	if unknown := projectEffectiveThreadStatus(withoutFinalEvidence, feedback); unknown.Status != "unknown" || unknown.Resolved != nil || unknown.Outdated != nil {
 		t.Fatalf("missing final thread evidence was presented as fact: %+v", unknown)
 	}
 	conflicting := thread
@@ -584,11 +596,30 @@ func TestTrustedFeedbackProjectionSeparatesInitialSnapshotFromFinalThreadEvidenc
 	if conflict.Status != "conflict" || conflict.Resolved != nil || conflict.Outdated != nil {
 		t.Fatalf("wrong repository/PR authority was presented as resolved: %+v", conflict)
 	}
+	corruptAggregate := pr
+	corruptAggregate.HeadBranch = "copied-feature"
+	corruptEvidence := *evidence
+	corruptEvidence.PullRequest = corruptAggregate
+	corruptInspection := inspection
+	corruptInspection.PullRequest = &corruptAggregate
+	corruptInspection.GitHubEvidence = &corruptEvidence
+	corruptInspection.GitHubEvidenceHistory = []domain.GitHubReadEvidence{corruptEvidence}
+	conflict = projectEffectiveThreadStatus(corruptInspection, feedback)
+	if conflict.Status != "conflict" || conflict.EvidenceSource != "feedback_pull_request_authority_conflict" {
+		t.Fatalf("mutually consistent evidence detached from the run was trusted: %+v", conflict)
+	}
 
 	resolvedFeedback := feedback
 	resolvedFeedback.Lifecycle = domain.TrustedReviewFeedbackResolved
 	resolvedFeedback.Resolved = true
 	resolvedFeedback.UpdatedAt = now.Add(5 * time.Minute)
+	corruptControllerInspection := corruptInspection
+	corruptControllerInspection.GitHubEvidence = nil
+	corruptControllerInspection.GitHubEvidenceHistory = nil
+	conflict = projectEffectiveThreadStatus(corruptControllerInspection, resolvedFeedback)
+	if conflict.Status != "conflict" || conflict.EvidenceSource != "feedback_pull_request_authority_conflict" {
+		t.Fatalf("controller resolution detached from the run PR was trusted: %+v", conflict)
+	}
 	for _, test := range []struct {
 		name       string
 		observedAt time.Time
@@ -616,6 +647,28 @@ func TestTrustedFeedbackProjectionSeparatesInitialSnapshotFromFinalThreadEvidenc
 			got := projectEffectiveThreadStatus(matrixInspection, resolvedFeedback)
 			if got.Status != test.wantStatus || got.EvidenceSource != test.wantSource {
 				t.Fatalf("effective thread status=%+v want status=%s source=%s", got, test.wantStatus, test.wantSource)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*TrustedReviewFeedbackRecord)
+	}{
+		{"wrong run", func(value *TrustedReviewFeedbackRecord) { value.RunID = "another-run" }},
+		{"missing review identity", func(value *TrustedReviewFeedbackRecord) { value.ReviewNodeID = "" }},
+		{"impossible resolved lifecycle", func(value *TrustedReviewFeedbackRecord) { value.Lifecycle = domain.TrustedReviewFeedbackReplied }},
+		{"missing source timestamp", func(value *TrustedReviewFeedbackRecord) { value.SourceAt = time.Time{} }},
+		{"missing observation timestamp", func(value *TrustedReviewFeedbackRecord) { value.ObservedAt = time.Time{} }},
+		{"missing lifecycle timestamp", func(value *TrustedReviewFeedbackRecord) { value.UpdatedAt = time.Time{} }},
+		{"lifecycle timestamp predates observation", func(value *TrustedReviewFeedbackRecord) { value.UpdatedAt = value.ObservedAt.Add(-time.Second) }},
+	} {
+		t.Run("corrupt feedback "+test.name, func(t *testing.T) {
+			corrupt := resolvedFeedback
+			test.mutate(&corrupt)
+			got := projectEffectiveThreadStatus(inspection, corrupt)
+			if got.Status != "conflict" || got.Resolved != nil || got.Outdated != nil || got.EvidenceSource != "trusted_review_feedback_authority_conflict" {
+				t.Fatalf("corrupt persisted feedback was projected as resolved: %+v", got)
 			}
 		})
 	}

@@ -520,7 +520,8 @@ same version 2 detail projection contract:
   `unknown`; an aggregate must have complete PR identity and match the run's
   branch, base branch, candidate head, base SHA, and ownership key before it can
   support that result. Mismatched repository/PR/topology/merge evidence projects
-  `conflict`.
+  `conflict`. A GitHub read without an observation timestamp also projects
+  `conflict`; it cannot be ordered before terminal evidence.
 - each trusted feedback item labels its initial change-request snapshot,
   exposes controller lifecycle fields separately, and derives
   `effective_thread_status` from the latest repository-, PR-, and strict
@@ -529,7 +530,10 @@ same version 2 detail projection contract:
   authority-conflicting evidence projects `unknown` or `conflict`. An
   unresolved GitHub read earlier than a controller resolution remains history;
   an equal-time or later unresolved read conflicts because neither source
-  establishes a safe final resolved state at that ordering boundary.
+  establishes a safe final resolved state at that ordering boundary. Both
+  GitHub-backed and controller-backed thread status require a valid run-bound
+  PR aggregate and a persisted feedback row with complete immutable identity,
+  a legal lifecycle/evidence combination, and ordered nonzero timestamps.
 
 **Authoritative state/evidence**
 

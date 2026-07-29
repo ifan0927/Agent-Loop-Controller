@@ -176,14 +176,19 @@ func TestCompletedMergeWithoutPullRequestAggregateProjectsUnknownAfterRestart(t 
 func TestResolvedFeedbackProjectionOrdersGitHubEvidenceAcrossSQLiteRestart(t *testing.T) {
 	resolutionAt := time.Date(2026, 7, 29, 5, 0, 0, 0, time.UTC)
 	for _, test := range []struct {
-		name       string
-		observedAt time.Time
-		wantStatus string
-		wantSource string
+		name         string
+		observedAt   time.Time
+		corruptField string
+		corruptValue any
+		wantStatus   string
+		wantSource   string
 	}{
-		{"earlier unresolved is historical", resolutionAt.Add(-time.Second), "resolved", "controller_resolution_observation"},
-		{"equal unresolved conflicts", resolutionAt, "conflict", "github_read_conflicts_with_controller_lifecycle"},
-		{"later unresolved conflicts", resolutionAt.Add(time.Second), "conflict", "github_read_conflicts_with_controller_lifecycle"},
+		{"earlier unresolved is historical", resolutionAt.Add(-time.Second), "", nil, "resolved", "controller_resolution_observation"},
+		{"equal unresolved conflicts", resolutionAt, "", nil, "conflict", "github_read_conflicts_with_controller_lifecycle"},
+		{"later unresolved conflicts", resolutionAt.Add(time.Second), "", nil, "conflict", "github_read_conflicts_with_controller_lifecycle"},
+		{"missing review identity fails closed", resolutionAt.Add(-time.Second), "review_node_id", "", "conflict", "trusted_review_feedback_authority_conflict"},
+		{"impossible resolved lifecycle fails closed", resolutionAt.Add(-time.Second), "lifecycle", string(domain.TrustedReviewFeedbackReplied), "conflict", "trusted_review_feedback_authority_conflict"},
+		{"invalid lifecycle timestamp fails closed", resolutionAt.Add(-time.Second), "updated_at", "not-a-time", "conflict", "trusted_review_feedback_authority_conflict"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -229,8 +234,13 @@ func TestResolvedFeedbackProjectionOrdersGitHubEvidenceAcrossSQLiteRestart(t *te
 			if _, created, err := store.SaveTrustedReviewFeedback(ctx, feedback); err != nil || !created {
 				t.Fatalf("feedback created=%v err=%v", created, err)
 			}
-			if _, err := store.db.ExecContext(ctx, `UPDATE trusted_review_feedback SET lifecycle=?,resolved=1,outdated=0,updated_at=? WHERE run_id=? AND root_comment_node_id=?`, domain.TrustedReviewFeedbackResolved, formatTime(resolutionAt), run.ID, feedback.RootCommentNodeID); err != nil {
+			if _, err := store.db.ExecContext(ctx, `UPDATE trusted_review_feedback SET lifecycle=?,bound_repair_head=?,resolved=1,outdated=0,updated_at=? WHERE run_id=? AND root_comment_node_id=?`, domain.TrustedReviewFeedbackResolved, strings.Repeat("d", 40), formatTime(resolutionAt), run.ID, feedback.RootCommentNodeID); err != nil {
 				t.Fatal(err)
+			}
+			if test.corruptField != "" {
+				if _, err := store.db.ExecContext(ctx, `UPDATE trusted_review_feedback SET `+test.corruptField+`=? WHERE run_id=? AND root_comment_node_id=?`, test.corruptValue, run.ID, feedback.RootCommentNodeID); err != nil {
+					t.Fatal(err)
+				}
 			}
 			thread := domain.GitHubReviewThread{
 				NodeID: feedback.ThreadNodeID, OriginalCommitSHA: head, Path: feedback.Path, Line: &line,
@@ -342,5 +352,68 @@ func TestCorruptPullRequestAggregateFailsClosedAcrossSQLiteRestart(t *testing.T)
 				t.Fatalf("corrupt PR aggregate was projected as terminal truth after restart: %+v", result.PullRequest)
 			}
 		})
+	}
+}
+
+func TestZeroTimeGitHubObservationFailsClosedAcrossSQLiteRestart(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "controller.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := strings.Repeat("a", 40)
+	base := strings.Repeat("b", 40)
+	repositoryJSON, _ := json.Marshal(application.LocalRepository{CanonicalRepository: "owner/repo", ExpectedRepositoryID: 99, AllowedOperatorLogins: []string{"operator"}})
+	run := application.Run{
+		ID: "zero-time-read", IssueID: "IFAN-86", IdempotencyKey: "zero-time-read-key",
+		SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task",
+		Repository: "owner/repo", RepositoryConfigJSON: string(repositoryJSON), RegistryVersion: 1,
+		BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: "/private/artifacts",
+	}
+	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE runs SET current_state=?,base_sha=?,candidate_head=? WHERE run_id=?`, domain.StateCompleted, base, head, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	pr := domain.PullRequest{
+		Number: 7, DatabaseID: 70, URL: "https://example.invalid/pull/7", NodeID: "PR_7",
+		HeadBranch: run.WorkingBranch, BaseBranch: run.BaseBranch, HeadSHA: head, BaseSHA: base,
+		BodyDigest: "body-digest", OwnershipKey: run.IdempotencyKey, State: "open",
+	}
+	if err := store.SavePullRequest(ctx, run.ID, pr); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveGitHubEvidence(ctx, run.ID, domain.GitHubReadEvidence{
+		Repository:  domain.RepositoryIdentity{ID: 99, NodeID: "REPO_99", Owner: "owner", Name: "repo"},
+		PullRequest: pr,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveMerge(ctx, application.MergeRecord{
+		RunID: run.ID, PRNumber: pr.Number, PreMergeSHA: head, BaseSHA: base,
+		Method: "squash", MergeSHA: strings.Repeat("c", 40), MergedAt: time.Date(2026, 7, 29, 7, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	result, err := application.NewQueryService(store).GetRunDetail(ctx, application.RunDetailQuery{
+		Requester: application.Requester{ID: "operator", Kind: "github_login"},
+		RunID:     run.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.PullRequest == nil || result.PullRequest.Status != "conflict" || result.PullRequest.Merged != nil || result.PullRequest.EvidenceSource != "github_read_observation_time_conflict" {
+		t.Fatalf("zero-time GitHub read was treated as earlier terminal history after restart: %+v", result.PullRequest)
 	}
 }

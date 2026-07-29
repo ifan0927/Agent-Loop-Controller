@@ -768,6 +768,10 @@ func projectEffectivePullRequest(value RunInspection) *EffectivePullRequestResul
 		return result
 	}
 	if value.GitHubEvidence != nil {
+		if value.GitHubEvidence.ObservedAt.IsZero() {
+			result.Status, result.State, result.EvidenceSource = "conflict", "conflict", "github_read_observation_time_conflict"
+			return result
+		}
 		if !repositoryIdentityMatches(value, value.GitHubEvidence.Repository) {
 			result.Status, result.State, result.EvidenceSource, result.ObservedAt = "conflict", "conflict", "github_repository_authority_conflict", value.GitHubEvidence.ObservedAt
 			return result
@@ -909,6 +913,18 @@ func sameProjectedPullRequest(expected, observed *domain.PullRequest) bool {
 }
 
 func projectEffectiveThreadStatus(value RunInspection, feedback TrustedReviewFeedbackRecord) ThreadStatusResult {
+	if feedback.ValidatePersistedAuthority(value.Run.ID) != nil {
+		return ThreadStatusResult{Status: "conflict", EvidenceSource: "trusted_review_feedback_authority_conflict"}
+	}
+	if value.PullRequest == nil || !validProjectionRepositoryBinding(value) {
+		return ThreadStatusResult{Status: "unknown", EvidenceSource: "missing_feedback_pull_request_authority"}
+	}
+	if !validPullRequestProjectionAuthority(value, *value.PullRequest) ||
+		value.PullRequest.Number != feedback.PRNumber ||
+		value.PullRequest.DatabaseID != feedback.PRDatabaseID ||
+		value.PullRequest.NodeID != feedback.PRNodeID {
+		return ThreadStatusResult{Status: "conflict", EvidenceSource: "feedback_pull_request_authority_conflict"}
+	}
 	for _, conflict := range value.FeedbackConflicts {
 		if conflict.RootCommentNodeID == feedback.RootCommentNodeID {
 			return ThreadStatusResult{Status: "conflict", EvidenceSource: "trusted_review_feedback_conflict", ObservedAt: conflict.ObservedAt}
@@ -917,6 +933,14 @@ func projectEffectiveThreadStatus(value RunInspection, feedback TrustedReviewFee
 	history := githubEvidenceHistory(value)
 	for index := len(history) - 1; index >= 0; index-- {
 		evidence := history[index]
+		if evidence.ObservedAt.IsZero() {
+			if evidence.PullRequest.Number == feedback.PRNumber ||
+				evidence.PullRequest.NodeID == feedback.PRNodeID ||
+				containsReviewThread(evidence.ReviewThreads, feedback.ThreadNodeID) {
+				return ThreadStatusResult{Status: "conflict", EvidenceSource: "github_read_observation_time_conflict"}
+			}
+			continue
+		}
 		if evidence.ObservedAt.Before(feedback.ObservedAt) {
 			continue
 		}
@@ -968,7 +992,8 @@ func feedbackEvidenceAuthority(value RunInspection, feedback TrustedReviewFeedba
 	}
 	aggregate := value.PullRequest
 	repositoryMatches := repositoryIdentityMatches(value, evidence.Repository)
-	prMatches := sameProjectedPullRequest(aggregate, &evidence.PullRequest) &&
+	prMatches := validPullRequestProjectionAuthority(value, *aggregate) &&
+		sameProjectedPullRequest(aggregate, &evidence.PullRequest) &&
 		evidence.PullRequest.Number == feedback.PRNumber &&
 		evidence.PullRequest.DatabaseID == feedback.PRDatabaseID &&
 		evidence.PullRequest.NodeID == feedback.PRNodeID

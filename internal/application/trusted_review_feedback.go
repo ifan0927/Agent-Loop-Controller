@@ -28,6 +28,72 @@ func (r TrustedReviewFeedbackRecord) ValidateObservation() error {
 	return r.TrustedReviewFeedback.ValidateObservation()
 }
 
+// ValidatePersistedAuthority verifies both the immutable observation and the
+// lifecycle evidence accumulated by controller-owned compare-and-swap writes.
+func (r TrustedReviewFeedbackRecord) ValidatePersistedAuthority(expectedRunID string) error {
+	if strings.TrimSpace(expectedRunID) == "" || r.RunID != expectedRunID {
+		return errors.New("feedback run authority does not match")
+	}
+	observation := r
+	observation.Lifecycle = domain.TrustedReviewFeedbackObserved
+	observation.BoundRepairHead = ""
+	observation.ReplyIntentKey = ""
+	observation.ReplyDatabaseID = 0
+	observation.ReplyNodeID = ""
+	observation.Resolved = false
+	observation.Outdated = false
+	observation.UpdatedAt = time.Time{}
+	if err := observation.ValidateObservation(); err != nil {
+		return err
+	}
+	if r.UpdatedAt.IsZero() || r.UpdatedAt.Before(r.ObservedAt) {
+		return errors.New("feedback lifecycle timestamp is invalid")
+	}
+	noRepair := r.BoundRepairHead == ""
+	validRepair := validFullSHA(r.BoundRepairHead)
+	noIntent := strings.TrimSpace(r.ReplyIntentKey) == ""
+	noReply := r.ReplyDatabaseID == 0 && r.ReplyNodeID == ""
+	validReply := r.ReplyDatabaseID > 0 && validPersistedFeedbackNodeID(r.ReplyNodeID)
+	if r.Lifecycle != domain.TrustedReviewFeedbackResolved && (r.Resolved || r.Outdated) {
+		return errors.New("feedback lifecycle includes impossible resolution state")
+	}
+	switch r.Lifecycle {
+	case domain.TrustedReviewFeedbackObserved, domain.TrustedReviewFeedbackSelectedForRepair:
+		if !noRepair || !noIntent || !noReply {
+			return errors.New("feedback lifecycle includes premature repair or reply evidence")
+		}
+	case domain.TrustedReviewFeedbackRepairVerified:
+		if !validRepair || !noIntent || !noReply {
+			return errors.New("verified feedback repair evidence is incomplete")
+		}
+	case domain.TrustedReviewFeedbackReplyPending:
+		if !validRepair || noIntent || !noReply {
+			return errors.New("pending feedback reply evidence is incomplete")
+		}
+	case domain.TrustedReviewFeedbackReplied:
+		if !validRepair || noIntent || !validReply {
+			return errors.New("feedback reply evidence is incomplete")
+		}
+	case domain.TrustedReviewFeedbackResolved:
+		if !r.Resolved || !validRepair || (!noReply && !validReply) || (validReply && noIntent) {
+			return errors.New("feedback resolution evidence is inconsistent")
+		}
+	case domain.TrustedReviewFeedbackSuperseded:
+		if !(noRepair && noIntent && noReply) &&
+			!(validRepair && noIntent && noReply) &&
+			!(validRepair && !noIntent && (noReply || validReply)) {
+			return errors.New("superseded feedback lifecycle evidence is inconsistent")
+		}
+	default:
+		return errors.New("feedback lifecycle is unknown")
+	}
+	return nil
+}
+
+func validPersistedFeedbackNodeID(value string) bool {
+	return strings.TrimSpace(value) != "" && !strings.ContainsRune(value, '\x00')
+}
+
 type TrustedReviewFeedbackConflict struct {
 	ID                int64     `json:"conflict_id"`
 	RunID             string    `json:"run_id"`

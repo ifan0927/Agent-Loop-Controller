@@ -714,7 +714,9 @@ name, or database ID projects `conflict`. A merge result also requires the
 stored PR aggregate to have complete identity and to match the run's branch,
 base branch, candidate head, base SHA, and ownership key. For resolved
 feedback, an earlier unresolved GitHub read remains historical, while an
-equal-time or later unresolved read projects `conflict`.
+equal-time or later unresolved read projects `conflict`. A missing GitHub
+observation time, a feedback row detached from the run/PR authority, or an
+invalid feedback identity, lifecycle, or timestamp also projects `conflict`.
 
 **Possible durable stop states**
 
