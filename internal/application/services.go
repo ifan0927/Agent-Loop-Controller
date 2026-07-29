@@ -217,7 +217,10 @@ func (s CommandService) Continue(ctx context.Context, command ContinueCommand) (
 	return CommandResult{Run: projectRunResult(run)}, nil
 }
 
-const querySchemaVersion = "v1"
+const (
+	querySchemaVersion      = "v1"
+	inspectionSchemaVersion = "v2"
+)
 
 const (
 	defaultRunSummaryLimit = 25
@@ -395,7 +398,8 @@ type InspectionResult struct {
 	Verifications           []VerificationResult            `json:"verifications"`
 	Reviews                 []ReviewResult                  `json:"reviews"`
 	Resources               []ResourceResult                `json:"owned_resources"`
-	PullRequest             *PullRequestResult              `json:"pull_request,omitempty"`
+	PullRequestSnapshot     *PullRequestSnapshotResult      `json:"pull_request_snapshot,omitempty"`
+	PullRequest             *EffectivePullRequestResult     `json:"pull_request,omitempty"`
 	Approval                *HumanApprovalResult            `json:"human_approval,omitempty"`
 	ApprovalStatus          *HumanApprovalStatusResult      `json:"human_approval_status,omitempty"`
 	Merge                   *MergeRecord                    `json:"merge_result,omitempty"`
@@ -576,32 +580,34 @@ type FindingResult struct {
 // TrustedFeedbackResult exposes durable authority markers only. The raw human
 // comment remains in the dedicated bounded store and is never an inspect value.
 type TrustedFeedbackResult struct {
-	PRNumber              int64     `json:"pr_number"`
-	PRDatabaseID          int64     `json:"pr_database_id"`
-	PRNodeID              string    `json:"pr_node_id"`
-	ReviewDatabaseID      int64     `json:"review_database_id"`
-	ReviewNodeID          string    `json:"review_node_id"`
-	ThreadNodeID          string    `json:"thread_node_id"`
-	RootCommentDatabaseID int64     `json:"root_comment_database_id"`
-	RootCommentNodeID     string    `json:"root_comment_node_id"`
-	AuthorDatabaseID      int64     `json:"author_database_id"`
-	AuthorNodeID          string    `json:"author_node_id"`
-	AuthorLogin           string    `json:"author_login"`
-	TrustedAuthor         bool      `json:"trusted_author"`
-	OriginalHeadSHA       string    `json:"original_review_head_sha"`
-	Path                  string    `json:"path,omitempty"`
-	Line                  *int      `json:"line,omitempty"`
-	BodyDigest            string    `json:"body_digest"`
-	Lifecycle             string    `json:"lifecycle"`
-	BoundRepairHead       string    `json:"bound_repair_head,omitempty"`
-	ReplyIntentKey        string    `json:"reply_intent_key,omitempty"`
-	ReplyDatabaseID       int64     `json:"reply_database_id,omitempty"`
-	ReplyNodeID           string    `json:"reply_node_id,omitempty"`
-	Resolved              bool      `json:"resolved"`
-	Outdated              bool      `json:"outdated"`
-	SourceAt              time.Time `json:"source_timestamp"`
-	ObservedAt            time.Time `json:"observation_timestamp"`
-	UpdatedAt             time.Time `json:"updated_at"`
+	PRNumber              int64              `json:"pr_number"`
+	PRDatabaseID          int64              `json:"pr_database_id"`
+	PRNodeID              string             `json:"pr_node_id"`
+	ReviewDatabaseID      int64              `json:"review_database_id"`
+	ReviewNodeID          string             `json:"review_node_id"`
+	ThreadNodeID          string             `json:"thread_node_id"`
+	RootCommentDatabaseID int64              `json:"root_comment_database_id"`
+	RootCommentNodeID     string             `json:"root_comment_node_id"`
+	AuthorDatabaseID      int64              `json:"author_database_id"`
+	AuthorNodeID          string             `json:"author_node_id"`
+	AuthorLogin           string             `json:"author_login"`
+	TrustedAuthor         bool               `json:"trusted_author"`
+	OriginalHeadSHA       string             `json:"original_review_head_sha"`
+	Path                  string             `json:"path,omitempty"`
+	Line                  *int               `json:"line,omitempty"`
+	BodyDigest            string             `json:"body_digest"`
+	SnapshotLabel         string             `json:"snapshot_label"`
+	ControllerLifecycle   string             `json:"controller_lifecycle"`
+	BoundRepairHead       string             `json:"bound_repair_head,omitempty"`
+	ReplyIntentKey        string             `json:"reply_intent_key,omitempty"`
+	ReplyDatabaseID       int64              `json:"reply_database_id,omitempty"`
+	ReplyNodeID           string             `json:"reply_node_id,omitempty"`
+	ControllerResolved    bool               `json:"controller_recorded_resolved"`
+	ControllerOutdated    bool               `json:"controller_recorded_outdated"`
+	EffectiveThreadStatus ThreadStatusResult `json:"effective_thread_status"`
+	SourceAt              time.Time          `json:"source_timestamp"`
+	ObservedAt            time.Time          `json:"observation_timestamp"`
+	UpdatedAt             time.Time          `json:"updated_at"`
 }
 type TrustedFeedbackConflictResult struct {
 	RootCommentNodeID string    `json:"root_comment_node_id"`
@@ -615,21 +621,46 @@ type TelemetryResult struct {
 	Value      string    `json:"value"`
 	ObservedAt time.Time `json:"observed_at,omitempty"`
 }
-type PullRequestResult struct {
-	Number     int64     `json:"number"`
-	URL        string    `json:"url"`
-	HeadBranch string    `json:"head_branch"`
-	BaseBranch string    `json:"base_branch"`
-	HeadSHA    string    `json:"head_sha"`
-	BaseSHA    string    `json:"base_sha"`
-	State      string    `json:"state"`
-	Merged     bool      `json:"merged"`
-	MergeSHA   string    `json:"merge_sha"`
-	MergedAt   time.Time `json:"merged_at,omitempty"`
+type PullRequestSnapshotResult struct {
+	SnapshotLabel string    `json:"snapshot_label"`
+	Number        int64     `json:"number"`
+	URL           string    `json:"url"`
+	HeadBranch    string    `json:"head_branch"`
+	BaseBranch    string    `json:"base_branch"`
+	HeadSHA       string    `json:"head_sha"`
+	BaseSHA       string    `json:"base_sha"`
+	State         string    `json:"state"`
+	Merged        bool      `json:"merged"`
+	MergeSHA      string    `json:"merge_sha"`
+	MergedAt      time.Time `json:"merged_at,omitempty"`
+}
+
+type EffectivePullRequestResult struct {
+	Number         int64     `json:"number"`
+	URL            string    `json:"url"`
+	HeadBranch     string    `json:"head_branch"`
+	BaseBranch     string    `json:"base_branch"`
+	HeadSHA        string    `json:"head_sha"`
+	BaseSHA        string    `json:"base_sha"`
+	Status         string    `json:"status"`
+	State          string    `json:"state,omitempty"`
+	Merged         *bool     `json:"merged,omitempty"`
+	MergeSHA       string    `json:"merge_sha,omitempty"`
+	MergedAt       time.Time `json:"merged_at,omitempty"`
+	EvidenceSource string    `json:"evidence_source"`
+	ObservedAt     time.Time `json:"observed_at,omitempty"`
+}
+
+type ThreadStatusResult struct {
+	Status         string    `json:"status"`
+	Resolved       *bool     `json:"resolved,omitempty"`
+	Outdated       *bool     `json:"outdated,omitempty"`
+	EvidenceSource string    `json:"evidence_source"`
+	ObservedAt     time.Time `json:"observed_at,omitempty"`
 }
 
 func projectInspection(value RunInspection) InspectionResult {
-	result := InspectionResult{SchemaVersion: querySchemaVersion, Run: projectRunResult(value.Run), RepositoryBinding: projectRepositoryBinding(value.RepositoryBinding), Merge: value.Merge,
+	result := InspectionResult{SchemaVersion: inspectionSchemaVersion, Run: projectRunResult(value.Run), RepositoryBinding: projectRepositoryBinding(value.RepositoryBinding), Merge: value.Merge,
 		Timeline: []TransitionResult{}, Attempts: []AttemptResult{}, Verifications: []VerificationResult{}, Reviews: []ReviewResult{}, Resources: []ResourceResult{}, LinearCompletion: append([]LinearCompletionObservation(nil), value.LinearCompletion...), Cleanup: []CleanupResult{}, RetrySchedules: append([]RetrySchedule(nil), value.RetrySchedules...), OperatorAttentionEvents: []OperatorAttentionEventResult{}, OperatorActions: []OperatorActionResult{}, Checks: []CheckResult{}, Findings: []FindingResult{}, TrustedFeedback: []TrustedFeedbackResult{}, FeedbackConflicts: []TrustedFeedbackConflictResult{}, Telemetry: []TelemetryResult{}}
 	if value.Approval != nil {
 		result.Approval = &HumanApprovalResult{Approver: sanitizeUntrustedContent(value.Approval.Approver), ApprovedSHA: value.Approval.ApprovedSHA, SourceAt: value.Approval.ApprovedAt, ObservedAt: value.Approval.ObservedAt}
@@ -639,7 +670,8 @@ func projectInspection(value RunInspection) InspectionResult {
 	}
 	if value.PullRequest != nil {
 		v := value.PullRequest
-		result.PullRequest = &PullRequestResult{v.Number, sanitizeExternalURL(v.URL), v.HeadBranch, v.BaseBranch, v.HeadSHA, v.BaseSHA, v.State, v.Merged, v.MergeSHA, v.MergedAt}
+		result.PullRequestSnapshot = &PullRequestSnapshotResult{SnapshotLabel: "last_persisted_github_observation", Number: v.Number, URL: sanitizeExternalURL(v.URL), HeadBranch: v.HeadBranch, BaseBranch: v.BaseBranch, HeadSHA: v.HeadSHA, BaseSHA: v.BaseSHA, State: v.State, Merged: v.Merged, MergeSHA: v.MergeSHA, MergedAt: v.MergedAt}
+		result.PullRequest = projectEffectivePullRequest(value)
 	}
 	for _, v := range value.Timeline {
 		result.Timeline = append(result.Timeline, TransitionResult{v.Sequence, v.From, v.To, sanitizeUntrustedContent(v.Reason), v.BoundHead, v.CreatedAt})
@@ -681,13 +713,162 @@ func projectInspection(value RunInspection) InspectionResult {
 			Outdated: finding.Outdated, HeadSHA: finding.HeadSHA, ObservedAt: finding.ObservedAt})
 	}
 	for _, feedback := range value.TrustedFeedback {
-		result.TrustedFeedback = append(result.TrustedFeedback, TrustedFeedbackResult{PRNumber: feedback.PRNumber, PRDatabaseID: feedback.PRDatabaseID, PRNodeID: feedback.PRNodeID, ReviewDatabaseID: feedback.ReviewDatabaseID, ReviewNodeID: feedback.ReviewNodeID, ThreadNodeID: feedback.ThreadNodeID, RootCommentDatabaseID: feedback.RootCommentDatabaseID, RootCommentNodeID: feedback.RootCommentNodeID, AuthorDatabaseID: feedback.Author.DatabaseID, AuthorNodeID: feedback.Author.NodeID, AuthorLogin: sanitizeUntrustedContent(feedback.Author.Login), TrustedAuthor: feedback.Author.Type == "User", OriginalHeadSHA: feedback.OriginalReviewHeadSHA, Path: sanitizeRepositoryPath(feedback.Path), Line: feedback.Line, BodyDigest: feedback.BodyDigest, Lifecycle: string(feedback.Lifecycle), BoundRepairHead: feedback.BoundRepairHead, ReplyIntentKey: sanitizeUntrustedContent(feedback.ReplyIntentKey), ReplyDatabaseID: feedback.ReplyDatabaseID, ReplyNodeID: feedback.ReplyNodeID, Resolved: feedback.Resolved, Outdated: feedback.Outdated, SourceAt: feedback.SourceAt, ObservedAt: feedback.ObservedAt, UpdatedAt: feedback.UpdatedAt})
+		result.TrustedFeedback = append(result.TrustedFeedback, TrustedFeedbackResult{PRNumber: feedback.PRNumber, PRDatabaseID: feedback.PRDatabaseID, PRNodeID: feedback.PRNodeID, ReviewDatabaseID: feedback.ReviewDatabaseID, ReviewNodeID: feedback.ReviewNodeID, ThreadNodeID: feedback.ThreadNodeID, RootCommentDatabaseID: feedback.RootCommentDatabaseID, RootCommentNodeID: feedback.RootCommentNodeID, AuthorDatabaseID: feedback.Author.DatabaseID, AuthorNodeID: feedback.Author.NodeID, AuthorLogin: sanitizeUntrustedContent(feedback.Author.Login), TrustedAuthor: feedback.Author.Type == "User", OriginalHeadSHA: feedback.OriginalReviewHeadSHA, Path: sanitizeRepositoryPath(feedback.Path), Line: feedback.Line, BodyDigest: feedback.BodyDigest, SnapshotLabel: "initial_trusted_change_request", ControllerLifecycle: string(feedback.Lifecycle), BoundRepairHead: feedback.BoundRepairHead, ReplyIntentKey: sanitizeUntrustedContent(feedback.ReplyIntentKey), ReplyDatabaseID: feedback.ReplyDatabaseID, ReplyNodeID: feedback.ReplyNodeID, ControllerResolved: feedback.Resolved, ControllerOutdated: feedback.Outdated, EffectiveThreadStatus: projectEffectiveThreadStatus(value, feedback), SourceAt: feedback.SourceAt, ObservedAt: feedback.ObservedAt, UpdatedAt: feedback.UpdatedAt})
 	}
 	for _, conflict := range value.FeedbackConflicts {
 		result.FeedbackConflicts = append(result.FeedbackConflicts, TrustedFeedbackConflictResult{RootCommentNodeID: conflict.RootCommentNodeID, ObservedDigest: conflict.ObservedDigest, ReasonCode: conflict.ReasonCode, ObservedAt: conflict.ObservedAt, OperatorAttention: true})
 	}
 	appendUnknownTelemetry(&result, value)
 	return result
+}
+
+func projectEffectivePullRequest(value RunInspection) *EffectivePullRequestResult {
+	if value.PullRequest == nil {
+		return nil
+	}
+	snapshot := value.PullRequest
+	result := &EffectivePullRequestResult{
+		Number:         snapshot.Number,
+		URL:            sanitizeExternalURL(snapshot.URL),
+		HeadBranch:     snapshot.HeadBranch,
+		BaseBranch:     snapshot.BaseBranch,
+		HeadSHA:        snapshot.HeadSHA,
+		BaseSHA:        snapshot.BaseSHA,
+		Status:         "unknown",
+		EvidenceSource: "pull_request_snapshot",
+	}
+	if value.Merge != nil {
+		if !validMergeProjectionAuthority(value, *snapshot, *value.Merge) {
+			result.Status, result.State, result.EvidenceSource = "conflict", "conflict", "merge_result_conflict"
+			return result
+		}
+		if value.GitHubEvidence != nil && value.GitHubEvidence.ObservedAt.After(value.Merge.MergedAt) {
+			observed := value.GitHubEvidence.PullRequest
+			if !sameProjectedPullRequest(snapshot, &observed) || !observed.Merged || !strings.EqualFold(observed.State, "closed") || observed.MergeSHA != value.Merge.MergeSHA {
+				result.Status, result.State, result.EvidenceSource, result.ObservedAt = "conflict", "conflict", "github_read_conflicts_with_merge_result", value.GitHubEvidence.ObservedAt
+				return result
+			}
+		}
+		merged := true
+		result.Status, result.State, result.Merged = "merged", "closed", &merged
+		result.MergeSHA, result.MergedAt = value.Merge.MergeSHA, value.Merge.MergedAt
+		result.EvidenceSource, result.ObservedAt = "merge_result", value.Merge.MergedAt
+		return result
+	}
+	if value.Run.State == domain.StateCompleted || value.Run.State == domain.StateCleaning || value.Run.State == domain.StateAwaitingLinearCompletion {
+		result.Status, result.State, result.EvidenceSource = "unknown", "unknown", "missing_terminal_merge_result"
+		return result
+	}
+	observed := snapshot
+	observedAt := time.Time{}
+	source := "pull_request_snapshot"
+	if value.GitHubEvidence != nil && sameProjectedPullRequest(snapshot, &value.GitHubEvidence.PullRequest) {
+		observed = &value.GitHubEvidence.PullRequest
+		observedAt = value.GitHubEvidence.ObservedAt
+		source = "github_read_snapshot"
+	}
+	merged := observed.Merged
+	result.State, result.Merged, result.MergeSHA, result.MergedAt = strings.ToLower(observed.State), &merged, observed.MergeSHA, observed.MergedAt
+	result.EvidenceSource, result.ObservedAt = source, observedAt
+	switch {
+	case observed.Merged && strings.EqualFold(observed.State, "closed") && observed.MergeSHA != "":
+		result.Status = "merged"
+	case !observed.Merged && strings.EqualFold(observed.State, "open"):
+		result.Status = "open"
+	case !observed.Merged && strings.EqualFold(observed.State, "closed"):
+		result.Status = "closed_unmerged"
+	default:
+		result.Status, result.State, result.Merged, result.EvidenceSource = "conflict", "conflict", nil, source+"_conflict"
+	}
+	return result
+}
+
+func validMergeProjectionAuthority(value RunInspection, snapshot domain.PullRequest, merge MergeRecord) bool {
+	return merge.RunID == value.Run.ID &&
+		merge.PRNumber == snapshot.Number &&
+		merge.PreMergeSHA == value.Run.CandidateHead &&
+		merge.PreMergeSHA == snapshot.HeadSHA &&
+		merge.BaseSHA == value.Run.BaseSHA &&
+		merge.BaseSHA == snapshot.BaseSHA &&
+		(merge.Method == "squash" || merge.Method == "external") &&
+		strings.TrimSpace(merge.MergeSHA) != "" &&
+		!merge.MergedAt.IsZero()
+}
+
+func sameProjectedPullRequest(expected, observed *domain.PullRequest) bool {
+	return expected != nil && observed != nil &&
+		expected.Number == observed.Number &&
+		expected.DatabaseID == observed.DatabaseID &&
+		expected.NodeID == observed.NodeID &&
+		expected.HeadBranch == observed.HeadBranch &&
+		expected.BaseBranch == observed.BaseBranch &&
+		expected.HeadSHA == observed.HeadSHA &&
+		expected.BaseSHA == observed.BaseSHA &&
+		expected.BodyDigest == observed.BodyDigest &&
+		expected.OwnershipKey == observed.OwnershipKey
+}
+
+func projectEffectiveThreadStatus(value RunInspection, feedback TrustedReviewFeedbackRecord) ThreadStatusResult {
+	for _, conflict := range value.FeedbackConflicts {
+		if conflict.RootCommentNodeID == feedback.RootCommentNodeID {
+			return ThreadStatusResult{Status: "conflict", EvidenceSource: "trusted_review_feedback_conflict", ObservedAt: conflict.ObservedAt}
+		}
+	}
+	if value.GitHubEvidence != nil && !value.GitHubEvidence.ObservedAt.Before(feedback.ObservedAt) {
+		for _, thread := range value.GitHubEvidence.ReviewThreads {
+			if thread.NodeID != feedback.ThreadNodeID {
+				continue
+			}
+			if !sameProjectedReviewThread(feedback, thread) {
+				return ThreadStatusResult{Status: "conflict", EvidenceSource: "github_read_thread_topology_conflict", ObservedAt: value.GitHubEvidence.ObservedAt}
+			}
+			if feedback.Resolved && !thread.Resolved && value.GitHubEvidence.ObservedAt.After(feedback.UpdatedAt) {
+				return ThreadStatusResult{Status: "conflict", EvidenceSource: "github_read_conflicts_with_controller_lifecycle", ObservedAt: value.GitHubEvidence.ObservedAt}
+			}
+			resolved, outdated := thread.Resolved, thread.Outdated
+			status := "open"
+			switch {
+			case resolved && outdated:
+				status = "resolved_outdated"
+			case resolved:
+				status = "resolved"
+			case outdated:
+				status = "outdated"
+			}
+			return ThreadStatusResult{Status: status, Resolved: &resolved, Outdated: &outdated, EvidenceSource: "github_read_snapshot", ObservedAt: value.GitHubEvidence.ObservedAt}
+		}
+	}
+	if feedback.Lifecycle == domain.TrustedReviewFeedbackResolved && feedback.Resolved {
+		resolved, outdated := true, feedback.Outdated
+		status := "resolved"
+		if outdated {
+			status = "resolved_outdated"
+		}
+		return ThreadStatusResult{Status: status, Resolved: &resolved, Outdated: &outdated, EvidenceSource: "controller_resolution_observation", ObservedAt: feedback.UpdatedAt}
+	}
+	return ThreadStatusResult{Status: "unknown", EvidenceSource: "no_authoritative_final_thread_observation"}
+}
+
+func sameProjectedReviewThread(feedback TrustedReviewFeedbackRecord, thread domain.GitHubReviewThread) bool {
+	if thread.NodeID != feedback.ThreadNodeID || thread.OriginalCommitSHA != "" && thread.OriginalCommitSHA != feedback.OriginalReviewHeadSHA || thread.Path != "" && thread.Path != feedback.Path {
+		return false
+	}
+	rootMatches := 0
+	for _, comment := range thread.Comments {
+		if comment.NodeID != feedback.RootCommentNodeID {
+			continue
+		}
+		if comment.DatabaseID != feedback.RootCommentDatabaseID ||
+			comment.Review.DatabaseID != feedback.ReviewDatabaseID ||
+			comment.Review.NodeID != feedback.ReviewNodeID ||
+			comment.BodyDigest != feedback.BodyDigest ||
+			comment.Author == nil ||
+			*comment.Author != feedback.Author {
+			return false
+		}
+		rootMatches++
+	}
+	return rootMatches == 1
 }
 
 const sourceCheckoutAttentionReason = "source_checkout_requires_manual_sync"

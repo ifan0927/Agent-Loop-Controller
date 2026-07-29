@@ -506,11 +506,28 @@ Immutable requester identity and run ID.
 **Outputs**
 
 Run summary/detail, state timeline, attempts, exact-head evidence, side-effect
-records, attention, and safe recovery authority.
+records, attention, and safe recovery authority. `status` and `inspect` use the
+same version 2 detail projection contract:
+
+- `pull_request_snapshot` is the last persisted GitHub observation. It remains
+  historical evidence and is never rewritten merely to make terminal output
+  look current.
+- `pull_request` is the effective status. A valid immutable `merge_result`
+  projects `merged` even when the preceding snapshot was open. Missing terminal
+  merge authority projects `unknown`; mismatched PR/head/base/merge evidence
+  projects `conflict`.
+- each trusted feedback item labels its initial change-request snapshot,
+  exposes controller lifecycle fields separately, and derives
+  `effective_thread_status` from the latest matching immutable GitHub read or a
+  controller-recorded resolution observation. Missing or topology-conflicting
+  evidence projects `unknown` or `conflict`.
 
 **Authoritative state/evidence**
 
-SQLite inspection joined from the run-scoped evidence tables.
+SQLite inspection joined from the run-scoped evidence tables. Effective
+terminal facts are derived only from typed merge results, trusted feedback
+lifecycle evidence, and sanitized GitHub read evidence; transition prose and
+agent claims are not projection authority.
 
 **External side effects**
 
@@ -937,7 +954,10 @@ around it. The principal table groups are:
 `runs.current_state` answers where the controller is now. Transitions and
 evidence tables answer why it may be there and what exact observations support
 the next action. Updating current state without its required evidence is not a
-valid recovery.
+valid recovery. Query projections also distinguish stored observations from
+effective facts: PR and feedback snapshots retain what GitHub reported at that
+time, while current terminal status is derived from later typed merge or
+thread-resolution evidence without updating the earlier observation.
 
 ### Intent versus observation
 

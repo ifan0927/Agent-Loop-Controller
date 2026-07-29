@@ -366,6 +366,105 @@ func TestKnownDeliveryStatesAreNotUnknownTelemetry(t *testing.T) {
 	}
 }
 
+func TestTerminalProjectionSeparatesHistoricalPullRequestSnapshotFromEffectiveMerge(t *testing.T) {
+	now := time.Date(2026, 7, 29, 2, 0, 0, 0, time.UTC)
+	head := strings.Repeat("a", 40)
+	base := strings.Repeat("b", 40)
+	mergeSHA := strings.Repeat("c", 40)
+	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateCompleted, CandidateHead: head, BaseSHA: base})
+	snapshot := domain.PullRequest{Number: 7, DatabaseID: 70, URL: "https://example.invalid/pull/7", NodeID: "PR_7", HeadBranch: "feature", BaseBranch: "main", HeadSHA: head, BaseSHA: base, BodyDigest: "body", OwnershipKey: "owner", State: "open"}
+	merge := &MergeRecord{RunID: run.ID, PRNumber: snapshot.Number, PreMergeSHA: head, BaseSHA: base, Method: "squash", MergeSHA: mergeSHA, MergedAt: now}
+	store := serviceStore{run: run, inspection: RunInspection{Run: run, PullRequest: &snapshot, Merge: merge}}
+
+	status, err := NewQueryService(store).Status(context.Background(), QueryInput{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspect, err := NewQueryService(store).Inspect(context.Background(), QueryInput{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(status, inspect) {
+		t.Fatalf("status and inspect projections differ:\nstatus=%+v\ninspect=%+v", status, inspect)
+	}
+	if status.SchemaVersion != "v2" {
+		t.Fatalf("terminal projection schema=%q", status.SchemaVersion)
+	}
+	if status.PullRequestSnapshot == nil || status.PullRequestSnapshot.SnapshotLabel != "last_persisted_github_observation" || status.PullRequestSnapshot.State != "open" || status.PullRequestSnapshot.Merged {
+		t.Fatalf("historical snapshot was rewritten or mislabeled: %+v", status.PullRequestSnapshot)
+	}
+	if status.PullRequest == nil || status.PullRequest.Status != "merged" || status.PullRequest.State != "closed" || status.PullRequest.Merged == nil || !*status.PullRequest.Merged || status.PullRequest.MergeSHA != mergeSHA || status.PullRequest.EvidenceSource != "merge_result" {
+		t.Fatalf("terminal merge was not projected effectively: %+v", status.PullRequest)
+	}
+}
+
+func TestTerminalProjectionFailsClosedForMissingOrConflictingMergeEvidence(t *testing.T) {
+	now := time.Date(2026, 7, 29, 2, 0, 0, 0, time.UTC)
+	head := strings.Repeat("a", 40)
+	base := strings.Repeat("b", 40)
+	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateCompleted, CandidateHead: head, BaseSHA: base})
+	snapshot := domain.PullRequest{Number: 7, DatabaseID: 70, URL: "https://example.invalid/pull/7", NodeID: "PR_7", HeadBranch: "feature", BaseBranch: "main", HeadSHA: head, BaseSHA: base, BodyDigest: "body", OwnershipKey: "owner", State: "open"}
+	service := NewQueryService(serviceStore{run: run, inspection: RunInspection{Run: run, PullRequest: &snapshot}})
+	missing, err := service.GetRunDetail(context.Background(), RunDetailQuery{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missing.PullRequest == nil || missing.PullRequest.Status != "unknown" || missing.PullRequest.State != "unknown" || missing.PullRequest.Merged != nil || missing.PullRequest.EvidenceSource != "missing_terminal_merge_result" {
+		t.Fatalf("missing terminal evidence did not fail closed: %+v", missing.PullRequest)
+	}
+
+	conflictingMerge := &MergeRecord{RunID: run.ID, PRNumber: snapshot.Number + 1, PreMergeSHA: head, BaseSHA: base, Method: "squash", MergeSHA: strings.Repeat("c", 40), MergedAt: now}
+	service = NewQueryService(serviceStore{run: run, inspection: RunInspection{Run: run, PullRequest: &snapshot, Merge: conflictingMerge}})
+	conflict, err := service.GetRunDetail(context.Background(), RunDetailQuery{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conflict.PullRequest == nil || conflict.PullRequest.Status != "conflict" || conflict.PullRequest.State != "conflict" || conflict.PullRequest.Merged != nil {
+		t.Fatalf("conflicting terminal evidence was presented as a fact: %+v", conflict.PullRequest)
+	}
+}
+
+func TestTrustedFeedbackProjectionSeparatesInitialSnapshotFromFinalThreadEvidence(t *testing.T) {
+	now := time.Date(2026, 7, 29, 2, 0, 0, 0, time.UTC)
+	head := strings.Repeat("a", 40)
+	author := domain.ActorIdentity{DatabaseID: 33, NodeID: "USER_33", Login: "operator", Type: "User"}
+	body := "Please fix this."
+	line := 12
+	feedback := TrustedReviewFeedbackRecord{RunID: "run", TrustedReviewFeedback: domain.TrustedReviewFeedback{
+		PRNumber: 7, PRDatabaseID: 70, PRNodeID: "PR_7", ReviewDatabaseID: 80, ReviewNodeID: "REVIEW_80",
+		ThreadNodeID: "THREAD_90", RootCommentDatabaseID: 100, RootCommentNodeID: "COMMENT_100", Author: author,
+		OriginalReviewHeadSHA: head, Path: "internal/example.go", Line: &line, BodyDigest: domain.TrustedReviewFeedbackDigest(body),
+		SourceAt: now, ObservedAt: now, Lifecycle: domain.TrustedReviewFeedbackReplied, UpdatedAt: now.Add(time.Minute),
+	}}
+	thread := domain.GitHubReviewThread{NodeID: feedback.ThreadNodeID, Resolved: true, Outdated: true, OriginalCommitSHA: head, Path: feedback.Path, Comments: []domain.GitHubReviewComment{{
+		DatabaseID: feedback.RootCommentDatabaseID, NodeID: feedback.RootCommentNodeID, Author: &author, BodyDigest: feedback.BodyDigest,
+		Review: domain.GitHubReview{DatabaseID: feedback.ReviewDatabaseID, NodeID: feedback.ReviewNodeID},
+	}}}
+	run := authorizeTestRun(Run{ID: feedback.RunID, Repository: "owner/repo", State: domain.StateCompleted, CandidateHead: head})
+	evidence := &domain.GitHubReadEvidence{ReviewThreads: []domain.GitHubReviewThread{thread}, ObservedAt: now.Add(2 * time.Minute)}
+	got, err := NewQueryService(serviceStore{run: run, inspection: RunInspection{Run: run, TrustedFeedback: []TrustedReviewFeedbackRecord{feedback}, GitHubEvidence: evidence}}).GetRunDetail(context.Background(), RunDetailQuery{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projected := got.TrustedFeedback[0]
+	if projected.SnapshotLabel != "initial_trusted_change_request" || projected.ControllerResolved || projected.ControllerOutdated {
+		t.Fatalf("initial/controller snapshot was rewritten: %+v", projected)
+	}
+	if projected.EffectiveThreadStatus.Status != "resolved_outdated" || projected.EffectiveThreadStatus.Resolved == nil || !*projected.EffectiveThreadStatus.Resolved || projected.EffectiveThreadStatus.Outdated == nil || !*projected.EffectiveThreadStatus.Outdated || projected.EffectiveThreadStatus.EvidenceSource != "github_read_snapshot" {
+		t.Fatalf("final thread evidence was not projected: %+v", projected.EffectiveThreadStatus)
+	}
+	if unknown := projectEffectiveThreadStatus(RunInspection{}, feedback); unknown.Status != "unknown" || unknown.Resolved != nil || unknown.Outdated != nil {
+		t.Fatalf("missing final thread evidence was presented as fact: %+v", unknown)
+	}
+	conflicting := thread
+	conflicting.Comments = append([]domain.GitHubReviewComment(nil), thread.Comments...)
+	conflicting.Comments[0].DatabaseID++
+	conflict := projectEffectiveThreadStatus(RunInspection{GitHubEvidence: &domain.GitHubReadEvidence{ReviewThreads: []domain.GitHubReviewThread{conflicting}, ObservedAt: now.Add(2 * time.Minute)}}, feedback)
+	if conflict.Status != "conflict" || conflict.Resolved != nil || conflict.Outdated != nil {
+		t.Fatalf("conflicting final thread evidence was presented as fact: %+v", conflict)
+	}
+}
+
 func TestServiceErrorDoesNotRenderUnderlyingDetails(t *testing.T) {
 	err := classifyServiceError(errors.New("/secret/path: token=credential"))
 	if err.Error() != "internal: application operation failed" {
