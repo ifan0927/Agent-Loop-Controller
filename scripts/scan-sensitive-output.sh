@@ -12,7 +12,7 @@ rg --quiet --pcre2 --hidden --no-messages --glob '!.git/**' --glob '!vendor/**' 
   -e '\bgh[pous]_[A-Za-z0-9]{20,}\b' \
   -e '\bgithub_pat_[A-Za-z0-9_]{20,}\b' \
   -e '\blin_api_[A-Za-z0-9_-]{20,}\b' \
-  -- "$@"
+  -- "$@" >/dev/null 2>&1
 status=$?
 set -e
 

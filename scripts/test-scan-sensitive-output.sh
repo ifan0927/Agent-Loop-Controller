@@ -83,3 +83,17 @@ set -e
 [ "$(cat "$test_root/missing.stderr")" = "$scanner_error_code" ] ||
   fail "scanner error returned non-sanitized stderr"
 assert_absent "$test_root/missing.stderr" "$missing_marker" "scanner error"
+
+missing_rg_root="$test_root/private-$missing_marker"
+set +e
+PATH=/nonexistent /bin/sh "$scanner" "$missing_rg_root" \
+  >"$test_root/missing-rg.stdout" 2>"$test_root/missing-rg.stderr"
+status=$?
+set -e
+[ "$status" -eq 2 ] || fail "missing rg returned status $status instead of 2"
+[ ! -s "$test_root/missing-rg.stdout" ] || fail "missing rg wrote to stdout"
+[ "$(cat "$test_root/missing-rg.stderr")" = "$scanner_error_code" ] ||
+  fail "missing rg returned non-sanitized stderr"
+assert_absent "$test_root/missing-rg.stderr" "$missing_marker" "missing rg secret path"
+assert_absent "$test_root/missing-rg.stderr" "$scanner" "missing rg absolute script path"
+assert_absent "$test_root/missing-rg.stderr" "$missing_rg_root" "missing rg absolute input path"
