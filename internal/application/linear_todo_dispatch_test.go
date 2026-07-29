@@ -200,6 +200,9 @@ type dispatchStore struct {
 	releasedLease          LinearTodoAdmissionLease
 	releaseDeadline        time.Time
 	held                   bool
+	heldErr                error
+	heldWaitForCancel      bool
+	heldCanceled           chan struct{}
 	run                    Run
 	journal                LinearTodoAdmissionJournal
 	journalFound           bool
@@ -308,10 +311,23 @@ func (s *dispatchStore) ReleaseLinearTodoAdmissionLease(ctx context.Context, lea
 	return true, nil
 }
 
-func (s *dispatchStore) LinearTodoAdmissionLeaseHeld(_ context.Context, lease LinearTodoAdmissionLease, _ time.Time) (bool, error) {
+func (s *dispatchStore) LinearTodoAdmissionLeaseHeld(ctx context.Context, lease LinearTodoAdmissionLease, now time.Time) (bool, error) {
+	s.mu.Lock()
+	waitForCancel, canceled := s.heldWaitForCancel, s.heldCanceled
+	s.mu.Unlock()
+	if waitForCancel {
+		<-ctx.Done()
+		if canceled != nil {
+			close(canceled)
+		}
+		return false, ctx.Err()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.held && !s.leaseLost && lease.OwnerNonce == s.lease.OwnerNonce && lease.Version == s.lease.Version, nil
+	if s.heldErr != nil {
+		return false, s.heldErr
+	}
+	return s.held && !s.leaseLost && !now.After(s.lease.ExpiresAt) && lease.OwnerNonce == s.lease.OwnerNonce && lease.Version == s.lease.Version, nil
 }
 
 func (s *dispatchStore) ListNonterminalRuns(context.Context) ([]Run, error) {
@@ -1390,6 +1406,199 @@ func TestLinearTodoDispatcherSettlesStartOutcomesBeforeAcceptingThem(t *testing.
 				t.Fatalf("driver=%+v attention=%+v", driver.calls, store.attention)
 			}
 		})
+	}
+}
+
+func TestLinearTodoDispatcherRechecksPersistedLeaseAfterScopedWorkWithoutRenewalTick(t *testing.T) {
+	workFailure := errors.New("scoped work failed after lease takeover")
+	for _, test := range []struct {
+		name              string
+		outcome           string
+		workErr           error
+		postProofConflict bool
+		changeAuthority   func(*dispatchStore, time.Time)
+	}{
+		{
+			name:    "start error after expiry and takeover",
+			outcome: "start",
+			workErr: workFailure,
+			changeAuthority: func(store *dispatchStore, now time.Time) {
+				store.lease.OwnerNonce = "takeover-owner"
+				store.lease.Version++
+				store.lease.RenewedAt, store.lease.ExpiresAt = now, now.Add(time.Minute)
+			},
+		},
+		{
+			name:    "start error with stale owner",
+			outcome: "start",
+			workErr: workFailure,
+			changeAuthority: func(store *dispatchStore, _ time.Time) {
+				store.lease.OwnerNonce = "different-owner"
+			},
+		},
+		{
+			name:    "start error with lease recheck persistence failure",
+			outcome: "start",
+			workErr: workFailure,
+			changeAuthority: func(store *dispatchStore, _ time.Time) {
+				store.heldErr = errors.New("lease authority persistence unavailable")
+			},
+		},
+		{
+			name:              "post start proof conflict after takeover",
+			outcome:           "start",
+			postProofConflict: true,
+			changeAuthority: func(store *dispatchStore, now time.Time) {
+				store.lease.OwnerNonce = "takeover-owner"
+				store.lease.Version++
+				store.lease.RenewedAt, store.lease.ExpiresAt = now, now.Add(time.Minute)
+			},
+		},
+		{
+			name:    "successful start stops before driver after takeover",
+			outcome: "pre-driver",
+			changeAuthority: func(store *dispatchStore, now time.Time) {
+				store.lease.OwnerNonce = "takeover-owner"
+				store.lease.Version++
+				store.lease.RenewedAt, store.lease.ExpiresAt = now, now.Add(time.Minute)
+			},
+		},
+		{
+			name:    "driver success after takeover",
+			outcome: "driver",
+			changeAuthority: func(store *dispatchStore, now time.Time) {
+				store.lease.OwnerNonce = "takeover-owner"
+				store.lease.Version++
+				store.lease.RenewedAt, store.lease.ExpiresAt = now, now.Add(time.Minute)
+			},
+		},
+		{
+			name:    "driver error after takeover",
+			outcome: "driver",
+			workErr: workFailure,
+			changeAuthority: func(store *dispatchStore, now time.Time) {
+				store.lease.OwnerNonce = "takeover-owner"
+				store.lease.Version++
+				store.lease.RenewedAt, store.lease.ExpiresAt = now, now.Add(time.Minute)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := dispatchCandidate("held-recheck-"+test.name, "IFAN-43", 1)
+			dispatcher, store, _, _, _, driver := newDispatchLab(t, candidate)
+			var nowNanos atomic.Int64
+			nowNanos.Store(store.now.UnixNano())
+			dispatcher.now = func() time.Time { return time.Unix(0, nowNanos.Load()).UTC() }
+			// No value is ever sent: ownership loss must be found by the
+			// authoritative post-scope check, not by a renewal CAS.
+			dispatcher.leaseTicks = func(time.Duration) (<-chan time.Time, func()) {
+				return make(chan time.Time), func() {}
+			}
+			switch test.outcome {
+			case "start", "pre-driver":
+				store.startEntered, store.startAllow = make(chan struct{}), make(chan struct{})
+				store.startErr, store.postProofDrift = test.workErr, test.postProofConflict
+			case "driver":
+				driver.started, driver.allow, driver.err = make(chan struct{}), make(chan struct{}), test.workErr
+			default:
+				t.Fatalf("unknown fixture outcome %q", test.outcome)
+			}
+			done := make(chan struct {
+				result LinearTodoDispatchResult
+				err    error
+			}, 1)
+			go func() {
+				result, err := dispatcher.Dispatch(context.Background())
+				done <- struct {
+					result LinearTodoDispatchResult
+					err    error
+				}{result, err}
+			}()
+			if test.outcome == "start" || test.outcome == "pre-driver" {
+				select {
+				case <-store.startEntered:
+				case <-time.After(time.Second):
+					t.Fatal("cycle did not reach initial start")
+				}
+			} else {
+				select {
+				case <-driver.started:
+				case <-time.After(time.Second):
+					t.Fatal("cycle did not reach exact-run driver")
+				}
+			}
+			advanced := store.now.Add(dispatcher.policy.LeaseTTL + dispatcher.policy.LeaseRenewal)
+			nowNanos.Store(advanced.UnixNano())
+			store.mu.Lock()
+			test.changeAuthority(store, advanced)
+			store.mu.Unlock()
+			if test.outcome == "start" || test.outcome == "pre-driver" {
+				close(store.startAllow)
+			} else {
+				close(driver.allow)
+			}
+			select {
+			case observed := <-done:
+				if observed.err != nil || observed.result.Outcome != LinearTodoDispatchAttention {
+					t.Fatalf("result=%+v err=%v", observed.result, observed.err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("authoritative lease recheck did not bound scoped outcome")
+			}
+			store.mu.Lock()
+			defer store.mu.Unlock()
+			if len(store.attention) != 1 || store.attention[0].EventType != OperatorAttentionSchedulerLease || store.attention[0].ReasonCode != "lease_lost" {
+				t.Fatalf("attention=%+v", store.attention)
+			}
+			if test.outcome != "driver" && len(driver.calls) != 0 {
+				t.Fatalf("driver called after pre-driver lease loss: %+v", driver.calls)
+			}
+		})
+	}
+}
+
+func TestLinearTodoDispatcherBoundsPersistedLeaseRecheck(t *testing.T) {
+	previousTimeout := dispatchLeaseAuthorityCheckTimeout
+	dispatchLeaseAuthorityCheckTimeout = 20 * time.Millisecond
+	defer func() { dispatchLeaseAuthorityCheckTimeout = previousTimeout }()
+
+	candidate := dispatchCandidate("bounded-held-recheck", "IFAN-44", 1)
+	dispatcher, store, _, _, _, driver := newDispatchLab(t, candidate)
+	dispatcher.leaseTicks = func(time.Duration) (<-chan time.Time, func()) {
+		return make(chan time.Time), func() {}
+	}
+	store.heldWaitForCancel, store.heldCanceled = true, make(chan struct{})
+	done := make(chan struct {
+		result LinearTodoDispatchResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := dispatcher.Dispatch(context.Background())
+		done <- struct {
+			result LinearTodoDispatchResult
+			err    error
+		}{result, err}
+	}()
+	select {
+	case <-store.heldCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("persisted lease recheck did not honor its deadline")
+	}
+	select {
+	case observed := <-done:
+		if observed.err != nil || observed.result.Outcome != LinearTodoDispatchAttention {
+			t.Fatalf("result=%+v err=%v", observed.result, observed.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bounded persisted lease recheck did not fail closed")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.attention) != 1 || store.attention[0].EventType != OperatorAttentionSchedulerLease || store.attention[0].ReasonCode != "lease_lost" {
+		t.Fatalf("attention=%+v", store.attention)
+	}
+	if len(driver.calls) != 0 {
+		t.Fatalf("driver called before bounded lease recheck: %+v", driver.calls)
 	}
 }
 

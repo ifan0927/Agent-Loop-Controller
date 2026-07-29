@@ -536,10 +536,14 @@ renewal before accepting driver success or failure, so concurrent lease loss
 takes precedence over the driver outcome. Settlement cancels renewal I/O
 without canceling successfully completed work, then joins the context-bounded
 renewal before returning. Unknown CAS results fail closed as scheduler
-attention. Attention parks admission but does not terminate the worker; a later
-cycle keeps observing the same durable authority without admitting a second
-run. The short scheduler lease is released after every cycle rather than
-renewed while parked. It reports bounded worker and queue-decision evidence;
+attention. Before accepting any scoped start or driver outcome, the cycle also
+rechecks persisted lease ownership and expiry; loss discovered without a
+renewal tick has the same fail-closed behavior, and this check also gates entry
+to the production driver. Attention parks admission but does not terminate the
+worker; a later cycle keeps observing the same durable authority without
+admitting a second run. The short scheduler lease is released after every cycle
+rather than renewed while parked. It reports bounded worker and queue-decision
+evidence;
 `status` is `running`, `driving`, `parked`, or `stopping`, and a stopping result
 includes `previous_status`. The worker atomically replaces the private
 `<controller-config>.worker-status.json` snapshot on each transition rather

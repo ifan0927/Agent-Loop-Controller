@@ -28,6 +28,8 @@ const (
 
 var errDispatchLeaseRenewalSettled = errors.New("automatic admission lease renewal settled")
 
+var dispatchLeaseAuthorityCheckTimeout = 5 * time.Second
+
 const (
 	LinearTodoQueueDecisionNoCandidate        = "no_candidate"
 	LinearTodoQueueDecisionActiveRun          = "active_run"
@@ -515,6 +517,7 @@ type dispatchLeaseScope struct {
 	stopTicks   func()
 	settleOnce  sync.Once
 	settled     bool
+	authority   chan struct{}
 	leaseMu     sync.Mutex
 	lease       LinearTodoAdmissionLease
 	targetLease *LinearTodoAdmissionLease
@@ -531,9 +534,11 @@ func (d *LinearTodoDispatcher) startLeaseRenewal(ctx context.Context, lease *Lin
 		done:        make(chan struct{}),
 		leaseLost:   make(chan struct{}),
 		stopTicks:   stopTicks,
+		authority:   make(chan struct{}, 1),
 		lease:       *lease,
 		targetLease: lease,
 	}
+	scope.authority <- struct{}{}
 	go func() {
 		defer close(scope.done)
 		for {
@@ -541,18 +546,24 @@ func (d *LinearTodoDispatcher) startLeaseRenewal(ctx context.Context, lease *Lin
 			case <-renewCtx.Done():
 				return
 			case <-ticks:
+				if !scope.acquireAuthority(renewCtx) {
+					return
+				}
 				attemptCtx, cancelAttempt := context.WithTimeout(renewCtx, d.policy.LeaseRenewal)
 				next, renewed, err := d.renewLeaseAttempt(attemptCtx, scope.currentLease())
 				cancelAttempt()
 				if err != nil && context.Cause(renewCtx) == errDispatchLeaseRenewalSettled && errors.Is(err, context.Canceled) {
+					scope.releaseAuthority()
 					return
 				}
 				if err != nil || !renewed {
+					scope.releaseAuthority()
 					close(scope.leaseLost)
 					cancelWork(errors.New("automatic admission lease renewal was lost"))
 					return
 				}
 				scope.updateLease(next)
+				scope.releaseAuthority()
 			}
 		}
 	}()
@@ -580,6 +591,19 @@ func (s *dispatchLeaseScope) updateLease(lease LinearTodoAdmissionLease) {
 	s.lease = lease
 }
 
+func (s *dispatchLeaseScope) acquireAuthority(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-s.authority:
+		return true
+	}
+}
+
+func (s *dispatchLeaseScope) releaseAuthority() {
+	s.authority <- struct{}{}
+}
+
 func (s *dispatchLeaseScope) settle() bool {
 	s.settleOnce.Do(func() {
 		s.stopTicks()
@@ -602,7 +626,25 @@ func (d *LinearTodoDispatcher) settleLeaseScope(ctx context.Context, leaseScope 
 		result, err := d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence(evidence, run.ID))
 		return result, true, err
 	}
+	held, heldErr := d.scopedLeaseHeld(ctx, leaseScope)
+	if err := ctx.Err(); err != nil {
+		return LinearTodoDispatchResult{}, true, err
+	}
+	if heldErr != nil || !held {
+		result, err := d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence(evidence, run.ID))
+		return result, true, err
+	}
 	return LinearTodoDispatchResult{}, false, nil
+}
+
+func (d *LinearTodoDispatcher) scopedLeaseHeld(ctx context.Context, leaseScope *dispatchLeaseScope) (bool, error) {
+	heldCtx, cancelHeld := context.WithTimeout(ctx, dispatchLeaseAuthorityCheckTimeout)
+	defer cancelHeld()
+	if !leaseScope.acquireAuthority(heldCtx) {
+		return false, heldCtx.Err()
+	}
+	defer leaseScope.releaseAuthority()
+	return d.store.LinearTodoAdmissionLeaseHeld(heldCtx, leaseScope.currentLease(), d.clock())
 }
 
 func (d *LinearTodoDispatcher) driveWithLeaseScope(ctx context.Context, leaseScope *dispatchLeaseScope, run Run) (LinearTodoDispatchResult, error) {
@@ -610,6 +652,16 @@ func (d *LinearTodoDispatcher) driveWithLeaseScope(ctx context.Context, leaseSco
 		if result, handled, settleErr := d.settleLeaseScope(ctx, leaseScope, run, "lease_lost_before_driver"); handled {
 			return result, settleErr
 		}
+	}
+	held, heldErr := d.scopedLeaseHeld(ctx, leaseScope)
+	if err := ctx.Err(); err != nil {
+		leaseScope.settle()
+		return LinearTodoDispatchResult{}, err
+	}
+	if heldErr != nil || !held {
+		leaseScope.settle()
+		result, err := d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_before_driver", run.ID))
+		return result, err
 	}
 	result, err := d.driver.Drive(leaseScope.ctx, ProductionDriveCommand{Requester: d.policy.Requester, RunID: run.ID, Repository: run.Repository, IdempotencyKey: run.IdempotencyKey})
 	// Stop new ticks and join an already-running renewal before accepting the

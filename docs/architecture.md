@@ -348,7 +348,12 @@ precedence over a concurrent driver success or error. Normal settlement cancels
 only the bounded renewal I/O context, not the completed work context. Lease
 persistence honors context cancellation so settlement joins the renewal
 goroutine without relying on a database busy timeout; any non-cancellation
-failure or unknown CAS result remains fail-closed lease loss.
+failure or unknown CAS result remains fail-closed lease loss. After joining,
+dispatch also rechecks the current versioned lease against persisted ownership
+and expiry, so a delayed process cannot accept a scoped outcome after expiry
+and takeover merely because no renewal tick fired. The same serialized,
+bounded check gates the Start-to-driver handoff, preventing a stale owner from
+starting driver mutations while the renewer remains continuously active.
 Every dispatch cycle releases its short scheduler lease before waiting.
 An authenticated `retry` action is deliberately narrower than general recovery:
 it accepts only a current `retry_budget_exhausted` attention whose retained
