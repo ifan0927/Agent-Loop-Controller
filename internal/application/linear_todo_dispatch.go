@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
@@ -112,6 +113,7 @@ type LinearTodoDispatchPolicy struct {
 	CandidateAuthority LinearTodoCandidateAuthority
 	StartAuthority     LinearIssueStartAuthority
 	LeaseTTL           time.Duration
+	LeaseRenewal       time.Duration
 	OwnerNonce         string
 	Requester          Requester
 	AttentionProfile   OperatorAttentionProfile
@@ -145,8 +147,9 @@ func withQueueDecision(result LinearTodoDispatchResult, decision LinearTodoQueue
 
 // LinearTodoDispatcher advances at most one persisted run. It is intentionally
 // a single cycle: it has no poll, CLI, or transport concern. During one
-// potentially long Drive call it may renew its already-held lease solely to
-// fence that call; a later caller owns trigger cadence and process lifetime.
+// potentially long local start and Drive handoff it renews its already-held
+// lease solely to fence that work; a later caller owns trigger cadence and
+// process lifetime.
 type LinearTodoDispatcher struct {
 	scanner    LinearTodoCandidateScanner
 	reader     LinearIssueReader
@@ -178,7 +181,9 @@ func validateLinearTodoDispatchPolicy(policy LinearTodoDispatchPolicy) error {
 	if err := policy.StartAuthority.validate(); err != nil || policy.CandidateAuthority.TeamID != policy.StartAuthority.TeamID || policy.CandidateAuthority.TeamKey != policy.StartAuthority.TeamKey || !stateMatches(policy.CandidateAuthority.TodoState, policy.StartAuthority.TodoState) || !stateMatches(policy.CandidateAuthority.InProgressState, policy.StartAuthority.InProgressState) || policy.CandidateAuthority.MaxCandidates < 1 || policy.CandidateAuthority.MaxCandidates > 100 || policy.CandidateAuthority.MaxPages < 1 || policy.CandidateAuthority.MaxPages > 20 {
 		return errors.New("Linear Todo dispatch workflow authority is invalid")
 	}
-	if policy.LeaseTTL < 30*time.Second || policy.LeaseTTL > MaxLinearTodoAdmissionLeaseTTL || strings.TrimSpace(policy.OwnerNonce) == "" || policy.Requester.ID == "" || policy.Requester.Kind != "github_login" {
+	if policy.LeaseTTL < 30*time.Second || policy.LeaseTTL > MaxLinearTodoAdmissionLeaseTTL ||
+		policy.LeaseRenewal <= 0 || policy.LeaseRenewal > policy.LeaseTTL/2 ||
+		strings.TrimSpace(policy.OwnerNonce) == "" || policy.Requester.ID == "" || policy.Requester.Kind != "github_login" {
 		return errors.New("Linear Todo dispatch lease or requester authority is invalid")
 	}
 	if err := policy.Retry.normalized().validate(); err != nil {
@@ -471,55 +476,98 @@ func (d *LinearTodoDispatcher) startAndDrive(ctx context.Context, lease *LinearT
 	if !d.renewLease(ctx, lease) {
 		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_before_local_start", run.ID))
 	}
-	startedRun, err := command.Start(ctx, StartCommand{Requester: d.policy.Requester, RepositorySelection: input.Task.Repository, IdempotencyKey: input.IdempotencyKey, Input: input})
+	leaseScope := d.startLeaseRenewal(ctx, lease)
+	defer leaseScope.stop()
+	startedRun, err := command.Start(leaseScope.ctx, StartCommand{Requester: d.policy.Requester, RepositorySelection: input.Task.Repository, IdempotencyKey: input.IdempotencyKey, Input: input})
+	if leaseScope.lost() {
+		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_during_local_start", run.ID))
+	}
 	if err != nil {
 		return LinearTodoDispatchResult{}, err
 	}
-	persisted, err := d.store.GetRun(ctx, run.ID)
+	persisted, err := d.store.GetRun(leaseScope.ctx, run.ID)
+	if leaseScope.lost() {
+		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_after_local_start", run.ID))
+	}
 	if err != nil || persisted.ID != run.ID || persisted.Repository != run.Repository || persisted.IdempotencyKey != run.IdempotencyKey || startedRun.Run.RunID != run.ID {
 		return d.runAttention(ctx, run, "admission_authority_conflict", dispatchEvidence("post_start_proof_conflict", run.ID))
 	}
-	return d.drive(ctx, lease, persisted)
+	return d.driveWithLeaseScope(ctx, leaseScope, persisted)
 }
 
 func (d *LinearTodoDispatcher) drive(ctx context.Context, lease *LinearTodoAdmissionLease, run Run) (LinearTodoDispatchResult, error) {
 	if !d.renewLease(ctx, lease) {
 		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_before_driver", run.ID))
 	}
-	driveCtx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
-	ticks, stopTicks := d.leaseTicks(d.policy.LeaseTTL / 2)
-	defer stopTicks()
-	driveDone := make(chan struct{})
-	renewerDone := make(chan struct{})
-	leaseLost := make(chan struct{}, 1)
+	leaseScope := d.startLeaseRenewal(ctx, lease)
+	defer leaseScope.stop()
+	return d.driveWithLeaseScope(ctx, leaseScope, run)
+}
+
+type dispatchLeaseScope struct {
+	ctx       context.Context
+	cancel    context.CancelCauseFunc
+	done      chan struct{}
+	leaseLost chan struct{}
+	stopTicks func()
+	stopOnce  sync.Once
+}
+
+func (d *LinearTodoDispatcher) startLeaseRenewal(ctx context.Context, lease *LinearTodoAdmissionLease) *dispatchLeaseScope {
+	leaseCtx, cancel := context.WithCancelCause(ctx)
+	ticks, stopTicks := d.leaseTicks(d.policy.LeaseRenewal)
+	scope := &dispatchLeaseScope{
+		ctx:       leaseCtx,
+		cancel:    cancel,
+		done:      make(chan struct{}),
+		leaseLost: make(chan struct{}),
+		stopTicks: stopTicks,
+	}
 	go func() {
-		defer close(renewerDone)
+		defer close(scope.done)
 		for {
 			select {
-			case <-driveDone:
-				return
-			case <-driveCtx.Done():
+			case <-leaseCtx.Done():
 				return
 			case <-ticks:
-				if !d.renewLease(driveCtx, lease) {
-					select {
-					case leaseLost <- struct{}{}:
-					default:
-					}
+				if !d.renewLease(leaseCtx, lease) {
+					close(scope.leaseLost)
 					cancel(errors.New("automatic admission lease renewal was lost"))
 					return
 				}
 			}
 		}
 	}()
-	result, err := d.driver.Drive(driveCtx, ProductionDriveCommand{Requester: d.policy.Requester, RunID: run.ID, Repository: run.Repository, IdempotencyKey: run.IdempotencyKey})
-	close(driveDone)
-	<-renewerDone
+	return scope
+}
+
+func (s *dispatchLeaseScope) lost() bool {
 	select {
-	case <-leaseLost:
-		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_during_driver", run.ID))
+	case <-s.leaseLost:
+		return true
 	default:
+		return false
+	}
+}
+
+func (s *dispatchLeaseScope) stop() {
+	s.stopOnce.Do(func() {
+		s.stopTicks()
+		s.cancel(nil)
+		<-s.done
+	})
+}
+
+func (d *LinearTodoDispatcher) driveWithLeaseScope(ctx context.Context, leaseScope *dispatchLeaseScope, run Run) (LinearTodoDispatchResult, error) {
+	if leaseScope.lost() {
+		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_before_driver", run.ID))
+	}
+	if err := leaseScope.ctx.Err(); err != nil {
+		return LinearTodoDispatchResult{}, err
+	}
+	result, err := d.driver.Drive(leaseScope.ctx, ProductionDriveCommand{Requester: d.policy.Requester, RunID: run.ID, Repository: run.Repository, IdempotencyKey: run.IdempotencyKey})
+	if leaseScope.lost() {
+		return d.schedulerAttention(ctx, d.profileForRun(run), "lease_lost", dispatchEvidence("lease_lost_during_driver", run.ID))
 	}
 	if err != nil {
 		return LinearTodoDispatchResult{}, err

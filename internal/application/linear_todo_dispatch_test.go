@@ -8,6 +8,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -90,7 +91,17 @@ func (r dispatchResolver) ResolveLinearAdmissionRepository(label string) (LocalR
 
 type dispatchController struct{ store *dispatchStore }
 
-func (c *dispatchController) StartAuthorized(_ context.Context, _ LocalStartInput, _ func(Run) error) (Run, error) {
+func (c *dispatchController) StartAuthorized(ctx context.Context, _ LocalStartInput, _ func(Run) error) (Run, error) {
+	if c.store.startEntered != nil {
+		close(c.store.startEntered)
+	}
+	if c.store.startAllow != nil {
+		select {
+		case <-c.store.startAllow:
+		case <-ctx.Done():
+			return Run{}, ctx.Err()
+		}
+	}
 	c.store.mu.Lock()
 	defer c.store.mu.Unlock()
 	c.store.continues++
@@ -98,7 +109,17 @@ func (c *dispatchController) StartAuthorized(_ context.Context, _ LocalStartInpu
 	return c.store.run, nil
 }
 
-func (c *dispatchController) ContinueExpected(_ context.Context, runID string, expected domain.State, key string, _ *Decision) (Run, error) {
+func (c *dispatchController) ContinueExpected(ctx context.Context, runID string, expected domain.State, key string, _ *Decision) (Run, error) {
+	if c.store.startEntered != nil {
+		close(c.store.startEntered)
+	}
+	if c.store.startAllow != nil {
+		select {
+		case <-c.store.startAllow:
+		case <-ctx.Done():
+			return Run{}, ctx.Err()
+		}
+	}
 	c.store.mu.Lock()
 	defer c.store.mu.Unlock()
 	if c.store.run.ID != runID || c.store.run.State != expected || c.store.run.IdempotencyKey != key {
@@ -176,10 +197,13 @@ type dispatchStore struct {
 	leaseLost              bool
 	renewCalls             int
 	failRenewAt            int
+	renewErrAt             int
 	renewed                chan int
 	postProofDrift         bool
 	omitDecisionTransition bool
 	reserveBlocked         chan struct{}
+	startEntered           chan struct{}
+	startAllow             chan struct{}
 	ciWaitActive           bool
 	ciWaitClosed           int
 	ciWaitClosedAt         time.Time
@@ -212,7 +236,13 @@ func (s *dispatchStore) RenewLinearTodoAdmissionLease(_ context.Context, lease L
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.renewCalls++
+	if s.renewErrAt == s.renewCalls {
+		return LinearTodoAdmissionLease{}, false, errors.New("lease persistence unavailable")
+	}
 	if s.failRenewAt == s.renewCalls || !s.held || s.leaseLost || lease.Namespace != s.lease.Namespace || lease.OwnerNonce != s.lease.OwnerNonce || lease.Version != s.lease.Version {
+		return LinearTodoAdmissionLease{}, false, nil
+	}
+	if now.After(s.lease.ExpiresAt) {
 		return LinearTodoAdmissionLease{}, false, nil
 	}
 	s.lease.Version++
@@ -503,7 +533,7 @@ func newDispatchLab(t *testing.T, candidates ...LinearTodoCandidate) (*LinearTod
 	store := &dispatchStore{now: now}
 	starter := &dispatchStarter{reader: reader}
 	driver := &dispatchDriver{}
-	policy := LinearTodoDispatchPolicy{CandidateAuthority: dispatchAuthority(), StartAuthority: dispatchStartAuthority(), LeaseTTL: time.Minute, OwnerNonce: "dispatch-owner", Requester: Requester{ID: "operator", Kind: "github_login"}, AttentionProfile: OperatorAttentionProfile{ID: "automation", Name: "linear"}}
+	policy := LinearTodoDispatchPolicy{CandidateAuthority: dispatchAuthority(), StartAuthority: dispatchStartAuthority(), LeaseTTL: time.Minute, LeaseRenewal: 20 * time.Second, OwnerNonce: "dispatch-owner", Requester: Requester{ID: "operator", Kind: "github_login"}, AttentionProfile: OperatorAttentionProfile{ID: "automation", Name: "linear"}}
 	dispatcher, err := NewLinearTodoDispatcher(scanner, reader, dispatchResolver{repository: repository}, starter, store, &dispatchController{store: store}, driver, policy)
 	if err != nil {
 		t.Fatal(err)
@@ -554,7 +584,7 @@ func TestLinearTodoDispatcherSelectsOnePriorityCandidateThenStartsAndDrives(t *t
 	if result.QueueDecision == nil || result.QueueDecision.Reason != LinearTodoQueueDecisionSelectedPriority || result.QueueDecision.CandidateCount != 2 || result.QueueDecision.SelectedPriority == nil || *result.QueueDecision.SelectedPriority != 1 || result.QueueDecision.SelectedTeamKey != "IFAN" || result.QueueDecision.SelectedIssueSequence == nil || *result.QueueDecision.SelectedIssueSequence != 12 || result.QueueDecision.SelectedIssueUUID != high.IssueID || result.QueueDecision.ExistingRunPreventedScan {
 		t.Fatalf("queue decision=%+v", result.QueueDecision)
 	}
-	if len(reader.calls) != 4 || reader.calls[0] != low.Identifier || reader.calls[1] != high.Identifier || store.journal.Status != "started" || store.continues != 1 || store.renewCalls != 9 || store.releasedLease.Version != store.lease.Version || store.held {
+	if len(reader.calls) != 4 || reader.calls[0] != low.Identifier || reader.calls[1] != high.Identifier || store.journal.Status != "started" || store.continues != 1 || store.renewCalls != 8 || store.releasedLease.Version != store.lease.Version || store.held {
 		t.Fatalf("reader=%v journal=%+v continues=%d renews=%d released=%+v current=%+v held=%t", reader.calls, store.journal, store.continues, store.renewCalls, store.releasedLease, store.lease, store.held)
 	}
 }
@@ -568,7 +598,7 @@ func TestLinearTodoDispatcherRenewalFailureStopsBeforeEachLongBoundary(t *testin
 		{name: "scan", failAt: 1},
 		{name: "authoritative read", failAt: 2, scannerCalls: 1},
 		{name: "start mutation", failAt: 5, scannerCalls: 1, reserveCalls: 1},
-		{name: "driver", failAt: 8, scannerCalls: 1, reserveCalls: 1, starterCalls: 1},
+		{name: "local start", failAt: 7, scannerCalls: 1, reserveCalls: 1, starterCalls: 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			candidate := dispatchCandidate("renew-"+test.name, "IFAN-31", 1)
@@ -973,6 +1003,175 @@ func TestLinearTodoDispatcherConcurrentCycleCannotReserveOrDriveSecondCandidate(
 	first := <-firstDone
 	if first.err != nil || first.result.Outcome != LinearTodoDispatchDriven {
 		t.Fatalf("first=%+v err=%v", first.result, first.err)
+	}
+}
+
+func TestLinearTodoDispatcherRenewsConfiguredLeaseAcrossBlockedStartAndDriverHandoff(t *testing.T) {
+	candidate := dispatchCandidate("long-start", "IFAN-34", 1)
+	dispatcher, store, _, _, _, driver := newDispatchLab(t, candidate)
+	store.startEntered, store.startAllow = make(chan struct{}), make(chan struct{})
+	driver.started = make(chan struct{})
+	ticks := make(chan time.Time)
+	tickerStopped := make(chan struct{})
+	var configuredInterval time.Duration
+	dispatcher.leaseTicks = func(interval time.Duration) (<-chan time.Time, func()) {
+		configuredInterval = interval
+		return ticks, func() { close(tickerStopped) }
+	}
+	var nowNanos atomic.Int64
+	nowNanos.Store(store.now.UnixNano())
+	dispatcher.now = func() time.Time { return time.Unix(0, nowNanos.Load()).UTC() }
+	store.renewed = make(chan int, 1)
+
+	done := make(chan struct {
+		result LinearTodoDispatchResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := dispatcher.Dispatch(context.Background())
+		done <- struct {
+			result LinearTodoDispatchResult
+			err    error
+		}{result, err}
+	}()
+	select {
+	case <-store.startEntered:
+	case <-time.After(time.Second):
+		t.Fatal("cycle did not reach initial local start")
+	}
+	if configuredInterval != dispatcher.policy.LeaseRenewal {
+		t.Fatalf("lease ticker interval=%s configured=%s", configuredInterval, dispatcher.policy.LeaseRenewal)
+	}
+
+	for elapsed := dispatcher.policy.LeaseRenewal; elapsed <= dispatcher.policy.LeaseTTL+dispatcher.policy.LeaseRenewal; elapsed += dispatcher.policy.LeaseRenewal {
+		nowNanos.Store(store.now.Add(elapsed).UnixNano())
+		ticks <- time.Unix(0, nowNanos.Load()).UTC()
+		select {
+		case <-store.renewed:
+		case <-time.After(time.Second):
+			t.Fatalf("blocked initial start did not renew at elapsed=%s", elapsed)
+		}
+	}
+	close(store.startAllow)
+	select {
+	case <-driver.started:
+	case <-time.After(time.Second):
+		t.Fatal("driver did not begin in the same dispatch after initial start")
+	}
+	observed := <-done
+	if observed.err != nil || observed.result.Outcome != LinearTodoDispatchDriven {
+		t.Fatalf("result=%+v err=%v", observed.result, observed.err)
+	}
+	select {
+	case <-tickerStopped:
+	default:
+		t.Fatal("lease renewal ticker did not terminate after driver completion")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.attention) != 0 || store.held || store.releasedLease.Version != store.lease.Version {
+		t.Fatalf("attention=%+v held=%t released=%+v lease=%+v", store.attention, store.held, store.releasedLease, store.lease)
+	}
+}
+
+func TestLinearTodoDispatcherFailsClosedWhenLeaseRenewalFailsDuringBlockedStart(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		setup func(*dispatchStore)
+	}{
+		{name: "ownership lost", setup: func(store *dispatchStore) { store.leaseLost = true }},
+		{name: "persistence failure", setup: func(store *dispatchStore) { store.renewErrAt = store.renewCalls + 1 }},
+		{name: "stale owner", setup: func(store *dispatchStore) { store.lease.OwnerNonce = "takeover-owner" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := dispatchCandidate("blocked-start-"+test.name, "IFAN-38", 1)
+			dispatcher, store, _, _, _, driver := newDispatchLab(t, candidate)
+			store.startEntered, store.startAllow = make(chan struct{}), make(chan struct{})
+			ticks := make(chan time.Time)
+			tickerStopped := make(chan struct{})
+			dispatcher.leaseTicks = func(time.Duration) (<-chan time.Time, func()) {
+				return ticks, func() { close(tickerStopped) }
+			}
+			done := make(chan struct {
+				result LinearTodoDispatchResult
+				err    error
+			}, 1)
+			go func() {
+				result, err := dispatcher.Dispatch(context.Background())
+				done <- struct {
+					result LinearTodoDispatchResult
+					err    error
+				}{result, err}
+			}()
+			select {
+			case <-store.startEntered:
+			case <-time.After(time.Second):
+				t.Fatal("cycle did not reach blocked initial start")
+			}
+			store.mu.Lock()
+			test.setup(store)
+			store.mu.Unlock()
+			ticks <- time.Now()
+			select {
+			case observed := <-done:
+				if observed.err != nil || observed.result.Outcome != LinearTodoDispatchAttention {
+					t.Fatalf("result=%+v err=%v", observed.result, observed.err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("lease renewal failure did not cancel blocked initial start")
+			}
+			select {
+			case <-tickerStopped:
+			default:
+				t.Fatal("lease renewal ticker did not terminate after lease failure")
+			}
+			store.mu.Lock()
+			defer store.mu.Unlock()
+			if len(driver.calls) != 0 || len(store.attention) != 1 || store.attention[0].EventType != OperatorAttentionSchedulerLease || store.attention[0].ReasonCode != "lease_lost" {
+				t.Fatalf("driver=%+v attention=%+v", driver.calls, store.attention)
+			}
+		})
+	}
+}
+
+func TestLinearTodoDispatcherCancellationJoinsRenewerDuringBlockedStart(t *testing.T) {
+	candidate := dispatchCandidate("cancel-start", "IFAN-39", 1)
+	dispatcher, store, _, _, _, driver := newDispatchLab(t, candidate)
+	store.startEntered, store.startAllow = make(chan struct{}), make(chan struct{})
+	ticks := make(chan time.Time)
+	tickerStopped := make(chan struct{})
+	dispatcher.leaseTicks = func(time.Duration) (<-chan time.Time, func()) {
+		return ticks, func() { close(tickerStopped) }
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := dispatcher.Dispatch(ctx)
+		done <- err
+	}()
+	select {
+	case <-store.startEntered:
+	case <-time.After(time.Second):
+		t.Fatal("cycle did not reach blocked initial start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("dispatch cancellation error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("caller cancellation did not cancel blocked initial start")
+	}
+	select {
+	case <-tickerStopped:
+	default:
+		t.Fatal("lease renewal ticker did not terminate after caller cancellation")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(driver.calls) != 0 || len(store.attention) != 0 || store.held || store.run.State != domain.StateReceived {
+		t.Fatalf("driver=%+v attention=%+v held=%t state=%s", driver.calls, store.attention, store.held, store.run.State)
 	}
 }
 

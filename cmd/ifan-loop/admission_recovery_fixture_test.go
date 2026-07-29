@@ -498,6 +498,7 @@ func newAcceptanceRetryDispatcher(scanner application.LinearTodoCandidateScanner
 		CandidateAuthority: application.LinearTodoCandidateAuthority{TeamID: "123e4567-e89b-42d3-a456-426614174100", TeamKey: "IFAN", TodoState: offlineAdmissionTodoState, InProgressState: offlineAdmissionInProgressState, MaxCandidates: 10, MaxPages: 1},
 		StartAuthority:     application.LinearIssueStartAuthority{TeamID: "123e4567-e89b-42d3-a456-426614174100", TeamKey: "IFAN", TodoState: offlineAdmissionTodoState, InProgressState: offlineAdmissionInProgressState},
 		LeaseTTL:           time.Minute,
+		LeaseRenewal:       20 * time.Second,
 		OwnerNonce:         owner,
 		Requester:          requester,
 		AttentionProfile:   application.OperatorAttentionProfile{ID: "offline", Name: "offline-retry-fixture"},

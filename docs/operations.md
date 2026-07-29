@@ -528,10 +528,14 @@ ifan-loop controller worker --once
 
 Validates automation authority and credential topology, acquires the singleton
 scheduler lease, resumes a nonterminal run or scans/adopts one eligible Todo,
-then drives it. Attention parks admission but does not terminate the worker; a
-later cycle keeps observing the same durable authority without admitting a
-second run. The short scheduler lease is released after every cycle rather than
-renewed while parked. It reports bounded worker and queue-decision evidence;
+then drives it. The configured scheduler renewal interval keeps the same
+versioned lease owner alive continuously across initial local start and the
+production-driver handoff. A failed renewal cancels that in-flight work before
+the cycle reports scheduler attention. Attention parks admission but does not
+terminate the worker; a later cycle keeps observing the same durable authority
+without admitting a second run. The short scheduler lease is released after
+every cycle rather than renewed while parked. It reports bounded worker and
+queue-decision evidence;
 `status` is `running`, `driving`, `parked`, or `stopping`, and a stopping result
 includes `previous_status`. The worker atomically replaces the private
 `<controller-config>.worker-status.json` snapshot on each transition rather

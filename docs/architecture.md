@@ -339,7 +339,10 @@ immutable UUID, independent of response order. Incomplete or contradictory
 scans, conflicts, and exhaustion stop for attention.
 Human-decision and manual-intervention states are parked with transition-bound
 attention; GitHub approval remains inside the production driver's bounded poll
-loop. Every dispatch cycle releases its short scheduler lease before waiting.
+loop. A single configured-interval renewer fences the potentially long initial
+local start and continues without a gap through production-driver handoff;
+renewal ownership loss or persistence failure cancels the in-flight work.
+Every dispatch cycle releases its short scheduler lease before waiting.
 An authenticated `retry` action is deliberately narrower than general recovery:
 it accepts only a current `retry_budget_exhausted` attention whose retained
 failure class is `process_start`, with matching failed-attempt or verifier

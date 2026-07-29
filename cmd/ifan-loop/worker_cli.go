@@ -142,6 +142,7 @@ func newAutomaticWorkerRuntime(loaded bootstrap.Bootstrap, instanceID string) (a
 		CandidateAuthority: application.LinearTodoCandidateAuthority{TeamID: configured.TeamID, TeamKey: configured.TeamKey, TodoState: application.LinearState{ID: configured.TodoState.ID, Name: configured.TodoState.Name, Type: configured.TodoState.Type}, InProgressState: application.LinearState{ID: configured.InProgressState.ID, Name: configured.InProgressState.Name, Type: configured.InProgressState.Type}, MaxCandidates: configured.MaxCandidates, MaxPages: configured.MaxPages},
 		StartAuthority:     application.LinearIssueStartAuthority{TeamID: configured.TeamID, TeamKey: configured.TeamKey, TodoState: application.LinearState{ID: configured.TodoState.ID, Name: configured.TodoState.Name, Type: configured.TodoState.Type}, InProgressState: application.LinearState{ID: configured.InProgressState.ID, Name: configured.InProgressState.Name, Type: configured.InProgressState.Type}},
 		LeaseTTL:           configured.SchedulerLeaseTTL,
+		LeaseRenewal:       configured.SchedulerLeaseRenewal,
 		OwnerNonce:         instanceID,
 		Requester:          requester,
 		AttentionProfile:   application.OperatorAttentionProfile{ID: "automation", Name: "linear-todo-admission"},
