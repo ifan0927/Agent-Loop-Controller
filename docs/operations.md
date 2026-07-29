@@ -699,13 +699,16 @@ ifan-loop controller status '<run-id>' <requester flags>
 **What it does**
 
 Reads SQLite only and returns run, timeline, attempts, evidence, owned resources,
-external observations, and safe recovery fields. `pull_request_snapshot`
-preserves the last stored GitHub observation; the separate `pull_request` field
-is the effective status derived from typed terminal evidence. Trusted feedback
-similarly separates its initial snapshot and controller lifecycle from
-`effective_thread_status`. An effective `unknown` or `conflict` means the
-persisted evidence is missing or inconsistent and must not be interpreted as
-open, closed, merged, resolved, or unresolved.
+external observations, and safe recovery fields. `pull_request_aggregate` is
+the explicitly mutable controller aggregate. Immutable creation-journal and
+GitHub read history appears under `pull_request_observations`; the separate
+`pull_request` field is the effective status derived from typed terminal
+evidence. Trusted feedback similarly separates its initial snapshot and
+controller lifecycle from `effective_thread_status`, selected from the latest
+repository-, PR-, and strict-thread-matching immutable observation. An
+effective `unknown` or `conflict` means the persisted evidence is missing or
+inconsistent and must not be interpreted as open, closed, merged, resolved, or
+unresolved.
 
 **Possible durable stop states**
 

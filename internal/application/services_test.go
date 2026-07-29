@@ -390,11 +390,20 @@ func TestTerminalProjectionSeparatesHistoricalPullRequestSnapshotFromEffectiveMe
 	if status.SchemaVersion != "v2" {
 		t.Fatalf("terminal projection schema=%q", status.SchemaVersion)
 	}
-	if status.PullRequestSnapshot == nil || status.PullRequestSnapshot.SnapshotLabel != "last_persisted_github_observation" || status.PullRequestSnapshot.State != "open" || status.PullRequestSnapshot.Merged {
-		t.Fatalf("historical snapshot was rewritten or mislabeled: %+v", status.PullRequestSnapshot)
+	if status.PullRequestAggregate == nil || status.PullRequestAggregate.AggregateLabel != "mutable_controller_aggregate" || status.PullRequestAggregate.State != "open" || status.PullRequestAggregate.Merged {
+		t.Fatalf("pull request aggregate was rewritten or mislabeled: %+v", status.PullRequestAggregate)
 	}
 	if status.PullRequest == nil || status.PullRequest.Status != "merged" || status.PullRequest.State != "closed" || status.PullRequest.Merged == nil || !*status.PullRequest.Merged || status.PullRequest.MergeSHA != mergeSHA || status.PullRequest.EvidenceSource != "merge_result" {
 		t.Fatalf("terminal merge was not projected effectively: %+v", status.PullRequest)
+	}
+	for _, observedAt := range []time.Time{now.Add(-time.Minute), now} {
+		mismatched := snapshot
+		mismatched.NodeID = "PR_WRONG"
+		evidence := &domain.GitHubReadEvidence{PullRequest: mismatched, ObservedAt: observedAt}
+		conflict := projectEffectivePullRequest(RunInspection{Run: run, PullRequest: &snapshot, Merge: merge, GitHubEvidence: evidence})
+		if conflict == nil || conflict.Status != "conflict" || conflict.EvidenceSource != "github_read_identity_conflict" {
+			t.Fatalf("identity mismatch at %s did not fail closed: %+v", observedAt, conflict)
+		}
 	}
 }
 
@@ -422,6 +431,15 @@ func TestTerminalProjectionFailsClosedForMissingOrConflictingMergeEvidence(t *te
 	if conflict.PullRequest == nil || conflict.PullRequest.Status != "conflict" || conflict.PullRequest.State != "conflict" || conflict.PullRequest.Merged != nil {
 		t.Fatalf("conflicting terminal evidence was presented as a fact: %+v", conflict.PullRequest)
 	}
+
+	service = NewQueryService(serviceStore{run: run, inspection: RunInspection{Run: run, Merge: &MergeRecord{RunID: run.ID, PRNumber: snapshot.Number, PreMergeSHA: head, BaseSHA: base, Method: "squash", MergeSHA: strings.Repeat("c", 40), MergedAt: now}}})
+	missingAggregate, err := service.GetRunDetail(context.Background(), RunDetailQuery{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missingAggregate.PullRequest == nil || missingAggregate.PullRequest.Status != "unknown" || missingAggregate.PullRequest.EvidenceSource != "missing_pull_request_aggregate" || missingAggregate.PullRequest.Merged != nil {
+		t.Fatalf("missing terminal PR aggregate was omitted or guessed: %+v", missingAggregate.PullRequest)
+	}
 }
 
 func TestTrustedFeedbackProjectionSeparatesInitialSnapshotFromFinalThreadEvidence(t *testing.T) {
@@ -436,13 +454,19 @@ func TestTrustedFeedbackProjectionSeparatesInitialSnapshotFromFinalThreadEvidenc
 		OriginalReviewHeadSHA: head, Path: "internal/example.go", Line: &line, BodyDigest: domain.TrustedReviewFeedbackDigest(body),
 		SourceAt: now, ObservedAt: now, Lifecycle: domain.TrustedReviewFeedbackReplied, UpdatedAt: now.Add(time.Minute),
 	}}
-	thread := domain.GitHubReviewThread{NodeID: feedback.ThreadNodeID, Resolved: true, Outdated: true, OriginalCommitSHA: head, Path: feedback.Path, Comments: []domain.GitHubReviewComment{{
+	pr := domain.PullRequest{Number: feedback.PRNumber, DatabaseID: feedback.PRDatabaseID, NodeID: feedback.PRNodeID, URL: "https://example.invalid/pull/7", HeadBranch: "feature", BaseBranch: "main", HeadSHA: head, BaseSHA: strings.Repeat("b", 40), BodyDigest: "body", OwnershipKey: "owner", State: "open"}
+	thread := domain.GitHubReviewThread{NodeID: feedback.ThreadNodeID, Resolved: true, Outdated: true, OriginalCommitSHA: head, Path: feedback.Path, Line: nil, Comments: []domain.GitHubReviewComment{{
 		DatabaseID: feedback.RootCommentDatabaseID, NodeID: feedback.RootCommentNodeID, Author: &author, BodyDigest: feedback.BodyDigest,
-		Review: domain.GitHubReview{DatabaseID: feedback.ReviewDatabaseID, NodeID: feedback.ReviewNodeID},
+		Review: domain.GitHubReview{DatabaseID: feedback.ReviewDatabaseID, NodeID: feedback.ReviewNodeID, State: "CHANGES_REQUESTED", CommitSHA: head, Actor: author},
 	}}}
-	run := authorizeTestRun(Run{ID: feedback.RunID, Repository: "owner/repo", State: domain.StateCompleted, CandidateHead: head})
-	evidence := &domain.GitHubReadEvidence{ReviewThreads: []domain.GitHubReviewThread{thread}, ObservedAt: now.Add(2 * time.Minute)}
-	got, err := NewQueryService(serviceStore{run: run, inspection: RunInspection{Run: run, TrustedFeedback: []TrustedReviewFeedbackRecord{feedback}, GitHubEvidence: evidence}}).GetRunDetail(context.Background(), RunDetailQuery{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID})
+	run := authorizeTestRun(Run{ID: feedback.RunID, Repository: "owner/repo", State: domain.StateCompleted, CandidateHead: head, BaseSHA: pr.BaseSHA})
+	repository := domain.RepositoryIdentity{ID: 99, Owner: "owner", Name: "repo"}
+	evidence := &domain.GitHubReadEvidence{Repository: repository, PullRequest: pr, ReviewThreads: []domain.GitHubReviewThread{thread}, ObservedAt: now.Add(2 * time.Minute)}
+	shadow := *evidence
+	shadow.ReviewThreads = nil
+	shadow.ObservedAt = now.Add(3 * time.Minute)
+	inspection := RunInspection{Run: run, RepositoryBinding: &SanitizedRepositoryBinding{ExpectedRepositoryID: repository.ID}, PullRequest: &pr, TrustedFeedback: []TrustedReviewFeedbackRecord{feedback}, GitHubEvidence: &shadow, GitHubEvidenceHistory: []domain.GitHubReadEvidence{*evidence, shadow}}
+	got, err := NewQueryService(serviceStore{run: run, inspection: inspection}).GetRunDetail(context.Background(), RunDetailQuery{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -450,7 +474,7 @@ func TestTrustedFeedbackProjectionSeparatesInitialSnapshotFromFinalThreadEvidenc
 	if projected.SnapshotLabel != "initial_trusted_change_request" || projected.ControllerResolved || projected.ControllerOutdated {
 		t.Fatalf("initial/controller snapshot was rewritten: %+v", projected)
 	}
-	if projected.EffectiveThreadStatus.Status != "resolved_outdated" || projected.EffectiveThreadStatus.Resolved == nil || !*projected.EffectiveThreadStatus.Resolved || projected.EffectiveThreadStatus.Outdated == nil || !*projected.EffectiveThreadStatus.Outdated || projected.EffectiveThreadStatus.EvidenceSource != "github_read_snapshot" {
+	if projected.EffectiveThreadStatus.Status != "resolved_outdated" || projected.EffectiveThreadStatus.Resolved == nil || !*projected.EffectiveThreadStatus.Resolved || projected.EffectiveThreadStatus.Outdated == nil || !*projected.EffectiveThreadStatus.Outdated || projected.EffectiveThreadStatus.EvidenceSource != "github_read_observation" {
 		t.Fatalf("final thread evidence was not projected: %+v", projected.EffectiveThreadStatus)
 	}
 	if unknown := projectEffectiveThreadStatus(RunInspection{}, feedback); unknown.Status != "unknown" || unknown.Resolved != nil || unknown.Outdated != nil {
@@ -459,9 +483,23 @@ func TestTrustedFeedbackProjectionSeparatesInitialSnapshotFromFinalThreadEvidenc
 	conflicting := thread
 	conflicting.Comments = append([]domain.GitHubReviewComment(nil), thread.Comments...)
 	conflicting.Comments[0].DatabaseID++
-	conflict := projectEffectiveThreadStatus(RunInspection{GitHubEvidence: &domain.GitHubReadEvidence{ReviewThreads: []domain.GitHubReviewThread{conflicting}, ObservedAt: now.Add(2 * time.Minute)}}, feedback)
+	conflictEvidence := *evidence
+	conflictEvidence.ReviewThreads = []domain.GitHubReviewThread{conflicting}
+	inspection.GitHubEvidence = &conflictEvidence
+	inspection.GitHubEvidenceHistory = []domain.GitHubReadEvidence{conflictEvidence}
+	conflict := projectEffectiveThreadStatus(inspection, feedback)
 	if conflict.Status != "conflict" || conflict.Resolved != nil || conflict.Outdated != nil {
 		t.Fatalf("conflicting final thread evidence was presented as fact: %+v", conflict)
+	}
+	wrongAuthority := *evidence
+	wrongAuthority.Repository.ID++
+	wrongAuthority.PullRequest.Number++
+	wrongAuthority.ObservedAt = now.Add(4 * time.Minute)
+	inspection.GitHubEvidence = &wrongAuthority
+	inspection.GitHubEvidenceHistory = []domain.GitHubReadEvidence{*evidence, wrongAuthority}
+	conflict = projectEffectiveThreadStatus(inspection, feedback)
+	if conflict.Status != "conflict" || conflict.Resolved != nil || conflict.Outdated != nil {
+		t.Fatalf("wrong repository/PR authority was presented as resolved: %+v", conflict)
 	}
 }
 

@@ -46,6 +46,20 @@ func TestTerminalProjectionSurvivesSQLiteRestart(t *testing.T) {
 		HeadBranch: run.WorkingBranch, BaseBranch: run.BaseBranch, HeadSHA: head, BaseSHA: base,
 		BodyDigest: "body-digest", OwnershipKey: run.IdempotencyKey, State: "open",
 	}
+	openSide, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{
+		RunID: run.ID, Kind: "open_pull_request", IdempotencyKey: head,
+		IntentJSON: `{"head_branch":"feature","base_branch":"main","candidate_sha":"` + head + `","base_sha":"` + base + `","body_digest":"body-digest"}`,
+		Attempt:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	openSide.Status = "observed"
+	openSide.ResultJSON = `{"pull_request":7,"database_id":70,"node_id":"PR_7","head_sha":"` + head + `","base_sha":"` + base + `","body_digest":"body-digest"}`
+	openSide.ObservedAt = now
+	if err := store.FinishSideEffect(ctx, openSide); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.SavePullRequest(ctx, run.ID, pr); err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +82,7 @@ func TestTerminalProjectionSurvivesSQLiteRestart(t *testing.T) {
 		Comments: []domain.GitHubReviewComment{{
 			DatabaseID: feedback.RootCommentDatabaseID, NodeID: feedback.RootCommentNodeID,
 			Author: &author, BodyDigest: feedback.BodyDigest,
-			Review: domain.GitHubReview{DatabaseID: feedback.ReviewDatabaseID, NodeID: feedback.ReviewNodeID},
+			Review: domain.GitHubReview{DatabaseID: feedback.ReviewDatabaseID, NodeID: feedback.ReviewNodeID, State: "CHANGES_REQUESTED", CommitSHA: head, Actor: author},
 		}},
 	}
 	evidence := domain.GitHubReadEvidence{
@@ -76,6 +90,12 @@ func TestTerminalProjectionSurvivesSQLiteRestart(t *testing.T) {
 		PullRequest: pr, ReviewThreads: []domain.GitHubReviewThread{thread}, ObservedAt: now.Add(time.Minute),
 	}
 	if err := store.SaveGitHubEvidence(ctx, run.ID, evidence); err != nil {
+		t.Fatal(err)
+	}
+	shadow := evidence
+	shadow.ReviewThreads = nil
+	shadow.ObservedAt = now.Add(time.Minute + 500*time.Millisecond)
+	if err := store.SaveGitHubEvidence(ctx, run.ID, shadow); err != nil {
 		t.Fatal(err)
 	}
 	merge := application.MergeRecord{RunID: run.ID, PRNumber: pr.Number, PreMergeSHA: head, BaseSHA: base, Method: "squash", MergeSHA: mergeSHA, MergedAt: now.Add(2 * time.Minute)}
@@ -98,13 +118,56 @@ func TestTerminalProjectionSurvivesSQLiteRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.PullRequestSnapshot == nil || result.PullRequestSnapshot.State != "open" || result.PullRequestSnapshot.Merged {
-		t.Fatalf("historical PR snapshot changed across restart: %+v", result.PullRequestSnapshot)
+	if result.PullRequestAggregate == nil || result.PullRequestAggregate.AggregateLabel != "mutable_controller_aggregate" || result.PullRequestAggregate.State != "open" || result.PullRequestAggregate.Merged {
+		t.Fatalf("PR aggregate changed or was mislabeled across restart: %+v", result.PullRequestAggregate)
+	}
+	if len(result.PullRequestObservations) != 3 || result.PullRequestObservations[0].ObservationKind != "creation_journal" || result.PullRequestObservations[1].ObservationKind != "github_read" || result.PullRequestObservations[2].ObservationKind != "github_read" {
+		t.Fatalf("immutable PR observations missing after restart: %+v", result.PullRequestObservations)
+	}
+	if !result.PullRequestObservations[1].ObservedAt.Equal(evidence.ObservedAt) || !result.PullRequestObservations[2].ObservedAt.Equal(shadow.ObservedAt) {
+		t.Fatalf("immutable GitHub evidence order is not chronological: %+v", result.PullRequestObservations)
 	}
 	if result.PullRequest == nil || result.PullRequest.Status != "merged" || result.PullRequest.Merged == nil || !*result.PullRequest.Merged || result.PullRequest.MergeSHA != mergeSHA {
-		t.Fatalf("effective merged projection missing after restart: run=%+v snapshot=%+v merge=%+v effective=%+v", result.Run, result.PullRequestSnapshot, result.Merge, result.PullRequest)
+		t.Fatalf("effective merged projection missing after restart: run=%+v aggregate=%+v merge=%+v effective=%+v", result.Run, result.PullRequestAggregate, result.Merge, result.PullRequest)
 	}
 	if len(result.TrustedFeedback) != 1 || result.TrustedFeedback[0].EffectiveThreadStatus.Status != "resolved_outdated" {
 		t.Fatalf("effective thread projection missing after restart: %+v", result.TrustedFeedback)
+	}
+}
+
+func TestCompletedMergeWithoutPullRequestAggregateProjectsUnknownAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "controller.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := strings.Repeat("a", 40)
+	base := strings.Repeat("b", 40)
+	repositoryJSON, _ := json.Marshal(application.LocalRepository{CanonicalRepository: "owner/repo", AllowedOperatorLogins: []string{"operator"}})
+	run := application.Run{ID: "missing-pr-aggregate", IssueID: "IFAN-86", IdempotencyKey: "missing-pr-key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: string(repositoryJSON), BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: "/private/artifacts"}
+	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE runs SET current_state=?,base_sha=?,candidate_head=? WHERE run_id=?`, domain.StateCompleted, base, head, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveMerge(ctx, application.MergeRecord{RunID: run.ID, PRNumber: 7, PreMergeSHA: head, BaseSHA: base, Method: "squash", MergeSHA: strings.Repeat("c", 40), MergedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	result, err := application.NewQueryService(store).GetRunDetail(ctx, application.RunDetailQuery{Requester: application.Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.PullRequest == nil || result.PullRequest.Status != "unknown" || result.PullRequest.EvidenceSource != "missing_pull_request_aggregate" || result.PullRequest.Merged != nil {
+		t.Fatalf("missing PR aggregate was omitted or guessed after restart: %+v", result.PullRequest)
 	}
 }

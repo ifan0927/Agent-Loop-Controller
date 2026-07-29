@@ -360,6 +360,33 @@ func TestReplyTargetRejectsActorLoginAndReviewActorDrift(t *testing.T) {
 	}
 }
 
+func TestReplyTargetTopologyRejectsRootReviewAndDuplicateDrift(t *testing.T) {
+	feedback := replyFeedback(9, "ROOT")
+	tests := []struct {
+		name   string
+		mutate func(*[]domain.GitHubReviewThread)
+	}{
+		{"root became reply", func(threads *[]domain.GitHubReviewThread) { (*threads)[0].Comments[0].ReplyToDatabaseID = 8 }},
+		{"review state", func(threads *[]domain.GitHubReviewThread) { (*threads)[0].Comments[0].Review.State = "APPROVED" }},
+		{"review commit", func(threads *[]domain.GitHubReviewThread) {
+			(*threads)[0].Comments[0].Review.CommitSHA = strings.Repeat("c", 40)
+		}},
+		{"duplicate thread", func(threads *[]domain.GitHubReviewThread) { *threads = append(*threads, (*threads)[0]) }},
+		{"duplicate root", func(threads *[]domain.GitHubReviewThread) {
+			(*threads)[0].Comments = append((*threads)[0].Comments, (*threads)[0].Comments[0])
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			threads, _ := replyTarget(feedback, true, false)
+			test.mutate(&threads)
+			if _, _, valid := replyTargetTopologyStatus(threads, feedback); valid {
+				t.Fatal("drifted reply topology was accepted")
+			}
+		})
+	}
+}
+
 func TestReplyEligibilityAllowsOutdatedRepairThreadAndRecordsResolved(t *testing.T) {
 	feedback := replyFeedback(9, "ROOT")
 	for _, tc := range []struct {

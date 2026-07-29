@@ -454,14 +454,35 @@ func replyTargetStatus(threads []domain.GitHubReviewThread, bodies domain.Inline
 	if err := bodies.Validate(); err != nil {
 		return false, false, false
 	}
-	bodyByID := make(map[string]domain.InlineReviewBody, len(bodies.Comments))
-	for _, body := range bodies.Comments {
-		bodyByID[body.CommentNodeID] = body
+	resolved, outdated, valid := replyTargetTopologyStatus(threads, feedback)
+	if !valid {
+		return false, false, false
 	}
+	matches := 0
+	for _, body := range bodies.Comments {
+		if body.CommentNodeID == feedback.RootCommentNodeID {
+			if body.ThreadNodeID != feedback.ThreadNodeID || body.BodyDigest != feedback.BodyDigest {
+				return false, false, false
+			}
+			matches++
+		}
+	}
+	return resolved, outdated, matches == 1
+}
+
+// replyTargetTopologyStatus is the shared digest-only authority check for a
+// persisted trusted root. The live reply flow adds the separate raw-body
+// handoff check above; read-only projections can safely reuse this topology
+// contract because the first accepted body digest is already immutable.
+func replyTargetTopologyStatus(threads []domain.GitHubReviewThread, feedback TrustedReviewFeedbackRecord) (bool, bool, bool) {
+	threadMatches := 0
+	rootMatches := 0
+	resolved, outdated := false, false
 	for _, thread := range threads {
 		if thread.NodeID != feedback.ThreadNodeID {
 			continue
 		}
+		threadMatches++
 		if thread.OriginalCommitSHA != feedback.OriginalReviewHeadSHA || thread.Path != feedback.Path || !sameReplyLocationLine(thread.Line, feedback.Line, thread.Outdated) {
 			return false, false, false
 		}
@@ -469,16 +490,16 @@ func replyTargetStatus(threads []domain.GitHubReviewThread, bodies domain.Inline
 			if comment.NodeID != feedback.RootCommentNodeID || comment.DatabaseID != feedback.RootCommentDatabaseID {
 				continue
 			}
-			body, found := bodyByID[comment.NodeID]
-			if !found || body.ThreadNodeID != feedback.ThreadNodeID || body.BodyDigest != feedback.BodyDigest || comment.BodyDigest != feedback.BodyDigest || comment.ReplyToDatabaseID != 0 || comment.ReplyToNodeID != "" || !sameReplyActor(comment.Author, feedback.Author) || comment.Review.DatabaseID != feedback.ReviewDatabaseID || comment.Review.NodeID != feedback.ReviewNodeID || comment.Review.State != "CHANGES_REQUESTED" || comment.Review.CommitSHA != feedback.OriginalReviewHeadSHA || !sameReplyActor(&comment.Review.Actor, feedback.Author) {
+			rootMatches++
+			if comment.BodyDigest != feedback.BodyDigest || comment.ReplyToDatabaseID != 0 || comment.ReplyToNodeID != "" || !sameReplyActor(comment.Author, feedback.Author) || comment.Review.DatabaseID != feedback.ReviewDatabaseID || comment.Review.NodeID != feedback.ReviewNodeID || comment.Review.State != "CHANGES_REQUESTED" || comment.Review.CommitSHA != feedback.OriginalReviewHeadSHA || !sameReplyActor(&comment.Review.Actor, feedback.Author) {
 				return false, false, false
 			}
-			// A repair necessarily changes the PR head. GitHub may consequently
-			// mark this original review thread outdated; that is not identity drift.
-			return thread.Resolved, thread.Outdated, true
+			resolved, outdated = thread.Resolved, thread.Outdated
 		}
 	}
-	return false, false, false
+	// A repair necessarily changes the PR head. GitHub may consequently mark
+	// this original review thread outdated; that is not identity drift.
+	return resolved, outdated, threadMatches == 1 && rootMatches == 1
 }
 
 func sameReplyActor(observed *domain.ActorIdentity, expected domain.ActorIdentity) bool {

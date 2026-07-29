@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -2652,19 +2653,50 @@ func (s *Store) Inspect(ctx context.Context, id string) (application.RunInspecti
 		inspection.GitHubRequests = append(inspection.GitHubRequests, o)
 	}
 	rows.Close()
-	var evidenceJSON, evidenceDigest string
-	if err := s.db.QueryRowContext(ctx, `SELECT evidence_json,evidence_digest FROM github_read_evidence WHERE run_id=? ORDER BY evidence_id DESC LIMIT 1`, id).Scan(&evidenceJSON, &evidenceDigest); err == nil {
+	rows, err = s.db.QueryContext(ctx, `SELECT evidence_id,evidence_json,evidence_digest FROM github_read_evidence WHERE run_id=?`, id)
+	if err != nil {
+		return inspection, err
+	}
+	type orderedGitHubEvidence struct {
+		id       int64
+		evidence domain.GitHubReadEvidence
+	}
+	var evidenceHistory []orderedGitHubEvidence
+	for rows.Next() {
+		var evidenceID int64
+		var evidenceJSON, evidenceDigest string
+		if err := rows.Scan(&evidenceID, &evidenceJSON, &evidenceDigest); err != nil {
+			rows.Close()
+			return inspection, err
+		}
 		sum := sha256.Sum256([]byte(evidenceJSON))
 		if hex.EncodeToString(sum[:]) != evidenceDigest {
+			rows.Close()
 			return inspection, errors.New("persisted GitHub evidence digest mismatch")
 		}
 		var e domain.GitHubReadEvidence
 		if err := json.Unmarshal([]byte(evidenceJSON), &e); err != nil {
+			rows.Close()
 			return inspection, err
 		}
-		inspection.GitHubEvidence = &e
-	} else if !errors.Is(err, sql.ErrNoRows) {
+		evidenceHistory = append(evidenceHistory, orderedGitHubEvidence{id: evidenceID, evidence: e})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
 		return inspection, err
+	}
+	rows.Close()
+	sort.SliceStable(evidenceHistory, func(i, j int) bool {
+		left, right := evidenceHistory[i], evidenceHistory[j]
+		if left.evidence.ObservedAt.Equal(right.evidence.ObservedAt) {
+			return left.id < right.id
+		}
+		return left.evidence.ObservedAt.Before(right.evidence.ObservedAt)
+	})
+	for _, item := range evidenceHistory {
+		inspection.GitHubEvidenceHistory = append(inspection.GitHubEvidenceHistory, item.evidence)
+		evidence := item.evidence
+		inspection.GitHubEvidence = &evidence
 	}
 	return inspection, nil
 }

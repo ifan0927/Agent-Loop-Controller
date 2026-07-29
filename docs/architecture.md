@@ -509,18 +509,21 @@ Run summary/detail, state timeline, attempts, exact-head evidence, side-effect
 records, attention, and safe recovery authority. `status` and `inspect` use the
 same version 2 detail projection contract:
 
-- `pull_request_snapshot` is the last persisted GitHub observation. It remains
-  historical evidence and is never rewritten merely to make terminal output
-  look current.
+- `pull_request_aggregate` is explicitly labelled as the mutable controller
+  aggregate used by delivery commands. It is not historical evidence.
+- `pull_request_observations` contains immutable creation-journal and GitHub
+  read observations in deterministic persisted order. These retain the
+  historical PR facts without rewriting the aggregate.
 - `pull_request` is the effective status. A valid immutable `merge_result`
-  projects `merged` even when the preceding snapshot was open. Missing terminal
-  merge authority projects `unknown`; mismatched PR/head/base/merge evidence
-  projects `conflict`.
+  projects `merged` even when the aggregate remains open. Missing aggregate or
+  terminal merge authority projects `unknown`; mismatched
+  repository/PR/head/base/merge evidence projects `conflict`.
 - each trusted feedback item labels its initial change-request snapshot,
   exposes controller lifecycle fields separately, and derives
-  `effective_thread_status` from the latest matching immutable GitHub read or a
-  controller-recorded resolution observation. Missing or topology-conflicting
-  evidence projects `unknown` or `conflict`.
+  `effective_thread_status` from the latest repository-, PR-, and strict
+  thread-topology-matching immutable GitHub read across the retained evidence
+  history, or from a controller-recorded resolution observation. Missing or
+  authority-conflicting evidence projects `unknown` or `conflict`.
 
 **Authoritative state/evidence**
 
@@ -955,9 +958,10 @@ around it. The principal table groups are:
 evidence tables answer why it may be there and what exact observations support
 the next action. Updating current state without its required evidence is not a
 valid recovery. Query projections also distinguish stored observations from
-effective facts: PR and feedback snapshots retain what GitHub reported at that
-time, while current terminal status is derived from later typed merge or
-thread-resolution evidence without updating the earlier observation.
+effective facts: the mutable PR aggregate supports workflow commands, immutable
+creation/read observations retain what was reported at each point in time, and
+current terminal status is derived from later typed merge or thread-resolution
+evidence without updating those earlier observations.
 
 ### Intent versus observation
 

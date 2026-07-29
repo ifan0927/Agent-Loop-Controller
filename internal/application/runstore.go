@@ -213,32 +213,33 @@ type OwnedResource struct {
 }
 
 type RunInspection struct {
-	Run                 Run                              `json:"run"`
-	RepositoryBinding   *SanitizedRepositoryBinding      `json:"repository_binding,omitempty"`
-	Timeline            []Transition                     `json:"state_timeline"`
-	Attempts            []Attempt                        `json:"attempts"`
-	Verifications       []VerificationRecord             `json:"verifications"`
-	Reviews             []ReviewRecord                   `json:"reviews"`
-	Resources           []OwnedResource                  `json:"owned_resources"`
-	SideEffects         []SideEffectRecord               `json:"external_side_effects"`
-	PullRequest         *domain.PullRequest              `json:"pull_request,omitempty"`
-	Polls               []PollObservation                `json:"poll_observations"`
-	Findings            []FindingRecord                  `json:"normalized_review_findings"`
-	TrustedFeedback     []TrustedReviewFeedbackRecord    `json:"trusted_review_feedback"`
-	ReviewReplies       []ReviewReplyEvidence            `json:"review_reply_evidence"`
-	FeedbackConflicts   []TrustedReviewFeedbackConflict  `json:"trusted_review_feedback_conflicts"`
-	ApprovalObservation *domain.HumanApprovalObservation `json:"human_approval_observation,omitempty"`
-	Approval            *domain.HumanApproval            `json:"human_approval,omitempty"`
-	Merge               *MergeRecord                     `json:"merge_result,omitempty"`
-	LinearCompletion    []LinearCompletionObservation    `json:"linear_completion_observations"`
-	Cleanup             []CleanupRecord                  `json:"cleanup_progress"`
-	RetrySchedules      []RetrySchedule                  `json:"retry_schedules"`
-	OperatorAttention   []OperatorAttentionEvent         `json:"operator_attention_events"`
-	OperatorActions     []OperatorActionRecord           `json:"operator_actions"`
-	GitHubInstallation  *GitHubInstallationMetadata      `json:"github_installation,omitempty"`
-	GitHubRequests      []GitHubRequestObservation       `json:"github_request_observations"`
-	GitHubEvidence      *domain.GitHubReadEvidence       `json:"github_read_evidence,omitempty"`
-	CIWaits             []CIWaitEvidence                 `json:"ci_waits"`
+	Run                   Run                              `json:"run"`
+	RepositoryBinding     *SanitizedRepositoryBinding      `json:"repository_binding,omitempty"`
+	Timeline              []Transition                     `json:"state_timeline"`
+	Attempts              []Attempt                        `json:"attempts"`
+	Verifications         []VerificationRecord             `json:"verifications"`
+	Reviews               []ReviewRecord                   `json:"reviews"`
+	Resources             []OwnedResource                  `json:"owned_resources"`
+	SideEffects           []SideEffectRecord               `json:"external_side_effects"`
+	PullRequest           *domain.PullRequest              `json:"pull_request,omitempty"`
+	Polls                 []PollObservation                `json:"poll_observations"`
+	Findings              []FindingRecord                  `json:"normalized_review_findings"`
+	TrustedFeedback       []TrustedReviewFeedbackRecord    `json:"trusted_review_feedback"`
+	ReviewReplies         []ReviewReplyEvidence            `json:"review_reply_evidence"`
+	FeedbackConflicts     []TrustedReviewFeedbackConflict  `json:"trusted_review_feedback_conflicts"`
+	ApprovalObservation   *domain.HumanApprovalObservation `json:"human_approval_observation,omitempty"`
+	Approval              *domain.HumanApproval            `json:"human_approval,omitempty"`
+	Merge                 *MergeRecord                     `json:"merge_result,omitempty"`
+	LinearCompletion      []LinearCompletionObservation    `json:"linear_completion_observations"`
+	Cleanup               []CleanupRecord                  `json:"cleanup_progress"`
+	RetrySchedules        []RetrySchedule                  `json:"retry_schedules"`
+	OperatorAttention     []OperatorAttentionEvent         `json:"operator_attention_events"`
+	OperatorActions       []OperatorActionRecord           `json:"operator_actions"`
+	GitHubInstallation    *GitHubInstallationMetadata      `json:"github_installation,omitempty"`
+	GitHubRequests        []GitHubRequestObservation       `json:"github_request_observations"`
+	GitHubEvidence        *domain.GitHubReadEvidence       `json:"github_read_evidence,omitempty"`
+	GitHubEvidenceHistory []domain.GitHubReadEvidence      `json:"-"`
+	CIWaits               []CIWaitEvidence                 `json:"ci_waits"`
 }
 
 // CIWaitEvidence is restart-stable observability for one exact candidate.
