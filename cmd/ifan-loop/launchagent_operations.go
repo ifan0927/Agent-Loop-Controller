@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -401,15 +402,38 @@ func launchAgentBootout(args []string) error {
 	if err := control.Bootout(ctx, target); err != nil {
 		return writeLaunchAgentControlResult(launchAgentControlErrorResult(options, "bootout", "unknown", false, err, "status"), err)
 	}
-	after, err := control.Status(ctx, target)
+	after, err := observeLaunchAgentAbsence(ctx, control, target)
 	if err != nil {
 		return writeLaunchAgentControlResult(launchAgentControlErrorResult(options, "bootout", after.State, false, err, "status"), err)
 	}
-	if after.State != "absent" {
-		err := &launchAgentControlError{Code: "bootout_not_observed"}
-		return writeLaunchAgentControlResult(launchAgentControlErrorResult(options, "bootout", after.State, false, err, "status"), err)
-	}
 	return writeLaunchAgentControlResult(launchAgentControlResultFor(options, "bootout", after.State, "stopped", "status", "", false, false), nil)
+}
+
+func observeLaunchAgentAbsence(ctx context.Context, control launchAgentControl, target string) (launchAgentObservation, error) {
+	last := launchAgentObservation{State: "unknown"}
+	for {
+		observed, err := control.Status(ctx, target)
+		if err != nil {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return last, &launchAgentControlError{Code: "bootout_observation_timeout"}
+			}
+			return observed, err
+		}
+		last = observed
+		if observed.State == "absent" {
+			return observed, nil
+		}
+		timer := time.NewTimer(launchAgentObservationInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return last, &launchAgentControlError{Code: "bootout_observation_timeout"}
+			}
+			return last, &launchAgentControlError{Code: "control_timeout"}
+		case <-timer.C:
+		}
+	}
 }
 
 func launchAgentRunAtLoadPending(state string) bool {

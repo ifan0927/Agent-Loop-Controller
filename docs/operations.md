@@ -1975,7 +1975,13 @@ ifan-loop controller launchagent bootout --binary "$HOME/.local/bin/ifan-loop"
 
 **What it does**
 
-Stops the exact label once; an absent service is idempotent.
+Stops the exact label at most once; an absent service is idempotent. After an
+accepted bootout request, it reconciles the exact label with read-only status
+observations inside the original bounded control window. A delayed
+disappearance is reported as `stopped`. If absence is not observed before that
+window expires, the result is `attention_required` with
+`bootout_observation_timeout`, the last sanitized observed state, and
+`timed_out: true`; the controller never sends a duplicate bootout request.
 
 **Possible durable stop states**
 
@@ -1983,7 +1989,9 @@ The active run remains persisted and resumable.
 
 **Safety notes**
 
-Confirm with `status` before replacing binaries, logs, or plist files.
+Confirm with `status` before replacing binaries, logs, or plist files. An
+unknown observation or timeout authorizes only another read-only status check,
+not another automatic control operation.
 
 **Related commands**
 

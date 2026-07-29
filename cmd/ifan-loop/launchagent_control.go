@@ -16,6 +16,7 @@ import (
 
 const (
 	defaultLaunchAgentControlTimeout = 15 * time.Second
+	launchAgentObservationInterval   = 100 * time.Millisecond
 	maxLaunchAgentControlTimeout     = 2 * time.Minute
 	maxLaunchAgentPlistBytes         = 64 << 10
 )
@@ -600,7 +601,7 @@ func launchAgentControlResultFor(options launchAgentOptions, step, state, outcom
 func launchAgentControlErrorCode(err error) (string, bool) {
 	var controlErr *launchAgentControlError
 	if errors.As(err, &controlErr) {
-		return controlErr.Code, controlErr.Code == "control_timeout"
+		return controlErr.Code, controlErr.Code == "control_timeout" || controlErr.Code == "bootout_observation_timeout"
 	}
 	return "control_failed", false
 }

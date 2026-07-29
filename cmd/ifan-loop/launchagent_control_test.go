@@ -12,13 +12,26 @@ import (
 )
 
 type scriptedLaunchAgentControl struct {
-	statuses []launchAgentObservation
-	calls    []string
+	statuses       []launchAgentObservation
+	statusErrors   []error
+	statusFallback *launchAgentObservation
+	bootoutErr     error
+	calls          []string
 }
 
 func (c *scriptedLaunchAgentControl) Status(context.Context, string) (launchAgentObservation, error) {
 	c.calls = append(c.calls, "status")
+	if len(c.statusErrors) > 0 {
+		err := c.statusErrors[0]
+		c.statusErrors = c.statusErrors[1:]
+		if err != nil {
+			return launchAgentObservation{State: "unknown"}, err
+		}
+	}
 	if len(c.statuses) == 0 {
+		if c.statusFallback != nil {
+			return *c.statusFallback, nil
+		}
 		return launchAgentObservation{State: "unknown"}, errors.New("missing scripted status")
 	}
 	status := c.statuses[0]
@@ -38,7 +51,7 @@ func (c *scriptedLaunchAgentControl) Kickstart(context.Context, string) error {
 
 func (c *scriptedLaunchAgentControl) Bootout(context.Context, string) error {
 	c.calls = append(c.calls, "bootout")
-	return nil
+	return c.bootoutErr
 }
 
 type recordingLaunchAgentRunner struct {
@@ -133,6 +146,195 @@ func TestLaunchAgentKickstartRestartsStoppedRunAtLoadService(t *testing.T) {
 	}
 	if strings.Join(fake.calls, ",") != "status,kickstart,status" {
 		t.Fatalf("calls=%v", fake.calls)
+	}
+}
+
+func TestLaunchAgentBootoutReconcilesDelayedAbsenceWithoutDuplicateControl(t *testing.T) {
+	root := resolvedTempDir(t)
+	config := filepath.Join(root, "controller.json")
+	binary := filepath.Join(root, "ifan-loop")
+	plist := filepath.Join(root, "worker.plist")
+	writeLaunchAgentFixture(t, binary, config, plist, true)
+	oldFactory := launchAgentControlFactory
+	defer func() { launchAgentControlFactory = oldFactory }()
+	fake := &scriptedLaunchAgentControl{statuses: []launchAgentObservation{
+		{State: "running"},
+		{State: "running"},
+		{State: "absent"},
+	}}
+	launchAgentControlFactory = func(time.Duration) launchAgentControl { return fake }
+	output, err := captureConfigOutput(func() error {
+		return launchAgentBootout([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
+	})
+	if err != nil || !strings.Contains(output, `"outcome": "stopped"`) || !strings.Contains(output, `"observed_state": "absent"`) {
+		t.Fatalf("output=%s err=%v calls=%v", output, err, fake.calls)
+	}
+	if strings.Join(fake.calls, ",") != "status,bootout,status,status" {
+		t.Fatalf("calls=%v", fake.calls)
+	}
+	fake.statuses = []launchAgentObservation{{State: "absent"}}
+	repeated, err := captureConfigOutput(func() error {
+		return launchAgentBootout([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
+	})
+	if err != nil || !strings.Contains(repeated, `"outcome": "already_stopped"`) {
+		t.Fatalf("repeated=%s err=%v calls=%v", repeated, err, fake.calls)
+	}
+	if strings.Join(fake.calls, ",") != "status,bootout,status,status,status" {
+		t.Fatalf("repeated calls=%v", fake.calls)
+	}
+}
+
+func TestLaunchAgentBootoutClassifiesRequestFailureWithoutRetry(t *testing.T) {
+	root := resolvedTempDir(t)
+	config := filepath.Join(root, "controller.json")
+	binary := filepath.Join(root, "ifan-loop")
+	plist := filepath.Join(root, "worker.plist")
+	writeLaunchAgentFixture(t, binary, config, plist, true)
+	oldFactory := launchAgentControlFactory
+	defer func() { launchAgentControlFactory = oldFactory }()
+	fake := &scriptedLaunchAgentControl{
+		statuses:   []launchAgentObservation{{State: "running"}},
+		bootoutErr: &launchAgentControlError{Code: "bootout_failed"},
+	}
+	launchAgentControlFactory = func(time.Duration) launchAgentControl { return fake }
+	output, err := captureConfigOutput(func() error {
+		return launchAgentBootout([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
+	})
+	var controlErr *launchAgentControlError
+	if !errors.As(err, &controlErr) || controlErr.Code != "bootout_failed" || !strings.Contains(output, `"reason": "bootout_failed"`) {
+		t.Fatalf("output=%s err=%v calls=%v", output, err, fake.calls)
+	}
+	if strings.Join(fake.calls, ",") != "status,bootout" {
+		t.Fatalf("calls=%v", fake.calls)
+	}
+}
+
+func TestLaunchAgentBootoutClassifiesObservationTimeoutWithoutRetry(t *testing.T) {
+	root := resolvedTempDir(t)
+	config := filepath.Join(root, "controller.json")
+	binary := filepath.Join(root, "ifan-loop")
+	plist := filepath.Join(root, "worker.plist")
+	writeLaunchAgentFixture(t, binary, config, plist, true)
+	oldFactory := launchAgentControlFactory
+	defer func() { launchAgentControlFactory = oldFactory }()
+	running := launchAgentObservation{State: "running"}
+	fake := &scriptedLaunchAgentControl{
+		statuses:       []launchAgentObservation{running},
+		statusFallback: &running,
+	}
+	launchAgentControlFactory = func(time.Duration) launchAgentControl { return fake }
+	output, err := captureConfigOutput(func() error {
+		return launchAgentBootout([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "25ms"})
+	})
+	var controlErr *launchAgentControlError
+	if !errors.As(err, &controlErr) || controlErr.Code != "bootout_observation_timeout" || !strings.Contains(output, `"reason": "bootout_observation_timeout"`) || !strings.Contains(output, `"timed_out": true`) {
+		t.Fatalf("output=%s err=%v calls=%v", output, err, fake.calls)
+	}
+	if strings.Join(fake.calls, ",") != "status,bootout,status" {
+		t.Fatalf("calls=%v", fake.calls)
+	}
+}
+
+func TestLaunchAgentBootoutAlreadyAbsentIsIdempotent(t *testing.T) {
+	root := resolvedTempDir(t)
+	config := filepath.Join(root, "controller.json")
+	binary := filepath.Join(root, "ifan-loop")
+	plist := filepath.Join(root, "worker.plist")
+	writeLaunchAgentFixture(t, binary, config, plist, true)
+	oldFactory := launchAgentControlFactory
+	defer func() { launchAgentControlFactory = oldFactory }()
+	fake := &scriptedLaunchAgentControl{statuses: []launchAgentObservation{{State: "absent"}, {State: "absent"}}}
+	launchAgentControlFactory = func(time.Duration) launchAgentControl { return fake }
+	for range 2 {
+		output, err := captureConfigOutput(func() error {
+			return launchAgentBootout([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
+		})
+		if err != nil || !strings.Contains(output, `"outcome": "already_stopped"`) || !strings.Contains(output, `"observed_state": "absent"`) {
+			t.Fatalf("output=%s err=%v calls=%v", output, err, fake.calls)
+		}
+	}
+	if strings.Join(fake.calls, ",") != "status,status" {
+		t.Fatalf("calls=%v", fake.calls)
+	}
+}
+
+func TestLaunchAgentUnknownObservationDoesNotDuplicateBootout(t *testing.T) {
+	root := resolvedTempDir(t)
+	config := filepath.Join(root, "controller.json")
+	binary := filepath.Join(root, "ifan-loop")
+	plist := filepath.Join(root, "worker.plist")
+	writeLaunchAgentFixture(t, binary, config, plist, true)
+	oldFactory := launchAgentControlFactory
+	defer func() { launchAgentControlFactory = oldFactory }()
+	fake := &scriptedLaunchAgentControl{
+		statuses:     []launchAgentObservation{{State: "running"}},
+		statusErrors: []error{nil, &launchAgentControlError{Code: "status_failed"}},
+	}
+	launchAgentControlFactory = func(time.Duration) launchAgentControl { return fake }
+	output, err := captureConfigOutput(func() error {
+		return launchAgentBootout([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
+	})
+	var controlErr *launchAgentControlError
+	if !errors.As(err, &controlErr) || controlErr.Code != "status_failed" || !strings.Contains(output, `"observed_state": "unknown"`) {
+		t.Fatalf("output=%s err=%v calls=%v", output, err, fake.calls)
+	}
+	if strings.Join(fake.calls, ",") != "status,bootout,status" {
+		t.Fatalf("calls=%v", fake.calls)
+	}
+}
+
+func TestLaunchAgentRepeatedStatusIsReadOnlyAndAbsentWins(t *testing.T) {
+	root := resolvedTempDir(t)
+	config := filepath.Join(root, "controller.json")
+	binary := filepath.Join(root, "ifan-loop")
+	plist := filepath.Join(root, "worker.plist")
+	writeLaunchAgentFixture(t, binary, config, plist, true)
+	oldFactory := launchAgentControlFactory
+	defer func() { launchAgentControlFactory = oldFactory }()
+	fake := &scriptedLaunchAgentControl{statuses: []launchAgentObservation{{State: "running"}, {State: "absent"}}}
+	launchAgentControlFactory = func(time.Duration) launchAgentControl { return fake }
+	if _, err := captureConfigOutput(func() error {
+		return launchAgentStatus([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	absent, err := captureConfigOutput(func() error {
+		return launchAgentStatus([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
+	})
+	if err != nil || !strings.Contains(absent, `"observed_state": "absent"`) || strings.Contains(absent, `"observed_state": "running"`) {
+		t.Fatalf("absent=%s err=%v calls=%v", absent, err, fake.calls)
+	}
+	if strings.Join(fake.calls, ",") != "status,status" {
+		t.Fatalf("calls=%v", fake.calls)
+	}
+}
+
+func TestLaunchAgentStatusDoesNotExposeRawLaunchctlOutput(t *testing.T) {
+	root := resolvedTempDir(t)
+	config := filepath.Join(root, "controller.json")
+	binary := filepath.Join(root, "ifan-loop")
+	plist := filepath.Join(root, "worker.plist")
+	writeLaunchAgentFixture(t, binary, config, plist, true)
+	oldFactory := launchAgentControlFactory
+	defer func() { launchAgentControlFactory = oldFactory }()
+	runner := &recordingLaunchAgentRunner{result: launchAgentCommandResult{
+		ExitCode: 0,
+		Stdout:   []byte("state = running\npid = 123\nforbidden-stdout-detail\n"),
+		Stderr:   []byte("forbidden-stderr-detail\n"),
+	}}
+	launchAgentControlFactory = func(timeout time.Duration) launchAgentControl {
+		return launchctlControl{runner: runner, timeout: timeout}
+	}
+	output, err := captureConfigOutput(func() error {
+		return launchAgentStatus([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
+	})
+	if err != nil || !strings.Contains(output, `"observed_state": "running"`) {
+		t.Fatalf("output=%s err=%v", output, err)
+	}
+	for _, forbidden := range []string{"forbidden-stdout-detail", "forbidden-stderr-detail", root} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("status output exposed %q: %s", forbidden, output)
+		}
 	}
 }
 
