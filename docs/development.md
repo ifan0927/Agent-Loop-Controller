@@ -115,7 +115,9 @@ It is part of the verification gate.
   "$WORKER_STDOUT_LOG" "$WORKER_STDERR_LOG"
 ```
 
-The scanner detects private-key blocks and common credential/header patterns.
+The scanner detects private-key blocks, authorization headers, Linear tokens,
+and all documented GitHub token prefixes. GitHub installation-token coverage
+accepts both opaque `ghs_` values and the stateless `ghs_APPID_JWT` format.
 It emits no matched bytes, lines, file names, or input paths. Exit status `1`
 reports only the fixed `prohibited_material_detected` reason code; scanner
 failures use a separate fixed reason code and exit status `2`. Credential-source

@@ -45,12 +45,37 @@ assert_detected_without_disclosure() {
   assert_absent "$case_root/stderr" "$forbidden" "$label stderr"
 }
 
+assert_binary_detected_without_disclosure() {
+  label=$1
+  payload=$2
+  forbidden=$3
+  case_number=$((case_number + 1))
+  case_root="$test_root/case-$case_number"
+  mkdir "$case_root"
+  printf '\000%s\000' "$payload" >"$case_root/evidence.db"
+
+  set +e
+  "$scanner" "$case_root/evidence.db" >"$case_root/stdout" 2>"$case_root/stderr"
+  status=$?
+  set -e
+
+  [ "$status" -eq 1 ] || fail "$label returned status $status instead of 1"
+  [ ! -s "$case_root/stdout" ] || fail "$label wrote to stdout"
+  [ "$(cat "$case_root/stderr")" = "$failure_code" ] || fail "$label returned non-sanitized stderr"
+  assert_absent "$case_root/stdout" "$forbidden" "$label stdout"
+  assert_absent "$case_root/stderr" "$forbidden" "$label stderr"
+}
+
 classic_suffix='0123456789abcdefghijklmnopqrstuvwxyz'
 fine_grained_suffix='0123456789_abcdefghijklmnopqrstuvwxyz'
 linear_suffix='0123456789-abcdefghijklmnopqrstuvwxyz'
 header_secret='header-secret-0123456789'
 private_key_marker="-----BE""GIN PRIVATE KEY-----"
 rsa_private_key_marker="-----BE""GIN RSA PRIVATE KEY-----"
+jwt_header='eyJhbGciOiJSUzI1NiJ9'
+jwt_payload='eyJpc3MiOiIxMjM0NTY3ODkwIn0'
+jwt_signature='fake-signature-0123456789_'
+stateless_installation_suffix="1234567890_${jwt_header}.${jwt_payload}.${jwt_signature}"
 
 assert_detected_without_disclosure "private key" "$private_key_marker" "PRIVATE KEY"
 assert_detected_without_disclosure "RSA private key" "$rsa_private_key_marker" "RSA PRIVATE KEY"
@@ -61,8 +86,11 @@ assert_detected_without_disclosure "GitHub ghp token" "ghp_$classic_suffix" "$cl
 assert_detected_without_disclosure "GitHub gho token" "gho_$classic_suffix" "$classic_suffix"
 assert_detected_without_disclosure "GitHub ghu token" "ghu_$classic_suffix" "$classic_suffix"
 assert_detected_without_disclosure "GitHub ghs token" "ghs_$classic_suffix" "$classic_suffix"
+assert_detected_without_disclosure "GitHub ghr token" "ghr_$classic_suffix" "$classic_suffix"
+assert_detected_without_disclosure "GitHub stateless ghs token" "ghs_$stateless_installation_suffix" "$stateless_installation_suffix"
 assert_detected_without_disclosure "GitHub fine-grained token" "github_pat_$fine_grained_suffix" "$fine_grained_suffix"
 assert_detected_without_disclosure "Linear token" "lin_api_$linear_suffix" "$linear_suffix"
+assert_binary_detected_without_disclosure "binary Linear token" "lin_api_$linear_suffix" "$linear_suffix"
 
 clean_root="$test_root/clean"
 mkdir "$clean_root"

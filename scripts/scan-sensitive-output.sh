@@ -9,7 +9,8 @@ set +e
 rg --quiet --pcre2 --hidden --no-messages --glob '!.git/**' --glob '!vendor/**' --glob '!.idea/**' --glob '!**/*_test.go' \
   -e '-----BEGIN(?: [A-Z]+)? PRIVATE KEY-----' \
   -e '(?i)authorization:[[:space:]]*(?:bearer|token|basic)[[:space:]]+[A-Za-z0-9._~+/-]+' \
-  -e '\bgh[pous]_[A-Za-z0-9]{20,}\b' \
+  -e '\bgh[pour]_[A-Za-z0-9_]{20,}\b' \
+  -e '\bghs_[A-Za-z0-9._-]{36,}' \
   -e '\bgithub_pat_[A-Za-z0-9_]{20,}\b' \
   -e '\blin_api_[A-Za-z0-9_-]{20,}\b' \
   -- "$@" >/dev/null 2>&1
