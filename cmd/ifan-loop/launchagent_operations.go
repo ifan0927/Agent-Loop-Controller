@@ -271,7 +271,14 @@ func launchAgentBootstrap(args []string) error {
 	if err != nil {
 		return writeLaunchAgentControlResult(launchAgentPlistErrorResult(options, "bootstrap", err), err)
 	}
+	if launchAgentPathExists(launchDaemonPlistPath()) {
+		err := &launchAgentControlError{Code: "launchdaemon_conflict"}
+		return writeLaunchAgentControlResult(launchAgentControlErrorResult(options, "bootstrap", "unknown", inspection.RunAtLoad, err, "status"), err)
+	}
 	control := launchAgentControlFactory(options.timeout)
+	if err := verifyNoLaunchDaemonService(ctx, control); err != nil {
+		return writeLaunchAgentControlResult(launchAgentControlErrorResult(options, "bootstrap", "unknown", inspection.RunAtLoad, err, "status"), err)
+	}
 	target := launchAgentTarget(options)
 	observed, err := control.Status(ctx, target)
 	if err != nil {
@@ -310,6 +317,9 @@ func launchAgentKickstart(args []string) error {
 		return writeLaunchAgentControlResult(launchAgentPlistErrorResult(options, "kickstart", err), err)
 	}
 	control := launchAgentControlFactory(options.timeout)
+	if err := verifyNoLaunchDaemonService(ctx, control); err != nil {
+		return writeLaunchAgentControlResult(launchAgentControlErrorResult(options, "kickstart", "unknown", inspection.RunAtLoad, err, "status"), err)
+	}
 	target := launchAgentTarget(options)
 	observed, err := control.Status(ctx, target)
 	if err != nil {
@@ -371,6 +381,16 @@ func launchAgentStatus(args []string) error {
 		}
 	}
 	result := launchAgentControlResultFor(options, "status", observed.State, outcome, next, "", runAtLoad, false)
+	daemon, daemonErr := control.Status(ctx, "system/"+launchAgentLabel)
+	if daemonErr != nil {
+		result.Outcome = "attention_required"
+		result.NextSafeAction = "status"
+		result.Reason = "launchdaemon_state_unverified"
+	} else if launchAgentPathExists(launchDaemonPlistPath()) || daemon.State != "absent" {
+		result.Outcome = "attention_required"
+		result.NextSafeAction = "bootout_launchdaemon"
+		result.Reason = "launchdaemon_conflict"
+	}
 	if observed.State == "running" {
 		result.WorkerStatus = workerStatusRunning
 		started, identityErr := processStartIdentity(observed.ProcessID)
@@ -381,6 +401,20 @@ func launchAgentStatus(args []string) error {
 		}
 	}
 	return writeLaunchAgentControlResult(result, nil)
+}
+
+func verifyNoLaunchDaemonService(ctx context.Context, control launchAgentControl) error {
+	if launchAgentPathExists(launchDaemonPlistPath()) {
+		return &launchAgentControlError{Code: "launchdaemon_conflict"}
+	}
+	observed, err := control.Status(ctx, "system/"+launchAgentLabel)
+	if err != nil {
+		return &launchAgentControlError{Code: "launchdaemon_state_unverified"}
+	}
+	if observed.State != "absent" {
+		return &launchAgentControlError{Code: "launchdaemon_conflict"}
+	}
+	return nil
 }
 
 func launchAgentBootout(args []string) error {

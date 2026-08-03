@@ -55,12 +55,18 @@ func (c *scriptedLaunchAgentControl) Bootout(context.Context, string) error {
 }
 
 type recordingLaunchAgentRunner struct {
-	calls  [][]string
-	result launchAgentCommandResult
+	calls   [][]string
+	result  launchAgentCommandResult
+	results []launchAgentCommandResult
 }
 
 func (r *recordingLaunchAgentRunner) Run(_ context.Context, args []string) (launchAgentCommandResult, error) {
 	r.calls = append(r.calls, append([]string(nil), args...))
+	if len(r.results) > 0 {
+		result := r.results[0]
+		r.results = r.results[1:]
+		return result, nil
+	}
 	return r.result, nil
 }
 
@@ -107,6 +113,15 @@ func TestLaunchctlControlTimeoutIsFiniteAndSanitized(t *testing.T) {
 	}
 }
 
+func TestLaunchctlControlTreatsMissingGUIDomainAsAbsent(t *testing.T) {
+	runner := &recordingLaunchAgentRunner{result: launchAgentCommandResult{ExitCode: 125, Stderr: []byte("Could not print domain: 125: Domain does not support specified action\n")}}
+	control := launchctlControl{runner: runner, timeout: time.Second}
+	status, err := control.Status(context.Background(), "gui/501/"+launchAgentLabel)
+	if err != nil || status.State != "absent" {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+}
+
 func TestLaunchAgentBootstrapReusesLoadedServiceAndVerifiesAfterBootstrap(t *testing.T) {
 	root := resolvedTempDir(t)
 	config := filepath.Join(root, "controller.json")
@@ -115,7 +130,7 @@ func TestLaunchAgentBootstrapReusesLoadedServiceAndVerifiesAfterBootstrap(t *tes
 	writeLaunchAgentFixture(t, binary, config, plist, true)
 	oldFactory := launchAgentControlFactory
 	defer func() { launchAgentControlFactory = oldFactory }()
-	fake := &scriptedLaunchAgentControl{statuses: []launchAgentObservation{{State: "absent"}, {State: "running"}}}
+	fake := &scriptedLaunchAgentControl{statuses: []launchAgentObservation{{State: "absent"}, {State: "absent"}, {State: "running"}}}
 	launchAgentControlFactory = func(time.Duration) launchAgentControl { return fake }
 	output, err := captureConfigOutput(func() error {
 		return launchAgentBootstrap([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
@@ -123,8 +138,37 @@ func TestLaunchAgentBootstrapReusesLoadedServiceAndVerifiesAfterBootstrap(t *tes
 	if err != nil || !strings.Contains(output, `"outcome": "bootstrapped"`) || !strings.Contains(output, `"observed_state": "running"`) {
 		t.Fatalf("output=%s err=%v calls=%v", output, err, fake.calls)
 	}
-	if strings.Join(fake.calls, ",") != "status,bootstrap,status" {
+	if strings.Join(fake.calls, ",") != "status,status,bootstrap,status" {
 		t.Fatalf("calls=%v", fake.calls)
+	}
+}
+
+func TestLaunchAgentBootstrapRejectsInstalledLaunchDaemon(t *testing.T) {
+	root := resolvedTempDir(t)
+	config := filepath.Join(root, "controller.json")
+	binary := filepath.Join(root, "ifan-loop")
+	plist := filepath.Join(root, "worker.plist")
+	writeLaunchAgentFixture(t, binary, config, plist, true)
+	originalDirectory := launchDaemonDirectory
+	originalFactory := launchAgentControlFactory
+	t.Cleanup(func() {
+		launchDaemonDirectory = originalDirectory
+		launchAgentControlFactory = originalFactory
+	})
+	launchDaemonDirectory = filepath.Join(root, "LaunchDaemons")
+	if err := os.MkdirAll(launchDaemonDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(launchDaemonPlistPath(), []byte("reserved"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fake := &scriptedLaunchAgentControl{}
+	launchAgentControlFactory = func(time.Duration) launchAgentControl { return fake }
+	output, err := captureConfigOutput(func() error {
+		return launchAgentBootstrap([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
+	})
+	if err == nil || !strings.Contains(output, `"reason": "launchdaemon_conflict"`) || len(fake.calls) != 0 {
+		t.Fatalf("output=%s err=%v calls=%v", output, err, fake.calls)
 	}
 }
 
@@ -136,7 +180,7 @@ func TestLaunchAgentKickstartRestartsStoppedRunAtLoadService(t *testing.T) {
 	writeLaunchAgentFixture(t, binary, config, plist, true)
 	oldFactory := launchAgentControlFactory
 	defer func() { launchAgentControlFactory = oldFactory }()
-	fake := &scriptedLaunchAgentControl{statuses: []launchAgentObservation{{State: "stopped"}, {State: "running"}}}
+	fake := &scriptedLaunchAgentControl{statuses: []launchAgentObservation{{State: "absent"}, {State: "stopped"}, {State: "running"}}}
 	launchAgentControlFactory = func(time.Duration) launchAgentControl { return fake }
 	output, err := captureConfigOutput(func() error {
 		return launchAgentKickstart([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
@@ -144,8 +188,26 @@ func TestLaunchAgentKickstartRestartsStoppedRunAtLoadService(t *testing.T) {
 	if err != nil || !strings.Contains(output, `"outcome": "kickstarted"`) {
 		t.Fatalf("output=%s err=%v calls=%v", output, err, fake.calls)
 	}
-	if strings.Join(fake.calls, ",") != "status,kickstart,status" {
+	if strings.Join(fake.calls, ",") != "status,status,kickstart,status" {
 		t.Fatalf("calls=%v", fake.calls)
+	}
+}
+
+func TestLaunchAgentKickstartRejectsLoadedLaunchDaemon(t *testing.T) {
+	root := resolvedTempDir(t)
+	config := filepath.Join(root, "controller.json")
+	binary := filepath.Join(root, "ifan-loop")
+	plist := filepath.Join(root, "worker.plist")
+	writeLaunchAgentFixture(t, binary, config, plist, true)
+	originalFactory := launchAgentControlFactory
+	t.Cleanup(func() { launchAgentControlFactory = originalFactory })
+	fake := &scriptedLaunchAgentControl{statuses: []launchAgentObservation{{State: "running"}}}
+	launchAgentControlFactory = func(time.Duration) launchAgentControl { return fake }
+	output, err := captureConfigOutput(func() error {
+		return launchAgentKickstart([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
+	})
+	if err == nil || !strings.Contains(output, `"reason": "launchdaemon_conflict"`) || strings.Contains(strings.Join(fake.calls, ","), "kickstart") {
+		t.Fatalf("output=%s err=%v calls=%v", output, err, fake.calls)
 	}
 }
 
@@ -291,7 +353,7 @@ func TestLaunchAgentRepeatedStatusIsReadOnlyAndAbsentWins(t *testing.T) {
 	writeLaunchAgentFixture(t, binary, config, plist, true)
 	oldFactory := launchAgentControlFactory
 	defer func() { launchAgentControlFactory = oldFactory }()
-	fake := &scriptedLaunchAgentControl{statuses: []launchAgentObservation{{State: "running"}, {State: "absent"}}}
+	fake := &scriptedLaunchAgentControl{statuses: []launchAgentObservation{{State: "running"}, {State: "absent"}, {State: "absent"}, {State: "absent"}}}
 	launchAgentControlFactory = func(time.Duration) launchAgentControl { return fake }
 	if _, err := captureConfigOutput(func() error {
 		return launchAgentStatus([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
@@ -304,7 +366,7 @@ func TestLaunchAgentRepeatedStatusIsReadOnlyAndAbsentWins(t *testing.T) {
 	if err != nil || !strings.Contains(absent, `"observed_state": "absent"`) || strings.Contains(absent, `"observed_state": "running"`) {
 		t.Fatalf("absent=%s err=%v calls=%v", absent, err, fake.calls)
 	}
-	if strings.Join(fake.calls, ",") != "status,status" {
+	if strings.Join(fake.calls, ",") != "status,status,status,status" {
 		t.Fatalf("calls=%v", fake.calls)
 	}
 }
@@ -317,10 +379,9 @@ func TestLaunchAgentStatusDoesNotExposeRawLaunchctlOutput(t *testing.T) {
 	writeLaunchAgentFixture(t, binary, config, plist, true)
 	oldFactory := launchAgentControlFactory
 	defer func() { launchAgentControlFactory = oldFactory }()
-	runner := &recordingLaunchAgentRunner{result: launchAgentCommandResult{
-		ExitCode: 0,
-		Stdout:   []byte("state = running\npid = 123\nforbidden-stdout-detail\n"),
-		Stderr:   []byte("forbidden-stderr-detail\n"),
+	runner := &recordingLaunchAgentRunner{results: []launchAgentCommandResult{
+		{ExitCode: 0, Stdout: []byte("state = running\npid = 123\nforbidden-stdout-detail\n"), Stderr: []byte("forbidden-stderr-detail\n")},
+		{ExitCode: 113, Stderr: []byte("Could not find service")},
 	}}
 	launchAgentControlFactory = func(timeout time.Duration) launchAgentControl {
 		return launchctlControl{runner: runner, timeout: timeout}
@@ -354,7 +415,7 @@ func TestLaunchAgentStatusProjectsLiveSanitizedWorkerSnapshot(t *testing.T) {
 	}
 	oldFactory := launchAgentControlFactory
 	defer func() { launchAgentControlFactory = oldFactory }()
-	fake := &scriptedLaunchAgentControl{statuses: []launchAgentObservation{{State: "running", ProcessID: os.Getpid()}}}
+	fake := &scriptedLaunchAgentControl{statuses: []launchAgentObservation{{State: "running", ProcessID: os.Getpid()}, {State: "absent"}}}
 	launchAgentControlFactory = func(time.Duration) launchAgentControl { return fake }
 	output, err := captureConfigOutput(func() error {
 		return launchAgentStatus([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
@@ -366,7 +427,7 @@ func TestLaunchAgentStatusProjectsLiveSanitizedWorkerSnapshot(t *testing.T) {
 	if err := reporter.Observe(admissionWorkerResult{Status: workerStatusParked, PreviousStatus: workerStatusDriving, Cycles: 2}); err != nil {
 		t.Fatal(err)
 	}
-	fake.statuses = []launchAgentObservation{{State: "running", ProcessID: os.Getpid()}}
+	fake.statuses = []launchAgentObservation{{State: "running", ProcessID: os.Getpid()}, {State: "absent"}}
 	stale, err := captureConfigOutput(func() error {
 		return launchAgentStatus([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
 	})

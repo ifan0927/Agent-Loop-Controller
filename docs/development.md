@@ -3,7 +3,7 @@
 ## Repository Layout
 
 ```text
-cmd/ifan-loop/          CLI, composition root, worker, LaunchAgent, fixtures
+cmd/ifan-loop/          CLI, composition root, worker, launchd supervisors, fixtures
 contracts/              embedded implementation/review JSON schemas
 internal/domain/        pure contracts, state topology, evidence validation
 internal/application/   use cases, orchestration, policy, and ports
@@ -98,6 +98,17 @@ Important integration boundaries include:
 - trusted review feedback identity/lifecycle/reply idempotency;
 - source sync and partial ownership-safe cleanup;
 - CLI restart using a second process and the same SQLite database.
+- process-lifetime worker exclusion before scheduler runtime construction;
+- exact LaunchAgent/LaunchDaemon plist, identity, privilege, and conflicting-
+  supervisor behavior.
+
+LaunchDaemon unit tests inject user/root identities and launchctl observations;
+they never require root or mutate `/Library/LaunchDaemons`. Real headless
+acceptance is an external E2E gate: authenticate a FileVault restart, reconnect
+without a GUI login, prove one non-root worker and the sole scheduler-lease
+namespace, then exercise the documented rollback. Keep every Linear fixture in
+Triage until that supervisor recovery is proven; moving the unique fixture to
+the intended cycle and Todo is a separate human admission action.
 
 ## Deterministic Fixtures
 

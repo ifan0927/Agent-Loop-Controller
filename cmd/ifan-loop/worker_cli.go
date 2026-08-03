@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/google/uuid"
@@ -48,6 +49,7 @@ type automaticWorkerRuntime struct {
 var buildAutomaticWorkerRuntime = newAutomaticWorkerRuntime
 var emitAutomaticWorkerOutput = func(output workerOutput) error { return printJSON(output) }
 var observeAutomaticWorkerStoreClosed = func() {}
+var workerEffectiveUID = os.Geteuid
 
 func (d automaticWorkerDriver) Drive(ctx context.Context, command application.ProductionDriveCommand) (application.ProductionDriveResult, error) {
 	return driveProductionRun(ctx, d.loaded, d.store, command.Requester, command.RunID, d.policy)
@@ -63,11 +65,8 @@ func controllerWorker(args []string) error {
 	if flags.NArg() != 0 {
 		return errors.New("controller worker does not accept positional arguments")
 	}
-	if err := boundWorkerLogStream(os.Stdout, workerLogStartupLimit); err != nil {
-		return errors.New("automatic admission stdout log is unsafe")
-	}
-	if err := boundWorkerLogStream(os.Stderr, workerLogStartupLimit); err != nil {
-		return errors.New("automatic admission stderr log is unsafe")
+	if workerEffectiveUID() == 0 {
+		return errors.New("automatic admission worker must not run as root")
 	}
 	path, err := resolveConfigPath(*configPath)
 	if err != nil {
@@ -83,6 +82,17 @@ func controllerWorker(args []string) error {
 	if !configured.Enabled {
 		output.Disabled, output.Stopped, output.PreviousStatus, output.Status = true, "disabled", workerStatusRunning, workerStatusStopping
 		return emitAutomaticWorkerOutput(output)
+	}
+	workerLock, err := acquireWorkerProcessLock(filepath.Dir(loaded.Controller.DatabasePath))
+	if err != nil {
+		return err
+	}
+	defer workerLock.Close()
+	if err := boundWorkerLogStream(os.Stdout, workerLogStartupLimit); err != nil {
+		return errors.New("automatic admission stdout log is unsafe")
+	}
+	if err := boundWorkerLogStream(os.Stderr, workerLogStartupLimit); err != nil {
+		return errors.New("automatic admission stderr log is unsafe")
 	}
 	runtime, err := buildAutomaticWorkerRuntime(loaded, instanceID)
 	if err != nil {
@@ -115,6 +125,62 @@ func controllerWorker(args []string) error {
 	}
 	storeOpen = false
 	return emitAutomaticWorkerOutput(output)
+}
+
+type workerProcessLock struct {
+	file *os.File
+}
+
+func acquireWorkerProcessLock(directory string) (*workerProcessLock, error) {
+	if !validLaunchAgentPath(directory) {
+		return nil, errors.New("automatic admission worker lock directory is unsafe")
+	}
+	info, err := os.Lstat(directory)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o022 != 0 || !ownedByCurrentUser(info) {
+		return nil, errors.New("automatic admission worker lock directory is unsafe")
+	}
+	path := filepath.Join(directory, "worker.lock")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, errors.New("automatic admission worker lock is unavailable")
+	}
+	locked := false
+	defer func() {
+		if !locked {
+			_ = file.Close()
+		}
+	}()
+	lockInfo, err := file.Stat()
+	stat, ok := lockInfoSys(lockInfo)
+	if err != nil || !ok || !lockInfo.Mode().IsRegular() || lockInfo.Mode().Perm() != 0o600 || !ownedByCurrentUser(lockInfo) || stat.Nlink != 1 {
+		return nil, errors.New("automatic admission worker lock is unsafe")
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return nil, errors.New("automatic admission worker is already running")
+	}
+	locked = true
+	return &workerProcessLock{file: file}, nil
+}
+
+func lockInfoSys(info os.FileInfo) (*syscall.Stat_t, bool) {
+	if info == nil {
+		return nil, false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return stat, ok
+}
+
+func (l *workerProcessLock) Close() error {
+	if l == nil || l.file == nil {
+		return nil
+	}
+	unlockErr := syscall.Flock(int(l.file.Fd()), syscall.LOCK_UN)
+	closeErr := l.file.Close()
+	l.file = nil
+	if unlockErr != nil {
+		return unlockErr
+	}
+	return closeErr
 }
 
 func newAutomaticWorkerRuntime(loaded bootstrap.Bootstrap, instanceID string) (automaticWorkerRuntime, error) {

@@ -17,7 +17,7 @@ func TestOfflineAcceptanceLaunchAgentControlReportsOneSanitizedServiceOutcome(t 
 
 	oldFactory := launchAgentControlFactory
 	defer func() { launchAgentControlFactory = oldFactory }()
-	fake := &scriptedLaunchAgentControl{statuses: []launchAgentObservation{{State: "absent"}, {State: "unknown"}}}
+	fake := &scriptedLaunchAgentControl{statuses: []launchAgentObservation{{State: "absent"}, {State: "absent"}, {State: "unknown"}}}
 	launchAgentControlFactory = func(time.Duration) launchAgentControl { return fake }
 	output, err := captureConfigOutput(func() error {
 		return launchAgentBootstrap([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
@@ -32,7 +32,7 @@ func TestOfflineAcceptanceLaunchAgentControlReportsOneSanitizedServiceOutcome(t 
 	if result.Outcome != "attention_required" || result.Reason != "bootstrap_not_observed" || result.ObservedState != "unknown" {
 		t.Fatalf("result=%+v output=%s err=%v", result, output, err)
 	}
-	if strings.Count(output, `"outcome"`) != 1 || strings.Join(fake.calls, ",") != "status,bootstrap,status" {
+	if strings.Count(output, `"outcome"`) != 1 || strings.Join(fake.calls, ",") != "status,status,bootstrap,status" {
 		t.Fatalf("output=%s calls=%v", output, fake.calls)
 	}
 	for _, forbidden := range []string{root, binary, config, plist, "secret://", "Authorization", "stderr"} {

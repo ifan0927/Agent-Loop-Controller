@@ -192,6 +192,9 @@ func launchAgentReasons(options launchAgentOptions, installValidation bool) []st
 	} else if !safeLogLeaf(filepath.Join(filepath.Dir(options.config), launchAgentLogDirectory, launchAgentStdoutLogName)) || !safeLogLeaf(filepath.Join(filepath.Dir(options.config), launchAgentLogDirectory, launchAgentStderrLogName)) {
 		reasons = append(reasons, "log_file_unsafe")
 	}
+	if launchAgentPathExists(launchDaemonPlistPath()) {
+		reasons = append(reasons, "launchdaemon_conflict")
+	}
 	if installValidation && launchAgentPathExists(options.plist) {
 		reasons = append(reasons, "plist_exists")
 	}

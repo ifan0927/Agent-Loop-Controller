@@ -196,7 +196,7 @@ func launchctlReportsAbsent(result launchAgentCommandResult) bool {
 		return true
 	}
 	output := strings.ToLower(string(append(append([]byte(nil), result.Stdout...), result.Stderr...)))
-	for _, marker := range []string{"could not find service", "service not found", "no such process", "unknown service"} {
+	for _, marker := range []string{"could not find service", "service not found", "no such process", "unknown service", "domain does not support specified action"} {
 		if strings.Contains(output, marker) {
 			return true
 		}

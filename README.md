@@ -76,8 +76,9 @@ the state machine.
   exhausted typed retries, interrupted delivery, graceful parked-run
   abandonment with proven managed-child termination, residue attention, and
   verified external merges.
-- macOS LaunchAgent tooling for building, installing, validating, starting,
-  observing, and stopping one local worker.
+- macOS LaunchAgent and headless system LaunchDaemon tooling for building,
+  installing, validating, starting, observing, and stopping exactly one local
+  non-root worker.
 
 ## Safety and Trust Model
 
@@ -122,7 +123,8 @@ GitHub write capability.
 
 For the supported automatic path, validate configuration and credentials,
 enable the bounded Linear Todo admission policy, then run
-`ifan-loop controller worker` directly or under the provided LaunchAgent.
+`ifan-loop controller worker` directly, under the per-login LaunchAgent, or
+under the system LaunchDaemon for pre-login headless recovery.
 The normal worker runs until SIGINT/SIGTERM rather than expiring on a global
 timer; durable recovery and operation-specific timeouts remain authoritative.
 Observe a run with `controller status` or `controller inspect`. If the run stops

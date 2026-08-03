@@ -27,9 +27,10 @@ go build -o ./bin/ifan-loop ./cmd/ifan-loop
 ./bin/ifan-loop version
 ```
 
-For LaunchAgent use, install a current-user-owned, non-symlink executable
-outside any repository checkout. It must have an execute bit and no group/world
-write bit. Example:
+For LaunchAgent supervision, install a worker-owned non-symlink executable
+outside any repository checkout. LaunchDaemon supervision also accepts a
+root-owned executable. In both cases it must have an execute bit and no
+group/world write bit. Example:
 
 ```sh
 mkdir -p "$HOME/.local/bin"
@@ -38,7 +39,7 @@ chmod 755 "$HOME/.local/bin/ifan-loop"
 ```
 
 Stop the worker before replacing the installed binary. Re-run configuration and
-LaunchAgent checks after every upgrade.
+launchd supervisor checks after every upgrade.
 
 ## 3. Filesystem Layout
 
@@ -50,7 +51,7 @@ The default macOS controller root is:
   controller.db         authoritative workflow state and evidence
   secrets/              private directory, mode 0700
     linear-token        regular single-link file, mode 0600
-  logs/                 private LaunchAgent logs, mode 0700
+  logs/                 private launchd worker logs, mode 0700
     worker.stdout.log   mode 0600
     worker.stderr.log   mode 0600
 ```
@@ -179,7 +180,7 @@ the worker in the foreground:
 ifan-loop controller worker
 ```
 
-or install and supervise it with the LaunchAgent commands in section 8. The
+or install and supervise it with the launchd commands in section 8. The
 worker receives no issue identifier. It resumes a nonterminal run before
 scanning for a new Todo.
 
@@ -504,7 +505,8 @@ Run automatic Linear Todo admission and the production driver.
 
 **When to use**
 
-For normal automatic operation, directly or under LaunchAgent supervision.
+For normal automatic operation, run directly or under one supported launchd
+supervisor.
 
 **Syntax**
 
@@ -549,7 +551,7 @@ includes `previous_status`. The worker atomically replaces the private
 `<controller-config>.worker-status.json` snapshot on each transition rather
 than appending cadence logs. `controller launchagent status` projects its
 `worker_status`, `worker_previous_status`, and observation timestamp while the
-LaunchAgent process is observed running and its launchctl PID matches the
+supervisor process is observed running and its launchctl PID matches the
 snapshot PID and OS process-start identity. A missing or stale snapshot falls
 back to launchd's sanitized `running` observation rather than projecting the
 previous worker instance, including after PID reuse.
@@ -565,12 +567,12 @@ durable outcomes observed by the continuing worker, not process expiry.
 Never pass an issue identifier. SIGINT/SIGTERM cancels the active driver and its
 children, stops lease renewal, performs bounded lease cleanup, closes SQLite,
 and emits a sanitized `stopped: canceled` result. It does not rewrite the run
-as failed or abandoned. An unexpected failure exits nonzero so LaunchAgent can
+as failed or abandoned. An unexpected failure exits nonzero so launchd can
 restart and resume from persisted state without duplicate admission.
 
 **Related commands**
 
-`controller status`, `controller inspect`, `controller drive`, LaunchAgent
+`controller status`, `controller inspect`, `controller drive`, launchd
 commands.
 
 ### `controller run`
@@ -1571,7 +1573,7 @@ fixture/development interfaces. Their inputs, safety boundary, and current
 scripts are documented in [Development](development.md). They are not supported
 production workflow steps.
 
-## 8. Automatic Worker and LaunchAgent
+## 8. Automatic Worker and launchd Supervision
 
 The embedded LaunchAgent runs exactly:
 
@@ -1997,6 +1999,92 @@ not another automatic control operation.
 
 `status`, `bootstrap`, `controller drive`.
 
+### Headless system LaunchDaemon
+
+Use `controller launchdaemon` when the Mac must restore the worker after boot
+without a graphical login. It supports the same
+`build|render|install|doctor|validate|plist-validate|bootstrap|kickstart|status|bootout`
+operations as the LaunchAgent surface, but the domain is fixed to `system`.
+There is no `--domain` flag and `user/<uid>` is never accepted.
+
+All LaunchDaemon commands share:
+
+```text
+--binary <absolute-installed-binary>   default /usr/local/bin/ifan-loop
+--config <absolute-controller.json>    default below the worker user's home
+--plist <absolute-plist>               default /Library/LaunchDaemons/com.ifan.agent-loop-controller.worker.plist
+--user <account>                       worker account; required under root
+--working-directory <absolute-dir>     default worker user's home
+--timeout <duration>                   default 15s, maximum 2m
+```
+
+The exact plist is root-owned mode `0600`, loaded into `system`, and pins the
+non-root `UserName`, absolute `WorkingDirectory`, and non-secret `HOME`. It
+contains no token, authorization header, credential reference, shell, issue, or
+branch. `doctor` runs as the worker user and verifies the executable,
+configuration, database/log parents, Codex auth file, GitHub App private keys,
+and file-backed Linear credential. Environment-backed Linear credentials are
+not supported for a pre-login LaunchDaemon. `install`, `bootstrap`, `kickstart`,
+and `bootout` require root; the worker itself refuses effective UID 0.
+
+#### Migrate from LaunchAgent
+
+Set exact paths first and retain the `.rollback` file until the reboot and
+rollback gates have both passed:
+
+```sh
+BIN="$HOME/.local/bin/ifan-loop"
+CONFIG="$HOME/Library/Application Support/agent-loop-controller/controller.json"
+WORKER_USER="$(id -un)"
+AGENT_PLIST="$HOME/Library/LaunchAgents/com.ifan.agent-loop-controller.worker.plist"
+DAEMON_PLIST="/Library/LaunchDaemons/com.ifan.agent-loop-controller.worker.plist"
+
+"$BIN" controller launchagent bootout --binary "$BIN" --config "$CONFIG" --plist "$AGENT_PLIST"
+"$BIN" controller launchagent status --binary "$BIN" --config "$CONFIG" --plist "$AGENT_PLIST"
+mv "$AGENT_PLIST" "$AGENT_PLIST.rollback"
+
+"$BIN" controller launchdaemon doctor --binary "$BIN" --config "$CONFIG" --user "$WORKER_USER"
+"$BIN" controller launchdaemon validate --binary "$BIN" --config "$CONFIG" --user "$WORKER_USER"
+"$BIN" controller launchdaemon render --binary "$BIN" --config "$CONFIG" --user "$WORKER_USER" | plutil -lint -
+sudo "$BIN" controller launchdaemon install --binary "$BIN" --config "$CONFIG" --user "$WORKER_USER"
+sudo "$BIN" controller launchdaemon plist-validate --binary "$BIN" --config "$CONFIG" --user "$WORKER_USER"
+sudo "$BIN" controller launchdaemon bootstrap --binary "$BIN" --config "$CONFIG" --user "$WORKER_USER"
+"$BIN" controller launchdaemon status --binary "$BIN" --config "$CONFIG" --user "$WORKER_USER"
+```
+
+Stop if either status is unknown, if the old service is not absent, if the
+opposite plist still has its `.plist` name, or if any finite reason code is
+reported. Bootstrap checks both installed and loaded opposite-supervisor state;
+the process-lifetime worker lock remains a final fence against an accidental
+second process before scheduler runtime construction.
+
+For the headless gate, use an authenticated `fdesetup authrestart`, reconnect by
+SSH without logging into the desktop, and prove the system service PID belongs
+to `WORKER_USER`. Confirm exactly one worker process, the sole
+`linear_todo_admission` scheduler-lease namespace, and no admitted fixture while
+the fixture remains in Triage. Cycle assignment and the move to Todo are later
+human admission actions, not part of supervisor recovery.
+
+#### Roll back to LaunchAgent
+
+Rollback first removes system supervision, verifies absence, preserves the
+daemon plist under a non-`.plist` name, and only then restores the LaunchAgent:
+
+```sh
+sudo "$BIN" controller launchdaemon bootout --binary "$BIN" --config "$CONFIG" --user "$WORKER_USER"
+"$BIN" controller launchdaemon status --binary "$BIN" --config "$CONFIG" --user "$WORKER_USER"
+sudo mv "$DAEMON_PLIST" "$DAEMON_PLIST.rollback"
+mv "$AGENT_PLIST.rollback" "$AGENT_PLIST"
+"$BIN" controller launchagent plist-validate --binary "$BIN" --config "$CONFIG" --plist "$AGENT_PLIST"
+"$BIN" controller launchagent bootstrap --binary "$BIN" --config "$CONFIG" --plist "$AGENT_PLIST"
+"$BIN" controller launchagent status --binary "$BIN" --config "$CONFIG" --plist "$AGENT_PLIST"
+```
+
+The final bootstrap requires an existing `gui/<uid>` domain. If rollback is
+prepared over headless SSH, stop after restoring and validating the LaunchAgent
+plist, then bootstrap after the next graphical login. Never rename the opposite
+backup to `.plist` while the current service is loaded.
+
 ## 9. Human Decision Workflow
 
 1. Inspect `awaiting_human_decision` and locate the exact decision request and
@@ -2103,7 +2191,7 @@ output, and schemas live in private per-attempt artifact directories. SQLite
 stores private paths plus hashes/sizes and the sanitized evidence needed for
 authorization and inspection.
 
-LaunchAgent logs contain controller-sanitized stdout/stderr but remain private.
+Worker logs contain controller-sanitized stdout/stderr but remain private.
 At every worker start, each current-user-owned, single-link mode-`0600` regular
 stdout/stderr leaf is truncated when it has reached 8 MiB. Unsafe regular log
 streams fail closed. The healthy worker emits no per-cycle log line, so an
@@ -2135,7 +2223,7 @@ artifacts into GitHub/Linear comments.
    commit the backup.
 3. Build/install the new binary outside the repository.
 4. Run `version`, `config validate`, `config inspect`, `config doctor`, and
-   LaunchAgent doctor/validation.
+   selected supervisor doctor/validation.
 5. Let the application open the database and apply ordered migrations. Never
    downgrade a database whose schema is newer than the binary supports.
 6. Render/lint the new plist. Replace an old plist only after bootout and
@@ -2168,6 +2256,9 @@ There is no automatic backup command or migration rollback command.
 | Retry attention | Inspect failure class, phase, count, and reason. Terminal audit schedules do not authorize evidence deletion. |
 | LaunchAgent not running | Run LaunchAgent `status`, inspect finite reason codes and private logs, correct binary/config/log permissions, then kickstart only when status recommends it. |
 | LaunchAgent control timeout | Treat as unknown/attention. Run `status`; never assume success and issue an immediate duplicate control operation. |
+| LaunchDaemon not running | Run LaunchDaemon `status`, verify the root-owned exact plist and worker-owned assets, then bootstrap or kickstart only when the sanitized next action permits it. |
+| Supervisor conflict | Boot out and prove absence of the current service, preserve its plist under a non-`.plist` rollback name, and retry the selected supervisor preflight. Never load both. |
+| Worker already running | Inspect both launchd domains and the process-lifetime lock owner. Do not remove the lock file or bypass the scheduler lease while a worker may still be alive. |
 
 When evidence remains unclear, stop external writes and preserve sanitized
 artifacts for review. The correct fallback is `manual_intervention`, not manual

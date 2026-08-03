@@ -22,6 +22,47 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/fixtureevidence"
 )
 
+func TestControllerWorkerRejectsRootBeforeOpeningRuntime(t *testing.T) {
+	originalUID := workerEffectiveUID
+	originalBuild := buildAutomaticWorkerRuntime
+	t.Cleanup(func() {
+		workerEffectiveUID = originalUID
+		buildAutomaticWorkerRuntime = originalBuild
+	})
+	workerEffectiveUID = func() int { return 0 }
+	buildAutomaticWorkerRuntime = func(bootstrap.Bootstrap, string) (automaticWorkerRuntime, error) {
+		t.Fatal("root worker reached runtime construction")
+		return automaticWorkerRuntime{}, nil
+	}
+	if err := controllerWorker(nil); err == nil || err.Error() != "automatic admission worker must not run as root" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestWorkerProcessLockRejectsConcurrentWorkerAndRecoversAfterClose(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	first, err := acquireWorkerProcessLock(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := acquireWorkerProcessLock(directory); err == nil || err.Error() != "automatic admission worker is already running" {
+		t.Fatalf("unexpected concurrent lock error: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := acquireWorkerProcessLock(directory)
+	if err != nil {
+		t.Fatalf("lock did not recover after close: %v", err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBoundWorkerLogStreamTruncatesOnlyPrivateRegularFileAtLimit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "worker.log")
 	if err := os.WriteFile(path, make([]byte, 64), 0o600); err != nil {

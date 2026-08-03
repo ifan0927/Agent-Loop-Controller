@@ -71,7 +71,8 @@ This milestone is recorded by the closed
 - Disabled-by-default Linear Todo admission with deterministic
   priority/identifier/UUID ordering and serial handoff.
 - Singleton scheduling lease, reservation/mutation journal, one-active-run
-  policy, durable retry schedule, worker, and macOS LaunchAgent controls.
+  policy, durable retry schedule, worker, macOS LaunchAgent controls, and
+  non-root headless LaunchDaemon supervision.
 - Sanitized transport-neutral operator-attention events and queue-decision
   projection.
 - Trusted I-Fan inline review feedback lifecycle, same-session repair, fresh

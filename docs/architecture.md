@@ -831,12 +831,25 @@ empty attempt directories, exclusive output leaves, non-overlap with the
 worktree, canonical containment, and stored hashes/sizes. Artifact contents are
 private evidence, not query output.
 
-### LaunchAgent and worker supervision
+### launchd and worker supervision
 
-The CLI embeds a fixed worker plist template and implements safe render/install,
-static validation, bounded `launchctl` control, and sanitized results. launchd
-supervises one logged-in user's worker process; SQLite leases and journals—not
-launchd—remain workflow authority.
+The CLI embeds separate exact LaunchAgent and LaunchDaemon plist templates and
+implements safe render/install, static validation, bounded `launchctl` control,
+and sanitized results. The LaunchAgent supervises one logged-in user's worker;
+the system LaunchDaemon supports pre-login headless recovery but pins
+`UserName`, `HOME`, and `WorkingDirectory` so the worker remains the configured
+non-root user. The system plist is root-owned; configuration, credentials,
+database, artifacts, status, and logs remain owned by the worker user. Secrets
+never enter a plist.
+
+Only `gui/<uid>` and `system` are supported supervisor domains. A user-domain
+service is not a substitute for either contract. Bootstrap checks the opposite
+installed and loaded topology and fails closed on conflict. Independently, the
+worker acquires a private advisory lock for its complete process lifetime before
+constructing the scheduler runtime; a second LaunchAgent, LaunchDaemon, or
+manual worker therefore exits before it can scan or recover work. This process
+fence complements the short singleton scheduler lease. SQLite leases and
+journals—not launchd or the process lock—remain workflow authority.
 
 The normal worker has no wall-clock expiry. SIGINT/SIGTERM stops new cadence,
 cancels the active production driver and child processes, joins lease renewal,
@@ -845,14 +858,15 @@ without changing the durable run into failure or abandonment. A restart
 re-enters persisted recovery before scanning, so process supervision cannot
 authorize duplicate admission. Per-operation timeouts remain independent of
 process lifetime, and GitHub App installation tokens refresh from their own
-expiry metadata. LaunchAgent configuration and binaries use restart-to-reload.
+expiry metadata. LaunchAgent and LaunchDaemon configuration and binaries use
+restart-to-reload.
 Private stdout/stderr leaves use a fixed startup truncation threshold; normal
 cadence does not produce per-cycle log records.
 Sanitized worker output reports `running`, `driving`, `parked`, or `stopping`;
 the final stopping record also identifies the immediately previous state. A
 private atomically replaced status snapshot next to the controller config makes
 the current state observable without appending one log record per poll;
-LaunchAgent status projects it only while launchd observes the worker running
+Supervisor status projects it only while launchd observes the worker running
 and the snapshot's PID plus OS process-start identity match launchd's current
 process, so restart races and PID reuse cannot adopt a previous worker's state.
 
@@ -1063,7 +1077,8 @@ resolution is not approval, and an approval for an old head is stale.
 ## 14. Known Constraints
 
 - One automatic nonterminal run; no preemption or concurrent queue execution.
-- Local macOS-oriented operation and LaunchAgent supervision; no server mode.
+- Local macOS-oriented operation with GUI LaunchAgent or headless system
+  LaunchDaemon supervision; no remote controller service or multi-host mode.
 - One repository and one owned PR per run; configuration may contain multiple
   selectable repository profiles, but there are no cross-repository
   transactions.
