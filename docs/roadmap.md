@@ -87,52 +87,61 @@ This milestone is recorded by the closed
 - Deterministic continuous-supervisor restart/fault matrix with a sanitized,
   machine-readable evidence summary for these boundaries.
 
-The implementation child work under the open
+The implementation child work under the
 [automatic-admission roadmap](https://github.com/ifan0927/Agent-Loop-Controller/issues/21)
-is complete; its final live acceptance item remains open.
+and the final isolated
+[live acceptance](https://github.com/ifan0927/Agent-Loop-Controller/issues/42)
+are complete. The accepted run proved automatic admission, trusted inline
+repair and reply, an unresolved-conversation worker restart, exact-head human
+approval, protected merge, Linear completion, exact source synchronization,
+owned cleanup, and non-disclosing retained evidence.
 
-## Current Stabilization Focus
+This milestone is recorded by the completed automatic-admission roadmap and its
+bounded remediation roadmap
+[#45](https://github.com/ifan0927/Agent-Loop-Controller/issues/45).
 
-### In progress: second isolated live E2E
+## Current Product Focus
 
-The current release-confidence gate is
-[issue #42](https://github.com/ifan0927/Agent-Loop-Controller/issues/42): one
-new eligible Linear Todo must complete the real automatic path through
-implementation, trusted inline change request, verified repair and reply,
-controlled restart while the conversation is unresolved, human resolution and
-exact-head approval, protected merge, Linear completion, exact source sync, and
-owned cleanup.
+### In progress: operator experience and repair-review precision
 
-The first attempt surfaced process, verifier-evidence, retry, abandon,
-fresh-review handoff, and runtime recovery gaps. Those bounded remediations were
-implemented under
-[roadmap #45](https://github.com/ifan0927/Agent-Loop-Controller/issues/45).
-The remaining work is acceptance evidence, not another broad feature phase.
+The active product roadmap is
+[#89](https://github.com/ifan0927/Agent-Loop-Controller/issues/89). It keeps the
+completed controller authority model intact while adding:
 
-Exit criteria:
+- repair-aware fresh review bound to exact trusted findings;
+- idempotent requests for the configured trusted human reviewer;
+- a loopback-first authenticated read-only operator API and monitoring Web UI;
+- fixed-authority privileged worker restart without browser password handling;
+- restart-safe notification delivery to a Web UI inbox and configured outbound
+  channels.
 
-- the entire path runs without manual state commands or SQLite edits;
-- restarts do not duplicate admission, repair, reply, push, PR, or merge;
-- I-Fan remains the only thread-resolution and approval authority;
-- the configured clean fixture source reaches the exact persisted merge SHA;
-- controller-owned resources are cleaned while audit artifacts remain;
-- retained evidence passes the sensitive-output scan.
+The work is decomposed into bounded issues
+[#90](https://github.com/ifan0927/Agent-Loop-Controller/issues/90) through
+[#98](https://github.com/ifan0927/Agent-Loop-Controller/issues/98). The final
+issue is the only new live full-chain acceptance; implementation children must
+not absorb adjacent roadmap scope.
 
 ## Near-Term Goals
 
 ### In progress: stabilize operator ergonomics
 
-The worker now remains alive while runs are parked, status exposes the current
+The worker remains alive while runs are parked, status exposes the current
 parked reason, and explicit authenticated recovery answers have a durable
-provenance boundary separate from automatic workflow evidence. Continue toward
-fewer operator-attention reasons, clearer inspection summaries, and safer guided
-recovery selection without exposing arbitrary state mutation.
+provenance boundary separate from automatic workflow evidence. Issues
+[#92](https://github.com/ifan0927/Agent-Loop-Controller/issues/92),
+[#93](https://github.com/ifan0927/Agent-Loop-Controller/issues/93),
+[#95](https://github.com/ifan0927/Agent-Loop-Controller/issues/95), and
+[#96](https://github.com/ifan0927/Agent-Loop-Controller/issues/96) add the
+operator API, monitoring UI, fixed privileged helper, and typed restart flow
+without exposing arbitrary state or root mutation.
 
-### Planned: notification and operator interface
+### In progress: notification delivery
 
-Deliver the current versioned operator-attention events beyond the SQLite
-adapter. The transport must remain idempotent, sanitized, and subordinate to
-controller state; delivery acknowledgement must not become workflow authority.
+Issues [#94](https://github.com/ifan0927/Agent-Loop-Controller/issues/94) and
+[#97](https://github.com/ifan0927/Agent-Loop-Controller/issues/97) deliver the
+current versioned operator events beyond SQLite. Transport remains idempotent,
+sanitized, and subordinate to controller state; delivery acknowledgement never
+becomes workflow authority.
 
 ### Planned: Hermes application integration
 
@@ -141,15 +150,6 @@ Hermes should submit a normalized authenticated admission intent, show the same
 sanitized run projection, and route structured decisions. It must not execute
 Mac shell commands, read worktrees, approve GitHub reviews, resolve human
 threads, or own controller state.
-
-### Planned: human-facing Web UI
-
-Build a restrained operator UI over authenticated controller application
-commands and queries. Initial value is configuration readiness, queue/run
-timeline, evidence summaries, human-decision forms, attention/recovery guidance,
-and links to exact GitHub authority. The UI must not read/write SQLite or config
-files directly and must not present low-level state commands as a normal
-step-by-step workflow.
 
 ### Planned: broader multi-repository operation
 
@@ -218,10 +218,12 @@ Status words in this document are deliberate:
 - **Non-goal**: outside the current product boundary.
 
 Detailed implementation state, acceptance checklists, dependencies, and defect
-history belong in GitHub issues and pull requests. The current open umbrella and
-acceptance trackers are
-[#21](https://github.com/ifan0927/Agent-Loop-Controller/issues/21),
+history belong in GitHub issues and pull requests. The current open umbrella is
+[#89](https://github.com/ifan0927/Agent-Loop-Controller/issues/89), with final
+acceptance tracked by
+[#98](https://github.com/ifan0927/Agent-Loop-Controller/issues/98). The completed
+Round 2 trackers [#21](https://github.com/ifan0927/Agent-Loop-Controller/issues/21),
 [#42](https://github.com/ifan0927/Agent-Loop-Controller/issues/42), and
-[#45](https://github.com/ifan0927/Agent-Loop-Controller/issues/45). Update this
-roadmap when their milestone meaning changes; do not copy their full checklists
-here.
+[#45](https://github.com/ifan0927/Agent-Loop-Controller/issues/45) retain their
+historical implementation evidence. Update this roadmap when milestone meaning
+changes; do not copy full issue checklists here.

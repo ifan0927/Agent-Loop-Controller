@@ -1087,5 +1087,7 @@ resolution is not approval, and an approval for an old head is stale.
 - GitHub writes require a narrowly permissioned selected-repository App.
 - Notification transport, Hermes runtime integration, Web UI, public API,
   webhooks, and multi-tenant authorization are not implemented.
-- External live E2E acceptance is restricted to an isolated fixture repository
-  and remains the current stabilization gate.
+- External live E2E acceptance remains restricted to isolated fixture
+  repositories. The automatic-delivery acceptance is complete; the next live
+  gate covers the operator UI, fixed-authority restart, notifications, reviewer
+  request, and repair-aware review without broadening production authority.
