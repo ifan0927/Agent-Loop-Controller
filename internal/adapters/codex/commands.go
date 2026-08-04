@@ -161,6 +161,9 @@ Review against the issue goal and acceptance criteria, applicable AGENTS.md file
 repository specifications, tests, security boundaries, and maintainability. Focus
 on real behavioral, integration, authorization, data, and regression risks. Do not
 edit files. A pass means the exact reviewed head is ready to open as a pull request.
+Return schema_version 2. For an initial review, return an empty
+expected_finding_dispositions array; the controller appends separate instructions
+and exact expected finding identities when this is a post-repair review.
 
 Goal: %s
 

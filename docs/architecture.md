@@ -136,6 +136,16 @@ Verifier commands come from the controller-owned `builtin:v1` registry; Linear
 may name only configured IDs. A verifier records whether the process was not
 started, exited, or was interrupted, plus all output bindings. Review is a new
 ephemeral Codex session in a read-only sandbox, never an implementation resume.
+A post-repair review receives the exact persisted finding set that authorized
+the repair, the previous candidate SHA, and the repaired candidate SHA. Finding
+text remains explicitly untrusted and subordinate to the frozen task. The
+reviewer must inspect both the repair delta and the complete branch delta, and
+the versioned outcome must cover every expected `source`, `source_id`, and body
+digest exactly once. A pass requires every expected finding to be materially
+addressed and permits no new code findings. Missing, duplicate, stale, or
+non-addressed dispositions fail closed; initial reviews require an empty
+disposition set. Legacy outcomes may be replayed only when no repair-finding
+context is required.
 A human approval must come from the configured immutable GitHub `User` identity,
 the owned PR, and the exact candidate reviewed internally and passed by CI.
 

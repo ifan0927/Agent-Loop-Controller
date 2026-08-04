@@ -483,6 +483,17 @@ func TestOfflineAcceptanceProductionRepairRebindsFindingsVerificationAndReviewTo
 	if len(inspection.Reviews) != 2 || inspection.Reviews[0].ReviewedHead != oldHead || inspection.Reviews[1].ReviewedHead != finalRun.CandidateHead {
 		t.Fatalf("review heads=%+v", inspection.Reviews)
 	}
+	if len(stack.process.reviewStdin) != 2 || !strings.Contains(stack.process.reviewStdin[1], `"previous_candidate_sha":"`+oldHead+`"`) || !strings.Contains(stack.process.reviewStdin[1], `"repaired_candidate_sha":"`+finalRun.CandidateHead+`"`) || !strings.Contains(stack.process.reviewStdin[1], "untrusted_text") {
+		t.Fatalf("post-repair review prompt lacks exact persisted context: %q", stack.process.reviewStdin)
+	}
+	data, err := os.ReadFile(inspection.Reviews[1].OutcomePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var outcome domain.ReviewOutcome
+	if json.Unmarshal(data, &outcome) != nil || outcome.SchemaVersion != domain.ReviewOutcomeSchemaVersion || len(outcome.ExpectedFindingDispositions) != 1 || outcome.ExpectedFindingDispositions[0].Source != application.FreshReviewFindingSource || outcome.ExpectedFindingDispositions[0].Status != domain.ReviewFindingAddressed {
+		t.Fatalf("post-repair review disposition=%+v", outcome)
+	}
 	candidateHeads := map[string]int{}
 	for _, verification := range inspection.Verifications {
 		if verification.Phase != "candidate" {

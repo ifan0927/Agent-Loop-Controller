@@ -66,7 +66,8 @@ the state machine.
   restart-stable parked states, local operator-attention records, and durable
   provenance for explicit authenticated recovery answers.
 - Isolated worktrees, resumable Codex implementation sessions, structured
-  outcomes, repository-owned verifier commands, and fresh read-only review.
+  outcomes, repository-owned verifier commands, and fresh read-only review that
+  binds post-repair passes to exact controller-selected finding dispositions.
 - Exact-HEAD branch push, owned PR creation/adoption, required-check and review
   reconciliation, trusted inline feedback repair, and idempotent App replies.
 - Exact-HEAD human approval, guarded squash merge, Linear completion

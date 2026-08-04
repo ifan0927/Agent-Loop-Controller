@@ -69,6 +69,9 @@ func TestReviewIsFreshAndCoversBranchDelta(t *testing.T) {
 	if !strings.Contains(spec.Stdin, "origin/dev") {
 		t.Fatal("review prompt must define the complete branch delta base")
 	}
+	if !strings.Contains(spec.Stdin, "schema_version 2") || !strings.Contains(spec.Stdin, "expected_finding_dispositions") {
+		t.Fatal("review prompt must define the versioned disposition contract")
+	}
 }
 
 func TestResumeRequiresExplicitSessionID(t *testing.T) {

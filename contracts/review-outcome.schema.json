@@ -3,8 +3,9 @@
   "title": "ReviewOutcome",
   "type": "object",
   "additionalProperties": false,
-  "required": ["verdict", "summary", "reviewed_head_sha", "findings"],
+  "required": ["schema_version", "verdict", "summary", "reviewed_head_sha", "findings", "expected_finding_dispositions"],
   "properties": {
+    "schema_version": { "type": "integer", "const": 2 },
     "verdict": { "type": "string", "enum": ["pass", "findings", "failed"] },
     "summary": { "type": "string" },
     "reviewed_head_sha": { "type": "string" },
@@ -21,6 +22,21 @@
           "body": { "type": "string" },
           "file": { "type": ["string", "null"] },
           "line": { "type": ["integer", "null"], "minimum": 1 }
+        }
+      }
+    },
+    "expected_finding_dispositions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "source_id", "body_digest", "status", "summary"],
+        "properties": {
+          "source": { "type": "string" },
+          "source_id": { "type": "string" },
+          "body_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "status": { "type": "string", "enum": ["addressed", "not_addressed", "uncertain"] },
+          "summary": { "type": "string" }
         }
       }
     }

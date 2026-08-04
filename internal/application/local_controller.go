@@ -1228,6 +1228,10 @@ func (c *LocalController) freshReview(ctx context.Context, run Run) error {
 	if err != nil {
 		return err
 	}
+	repairContext, err := buildRepairReviewContext(run, inspection)
+	if err != nil {
+		return err
+	}
 	if err := rejectUnprovenStartedProcessGroup(inspection.Attempts); err != nil {
 		return err
 	}
@@ -1292,6 +1296,13 @@ func (c *LocalController) freshReview(ctx context.Context, run Run) error {
 	spec := c.commands.FreshReview(task, run.WorktreePath, directory)
 	spec.ProcessControlKey = attempt.ProcessControlKey
 	spec.Stdin += fmt.Sprintf("\nController candidate HEAD: %s\nController verification is authoritative for this exact HEAD.\n", run.CandidateHead)
+	if repairContext != nil {
+		instructions, promptErr := repairReviewPrompt(*repairContext)
+		if promptErr != nil {
+			return c.failAttempt(ctx, attempt, "repair_review_context", promptErr)
+		}
+		spec.Stdin += "\n" + instructions
+	}
 	if hasDecision {
 		contract, err := humanDecisionContract(decision)
 		if err != nil {
@@ -1337,6 +1348,13 @@ func (c *LocalController) applyFreshReviewOutcome(ctx context.Context, run Run, 
 		return err
 	}
 	outcome = persistedOutcome
+	repairContext, err := buildRepairReviewContext(run, inspection)
+	if err != nil {
+		return err
+	}
+	if err := validateRepairReviewOutcome(outcome, repairContext); err != nil {
+		return err
+	}
 	switch outcome.Verdict {
 	case domain.ReviewPass:
 		return c.authorizeReview(ctx, run, outcome, evidence, inspection)
@@ -1602,7 +1620,11 @@ func (c *LocalController) validateApproval(ctx context.Context, run Run) error {
 			if err != nil {
 				return err
 			}
-			if outcome.ReviewedHeadSHA == run.CandidateHead {
+			repairContext, err := buildRepairReviewContext(run, inspection)
+			if err != nil {
+				return err
+			}
+			if outcome.ReviewedHeadSHA == run.CandidateHead && validateRepairReviewOutcome(outcome, repairContext) == nil {
 				return nil
 			}
 		}

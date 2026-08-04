@@ -52,7 +52,7 @@ func (fixtureCodexProcess) Run(_ context.Context, spec processadapter.Spec) (pro
 	if err != nil {
 		return processadapter.Result{}, err
 	}
-	message := fmt.Sprintf(`{"verdict":"pass","summary":"Fixture is ready.","reviewed_head_sha":%q,"findings":[]}`, head)
+	message := fmt.Sprintf(`{"schema_version":2,"verdict":"pass","summary":"Fixture is ready.","reviewed_head_sha":%q,"findings":[],"expected_finding_dispositions":[]}`, head)
 	if err := os.WriteFile(output, []byte(message), 0o600); err != nil {
 		return processadapter.Result{}, err
 	}

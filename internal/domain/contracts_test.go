@@ -1,6 +1,9 @@
 package domain
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestCodingTaskMissingFieldsAreDeterministic(t *testing.T) {
 	err := (CodingTask{}).Validate()
@@ -126,5 +129,37 @@ func TestReviewRejectsUnusableFinding(t *testing.T) {
 	}
 	if err := outcome.Validate(); err == nil {
 		t.Fatal("finding with blank ID must be rejected")
+	}
+}
+
+func TestReviewDispositionRequiresVersionedBoundedIdentity(t *testing.T) {
+	disposition := ReviewFindingDisposition{
+		Source: "github_required_check", SourceID: "check-1", BodyDigest: strings.Repeat("a", 64),
+		Status: ReviewFindingAddressed, Summary: "The finding is addressed.",
+	}
+	outcome := ReviewOutcome{
+		SchemaVersion: ReviewOutcomeSchemaVersion, Verdict: ReviewPass, Summary: "ready", ReviewedHeadSHA: "head",
+		ExpectedFindingDispositions: []ReviewFindingDisposition{disposition},
+	}
+	if err := outcome.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	duplicate := outcome
+	duplicate.ExpectedFindingDispositions = append(duplicate.ExpectedFindingDispositions, disposition)
+	if err := duplicate.Validate(); err == nil {
+		t.Fatal("duplicate disposition was accepted")
+	}
+	invalid := outcome
+	invalid.ExpectedFindingDispositions = append([]ReviewFindingDisposition(nil), outcome.ExpectedFindingDispositions...)
+	invalid.ExpectedFindingDispositions[0].BodyDigest = "not-a-digest"
+	if err := invalid.Validate(); err == nil {
+		t.Fatal("invalid disposition digest was accepted")
+	}
+}
+
+func TestReviewRejectsUnknownOutcomeSchemaVersion(t *testing.T) {
+	outcome := ReviewOutcome{SchemaVersion: ReviewOutcomeSchemaVersion + 1, Verdict: ReviewPass, Summary: "ready", ReviewedHeadSHA: "head"}
+	if err := outcome.Validate(); err == nil {
+		t.Fatal("unknown review schema version was accepted")
 	}
 }

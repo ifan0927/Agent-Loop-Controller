@@ -183,7 +183,7 @@ func (p *durableFakeProcess) Run(ctx context.Context, s processadapter.Spec) (pr
 				return processadapter.Result{}, ctx.Err()
 			}
 			if !p.noChangeOnResume {
-				mustWriteFile(filepath.Join(s.WorkingDir, "mathutil", "clamp.go"), "package mathutil\n\nfunc Clamp(value, min, max int) int { if value < min { return min }; if value > max { return max }; return value }\n")
+				mustWriteFile(filepath.Join(s.WorkingDir, "mathutil", "clamp.go"), fmt.Sprintf("package mathutil\n\n// Repair fixture attempt %d.\nfunc Clamp(value, min, max int) int { if value < min { return min }; if value > max { return max }; return value }\n", p.resumeCalls))
 				mustWriteFile(filepath.Join(s.WorkingDir, "mathutil", "clamp_test.go"), "package mathutil\n\nimport \"testing\"\n\nfunc TestClamp(t *testing.T) { tests := []struct{ v, min, max, want int }{{-1,0,5,0},{3,0,5,3},{9,0,5,5}}; for _, tt := range tests { if got := Clamp(tt.v,tt.min,tt.max); got != tt.want { t.Fatalf(\"got %d want %d\",got,tt.want) } } }\n")
 			}
 			outcome := completedOutcome
@@ -211,7 +211,8 @@ func (p *durableFakeProcess) Run(ctx context.Context, s processadapter.Spec) (pr
 				verdict, summary = "findings", "actionable finding"
 				findings = `[{"id":"f1","severity":"medium","title":"Finding","body":"Fix it","file":null,"line":null}]`
 			}
-			writeLastMessage(s.Args, fmt.Sprintf(`{"verdict":%q,"summary":%q,"reviewed_head_sha":%q,"findings":%s}`, verdict, summary, head, findings))
+			dispositions := addressedReviewDispositions(s.Stdin)
+			writeLastMessage(s.Args, fmt.Sprintf(`{"schema_version":2,"verdict":%q,"summary":%q,"reviewed_head_sha":%q,"findings":%s,"expected_finding_dispositions":%s}`, verdict, summary, head, findings, dispositions))
 			stdout = fmt.Sprintf("{\"type\":\"thread.started\",\"thread_id\":\"review-session-%d\"}\n", p.reviewCalls)
 		} else {
 			p.implementationCalls++
@@ -240,6 +241,35 @@ func (p *durableFakeProcess) Run(ctx context.Context, s processadapter.Spec) (pr
 		}
 	}
 	return processadapter.Result{Outcome: processadapter.OutcomeExited, ExitCode: 0, StdoutPath: s.StdoutPath, StderrPath: s.StderrPath}, nil
+}
+
+func addressedReviewDispositions(prompt string) string {
+	for _, line := range strings.Split(prompt, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, `{"previous_candidate_sha"`) {
+			continue
+		}
+		var context struct {
+			Expected []struct {
+				Source     string `json:"source"`
+				SourceID   string `json:"source_id"`
+				BodyDigest string `json:"body_digest"`
+			} `json:"expected_findings"`
+		}
+		if json.Unmarshal([]byte(line), &context) != nil {
+			panic("invalid repair review context")
+		}
+		dispositions := make([]map[string]string, 0, len(context.Expected))
+		for _, finding := range context.Expected {
+			dispositions = append(dispositions, map[string]string{"source": finding.Source, "source_id": finding.SourceID, "body_digest": finding.BodyDigest, "status": "addressed", "summary": "The exact expected finding is materially addressed."})
+		}
+		encoded, err := json.Marshal(dispositions)
+		if err != nil {
+			panic(err)
+		}
+		return string(encoded)
+	}
+	return "[]"
 }
 
 func TestUnprovenCodexProcessGroupRemainsStartedForOperatorAbandonment(t *testing.T) {

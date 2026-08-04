@@ -258,9 +258,19 @@ func (r DecisionRequest) Validate() error {
 type ReviewVerdict string
 
 const (
+	ReviewOutcomeSchemaVersion = 2
+
 	ReviewPass     ReviewVerdict = "pass"
 	ReviewFindings ReviewVerdict = "findings"
 	ReviewFailed   ReviewVerdict = "failed"
+)
+
+type ReviewFindingDispositionStatus string
+
+const (
+	ReviewFindingAddressed    ReviewFindingDispositionStatus = "addressed"
+	ReviewFindingNotAddressed ReviewFindingDispositionStatus = "not_addressed"
+	ReviewFindingUncertain    ReviewFindingDispositionStatus = "uncertain"
 )
 
 type ReviewFinding struct {
@@ -273,13 +283,26 @@ type ReviewFinding struct {
 }
 
 type ReviewOutcome struct {
-	Verdict         ReviewVerdict   `json:"verdict"`
-	Summary         string          `json:"summary"`
-	ReviewedHeadSHA string          `json:"reviewed_head_sha"`
-	Findings        []ReviewFinding `json:"findings"`
+	SchemaVersion               int                        `json:"schema_version"`
+	Verdict                     ReviewVerdict              `json:"verdict"`
+	Summary                     string                     `json:"summary"`
+	ReviewedHeadSHA             string                     `json:"reviewed_head_sha"`
+	Findings                    []ReviewFinding            `json:"findings"`
+	ExpectedFindingDispositions []ReviewFindingDisposition `json:"expected_finding_dispositions"`
+}
+
+type ReviewFindingDisposition struct {
+	Source     string                         `json:"source"`
+	SourceID   string                         `json:"source_id"`
+	BodyDigest string                         `json:"body_digest"`
+	Status     ReviewFindingDispositionStatus `json:"status"`
+	Summary    string                         `json:"summary"`
 }
 
 func (o ReviewOutcome) Validate() error {
+	if o.SchemaVersion != 0 && o.SchemaVersion != ReviewOutcomeSchemaVersion {
+		return fmt.Errorf("unsupported review outcome schema version: %d", o.SchemaVersion)
+	}
 	if strings.TrimSpace(o.ReviewedHeadSHA) == "" {
 		return errors.New("reviewed_head_sha must not be empty")
 	}
@@ -304,7 +327,45 @@ func (o ReviewOutcome) Validate() error {
 	default:
 		return fmt.Errorf("unknown review verdict: %q", o.Verdict)
 	}
+	seenDispositions := make(map[string]struct{}, len(o.ExpectedFindingDispositions))
+	for index, disposition := range o.ExpectedFindingDispositions {
+		if err := disposition.Validate(); err != nil {
+			return fmt.Errorf("invalid expected finding disposition %d: %w", index, err)
+		}
+		key := disposition.Source + "\x00" + disposition.SourceID + "\x00" + disposition.BodyDigest
+		if _, exists := seenDispositions[key]; exists {
+			return errors.New("duplicate expected finding disposition")
+		}
+		seenDispositions[key] = struct{}{}
+	}
 	return nil
+}
+
+func (d ReviewFindingDisposition) Validate() error {
+	for _, field := range []struct{ name, value string }{
+		{name: "source", value: d.Source},
+		{name: "source_id", value: d.SourceID},
+		{name: "body_digest", value: d.BodyDigest},
+		{name: "summary", value: d.Summary},
+	} {
+		if strings.TrimSpace(field.value) == "" || strings.ContainsRune(field.value, '\x00') {
+			return fmt.Errorf("%s must not be blank or contain NUL", field.name)
+		}
+	}
+	if len(d.BodyDigest) != 64 {
+		return errors.New("body_digest must be a SHA-256 digest")
+	}
+	for _, character := range d.BodyDigest {
+		if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f') {
+			return errors.New("body_digest must be lowercase hexadecimal")
+		}
+	}
+	switch d.Status {
+	case ReviewFindingAddressed, ReviewFindingNotAddressed, ReviewFindingUncertain:
+		return nil
+	default:
+		return fmt.Errorf("unknown disposition status: %q", d.Status)
+	}
 }
 
 func (f ReviewFinding) Validate() error {

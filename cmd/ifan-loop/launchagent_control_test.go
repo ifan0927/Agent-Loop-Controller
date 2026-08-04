@@ -467,6 +467,7 @@ func TestLaunchAgentPlistParserRejectsInvalidStructureAndDuplicateKeys(t *testin
 
 func TestLaunchAgentInstallIsIdempotentAndDoesNotOverwrite(t *testing.T) {
 	root := resolvedTempDir(t)
+	isolateLaunchDaemonDirectory(t, root)
 	if err := os.Chmod(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -542,6 +543,8 @@ func TestLaunchAgentInstallBindingRejectsDetachedParent(t *testing.T) {
 
 func writeLaunchAgentFixture(t *testing.T, binary, config, plist string, runAtLoad bool) {
 	t.Helper()
+	isolateLaunchDaemonDirectory(t, filepath.Dir(config))
+
 	if err := os.WriteFile(binary, []byte("fixture"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -552,4 +555,13 @@ func writeLaunchAgentFixture(t *testing.T, binary, config, plist string, runAtLo
 	if err := os.WriteFile(plist, []byte(rendered), 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func isolateLaunchDaemonDirectory(t *testing.T, root string) {
+	t.Helper()
+	originalLaunchDaemonDirectory := launchDaemonDirectory
+	launchDaemonDirectory = filepath.Join(root, "LaunchDaemons")
+	t.Cleanup(func() {
+		launchDaemonDirectory = originalLaunchDaemonDirectory
+	})
 }

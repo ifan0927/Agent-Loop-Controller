@@ -302,7 +302,7 @@ The acceptance matrix requires:
 | --- | --- |
 | Automatic admission | Bounded scan, unique priority selection, journaled reservation, exact Todo-to-In-Progress mutation, one run |
 | Implementation | Owned worktree, resumable session, exact candidate, successful verifier batch |
-| Internal review | Fresh independent read-only review bound to candidate head |
+| Internal review | Fresh independent read-only review bound to candidate head; after repair, exact expected-finding dispositions cover both repair and full branch deltas |
 | Delivery | One owned branch/PR, required CI at exact head |
 | Human feedback | Trusted root `CHANGES_REQUESTED`, one repair, new evidence, one fixed reply |
 | Restart | Read-only unresolved-thread wait resumes without duplicate repair/reply/merge |
