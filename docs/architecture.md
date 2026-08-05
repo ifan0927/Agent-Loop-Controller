@@ -979,6 +979,39 @@ application use cases and sanitized projections. It must not execute shell
 instructions, read Mac files directly, manufacture decisions/approval, or own
 workflow state.
 
+### Planned local operator interface boundary
+
+The planned Web UI does not introduce another workflow engine. Controller-owned
+application services must first define repository onboarding, configuration
+transactions, legal operator commands, idempotency, and audit evidence without
+depending on HTTP or browser presentation. A loopback authenticated Operator API
+then adapts those same commands and sanitized queries under a versioned OpenAPI
+contract. HTTP handlers may authenticate, validate, bound, and render requests;
+they may not duplicate state transitions, authorization, or external-write
+policy.
+
+The frontend is planned as a separate source repository and a local Vite
+process during initial development. That repository boundary is for independent
+UI maintenance, not for a second backend or deployment authority. The browser
+never accesses SQLite, controller configuration, credentials, worktrees, or
+arbitrary local paths directly. It may submit only controller-advertised typed
+commands and must present the observed post-command state.
+
+Repository onboarding is a persisted controller saga rather than one HTTP
+request. A new-project flow begins from an existing empty GitHub repository,
+creates the managed local checkout and initial base revision, creates or adopts
+the exact Linear `repo:<slug>` label, validates the repository profile, applies
+configuration, and observes worker readiness. An existing-project flow validates
+and adopts a matching local checkout and GitHub origin without rewriting
+user-owned Git state. Partial progress is resumed or reconciled; external
+resources are not destructively rolled back by implication.
+
+GitHub repository creation, project templates, browser secret provisioning,
+GitHub approval or review resolution, general Linear issue editing, privileged
+helper installation, and break-glass recovery remain outside the Web UI. The UI
+has no notification inbox; future outbound channels such as Discord remain
+separate adapters without workflow authority.
+
 ## 10. Persistence Model
 
 SQLite stores current state in `runs` and append-oriented or lifecycle evidence
@@ -1095,9 +1128,11 @@ resolution is not approval, and an approval for an old head is stale.
 - Linear admission and completion observation are implemented, but completion
   remains external automation/human authority.
 - GitHub writes require a narrowly permissioned selected-repository App.
-- Notification transport, Hermes runtime integration, Web UI, public API,
-  webhooks, and multi-tenant authorization are not implemented.
+- Transactional repository onboarding and WebUI-oriented configuration mutation
+  services, the local Operator API, Web UI, notification transport, Hermes
+  runtime integration, public API, webhooks, and multi-tenant authorization are
+  not implemented.
 - External live E2E acceptance remains restricted to isolated fixture
-  repositories. The automatic-delivery acceptance is complete; the next live
-  gate covers the operator UI, fixed-authority restart, notifications, reviewer
-  request, and repair-aware review without broadening production authority.
+  repositories. The automatic-delivery acceptance and repair-aware independent
+  review are complete; future live gates must follow the staged controller,
+  Operator API, and frontend contracts without broadening production authority.

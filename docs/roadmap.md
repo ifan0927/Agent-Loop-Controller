@@ -102,73 +102,96 @@ bounded remediation roadmap
 
 ## Current Product Focus
 
-### In progress: operator experience and repair-review precision
+### Planned: local operator product
 
-The active product roadmap is
-[#89](https://github.com/ifan0927/Agent-Loop-Controller/issues/89). It keeps the
-completed controller authority model intact while adding:
+The active umbrella is
+[#99](https://github.com/ifan0927/Agent-Loop-Controller/issues/99). It replaces
+the retired read-only monitoring roadmap with a staged operator product intended
+to cover at least 90 percent of routine local work:
 
-- repair-aware fresh review bound to exact trusted findings;
-- idempotent requests for the configured trusted human reviewer;
-- a loopback-first authenticated read-only operator API and monitoring Web UI;
-- fixed-authority privileged worker restart without browser password handling;
-- restart-safe notification delivery to a Web UI inbox and configured outbound
-  channels.
+```text
+controller operator capabilities
+  -> authenticated loopback Operator API
+  -> separately maintained Web UI frontend
+```
 
-The work is decomposed into bounded issues
-[#90](https://github.com/ifan0927/Agent-Loop-Controller/issues/90) through
-[#98](https://github.com/ifan0927/Agent-Loop-Controller/issues/98). The final
-issue is the only new live full-chain acceptance; implementation children must
-not absorb adjacent roadmap scope.
+Only the umbrella is open initially. Implementation work should be decomposed
+after the preceding phase has a stable enough contract; the frontend must not
+drive speculative controller or API design.
+
+### Phase 1: controller operator foundations
+
+The controller first needs presentation-independent application services for:
+
+- restart-safe onboarding of a manually created empty GitHub repository into a
+  managed local checkout, initial base revision, Linear `repo:<slug>` label, and
+  validated repository profile;
+- safe adoption of an existing local checkout with a matching GitHub origin,
+  without moving it or rewriting user-owned Git state;
+- configuration draft, validation, change preview, compare-and-swap apply,
+  rollback, and readiness observation;
+- repository add, edit, disable, and guarded removal;
+- existing human-decision, retry, abandon, reconcile, cleanup, and other narrow
+  operator commands behind one consistent authorization, idempotency, and audit
+  boundary.
+
+GitHub repository creation, source templates, and browser secret provisioning
+are not part of this phase.
+
+### Phase 2: local WebUI Operator API
+
+The Controller repository owns a loopback-first authenticated HTTP adapter and
+versioned OpenAPI contract. It exposes sanitized health, queue, repository,
+onboarding, run, evidence, attention, configuration, and audit queries plus only
+the typed commands already authorized by controller application services. It
+must not expose arbitrary commands, SQL, filesystem browsing, generic config
+patches, or alternate workflow transitions.
+
+GitHub approval and review resolution remain in GitHub. General Linear issue
+editing remains in Linear. Privileged installation/upgrade and break-glass
+recovery remain explicit CLI/operator procedures.
+
+### Phase 3: separate Web UI frontend
+
+The frontend is maintained in a separate repository and initially runs locally
+as a React, strict TypeScript, Vite, and Ant Design application. Vite proxies
+`/api/v1` to the local Controller API. The Controller repository owns the
+OpenAPI source; the frontend generates and commits its TypeScript API types.
+
+The initial pages are Overview, Runs, Attention, Repositories, repository
+onboarding, Settings, and System/Audit. The frontend presents controller-owned
+legal actions and observed results; it does not infer authority or implement a
+second state machine.
+
+The first local-only version does not require frontend release artifacts,
+digest manifests, compatibility packaging, SSR, a Node production backend, or
+a separate BFF.
 
 ## Near-Term Goals
 
-### In progress: stabilize operator ergonomics
+### Planned: outbound notification delivery
 
-The worker remains alive while runs are parked, status exposes the current
-parked reason, and explicit authenticated recovery answers have a durable
-provenance boundary separate from automatic workflow evidence. Issues
-[#92](https://github.com/ifan0927/Agent-Loop-Controller/issues/92),
-[#93](https://github.com/ifan0927/Agent-Loop-Controller/issues/93),
-[#95](https://github.com/ifan0927/Agent-Loop-Controller/issues/95), and
-[#96](https://github.com/ifan0927/Agent-Loop-Controller/issues/96) add the
-operator API, monitoring UI, fixed privileged helper, and typed restart flow
-without exposing arbitrary state or root mutation.
-
-### In progress: notification delivery
-
-Issues [#94](https://github.com/ifan0927/Agent-Loop-Controller/issues/94) and
-[#97](https://github.com/ifan0927/Agent-Loop-Controller/issues/97) deliver the
-current versioned operator events beyond SQLite. Transport remains idempotent,
-sanitized, and subordinate to controller state; delivery acknowledgement never
-becomes workflow authority.
+The Web UI has no notification inbox, delivery history, read state, or inbound
+chat authority. It only shows current state and operator attention. After the
+controller, API, and frontend foundation is usable, outbound notifications may
+be planned separately, with Discord as the likely first adapter. Delivery and
+acknowledgement must remain subordinate to controller state.
 
 ### Planned: Hermes application integration
 
-Connect Hermes as the conversation, trigger, status, and notification surface.
-Hermes should submit a normalized authenticated admission intent, show the same
-sanitized run projection, and route structured decisions. It must not execute
-Mac shell commands, read worktrees, approve GitHub reviews, resolve human
-threads, or own controller state.
+Hermes may later use the same authenticated application commands and sanitized
+queries for conversation, trigger, status, and notification workflows. It must
+not execute Mac shell commands, read worktrees, approve GitHub reviews, resolve
+human threads, or own controller state.
 
 ### Planned: broader multi-repository operation
 
 Configuration already supports multiple repository profiles while each run
-selects exactly one. The next product step is safe scheduling and operator
-visibility across more repositories, with per-profile credentials, verifier
-policy, and authority isolation. Cross-repository transactions and one issue
-spanning multiple PRs remain outside this goal until explicitly designed.
+selects exactly one. Onboarding and operator visibility should make those
+profiles easier to manage without introducing cross-repository transactions or
+one issue spanning multiple PRs.
 
 ## Longer-Term Direction
-
-### Exploratory: authenticated API boundary
-
-The existing transport-neutral application services and sanitized query results
-can support a local authenticated API for Hermes and Web UI. Before adding an
-HTTP server, define authentication/session ownership, CSRF/origin policy,
-request idempotency, streaming/polling bounds, credential-safe projections, and
-which recovery commands are safe to expose. The API must be an adapter over the
-controller, not a second workflow engine.
 
 ### Exploratory: event-driven admission
 
@@ -219,10 +242,8 @@ Status words in this document are deliberate:
 
 Detailed implementation state, acceptance checklists, dependencies, and defect
 history belong in GitHub issues and pull requests. The current open umbrella is
-[#89](https://github.com/ifan0927/Agent-Loop-Controller/issues/89), with final
-acceptance tracked by
-[#98](https://github.com/ifan0927/Agent-Loop-Controller/issues/98). The completed
-Round 2 trackers [#21](https://github.com/ifan0927/Agent-Loop-Controller/issues/21),
+[#99](https://github.com/ifan0927/Agent-Loop-Controller/issues/99). The completed
+trackers [#21](https://github.com/ifan0927/Agent-Loop-Controller/issues/21),
 [#42](https://github.com/ifan0927/Agent-Loop-Controller/issues/42), and
 [#45](https://github.com/ifan0927/Agent-Loop-Controller/issues/45) retain their
 historical implementation evidence. Update this roadmap when milestone meaning

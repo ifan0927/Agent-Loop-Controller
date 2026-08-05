@@ -143,14 +143,13 @@ normal workflow.
 
 The production MVP and the automatic-admission, trusted-feedback, source-sync,
 recovery, headless supervision, and second isolated live-E2E milestones are
-complete. The current product focus is repair-aware independent review,
-automatic trusted-reviewer requests, an authenticated local operator API and
-Web UI, fixed-authority privileged worker control, and restart-safe notification
-delivery under
-[roadmap #89](https://github.com/ifan0927/Agent-Loop-Controller/issues/89).
-Hermes runtime integration, public API/webhook admission, and broader
-concurrent/multi-repository operation remain planned or exploratory rather than
-implemented.
+complete. The current product focus is a controller-owned repository and
+configuration lifecycle, followed by a local authenticated Operator API and a
+separately maintained Web UI under
+[roadmap #99](https://github.com/ifan0927/Agent-Loop-Controller/issues/99).
+These operator-product capabilities are planned, not current behavior. Outbound
+notifications, Hermes runtime integration, public API/webhook admission, and
+broader concurrent or cross-repository operation remain deferred or exploratory.
 
 See [Roadmap](docs/roadmap.md) for status categories and current tracking.
 
