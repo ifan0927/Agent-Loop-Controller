@@ -177,7 +177,11 @@ func TestControllerWorkerSubprocessSIGTERMClosesCompleteRuntime(t *testing.T) {
 		t.Fatalf("managed child did not start stdout=%s stderr=%s", workerOutput, workerError)
 	}
 	liveStatus, err := readWorkerStatusSnapshot(configPath)
-	if err != nil || liveStatus.Cycles != 1 || liveStatus.Status != workerStatusDriving && liveStatus.Status != workerStatusParked {
+	// The bounded supervisor may complete admission-coordination cycles while a
+	// sibling continues driving the managed process. This fixture only requires
+	// evidence that work started before SIGTERM; the exact cycle count is not a
+	// shutdown invariant.
+	if err != nil || liveStatus.Cycles < 1 || liveStatus.Status != workerStatusDriving && liveStatus.Status != workerStatusParked {
 		t.Fatalf("live worker status=%+v err=%v", liveStatus, err)
 	}
 	if err := command.Process.Signal(syscall.SIGTERM); err != nil {
