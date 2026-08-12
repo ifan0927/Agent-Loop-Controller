@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -54,6 +55,88 @@ func TestSchedulingReservesDifferentRepositoriesUpToGenericCapacity(t *testing.T
 	}
 	if sequence != 201 || priority != 1 || profileID != "profile-fixture" || binding != digestBytes([]byte("binding:IFAN-201")) {
 		t.Fatalf("decision sequence=%d priority=%d profile=%q binding=%q", sequence, priority, profileID, binding)
+	}
+}
+
+func TestSchedulingProjectionQueriesAreReadOnlyBoundedAndOrdered(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if _, err := store.ConfigureHeavyCapacity(ctx, 3, "projection-three", now); err != nil {
+		t.Fatal(err)
+	}
+	lease, acquired, err := store.AcquireLinearTodoAdmissionLease(ctx, "scheduler", time.Minute, now)
+	if err != nil || !acquired {
+		t.Fatalf("lease=%+v acquired=%t err=%v", lease, acquired, err)
+	}
+	for index, id := range []string{"IFAN-207", "IFAN-208", "IFAN-209"} {
+		reservation := automaticAdmissionReservation(fixtureUUID(id), "projection-"+id, id, lease)
+		reservation.Input.Repository.RepositoryBindingDigest = digestBytes([]byte("projection-binding:" + id))
+		reservation.Scheduling = schedulingReservation(id, "projection-three", 3, now.Add(time.Duration(index)*time.Second))
+		reservation.Scheduling.IssueSequence = 207 + index
+		if _, _, reserved, err := store.ReserveLinearTodoAdmission(ctx, reservation); err != nil || !reserved {
+			t.Fatalf("reservation %s reserved=%t err=%v", id, reserved, err)
+		}
+	}
+	runs, err := store.ListSchedulingRuns(ctx, 2)
+	if err != nil || len(runs) != 2 || runs[0].RunID != "projection-IFAN-207" || runs[1].RunID != "projection-IFAN-208" || !runs[0].HasHeavyPermit || runs[0].WaitingForCapacity {
+		t.Fatalf("runs=%+v err=%v", runs, err)
+	}
+	decisions, err := store.ListSchedulingDecisions(ctx, 2)
+	if err != nil || len(decisions) != 2 || decisions[0].IssueSequence != 209 || decisions[1].IssueSequence != 208 {
+		t.Fatalf("decisions=%+v err=%v", decisions, err)
+	}
+	for _, invalid := range []int{0, application.MaxSchedulingQueryItems + 1} {
+		if _, err := store.ListSchedulingRuns(ctx, invalid); err == nil {
+			t.Fatalf("scheduling run query accepted limit %d", invalid)
+		}
+		if _, err := store.ListSchedulingDecisions(ctx, invalid); err == nil {
+			t.Fatalf("scheduling decision query accepted limit %d", invalid)
+		}
+	}
+	var schedulingRowsBefore int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM run_scheduling`).Scan(&schedulingRowsBefore); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ListSchedulingRuns(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	var schedulingRowsAfter int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM run_scheduling`).Scan(&schedulingRowsAfter); err != nil || schedulingRowsAfter != schedulingRowsBefore {
+		t.Fatalf("read-only query changed scheduling rows: before=%d after=%d err=%v", schedulingRowsBefore, schedulingRowsAfter, err)
+	}
+}
+
+func TestSchedulingProjectionQueriesFailClosedForMissingOrCorruptEvidence(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	lease, _, _ := store.AcquireLinearTodoAdmissionLease(ctx, "scheduler", time.Minute, now)
+	reservation := automaticAdmissionReservation(fixtureUUID("projection-corrupt"), "projection-corrupt", "IFAN-210", lease)
+	reservation.Input.Repository.RepositoryBindingDigest = digestBytes([]byte("projection-corrupt-binding"))
+	reservation.Scheduling = schedulingReservation("IFAN-210", "schema-v29-default", 2, now)
+	if _, _, reserved, err := store.ReserveLinearTodoAdmission(ctx, reservation); err != nil || !reserved {
+		t.Fatalf("reserved=%t err=%v", reserved, err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM run_scheduling WHERE run_id=?`, reservation.Input.Task.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ListSchedulingRuns(ctx, 10); err == nil {
+		t.Fatal("missing scheduling row was projected as healthy")
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE scheduling_decisions SET reason_code='raw /private/path' WHERE run_id=?`, reservation.Input.Task.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ListSchedulingDecisions(ctx, 10); err == nil {
+		t.Fatal("corrupt scheduling decision was projected")
 	}
 }
 
@@ -546,7 +629,27 @@ func TestPreConcurrencySchemaRefusesConcurrencyDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store.Close()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if _, err := store.ConfigureHeavyCapacity(ctx, 2, "compatibility-two", now); err != nil {
+		t.Fatal(err)
+	}
+	for index, id := range []string{"compatibility-a", "compatibility-b"} {
+		issueID := []string{"IFAN-260", "IFAN-261"}[index]
+		input := application.CreateRunInput{Run: application.Run{ID: id, IssueID: issueID, IdempotencyKey: "key-" + id, SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw-" + id, NormalizedTaskJSON: "{}", TaskHash: "task-" + id, Repository: "owner/" + id, RepositoryConfigJSON: "{}", RepositoryBindingDigest: digestBytes([]byte("binding:" + id)), BaseBranch: "main", WorkingBranch: "ifan/" + id, ArtifactRoot: "/tmp/" + id, WorktreePath: "/tmp/worktree-" + id, ImplementationModel: "implementation", ReviewModel: "review"}}
+		if _, created, err := store.CreateRun(ctx, input); err != nil || !created {
+			t.Fatalf("create %s: created=%t err=%v", id, created, err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if legacy, err := openWithSupportedSchema(path, 28); err == nil {
+		legacy.Close()
+		t.Fatal("pre-concurrency schema reader accepted concurrency database")
+	} else if !strings.Contains(err.Error(), "database schema version 29 is newer than supported 28") {
+		t.Fatalf("compatibility error=%v", err)
+	}
 	db, err := sql.Open("sqlite", sqliteDSN(path))
 	if err != nil {
 		t.Fatal(err)
@@ -558,6 +661,10 @@ func TestPreConcurrencySchemaRefusesConcurrencyDatabase(t *testing.T) {
 	}
 	if version <= 28 {
 		t.Fatal("pre-concurrency binary could misclassify the database")
+	}
+	var runs int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM runs WHERE current_state NOT IN ('rejected','failed','completed')`).Scan(&runs); err != nil || runs != 2 {
+		t.Fatalf("compatibility refusal mutated runs=%d err=%v", runs, err)
 	}
 }
 

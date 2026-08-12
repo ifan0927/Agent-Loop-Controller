@@ -32,6 +32,13 @@ type Store struct {
 }
 
 func Open(path string) (*Store, error) {
+	return openWithSupportedSchema(path, schemaVersion)
+}
+
+func openWithSupportedSchema(path string, supportedVersion int) (*Store, error) {
+	if supportedVersion < 1 || supportedVersion > schemaVersion {
+		return nil, errors.New("supported SQLite schema version is invalid")
+	}
 	absolute, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
@@ -48,7 +55,7 @@ func Open(path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	store := &Store{db: db}
-	if err := store.migrate(context.Background()); err != nil {
+	if err := store.migrate(context.Background(), supportedVersion); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -71,7 +78,7 @@ func (s *Store) SchemaVersion(ctx context.Context) (int, error) {
 	return version, err
 }
 
-func (s *Store) migrate(ctx context.Context) error {
+func (s *Store) migrate(ctx context.Context, supportedVersion int) error {
 	if _, err := s.db.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
 		return err
 	}
@@ -87,13 +94,13 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&current); err != nil {
 		return err
 	}
-	if current > schemaVersion {
-		return fmt.Errorf("database schema version %d is newer than supported %d", current, schemaVersion)
+	if current > supportedVersion {
+		return fmt.Errorf("database schema version %d is newer than supported %d", current, supportedVersion)
 	}
-	if current == schemaVersion {
+	if current == supportedVersion {
 		return tx.Commit()
 	}
-	for version := current + 1; version <= schemaVersion; version++ {
+	for version := current + 1; version <= supportedVersion; version++ {
 		var statements []string
 		switch version {
 		case 1:

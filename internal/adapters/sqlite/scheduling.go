@@ -118,6 +118,82 @@ func (s *Store) Capacity(ctx context.Context, now time.Time) (application.Capaci
 	return projection, nil
 }
 
+func (s *Store) ListSchedulingRuns(ctx context.Context, limit int) ([]application.SchedulingRun, error) {
+	if limit < 1 || limit > application.MaxSchedulingQueryItems {
+		return nil, errors.New("scheduling run query limit is invalid")
+	}
+	var missing int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs r LEFT JOIN run_scheduling rs ON rs.run_id=r.run_id WHERE r.current_state NOT IN ('rejected','failed','completed') AND rs.run_id IS NULL`).Scan(&missing); err != nil {
+		return nil, err
+	}
+	if missing != 0 {
+		return nil, errors.New("nonterminal run is missing scheduling projection")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT r.run_id,r.repository_binding_digest,r.current_state,rs.runnable_since,rs.supervisor_state,rs.quarantined,
+		EXISTS(SELECT 1 FROM heavy_permits hp WHERE hp.run_id=r.run_id)
+		FROM run_scheduling rs JOIN runs r ON r.run_id=rs.run_id
+		WHERE r.current_state NOT IN ('rejected','failed','completed')
+		ORDER BY rs.runnable_since_unix_ns,r.run_id LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]application.SchedulingRun, 0, limit)
+	for rows.Next() {
+		var run application.SchedulingRun
+		var state, runnable string
+		var quarantined, hasPermit int
+		if err := rows.Scan(&run.RunID, &run.RepositoryBindingDigest, &state, &runnable, &run.SupervisorState, &quarantined, &hasPermit); err != nil {
+			return nil, err
+		}
+		run.State = domain.State(state)
+		run.RunnableSince = parseTime(runnable)
+		run.Quarantined = quarantined != 0
+		run.HasHeavyPermit = hasPermit != 0
+		run.WaitingForCapacity = run.SupervisorState == "waiting"
+		if run.RunID == "" || strings.TrimSpace(run.RepositoryBindingDigest) == "" || run.RunnableSince.IsZero() || !validSupervisorState(run.SupervisorState) {
+			return nil, errors.New("scheduling run projection is corrupt")
+		}
+		result = append(result, run)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) ListSchedulingDecisions(ctx context.Context, limit int) ([]application.SchedulingDecision, error) {
+	if limit < 1 || limit > application.MaxSchedulingQueryItems {
+		return nil, errors.New("scheduling decision query limit is invalid")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT decision_id,snapshot_digest,observed_at,capacity_identity,issue_uuid,issue_sequence,priority,repository_profile_id,run_id,repository_binding_digest,classification,reason_code,repository_slot_version,heavy_permit_version,admission_lease_version
+		FROM scheduling_decisions ORDER BY observed_at DESC,decision_id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]application.SchedulingDecision, 0, limit)
+	for rows.Next() {
+		var decision application.SchedulingDecision
+		var observed string
+		if err := rows.Scan(&decision.DecisionID, &decision.SnapshotDigest, &observed, &decision.CapacityIdentity, &decision.IssueUUID, &decision.IssueSequence, &decision.Priority, &decision.RepositoryProfileID, &decision.RunID, &decision.RepositoryBindingDigest, &decision.Classification, &decision.ReasonCode, &decision.RepositorySlotVersion, &decision.HeavyPermitVersion, &decision.AdmissionLeaseVersion); err != nil {
+			return nil, err
+		}
+		decision.ObservedAt = parseTime(observed)
+		if err := decision.Validate(); err != nil {
+			return nil, errors.New("scheduling decision projection is corrupt")
+		}
+		result = append(result, decision)
+	}
+	return result, rows.Err()
+}
+
+func validSupervisorState(value string) bool {
+	switch value {
+	case "waiting", "running", "external_wait", "human_wait", "terminal", "quarantined":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Store) ReconcileSchedulingAuthorities(ctx context.Context, now time.Time) ([]application.SchedulingRun, error) {
 	if now.IsZero() {
 		return nil, errors.New("scheduling reconciliation time is required")

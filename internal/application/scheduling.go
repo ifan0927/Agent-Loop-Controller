@@ -10,8 +10,9 @@ import (
 )
 
 const (
-	DefaultHeavyCapacity = 2
-	MaxHeavyCapacity     = 32
+	DefaultHeavyCapacity    = 2
+	MaxHeavyCapacity        = 32
+	MaxSchedulingQueryItems = 100
 
 	RepositoryEligibilityEligible = "eligible"
 	RepositoryEligibilityDisabled = "repository_disabled"
@@ -275,4 +276,12 @@ type SchedulingAuthorityStore interface {
 	SaveQueueSnapshot(context.Context, QueueSnapshot) error
 	LatestQueueSnapshot(context.Context) (QueueSnapshot, bool, error)
 	AppendSchedulingDecision(context.Context, SchedulingDecision) (bool, error)
+}
+
+// SchedulingProjectionReader exposes bounded, read-only scheduler state for
+// later transport adapters. Queries never reconcile authorities or trigger
+// external observation.
+type SchedulingProjectionReader interface {
+	ListSchedulingRuns(context.Context, int) ([]SchedulingRun, error)
+	ListSchedulingDecisions(context.Context, int) ([]SchedulingDecision, error)
 }

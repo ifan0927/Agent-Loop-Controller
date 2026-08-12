@@ -1059,6 +1059,11 @@ creation/read observations retain what was reported at each point in time, and
 current terminal status is derived from later typed merge or thread-resolution
 evidence without updating those earlier observations.
 
+Transport-neutral scheduling read ports expose bounded active-run scheduling
+state and recent decision detail without running reconciliation or triggering
+external observation. Capacity and latest-queue reads are likewise read-only;
+restart reconciliation remains a separate authority-changing operation.
+
 ### Intent versus observation
 
 For an external write, `side_effects` or its specialized table records immutable
