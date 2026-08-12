@@ -131,6 +131,24 @@ func TestProductionContinueUsesOnlyPersistedRepairFindings(t *testing.T) {
 	}
 }
 
+func TestProductionContinueRepairCannotBypassHeavyPermit(t *testing.T) {
+	coordinator, store, run := newPushCoordinator(t, domain.StateRepairing)
+	store.schedulingEnabled = true
+	store.inspection = RunInspection{Run: run, Findings: []FindingRecord{repairFinding("finding-permit", "bounded repair")}}
+	controller := &repairingController{serviceController: serviceController{run: run}}
+	coordinator.controller = controller
+	command := ProductionContinueCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}
+
+	if _, err := coordinator.Continue(context.Background(), command); err == nil || len(controller.findings) != 0 || store.permitAcquires != 1 {
+		t.Fatalf("err=%v findings=%+v acquires=%d", err, controller.findings, store.permitAcquires)
+	}
+	store.permitHeld = true
+	result, err := coordinator.Continue(context.Background(), command)
+	if err != nil || result.Action != ProductionPush || len(controller.findings) != 1 || store.permitAcquires != 2 || store.permitReleases != 1 {
+		t.Fatalf("result=%+v findings=%+v acquires=%d releases=%d err=%v", result, controller.findings, store.permitAcquires, store.permitReleases, err)
+	}
+}
+
 type pushTestStore struct {
 	admissionStore
 	run               Run
@@ -165,6 +183,27 @@ type pushTestStore struct {
 	leaseLost         bool
 	leaseAcquires     int
 	leaseReleases     int
+	schedulingEnabled bool
+	permitHeld        bool
+	permitAcquires    int
+	permitReleases    int
+}
+
+func (s *pushTestStore) HasSchedulingAuthority(context.Context, string) (bool, error) {
+	return s.schedulingEnabled, nil
+}
+
+func (s *pushTestStore) AcquireHeavyPermit(_ context.Context, runID, owner string, now time.Time) (HeavyPermit, bool, error) {
+	s.permitAcquires++
+	if !s.permitHeld {
+		return HeavyPermit{}, false, nil
+	}
+	return HeavyPermit{RunID: runID, OwnerNonce: owner, Version: 1, AcquiredAt: now, UpdatedAt: now}, true, nil
+}
+
+func (s *pushTestStore) ReleaseHeavyPermit(context.Context, HeavyPermit, string, time.Time) (bool, error) {
+	s.permitReleases++
+	return true, nil
 }
 
 func (s *pushTestStore) AcquireLease(context.Context, string, string, time.Time) (bool, error) {

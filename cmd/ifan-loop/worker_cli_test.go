@@ -90,8 +90,8 @@ func TestBoundWorkerLogStreamTruncatesOnlyPrivateRegularFileAtLimit(t *testing.T
 
 func TestAutomaticWorkerKeepsAdmissionAndDeliveryCadencesIndependent(t *testing.T) {
 	configured := bootstrap.LinearTodoAdmission{PollInterval: 5 * time.Minute, DeliveryPollInterval: 30 * time.Second}
-	policy := automaticWorkerDriverPolicy(configured)
-	if configured.PollInterval != 5*time.Minute || policy.PollInterval != 30*time.Second || policy.MaxImmediateAction != 32 {
+	policy := automaticWorkerDriverPolicy(configured, "fixture-owner")
+	if configured.PollInterval != 5*time.Minute || policy.PollInterval != 30*time.Second || policy.MaxImmediateAction != 32 || policy.HeavyPermitOwner != "fixture-owner" {
 		t.Fatalf("configured=%+v policy=%+v", configured, policy)
 	}
 }

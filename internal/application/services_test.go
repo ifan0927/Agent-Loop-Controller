@@ -101,16 +101,60 @@ func (s serviceStore) RenewLease(context.Context, string, string, time.Time) (bo
 func (s serviceStore) ReleaseLease(context.Context, string, string) error { return nil }
 
 type serviceController struct {
-	started   int
-	continued int
-	run       Run
-	expected  domain.State
-	key       string
+	started        int
+	continued      int
+	reconciled     int
+	reconcileError error
+	run            Run
+	expected       domain.State
+	key            string
 }
 
 type foundServiceStore struct {
 	serviceStore
 	existing Run
+}
+
+type foundSchedulingStore struct {
+	*serviceSchedulingStore
+	existing Run
+}
+
+func (s foundSchedulingStore) GetRunByIdempotency(context.Context, string) (Run, bool, error) {
+	return s.existing, true, nil
+}
+
+type serviceSchedulingStore struct {
+	serviceStore
+	enabled       bool
+	held          bool
+	acquireErrors []error
+	owners        []string
+	acquireCalls  int
+	releaseCalls  int
+}
+
+func (s *serviceSchedulingStore) HasSchedulingAuthority(context.Context, string) (bool, error) {
+	return s.enabled, nil
+}
+
+func (s *serviceSchedulingStore) AcquireHeavyPermit(_ context.Context, runID, owner string, now time.Time) (HeavyPermit, bool, error) {
+	s.acquireCalls++
+	s.owners = append(s.owners, owner)
+	if len(s.acquireErrors) > 0 {
+		err := s.acquireErrors[0]
+		s.acquireErrors = s.acquireErrors[1:]
+		return HeavyPermit{}, false, err
+	}
+	if !s.held {
+		return HeavyPermit{}, false, nil
+	}
+	return HeavyPermit{RunID: runID, OwnerNonce: owner, Version: 1, AcquiredAt: now, UpdatedAt: now}, true, nil
+}
+
+func (s *serviceSchedulingStore) ReleaseHeavyPermit(context.Context, HeavyPermit, string, time.Time) (bool, error) {
+	s.releaseCalls++
+	return true, nil
 }
 
 func (s foundServiceStore) GetRunByIdempotency(context.Context, string) (Run, bool, error) {
@@ -149,6 +193,11 @@ func (c *serviceController) BoundRepairActionContext(ctx context.Context, _ stri
 func (c *serviceController) RepairFindings(_ context.Context, _ string, _ []FindingRecord) (Run, error) {
 	c.continued++
 	return c.run, nil
+}
+
+func (c *serviceController) ReconcileInterruptedRun(context.Context, string) error {
+	c.reconciled++
+	return c.reconcileError
 }
 
 func authorizeTestRun(run Run) Run {
@@ -195,6 +244,33 @@ func TestCommandServiceRestartRejectsProfileDrift(t *testing.T) {
 	}
 }
 
+func TestCommandServiceExistingStartReconcilesBeforeDriverOwnedPermitAdoption(t *testing.T) {
+	existing := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateExecuting, IdempotencyKey: "key", TaskHash: "task"})
+	controller := &serviceController{run: existing}
+	scheduling := &serviceSchedulingStore{
+		serviceStore:  serviceStore{run: existing},
+		enabled:       true,
+		held:          true,
+		acquireErrors: []error{ErrHeavyPermitProcessReconciliationRequired},
+	}
+	store := foundSchedulingStore{serviceSchedulingStore: scheduling, existing: existing}
+	var repository LocalRepository
+	if err := json.Unmarshal([]byte(existing.RepositoryConfigJSON), &repository); err != nil {
+		t.Fatal(err)
+	}
+	repository.ProfileSnapshotVersion = existing.ProfileSnapshotVersion
+	repository.ProfileDigest = existing.ProfileDigest
+	repository.ProfileSnapshotJSON = existing.ProfileSnapshotJSON
+	ctx := WithHeavyPermitOwner(context.Background(), "direct-owner")
+	result, err := NewCommandService(controller, store).Start(ctx, StartCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RepositorySelection: existing.Repository, IdempotencyKey: existing.IdempotencyKey, Input: LocalStartInput{Task: domain.CodingTask{Repository: existing.Repository}, TaskHash: existing.TaskHash, Repository: repository, IdempotencyKey: existing.IdempotencyKey}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Run.RunID != existing.ID || controller.reconciled != 1 || controller.continued != 1 || scheduling.acquireCalls != 2 || scheduling.releaseCalls != 0 {
+		t.Fatalf("result=%+v reconciled=%d continued=%d acquires=%d releases=%d", result, controller.reconciled, controller.continued, scheduling.acquireCalls, scheduling.releaseCalls)
+	}
+}
+
 func TestCommandServicePassesAuthorityAndProjectsContinueIdempotencyKey(t *testing.T) {
 	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateExecuting, IdempotencyKey: "key", WorktreePath: "/secret/worktree", ArtifactRoot: "/secret/artifacts", ImplementationSession: "secret-session", LastError: "secret-error"})
 	controller := &serviceController{run: run}
@@ -216,6 +292,56 @@ func TestCommandServiceContinueUsesExpectedStateAndRepository(t *testing.T) {
 	var safe *ServiceError
 	if !errors.As(err, &safe) || safe.Category != ErrorConflict || controller.continued != 0 {
 		t.Fatalf("err=%v continued=%d", err, controller.continued)
+	}
+}
+
+func TestCommandServiceManualDecisionCannotBypassHeavyPermit(t *testing.T) {
+	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateAwaitingHumanDecision, IdempotencyKey: "key"})
+	heavyRun := run
+	heavyRun.State = domain.StateExecuting
+	controller := &serviceController{run: heavyRun}
+	store := &serviceSchedulingStore{serviceStore: serviceStore{run: run}, enabled: true}
+	decision := &Decision{ChoiceID: "continue"}
+	command := ContinueCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey, Decision: decision}
+	if _, err := NewCommandService(controller, store).Continue(context.Background(), command); err == nil || controller.continued != 1 || store.acquireCalls != 1 {
+		t.Fatalf("err=%v continued=%d acquires=%d", err, controller.continued, store.acquireCalls)
+	}
+	store.held = true
+	if _, err := NewCommandService(controller, store).Continue(context.Background(), command); err != nil || controller.continued != 3 || store.acquireCalls != 2 || store.releaseCalls != 1 {
+		t.Fatalf("err=%v continued=%d acquires=%d releases=%d", err, controller.continued, store.acquireCalls, store.releaseCalls)
+	}
+}
+
+func TestCommandServiceManualContinueReconcilesBeforePermitAdoption(t *testing.T) {
+	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateExecuting, IdempotencyKey: "key"})
+	controller := &serviceController{run: run}
+	store := &serviceSchedulingStore{
+		serviceStore:  serviceStore{run: run},
+		enabled:       true,
+		held:          true,
+		acquireErrors: []error{ErrHeavyPermitProcessReconciliationRequired},
+	}
+	command := ContinueCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}
+	if _, err := NewCommandService(controller, store).Continue(context.Background(), command); err != nil {
+		t.Fatal(err)
+	}
+	if controller.reconciled != 1 || controller.continued != 1 || store.acquireCalls != 2 || store.releaseCalls != 1 {
+		t.Fatalf("reconciled=%d continued=%d acquires=%d releases=%d", controller.reconciled, controller.continued, store.acquireCalls, store.releaseCalls)
+	}
+}
+
+func TestCommandServiceUsesUniqueBoundManualSupervisorOwnerAndReleases(t *testing.T) {
+	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateExecuting, IdempotencyKey: "key"})
+	controller := &serviceController{run: run}
+	store := &serviceSchedulingStore{serviceStore: serviceStore{run: run}, enabled: true, held: true}
+	command := ContinueCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey}
+	for _, owner := range []string{"manual:run:first", "manual:run:second"} {
+		if _, err := NewCommandService(controller, store).Continue(WithManualHeavyPermitOwner(context.Background(), owner), command); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !reflect.DeepEqual(store.owners, []string{"manual:run:first", "manual:run:second"}) || store.releaseCalls != 2 {
+		t.Fatalf("owners=%v releases=%d", store.owners, store.releaseCalls)
 	}
 }
 

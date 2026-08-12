@@ -62,9 +62,11 @@ the state machine.
 - Versioned, secret-free local configuration with inline repository profiles
   and narrow GitHub App authorities.
 - Manual Linear admission and disabled-by-default automatic Todo admission.
-- Deterministically ordered single-run worker scheduling, durable leases, retry schedules,
-  restart-stable parked states, local operator-attention records, and durable
-  provenance for explicit authenticated recovery answers.
+- Deterministically ordered bounded worker scheduling with one nonterminal run
+  per repository, a configurable local-heavy-work capacity, durable leases and
+  permits, restart-stable parked states, retry schedules, local
+  operator-attention records, and durable provenance for explicit authenticated
+  recovery answers.
 - Isolated worktrees, resumable Codex implementation sessions, structured
   outcomes, repository-owned verifier commands, and fresh read-only review that
   binds post-repair passes to exact controller-selected finding dispositions.
@@ -79,7 +81,7 @@ the state machine.
   verified external merges.
 - macOS LaunchAgent and headless system LaunchDaemon tooling for building,
   installing, validating, starting, observing, and stopping exactly one local
-  non-root worker.
+  non-root supervisor process.
 
 ## Safety and Trust Model
 
@@ -149,7 +151,7 @@ separately maintained Web UI under
 [roadmap #99](https://github.com/ifan0927/Agent-Loop-Controller/issues/99).
 These operator-product capabilities are planned, not current behavior. Outbound
 notifications, Hermes runtime integration, public API/webhook admission, and
-broader concurrent or cross-repository operation remain deferred or exploratory.
+cross-repository transactions remain deferred or exploratory.
 
 See [Roadmap](docs/roadmap.md) for status categories and current tracking.
 

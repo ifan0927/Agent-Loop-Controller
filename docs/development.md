@@ -94,7 +94,9 @@ Important integration boundaries include:
 - implementation interruption and explicit session resume;
 - exact-head verifier/review authorization and invalidation;
 - intent-before-write plus post-interruption reconciliation;
-- automatic scheduler lease, one-active-run, deterministic total ordering, and durable retry;
+- short admission lease, per-repository slots, generic heavy-work permits,
+  process-lock-fenced permit adoption, deterministic total ordering, earliest
+  persisted runnable wakeup, and durable retry;
 - trusted review feedback identity/lifecycle/reply idempotency;
 - source sync and partial ownership-safe cleanup;
 - CLI restart using a second process and the same SQLite database.
@@ -105,7 +107,7 @@ Important integration boundaries include:
 LaunchDaemon unit tests inject user/root identities and launchctl observations;
 they never require root or mutate `/Library/LaunchDaemons`. Real headless
 acceptance is an external E2E gate: authenticate a FileVault restart, reconnect
-without a GUI login, prove one non-root worker and the sole scheduler-lease
+without a GUI login, prove one non-root worker and the sole admission-lease
 namespace, then exercise the documented rollback. Keep every Linear fixture in
 Triage until that supervisor recovery is proven; moving the unique fixture to
 the intended cycle and Todo is a separate human admission action.
@@ -300,7 +302,8 @@ The acceptance matrix requires:
 
 | Boundary | Required evidence |
 | --- | --- |
-| Automatic admission | Bounded scan, unique priority selection, journaled reservation, exact Todo-to-In-Progress mutation, one run |
+| Automatic admission | Bounded scan, priority selection, atomic run/slot/permit reservation, exact Todo-to-In-Progress mutation, and one nonterminal run per repository |
+| Bounded concurrency | Generic capacity above two, same-repository exclusion, drain-on-reduction, sibling failure isolation, and restart reconstruction |
 | Implementation | Owned worktree, resumable session, exact candidate, successful verifier batch |
 | Internal review | Fresh independent read-only review bound to candidate head; after repair, exact expected-finding dispositions cover both repair and full branch deltas |
 | Delivery | One owned branch/PR, required CI at exact head |

@@ -176,6 +176,16 @@ func TestLocalCommandsAcceptDocumentedLeadingRunID(t *testing.T) {
 	}
 }
 
+func TestNormalizeControllerDatabasePathAcceptsRelativeCLIPath(t *testing.T) {
+	path, err := normalizeControllerDatabasePath("./controller.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(path) || filepath.Base(path) != "controller.db" {
+		t.Fatalf("normalized database path=%q", path)
+	}
+}
+
 func TestLocalContinueRequiresCallerCASExpectations(t *testing.T) {
 	err := localContinue([]string{"run-123", "--db", "/unused/controller.db", "--registry", "/unused/registry.json", "--requester", "ifan0927", "--repository", "owner/repo"})
 	if err == nil || !strings.Contains(err.Error(), "--expected-state") || !strings.Contains(err.Error(), "--idempotency-key") {

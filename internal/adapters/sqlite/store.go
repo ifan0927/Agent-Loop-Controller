@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -22,9 +23,13 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 28
+const schemaVersion = 29
 
-type Store struct{ db *sql.DB }
+type Store struct {
+	db                   *sql.DB
+	heavySupervisorMu    sync.RWMutex
+	heavySupervisorOwner string
+}
 
 func Open(path string) (*Store, error) {
 	absolute, err := filepath.Abs(path)
@@ -147,6 +152,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements = migrationV27
 		case 28:
 			statements = migrationV28
+		case 29:
+			statements = migrationV29
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -282,6 +289,78 @@ var migrationV28 = []string{
 		head_sha TEXT NOT NULL, profile_digest TEXT NOT NULL, first_seen_at TEXT NOT NULL,
 		warning_at TEXT NOT NULL DEFAULT '', closed_at TEXT NOT NULL DEFAULT '',
 		PRIMARY KEY(run_id,pr_number,head_sha,profile_digest))`,
+}
+
+// migrationV29 introduces generalized concurrency authorities. Repository
+// slots, run execution leases, heavy permits, and the admission lease remain
+// separate persisted concepts. The singleton capacity row is an effective
+// restart-time configuration identity, not a fixed array of slots.
+var migrationV29 = []string{
+	`CREATE TABLE IF NOT EXISTS heavy_capacity_authority (
+		namespace TEXT PRIMARY KEY CHECK(namespace='local_heavy_work'),
+		configured_capacity INTEGER NOT NULL CHECK(configured_capacity > 0 AND configured_capacity <= 32),
+		effective_capacity INTEGER NOT NULL CHECK(effective_capacity > 0 AND effective_capacity <= 32),
+		effective_identity TEXT NOT NULL,
+		version INTEGER NOT NULL CHECK(version > 0),
+		updated_at TEXT NOT NULL
+	)`,
+	`INSERT OR IGNORE INTO heavy_capacity_authority(namespace,configured_capacity,effective_capacity,effective_identity,version,updated_at)
+		VALUES('local_heavy_work',2,2,'schema-v29-default',1,CURRENT_TIMESTAMP)`,
+	`CREATE TABLE IF NOT EXISTS repository_slots (
+		repository_binding_digest TEXT PRIMARY KEY,
+		run_id TEXT NOT NULL UNIQUE REFERENCES runs(run_id),
+		version INTEGER NOT NULL CHECK(version > 0),
+		acquired_at TEXT NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS heavy_permits (
+		run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+		owner_nonce TEXT NOT NULL,
+		version INTEGER NOT NULL CHECK(version > 0),
+		acquired_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS run_scheduling (
+		run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+		runnable_since TEXT NOT NULL,
+		runnable_since_unix_ns INTEGER NOT NULL,
+		supervisor_state TEXT NOT NULL CHECK(supervisor_state IN ('waiting','running','external_wait','human_wait','terminal','quarantined')),
+		quarantined INTEGER NOT NULL DEFAULT 0 CHECK(quarantined IN (0,1)),
+		reason_code TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS run_scheduling_runnable ON run_scheduling(quarantined,supervisor_state,runnable_since_unix_ns,run_id)`,
+	`CREATE TABLE IF NOT EXISTS queue_snapshot (
+		namespace TEXT PRIMARY KEY CHECK(namespace='latest_complete'),
+		digest TEXT NOT NULL,
+		observed_at TEXT NOT NULL,
+		effective_capacity_identity TEXT NOT NULL,
+		candidates_json TEXT NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS scheduling_decisions (
+		decision_id TEXT PRIMARY KEY,
+		snapshot_digest TEXT NOT NULL,
+		observed_at TEXT NOT NULL,
+		capacity_identity TEXT NOT NULL,
+		issue_uuid TEXT NOT NULL,
+		issue_sequence INTEGER NOT NULL CHECK(issue_sequence > 0),
+		priority INTEGER NOT NULL CHECK(priority BETWEEN 0 AND 4),
+		repository_profile_id TEXT NOT NULL,
+		run_id TEXT NOT NULL DEFAULT '',
+		repository_binding_digest TEXT NOT NULL DEFAULT '',
+		classification TEXT NOT NULL,
+		reason_code TEXT NOT NULL,
+		repository_slot_version INTEGER NOT NULL DEFAULT 0,
+		heavy_permit_version INTEGER NOT NULL DEFAULT 0,
+		admission_lease_version INTEGER NOT NULL DEFAULT 0
+	)`,
+	`CREATE INDEX IF NOT EXISTS scheduling_decisions_observed ON scheduling_decisions(observed_at,decision_id)`,
+	`CREATE TRIGGER IF NOT EXISTS release_terminal_scheduling_authority AFTER UPDATE OF current_state ON runs
+		WHEN NEW.current_state IN ('rejected','failed','completed')
+		BEGIN
+			DELETE FROM heavy_permits WHERE run_id=NEW.run_id;
+			DELETE FROM repository_slots WHERE run_id=NEW.run_id;
+			UPDATE run_scheduling SET supervisor_state='terminal',quarantined=0,reason_code='',updated_at=NEW.updated_at WHERE run_id=NEW.run_id;
+		END`,
 }
 
 var migrationV3 = []string{
@@ -603,6 +682,8 @@ func migrateOperatorAttentionV23Tx(ctx context.Context, tx *sql.Tx) error {
 
 func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput) (application.Run, bool, error) {
 	run := input.Run
+	hasExplicitSchedulingAuthority := strings.TrimSpace(run.RepositoryBindingDigest) != ""
+	ensureRepositoryBindingDigest(&run)
 	now := time.Now().UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -636,11 +717,26 @@ func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput)
 		VALUES(?,1,'',?,'run created','task snapshot','',?)`, run.ID, domain.StateReceived, formatTime(now)); err != nil {
 		return application.Run{}, false, err
 	}
+	if hasExplicitSchedulingAuthority {
+		if _, _, reserved, err := reserveSchedulingAuthoritiesTx(ctx, tx, run, application.SchedulingReservation{}, s.defaultHeavyPermitOwner(run.ID), now); err != nil {
+			return application.Run{}, false, err
+		} else if !reserved {
+			return application.Run{}, false, errors.New("repository slot or heavy capacity is unavailable")
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return application.Run{}, false, err
 	}
 	created, err := s.GetRun(ctx, run.ID)
 	return created, true, err
+}
+
+func ensureRepositoryBindingDigest(run *application.Run) {
+	if run == nil || run.RepositoryBindingDigest != "" || strings.TrimSpace(run.Repository) == "" {
+		return
+	}
+	sum := sha256.Sum256([]byte("legacy-repository-binding:" + strings.ToLower(strings.TrimSpace(run.Repository))))
+	run.RepositoryBindingDigest = hex.EncodeToString(sum[:])
 }
 
 func localOwnershipConflict(existingJSON, currentJSON string) bool {

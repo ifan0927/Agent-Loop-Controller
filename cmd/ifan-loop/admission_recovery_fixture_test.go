@@ -80,6 +80,11 @@ func TestOfflineAcceptanceWorkerRestartPreservesRetryAndParksAtDurableAttention(
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
+	if delay := time.Until(schedules[0].NextEligibleAt); delay > 0 {
+		if err := waitAdmissionWorker(ctx, delay); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	store, err = storeadapter.Open(dbPath)
 	if err != nil {
@@ -93,7 +98,7 @@ func TestOfflineAcceptanceWorkerRestartPreservesRetryAndParksAtDurableAttention(
 	secondCtx, stopSecond := context.WithCancel(ctx)
 	secondWait := func(waitCtx context.Context, delay time.Duration) error {
 		waits = append(waits, delay)
-		if len(waits) == 2 {
+		if len(waits) == 1 {
 			stopSecond()
 			return context.Canceled
 		}
@@ -104,10 +109,10 @@ func TestOfflineAcceptanceWorkerRestartPreservesRetryAndParksAtDurableAttention(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if secondResult.Cycles != 2 || secondResult.LastOutcome != application.LinearTodoDispatchAttention || secondResult.Stopped != "canceled" {
+	if secondResult.Cycles != 1 || secondResult.LastOutcome != application.LinearTodoDispatchAttention || secondResult.Stopped != "canceled" {
 		t.Fatalf("second worker=%+v err=%v", secondResult, err)
 	}
-	if len(waits) != 2 || waits[0] <= 0 || waits[0] > application.DefaultAutomaticRetryInitialDelay || waits[1] != time.Minute {
+	if len(waits) != 1 || waits[0] != time.Minute {
 		t.Fatalf("durable retry waits=%v", waits)
 	}
 	if first.scanner.calls()+second.scanner.calls() != 1 || len(first.starter.mutations())+len(second.starter.mutations()) != 1 || first.driver.calls()+second.driver.calls() != 1 || first.worktrees.calls()+second.worktrees.calls() != 1 {

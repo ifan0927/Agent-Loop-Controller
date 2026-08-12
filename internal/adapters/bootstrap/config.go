@@ -23,7 +23,8 @@ import (
 const (
 	LegacyVersion  = 1
 	VersionTwo     = 2
-	CurrentVersion = 3
+	VersionThree   = 3
+	CurrentVersion = 4
 
 	minimumDeliveryPollInterval = 30 * time.Second
 	maximumDeliveryPollInterval = 5 * time.Minute
@@ -87,10 +88,12 @@ type LinearTodoAdmission struct {
 	SchedulerLeaseRenewal time.Duration
 	MaxCandidates         int
 	MaxPages              int
-	MaxActiveRuns         int
-	Requester             localregistry.TrustedActorIdentity
-	NotificationMode      string
-	CredentialSourceRef   string
+	// MaxActiveRuns is populated only when reading legacy version 3 input.
+	MaxActiveRuns       int
+	HeavyCapacity       int
+	Requester           localregistry.TrustedActorIdentity
+	NotificationMode    string
+	CredentialSourceRef string
 }
 
 type WorkflowState struct {
@@ -145,7 +148,7 @@ type readinessLinearTodoAdmission struct {
 	SchedulerLeaseRenewal string              `json:"scheduler_lease_renewal_interval,omitempty"`
 	MaxCandidates         int                 `json:"max_candidates,omitempty"`
 	MaxPages              int                 `json:"max_pages,omitempty"`
-	MaxActiveRuns         int                 `json:"max_active_runs,omitempty"`
+	HeavyCapacity         int                 `json:"heavy_capacity,omitempty"`
 	Requester             *readinessRequester `json:"requester,omitempty"`
 }
 
@@ -182,7 +185,7 @@ func (b Bootstrap) Readiness() any {
 		admission.SchedulerLeaseRenewal = configured.SchedulerLeaseRenewal.String()
 		admission.MaxCandidates = configured.MaxCandidates
 		admission.MaxPages = configured.MaxPages
-		admission.MaxActiveRuns = configured.MaxActiveRuns
+		admission.HeavyCapacity = configured.HeavyCapacity
 		admission.Requester = &readinessRequester{DatabaseID: configured.Requester.DatabaseID, NodeID: configured.Requester.NodeID, Login: configured.Requester.Login, Type: configured.Requester.Type}
 	}
 	return readinessFile{Version: b.Version, ConfigurationDigest: b.Digest, Offline: true,
@@ -230,7 +233,8 @@ type linearTodoAdmissionFile struct {
 	SchedulerLeaseRenewalInterval string            `json:"scheduler_lease_renewal_interval"`
 	MaxCandidates                 int               `json:"max_candidates"`
 	MaxPages                      int               `json:"max_pages"`
-	MaxActiveRuns                 int               `json:"max_active_runs"`
+	MaxActiveRuns                 json.RawMessage   `json:"max_active_runs"`
+	HeavyCapacity                 json.RawMessage   `json:"heavy_capacity"`
 	Requester                     requesterFile     `json:"requester"`
 	NotificationMode              string            `json:"notification_mode"`
 	CredentialSourceRef           string            `json:"credential_source_ref"`
@@ -276,7 +280,7 @@ func Load(path string) (Bootstrap, error) {
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return Bootstrap{}, invalid("controller configuration must contain one strict JSON value")
 	}
-	if raw.Version != LegacyVersion && raw.Version != VersionTwo && raw.Version != CurrentVersion {
+	if raw.Version != LegacyVersion && raw.Version != VersionTwo && raw.Version != VersionThree && raw.Version != CurrentVersion {
 		return Bootstrap{}, invalid("unsupported controller configuration version")
 	}
 	controller, err := decodeController(raw.Controller)
@@ -331,7 +335,7 @@ func decodeRegistry(raw configFile) (localregistry.Registry, string, error) {
 			return localregistry.Registry{}, "", invalid("repository registry is invalid")
 		}
 		return registry, registryPath, nil
-	case VersionTwo, CurrentVersion:
+	case VersionTwo, VersionThree, CurrentVersion:
 		if len(raw.RepositoryRegistryFile) != 0 {
 			return localregistry.Registry{}, "", invalid("controller configuration must use inline repositories")
 		}
@@ -361,9 +365,9 @@ func decodeRegistry(raw configFile) (localregistry.Registry, string, error) {
 // credential source. The configuration remains inert until the worker composes
 // its admission and delivery mechanisms.
 func decodeAutomation(raw configFile, registry localregistry.Registry) (Automation, error) {
-	if raw.Version != CurrentVersion {
+	if raw.Version != VersionThree && raw.Version != CurrentVersion {
 		if len(raw.Automation) != 0 {
-			return Automation{}, invalid("automatic admission requires controller configuration version 3")
+			return Automation{}, invalid("automatic admission requires controller configuration version 3 or 4")
 		}
 		return Automation{}, nil
 	}
@@ -391,10 +395,10 @@ func decodeAutomation(raw configFile, registry localregistry.Registry) (Automati
 	if !*admission.Enabled {
 		return Automation{}, nil
 	}
-	return validateLinearTodoAdmission(admission, registry)
+	return validateLinearTodoAdmission(admission, registry, raw.Version)
 }
 
-func validateLinearTodoAdmission(raw linearTodoAdmissionFile, registry localregistry.Registry) (Automation, error) {
+func validateLinearTodoAdmission(raw linearTodoAdmissionFile, registry localregistry.Registry, version int) (Automation, error) {
 	if !validUUID(raw.TeamID) || raw.TeamKey != "IFAN" ||
 		!validWorkflowState(raw.TodoState, "Todo", "unstarted") ||
 		!validWorkflowState(raw.InProgressState, "In Progress", "started") ||
@@ -425,7 +429,24 @@ func validateLinearTodoAdmission(raw linearTodoAdmissionFile, registry localregi
 	if err != nil || leaseRenewal < 5*time.Second || leaseRenewal > leaseTTL/2 {
 		return Automation{}, invalid("automatic admission scheduler lease renewal is invalid")
 	}
-	if raw.MaxCandidates < 1 || raw.MaxCandidates > 100 || raw.MaxPages < 1 || raw.MaxPages > 20 || raw.MaxActiveRuns != 1 {
+	heavyCapacity := 0
+	if version == VersionThree {
+		var maxActiveRuns int
+		if len(raw.MaxActiveRuns) == 0 || string(raw.MaxActiveRuns) == "null" || json.Unmarshal(raw.MaxActiveRuns, &maxActiveRuns) != nil || maxActiveRuns != 1 || len(raw.HeavyCapacity) != 0 {
+			return Automation{}, invalid("automatic admission singleton migration authority is invalid")
+		}
+		heavyCapacity = 1
+	} else {
+		if len(raw.MaxActiveRuns) != 0 {
+			return Automation{}, invalid("max_active_runs is retired; use heavy_capacity")
+		}
+		if len(raw.HeavyCapacity) == 0 {
+			heavyCapacity = 2
+		} else if string(raw.HeavyCapacity) == "null" || json.Unmarshal(raw.HeavyCapacity, &heavyCapacity) != nil {
+			return Automation{}, invalid("automatic admission limits are invalid")
+		}
+	}
+	if raw.MaxCandidates < 1 || raw.MaxCandidates > 100 || raw.MaxPages < 1 || raw.MaxPages > 20 || heavyCapacity < 1 || heavyCapacity > 32 {
 		return Automation{}, invalid("automatic admission limits are invalid")
 	}
 	if raw.NotificationMode != "local_outbox" || !linearadapter.ValidCredentialSourceRef(raw.CredentialSourceRef) {
@@ -442,7 +463,12 @@ func validateLinearTodoAdmission(raw linearTodoAdmissionFile, registry localregi
 		TodoState:       WorkflowState{ID: raw.TodoState.ID, Name: raw.TodoState.Name, Type: raw.TodoState.Type},
 		InProgressState: WorkflowState{ID: raw.InProgressState.ID, Name: raw.InProgressState.Name, Type: raw.InProgressState.Type},
 		PollInterval:    poll, DeliveryPollInterval: deliveryPoll, SchedulerLeaseTTL: leaseTTL, SchedulerLeaseRenewal: leaseRenewal, MaxCandidates: raw.MaxCandidates,
-		MaxPages: raw.MaxPages, MaxActiveRuns: raw.MaxActiveRuns, Requester: requester, NotificationMode: raw.NotificationMode,
+		MaxPages: raw.MaxPages, MaxActiveRuns: func() int {
+			if version == VersionThree {
+				return 1
+			}
+			return 0
+		}(), HeavyCapacity: heavyCapacity, Requester: requester, NotificationMode: raw.NotificationMode,
 		CredentialSourceRef: raw.CredentialSourceRef}}, nil
 }
 

@@ -138,6 +138,7 @@ func (s *Store) ReserveLinearTodoAdmission(ctx context.Context, reservation appl
 	if err != nil {
 		return application.Run{}, application.LinearTodoAdmissionJournal{}, false, err
 	}
+	ensureRepositoryBindingDigest(&run)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return application.Run{}, application.LinearTodoAdmissionJournal{}, false, err
@@ -150,13 +151,6 @@ func (s *Store) ReserveLinearTodoAdmission(ctx context.Context, reservation appl
 	if err := requireNoAdmissionJournalCorruption(ctx, tx); err != nil {
 		return application.Run{}, application.LinearTodoAdmissionJournal{}, false, err
 	}
-	var active int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE current_state NOT IN ('rejected','failed','completed')`).Scan(&active); err != nil {
-		return application.Run{}, application.LinearTodoAdmissionJournal{}, false, err
-	}
-	if active != 0 {
-		return application.Run{}, application.LinearTodoAdmissionJournal{}, false, nil
-	}
 	var existing int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM linear_todo_admission_journal WHERE issue_uuid=? OR run_id=?`, journal.IssueUUID, journal.RunID).Scan(&existing); err != nil {
 		return application.Run{}, application.LinearTodoAdmissionJournal{}, false, err
@@ -167,9 +161,22 @@ func (s *Store) ReserveLinearTodoAdmission(ctx context.Context, reservation appl
 	if err := insertReservedRun(ctx, tx, run, now); err != nil {
 		return application.Run{}, application.LinearTodoAdmissionJournal{}, false, fmt.Errorf("reserve automatic admission run: %w", err)
 	}
+	slot, permit, available, err := reserveSchedulingAuthoritiesTx(ctx, tx, run, reservation.Scheduling, "", now)
+	if err != nil {
+		return application.Run{}, application.LinearTodoAdmissionJournal{}, false, err
+	}
+	if !available {
+		return application.Run{}, application.LinearTodoAdmissionJournal{}, false, nil
+	}
 	journal.CreatedAt, journal.UpdatedAt = now, now
 	if _, err := tx.ExecContext(ctx, `INSERT INTO linear_todo_admission_journal(issue_uuid,run_id,scan_digest,task_digest,profile_digest,status,mutation_intent_ref,reason_code,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, journal.IssueUUID, journal.RunID, journal.ScanDigest, journal.TaskDigest, journal.ProfileDigest, journal.Status, journal.MutationIntentRef, journal.ReasonCode, formatTime(journal.CreatedAt), formatTime(journal.UpdatedAt)); err != nil {
 		return application.Run{}, application.LinearTodoAdmissionJournal{}, false, err
+	}
+	if reservation.Scheduling.Enabled() {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO scheduling_decisions(decision_id,snapshot_digest,observed_at,capacity_identity,issue_uuid,issue_sequence,priority,repository_profile_id,run_id,repository_binding_digest,classification,reason_code,repository_slot_version,heavy_permit_version,admission_lease_version)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, reservation.Scheduling.DecisionID, reservation.ScanDigest, formatTime(now), reservation.Scheduling.CapacityIdentity, reservation.IssueUUID, reservation.Scheduling.IssueSequence, reservation.Scheduling.Priority, reservation.Scheduling.RepositoryProfileID, run.ID, run.RepositoryBindingDigest, application.QueueCandidateSelected, "reserved", slot.Version, permit.Version, reservation.Lease.Version); err != nil {
+			return application.Run{}, application.LinearTodoAdmissionJournal{}, false, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return application.Run{}, application.LinearTodoAdmissionJournal{}, false, err

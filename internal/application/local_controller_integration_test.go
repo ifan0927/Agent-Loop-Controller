@@ -156,6 +156,15 @@ type durableFakeProcess struct {
 	reviewStdin                                   []string
 }
 
+type attemptStopperFake struct {
+	calls int
+}
+
+func (s *attemptStopperFake) StopAttempt(context.Context, string, string) error {
+	s.calls++
+	return nil
+}
+
 func (p *durableFakeProcess) Run(ctx context.Context, s processadapter.Spec) (processadapter.Result, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1330,6 +1339,112 @@ func TestRestartRecoversStartedAttemptSessionAndResumesExplicitly(t *testing.T) 
 	}
 	if !found {
 		t.Fatal("recovered interrupted attempt evidence missing")
+	}
+}
+
+func TestInterruptedAttemptReconciliationOwnsRunLeaseBeforeStoppingProcess(t *testing.T) {
+	lab := newLocalLab(t)
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	process := &durableFakeProcess{}
+	wrapper := &failAfterTransitionStore{RunStore: store, from: domain.StateProvisioning, to: domain.StateExecuting, remaining: 1}
+	run, err := newController(t, wrapper, lab, process, gitadapter.Workspace{}).Start(context.Background(), startInput(lab))
+	if err == nil || run.State != domain.StateExecuting {
+		t.Fatalf("run=%+v err=%v", run, err)
+	}
+	directory := filepath.Join(run.ArtifactRoot, "attempts", "interrupted-reconcile")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	attempt, err := store.BeginAttempt(context.Background(), run.ID, "implementation", codex.ImplementationModel, directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed, err := store.CommitAttemptProcessLaunch(context.Background(), attempt.ID); err != nil || !committed {
+		t.Fatalf("commit process launch: committed=%t err=%v", committed, err)
+	}
+	mustWrite(t, filepath.Join(directory, "implementation.stdout.jsonl"), "{\"type\":\"thread.started\",\"thread_id\":\"reconciled-session\"}\n")
+	mustWrite(t, filepath.Join(directory, "implementation.stderr.txt"), "")
+	if ok, err := store.AcquireLease(context.Background(), run.ID, "competing-controller", time.Now().Add(time.Minute)); err != nil || !ok {
+		t.Fatalf("lease=%v err=%v", ok, err)
+	}
+	stopper := &attemptStopperFake{}
+	workspace := gitadapter.Workspace{}
+	registry := verifier.NewRegistry(map[string]verifier.Command{"fixture-go-test": {Program: "go", Args: []string{"test", "./..."}}}, processadapter.OSRunner{}, workspace)
+	controller := application.NewLocalControllerWithAttemptStopper(store, testWorktrees{}, codex.NewExecutor(process, "codex"), registry, workspace, "codex", lab.worktrees, stopper)
+	if err := controller.ReconcileInterruptedRun(context.Background(), run.ID); err == nil || !strings.Contains(err.Error(), "active run lease") {
+		t.Fatalf("reconcile competing lease error=%v", err)
+	}
+	if stopper.calls != 0 {
+		t.Fatalf("stop calls while competing lease is active=%d", stopper.calls)
+	}
+	if err := store.ReleaseLease(context.Background(), run.ID, "competing-controller"); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.ReconcileInterruptedRun(context.Background(), run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if stopper.calls != 1 {
+		t.Fatalf("stop calls=%d", stopper.calls)
+	}
+	inspection, err := store.Inspect(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Run.ImplementationSession != "reconciled-session" {
+		t.Fatalf("implementation session=%q", inspection.Run.ImplementationSession)
+	}
+	for _, persisted := range inspection.Attempts {
+		if persisted.ID == attempt.ID && persisted.Status == "failed" && persisted.ErrorCategory == "controller_restart_session_recovered" {
+			return
+		}
+	}
+	t.Fatalf("reconciled attempt evidence missing: %+v", inspection.Attempts)
+}
+
+func TestInterruptedAttemptWithoutSessionPersistsManualIntervention(t *testing.T) {
+	lab := newLocalLab(t)
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	process := &durableFakeProcess{}
+	wrapper := &failAfterTransitionStore{RunStore: store, from: domain.StateProvisioning, to: domain.StateExecuting, remaining: 1}
+	run, err := newController(t, wrapper, lab, process, gitadapter.Workspace{}).Start(context.Background(), startInput(lab))
+	if err == nil || run.State != domain.StateExecuting {
+		t.Fatalf("run=%+v err=%v", run, err)
+	}
+	directory := filepath.Join(run.ArtifactRoot, "attempts", "missing-session-reconcile")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	attempt, err := store.BeginAttempt(context.Background(), run.ID, "implementation", codex.ImplementationModel, directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed, err := store.CommitAttemptProcessLaunch(context.Background(), attempt.ID); err != nil || !committed {
+		t.Fatalf("commit process launch: committed=%t err=%v", committed, err)
+	}
+	stopper := &attemptStopperFake{}
+	registry := verifier.NewRegistry(map[string]verifier.Command{"fixture-go-test": {Program: "go", Args: []string{"test", "./..."}}}, processadapter.OSRunner{}, gitadapter.Workspace{})
+	controller := application.NewLocalControllerWithAttemptStopper(store, testWorktrees{}, codex.NewExecutor(process, "codex"), registry, gitadapter.Workspace{}, "codex", lab.worktrees, stopper)
+	if err := controller.ReconcileInterruptedRun(context.Background(), run.ID); err == nil || !strings.Contains(err.Error(), "no recoverable explicit session ID") {
+		t.Fatalf("reconcile error=%v", err)
+	}
+	inspection, err := store.Inspect(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Run.State != domain.StateManualIntervention || stopper.calls != 1 {
+		t.Fatalf("state=%s stop_calls=%d", inspection.Run.State, stopper.calls)
+	}
+	latest := inspection.Timeline[len(inspection.Timeline)-1]
+	if latest.To != domain.StateManualIntervention || !strings.Contains(latest.EvidenceReference, "controller_restart_missing_session") {
+		t.Fatalf("latest transition=%+v", latest)
 	}
 }
 

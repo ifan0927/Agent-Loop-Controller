@@ -35,7 +35,7 @@ func TestResolveConfigPathPreservesExplicitOverride(t *testing.T) {
 	}
 }
 
-func TestConfigInitCreatesExclusiveSecretFreeV3Template(t *testing.T) {
+func TestConfigInitCreatesExclusiveSecretFreeV4Template(t *testing.T) {
 	home := resolvedTempDir(t)
 	withTestHome(t, home)
 
@@ -76,7 +76,7 @@ func TestConfigInitCreatesExclusiveSecretFreeV3Template(t *testing.T) {
 	if err := json.Unmarshal(raw, &template); err != nil {
 		t.Fatalf("template JSON: %v", err)
 	}
-	if template.Version != 3 || len(template.GitHubAppProfiles) != 0 || len(template.Repositories) != 0 || template.Automation.LinearTodoAdmission.Enabled {
+	if template.Version != 4 || len(template.GitHubAppProfiles) != 0 || len(template.Repositories) != 0 || template.Automation.LinearTodoAdmission.Enabled || template.Automation.LinearTodoAdmission.HeavyCapacity != 2 {
 		t.Fatalf("unexpected template: %#v", template)
 	}
 	if template.Controller.DatabasePath != filepath.Join(filepath.Dir(path), "controller.db") {

@@ -162,6 +162,33 @@ type driverCoordinator struct {
 	branchPublisher BranchPublisher
 	pullRequestOpen PullRequestOpener
 	sourceSync      SourceSyncPort
+	reconciled      int
+	reconcileErr    error
+}
+
+type driverHeavyScheduler struct {
+	acquireCalls  int
+	releaseCalls  int
+	held          bool
+	acquireErrors []error
+}
+
+func (s *driverHeavyScheduler) AcquireHeavyPermit(_ context.Context, runID, owner string, now time.Time) (HeavyPermit, bool, error) {
+	s.acquireCalls++
+	if len(s.acquireErrors) > 0 {
+		err := s.acquireErrors[0]
+		s.acquireErrors = s.acquireErrors[1:]
+		return HeavyPermit{}, false, err
+	}
+	if !s.held {
+		return HeavyPermit{}, false, nil
+	}
+	return HeavyPermit{RunID: runID, OwnerNonce: owner, Version: 1, AcquiredAt: now, UpdatedAt: now}, true, nil
+}
+
+func (s *driverHeavyScheduler) ReleaseHeavyPermit(context.Context, HeavyPermit, string, time.Time) (bool, error) {
+	s.releaseCalls++
+	return true, nil
 }
 
 func (c *driverCoordinator) record(action ProductionAction) error {
@@ -170,6 +197,11 @@ func (c *driverCoordinator) record(action ProductionAction) error {
 		return c.apply(action)
 	}
 	return nil
+}
+
+func (c *driverCoordinator) ReconcileInterruptedRun(context.Context, string) error {
+	c.reconciled++
+	return c.reconcileErr
 }
 
 func (c *driverCoordinator) Continue(context.Context, ProductionContinueCommand) (ProductionResult, error) {
@@ -536,6 +568,88 @@ func TestProductionDriverUnavailableRetryHonorsCancellation(t *testing.T) {
 	_, err := driver.Drive(ctx, driverCommand())
 	if !errors.Is(err, context.Canceled) || len(coordinator.calls) != 1 {
 		t.Fatalf("err=%v calls=%v", err, coordinator.calls)
+	}
+}
+
+func TestProductionDriverReturnsRetryableFailureToExternalScheduler(t *testing.T) {
+	reader := &driverRunReader{run: driverRun(domain.StateReconcilingReviews)}
+	coordinator := &driverCoordinator{runs: reader, apply: func(ProductionAction) error {
+		return serviceError(ErrorUnavailable, "temporary GitHub read failure", errors.New("transport"))
+	}}
+	driver, err := NewProductionDriver(coordinator, reader, reader, reader, ProductionDriverPorts{
+		GitHubReader:      driverGitHubReader{},
+		ApprovalValidator: driverApprovalValidator{},
+		SquashMerger:      driverMerger{},
+		CleanupPort:       driverCleanupPort{},
+		SourceSyncPort:    driverSourceSyncPort{},
+	}, ProductionDriverPolicy{PollInterval: time.Second, MaxImmediateAction: 8, ReturnOnExternalWait: true}, func(context.Context, time.Duration) error {
+		t.Fatal("external scheduler mode must not poll after a retryable failure")
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = driver.Drive(context.Background(), driverCommand())
+	var safe *ServiceError
+	if !errors.As(err, &safe) || safe.Category != ErrorUnavailable || len(coordinator.calls) != 1 {
+		t.Fatalf("err=%v calls=%v", err, coordinator.calls)
+	}
+}
+
+func TestProductionDriverAcquiresPermitBeforeExternalTransitionStartsHeavyWork(t *testing.T) {
+	reader := &driverRunReader{run: driverRun(domain.StateReconcilingReviews)}
+	coordinator := &driverCoordinator{runs: reader}
+	coordinator.apply = func(action ProductionAction) error {
+		if action != ProductionReconcileGitHub {
+			t.Fatalf("heavy action ran before a permit was acquired: %s", action)
+		}
+		reader.run.State = domain.StateRepairing
+		return nil
+	}
+	scheduler := &driverHeavyScheduler{}
+	ctx, cancel := context.WithCancel(context.Background())
+	driver, err := NewProductionDriver(coordinator, reader, reader, reader, ProductionDriverPorts{
+		GitHubReader:       driverGitHubReader{},
+		ApprovalValidator:  driverApprovalValidator{},
+		SquashMerger:       driverMerger{},
+		CleanupPort:        driverCleanupPort{},
+		SourceSyncPort:     driverSourceSyncPort{},
+		HeavyWorkScheduler: scheduler,
+	}, ProductionDriverPolicy{PollInterval: time.Second, MaxImmediateAction: 8, HeavyPermitOwner: "direct-fixture"}, func(context.Context, time.Duration) error {
+		cancel()
+		return context.Canceled
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = driver.Drive(ctx, driverCommand())
+	if !errors.Is(err, context.Canceled) || scheduler.acquireCalls != 1 || len(coordinator.calls) != 1 || coordinator.calls[0] != ProductionReconcileGitHub {
+		t.Fatalf("err=%v scheduler=%+v calls=%v", err, scheduler, coordinator.calls)
+	}
+}
+
+func TestProductionDriverReconcilesStartedAttemptBeforeFirstPermit(t *testing.T) {
+	reader := &driverRunReader{run: driverRun(domain.StateExecuting)}
+	coordinator := &driverCoordinator{runs: reader}
+	scheduler := &driverHeavyScheduler{held: true, acquireErrors: []error{ErrHeavyPermitProcessReconciliationRequired}}
+	ctx, cancel := context.WithCancel(context.Background())
+	driver, err := NewProductionDriver(coordinator, reader, reader, reader, ProductionDriverPorts{
+		GitHubReader:       driverGitHubReader{},
+		ApprovalValidator:  driverApprovalValidator{},
+		SquashMerger:       driverMerger{},
+		CleanupPort:        driverCleanupPort{},
+		SourceSyncPort:     driverSourceSyncPort{},
+		HeavyWorkScheduler: scheduler,
+	}, ProductionDriverPolicy{PollInterval: time.Second, MaxImmediateAction: 8, HeavyPermitOwner: "direct-fixture"}, func(context.Context, time.Duration) error {
+		cancel()
+		return context.Canceled
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = driver.Drive(ctx, driverCommand())
+	if !errors.Is(err, context.Canceled) || coordinator.reconciled != 1 || scheduler.acquireCalls != 2 {
+		t.Fatalf("err=%v reconciled=%d acquires=%d", err, coordinator.reconciled, scheduler.acquireCalls)
 	}
 }
 

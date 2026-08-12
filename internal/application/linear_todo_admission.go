@@ -66,6 +66,7 @@ type LinearTodoAdmissionReservation struct {
 	ScanDigest string
 	IssueUUID  string
 	Input      LocalStartInput
+	Scheduling SchedulingReservation
 }
 
 // LinearTodoAdmissionJournalTransition carries the only mutable journal

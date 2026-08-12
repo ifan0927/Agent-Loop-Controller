@@ -107,16 +107,155 @@ type DurableGit interface {
 	CommitMetadata(context.Context, string, string) (string, string, error)
 }
 
+type ManagedAttemptStopper interface {
+	StopAttempt(context.Context, string, string) error
+}
+
 type LocalController struct {
-	store        RunStore
-	worktrees    WorktreeProvisioner
-	codex        DurableCodex
-	verify       VerificationRunner
-	git          DurableGit
-	commands     codex.CommandBuilder
-	planner      Planner
-	worktreeRoot string
-	repairClock  func() time.Time
+	store          RunStore
+	worktrees      WorktreeProvisioner
+	codex          DurableCodex
+	verify         VerificationRunner
+	git            DurableGit
+	commands       codex.CommandBuilder
+	planner        Planner
+	worktreeRoot   string
+	repairClock    func() time.Time
+	attemptStopper ManagedAttemptStopper
+}
+
+// NewLocalControllerWithAttemptStopper enables restart adoption only when the
+// production process adapter can prove that every persisted managed child has
+// stopped. The ordinary constructor remains useful for isolated unit fixtures
+// that never create authenticated process-control evidence.
+func NewLocalControllerWithAttemptStopper(store RunStore, worktrees WorktreeProvisioner, executor DurableCodex,
+	verification VerificationRunner, git DurableGit, codexBinary, worktreeRoot string, stopper ManagedAttemptStopper) *LocalController {
+	controller := NewLocalController(store, worktrees, executor, verification, git, codexBinary, worktreeRoot)
+	controller.attemptStopper = stopper
+	return controller
+}
+
+func (c *LocalController) ReconcileInterruptedRun(ctx context.Context, runID string) error {
+	owner, err := randomIdentifier("recovery-")
+	if err != nil {
+		return err
+	}
+	acquired, err := c.store.AcquireLease(ctx, runID, owner, time.Now().UTC().Add(localLeaseTTL))
+	if err != nil {
+		return fmt.Errorf("acquire interrupted-run lease: %w", err)
+	}
+	if !acquired {
+		return errors.New("active run lease prevents interrupted attempt reconciliation")
+	}
+	leaseCtx, cancelLease := context.WithCancelCause(ctx)
+	stopLease := make(chan struct{})
+	leaseDone := make(chan struct{})
+	go func() {
+		defer close(leaseDone)
+		ticker := time.NewTicker(localLeaseTTL / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopLease:
+				return
+			case <-leaseCtx.Done():
+				return
+			case <-ticker.C:
+				ok, renewErr := c.store.RenewLease(context.Background(), runID, owner, time.Now().UTC().Add(localLeaseTTL))
+				if renewErr != nil {
+					cancelLease(fmt.Errorf("renew interrupted-run lease: %w", renewErr))
+					return
+				}
+				if !ok {
+					cancelLease(errors.New("interrupted-run lease ownership was lost"))
+					return
+				}
+			}
+		}
+	}()
+	defer func() {
+		close(stopLease)
+		cancelLease(nil)
+		<-leaseDone
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = c.store.ReleaseLease(releaseCtx, runID, owner)
+	}()
+	ctx = leaseCtx
+
+	inspection, err := c.store.Inspect(ctx, runID)
+	if err != nil {
+		return err
+	}
+	hasStarted := false
+	for _, attempt := range inspection.Attempts {
+		if attempt.Status == "started" {
+			hasStarted = true
+			break
+		}
+	}
+	if !hasStarted {
+		return nil
+	}
+	for index := range inspection.Attempts {
+		attempt := inspection.Attempts[index]
+		if attempt.Status != "started" {
+			continue
+		}
+		if c.attemptStopper == nil || attempt.ProcessControlKey == "" {
+			return errors.New("interrupted managed attempt cannot be reconciled")
+		}
+		if err := c.attemptStopper.StopAttempt(ctx, attempt.ArtifactDir, attempt.ProcessControlKey); err != nil {
+			return fmt.Errorf("stop interrupted managed attempt: %w", err)
+		}
+		stdoutName, stderrName := attempt.Kind+".stdout.jsonl", attempt.Kind+".stderr.txt"
+		if attempt.Kind == "resume" {
+			stdoutName, stderrName = "implementation.stdout.jsonl", "implementation.stderr.txt"
+		}
+		stdoutPath := filepath.Join(attempt.ArtifactDir, stdoutName)
+		stderrPath := filepath.Join(attempt.ArtifactDir, stderrName)
+		attempt.Status = "failed"
+		attempt.FinishedAt = time.Now().UTC()
+		attempt.ExitCode = -1
+		attempt.StdoutPath = stdoutPath
+		attempt.StderrPath = stderrPath
+		var recoverErr error
+		if attempt.Kind == "implementation" || attempt.Kind == "resume" {
+			var sessionID string
+			sessionID, recoverErr = codex.ExtractSessionIDFile(stdoutPath)
+			if recoverErr == nil {
+				attempt.SessionID = sessionID
+				attempt.ErrorCategory = "controller_restart_session_recovered"
+				if err := c.store.SetImplementationSession(ctx, runID, sessionID); err != nil {
+					return err
+				}
+			} else {
+				attempt.ErrorCategory = "controller_restart_missing_session"
+			}
+		} else {
+			attempt.ErrorCategory = "controller_restart_process_stopped"
+		}
+		_ = c.populateAttemptCaptureDigests(&attempt)
+		if err := c.store.FinishAttempt(ctx, attempt); err != nil {
+			return err
+		}
+		if recoverErr != nil {
+			return c.persistMissingSessionIntervention(ctx, inspection.Run, attempt, recoverErr)
+		}
+	}
+	return nil
+}
+
+func (c *LocalController) persistMissingSessionIntervention(ctx context.Context, run Run, attempt Attempt, recoverErr error) error {
+	reason := "interrupted managed attempt has no recoverable Codex session"
+	evidence := fmt.Sprintf("attempt:%d:controller_restart_missing_session", attempt.ID)
+	if !domain.CanRequireManualIntervention(run.State) {
+		return fmt.Errorf("%s and run cannot enter manual intervention from %s: %w", reason, run.State, recoverErr)
+	}
+	if err := c.store.Transition(ctx, run.ID, run.State, domain.StateManualIntervention, reason, evidence, run.CandidateHead); err != nil {
+		return errors.Join(fmt.Errorf("interrupted attempt has no recoverable explicit session ID: %w", recoverErr), fmt.Errorf("persist fail-closed run state: %w", err))
+	}
+	return fmt.Errorf("interrupted attempt has no recoverable explicit session ID: %w", recoverErr)
 }
 
 func NewLocalController(store RunStore, worktrees WorktreeProvisioner, executor DurableCodex,
@@ -383,6 +522,12 @@ func (c *LocalController) continueExpected(ctx context.Context, runID string, ex
 				return run, nil
 			}
 			err = c.acceptDecision(ctx, run, *decision)
+			if err == nil && stopAfterHumanDecision(ctx) {
+				// The accepted decision is persisted first. Its resulting heavy state
+				// must be re-entered through CommandService's permit boundary rather
+				// than continuing local execution under the human-wait lease.
+				return c.store.GetRun(ctx, run.ID)
+			}
 		case domain.StateVerifying:
 			err = c.verifyCandidate(ctx, run)
 		case domain.StateFreshReview:
@@ -864,7 +1009,7 @@ func (c *LocalController) execute(ctx context.Context, run Run, decision *Decisi
 				if finishErr := c.store.FinishAttempt(ctx, attempt); finishErr != nil {
 					return errors.Join(recoverErr, finishErr)
 				}
-				return fmt.Errorf("interrupted attempt has no recoverable explicit session ID: %w", recoverErr)
+				return c.persistMissingSessionIntervention(ctx, run, attempt, recoverErr)
 			}
 			if err := c.store.SetImplementationSession(ctx, run.ID, sessionID); err != nil {
 				return err
