@@ -35,9 +35,9 @@ var (
 )
 
 type launchDaemonOptions struct {
-	binary, config, plist, username, home, workingDirectory string
-	uid                                                     int
-	timeout                                                 time.Duration
+	binary, legacyBinary, config, plist, username, home, workingDirectory string
+	uid                                                                   int
+	timeout                                                               time.Duration
 }
 
 func controllerLaunchDaemon(args []string) error {
@@ -63,18 +63,25 @@ func controllerLaunchDaemon(args []string) error {
 		return launchDaemonStatus(args[1:])
 	case "bootout":
 		return launchDaemonBootout(args[1:])
+	case "migration-status":
+		return launchDaemonMigrationStatus(args[1:])
+	case "migrate":
+		return launchDaemonMigrate(args[1:])
+	case "rollback":
+		return launchDaemonRollback(args[1:])
 	default:
 		return launchDaemonUsage()
 	}
 }
 
 func launchDaemonUsage() error {
-	return errors.New("usage: ifan-loop controller launchdaemon <build|render|install|doctor|validate|plist-validate|bootstrap|kickstart|status|bootout> [options]")
+	return errors.New("usage: agentctl controller launchdaemon <build|render|install|doctor|validate|plist-validate|bootstrap|kickstart|status|bootout|migration-status|migrate|rollback> [options]")
 }
 
 func parseLaunchDaemonOptions(name string, args []string) (launchDaemonOptions, error) {
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
 	binary := flags.String("binary", defaultInstalledBinary, "absolute installed controller binary")
+	legacyBinary := flags.String("legacy-binary", defaultLegacyBinary, "absolute installed legacy controller binary used only for migration or rollback")
 	config := flags.String("config", "", "absolute controller configuration")
 	plist := flags.String("plist", launchDaemonPlistPath(), "absolute system LaunchDaemon plist")
 	username := flags.String("user", "", "non-root worker account")
@@ -109,7 +116,7 @@ func parseLaunchDaemonOptions(name string, args []string) (launchDaemonOptions, 
 	if configPath == "" {
 		configPath = filepath.Join(home, "Library", "Application Support", defaultConfigDirectoryName, defaultConfigFileName)
 	}
-	options := launchDaemonOptions{binary: *binary, config: configPath, plist: *plist, username: account.Username, uid: uid, home: home, workingDirectory: workdir, timeout: *timeout}
+	options := launchDaemonOptions{binary: *binary, legacyBinary: *legacyBinary, config: configPath, plist: *plist, username: account.Username, uid: uid, home: home, workingDirectory: workdir, timeout: *timeout}
 	if !validLaunchAgentPath(options.binary) || !validLaunchAgentPath(options.config) || !validLaunchAgentPath(options.plist) || !validLaunchAgentPath(options.workingDirectory) {
 		return launchDaemonOptions{}, errors.New("LaunchDaemon paths must be absolute and canonical")
 	}
@@ -121,6 +128,10 @@ func parseLaunchDaemonOptions(name string, args []string) (launchDaemonOptions, 
 
 func launchDaemonPlistPath() string {
 	return filepath.Join(launchDaemonDirectory, launchAgentLabel+".plist")
+}
+
+func legacyLaunchDaemonPlistPath() string {
+	return filepath.Join(launchDaemonDirectory, legacyLaunchdLabel+".plist")
 }
 
 func resolveLaunchDaemonUser(override string) (*user.User, error) {
@@ -192,8 +203,11 @@ func launchDaemonReasons(options launchDaemonOptions, installValidation bool) []
 			reasons = append(reasons, "linear_credential_unavailable")
 		}
 	}
-	if launchAgentPathExists(filepath.Join(options.home, "Library", "LaunchAgents", launchAgentLabel+".plist")) {
+	if launchAgentPathExists(filepath.Join(options.home, "Library", "LaunchAgents", launchAgentLabel+".plist")) || launchAgentPathExists(filepath.Join(options.home, "Library", "LaunchAgents", legacyLaunchdLabel+".plist")) {
 		reasons = append(reasons, "launchagent_conflict")
+	}
+	if launchAgentPathExists(legacyLaunchDaemonPlistPath()) {
+		reasons = append(reasons, "legacy_service_conflict")
 	}
 	if installValidation && launchAgentPathExists(options.plist) {
 		reasons = append(reasons, "plist_exists")
@@ -329,13 +343,23 @@ func launchDaemonInstall(args []string) error {
 		result.Reason = "privilege_required"
 		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
 	}
-	if launchAgentPathExists(filepath.Join(options.home, "Library", "LaunchAgents", launchAgentLabel+".plist")) {
+	if launchAgentPathExists(filepath.Join(options.home, "Library", "LaunchAgents", launchAgentLabel+".plist")) || launchAgentPathExists(filepath.Join(options.home, "Library", "LaunchAgents", legacyLaunchdLabel+".plist")) {
 		result.Reason = "launchagent_conflict"
+		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
+	}
+	if launchAgentPathExists(legacyLaunchDaemonPlistPath()) {
+		result.Reason = "legacy_service_conflict"
 		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
 	}
 	if len(launchDaemonAssetReasons(options)) != 0 {
 		result.Reason = "worker_assets_unsafe"
 		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
+	}
+	ctx, cancel := localContext(options.timeout)
+	defer cancel()
+	if err := verifyNoLaunchAgentConflict(ctx, options); err != nil {
+		result.Reason, _ = launchAgentControlErrorCode(err)
+		return writeLaunchAgentControlResult(result, err)
 	}
 	desired := []byte(renderLaunchDaemonPlist(options))
 	parent, err := openLaunchAgentParent(options.plist)
@@ -344,8 +368,6 @@ func launchDaemonInstall(args []string) error {
 		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
 	}
 	defer parent.Close()
-	ctx, cancel := localContext(options.timeout)
-	defer cancel()
 	name := filepath.Base(options.plist)
 	existing, openErr := openLaunchAgentFileAt(parent, name)
 	if openErr == nil {
@@ -450,18 +472,18 @@ func launchDaemonBootstrap(args []string) error {
 }
 
 func verifyNoLaunchAgentConflict(ctx context.Context, options launchDaemonOptions) error {
-	if launchAgentPathExists(filepath.Join(options.home, "Library", "LaunchAgents", launchAgentLabel+".plist")) {
-		return &launchAgentControlError{Code: "launchagent_conflict"}
-	}
 	control := launchAgentControlFactory(options.timeout)
-	observed, err := control.Status(ctx, fmt.Sprintf("gui/%d/%s", options.uid, launchAgentLabel))
-	if err != nil {
-		return &launchAgentControlError{Code: "launchagent_state_unverified"}
+	err := verifyNoLaunchdCompatibilityConflict(ctx, control, "system", fmt.Sprintf("gui/%d", options.uid), legacyLaunchDaemonPlistPath(), filepath.Join(options.home, "Library", "LaunchAgents", launchAgentLabel+".plist"), filepath.Join(options.home, "Library", "LaunchAgents", legacyLaunchdLabel+".plist"))
+	var controlErr *launchAgentControlError
+	if errors.As(err, &controlErr) {
+		switch controlErr.Code {
+		case "opposite_supervisor_conflict":
+			return &launchAgentControlError{Code: "launchagent_conflict"}
+		case "opposite_supervisor_state_unverified":
+			return &launchAgentControlError{Code: "launchagent_state_unverified"}
+		}
 	}
-	if observed.State != "absent" {
-		return &launchAgentControlError{Code: "launchagent_conflict"}
-	}
-	return nil
+	return err
 }
 
 func controlLaunchDaemonBootstrap(ctx context.Context, options launchDaemonOptions) error {
@@ -552,12 +574,23 @@ func launchDaemonStatus(args []string) error {
 		}
 	}
 	result := launchDaemonResult("status", observed.State, outcome, next, "", launchAgentPathExists(options.plist))
+	legacy, legacyErr := control.Status(ctx, "system/"+legacyLaunchdLabel)
+	result.LegacyInstalled = launchAgentPathExists(legacyLaunchDaemonPlistPath())
+	result.LegacyObservedState = legacy.State
+	if legacyErr != nil {
+		result.Outcome, result.NextSafeAction, result.Reason = "attention_required", "migration-status", "legacy_state_unverified"
+	} else if result.LegacyInstalled || legacy.State != "absent" {
+		result.Outcome, result.NextSafeAction, result.Reason = "attention_required", "migrate", "legacy_service_conflict"
+	}
 	agent, agentErr := control.Status(ctx, fmt.Sprintf("gui/%d/%s", options.uid, launchAgentLabel))
+	legacyAgent, legacyAgentErr := control.Status(ctx, fmt.Sprintf("gui/%d/%s", options.uid, legacyLaunchdLabel))
 	if agentErr != nil {
 		result.Outcome = "attention_required"
 		result.NextSafeAction = "status"
 		result.Reason = "launchagent_state_unverified"
-	} else if launchAgentPathExists(filepath.Join(options.home, "Library", "LaunchAgents", launchAgentLabel+".plist")) || agent.State != "absent" {
+	} else if legacyAgentErr != nil {
+		result.Outcome, result.NextSafeAction, result.Reason = "attention_required", "status", "launchagent_state_unverified"
+	} else if launchAgentPathExists(filepath.Join(options.home, "Library", "LaunchAgents", launchAgentLabel+".plist")) || launchAgentPathExists(filepath.Join(options.home, "Library", "LaunchAgents", legacyLaunchdLabel+".plist")) || agent.State != "absent" || legacyAgent.State != "absent" {
 		result.Outcome = "attention_required"
 		result.NextSafeAction = "bootout_launchagent"
 		result.Reason = "launchagent_conflict"
@@ -567,6 +600,7 @@ func launchDaemonStatus(args []string) error {
 		started, identityErr := processStartIdentity(observed.ProcessID)
 		if snapshot, snapshotErr := readWorkerStatusSnapshot(options.config); identityErr == nil && snapshotErr == nil && snapshot.ProcessID == observed.ProcessID && snapshot.ProcessStartID == started && observed.ProcessID > 0 {
 			result.WorkerStatus, result.WorkerPreviousStatus, result.WorkerStatusObservedAt = snapshot.Status, snapshot.PreviousStatus, snapshot.ObservedAt.UTC().Format(time.RFC3339Nano)
+			result.WorkerIdentityVerified = true
 		}
 	}
 	return writeLaunchAgentControlResult(result, nil)

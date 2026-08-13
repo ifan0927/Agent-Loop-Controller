@@ -23,12 +23,15 @@ const (
 )
 
 var managedGitExcludedEnvironment = []string{
+	"AGENTCTL_LINEAR_TOKEN",
 	"IFAN_LOOP_LINEAR_TOKEN",
 	"GITHUB_TOKEN",
 	"GH_TOKEN",
 	"GITHUB_APP_TOKEN",
 	"GITHUB_APP_PRIVATE_KEY",
 	"GITHUB_APP_PRIVATE_KEY_FILE",
+	"AGENTCTL_GITHUB_APP_PRIVATE_KEY",
+	"AGENTCTL_GITHUB_APP_PEM",
 	"IFAN_LOOP_GITHUB_APP_PRIVATE_KEY",
 	"IFAN_LOOP_GITHUB_APP_PEM",
 	"GIT_ASKPASS",
@@ -124,7 +127,7 @@ func (w Workspace) hasStagedChanges(ctx context.Context, directory string) (bool
 }
 
 func (w Workspace) run(ctx context.Context, directory string, args ...string) (string, error) {
-	captureRoot, err := os.MkdirTemp("", "ifan-loop-git-")
+	captureRoot, err := os.MkdirTemp("", "agentctl-git-")
 	if err != nil {
 		return "", gitCommandError{category: processadapter.FailureArtifactSetup}
 	}

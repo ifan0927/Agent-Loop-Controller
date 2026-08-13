@@ -4,7 +4,7 @@ set -eu
 repo_root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)"
 lab="$($repo_root/scripts/create-local-lab.sh)"
 
-go run "$repo_root/cmd/ifan-loop" local start \
+go run "$repo_root/cmd/agentctl" local start \
   --issue "$lab/simulated-issue.json" \
   --registry "$lab/repository-registry.json" \
   --db "$lab/controller.db" --repository fixture-owner/test-project \

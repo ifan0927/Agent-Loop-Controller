@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-root="$(mktemp -d "${TMPDIR:-/tmp}/ifan-loop-live.XXXXXX")"
+root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-live.XXXXXX")"
 remote="$root/origin.git"
 workspace="$root/workspace"
 artifacts="$root/artifacts"
@@ -50,5 +50,5 @@ cat >"$task" <<'JSON'
 }
 JSON
 
-go run ./cmd/ifan-loop spike --task "$task" --workspace "$workspace" --artifacts "$artifacts"
+go run ./cmd/agentctl spike --task "$task" --workspace "$workspace" --artifacts "$artifacts"
 printf 'Live fixture retained at %s\n' "$root"

@@ -35,6 +35,9 @@ type launchAgentControlResult struct {
 	WorkerStatus           string `json:"worker_status,omitempty"`
 	WorkerPreviousStatus   string `json:"worker_previous_status,omitempty"`
 	WorkerStatusObservedAt string `json:"worker_status_observed_at,omitempty"`
+	WorkerIdentityVerified bool   `json:"worker_identity_verified,omitempty"`
+	LegacyInstalled        bool   `json:"legacy_installed,omitempty"`
+	LegacyObservedState    string `json:"legacy_observed_state,omitempty"`
 }
 
 type launchAgentObservation struct {
@@ -261,6 +264,10 @@ func inspectLaunchAgentPlist(ctx context.Context, path string) (launchAgentPlist
 	if err != nil {
 		return launchAgentPlistInspection{}, err
 	}
+	return inspectLaunchAgentPlistData(data)
+}
+
+func inspectLaunchAgentPlistData(data []byte) (launchAgentPlistInspection, error) {
 	decoder := xml.NewDecoder(bytes.NewReader(data))
 	token, err := nextPlistDocumentToken(decoder)
 	if err != nil {

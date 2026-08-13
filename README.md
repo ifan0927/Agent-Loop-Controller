@@ -111,23 +111,23 @@ Prerequisites are Go from [`go.mod`](go.mod), Git, a compatible authenticated
 Codex CLI, Linear access, and a selected-repository GitHub App. Production
 configuration is macOS-local by default.
 
-`agentctl` is the approved canonical executable name. The current implemented
-compatibility executable remains `ifan-loop` until the running launchd
-installation identity can be migrated without creating a second worker or
-losing restart evidence; that bounded migration is tracked in
-[issue #104](https://github.com/ifan0927/Agent-Loop-Controller/issues/104).
-The commands below intentionally describe current behavior.
+`agentctl` is the canonical executable and `cmd/agentctl` is its command
+package. New LaunchAgent and LaunchDaemon installations use the neutral
+`io.agent-loop-controller.worker` label. Existing `ifan-loop` or
+`com.ifan.agent-loop-controller.worker` installations must use the bounded
+migration and rollback procedure in [Operations](docs/operations.md); never
+bootstrap a neutral service beside a legacy worker.
 
 ```sh
 mkdir -p ./bin
-go build -o ./bin/ifan-loop ./cmd/ifan-loop
-./bin/ifan-loop config init
+go build -o ./bin/agentctl ./cmd/agentctl
+./bin/agentctl config init
 # Edit the generated secret-free controller.json and provision credentials
 # outside the repository.
-./bin/ifan-loop config validate
-./bin/ifan-loop config inspect
-./bin/ifan-loop config doctor
-./bin/ifan-loop controller worker --once
+./bin/agentctl config validate
+./bin/agentctl config inspect
+./bin/agentctl config doctor
+./bin/agentctl controller worker --once
 ```
 
 `config init` deliberately creates an incomplete starter. Follow
@@ -138,7 +138,7 @@ GitHub write capability.
 
 For the supported automatic path, validate configuration and credentials,
 enable the bounded Linear Todo admission policy, then run
-`ifan-loop controller worker` directly, under the per-login LaunchAgent, or
+`agentctl controller worker` directly, under the per-login LaunchAgent, or
 under the system LaunchDaemon for pre-login headless recovery.
 The normal worker runs until SIGINT/SIGTERM rather than expiring on a global
 timer; durable recovery and operation-specific timeouts remain authoritative.

@@ -8,12 +8,12 @@ import (
 )
 
 func TestLaunchAgentTemplateRendersOnlyExactWorkerArguments(t *testing.T) {
-	binary := "/usr/local/bin/ifan-loop"
+	binary := "/usr/local/bin/agentctl"
 	config := "/Users/operator/Library/Application Support/agent-loop-controller/controller.json"
 	stdout := "/Users/operator/Library/Application Support/agent-loop-controller/logs/worker.stdout.log"
 	stderr := "/Users/operator/Library/Application Support/agent-loop-controller/logs/worker.stderr.log"
 	rendered := renderLaunchAgentPlist(binary, config, stdout, stderr)
-	for _, required := range []string{`<string>com.ifan.agent-loop-controller.worker</string>`, `<string>/usr/local/bin/ifan-loop</string>`, `<string>controller</string>`, `<string>worker</string>`, `<string>--config</string>`, `<key>SuccessfulExit</key>`, `<false/>`, `<integer>30</integer>`, `<integer>63</integer>`, stdout, stderr} {
+	for _, required := range []string{`<string>io.agent-loop-controller.worker</string>`, `<string>/usr/local/bin/agentctl</string>`, `<string>controller</string>`, `<string>worker</string>`, `<string>--config</string>`, `<key>SuccessfulExit</key>`, `<false/>`, `<integer>30</integer>`, `<integer>63</integer>`, stdout, stderr} {
 		if !strings.Contains(rendered, required) {
 			t.Fatalf("template missing %q: %s", required, rendered)
 		}
@@ -31,7 +31,7 @@ func TestLaunchAgentTemplateRendersOnlyExactWorkerArguments(t *testing.T) {
 func TestLaunchAgentDoctorUsesOnlyReasonCodesAndDoesNotOverwriteExistingPlist(t *testing.T) {
 	root := resolvedTempDir(t)
 	config, _ := writeControllerStatusConfig(t, root)
-	binary := filepath.Join(root, "bin", "ifan-loop")
+	binary := filepath.Join(root, "bin", "agentctl")
 	if err := os.Mkdir(filepath.Dir(binary), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestLaunchAgentDoctorRejectsUnsafeLogLeafAndRenderRejectsRelativePath(t *te
 		t.Fatal("group-readable log leaf was accepted")
 	}
 	if _, err := captureConfigOutput(func() error {
-		return controllerLaunchAgent([]string{"render", "--binary", "relative/ifan-loop", "--config", filepath.Join(root, "controller.json")})
+		return controllerLaunchAgent([]string{"render", "--binary", "relative/agentctl", "--config", filepath.Join(root, "controller.json")})
 	}); err == nil || !strings.Contains(err.Error(), "absolute and canonical") {
 		t.Fatalf("relative render error=%v", err)
 	}
@@ -115,7 +115,7 @@ func TestLaunchAgentDoctorRejectsGroupWritableBinaryAndConfig(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			root := resolvedTempDir(t)
 			config, _ := writeControllerStatusConfig(t, root)
-			binary := filepath.Join(root, "bin", "ifan-loop")
+			binary := filepath.Join(root, "bin", "agentctl")
 			if err := os.Mkdir(filepath.Dir(binary), 0o700); err != nil {
 				t.Fatal(err)
 			}

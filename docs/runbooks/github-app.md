@@ -5,10 +5,10 @@ controller's GitHub App. General command use and delivery behavior belong in
 [Operations](../operations.md); authority and evidence design belong in
 [Architecture](../architecture.md).
 
-Command examples use the currently implemented `ifan-loop` compatibility
-executable. The canonical `agentctl` migration is tracked in
-[issue #104](https://github.com/ifan0927/Agent-Loop-Controller/issues/104) and
-must not be performed independently of launchd installation compatibility.
+Command examples use the canonical `agentctl` executable. If the host still
+uses the legacy executable or launchd label, complete the bounded procedure in
+[Operations](../operations.md) rather than changing GitHub App credentials or
+repository permissions as part of the runtime migration.
 
 ## Safety Boundary
 
@@ -104,9 +104,9 @@ The values above are placeholders, not usable identities.
 ## Validate Without Exposing Credentials
 
 ```sh
-ifan-loop config validate --config /absolute/private/controller.json
-ifan-loop config inspect --config /absolute/private/controller.json
-ifan-loop config doctor --config /absolute/private/controller.json
+agentctl config validate --config /absolute/private/controller.json
+agentctl config inspect --config /absolute/private/controller.json
+agentctl config doctor --config /absolute/private/controller.json
 ```
 
 `config validate` and `config inspect` validate key-path topology but do not read

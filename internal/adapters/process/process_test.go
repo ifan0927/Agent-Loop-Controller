@@ -321,7 +321,7 @@ func TestManagedChildCannotReleaseOrReplaceControllerLifecycleLock(t *testing.T)
 	}
 }
 
-func TestAttemptStopperAdoptsAuthenticatedLockAfterRunnerCrash(t *testing.T) {
+func TestAttemptStopperAdoptsLegacyManagedProcessAfterControllerRestart(t *testing.T) {
 	directory := t.TempDir()
 	controlPath := filepath.Join(directory, "implementation.process-control.json")
 	targetPIDPath := filepath.Join(directory, "target.pid")
@@ -335,10 +335,11 @@ func TestAttemptStopperAdoptsAuthenticatedLockAfterRunnerCrash(t *testing.T) {
 		files.Close()
 		t.Fatal(err)
 	}
-	command := exec.Command(os.Args[0], managedLaunchArgument, os.Args[0], "-test.run=TestProcessHelper", "--", "ignore-with-child-pids", targetPIDPath, descendantPIDPath)
+	command := exec.Command(os.Args[0], legacyManagedLaunchArgument, os.Args[0], "-test.run=TestProcessHelper", "--", "ignore-with-child-pids", targetPIDPath, descendantPIDPath)
 	// This directly constructed helper deliberately omits the test-only parent
-	// lifetime pipe and covers production crash adoption.
-	command.Env = append(withoutEnvironment(os.Environ(), []string{managedLaunchEnvironment, managedTestParentLifetimeEnvironment}), managedLaunchEnvironment+"=1")
+	// lifetime pipe and covers production crash adoption from the legacy launch
+	// protocol after the controller executable identity changes.
+	command.Env = append(withoutEnvironment(os.Environ(), []string{managedLaunchEnvironment, legacyManagedLaunchEnvironment, managedTestParentLifetimeEnvironment}), legacyManagedLaunchEnvironment+"=1")
 	command.ExtraFiles = []*os.File{reader}
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := command.Start(); err != nil {
@@ -464,6 +465,23 @@ func TestManagedLaunchGateDoesNotExecTargetAfterParentEOF(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("target executed before lifecycle release: %v", err)
+	}
+}
+
+func TestManagedLaunchProtocolReadsLegacyAndWritesNeutral(t *testing.T) {
+	environment := map[string]string{
+		managedLaunchEnvironment:       "1",
+		legacyManagedLaunchEnvironment: "1",
+	}
+	getenv := func(name string) string { return environment[name] }
+	if !managedLaunchRequested([]string{"agentctl", managedLaunchArgument, "target"}, getenv) {
+		t.Fatal("neutral managed launch was not recognized")
+	}
+	if !managedLaunchRequested([]string{"ifan-loop", legacyManagedLaunchArgument, "target"}, getenv) {
+		t.Fatal("legacy managed launch was not recognized")
+	}
+	if managedLaunchArgument == legacyManagedLaunchArgument || managedLaunchEnvironment == legacyManagedLaunchEnvironment {
+		t.Fatal("new managed launches did not move to neutral identity")
 	}
 }
 

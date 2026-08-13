@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const interruptedRunnerFixtureChildEnvironment = "IFAN_LOOP_TEST_INTERRUPTED_RUNNER_CHILD"
+const interruptedRunnerFixtureChildEnvironment = "AGENTCTL_TEST_INTERRUPTED_RUNNER_CHILD"
 
 // TestInterruptedTestRunnerSelfReapsManagedLaunch proves that a managed group
 // created inside a Go test cannot outlive abrupt loss of that test runner. Its
@@ -23,7 +23,7 @@ func TestInterruptedTestRunnerSelfReapsManagedLaunch(t *testing.T) {
 		return
 	}
 
-	root, err := os.MkdirTemp("", "ifan-loop-interrupted-runner-")
+	root, err := os.MkdirTemp("", "agentctl-interrupted-runner-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestInterruptedTestRunnerSelfReapsManagedLaunch(t *testing.T) {
 }
 
 func TestInterruptedRunnerCleanupOwnsEarlyFailure(t *testing.T) {
-	root, err := os.MkdirTemp("", "ifan-loop-interrupted-runner-cleanup-")
+	root, err := os.MkdirTemp("", "agentctl-interrupted-runner-cleanup-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +170,7 @@ func newInterruptedRunnerFixtureChild(root string) *exec.Cmd {
 	child := exec.Command(os.Args[0], "-test.run=^TestInterruptedTestRunnerSelfReapsManagedLaunch$")
 	child.Env = append(withoutEnvironment(os.Environ(), []string{interruptedRunnerFixtureChildEnvironment}),
 		interruptedRunnerFixtureChildEnvironment+"=1",
-		"IFAN_LOOP_TEST_INTERRUPTED_RUNNER_ROOT="+root,
+		"AGENTCTL_TEST_INTERRUPTED_RUNNER_ROOT="+root,
 	)
 	child.Stdout = os.Stderr
 	child.Stderr = os.Stderr
@@ -252,7 +252,7 @@ func (c *interruptedRunnerCleanup) stopAndWaitChild(timeout time.Duration) error
 }
 
 func runInterruptedRunnerFixtureChild(t *testing.T) {
-	root := os.Getenv("IFAN_LOOP_TEST_INTERRUPTED_RUNNER_ROOT")
+	root := os.Getenv("AGENTCTL_TEST_INTERRUPTED_RUNNER_ROOT")
 	if !filepath.IsAbs(root) || filepath.Clean(root) != root {
 		t.Fatal("reproduction root must be an absolute clean path")
 	}

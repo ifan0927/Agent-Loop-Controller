@@ -11,7 +11,7 @@ import (
 func TestOfflineAcceptanceLaunchAgentControlReportsOneSanitizedServiceOutcome(t *testing.T) {
 	root := resolvedTempDir(t)
 	config := filepath.Join(root, "controller.json")
-	binary := filepath.Join(root, "ifan-loop")
+	binary := filepath.Join(root, "agentctl")
 	plist := filepath.Join(root, "worker.plist")
 	writeLaunchAgentFixture(t, binary, config, plist, true)
 

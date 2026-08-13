@@ -10,6 +10,8 @@ import (
 )
 
 const (
+	// EnvironmentCredentialSourceRef is retained for existing explicit
+	// configuration. New configuration templates use FileCredentialSourceRef.
 	EnvironmentCredentialSourceRef = "secret://env/IFAN_LOOP_LINEAR_TOKEN"
 	FileCredentialSourceRef        = "secret://file/linear-token"
 )

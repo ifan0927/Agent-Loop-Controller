@@ -14,12 +14,23 @@ import (
 type scriptedLaunchAgentControl struct {
 	statuses       []launchAgentObservation
 	statusErrors   []error
+	statusByTarget map[string][]launchAgentObservation
 	statusFallback *launchAgentObservation
 	bootoutErr     error
 	calls          []string
+	targetCalls    []string
 }
 
-func (c *scriptedLaunchAgentControl) Status(context.Context, string) (launchAgentObservation, error) {
+func (c *scriptedLaunchAgentControl) Status(_ context.Context, target string) (launchAgentObservation, error) {
+	c.targetCalls = append(c.targetCalls, target)
+	if statuses := c.statusByTarget[target]; len(statuses) > 0 {
+		status := statuses[0]
+		c.statusByTarget[target] = statuses[1:]
+		return status, nil
+	}
+	if strings.HasSuffix(target, "/"+legacyLaunchdLabel) {
+		return launchAgentObservation{State: "absent"}, nil
+	}
 	c.calls = append(c.calls, "status")
 	if len(c.statusErrors) > 0 {
 		err := c.statusErrors[0]
@@ -125,7 +136,7 @@ func TestLaunchctlControlTreatsMissingGUIDomainAsAbsent(t *testing.T) {
 func TestLaunchAgentBootstrapReusesLoadedServiceAndVerifiesAfterBootstrap(t *testing.T) {
 	root := resolvedTempDir(t)
 	config := filepath.Join(root, "controller.json")
-	binary := filepath.Join(root, "ifan-loop")
+	binary := filepath.Join(root, "agentctl")
 	plist := filepath.Join(root, "worker.plist")
 	writeLaunchAgentFixture(t, binary, config, plist, true)
 	oldFactory := launchAgentControlFactory
@@ -146,7 +157,7 @@ func TestLaunchAgentBootstrapReusesLoadedServiceAndVerifiesAfterBootstrap(t *tes
 func TestLaunchAgentBootstrapRejectsInstalledLaunchDaemon(t *testing.T) {
 	root := resolvedTempDir(t)
 	config := filepath.Join(root, "controller.json")
-	binary := filepath.Join(root, "ifan-loop")
+	binary := filepath.Join(root, "agentctl")
 	plist := filepath.Join(root, "worker.plist")
 	writeLaunchAgentFixture(t, binary, config, plist, true)
 	originalDirectory := launchDaemonDirectory
@@ -175,7 +186,7 @@ func TestLaunchAgentBootstrapRejectsInstalledLaunchDaemon(t *testing.T) {
 func TestLaunchAgentKickstartRestartsStoppedRunAtLoadService(t *testing.T) {
 	root := resolvedTempDir(t)
 	config := filepath.Join(root, "controller.json")
-	binary := filepath.Join(root, "ifan-loop")
+	binary := filepath.Join(root, "agentctl")
 	plist := filepath.Join(root, "worker.plist")
 	writeLaunchAgentFixture(t, binary, config, plist, true)
 	oldFactory := launchAgentControlFactory
@@ -196,7 +207,7 @@ func TestLaunchAgentKickstartRestartsStoppedRunAtLoadService(t *testing.T) {
 func TestLaunchAgentKickstartRejectsLoadedLaunchDaemon(t *testing.T) {
 	root := resolvedTempDir(t)
 	config := filepath.Join(root, "controller.json")
-	binary := filepath.Join(root, "ifan-loop")
+	binary := filepath.Join(root, "agentctl")
 	plist := filepath.Join(root, "worker.plist")
 	writeLaunchAgentFixture(t, binary, config, plist, true)
 	originalFactory := launchAgentControlFactory
@@ -214,7 +225,7 @@ func TestLaunchAgentKickstartRejectsLoadedLaunchDaemon(t *testing.T) {
 func TestLaunchAgentBootoutReconcilesDelayedAbsenceWithoutDuplicateControl(t *testing.T) {
 	root := resolvedTempDir(t)
 	config := filepath.Join(root, "controller.json")
-	binary := filepath.Join(root, "ifan-loop")
+	binary := filepath.Join(root, "agentctl")
 	plist := filepath.Join(root, "worker.plist")
 	writeLaunchAgentFixture(t, binary, config, plist, true)
 	oldFactory := launchAgentControlFactory
@@ -249,7 +260,7 @@ func TestLaunchAgentBootoutReconcilesDelayedAbsenceWithoutDuplicateControl(t *te
 func TestLaunchAgentBootoutClassifiesRequestFailureWithoutRetry(t *testing.T) {
 	root := resolvedTempDir(t)
 	config := filepath.Join(root, "controller.json")
-	binary := filepath.Join(root, "ifan-loop")
+	binary := filepath.Join(root, "agentctl")
 	plist := filepath.Join(root, "worker.plist")
 	writeLaunchAgentFixture(t, binary, config, plist, true)
 	oldFactory := launchAgentControlFactory
@@ -274,7 +285,7 @@ func TestLaunchAgentBootoutClassifiesRequestFailureWithoutRetry(t *testing.T) {
 func TestLaunchAgentBootoutClassifiesObservationTimeoutWithoutRetry(t *testing.T) {
 	root := resolvedTempDir(t)
 	config := filepath.Join(root, "controller.json")
-	binary := filepath.Join(root, "ifan-loop")
+	binary := filepath.Join(root, "agentctl")
 	plist := filepath.Join(root, "worker.plist")
 	writeLaunchAgentFixture(t, binary, config, plist, true)
 	oldFactory := launchAgentControlFactory
@@ -300,7 +311,7 @@ func TestLaunchAgentBootoutClassifiesObservationTimeoutWithoutRetry(t *testing.T
 func TestLaunchAgentBootoutAlreadyAbsentIsIdempotent(t *testing.T) {
 	root := resolvedTempDir(t)
 	config := filepath.Join(root, "controller.json")
-	binary := filepath.Join(root, "ifan-loop")
+	binary := filepath.Join(root, "agentctl")
 	plist := filepath.Join(root, "worker.plist")
 	writeLaunchAgentFixture(t, binary, config, plist, true)
 	oldFactory := launchAgentControlFactory
@@ -323,7 +334,7 @@ func TestLaunchAgentBootoutAlreadyAbsentIsIdempotent(t *testing.T) {
 func TestLaunchAgentUnknownObservationDoesNotDuplicateBootout(t *testing.T) {
 	root := resolvedTempDir(t)
 	config := filepath.Join(root, "controller.json")
-	binary := filepath.Join(root, "ifan-loop")
+	binary := filepath.Join(root, "agentctl")
 	plist := filepath.Join(root, "worker.plist")
 	writeLaunchAgentFixture(t, binary, config, plist, true)
 	oldFactory := launchAgentControlFactory
@@ -348,7 +359,7 @@ func TestLaunchAgentUnknownObservationDoesNotDuplicateBootout(t *testing.T) {
 func TestLaunchAgentRepeatedStatusIsReadOnlyAndAbsentWins(t *testing.T) {
 	root := resolvedTempDir(t)
 	config := filepath.Join(root, "controller.json")
-	binary := filepath.Join(root, "ifan-loop")
+	binary := filepath.Join(root, "agentctl")
 	plist := filepath.Join(root, "worker.plist")
 	writeLaunchAgentFixture(t, binary, config, plist, true)
 	oldFactory := launchAgentControlFactory
@@ -374,7 +385,7 @@ func TestLaunchAgentRepeatedStatusIsReadOnlyAndAbsentWins(t *testing.T) {
 func TestLaunchAgentStatusDoesNotExposeRawLaunchctlOutput(t *testing.T) {
 	root := resolvedTempDir(t)
 	config := filepath.Join(root, "controller.json")
-	binary := filepath.Join(root, "ifan-loop")
+	binary := filepath.Join(root, "agentctl")
 	plist := filepath.Join(root, "worker.plist")
 	writeLaunchAgentFixture(t, binary, config, plist, true)
 	oldFactory := launchAgentControlFactory
@@ -402,7 +413,7 @@ func TestLaunchAgentStatusDoesNotExposeRawLaunchctlOutput(t *testing.T) {
 func TestLaunchAgentStatusProjectsLiveSanitizedWorkerSnapshot(t *testing.T) {
 	root := resolvedTempDir(t)
 	config := filepath.Join(root, "controller.json")
-	binary := filepath.Join(root, "ifan-loop")
+	binary := filepath.Join(root, "agentctl")
 	plist := filepath.Join(root, "worker.plist")
 	writeLaunchAgentFixture(t, binary, config, plist, true)
 	reporter, err := newWorkerStatusReporter(config, "worker-status-fixture")
@@ -420,7 +431,7 @@ func TestLaunchAgentStatusProjectsLiveSanitizedWorkerSnapshot(t *testing.T) {
 	output, err := captureConfigOutput(func() error {
 		return launchAgentStatus([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
 	})
-	if err != nil || !strings.Contains(output, `"worker_status": "parked"`) || !strings.Contains(output, `"worker_previous_status": "driving"`) || !strings.Contains(output, `"worker_status_observed_at": "2026-07-16T12:30:00Z"`) {
+	if err != nil || !strings.Contains(output, `"worker_status": "parked"`) || !strings.Contains(output, `"worker_previous_status": "driving"`) || !strings.Contains(output, `"worker_status_observed_at": "2026-07-16T12:30:00Z"`) || !strings.Contains(output, `"worker_identity_verified": true`) {
 		t.Fatalf("output=%s err=%v", output, err)
 	}
 	reporter.processStartID = "1"
@@ -431,14 +442,14 @@ func TestLaunchAgentStatusProjectsLiveSanitizedWorkerSnapshot(t *testing.T) {
 	stale, err := captureConfigOutput(func() error {
 		return launchAgentStatus([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
 	})
-	if err != nil || !strings.Contains(stale, `"worker_status": "running"`) || strings.Contains(stale, `"worker_status_observed_at"`) || strings.Contains(stale, `"worker_status": "parked"`) {
+	if err != nil || !strings.Contains(stale, `"worker_status": "running"`) || strings.Contains(stale, `"worker_status_observed_at"`) || strings.Contains(stale, `"worker_status": "parked"`) || strings.Contains(stale, `"worker_identity_verified"`) {
 		t.Fatalf("stale output=%s err=%v", stale, err)
 	}
 }
 
 func TestLaunchAgentPlistParserRejectsInvalidStructureAndDuplicateKeys(t *testing.T) {
 	root := resolvedTempDir(t)
-	binary := filepath.Join(root, "ifan-loop")
+	binary := filepath.Join(root, "agentctl")
 	config := filepath.Join(root, "controller.json")
 	plist := filepath.Join(root, "worker.plist")
 	if err := os.WriteFile(binary, []byte("fixture"), 0o700); err != nil {
@@ -472,7 +483,7 @@ func TestLaunchAgentInstallIsIdempotentAndDoesNotOverwrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	config, _ := writeControllerStatusConfig(t, root)
-	binary := filepath.Join(root, "bin", "ifan-loop")
+	binary := filepath.Join(root, "bin", "agentctl")
 	if err := os.Mkdir(filepath.Dir(binary), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -560,8 +571,14 @@ func writeLaunchAgentFixture(t *testing.T, binary, config, plist string, runAtLo
 func isolateLaunchDaemonDirectory(t *testing.T, root string) {
 	t.Helper()
 	originalLaunchDaemonDirectory := launchDaemonDirectory
+	originalFactory := launchAgentControlFactory
 	launchDaemonDirectory = filepath.Join(root, "LaunchDaemons")
+	absent := launchAgentObservation{State: "absent"}
+	launchAgentControlFactory = func(time.Duration) launchAgentControl {
+		return &scriptedLaunchAgentControl{statusFallback: &absent}
+	}
 	t.Cleanup(func() {
 		launchDaemonDirectory = originalLaunchDaemonDirectory
+		launchAgentControlFactory = originalFactory
 	})
 }

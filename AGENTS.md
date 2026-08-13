@@ -79,10 +79,9 @@ application contracts; it is not another workflow authority.
 
 ## Operator interface rules
 
-- `agentctl` is the canonical target CLI and executable name for all new
-  product-facing contracts. The implemented compatibility executable remains
-  `ifan-loop` until the installation-safe migration in issue #104 is complete;
-  do not perform a partial rename.
+- `agentctl` is the canonical CLI, command package, and built executable.
+  `ifan-loop` is accepted only as an explicitly classified legacy migration or
+  compatibility-read identity; do not reintroduce it as a current command.
 - The intended routine entrypoint is `agentctl operator`. The intended worker
   entrypoint is `agentctl controller worker`.
 - The initial TUI belongs in this repository, Go module, and product binary. Do

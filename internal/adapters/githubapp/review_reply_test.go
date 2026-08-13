@@ -41,7 +41,7 @@ func TestReplyToReviewCommentUsesOnlyRootReplyEndpointAndConfiguredApp(t *testin
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.Body != body {
 			t.Fatalf("payload=%+v err=%v", payload, err)
 		}
-		fmt.Fprintf(w, `{"id":10,"node_id":"COMMENT_10","in_reply_to_id":9,"body":%q,"created_at":"2026-07-14T00:00:00Z","user":{"id":2,"node_id":"BOT_2","login":"ifan-loop[bot]","type":"Bot","avatar_url":"https://avatars.githubusercontent.com/in/1?v=4"},"performed_via_github_app":null}`, body)
+		fmt.Fprintf(w, `{"id":10,"node_id":"COMMENT_10","in_reply_to_id":9,"body":%q,"created_at":"2026-07-14T00:00:00Z","user":{"id":2,"node_id":"BOT_2","login":"agentctl[bot]","type":"Bot","avatar_url":"https://avatars.githubusercontent.com/in/1?v=4"},"performed_via_github_app":null}`, body)
 	})
 	server := httptest.NewServer(mux)
 	defer server.Close()

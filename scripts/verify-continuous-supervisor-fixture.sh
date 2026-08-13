@@ -9,7 +9,7 @@ trap 'rm -f "$actual" "$events"' EXIT HUP INT TERM
 
 cd "$repo_root"
 {
-  go test -json ./cmd/ifan-loop -count=1 -run '^(TestAdmissionWorkerHasNoSevenDayProcessExpiry|TestAdmissionWorkerHasNoSevenDayExpiryWhileDriverPolls|TestAdmissionWorkerCancellationDuringOnceDispatchIsAStatus|TestControllerWorkerSubprocessSIGTERMClosesCompleteRuntime|TestOfflineAcceptanceWorkerRestartPreservesRetryAndParksAtDurableAttention|TestOfflineParkedDecisionSurvivesRestartAndAutomaticallyReturnsToDriver|TestOfflineSQLiteAdmissionSelectsTotalOrderFromThreeCandidates)$'
+  go test -json ./cmd/agentctl -count=1 -run '^(TestAdmissionWorkerHasNoSevenDayProcessExpiry|TestAdmissionWorkerHasNoSevenDayExpiryWhileDriverPolls|TestAdmissionWorkerCancellationDuringOnceDispatchIsAStatus|TestControllerWorkerSubprocessSIGTERMClosesCompleteRuntime|TestOfflineAcceptanceWorkerRestartPreservesRetryAndParksAtDurableAttention|TestOfflineParkedDecisionSurvivesRestartAndAutomaticallyReturnsToDriver|TestOfflineSQLiteAdmissionSelectsTotalOrderFromThreeCandidates)$'
   go test -json ./internal/adapters/sqlite -count=1 -run '^TestAutomaticAdmissionAbandonReleasesSlotAndReplaysIdempotently$'
   go test -json ./internal/application -count=1 -run '^TestOfflineAcceptanceProductionAbandon(CompletesOwnedCleanup|TerminalizesWithResidueAndReplaysCleanup)$'
 } | tee "$events" | go run ./cmd/fixture-summary --expected "$summary" >"$actual"

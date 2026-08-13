@@ -14,7 +14,7 @@ const (
 )
 
 // Controller-managed Codex subprocesses must not inherit trigger credentials.
-var controllerManagedExcludedEnvironment = []string{"IFAN_LOOP_LINEAR_TOKEN"}
+var controllerManagedExcludedEnvironment = []string{"AGENTCTL_LINEAR_TOKEN", "IFAN_LOOP_LINEAR_TOKEN"}
 
 type CommandSpec struct {
 	Program           string   `json:"program"`
