@@ -190,6 +190,30 @@ func TestLoadVersionThreeDisabledAutomationIsCompatibleAndOffline(t *testing.T) 
 	}
 }
 
+func TestLoadVersionThreeMapsSingletonAuthorityToCapacityOne(t *testing.T) {
+	root := canonicalTempDir(t)
+	configPath, _ := writeV2Fixture(t, root, "github-app-profile:fixture", 7)
+	config := readJSONFixture(t, configPath)
+	config["version"] = VersionThree
+	admission := validAdmissionFixture()
+	delete(admission, "heavy_capacity")
+	admission["max_active_runs"] = 1
+	config["automation"] = map[string]any{"linear_todo_admission": admission}
+	writeJSONFixture(t, configPath, config)
+
+	loaded, err := Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Version != VersionThree || loaded.Automation.LinearTodoAdmission.MaxActiveRuns != 1 || loaded.Automation.LinearTodoAdmission.HeavyCapacity != 1 {
+		t.Fatalf("version=%d automation=%+v", loaded.Version, loaded.Automation.LinearTodoAdmission)
+	}
+	readiness, err := json.Marshal(loaded.Readiness())
+	if err != nil || !strings.Contains(string(readiness), `"heavy_capacity":1`) || strings.Contains(string(readiness), "max_active_runs") {
+		t.Fatalf("readiness=%s err=%v", readiness, err)
+	}
+}
+
 func TestLoadVersionTwoRejectsAutomationRatherThanSilentlyEnablingIt(t *testing.T) {
 	root := canonicalTempDir(t)
 	configPath, _ := writeV2Fixture(t, root, "github-app-profile:fixture", 7)
@@ -213,7 +237,7 @@ func TestLoadVersionThreeEnabledAutomationValidatesAuthorityAndSanitizesInspect(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !loaded.Automation.LinearTodoAdmission.Enabled || loaded.Automation.LinearTodoAdmission.MaxActiveRuns != 1 || loaded.Automation.LinearTodoAdmission.DeliveryPollInterval != 30*time.Second {
+	if !loaded.Automation.LinearTodoAdmission.Enabled || loaded.Automation.LinearTodoAdmission.HeavyCapacity != 2 || loaded.Automation.LinearTodoAdmission.DeliveryPollInterval != 30*time.Second {
 		t.Fatalf("automation=%+v", loaded.Automation.LinearTodoAdmission)
 	}
 	first, err := json.Marshal(loaded.Readiness())
@@ -233,7 +257,7 @@ func TestLoadVersionThreeEnabledAutomationValidatesAuthorityAndSanitizesInspect(
 			t.Fatalf("inspect leaked %q: %s", forbidden, first)
 		}
 	}
-	for _, required := range []string{`"enabled":true`, `"poll_interval":"5m0s"`, `"delivery_poll_interval":"30s"`, `"max_active_runs":1`, `"login":"ifan0927"`, `"profile_digest"`, `"credential_source_type":"environment"`} {
+	for _, required := range []string{`"enabled":true`, `"poll_interval":"5m0s"`, `"delivery_poll_interval":"30s"`, `"heavy_capacity":2`, `"login":"ifan0927"`, `"profile_digest"`, `"credential_source_type":"environment"`} {
 		if !strings.Contains(string(first), required) {
 			t.Fatalf("inspect omitted %q: %s", required, first)
 		}
@@ -241,7 +265,7 @@ func TestLoadVersionThreeEnabledAutomationValidatesAuthorityAndSanitizesInspect(
 }
 
 func TestLoadVersionThreeEnabledAutomationRejectsMissingInvalidAndUnknownFields(t *testing.T) {
-	for _, field := range []string{"enabled", "team_id", "team_key", "todo_state", "in_progress_state", "poll_interval", "scheduler_lease_ttl", "scheduler_lease_renewal_interval", "max_candidates", "max_pages", "max_active_runs", "requester", "notification_mode", "credential_source_ref"} {
+	for _, field := range []string{"enabled", "team_id", "team_key", "todo_state", "in_progress_state", "poll_interval", "scheduler_lease_ttl", "scheduler_lease_renewal_interval", "max_candidates", "max_pages", "requester", "notification_mode", "credential_source_ref"} {
 		t.Run("missing_"+field, func(t *testing.T) {
 			configPath, config := enabledAutomationConfig(t)
 			admission := config["automation"].(map[string]any)["linear_todo_admission"].(map[string]any)
@@ -277,8 +301,12 @@ func TestLoadVersionThreeEnabledAutomationRejectsMissingInvalidAndUnknownFields(
 		func(a map[string]any) { a["max_candidates"] = 101 },
 		func(a map[string]any) { a["max_pages"] = 0 },
 		func(a map[string]any) { a["max_pages"] = 21 },
+		func(a map[string]any) { a["heavy_capacity"] = nil },
+		func(a map[string]any) { a["heavy_capacity"] = 0 },
+		func(a map[string]any) { a["heavy_capacity"] = -1 },
+		func(a map[string]any) { a["heavy_capacity"] = 33 },
+		func(a map[string]any) { a["max_active_runs"] = 1 },
 		func(a map[string]any) { a["max_active_runs"] = 0 },
-		func(a map[string]any) { a["max_active_runs"] = 2 },
 		func(a map[string]any) { a["notification_mode"] = "remote" },
 		func(a map[string]any) { a["credential_source_ref"] = "admission-secret-value" },
 	} {
@@ -407,7 +435,7 @@ func validAdmissionFixture() map[string]any {
 		"todo_state":        map[string]any{"id": "123e4567-e89b-42d3-a456-426614174001", "name": "Todo", "type": "unstarted"},
 		"in_progress_state": map[string]any{"id": "123e4567-e89b-42d3-a456-426614174002", "name": "In Progress", "type": "started"},
 		"poll_interval":     "5m", "delivery_poll_interval": "30s", "scheduler_lease_ttl": "1m", "scheduler_lease_renewal_interval": "20s",
-		"max_candidates": 20, "max_pages": 5, "max_active_runs": 1,
+		"max_candidates": 20, "max_pages": 5, "heavy_capacity": 2,
 		"requester":         map[string]any{"database_id": 1, "node_id": "node", "login": "ifan0927", "type": "User"},
 		"notification_mode": "local_outbox", "credential_source_ref": "secret://env/IFAN_LOOP_LINEAR_TOKEN",
 	}

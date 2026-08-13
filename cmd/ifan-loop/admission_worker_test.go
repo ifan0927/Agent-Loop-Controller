@@ -142,7 +142,7 @@ func TestAdmissionWorkerDoesNotRecreateInMemoryRetryPolicy(t *testing.T) {
 	}
 }
 
-func TestAdmissionWorkerWaitsForDurableRetryEligibility(t *testing.T) {
+func TestAdmissionWorkerRetryDelayDoesNotBlockOtherScheduling(t *testing.T) {
 	calls := 0
 	waits := []time.Duration{}
 	now := time.Date(2026, 7, 15, 0, 0, 0, 0, time.UTC)
@@ -160,7 +160,7 @@ func TestAdmissionWorkerWaitsForDurableRetryEligibility(t *testing.T) {
 		}
 		return nil
 	}, func() time.Time { return now })
-	if err != nil || calls != 2 || len(waits) != 2 || waits[0] != 4*time.Second || waits[1] != time.Minute || result.Stopped != "canceled" {
+	if err != nil || calls != 2 || len(waits) != 2 || waits[0] != 0 || waits[1] != time.Minute || result.Stopped != "canceled" {
 		t.Fatalf("result=%+v calls=%d waits=%v err=%v", result, calls, waits, err)
 	}
 }

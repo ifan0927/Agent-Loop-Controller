@@ -90,8 +90,8 @@ func TestBoundWorkerLogStreamTruncatesOnlyPrivateRegularFileAtLimit(t *testing.T
 
 func TestAutomaticWorkerKeepsAdmissionAndDeliveryCadencesIndependent(t *testing.T) {
 	configured := bootstrap.LinearTodoAdmission{PollInterval: 5 * time.Minute, DeliveryPollInterval: 30 * time.Second}
-	policy := automaticWorkerDriverPolicy(configured)
-	if configured.PollInterval != 5*time.Minute || policy.PollInterval != 30*time.Second || policy.MaxImmediateAction != 32 {
+	policy := automaticWorkerDriverPolicy(configured, "fixture-owner")
+	if configured.PollInterval != 5*time.Minute || policy.PollInterval != 30*time.Second || policy.MaxImmediateAction != 32 || policy.HeavyPermitOwner != "fixture-owner" {
 		t.Fatalf("configured=%+v policy=%+v", configured, policy)
 	}
 }
@@ -177,7 +177,11 @@ func TestControllerWorkerSubprocessSIGTERMClosesCompleteRuntime(t *testing.T) {
 		t.Fatalf("managed child did not start stdout=%s stderr=%s", workerOutput, workerError)
 	}
 	liveStatus, err := readWorkerStatusSnapshot(configPath)
-	if err != nil || liveStatus.Cycles != 1 || liveStatus.Status != workerStatusDriving && liveStatus.Status != workerStatusParked {
+	// The bounded supervisor may complete admission-coordination cycles while a
+	// sibling continues driving the managed process. This fixture only requires
+	// evidence that work started before SIGTERM; the exact cycle count is not a
+	// shutdown invariant.
+	if err != nil || liveStatus.Cycles < 1 || liveStatus.Status != workerStatusDriving && liveStatus.Status != workerStatusParked {
 		t.Fatalf("live worker status=%+v err=%v", liveStatus, err)
 	}
 	if err := command.Process.Signal(syscall.SIGTERM); err != nil {

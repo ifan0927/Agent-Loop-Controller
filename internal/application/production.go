@@ -81,6 +81,14 @@ func NewProductionCoordinator(admission *LinearAdmissionService, controller Loca
 	return &ProductionCoordinator{admission: admission, controller: controller, commands: NewCommandService(controller, store), store: store, publisher: store}, nil
 }
 
+func (c *ProductionCoordinator) ReconcileInterruptedRun(ctx context.Context, runID string) error {
+	reconciler, ok := c.controller.(InterruptedRunReconciler)
+	if !ok {
+		return errors.New("interrupted-run reconciliation is unavailable")
+	}
+	return reconciler.ReconcileInterruptedRun(ctx, runID)
+}
+
 func (c *ProductionCoordinator) Continue(ctx context.Context, command ProductionContinueCommand) (_result ProductionResult, _err error) {
 	defer c.publishManualInterventionOnReturn(ctx, command.RunID, &_err)
 	var cancelAction context.CancelFunc = func() {}
@@ -114,6 +122,11 @@ func (c *ProductionCoordinator) Continue(ctx context.Context, command Production
 	}
 	action, reason := productionNextAction(run.State)
 	if run.State == domain.StateRepairing {
+		repairCtx, releaseHeavy, permitErr := c.commands.enterHeavyWork(ctx, run)
+		if permitErr != nil {
+			return ProductionResult{}, permitErr
+		}
+		defer releaseHeavy()
 		inspection, inspectErr := c.store.Inspect(ctx, run.ID)
 		if inspectErr != nil {
 			if command.RunID != "" {
@@ -126,7 +139,7 @@ func (c *ProductionCoordinator) Continue(ctx context.Context, command Production
 		if !ok {
 			return ProductionResult{}, serviceError(ErrorInternal, "repair controller capability is unavailable", nil)
 		}
-		repaired, repairErr := repairer.RepairFindings(ctx, run.ID, inspection.Findings)
+		repaired, repairErr := repairer.RepairFindings(repairCtx, run.ID, inspection.Findings)
 		if repairErr != nil {
 			if command.RunID != "" {
 				_, deadlineErr := c.controller.EnforceRepairDeadline(ctx, command.RunID)

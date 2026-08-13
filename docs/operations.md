@@ -66,8 +66,8 @@ configuration. Never repair a run by editing SQLite or artifact JSON.
 
 ## 4. Configuration
 
-Configuration version 3 is current. Versions 1 and 2 remain readable for
-compatibility, but new installations should use `config init` and version 3.
+Configuration version 4 is current. Versions 1 through 3 remain readable for
+compatibility, but new installations should use `config init` and version 4.
 The starter is intentionally incomplete and automatic admission is disabled.
 
 The strict JSON document contains:
@@ -78,7 +78,7 @@ The strict JSON document contains:
 | `linear` | Allowed GraphQL endpoint, credential source reference, team key, and bounded request settings |
 | `github_app_profiles` | App/installation/repository identities, PEM reference, request bounds, and narrow write switches |
 | `repositories` | Canonical owner/name, origins and local roots, base branch, verifier IDs, profile reference, and trusted actors |
-| `automation.linear_todo_admission` | Disabled/enabled authority, exact workflow states, independent admission/delivery poll bounds, lease bounds, fixed requester, durable local event adapter mode, and credential reference |
+| `automation.linear_todo_admission` | Disabled/enabled authority, exact workflow states, independent admission/delivery poll bounds, admission lease bounds, generic `heavy_capacity`, fixed requester, durable local event adapter mode, and credential reference |
 
 Repository profiles are selectable one at a time per run. They may coexist in
 one configuration, but paths must not overlap and a run freezes the selected
@@ -99,16 +99,24 @@ priorities use the numeric sequence from the validated `IFAN-<sequence>`
 identifier, ascending, with immutable issue UUID as a defensive final
 comparator. The worker scans and revalidates the complete bounded set before
 selection; response order, timestamps, title, assignee, and issue prose do not
-affect the result. One nonterminal run blocks scanning and is never preempted.
+affect the result. One nonterminal run owns each immutable repository binding;
+an active repository candidate does not block an eligible idle repository.
 Duplicate or contradictory identities and incomplete bounded scans still fail
 closed for operator attention.
+
+`heavy_capacity` is a positive integer from 1 through 32 and defaults to `2` in
+version 4. It bounds local Codex, verification, fresh review, and repair work;
+external CI/Linear waits and human/manual waits do not consume it. Changes take
+effect on worker restart. Lowering capacity drains without canceling current
+holders. Version-3 `max_active_runs: 1` remains readable as capacity one for
+upgrade compatibility; version 4 rejects that retired field.
 
 `automation.linear_todo_admission.poll_interval` controls only idle Linear Todo
 admission scans and remains bounded from `1m` through `1h` (`5m` in the starter
 configuration). `delivery_poll_interval` independently controls active-run
 GitHub and Linear delivery observations and the driver's immediate-action
 guard. It is bounded from `30s` through `5m`, with a `30s` default. This fixed
-30-second strategy is the smallest deterministic MVP policy: one active run
+30-second strategy is the smallest deterministic MVP policy: each active run
 makes at most roughly two delivery attempts or observations per minute while
 avoiding the five-minute ready-state latency caused by inheriting admission
 cadence. This bound includes retryable unavailable side-effect attempts; each
@@ -116,8 +124,8 @@ attempt still performs its normal fresh authority validation and idempotency
 checks. Pending CI remains pending and is reread at this cadence; durable wait
 evidence and the repository's 20-minute default slow-CI threshold are unchanged.
 
-Enabled version-3 configurations created before this field existed remain
-readable when `delivery_poll_interval` is omitted; the effective compatibility
+Enabled version-3 configurations created before `delivery_poll_interval`
+existed remain readable when it is omitted; the effective compatibility
 default is `30s`, and `config inspect` projects that value. Operators should add
 `"delivery_poll_interval": "30s"` explicitly on the next configuration update
 so intent remains discoverable. An explicitly empty, `null`, malformed, below-
@@ -281,7 +289,7 @@ The version string does not prove configuration or CLI capability readiness.
 
 **Purpose**
 
-Create an absent secret-free version 3 starter configuration and private
+Create an absent secret-free version 4 starter configuration and private
 credential directory.
 
 **When to use**
@@ -528,24 +536,25 @@ ifan-loop controller worker --once
 
 **What it does**
 
-Validates automation authority and credential topology, acquires the singleton
-scheduler lease, resumes a nonterminal run or scans/adopts one eligible Todo,
-then drives it. The configured scheduler renewal interval keeps the same
-versioned lease owner alive continuously across initial local start and the
-production-driver handoff. A failed renewal cancels that in-flight work before
-the cycle reports scheduler attention. The cycle joins an in-flight final
-renewal before accepting driver success or failure, so concurrent lease loss
-takes precedence over the driver outcome. Settlement cancels renewal I/O
-without canceling successfully completed work, then joins the context-bounded
-renewal before returning. Unknown CAS results fail closed as scheduler
-attention. Before accepting any scoped start or driver outcome, the cycle also
-rechecks persisted lease ownership and expiry; loss discovered without a
-renewal tick has the same fail-closed behavior, and this check also gates entry
-to the production driver. Attention parks admission but does not terminate the
-worker; a later cycle keeps observing the same durable authority without
-admitting a second run. The short scheduler lease is released after every cycle
-rather than renewed while parked. It reports bounded worker and queue-decision
-evidence;
+Validates automation authority and credential topology, reconciles every
+nonterminal run and its repository slot, execution lease, and heavy permit,
+then resumes existing runnable work before scanning for new Todos. Heavy work
+remains bounded by `heavy_capacity`; one additional supervisor slot preserves
+admission and due external polls while all heavy supervisors are occupied. A
+short versioned admission lease serializes scan, authoritative reread, atomic
+reservation, and Linear mutation handoff; it is released before local heavy
+work. Capacity exhaustion performs no Linear mutation. Unknown CAS results,
+duplicate repository ownership, and globally ambiguous process ownership fail
+closed as attention. External and human waits retain the repository slot but
+release the heavy permit after process-stop proof. Attention parks only the
+affected authority unless evidence is controller-global. External polls move
+their durable `runnable_since` by `delivery_poll_interval`; the earliest such
+deadline wakes the worker even when the admission scan cadence is slower.
+Human waits are not repeatedly driven. Manual `continue`, `controller run`, and
+`controller drive` use the same heavy permit authority. A direct driver and the
+automatic worker are mutually excluded by the database-directory process lock,
+which also fences restart-only permit adoption. The worker reports
+bounded worker and queue-decision evidence;
 `status` is `running`, `driving`, `parked`, or `stopping`, and a stopping result
 includes `previous_status`. The worker atomically replaces the private
 `<controller-config>.worker-status.json` snapshot on each transition rather
@@ -564,11 +573,13 @@ durable outcomes observed by the continuing worker, not process expiry.
 
 **Safety notes**
 
-Never pass an issue identifier. SIGINT/SIGTERM cancels the active driver and its
-children, stops lease renewal, performs bounded lease cleanup, closes SQLite,
-and emits a sanitized `stopped: canceled` result. It does not rewrite the run
-as failed or abandoned. An unexpected failure exits nonzero so launchd can
-restart and resume from persisted state without duplicate admission.
+Never pass an issue identifier. `--once` intentionally uses one dispatch so it
+cannot return while sibling dispatch goroutines are still mutating state.
+SIGINT/SIGTERM cancels active drivers and their children, performs bounded lease
+cleanup, closes SQLite, and emits a sanitized `stopped: canceled` result. It
+does not rewrite runs as failed or abandoned. An unexpected failure exits
+nonzero so launchd can restart and resume from persisted state without duplicate
+admission.
 
 **Related commands**
 
@@ -832,6 +843,11 @@ ifan-loop controller continue '<run-id>' <requester flags> \
 
 Revalidates Linear, binds the selected offered choice to its exact originating
 outcome, persists the decision, and advances/resumes the local controller.
+The command takes the database-directory process lock for its complete lifetime,
+fences permit adoption with a unique `manual:<run-id>:<nonce>` owner, and
+reconciles any interrupted
+managed attempt before adopting its permit. It therefore fails closed while the
+automatic worker or another direct controller process owns that lock.
 When the long-running worker is active, its next poll automatically returns the
 same run to the production driver; do not issue a separate `controller drive`.
 
@@ -1498,7 +1514,9 @@ ifan-loop linear start IFAN-123 <requester flags>
 **What it does**
 
 Reads/admit the authoritative Linear issue and invokes the bounded local
-controller. It does not construct the long-lived GitHub delivery driver.
+controller. It takes the same database-directory process lock as the automatic
+worker and reconciles an interrupted existing run before resuming it. It does
+not construct the long-lived GitHub delivery driver.
 
 **Possible durable stop states**
 

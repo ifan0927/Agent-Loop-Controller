@@ -70,9 +70,10 @@ This milestone is recorded by the closed
 
 - Disabled-by-default Linear Todo admission with deterministic
   priority/identifier/UUID ordering and serial handoff.
-- Singleton scheduling lease, reservation/mutation journal, one-active-run
-  policy, durable retry schedule, worker, macOS LaunchAgent controls, and
-  non-root headless LaunchDaemon supervision.
+- Short global admission lease, atomic reservation/mutation journal, one-active-
+  run-per-repository slots, generic bounded local-heavy-work permits, durable
+  retry schedule, worker, macOS LaunchAgent controls, and non-root headless
+  LaunchDaemon supervision.
 - Sanitized transport-neutral operator-attention events and queue-decision
   projection.
 - Trusted I-Fan inline review feedback lifecycle, same-session repair, fresh
@@ -196,16 +197,9 @@ one issue spanning multiple PRs.
 ### Exploratory: event-driven admission
 
 Linear webhooks or another event source may reduce polling latency after the
-same admission eligibility, singleton/concurrency, signature verification, and
+same admission eligibility, repository/capacity, signature verification, and
 deduplication rules can be preserved. Event delivery must be treated as a hint
 to re-read Linear, never as authoritative task content.
-
-### Exploratory: bounded concurrency
-
-Multiple simultaneous runs may be considered only after per-repository and
-global resource limits, fairness, credential isolation, worker crash recovery,
-operator attention, and external rate limits have explicit policy. The current
-one-active-run design is intentional and should not be loosened incidentally.
 
 ### Exploratory: executor and review evolution
 

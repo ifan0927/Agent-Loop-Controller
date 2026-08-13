@@ -123,7 +123,9 @@ func TestReserveAutomaticAdmissionIsAtomicAndAdoptable(t *testing.T) {
 	if err != nil || !found || adopted.ID != run.ID || adoptedJournal.ScanDigest != journal.ScanDigest {
 		t.Fatalf("adopted=%+v journal=%+v found=%v err=%v", adopted, adoptedJournal, found, err)
 	}
-	if _, _, reserved, err := store.ReserveLinearTodoAdmission(ctx, automaticAdmissionReservation("123e4567-e89b-42d3-a456-426614174002", "run-auto-two", "IFAN-2", lease)); err != nil || reserved {
+	second := automaticAdmissionReservation("123e4567-e89b-42d3-a456-426614174002", "run-auto-two", "IFAN-2", lease)
+	second.Input.Repository.RepositoryBindingDigest = reservation.Input.Repository.RepositoryBindingDigest
+	if _, _, reserved, err := store.ReserveLinearTodoAdmission(ctx, second); err != nil || reserved {
 		t.Fatalf("second reserve reserved=%v err=%v", reserved, err)
 	}
 	var journalRows, runRows int
@@ -157,7 +159,9 @@ func TestAutomaticAdmissionFailsClosedForActiveOrCorruptEvidence(t *testing.T) {
 	if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: manualRun}); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, reserved, err := store.ReserveLinearTodoAdmission(ctx, automaticAdmissionReservation("123e4567-e89b-42d3-a456-426614174004", "run-auto-three", "IFAN-4", lease)); err != nil || reserved {
+	blocked := automaticAdmissionReservation("123e4567-e89b-42d3-a456-426614174004", "run-auto-three", "IFAN-4", lease)
+	blocked.Input.Repository.RepositoryBindingDigest = manualRun.RepositoryBindingDigest
+	if _, _, reserved, err := store.ReserveLinearTodoAdmission(ctx, blocked); err != nil || reserved {
 		t.Fatalf("active manual run reserve=%v err=%v", reserved, err)
 	}
 	for _, state := range []domain.State{domain.StateAwaitingHumanApproval, domain.StateAwaitingHumanDecision, domain.StateManualIntervention, domain.StateCleaning, domain.StateRepairing} {
@@ -291,10 +295,12 @@ func TestAutomaticAdmissionConcurrentReserveCreatesAtMostOneRun(t *testing.T) {
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	results := make(chan bool, 2)
-	for _, reservation := range []application.LinearTodoAdmissionReservation{
+	reservations := []application.LinearTodoAdmissionReservation{
 		automaticAdmissionReservation("123e4567-e89b-42d3-a456-426614174010", "run-auto-nine", "IFAN-10", lease),
 		automaticAdmissionReservation("123e4567-e89b-42d3-a456-426614174011", "run-auto-ten", "IFAN-11", lease),
-	} {
+	}
+	reservations[1].Input.Repository.RepositoryBindingDigest = reservations[0].Input.Repository.RepositoryBindingDigest
+	for _, reservation := range reservations {
 		wg.Add(1)
 		go func(reservation application.LinearTodoAdmissionReservation) {
 			defer wg.Done()

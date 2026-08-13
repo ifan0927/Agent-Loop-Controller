@@ -124,6 +124,13 @@ type LocalRunController interface {
 	BoundRepairActionContext(context.Context, string) (context.Context, context.CancelFunc, error)
 }
 
+// InterruptedRunReconciler is an optional production boundary used before a
+// new supervisor adopts a heavy permit. It must prove that every previously
+// launched managed child stopped and persist the interrupted attempt outcome.
+type InterruptedRunReconciler interface {
+	ReconcileInterruptedRun(context.Context, string) error
+}
+
 type CommandService struct {
 	controller LocalRunController
 	store      RunStore
@@ -153,7 +160,12 @@ func (s CommandService) Start(ctx context.Context, command StartCommand) (Comman
 		if existing.TaskHash != command.Input.TaskHash || existing.Repository != command.RepositorySelection || !samePersistedProfile(existing, command.Input.Repository) {
 			return CommandResult{}, serviceError(ErrorConflict, "idempotency key belongs to a different run authority", nil)
 		}
-		run, err := s.controller.ContinueExpected(ctx, existing.ID, existing.State, existing.IdempotencyKey, nil)
+		heavyCtx, releaseHeavy, err := s.enterHeavyWork(ctx, existing)
+		if err != nil {
+			return CommandResult{}, err
+		}
+		defer releaseHeavy()
+		run, err := s.controller.ContinueExpected(heavyCtx, existing.ID, existing.State, existing.IdempotencyKey, nil)
 		if err != nil {
 			return CommandResult{}, classifyServiceError(err)
 		}
@@ -210,11 +222,89 @@ func (s CommandService) Continue(ctx context.Context, command ContinueCommand) (
 	if run.IdempotencyKey != command.IdempotencyKey {
 		return CommandResult{}, serviceError(ErrorConflict, "run idempotency authority does not match the request", nil)
 	}
-	run, err = s.controller.ContinueExpected(ctx, command.RunID, command.ExpectedState, command.IdempotencyKey, command.Decision)
+	heavyCtx, releaseHeavy, err := s.enterHeavyWork(ctx, run)
+	if err != nil {
+		return CommandResult{}, err
+	}
+	defer releaseHeavy()
+	continueCtx := heavyCtx
+	if command.ExpectedState == domain.StateAwaitingHumanDecision && command.Decision != nil {
+		continueCtx = withStopAfterHumanDecision(ctx)
+	}
+	run, err = s.controller.ContinueExpected(continueCtx, command.RunID, command.ExpectedState, command.IdempotencyKey, command.Decision)
 	if err != nil {
 		return CommandResult{}, classifyServiceError(err)
 	}
+	if command.ExpectedState == domain.StateAwaitingHumanDecision && command.Decision != nil && HeavyWorkRequired(run.State) {
+		resumeCtx, releaseResume, acquireErr := s.enterHeavyWork(ctx, run)
+		if acquireErr != nil {
+			return CommandResult{Run: projectRunResult(run)}, acquireErr
+		}
+		defer releaseResume()
+		run, err = s.controller.ContinueExpected(resumeCtx, command.RunID, run.State, command.IdempotencyKey, nil)
+		if err != nil {
+			return CommandResult{}, classifyServiceError(err)
+		}
+	}
 	return CommandResult{Run: projectRunResult(run)}, nil
+}
+
+func (s CommandService) enterHeavyWork(ctx context.Context, run Run) (context.Context, func(), error) {
+	noRelease := func() {}
+	if !HeavyWorkRequired(run.State) {
+		return ctx, noRelease, nil
+	}
+	permitOwner, retainForDriver, ownerBound := heavyPermitOwnerFromContext(ctx)
+	if authority, ok := s.store.(interface {
+		HasSchedulingAuthority(context.Context, string) (bool, error)
+	}); ok {
+		enabled, err := authority.HasSchedulingAuthority(ctx, run.ID)
+		if err != nil {
+			return ctx, noRelease, classifyServiceError(err)
+		}
+		if !enabled {
+			return ctx, noRelease, nil
+		}
+	} else if !ownerBound {
+		return ctx, noRelease, nil
+	}
+	scheduler, ok := s.store.(ProductionHeavyWorkScheduler)
+	if !ok {
+		return ctx, noRelease, serviceError(ErrorInternal, "heavy-work scheduler capability is unavailable", nil)
+	}
+	if !ownerBound {
+		permitOwner = "manual:" + run.ID
+	}
+	permit, held, err := scheduler.AcquireHeavyPermit(ctx, run.ID, permitOwner, time.Now().UTC())
+	if errors.Is(err, ErrHeavyPermitProcessReconciliationRequired) {
+		reconciler, ok := s.controller.(InterruptedRunReconciler)
+		if !ok {
+			return ctx, noRelease, serviceError(ErrorInternal, "interrupted heavy work cannot be reconciled", nil)
+		}
+		if reconcileErr := reconciler.ReconcileInterruptedRun(ctx, run.ID); reconcileErr != nil {
+			return ctx, noRelease, classifyServiceError(reconcileErr)
+		}
+		permit, held, err = scheduler.AcquireHeavyPermit(ctx, run.ID, permitOwner, time.Now().UTC())
+	}
+	if err != nil {
+		return ctx, noRelease, classifyServiceError(err)
+	}
+	if !held {
+		return ctx, noRelease, serviceError(ErrorConflict, "heavy-work capacity or supervisor authority is unavailable", nil)
+	}
+	if retainForDriver {
+		return ctx, noRelease, nil
+	}
+	release := func() {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		reason := "shutdown_after_process_exit"
+		if latest, getErr := s.store.GetRun(releaseCtx, run.ID); getErr == nil && !HeavyWorkRequired(latest.State) {
+			reason = productionPermitReleaseReason(latest.State)
+		}
+		_, _ = scheduler.ReleaseHeavyPermit(releaseCtx, permit, reason, time.Now().UTC())
+	}
+	return withHeavyPermitOwner(ctx, permitOwner), release, nil
 }
 
 const (

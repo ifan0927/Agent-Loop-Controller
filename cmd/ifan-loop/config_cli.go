@@ -109,7 +109,7 @@ type configInitOutput struct {
 }
 
 // configTemplate intentionally contains no credentials or private-key paths.
-// It remains a strict v3 JSON document, but has no repository or GitHub App
+// It remains a strict v4 JSON document, but has no repository or GitHub App
 // profiles; an operator must add those before validation and execution.
 type configTemplate struct {
 	Version           int                      `json:"version"`
@@ -132,7 +132,7 @@ type configTemplateLinearTodoAdmission struct {
 	SchedulerLeaseRenewalInterval string `json:"scheduler_lease_renewal_interval"`
 	MaxCandidates                 int    `json:"max_candidates"`
 	MaxPages                      int    `json:"max_pages"`
-	MaxActiveRuns                 int    `json:"max_active_runs"`
+	HeavyCapacity                 int    `json:"heavy_capacity"`
 	NotificationMode              string `json:"notification_mode"`
 }
 
@@ -245,7 +245,7 @@ func createCredentialDirectory(path string) error {
 
 func newConfigTemplate(root string) configTemplate {
 	return configTemplate{
-		Version: 3,
+		Version: 4,
 		Controller: configTemplateControl{
 			DatabasePath: filepath.Join(root, "controller.db"),
 			CodexBinary:  "codex",
@@ -265,7 +265,7 @@ func newConfigTemplate(root string) configTemplate {
 		Repositories:      []json.RawMessage{},
 		Automation: configTemplateAutomation{LinearTodoAdmission: configTemplateLinearTodoAdmission{
 			Enabled: false, PollInterval: "5m", DeliveryPollInterval: "30s", SchedulerLeaseTTL: "1m", SchedulerLeaseRenewalInterval: "20s",
-			MaxCandidates: 20, MaxPages: 5, MaxActiveRuns: 1, NotificationMode: "local_outbox",
+			MaxCandidates: 20, MaxPages: 5, HeavyCapacity: 2, NotificationMode: "local_outbox",
 		}},
 	}
 }

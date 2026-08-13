@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/bootstrap"
 	codexadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/codex"
 	gitadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/git"
@@ -152,11 +153,23 @@ func linearStart(args []string) error {
 	if err != nil {
 		return err
 	}
+	supervisorLock, err := acquireWorkerProcessLock(filepath.Dir(loaded.Controller.DatabasePath))
+	if err != nil {
+		return err
+	}
+	defer supervisorLock.Close()
+	permitOwner := "direct:" + uuid.NewString()
 	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
+	if err := store.AuthorizeHeavyPermitAdoption(permitOwner); err != nil {
+		return errors.New("controller supervisor fencing is unavailable")
+	}
+	if err := configureSchedulingAuthorities(store, loaded); err != nil {
+		return errors.New("controller scheduling authority is unavailable")
+	}
 	credentials, err := linearCredentialSource(loaded)
 	if err != nil {
 		return err
@@ -171,9 +184,13 @@ func linearStart(args []string) error {
 	}
 	ctx, cancel := localContext(loaded.Controller.RunTimeout)
 	defer cancel()
+	ctx = application.WithHeavyPermitOwner(ctx, permitOwner)
 	result, _, err := service.Start(ctx, application.LinearStartCommand{Requester: requesterIdentity.value(), Identifier: identifier})
 	if err != nil {
 		return err
+	}
+	if _, err := store.ReconcileSchedulingAuthorities(context.Background(), time.Now().UTC()); err != nil {
+		return errors.New("controller scheduling authority could not be settled")
 	}
 	return printJSON(result.Run)
 }
@@ -211,11 +228,23 @@ func controllerRun(args []string) error {
 	if err != nil {
 		return err
 	}
+	supervisorLock, err := acquireWorkerProcessLock(filepath.Dir(loaded.Controller.DatabasePath))
+	if err != nil {
+		return err
+	}
+	defer supervisorLock.Close()
+	policy.HeavyPermitOwner = "direct:" + uuid.NewString()
 	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
+	if err := store.AuthorizeHeavyPermitAdoption(policy.HeavyPermitOwner); err != nil {
+		return errors.New("controller supervisor fencing is unavailable")
+	}
+	if err := configureSchedulingAuthorities(store, loaded); err != nil {
+		return errors.New("controller scheduling authority is unavailable")
+	}
 	credentials, err := linearCredentialSource(loaded)
 	if err != nil {
 		return err
@@ -229,10 +258,14 @@ func controllerRun(args []string) error {
 		return err
 	}
 	startCtx, cancelStart := localContext(loaded.Controller.RunTimeout)
+	startCtx = application.WithHeavyPermitOwner(startCtx, policy.HeavyPermitOwner)
 	started, _, err := admission.Start(startCtx, application.LinearStartCommand{Requester: requester.value(), Identifier: identifier})
 	cancelStart()
 	if err != nil {
 		return err
+	}
+	if _, err := store.ReconcileSchedulingAuthorities(context.Background(), time.Now().UTC()); err != nil {
+		return errors.New("controller scheduling authority could not be settled")
 	}
 	// Keep the terminal JSON result reserved for the driver's durable stop
 	// result, but make the restart-safe run ID available while it waits for
@@ -281,11 +314,20 @@ func controllerDrive(args []string) error {
 	if err != nil {
 		return err
 	}
+	supervisorLock, err := acquireWorkerProcessLock(filepath.Dir(loaded.Controller.DatabasePath))
+	if err != nil {
+		return err
+	}
+	defer supervisorLock.Close()
+	policy.HeavyPermitOwner = "direct:" + uuid.NewString()
 	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
+	if err := store.AuthorizeHeavyPermitAdoption(policy.HeavyPermitOwner); err != nil {
+		return errors.New("controller supervisor fencing is unavailable")
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, *maxRuntime)
@@ -315,6 +357,12 @@ func validateProductionDriverOptions(policy application.ProductionDriverPolicy, 
 // opening the GitHub App credential source or constructing any write-capable
 // adapter.
 func driveProductionRun(ctx context.Context, loaded bootstrap.Bootstrap, store *sqlitestore.Store, requester application.Requester, runID string, policy application.ProductionDriverPolicy) (application.ProductionDriveResult, error) {
+	if err := configureSchedulingAuthorities(store, loaded); err != nil {
+		return application.ProductionDriveResult{}, application.ClassifyError(errors.New("controller scheduling authority is unavailable"))
+	}
+	if policy.HeavyPermitOwner == "" {
+		return application.ProductionDriveResult{}, application.ClassifyError(errors.New("controller supervisor fencing owner is required"))
+	}
 	run, err := store.GetRun(ctx, runID)
 	if err != nil {
 		return application.ProductionDriveResult{}, application.ClassifyError(err)
@@ -383,6 +431,7 @@ func driveProductionRun(ctx context.Context, loaded bootstrap.Bootstrap, store *
 		SquashMerger:       github,
 		CleanupPort:        gitadapter.Cleanup{Workspace: gitadapter.Workspace{Process: processadapter.OSRunner{}}, SourcePath: repository.SourcePath, OriginPath: repository.OriginPath},
 		SourceSyncPort:     sourceSyncAdapter{sync: gitadapter.SourceSynchronizer{Workspace: gitadapter.Workspace{Process: processadapter.OSRunner{}}}},
+		HeavyWorkScheduler: store,
 	}, policy, nil)
 	if err != nil {
 		return application.ProductionDriveResult{}, err
@@ -436,12 +485,28 @@ func controllerContinue(args []string) error {
 	if err := validateProductionPersistedBinding(command.run, loaded.Registry); err != nil {
 		return application.ClassifyError(err)
 	}
+	if _, err := application.NewQueryService(store).Status(context.Background(), application.QueryInput{Requester: command.requester, RunID: command.run.ID, Repository: command.repository}); err != nil {
+		return err
+	}
+	supervisorLock, err := acquireWorkerProcessLock(filepath.Dir(loaded.Controller.DatabasePath))
+	if err != nil {
+		return err
+	}
+	defer supervisorLock.Close()
+	permitOwner := "manual:" + command.run.ID + ":" + uuid.NewString()
+	if err := store.AuthorizeHeavyPermitAdoption(permitOwner); err != nil {
+		return errors.New("controller supervisor fencing is unavailable")
+	}
+	if err := configureSchedulingAuthorities(store, loaded); err != nil {
+		return errors.New("controller scheduling authority is unavailable")
+	}
 	coordinator, err := newProductionCoordinator(loaded, store, filepath.Dir(command.run.WorktreePath))
 	if err != nil {
 		return err
 	}
 	ctx, cancel := localContext(loaded.Controller.RunTimeout)
 	defer cancel()
+	ctx = application.WithManualHeavyPermitOwner(ctx, permitOwner)
 	result, err := coordinator.Continue(ctx, application.ProductionContinueCommand{Requester: command.requester, RunID: command.run.ID, Repository: command.repository, ExpectedState: command.expectedState, IdempotencyKey: command.idempotencyKey, Decision: command.decision})
 	if err != nil {
 		return err
@@ -1097,20 +1162,37 @@ func localStart(args []string) error {
 	if snapshot.Task.Repository != *repository {
 		return application.ClassifyError(errors.New("admitted task repository does not match caller selection"))
 	}
-	store, err := sqlitestore.Open(*dbPath)
+	normalizedDBPath, err := normalizeControllerDatabasePath(*dbPath)
+	if err != nil {
+		return err
+	}
+	supervisorLock, err := acquireWorkerProcessLock(filepath.Dir(normalizedDBPath))
+	if err != nil {
+		return err
+	}
+	defer supervisorLock.Close()
+	permitOwner := "manual:" + snapshot.Task.RunID + ":" + uuid.NewString()
+	store, err := sqlitestore.Open(normalizedDBPath)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
+	if err := store.AuthorizeHeavyPermitAdoption(permitOwner); err != nil {
+		return errors.New("local supervisor fencing is unavailable")
+	}
 	controller := newLocalController(store, *codexBinary, repo.WorktreeRoot)
 	ctx, cancel := localContext(*timeout)
 	defer cancel()
+	ctx = application.WithManualHeavyPermitOwner(ctx, permitOwner)
 	input := application.LocalStartInput{Task: snapshot.Task, RawIssueJSON: snapshot.RawJSON, RawIssueHash: snapshot.RawHash,
 		NormalizedJSON: snapshot.NormalizedJSON, TaskHash: snapshot.TaskHash, IdempotencyKey: snapshot.IdempotencyKey,
 		Repository: localRepository(repo), RunRoot: repo.RunRoot, WorktreeRoot: repo.WorktreeRoot}
 	result, err := application.NewCommandService(controller, store).Start(ctx, application.StartCommand{Requester: requesterIdentity.value(), RepositorySelection: snapshot.Task.Repository, IdempotencyKey: snapshot.IdempotencyKey, Input: input})
 	if err != nil {
 		return err
+	}
+	if _, err := store.ReconcileSchedulingAuthorities(context.Background(), time.Now().UTC()); err != nil {
+		return errors.New("local scheduling authority could not be settled")
 	}
 	return printJSON(result.Run)
 }
@@ -1136,7 +1218,16 @@ func localContinue(args []string) error {
 	if runID == "" || *dbPath == "" || *registryPath == "" || !requesterIdentity.complete() || *repository == "" || *expectedState == "" || *idempotencyKey == "" {
 		return fmt.Errorf("usage: ifan-loop local continue <run-id> --db <controller.db> --registry <repository-registry.json> --requester <login> --repository <owner/repo> --expected-state <state> --idempotency-key <key> [--decision <decision.json>]")
 	}
-	store, err := sqlitestore.Open(*dbPath)
+	normalizedDBPath, err := normalizeControllerDatabasePath(*dbPath)
+	if err != nil {
+		return err
+	}
+	supervisorLock, err := acquireWorkerProcessLock(filepath.Dir(normalizedDBPath))
+	if err != nil {
+		return err
+	}
+	defer supervisorLock.Close()
+	store, err := sqlitestore.Open(normalizedDBPath)
 	if err != nil {
 		return err
 	}
@@ -1147,6 +1238,10 @@ func localContinue(args []string) error {
 	}
 	if _, err := application.NewQueryService(store).Status(context.Background(), application.QueryInput{Requester: requesterIdentity.value(), RunID: runID, Repository: *repository}); err != nil {
 		return err
+	}
+	permitOwner := "manual:" + runID + ":" + uuid.NewString()
+	if err := store.AuthorizeHeavyPermitAdoption(permitOwner); err != nil {
+		return errors.New("local supervisor fencing is unavailable")
 	}
 	registry, err := localregistry.Load(*registryPath)
 	if err != nil {
@@ -1171,11 +1266,20 @@ func localContinue(args []string) error {
 	controller := newLocalController(store, *codexBinary, filepath.Dir(existing.WorktreePath))
 	ctx, cancel := localContext(*timeout)
 	defer cancel()
+	ctx = application.WithManualHeavyPermitOwner(ctx, permitOwner)
 	result, err := application.NewCommandService(controller, store).Continue(ctx, application.ContinueCommand{Requester: requesterIdentity.value(), RunID: runID, ExpectedState: domain.State(*expectedState), Repository: *repository, IdempotencyKey: *idempotencyKey, Decision: decision})
 	if err != nil {
 		return err
 	}
 	return printJSON(result.Run)
+}
+
+func normalizeControllerDatabasePath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve SQLite controller database path: %w", err)
+	}
+	return filepath.Clean(abs), nil
 }
 
 func localRepository(repo localregistry.Binding) application.LocalRepository {
@@ -1403,7 +1507,7 @@ func newLocalController(store application.RunStore, codexBinary, worktreeRoot st
 	git := gitadapter.Workspace{Process: process}
 	registry := verifier.NewRegistry(localregistry.BuiltinVerifierCommands(), process, git)
 	executor := codexadapter.NewExecutor(process, codexBinary)
-	return application.NewLocalController(store, commandWorktrees{gitadapter.WorktreeManager{Workspace: git}}, executor, registry, git, codexBinary, worktreeRoot)
+	return application.NewLocalControllerWithAttemptStopper(store, commandWorktrees{gitadapter.WorktreeManager{Workspace: git}}, executor, registry, git, codexBinary, worktreeRoot, processadapter.AttemptStopper{})
 }
 func localContext(timeout time.Duration) (context.Context, context.CancelFunc) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)

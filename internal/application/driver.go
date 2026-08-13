@@ -36,6 +36,11 @@ type ProductionDriverCoordinator interface {
 	Cleanup(context.Context, ProductionCleanupCommand, CleanupPort, SourceSyncPort) (ProductionCleanupResult, error)
 }
 
+type ProductionHeavyWorkScheduler interface {
+	AcquireHeavyPermit(context.Context, string, string, time.Time) (HeavyPermit, bool, error)
+	ReleaseHeavyPermit(context.Context, HeavyPermit, string, time.Time) (bool, error)
+}
+
 var _ ProductionDriverCoordinator = (*ProductionCoordinator)(nil)
 
 // ProductionDriverPorts holds only the bounded, action-specific ports needed
@@ -49,6 +54,7 @@ type ProductionDriverPorts struct {
 	SquashMerger       SquashMerger
 	CleanupPort        CleanupPort
 	SourceSyncPort     SourceSyncPort
+	HeavyWorkScheduler ProductionHeavyWorkScheduler
 }
 
 // ProductionDriverPolicy bounds synchronous work between polls and prevents a
@@ -56,9 +62,11 @@ type ProductionDriverPorts struct {
 // it keeps polling external pending states until that context is canceled or a
 // durable human/terminal stop state is reached.
 type ProductionDriverPolicy struct {
-	PollInterval       time.Duration
-	MaxImmediateAction int
-	CISlowThreshold    time.Duration
+	PollInterval         time.Duration
+	MaxImmediateAction   int
+	CISlowThreshold      time.Duration
+	ReturnOnExternalWait bool
+	HeavyPermitOwner     string
 }
 
 func (p ProductionDriverPolicy) validate() error {
@@ -154,6 +162,18 @@ func (d *ProductionDriver) Drive(ctx context.Context, command ProductionDriveCom
 	}
 
 	actions, immediate := 0, 0
+	var permit HeavyPermit
+	releasePermit := func(reason string) {
+		if permit.RunID == "" || d.ports.HeavyWorkScheduler == nil {
+			return
+		}
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if released, _ := d.ports.HeavyWorkScheduler.ReleaseHeavyPermit(releaseCtx, permit, reason, d.now()); released {
+			permit = HeavyPermit{}
+		}
+	}
+	defer releasePermit("shutdown_after_process_exit")
 	for {
 		if err := ctx.Err(); err != nil {
 			return ProductionDriveResult{}, err
@@ -167,6 +187,36 @@ func (d *ProductionDriver) Drive(ctx context.Context, command ProductionDriveCom
 		}
 		if err := authorizePersistedRequester(run, command.Requester); err != nil {
 			return ProductionDriveResult{}, err
+		}
+		if HeavyWorkRequired(run.State) && d.ports.HeavyWorkScheduler != nil {
+			if d.policy.HeavyPermitOwner == "" {
+				return ProductionDriveResult{}, serviceError(ErrorInternal, "heavy-work permit owner is required", nil)
+			}
+			if permit.RunID == "" {
+				acquired, held, acquireErr := d.ports.HeavyWorkScheduler.AcquireHeavyPermit(ctx, run.ID, d.policy.HeavyPermitOwner, d.now())
+				if errors.Is(acquireErr, ErrHeavyPermitProcessReconciliationRequired) {
+					reconciler, ok := d.coordinator.(InterruptedRunReconciler)
+					if !ok {
+						return ProductionDriveResult{}, serviceError(ErrorInternal, "interrupted heavy work cannot be reconciled", nil)
+					}
+					if reconcileErr := reconciler.ReconcileInterruptedRun(ctx, run.ID); reconcileErr != nil {
+						return ProductionDriveResult{}, classifyServiceError(reconcileErr)
+					}
+					acquired, held, acquireErr = d.ports.HeavyWorkScheduler.AcquireHeavyPermit(ctx, run.ID, d.policy.HeavyPermitOwner, d.now())
+				}
+				if acquireErr != nil {
+					return ProductionDriveResult{}, classifyServiceError(acquireErr)
+				}
+				if !held {
+					if waitErr := d.wait(ctx, d.policy.PollInterval); waitErr != nil {
+						return ProductionDriveResult{}, waitErr
+					}
+					continue
+				}
+				permit = acquired
+			}
+		} else if permit.RunID != "" {
+			releasePermit(productionPermitReleaseReason(run.State))
 		}
 		// Reconcile wait evidence before every dispatch decision, including a
 		// durable stop. This closes a residual wait after a crash that happened
@@ -191,7 +241,8 @@ func (d *ProductionDriver) Drive(ctx context.Context, command ProductionDriveCom
 		}
 		immediate++
 		actions++
-		poll, err := d.apply(ctx, command, run, action)
+		actionCtx := withHeavyPermitOwner(ctx, d.policy.HeavyPermitOwner)
+		poll, err := d.apply(actionCtx, command, run, action)
 		if err != nil {
 			if !retryableProductionDriverError(err) {
 				if action == ProductionReconcileGitHub {
@@ -204,6 +255,9 @@ func (d *ProductionDriver) Drive(ctx context.Context, command ProductionDriveCom
 				}
 				return ProductionDriveResult{}, err
 			}
+			if d.policy.ReturnOnExternalWait {
+				return ProductionDriveResult{}, err
+			}
 			poll = true
 		}
 		if err == nil && action == ProductionReconcileGitHub {
@@ -214,6 +268,17 @@ func (d *ProductionDriver) Drive(ctx context.Context, command ProductionDriveCom
 		if !poll {
 			continue
 		}
+		if d.policy.ReturnOnExternalWait {
+			waiting, readErr := d.runs.GetRun(ctx, command.RunID)
+			if readErr != nil {
+				return ProductionDriveResult{}, classifyServiceError(readErr)
+			}
+			if !HeavyWorkRequired(waiting.State) {
+				releasePermit(productionPermitReleaseReason(waiting.State))
+			}
+			next, nextReason := productionNextAction(waiting.State)
+			return ProductionDriveResult{Run: projectRunResult(waiting), Action: next, Reason: nextReason, ActionsRun: actions}, nil
+		}
 		if err := d.wait(ctx, d.policy.PollInterval); err != nil {
 			return ProductionDriveResult{}, err
 		}
@@ -222,6 +287,19 @@ func (d *ProductionDriver) Drive(ctx context.Context, command ProductionDriveCom
 		// ever becoming a busy loop.
 		immediate = 0
 	}
+}
+
+func productionPermitReleaseReason(state domain.State) string {
+	if TerminalRunState(state) {
+		return "terminal"
+	}
+	if state == domain.StateManualIntervention {
+		return "manual_intervention"
+	}
+	if state == domain.StateAwaitingHumanDecision {
+		return "human_wait"
+	}
+	return "external_wait"
 }
 
 func (d *ProductionDriver) reconcileCIWait(ctx context.Context, runID string) error {

@@ -266,7 +266,7 @@ not a general operator override.
 - `rejected`: admission rejected the task before delivery.
 - `failed`: terminal execution/admission failure or an explicit eligible
   graceful abandon. Cleanup residue remains separately visible and does not
-  retain the singleton active-run slot.
+  retain a repository scheduling slot or heavy-work permit.
 
 ### Narrow recovery edges
 
@@ -319,12 +319,14 @@ controller-chosen branch name.
 
 **Purpose**
 
-Select at most one eligible Todo and run or resume its production driver.
+Resume existing work and admit eligible Todos within persisted repository and
+local-heavy-work capacity authorities.
 
 **Inputs**
 
-Validated automation authority, bounded candidate scan, scheduler lease,
-existing nonterminal runs, retry schedules, and fixed trusted requester.
+Validated automation authority, bounded candidate scan, short admission lease,
+repository slots, per-run execution leases, heavy-work permits, retry schedules,
+and fixed trusted requester.
 
 **Outputs**
 
@@ -333,38 +335,45 @@ operator-attention event.
 
 **Authoritative state/evidence**
 
-Singleton admission lease, journal, run state, deterministic priority/team
-sequence/UUID selection evidence, and retry schedule.
+Short global admission lease, reservation journal, immutable repository slot,
+per-run execution lease, heavy-work permit, run state, latest complete queue
+snapshot, append-only scheduling decisions, and retry schedule.
 
 **External side effects**
 
-One Linear state mutation and the existing driver's narrow side effects.
+One Linear state mutation per admitted task and each run's existing narrow
+driver side effects.
 
 **Failure and recovery behavior**
 
-One nonterminal run prevents scanning and is resumed first. Only typed process
-start/temporary-unavailable failures receive bounded durable retries. A
-complete valid bounded scan selects by priority, numeric Linear sequence, then
-immutable UUID, independent of response order. Incomplete or contradictory
-scans, conflicts, and exhaustion stop for attention.
-Human-decision and manual-intervention states are parked with transition-bound
-attention; GitHub approval remains inside the production driver's bounded poll
-loop. A single configured-interval renewer fences the potentially long initial
-local start and continues without a gap through production-driver handoff;
-renewal ownership loss or persistence failure cancels the in-flight work.
-After the driver returns, dispatch stops new renewal ticks and joins any
-in-flight renewal before accepting the driver outcome; lease loss takes
-precedence over a concurrent driver success or error. Normal settlement cancels
-only the bounded renewal I/O context, not the completed work context. Lease
-persistence honors context cancellation so settlement joins the renewal
-goroutine without relying on a database busy timeout; any non-cancellation
-failure or unknown CAS result remains fail-closed lease loss. After joining,
-dispatch also rechecks the current versioned lease against persisted ownership
-and expiry, so a delayed process cannot accept a scoped outcome after expiry
-and takeover merely because no renewal tick fired. The same serialized,
-bounded check gates the Start-to-driver handoff, preventing a stale owner from
-starting driver mutations while the renewer remains continuously active.
-Every dispatch cycle releases its short scheduler lease before waiting.
+Restart reconciliation enumerates every nonterminal run, validates immutable
+repository bindings, quarantines duplicate repository ownership, reconstructs
+supervision, and adopts or safely settles persisted scheduling authorities
+before new admission. Existing runnable work is ordered by durable
+`runnable_since` then run ID. New admission ranks Linear priorities 1 through 4,
+then unprioritized work, with numeric IFAN sequence and immutable UUID as
+tie-breakers. An active repository candidate is classified and skipped so an
+idle repository may proceed; a typed disabled repository is likewise skipped.
+The authoritative top-candidate reread may skip only definitive invalidity.
+Ranking/source drift requires a fresh scan, while repeated ambiguous reads stop
+for attention without admitting lower-ranked work.
+
+Admission atomically reserves the run, repository slot, initial heavy permit,
+and decision evidence before the Linear mutation. The global admission lease is
+released before local execution. Local Codex, verifier, fresh review, and repair
+states consume a heavy permit. External CI/Linear waits, human waits, manual
+intervention, retry delay, and terminal states release it only after managed-
+child stop is proven. A permit heartbeat or lease expiry is never process-stop
+evidence. Lowering capacity enters drain mode and never cancels an existing
+permit holder. External polls advance durable `runnable_since` by the configured
+delivery interval, and the worker wakes at the earliest persisted runnable
+deadline instead of the slower admission-scan cadence; human waits are not
+runnable. Manual continuation crosses the same permit boundary as automatic
+delivery. A supervisor may adopt a differently owned permit only while holding
+the database-directory process lock, so lease gaps are not treated as proof
+that the prior supervisor exited. The worker retains one
+admission/poll supervisor beyond heavy capacity so waiting runs cannot starve an
+idle repository.
 An authenticated `retry` action is deliberately narrower than general recovery:
 it accepts only a current `retry_budget_exhausted` attention whose retained
 failure class is `process_start`, with matching failed-attempt or verifier
@@ -392,7 +401,9 @@ review authority remain unchanged.
 
 **Key invariants**
 
-No preemption, timestamp/FIFO ordering, or more than one active run. The total
+No preemption, weighted fairness, aging, or more than one nonterminal run for an
+immutable repository binding. Heavy capacity is a generic positive integer;
+the default is two and a legacy version-3 configuration maps to one. The total
 order is controller policy and never derives from issue prose.
 Retry cannot answer a human decision, approve or merge a PR, abandon a run, or
 adopt unrelated external state.
@@ -769,7 +780,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 28; migration history is code, not a
+inspection. The current schema is version 29; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees
@@ -858,12 +869,15 @@ installed and loaded topology and fails closed on conflict. Independently, the
 worker acquires a private advisory lock for its complete process lifetime before
 constructing the scheduler runtime; a second LaunchAgent, LaunchDaemon, or
 manual worker therefore exits before it can scan or recover work. This process
-fence complements the short singleton scheduler lease. SQLite leases and
+fence complements the short global admission lease. Manual `controller
+continue` and experimental `local continue` acquire the same lock before they
+authorize permit adoption, and an interrupted managed attempt must be stopped
+and reconciled before its permit changes owner. SQLite authorities and
 journals—not launchd or the process lock—remain workflow authority.
 
 The normal worker has no wall-clock expiry. SIGINT/SIGTERM stops new cadence,
-cancels the active production driver and child processes, joins lease renewal,
-releases the scheduler lease with a bounded cleanup context, and closes SQLite
+cancels active production drivers and child processes, releases the admission
+lease with a bounded cleanup context, and closes SQLite
 without changing the durable run into failure or abandonment. A restart
 re-enters persisted recovery before scanning, so process supervision cannot
 authorize duplicate admission. Per-operation timeouts remain independent of
@@ -1028,7 +1042,9 @@ around it. The principal table groups are:
 | `human_approval_observations`, `human_approvals` | Rejected/pending/accepted approval reads and final exact-head authority |
 | `trusted_review_feedback`, conflict and reply tables | Immutable trusted feedback lifecycle, drift conflicts, and one reply proof |
 | `merge_results` | Controller squash or explicitly accepted external merge evidence |
-| Linear request/completion and Todo admission tables | Linear observations, singleton scheduler lease, reservation/mutation journal |
+| Linear request/completion and Todo admission tables | Linear observations, short admission lease, reservation/mutation journal |
+| `heavy_capacity_authority`, `repository_slots`, `heavy_permits`, `run_scheduling` | Effective capacity, per-repository exclusion, local-heavy-work ownership, and durable runnable order |
+| `queue_snapshot`, `scheduling_decisions` | Bounded replaceable queue projection and append-only authority-changing decision evidence |
 | `automatic_retry_schedules`, `operator_attention_outbox` | Restart-stable retry policy and immutable versioned operator-attention events; legacy delivery fields are storage-only evidence |
 | `operator_actions` | Explicit authenticated recovery intent and its validated/applied/observed provenance, separate from automatic workflow evidence |
 
@@ -1042,6 +1058,11 @@ effective facts: the mutable PR aggregate supports workflow commands, immutable
 creation/read observations retain what was reported at each point in time, and
 current terminal status is derived from later typed merge or thread-resolution
 evidence without updating those earlier observations.
+
+Transport-neutral scheduling read ports expose bounded active-run scheduling
+state and recent decision detail without running reconciliation or triggering
+external observation. Capacity and latest-queue reads are likewise read-only;
+restart reconciliation remains a separate authority-changing operation.
 
 ### Intent versus observation
 
@@ -1059,18 +1080,22 @@ override a newer failed/interrupted batch or later candidate.
 
 ### Leases, CAS, and idempotency
 
-Run leases fence concurrent local controllers during long child processes. The
-automatic scheduler has a separate renewable singleton lease. Expected state
-and idempotency keys provide application-level CAS. Unique side-effect,
+Run leases fence concurrent local controllers during long child processes. A
+short global lease serializes only admission decisions; repository slots fence
+nonterminal work per immutable binding, and heavy permits fence generic local
+execution capacity. Each authority has a separate version for CAS. Expected
+state and idempotency keys provide application-level CAS. Unique side-effect,
 resource, PR, feedback, and reply identities make replay deterministic.
 
 ### Restart recovery
 
-On restart, the controller reloads the frozen run/profile authority, validates
-owned filesystem/Git state, inspects interrupted attempts and persisted intents,
-and re-reads external state where necessary. It resumes only the same admitted
-run and implementation session. Missing, mutated, or contradictory evidence
-creates a fail-closed stop rather than reconstruction by guesswork.
+On restart, the controller enumerates all nonterminal runs before admission,
+reloads frozen run/profile authority, validates repository-slot uniqueness,
+reconciles permits and execution leases with managed-process evidence, and
+re-reads external state where necessary. It resumes only the same admitted run
+and implementation session. Missing, mutated, globally ambiguous, or
+contradictory evidence creates a fail-closed fence rather than reconstruction by
+guesswork.
 
 ## 11. Recovery and Idempotency
 
@@ -1119,7 +1144,8 @@ resolution is not approval, and an approval for an old head is stale.
 
 ## 14. Known Constraints
 
-- One automatic nonterminal run; no preemption or concurrent queue execution.
+- One automatic nonterminal run per immutable repository binding, bounded by
+  configured local-heavy-work capacity; no preemption or cross-run authority.
 - Local macOS-oriented operation with GUI LaunchAgent or headless system
   LaunchDaemon supervision; no remote controller service or multi-host mode.
 - One repository and one owned PR per run; configuration may contain multiple

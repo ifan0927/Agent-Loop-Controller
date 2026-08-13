@@ -83,7 +83,7 @@ waitForDriver:
 		case <-driver.started:
 			break waitForDriver
 		case result := <-results:
-			if loserObserved || result.err != nil || result.result.LastOutcome != application.LinearTodoDispatchAttention || result.result.Stopped != "once" {
+			if loserObserved || result.err != nil || result.result.LastOutcome != application.LinearTodoDispatchWaiting || result.result.Stopped != "once" {
 				attention, _ := store.ListOperatorAttention(context.Background(), application.OperatorAttentionQueryInput{Limit: 10})
 				reasons := make([]string, 0, len(attention))
 				for _, event := range attention {
@@ -102,7 +102,7 @@ waitForDriver:
 	if !loserObserved {
 		loser = receiveOfflineAdmissionWorker(t, ctx, results)
 	}
-	if loser.err != nil || loser.result.LastOutcome != application.LinearTodoDispatchAttention || loser.result.Stopped != "once" {
+	if loser.err != nil || loser.result.LastOutcome != application.LinearTodoDispatchWaiting || loser.result.Stopped != "once" {
 		t.Fatalf("losing worker=%+v", loser)
 	}
 
@@ -146,8 +146,130 @@ waitForDriver:
 		t.Fatalf("journal=%+v found=%t err=%v", journal, found, err)
 	}
 	attention, err := store.ListOperatorAttention(ctx, application.OperatorAttentionQueryInput{Limit: 10})
-	if err != nil || len(attention) != 1 || attention[0].ReasonCode != "lease_conflict" {
+	if err != nil || len(attention) != 0 {
 		t.Fatalf("attention=%+v err=%v", attention, err)
+	}
+}
+
+func TestOfflineBoundedWorkerDrivesTwoTemporaryRepositoriesAtCapacityTwo(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	store, err := sqlitestore.Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.ConfigureHeavyCapacity(ctx, 2, offlineAdmissionDigest("capacity-two"), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+
+	firstRepository := offlineAdmissionRepository(t)
+	firstRepository.CanonicalRepository = "owner/first"
+	firstRepository.ProfileID = "profile-owner-first"
+	firstRepository.ProfileDigest = offlineAdmissionDigest("profile-first")
+	firstRepository.RepositoryBindingDigest = offlineAdmissionDigest("binding-first")
+	secondRepository := offlineAdmissionRepository(t)
+	secondRepository.CanonicalRepository = "owner/second"
+	secondRepository.ProfileID = "profile-owner-second"
+	secondRepository.ProfileDigest = offlineAdmissionDigest("profile-second")
+	secondRepository.RepositoryBindingDigest = offlineAdmissionDigest("binding-second")
+
+	first := offlineAdmissionCandidate()
+	first.RepositoryLabels[0].Name, first.Labels[1].Name = "repo:first", "repo:first"
+	second := offlineAdmissionCandidate()
+	second.IssueID = "123e4567-e89b-42d3-a456-426614174109"
+	second.Identifier, second.IssueSequence, second.Priority = "IFAN-42", 42, 2
+	second.BranchName = "ifan/ifan-42-bounded-concurrency"
+	second.UpdatedAt = second.UpdatedAt.Add(time.Second)
+	second.SourceRevision = second.UpdatedAt.Format(time.RFC3339Nano)
+	second.SourceDigest = offlineAdmissionDigest("second-concurrent-source")
+	second.RepositoryLabels[0].Name, second.Labels[1].Name = "repo:second", "repo:second"
+
+	reader := newOfflineAdmissionReaders(offlineAdmissionSource(first), offlineAdmissionSource(second))
+	scanner := &offlineAdmissionScanner{scan: application.LinearTodoCandidateScan{Candidates: []application.LinearTodoCandidate{first, second}, Digest: offlineAdmissionDigest("two-repository-scan"), ObservedAt: second.UpdatedAt}}
+	starter := &offlineAdmissionStarter{reader: reader}
+	driver := newOfflineAdmissionDriver()
+	defer driver.release()
+	worktrees := &offlineAdmissionWorktrees{}
+	controller := application.NewLocalController(store, worktrees, &offlineAdmissionCodex{}, offlineAdmissionVerifier{}, offlineAdmissionGit{}, "fixture-codex", "")
+	dispatcher, err := newOfflineAdmissionDispatcherWithResolver(scanner, reader, starter, store, controller, driver, offlineAdmissionResolverMap{"repo:first": firstRepository, "repo:second": secondRepository}, "bounded-fixture-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := newBoundedAdmissionWorker(2, dispatcher.Dispatch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker.fill(ctx)
+
+	firstStarted := <-driver.startedRun
+	waiting, err := worker.next(ctx)
+	if err != nil || waiting.Outcome != application.LinearTodoDispatchWaiting {
+		t.Fatalf("first completed dispatch=%+v err=%v", waiting, err)
+	}
+	worker.fill(ctx)
+	var secondStarted string
+	type dispatchObservation struct {
+		result application.LinearTodoDispatchResult
+		err    error
+	}
+	var secondFinished chan dispatchObservation
+	for secondStarted == "" {
+		secondFinished = make(chan dispatchObservation, 1)
+		go func(completed chan<- dispatchObservation) {
+			result, err := worker.next(ctx)
+			completed <- dispatchObservation{result: result, err: err}
+		}(secondFinished)
+		select {
+		case secondStarted = <-driver.startedRun:
+		case finished := <-secondFinished:
+			if finished.err != nil || finished.result.Outcome != application.LinearTodoDispatchWaiting {
+				attention, _ := store.ListOperatorAttention(ctx, application.OperatorAttentionQueryInput{Limit: 10})
+				t.Fatalf("second repository dispatch finished early: result=%+v queue=%+v attention=%+v err=%v", finished.result, finished.result.QueueDecision, attention, finished.err)
+			}
+			worker.fill(ctx)
+		case <-ctx.Done():
+			t.Fatal("second repository did not reach the driver")
+		}
+	}
+	if firstStarted == secondStarted {
+		t.Fatalf("duplicate driver run=%q", firstStarted)
+	}
+	driver.release()
+	driven := 0
+	for driven < 2 {
+		finished := <-secondFinished
+		if finished.err != nil {
+			t.Fatal(finished.err)
+		}
+		if finished.result.Outcome == application.LinearTodoDispatchDriven {
+			driven++
+		}
+		if driven < 2 {
+			secondFinished = make(chan dispatchObservation, 1)
+			go func(completed chan<- dispatchObservation) {
+				result, err := worker.next(ctx)
+				completed <- dispatchObservation{result: result, err: err}
+			}(secondFinished)
+		}
+	}
+	runs, err := store.ListNonterminalRuns(ctx)
+	if err != nil || len(runs) != 2 || worktrees.calls() != 2 || len(starter.mutations()) != 2 || len(driver.commands()) != 2 {
+		t.Fatalf("runs=%+v worktrees=%d mutations=%+v commands=%+v err=%v", runs, worktrees.calls(), starter.mutations(), driver.commands(), err)
+	}
+	bindings := map[string]bool{}
+	for _, run := range runs {
+		bindings[run.RepositoryBindingDigest] = true
+		if run.State != domain.StateAwaitingHumanDecision {
+			t.Fatalf("run=%+v", run)
+		}
+	}
+	if !bindings[firstRepository.RepositoryBindingDigest] || !bindings[secondRepository.RepositoryBindingDigest] {
+		t.Fatalf("bindings=%v", bindings)
+	}
+	capacity, err := store.Capacity(ctx, time.Now().UTC())
+	if err != nil || capacity.InUse != 0 || capacity.Available != 2 {
+		t.Fatalf("capacity=%+v err=%v", capacity, err)
 	}
 }
 
@@ -413,6 +535,13 @@ func (r offlineAdmissionResolver) ResolveLinearAdmissionRepository(label string)
 	return r.repository, label == "repo:test" || label == "repo:"+r.repository.CanonicalRepository
 }
 
+type offlineAdmissionResolverMap map[string]application.LocalRepository
+
+func (r offlineAdmissionResolverMap) ResolveLinearAdmissionRepository(label string) (application.LocalRepository, bool) {
+	repository, found := r[label]
+	return repository, found
+}
+
 // These fakes are only the process, Git, verifier, and worktree ports that a
 // real LocalController owns outside the application. The dispatcher therefore
 // exercises its actual persisted continuation path rather than a test-only
@@ -511,16 +640,17 @@ func (offlineAdmissionGit) CommitMetadata(context.Context, string, string) (stri
 }
 
 type offlineAdmissionDriver struct {
-	mu        sync.Mutex
-	calls     []application.ProductionDriveCommand
-	started   chan struct{}
-	allow     chan struct{}
-	startOnce sync.Once
-	allowOnce sync.Once
+	mu         sync.Mutex
+	calls      []application.ProductionDriveCommand
+	started    chan struct{}
+	allow      chan struct{}
+	startOnce  sync.Once
+	allowOnce  sync.Once
+	startedRun chan string
 }
 
 func newOfflineAdmissionDriver() *offlineAdmissionDriver {
-	return &offlineAdmissionDriver{started: make(chan struct{}), allow: make(chan struct{})}
+	return &offlineAdmissionDriver{started: make(chan struct{}), allow: make(chan struct{}), startedRun: make(chan string, application.MaxHeavyCapacity)}
 }
 
 func (d *offlineAdmissionDriver) Drive(ctx context.Context, command application.ProductionDriveCommand) (application.ProductionDriveResult, error) {
@@ -528,6 +658,7 @@ func (d *offlineAdmissionDriver) Drive(ctx context.Context, command application.
 	d.calls = append(d.calls, command)
 	d.mu.Unlock()
 	d.startOnce.Do(func() { close(d.started) })
+	d.startedRun <- command.RunID
 	select {
 	case <-d.allow:
 	case <-ctx.Done():
@@ -547,7 +678,11 @@ func (d *offlineAdmissionDriver) commands() []application.ProductionDriveCommand
 }
 
 func newOfflineAdmissionDispatcher(scanner application.LinearTodoCandidateScanner, reader application.LinearIssueReader, starter application.LinearReservedIssueStarter, store *sqlitestore.Store, controller application.LocalRunController, driver application.LinearTodoDispatchDriver, repository application.LocalRepository, owner string) (*application.LinearTodoDispatcher, error) {
-	return application.NewLinearTodoDispatcher(scanner, reader, offlineAdmissionResolver{repository: repository}, starter, store, controller, driver, application.LinearTodoDispatchPolicy{
+	return newOfflineAdmissionDispatcherWithResolver(scanner, reader, starter, store, controller, driver, offlineAdmissionResolver{repository: repository}, owner)
+}
+
+func newOfflineAdmissionDispatcherWithResolver(scanner application.LinearTodoCandidateScanner, reader application.LinearIssueReader, starter application.LinearReservedIssueStarter, store *sqlitestore.Store, controller application.LocalRunController, driver application.LinearTodoDispatchDriver, resolver application.LinearAdmissionRepositoryResolver, owner string) (*application.LinearTodoDispatcher, error) {
+	return application.NewLinearTodoDispatcher(scanner, reader, resolver, starter, store, controller, driver, application.LinearTodoDispatchPolicy{
 		CandidateAuthority: application.LinearTodoCandidateAuthority{TeamID: "123e4567-e89b-42d3-a456-426614174100", TeamKey: "IFAN", TodoState: offlineAdmissionTodoState, InProgressState: offlineAdmissionInProgressState, MaxCandidates: 10, MaxPages: 1},
 		StartAuthority:     application.LinearIssueStartAuthority{TeamID: "123e4567-e89b-42d3-a456-426614174100", TeamKey: "IFAN", TodoState: offlineAdmissionTodoState, InProgressState: offlineAdmissionInProgressState},
 		LeaseTTL:           time.Minute,

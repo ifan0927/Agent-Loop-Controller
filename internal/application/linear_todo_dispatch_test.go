@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -89,7 +90,93 @@ func (r dispatchResolver) ResolveLinearAdmissionRepository(label string) (LocalR
 	return r.repository, label == "repo:test"
 }
 
+type dispatchRepositoryMap struct {
+	repositories map[string]LocalRepository
+	disabled     map[string]string
+}
+
+func (r dispatchRepositoryMap) ResolveLinearAdmissionRepository(label string) (LocalRepository, bool) {
+	repository, found := r.repositories[label]
+	return repository, found
+}
+
+func (r dispatchRepositoryMap) RepositoryEligibility(repository LocalRepository) RepositoryEligibility {
+	if reason := r.disabled[repository.RepositoryBindingDigest]; reason != "" {
+		return RepositoryEligibility{Status: RepositoryEligibilityDisabled, ReasonCode: reason}
+	}
+	return RepositoryEligibility{Status: RepositoryEligibilityEligible}
+}
+
+type dispatchSchedulingStore struct {
+	*dispatchStore
+	projection    CapacityProjection
+	scheduled     []SchedulingRun
+	snapshots     []QueueSnapshot
+	acquireErrors []error
+	acquireCalls  int
+}
+
+func (s *dispatchSchedulingStore) ConfigureHeavyCapacity(context.Context, int, string, time.Time) (CapacityProjection, error) {
+	return s.projection, nil
+}
+
+func (s *dispatchSchedulingStore) ReconcileSchedulingAuthorities(context.Context, time.Time) ([]SchedulingRun, error) {
+	return slices.Clone(s.scheduled), nil
+}
+
+func (s *dispatchSchedulingStore) AcquireHeavyPermit(_ context.Context, runID, owner string, now time.Time) (HeavyPermit, bool, error) {
+	s.acquireCalls++
+	if len(s.acquireErrors) > 0 {
+		err := s.acquireErrors[0]
+		s.acquireErrors = s.acquireErrors[1:]
+		if err != nil {
+			return HeavyPermit{}, false, err
+		}
+	}
+	return HeavyPermit{RunID: runID, OwnerNonce: owner, Version: 1, AcquiredAt: now, UpdatedAt: now}, true, nil
+}
+
+func (s *dispatchSchedulingStore) ReleaseHeavyPermit(context.Context, HeavyPermit, string, time.Time) (bool, error) {
+	return true, nil
+}
+
+func (s *dispatchSchedulingStore) DeferSchedulingRun(_ context.Context, runID string, runnableAt, _ time.Time) (bool, error) {
+	for index := range s.scheduled {
+		if s.scheduled[index].RunID == runID {
+			s.scheduled[index].RunnableSince = runnableAt
+			s.scheduled[index].SupervisorState = "external_wait"
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *dispatchSchedulingStore) Capacity(context.Context, time.Time) (CapacityProjection, error) {
+	return s.projection, nil
+}
+
+func (s *dispatchSchedulingStore) SaveQueueSnapshot(_ context.Context, snapshot QueueSnapshot) error {
+	s.snapshots = append(s.snapshots, snapshot)
+	return nil
+}
+
+func (s *dispatchSchedulingStore) LatestQueueSnapshot(context.Context) (QueueSnapshot, bool, error) {
+	if len(s.snapshots) == 0 {
+		return QueueSnapshot{}, false, nil
+	}
+	return s.snapshots[len(s.snapshots)-1], true, nil
+}
+
+func (s *dispatchSchedulingStore) AppendSchedulingDecision(context.Context, SchedulingDecision) (bool, error) {
+	return true, nil
+}
+
 type dispatchController struct{ store *dispatchStore }
+
+func (c *dispatchController) ReconcileInterruptedRun(context.Context, string) error {
+	c.store.reconcileCalls++
+	return c.store.reconcileErr
+}
 
 func (c *dispatchController) StartAuthorized(ctx context.Context, _ LocalStartInput, _ func(Run) error) (Run, error) {
 	if c.store.startReturned != nil {
@@ -209,6 +296,8 @@ type dispatchStore struct {
 	reserveCalls           int
 	adoptCalls             int
 	continues              int
+	reconcileCalls         int
+	reconcileErr           error
 	side                   SideEffectRecord
 	attempts               []Attempt
 	attention              []OperatorAttentionEvent
@@ -225,6 +314,7 @@ type dispatchStore struct {
 	postProofDrift         bool
 	omitDecisionTransition bool
 	reserveBlocked         chan struct{}
+	reserveUnavailable     bool
 	startEntered           chan struct{}
 	startReturned          chan struct{}
 	startAllow             chan struct{}
@@ -354,6 +444,9 @@ func (s *dispatchStore) ReserveLinearTodoAdmission(_ context.Context, reservatio
 	s.reserveCalls++
 	if s.reserveBlocked != nil {
 		<-s.reserveBlocked
+	}
+	if s.reserveUnavailable {
+		return Run{}, LinearTodoAdmissionJournal{}, false, nil
 	}
 	if !s.held || (s.run.ID != "" && s.run.State != domain.StateCompleted && s.run.State != domain.StateFailed && s.run.State != domain.StateRejected) {
 		return Run{}, LinearTodoAdmissionJournal{}, false, nil
@@ -640,8 +733,151 @@ func TestLinearTodoDispatcherSelectsOnePriorityCandidateThenStartsAndDrives(t *t
 	if result.QueueDecision == nil || result.QueueDecision.Reason != LinearTodoQueueDecisionSelectedPriority || result.QueueDecision.CandidateCount != 2 || result.QueueDecision.SelectedPriority == nil || *result.QueueDecision.SelectedPriority != 1 || result.QueueDecision.SelectedTeamKey != "IFAN" || result.QueueDecision.SelectedIssueSequence == nil || *result.QueueDecision.SelectedIssueSequence != 12 || result.QueueDecision.SelectedIssueUUID != high.IssueID || result.QueueDecision.ExistingRunPreventedScan {
 		t.Fatalf("queue decision=%+v", result.QueueDecision)
 	}
-	if len(reader.calls) != 4 || reader.calls[0] != low.Identifier || reader.calls[1] != high.Identifier || store.journal.Status != "started" || store.continues != 1 || store.renewCalls != 8 || store.releasedLease.Version != store.lease.Version || store.held {
+	if len(reader.calls) != 3 || reader.calls[0] != high.Identifier || store.journal.Status != "started" || store.continues != 1 || store.renewCalls != 7 || store.releasedLease.Version != store.lease.Version || store.held {
 		t.Fatalf("reader=%v journal=%+v continues=%d renews=%d released=%+v current=%+v held=%t", reader.calls, store.journal, store.continues, store.renewCalls, store.releasedLease, store.lease, store.held)
+	}
+}
+
+func TestLinearTodoDispatcherSkipsActiveAndDisabledRepositoriesForIdleRepository(t *testing.T) {
+	active := dispatchCandidate("active-repository", "IFAN-101", 1)
+	disabled := dispatchCandidate("disabled-repository", "IFAN-102", 2)
+	idle := dispatchCandidate("idle-repository", "IFAN-103", 3)
+	setRepositoryLabel := func(candidate *LinearTodoCandidate, label string) {
+		candidate.RepositoryLabels[0].Name = label
+		candidate.Labels[1].Name = label
+	}
+	setRepositoryLabel(&active, "repo:active")
+	setRepositoryLabel(&disabled, "repo:disabled")
+	setRepositoryLabel(&idle, "repo:idle")
+	dispatcher, base, scanner, _, _, _ := newDispatchLab(t, active, disabled, idle)
+	template := dispatcher.resolver.(dispatchResolver).repository
+	repository := func(name string) LocalRepository {
+		value := template
+		value.CanonicalRepository = "owner/" + name
+		value.ProfileID = "profile-" + name
+		value.ProfileDigest = dispatchDigest("profile:" + name)
+		value.RepositoryBindingDigest = dispatchDigest("binding:" + name)
+		return value
+	}
+	activeRepository, disabledRepository, idleRepository := repository("active"), repository("disabled"), repository("idle")
+	dispatcher.resolver = dispatchRepositoryMap{
+		repositories: map[string]LocalRepository{"repo:active": activeRepository, "repo:disabled": disabledRepository, "repo:idle": idleRepository},
+		disabled:     map[string]string{disabledRepository.RepositoryBindingDigest: "repository_disabled"},
+	}
+	scheduling := &dispatchSchedulingStore{dispatchStore: base, projection: CapacityProjection{ConfiguredCapacity: 3, EffectiveCapacity: 3, InUse: 1, Available: 2, EffectiveIdentity: "capacity-three", Version: 1, ObservedAt: base.now}}
+	dispatcher.store = scheduling
+	lease, acquired, err := base.AcquireLinearTodoAdmissionLease(context.Background(), "dispatch-owner", time.Minute, base.now)
+	if err != nil || !acquired {
+		t.Fatal(err)
+	}
+	selected, found, lost, err := dispatcher.readAndSelect(context.Background(), &lease, scanner.scan, []Run{{ID: "active-run", RepositoryBindingDigest: activeRepository.RepositoryBindingDigest}})
+	if err != nil || !found || lost || selected.candidate.IssueID != idle.IssueID {
+		t.Fatalf("selected=%+v found=%t lost=%t err=%v", selected, found, lost, err)
+	}
+	if len(scheduling.snapshots) != 1 || len(scheduling.snapshots[0].Candidates) != 3 {
+		t.Fatalf("snapshots=%+v", scheduling.snapshots)
+	}
+	projections := scheduling.snapshots[0].Candidates
+	if projections[0].Classification != QueueCandidateBlockedByActiveRepository || projections[1].Classification != QueueCandidateRepositoryDisabled || projections[2].Classification != QueueCandidateSelected {
+		t.Fatalf("projections=%+v", projections)
+	}
+}
+
+func TestLinearTodoDispatcherRevalidatesBlockedHigherPriorityCandidate(t *testing.T) {
+	active := dispatchCandidate("active-drift", "IFAN-107", 1)
+	idle := dispatchCandidate("idle-lower", "IFAN-108", 2)
+	setRepositoryLabel := func(candidate *LinearTodoCandidate, label string) {
+		candidate.RepositoryLabels[0].Name = label
+		candidate.Labels[1].Name = label
+	}
+	setRepositoryLabel(&active, "repo:active")
+	setRepositoryLabel(&idle, "repo:idle")
+	dispatcher, base, scanner, reader, _, _ := newDispatchLab(t, active, idle)
+	template := dispatcher.resolver.(dispatchResolver).repository
+	activeRepository, idleRepository := template, template
+	activeRepository.CanonicalRepository, activeRepository.ProfileID, activeRepository.RepositoryBindingDigest = "owner/active", "profile-active", dispatchDigest("binding:active")
+	idleRepository.CanonicalRepository, idleRepository.ProfileID, idleRepository.RepositoryBindingDigest = "owner/idle", "profile-idle", dispatchDigest("binding:idle")
+	dispatcher.resolver = dispatchRepositoryMap{repositories: map[string]LocalRepository{"repo:active": activeRepository, "repo:idle": idleRepository}}
+	drifted := reader.sources[active.Identifier]
+	for index := range drifted.Labels {
+		if drifted.Labels[index].Name == "repo:active" {
+			drifted.Labels[index].Name = "repo:idle"
+		}
+	}
+	reader.sources[active.Identifier] = drifted
+	scheduling := &dispatchSchedulingStore{dispatchStore: base, projection: CapacityProjection{ConfiguredCapacity: 2, EffectiveCapacity: 2, Available: 1, EffectiveIdentity: "capacity-two", ObservedAt: base.now}}
+	dispatcher.store = scheduling
+	lease, acquired, err := base.AcquireLinearTodoAdmissionLease(context.Background(), "dispatch-owner", time.Minute, base.now)
+	if err != nil || !acquired {
+		t.Fatal(err)
+	}
+	selected, found, lost, err := dispatcher.readAndSelect(context.Background(), &lease, scanner.scan, []Run{{ID: "active-run", RepositoryBindingDigest: activeRepository.RepositoryBindingDigest}})
+	if !errors.Is(err, errLinearTodoSelectionAmbiguous) || found || lost || selected.candidate.IssueID != "" || len(reader.calls) == 0 || reader.calls[0] != active.Identifier {
+		t.Fatalf("selected=%+v found=%t lost=%t reads=%v err=%v", selected, found, lost, reader.calls, err)
+	}
+}
+
+func TestConcurrentExistingRunHonorsDurableRetryBackoff(t *testing.T) {
+	candidate := dispatchCandidate("concurrent-retry", "IFAN-104", 1)
+	dispatcher, base, _, _, _, driver := newDispatchLab(t, candidate)
+	base.run = authorizeDispatchRun(Run{ID: "concurrent-retry-run", IssueID: candidate.Identifier, IdempotencyKey: "concurrent-retry-key", Repository: "owner/repo", RepositoryBindingDigest: dispatchDigest("concurrent-retry-binding"), State: domain.StateExecuting})
+	now := base.now
+	base.retrySchedules = []RetrySchedule{{RunID: base.run.ID, Phase: AutomaticRetryPhaseForRun(base.run), ControllerState: string(base.run.State), AttemptCount: 1, MaxAttempts: 3, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: RetryFailureUnavailable, ReasonCode: RetryReasonUnavailable, Status: RetryScheduleScheduled, NextEligibleAt: now.Add(time.Minute), CreatedAt: now, UpdatedAt: now}}
+	dispatcher.store = &dispatchSchedulingStore{dispatchStore: base, projection: CapacityProjection{ConfiguredCapacity: 2, EffectiveCapacity: 2, Available: 1, EffectiveIdentity: "capacity-two", ObservedAt: now}, scheduled: []SchedulingRun{{RunID: base.run.ID, RepositoryBindingDigest: base.run.RepositoryBindingDigest, State: base.run.State, RunnableSince: now, SupervisorState: "waiting", WaitingForCapacity: true}}}
+
+	result, handled, err := dispatcher.dispatchExistingRunWithoutAdmissionLease(context.Background())
+	if err != nil || !handled || result.Outcome != LinearTodoDispatchRetryWait || len(driver.calls) != 0 {
+		t.Fatalf("result=%+v handled=%t driver=%+v err=%v", result, handled, driver.calls, err)
+	}
+}
+
+func TestNextScheduledRunSkipsHumanAndNotYetRunnableExternalWait(t *testing.T) {
+	now := time.Now().UTC()
+	runs := []Run{{ID: "human"}, {ID: "external-future"}, {ID: "external-ready"}}
+	scheduled := []SchedulingRun{
+		{RunID: "human", RunnableSince: now.Add(-time.Minute), SupervisorState: "human_wait"},
+		{RunID: "external-future", RunnableSince: now.Add(time.Minute), SupervisorState: "external_wait"},
+		{RunID: "external-ready", RunnableSince: now, SupervisorState: "external_wait"},
+	}
+	run, found, quarantined := nextScheduledRun(runs, scheduled, nil, now)
+	if !found || quarantined || run.ID != "external-ready" {
+		t.Fatalf("run=%+v found=%t quarantined=%t", run, found, quarantined)
+	}
+}
+
+func TestLinearTodoDispatcherProjectsPersistedFutureWakeAfterRestart(t *testing.T) {
+	dispatcher, base, scanner, _, _, _ := newDispatchLab(t)
+	now := base.now
+	deadline := now.Add(2 * time.Minute)
+	base.run = authorizeDispatchRun(Run{ID: "future-run", IssueID: "IFAN-105", IdempotencyKey: "future-key", Repository: "owner/repo", RepositoryBindingDigest: dispatchDigest("future-binding"), State: domain.StatePROpen})
+	dispatcher.store = &dispatchSchedulingStore{
+		dispatchStore: base,
+		projection:    CapacityProjection{ConfiguredCapacity: 2, EffectiveCapacity: 2, Available: 2, EffectiveIdentity: "capacity-two", ObservedAt: now},
+		scheduled:     []SchedulingRun{{RunID: base.run.ID, RepositoryBindingDigest: base.run.RepositoryBindingDigest, State: base.run.State, RunnableSince: deadline, SupervisorState: "external_wait"}},
+	}
+
+	result, err := dispatcher.Dispatch(context.Background())
+	if err != nil || result.Outcome != LinearTodoDispatchNoCandidate || !result.NextRunnableAt.Equal(deadline) || scanner.calls != 1 {
+		t.Fatalf("result=%+v scans=%d err=%v", result, scanner.calls, err)
+	}
+}
+
+func TestLinearTodoDispatcherReconcilesStartedAttemptBeforePermitAdoption(t *testing.T) {
+	candidate := dispatchCandidate("reconcile-permit", "IFAN-106", 1)
+	dispatcher, base, scanner, _, _, driver := newDispatchLab(t, candidate)
+	base.run = authorizeDispatchRun(Run{ID: "reconcile-run", IssueID: candidate.Identifier, IdempotencyKey: "reconcile-key", Repository: "owner/repo", RepositoryBindingDigest: dispatchDigest("reconcile-binding"), State: domain.StateExecuting})
+	now := base.now
+	scheduling := &dispatchSchedulingStore{
+		dispatchStore: base,
+		projection:    CapacityProjection{ConfiguredCapacity: 2, EffectiveCapacity: 2, InUse: 1, Available: 1, EffectiveIdentity: "capacity-two", ObservedAt: now},
+		scheduled:     []SchedulingRun{{RunID: base.run.ID, RepositoryBindingDigest: base.run.RepositoryBindingDigest, State: base.run.State, RunnableSince: now, SupervisorState: "running", HasHeavyPermit: true}},
+		acquireErrors: []error{ErrHeavyPermitProcessReconciliationRequired},
+	}
+	dispatcher.store = scheduling
+
+	result, err := dispatcher.Dispatch(context.Background())
+	if err != nil || result.Outcome != LinearTodoDispatchDriven || base.reconcileCalls != 1 || scheduling.acquireCalls != 2 || len(driver.calls) != 1 || scanner.calls != 0 {
+		t.Fatalf("result=%+v reconciles=%d acquires=%d drives=%d scans=%d err=%v", result, base.reconcileCalls, scheduling.acquireCalls, len(driver.calls), scanner.calls, err)
 	}
 }
 
@@ -790,6 +1026,7 @@ func TestLinearTodoQueueDecisionValidationIsAllowlisted(t *testing.T) {
 		queueDecision(LinearTodoQueueDecisionNoCandidate, 0, false),
 		queueDecision(LinearTodoQueueDecisionActiveRun, 0, true),
 		queueDecision(LinearTodoQueueDecisionIncompleteScan, 2, false),
+		queueDecision(LinearTodoQueueDecisionNoEligibleCandidate, 2, false),
 		{Reason: LinearTodoQueueDecisionSelectedPriority, CandidateCount: 3, SelectedPriority: &priority, SelectedTeamKey: "IFAN", SelectedIssueSequence: &sequence, SelectedIssueUUID: dispatchUUID("decision")},
 	}
 	for _, decision := range valid {
@@ -812,6 +1049,41 @@ func TestLinearTodoQueueDecisionValidationIsAllowlisted(t *testing.T) {
 		if err := decision.Validate(); err == nil {
 			t.Fatalf("invalid decision accepted: %+v", decision)
 		}
+	}
+}
+
+func TestLinearTodoDispatcherTreatsReservationCapacityRaceAsWaiting(t *testing.T) {
+	candidate := dispatchCandidate("capacity-race", "IFAN-12", 1)
+	dispatcher, store, scanner, _, starter, driver := newDispatchLab(t, candidate)
+	store.reserveUnavailable = true
+	lease, acquired, err := store.AcquireLinearTodoAdmissionLease(context.Background(), dispatcher.policy.OwnerNonce, time.Minute, store.now)
+	if err != nil || !acquired {
+		t.Fatalf("lease=%+v acquired=%t err=%v", lease, acquired, err)
+	}
+	snapshot, repository, err := admitLinearTask(dispatchSource(candidate), dispatcher.resolver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := dispatcher.reserveStartAndDrive(context.Background(), &lease, linearTodoDispatchCandidate{candidate: scanner.scan.Candidates[0], snapshot: snapshot, repository: repository}, scanner.scan.Digest)
+	if err != nil || result.Outcome != LinearTodoDispatchWaiting || result.QueueDecision == nil || result.QueueDecision.Reason != LinearTodoQueueDecisionCapacityFull || len(store.attention) != 0 || len(starter.calls) != 0 || len(driver.calls) != 0 {
+		t.Fatalf("result=%+v attention=%+v starter=%+v driver=%+v err=%v", result, store.attention, starter.calls, driver.calls, err)
+	}
+}
+
+func TestLinearTodoDispatcherPreservesReservationCapacityDecision(t *testing.T) {
+	candidate := dispatchCandidate("capacity-decision", "IFAN-75", 1)
+	dispatcher, store, _, _, starter, driver := newDispatchLab(t, candidate)
+	store.reserveUnavailable = true
+
+	result, err := dispatcher.Dispatch(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outcome != LinearTodoDispatchWaiting || result.QueueDecision == nil || result.QueueDecision.Reason != LinearTodoQueueDecisionCapacityFull {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(store.attention) != 0 || len(starter.calls) != 0 || len(driver.calls) != 0 {
+		t.Fatalf("attention=%+v starter=%+v driver=%+v", store.attention, starter.calls, driver.calls)
 	}
 }
 
@@ -971,14 +1243,14 @@ func TestLinearTodoDispatcherExcludesInvalidCandidatesBeforePrioritySelection(t 
 			t.Fatalf("result=%+v run=%+v reserve=%d starter=%+v driver=%+v attention=%+v err=%v", result, store.run, store.reserveCalls, starter.calls, driver.calls, store.attention, err)
 		}
 	})
-	t.Run("invalid higher priority authority drift does not block valid best", func(t *testing.T) {
+	t.Run("higher priority source drift forces rescan", func(t *testing.T) {
 		invalid, best := dispatchCandidate("invalid-higher", "IFAN-24", 1), dispatchCandidate("best-lower", "IFAN-25", 2)
 		dispatcher, store, _, reader, starter, driver := newDispatchLab(t, invalid, best)
 		drifted := reader.sources[invalid.Identifier]
 		drifted.BranchName = "ifan/drifted-authority"
 		reader.sources[invalid.Identifier] = drifted
 		result, err := dispatcher.Dispatch(context.Background())
-		if err != nil || result.Outcome != LinearTodoDispatchDriven || store.run.IssueID != best.Identifier || store.reserveCalls != 1 || len(starter.calls) != 1 || starter.calls[0].IssueID != best.IssueID || len(driver.calls) != 1 || len(store.attention) != 0 {
+		if err != nil || result.Outcome != LinearTodoDispatchAttention || store.reserveCalls != 0 || len(starter.calls) != 0 || len(driver.calls) != 0 || len(store.attention) != 1 {
 			t.Fatalf("result=%+v run=%+v reserve=%d starter=%+v driver=%+v attention=%+v err=%v", result, store.run, store.reserveCalls, starter.calls, driver.calls, store.attention, err)
 		}
 	})

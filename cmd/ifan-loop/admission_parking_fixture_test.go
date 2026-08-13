@@ -66,7 +66,7 @@ func TestOfflineParkedDecisionSurvivesRestartAndAutomaticallyReturnsToDriver(t *
 	finalDriver.release()
 	finalDispatcher := parkingDispatcher(t, store, repository, candidate, process, finalDriver, "parking-owner-three")
 	replayed, err := runAdmissionWorker(ctx, true, time.Minute, finalDispatcher.Dispatch, waitAdmissionWorker)
-	if err != nil || replayed.LastOutcome != application.LinearTodoDispatchAttention || replayed.Status != workerStatusParked {
+	if err != nil || replayed.LastOutcome != application.LinearTodoDispatchWaiting || replayed.Status != workerStatusRunning {
 		t.Fatalf("replayed=%+v err=%v", replayed, err)
 	}
 	attention, err = store.ListOperatorAttention(ctx, application.OperatorAttentionQueryInput{Limit: 10})

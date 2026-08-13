@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/bootstrap"
@@ -115,7 +116,11 @@ func controllerWorker(args []string) error {
 	}
 	ctx, stop := workerSignalContext()
 	defer stop()
-	result, err := runAdmissionWorkerObserved(ctx, *once, configured.PollInterval, runtime.dispatch, waitAdmissionWorker, reporter.Observe)
+	workerCapacity := configured.HeavyCapacity + 1
+	if *once {
+		workerCapacity = 1
+	}
+	result, err := runBoundedAdmissionWorkerAtObserved(ctx, *once, configured.PollInterval, workerCapacity, runtime.dispatch, waitAdmissionWorker, func() time.Time { return time.Now().UTC() }, reporter.Observe)
 	if err != nil {
 		return application.ClassifyError(err)
 	}
@@ -203,15 +208,24 @@ func newAutomaticWorkerRuntime(loaded bootstrap.Bootstrap, instanceID string) (a
 	if err != nil {
 		return automaticWorkerRuntime{}, errors.New("automatic admission state store is unavailable")
 	}
+	if err := store.AuthorizeHeavyPermitAdoption(instanceID); err != nil {
+		_ = store.Close()
+		return automaticWorkerRuntime{}, errors.New("automatic admission supervisor fencing is unavailable")
+	}
+	if err := configureSchedulingAuthorities(store, loaded); err != nil {
+		_ = store.Close()
+		return automaticWorkerRuntime{}, errors.New("automatic admission scheduling authority is unavailable")
+	}
 	requester := application.Requester{ID: configured.Requester.Login, Kind: "github_login", DatabaseID: configured.Requester.DatabaseID, NodeID: configured.Requester.NodeID, ActorType: configured.Requester.Type}
-	dispatcher, err := application.NewLinearTodoDispatcher(client, client, linearRegistryResolver{registry: loaded.Registry}, client, store, newLocalController(store, loaded.Controller.CodexBinary, ""), automaticWorkerDriver{loaded: loaded, store: store, policy: automaticWorkerDriverPolicy(configured)}, application.LinearTodoDispatchPolicy{
-		CandidateAuthority: application.LinearTodoCandidateAuthority{TeamID: configured.TeamID, TeamKey: configured.TeamKey, TodoState: application.LinearState{ID: configured.TodoState.ID, Name: configured.TodoState.Name, Type: configured.TodoState.Type}, InProgressState: application.LinearState{ID: configured.InProgressState.ID, Name: configured.InProgressState.Name, Type: configured.InProgressState.Type}, MaxCandidates: configured.MaxCandidates, MaxPages: configured.MaxPages},
-		StartAuthority:     application.LinearIssueStartAuthority{TeamID: configured.TeamID, TeamKey: configured.TeamKey, TodoState: application.LinearState{ID: configured.TodoState.ID, Name: configured.TodoState.Name, Type: configured.TodoState.Type}, InProgressState: application.LinearState{ID: configured.InProgressState.ID, Name: configured.InProgressState.Name, Type: configured.InProgressState.Type}},
-		LeaseTTL:           configured.SchedulerLeaseTTL,
-		LeaseRenewal:       configured.SchedulerLeaseRenewal,
-		OwnerNonce:         instanceID,
-		Requester:          requester,
-		AttentionProfile:   application.OperatorAttentionProfile{ID: "automation", Name: "linear-todo-admission"},
+	dispatcher, err := application.NewLinearTodoDispatcher(client, client, linearRegistryResolver{registry: loaded.Registry}, client, store, newLocalController(store, loaded.Controller.CodexBinary, ""), automaticWorkerDriver{loaded: loaded, store: store, policy: automaticWorkerDriverPolicy(configured, instanceID)}, application.LinearTodoDispatchPolicy{
+		CandidateAuthority:   application.LinearTodoCandidateAuthority{TeamID: configured.TeamID, TeamKey: configured.TeamKey, TodoState: application.LinearState{ID: configured.TodoState.ID, Name: configured.TodoState.Name, Type: configured.TodoState.Type}, InProgressState: application.LinearState{ID: configured.InProgressState.ID, Name: configured.InProgressState.Name, Type: configured.InProgressState.Type}, MaxCandidates: configured.MaxCandidates, MaxPages: configured.MaxPages},
+		StartAuthority:       application.LinearIssueStartAuthority{TeamID: configured.TeamID, TeamKey: configured.TeamKey, TodoState: application.LinearState{ID: configured.TodoState.ID, Name: configured.TodoState.Name, Type: configured.TodoState.Type}, InProgressState: application.LinearState{ID: configured.InProgressState.ID, Name: configured.InProgressState.Name, Type: configured.InProgressState.Type}},
+		LeaseTTL:             configured.SchedulerLeaseTTL,
+		LeaseRenewal:         configured.SchedulerLeaseRenewal,
+		OwnerNonce:           instanceID,
+		Requester:            requester,
+		AttentionProfile:     application.OperatorAttentionProfile{ID: "automation", Name: "linear-todo-admission"},
+		ExternalPollInterval: configured.DeliveryPollInterval,
 	})
 	if err != nil {
 		_ = store.Close()
@@ -220,8 +234,24 @@ func newAutomaticWorkerRuntime(loaded bootstrap.Bootstrap, instanceID string) (a
 	return automaticWorkerRuntime{store: store, dispatch: dispatcher.Dispatch}, nil
 }
 
-func automaticWorkerDriverPolicy(configured bootstrap.LinearTodoAdmission) application.ProductionDriverPolicy {
-	return application.ProductionDriverPolicy{PollInterval: configured.DeliveryPollInterval, MaxImmediateAction: 32}
+func configureSchedulingAuthorities(store *sqlitestore.Store, loaded bootstrap.Bootstrap) error {
+	if store == nil {
+		return errors.New("scheduling state store is unavailable")
+	}
+	capacity := loaded.Automation.LinearTodoAdmission.HeavyCapacity
+	if capacity == 0 {
+		capacity = application.DefaultHeavyCapacity
+	}
+	now := time.Now().UTC()
+	if _, err := store.ConfigureHeavyCapacity(context.Background(), capacity, loaded.Digest, now); err != nil {
+		return err
+	}
+	_, err := store.ReconcileSchedulingAuthorities(context.Background(), now)
+	return err
+}
+
+func automaticWorkerDriverPolicy(configured bootstrap.LinearTodoAdmission, owner string) application.ProductionDriverPolicy {
+	return application.ProductionDriverPolicy{PollInterval: configured.DeliveryPollInterval, MaxImmediateAction: 32, ReturnOnExternalWait: true, HeavyPermitOwner: owner}
 }
 
 func closeWorkerStateStore(store *sqlitestore.Store) error {
