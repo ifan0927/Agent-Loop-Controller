@@ -223,12 +223,17 @@ func TestAllLegalActionOffersHaveStablePresentationSemantics(t *testing.T) {
 
 func TestAcceptedActionSuppressesMutuallyExclusiveOffersAndAttentionActions(t *testing.T) {
 	store, authorizer, requester := legalActionDecisionFixture(t)
-	store.run.State = domain.StateExecuting
+	store.run.State = domain.StateProvisioning
 	store.inspection.Run = store.run
-	store.inspection.Timeline = []Transition{{Sequence: 4, From: domain.StateAdmitting, To: domain.StateExecuting, Reason: "running", CreatedAt: time.Date(2026, 8, 13, 1, 0, 0, 0, time.UTC)}}
-	store.event = OperatorAttentionEvent{EventKey: "automation:run-legal:automatic_retry_attention:" + strings.Repeat("e", 64), EventType: OperatorAttentionRetry, RunID: store.run.ID, ControllerState: string(store.run.State), ReasonCode: RetryReasonBudgetExhausted, RetryFailureClass: RetryFailureProcessStart, AllowedActions: []OperatorAttentionActionID{OperatorAttentionActionRetry, OperatorAttentionActionAbandon}}
+	store.inspection.Timeline = []Transition{{Sequence: 4, From: domain.StateAdmitting, To: domain.StateProvisioning, Reason: "provisioning", CreatedAt: time.Date(2026, 8, 13, 1, 0, 0, 0, time.UTC)}}
+	store.inspection.Attempts = []Attempt{{ID: 1, RunID: store.run.ID, Status: "failed", ErrorCategory: RetryReasonProcessStart, FinishedAt: time.Date(2026, 8, 13, 0, 59, 0, 0, time.UTC)}}
 	schedule := RetrySchedule{RunID: store.run.ID, Phase: AutomaticRetryPhaseForRun(store.run), ControllerState: string(store.run.State), AttemptCount: 4, MaxAttempts: 3, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: RetryFailureProcessStart, FailureEvidenceRef: "attempt:1", ReasonCode: RetryReasonBudgetExhausted, Status: RetryScheduleAttention, AttentionAt: time.Date(2026, 8, 13, 1, 0, 0, 0, time.UTC), CreatedAt: time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC), UpdatedAt: time.Date(2026, 8, 13, 1, 0, 0, 0, time.UTC)}
 	store.inspection.RetrySchedules = []RetrySchedule{schedule}
+	event, err := AutomaticRetryAttentionEvent(store.run, schedule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.event = event
 	action := newOperatorActionRecord(OperatorActionInput{Requester: requester, RunID: store.run.ID, Repository: store.run.Repository, ExpectedState: store.run.State, RunIdempotencyKey: store.run.IdempotencyKey, TransitionSequence: 4, ActionType: OperatorActionRetry, ReasonCode: store.event.ReasonCode, AttentionEventKey: store.event.EventKey}, schedule.AttentionAt.Add(time.Second))
 	store.inspection.OperatorActions = []OperatorActionRecord{action}
 	service, err := NewLegalActionService(store, authorizer)
