@@ -1143,39 +1143,13 @@ func (c *LocalController) applyImplementationOutcome(ctx context.Context, run Ru
 }
 
 func (c *LocalController) acceptDecision(ctx context.Context, run Run, decision Decision) error {
-	if strings.TrimSpace(decision.ChoiceID) == "" || strings.TrimSpace(decision.Instructions) == "" {
-		return errors.New("decision choice_id and instructions are required")
-	}
 	inspection, err := c.store.Inspect(ctx, run.ID)
 	if err != nil {
 		return err
 	}
-	var outcome domain.AgentOutcome
-	var sourceAttempt Attempt
-	found := false
-	for i := len(inspection.Attempts) - 1; i >= 0; i-- {
-		attempt := inspection.Attempts[i]
-		if (attempt.Kind == "implementation" || attempt.Kind == "resume") && attempt.Status == "succeeded" {
-			outcome, err = readOutcome[domain.AgentOutcome](attempt.OutcomePath, attempt.OutcomeHash)
-			sourceAttempt = attempt
-			found = true
-			break
-		}
-	}
+	sourceAttempt, err := validateDecisionRequestEvidence(inspection, decision)
 	if err != nil {
 		return err
-	}
-	if !found || outcome.DecisionRequest == nil {
-		return errors.New("missing persisted decision request evidence")
-	}
-	valid := false
-	for _, option := range outcome.DecisionRequest.Options {
-		if option.ID == decision.ChoiceID {
-			valid = true
-		}
-	}
-	if !valid {
-		return errors.New("decision choice_id is not an offered option")
 	}
 	data, _ := json.MarshalIndent(decision, "", "  ")
 	path := filepath.Join(run.ArtifactRoot, fmt.Sprintf("decision-%d.json", len(inspection.Attempts)))
@@ -1190,6 +1164,41 @@ func (c *LocalController) acceptDecision(ctx context.Context, run Run, decision 
 	}
 	evidenceData, _ := json.Marshal(evidence)
 	return c.store.Transition(ctx, run.ID, domain.StateAwaitingHumanDecision, domain.StateExecuting, "accepted simulated human decision", string(evidenceData), "")
+}
+
+func validateDecisionRequestEvidence(inspection RunInspection, decision Decision) (Attempt, error) {
+	if strings.TrimSpace(decision.ChoiceID) == "" || strings.TrimSpace(decision.Instructions) == "" || int64(len([]byte(decision.ChoiceID))+len([]byte(decision.Instructions))) > maxStructuredOutcomeBytes {
+		return Attempt{}, errors.New("decision choice_id and instructions are invalid")
+	}
+	var outcome domain.AgentOutcome
+	var sourceAttempt Attempt
+	var err error
+	found := false
+	for i := len(inspection.Attempts) - 1; i >= 0; i-- {
+		attempt := inspection.Attempts[i]
+		if (attempt.Kind == "implementation" || attempt.Kind == "resume") && attempt.Status == "succeeded" {
+			outcome, err = readOutcome[domain.AgentOutcome](attempt.OutcomePath, attempt.OutcomeHash)
+			sourceAttempt = attempt
+			found = true
+			break
+		}
+	}
+	if err != nil {
+		return Attempt{}, err
+	}
+	if !found || outcome.DecisionRequest == nil {
+		return Attempt{}, errors.New("missing persisted decision request evidence")
+	}
+	valid := false
+	for _, option := range outcome.DecisionRequest.Options {
+		if option.ID == decision.ChoiceID {
+			valid = true
+		}
+	}
+	if !valid {
+		return Attempt{}, errors.New("decision choice_id is not an offered option")
+	}
+	return sourceAttempt, nil
 }
 
 func validatePersistedDecisionReplay(ctx context.Context, timeline []Transition, expected persistedDecisionEvidence, expectedData []byte) error {

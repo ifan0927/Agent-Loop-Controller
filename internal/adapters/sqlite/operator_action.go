@@ -15,7 +15,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const operatorActionSelect = `SELECT action_id,idempotency_key,payload_digest,run_id,repository,expected_state,run_idempotency_key,transition_sequence,action_type,requester_login,requester_database_id,requester_node_id,requester_actor_type,reason_code,attention_event_key,status,result_status,resulting_state,resulting_transition_sequence,evidence_digest,outcome_digest,next_eligible_at,received_at,validated_at,applied_at,observed_at FROM operator_actions`
+const operatorActionSelect = `SELECT action_id,idempotency_key,payload_digest,request_digest,expected_authority_digest,run_id,repository,expected_state,run_idempotency_key,transition_sequence,action_type,requester_login,requester_database_id,requester_node_id,requester_actor_type,reason_code,attention_event_key,status,result_status,resulting_state,resulting_transition_sequence,evidence_digest,outcome_digest,next_eligible_at,received_at,validated_at,applied_at,observed_at FROM operator_actions`
 
 func (s *Store) listOperatorActions(ctx context.Context, runID string) ([]application.OperatorActionRecord, error) {
 	rows, err := s.db.QueryContext(ctx, operatorActionSelect+` WHERE run_id=? ORDER BY transition_sequence,action_id`, runID)
@@ -38,8 +38,13 @@ func (s *Store) BeginOperatorAction(ctx context.Context, record application.Oper
 	if err := application.ValidateOperatorActionRecord(record); err != nil {
 		return application.OperatorActionRecord{}, false, err
 	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO operator_actions(action_id,idempotency_key,payload_digest,run_id,repository,expected_state,run_idempotency_key,transition_sequence,action_type,requester_login,requester_database_id,requester_node_id,requester_actor_type,reason_code,attention_event_key,status,result_status,received_at,validated_at)
-		SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return application.OperatorActionRecord{}, false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `INSERT INTO operator_actions(action_id,idempotency_key,payload_digest,request_digest,expected_authority_digest,run_id,repository,expected_state,run_idempotency_key,transition_sequence,action_type,requester_login,requester_database_id,requester_node_id,requester_actor_type,reason_code,attention_event_key,status,result_status,received_at,validated_at)
+		SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
 		FROM runs
 		WHERE run_id=? AND repository=? AND current_state=? AND idempotency_key=?
 		AND (SELECT COALESCE(MAX(sequence),0) FROM transitions WHERE transitions.run_id=runs.run_id)=?
@@ -47,16 +52,10 @@ func (s *Store) BeginOperatorAction(ctx context.Context, record application.Oper
 			SELECT 1 FROM operator_attention_outbox
 			WHERE event_key=? AND run_id=runs.run_id AND controller_state=? AND reason_code=?
 			AND rowid=(SELECT rowid FROM operator_attention_outbox current WHERE current.run_id=runs.run_id ORDER BY created_at DESC,rowid DESC LIMIT 1)
-			AND CASE ?
-				WHEN 'retry' THEN allowed_actions_json='["retry","abandon"]'
-				WHEN 'abandon' THEN allowed_actions_json IN ('["retry","abandon"]','["abandon"]')
-				WHEN 'recover_ci_wait' THEN allowed_actions_json='["recover_ci_wait"]'
-				ELSE 0
-			END
 		)
 		ON CONFLICT DO NOTHING`,
-		record.ActionID, record.IdempotencyKey, record.PayloadDigest, record.RunID, record.Repository, string(record.ExpectedState), record.RunIdempotencyKey, record.TransitionSequence, string(record.ActionType), record.Requester.ID, record.Requester.DatabaseID, record.Requester.NodeID, record.Requester.ActorType, record.ReasonCode, record.AttentionEventKey, record.Status, record.ResultStatus, formatTime(record.ReceivedAt), formatTime(record.ValidatedAt),
-		record.RunID, record.Repository, string(record.ExpectedState), record.RunIdempotencyKey, record.TransitionSequence, record.AttentionEventKey, string(record.ExpectedState), record.ReasonCode, string(record.ActionType))
+		record.ActionID, record.IdempotencyKey, record.PayloadDigest, record.RequestDigest, record.ExpectedAuthorityDigest, record.RunID, record.Repository, string(record.ExpectedState), record.RunIdempotencyKey, record.TransitionSequence, string(record.ActionType), record.Requester.ID, record.Requester.DatabaseID, record.Requester.NodeID, record.Requester.ActorType, record.ReasonCode, record.AttentionEventKey, record.Status, record.ResultStatus, formatTime(record.ReceivedAt), formatTime(record.ValidatedAt),
+		record.RunID, record.Repository, string(record.ExpectedState), record.RunIdempotencyKey, record.TransitionSequence, record.AttentionEventKey, string(record.ExpectedState), record.ReasonCode)
 	if err != nil {
 		return application.OperatorActionRecord{}, false, err
 	}
@@ -65,19 +64,36 @@ func (s *Store) BeginOperatorAction(ctx context.Context, record application.Oper
 		return application.OperatorActionRecord{}, false, err
 	}
 	if affected == 1 {
+		var binding string
+		if err := tx.QueryRowContext(ctx, `SELECT repository_binding_digest FROM runs WHERE run_id=?`, record.RunID).Scan(&binding); err != nil {
+			return application.OperatorActionRecord{}, false, err
+		}
+		if !validOperatorActionDigest(binding) {
+			binding = application.LegacyRunAuthorityDigest(record.Repository)
+		}
+		receipt, err := application.OperationReceiptForOperatorAction(record, binding)
+		if err != nil {
+			return application.OperatorActionRecord{}, false, err
+		}
+		if err := insertOperationReceiptTx(ctx, tx, receipt, record.ActionID); err != nil {
+			return application.OperatorActionRecord{}, false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return application.OperatorActionRecord{}, false, err
+		}
 		return record, true, nil
 	}
-	existing, found, lookupErr := scanOperatorActionMaybe(s.db.QueryRowContext(ctx, operatorActionSelect+` WHERE idempotency_key=?`, record.IdempotencyKey))
+	existing, found, lookupErr := scanOperatorActionMaybe(tx.QueryRowContext(ctx, operatorActionSelect+` WHERE idempotency_key=?`, record.IdempotencyKey))
 	if lookupErr != nil {
 		return application.OperatorActionRecord{}, false, lookupErr
 	}
 	if found {
 		if existing.PayloadDigest != record.PayloadDigest || existing.ActionID != record.ActionID {
-			return application.OperatorActionRecord{}, false, errors.New("operator action idempotency authority conflicts")
+			return application.OperatorActionRecord{}, false, fmt.Errorf("%w: idempotency changed", application.ErrOperatorActionConflict)
 		}
-		return existing, false, nil
+		return existing, false, tx.Commit()
 	}
-	return application.OperatorActionRecord{}, false, errors.New("operator action current authority conflicts")
+	return application.OperatorActionRecord{}, false, application.ErrOperatorActionConflict
 }
 
 func (s *Store) ApplyOperatorActionResult(ctx context.Context, result application.OperatorActionMutationResult) (application.OperatorActionRecord, bool, error) {
@@ -169,6 +185,9 @@ func (s *Store) ApplyCIWaitRecovery(ctx context.Context, request application.CIW
 	if changed, _ := update.RowsAffected(); changed != 1 {
 		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, errors.New("CI wait recovery action compare-and-swap lost")
 	}
+	if err := syncOperationReceiptForActionTx(ctx, tx, action.ActionID); err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
+	}
 	action, _, err = getOperatorActionByIDTx(ctx, tx, action.ActionID)
 	if err != nil {
 		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
@@ -243,6 +262,9 @@ func (s *Store) applyOperatorRetryOnce(ctx context.Context, request application.
 	}
 	if changed, rowsErr := update.RowsAffected(); rowsErr != nil || changed != 1 {
 		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, errors.New("operator retry action compare-and-swap lost")
+	}
+	if err := syncOperationReceiptForActionTx(ctx, tx, action.ActionID); err != nil {
+		return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
 	}
 	action, _, err = getOperatorActionByIDTx(ctx, tx, action.ActionID)
 	if err != nil {
@@ -326,6 +348,9 @@ func (s *Store) advanceOperatorActionOnce(ctx context.Context, result applicatio
 	if affected, affectedErr := update.RowsAffected(); affectedErr != nil || affected != 1 {
 		return application.OperatorActionRecord{}, false, errors.New("operator action lifecycle compare-and-swap lost")
 	}
+	if err := syncOperationReceiptForActionTx(ctx, tx, result.ActionID); err != nil {
+		return application.OperatorActionRecord{}, false, err
+	}
 	updated, _, err := getOperatorActionByIDTx(ctx, tx, result.ActionID)
 	if err != nil || application.ValidateOperatorActionRecord(updated) != nil {
 		return application.OperatorActionRecord{}, false, errors.New("operator action persisted result is invalid")
@@ -361,7 +386,7 @@ func scanOperatorActionMaybe(row rowScanner) (application.OperatorActionRecord, 
 func scanOperatorAction(row rowScanner) (application.OperatorActionRecord, error) {
 	var record application.OperatorActionRecord
 	var expected, actionType, resulting, eligible, received, validated, applied, observed string
-	if err := row.Scan(&record.ActionID, &record.IdempotencyKey, &record.PayloadDigest, &record.RunID, &record.Repository, &expected, &record.RunIdempotencyKey, &record.TransitionSequence, &actionType, &record.Requester.ID, &record.Requester.DatabaseID, &record.Requester.NodeID, &record.Requester.ActorType, &record.ReasonCode, &record.AttentionEventKey, &record.Status, &record.ResultStatus, &resulting, &record.ResultingTransitionSequence, &record.EvidenceDigest, &record.OutcomeDigest, &eligible, &received, &validated, &applied, &observed); err != nil {
+	if err := row.Scan(&record.ActionID, &record.IdempotencyKey, &record.PayloadDigest, &record.RequestDigest, &record.ExpectedAuthorityDigest, &record.RunID, &record.Repository, &expected, &record.RunIdempotencyKey, &record.TransitionSequence, &actionType, &record.Requester.ID, &record.Requester.DatabaseID, &record.Requester.NodeID, &record.Requester.ActorType, &record.ReasonCode, &record.AttentionEventKey, &record.Status, &record.ResultStatus, &resulting, &record.ResultingTransitionSequence, &record.EvidenceDigest, &record.OutcomeDigest, &eligible, &received, &validated, &applied, &observed); err != nil {
 		return application.OperatorActionRecord{}, err
 	}
 	record.ExpectedState, record.ActionType, record.ResultingState = domain.State(expected), application.OperatorActionType(actionType), domain.State(resulting)

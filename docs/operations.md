@@ -2285,17 +2285,23 @@ while a separate trusted exact-head review supplied `CHANGES_REQUESTED`; the
 controller does not combine those reviews. Reason fields contain no review body
 or other actor-controlled prose.
 
-`operator_actions` is a separate ordered projection for authenticated recovery
-answers. It shows the allowlisted action, immutable requester identity, exact
-attention/reason and transition binding, lifecycle/result, resulting
+`operator_actions` remains the ordered compatibility projection for
+authenticated recovery answers. It shows the allowlisted action, immutable
+requester identity, exact attention/reason and transition binding,
+lifecycle/result, resulting
 state/sequence, separate sanitized applied-evidence/outcome digests, and
 the exact persisted retry eligibility plus received/validated/applied/observed
 times. It never exposes the action or run
 idempotency key, raw CLI arguments, paths, prose, or credentials. An entry is
 human-action provenance; ordinary timeline transitions and external side
-effects remain automatic/controller evidence. `controller retry` consumes this
-journal; other recovery commands retain their dedicated boundaries. It is not a
-generic state-mutation interface.
+effects remain automatic/controller evidence. Decision, retry, abandon,
+CI-wait recovery, owned-push recovery, and external-merge acceptance all bind
+this action-specific journal to the common scope-neutral operation receipt
+before controller mutation. The presentation-independent legal-action and
+single-receipt application queries are not new CLI mutation commands. Every
+execution still enters its dedicated revalidation, ownership, exact-head, CAS,
+lease, and reconciliation boundary; there is no generic state-mutation
+interface.
 
 The persisted idempotency key is controller authority for an authenticated
 recovery command, not a credential for an external service. Keep it run-scoped

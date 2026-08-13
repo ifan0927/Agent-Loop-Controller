@@ -126,6 +126,44 @@ existing exact-head, CAS, lease, idempotency, and reconciliation checks. The
 current CLI requester flags remain compatible by entering these same
 application contracts.
 
+### Legal actions and operation receipts
+
+The Controller derives legal-action offers only from authorized persisted run,
+transition, scheduling, recovery, and current-attention evidence. An offer has
+an opaque stable identifier, typed action, sanitized reason, required
+confirmation/input kind, and consequence. It does not expose expected or target
+state, transition sequence, action/run idempotency keys, command arguments,
+paths, sessions, or mutable workflow authority. Possessing an offer is not
+authorization: execution resolves the configured immutable operator again,
+loads only the encoded target, re-reads its frozen authority, and recomputes the
+current offer before entering the existing action-specific service.
+
+The six current actions are `decide`, `retry`, `abandon`, `recover_ci_wait`,
+`recover_owned_push`, and `accept_external_merge`. Attention `allowed_actions`
+and offered legal actions use the same eligibility predicates. Each typed
+executor retains its own revalidation and safety gates; there is no generic
+state-mutation endpoint.
+
+Before the first controller mutation, every accepted action is atomically bound
+to a common scope-neutral receipt. Controller, repository, run, and onboarding
+targets share the same envelope without invented run fields. Deterministic
+operation identity combines the exact requester, target scope, target,
+authority digest, operation type, and request digest. A private
+Controller-derived operation anchor binds the exact attention/transition or
+equivalent future mutation occurrence; it is neither rendered nor accepted as
+presentation authority. Exact replay returns the persisted receipt. Within one
+anchor, payload, action, or expected-authority drift conflicts, while a later
+Controller-owned occurrence receives a new anchor. Mutually exclusive actions
+share the same authority uniqueness boundary.
+
+Receipt phase and outcome are separate. The monotonic phases are `accepted`,
+`applied`, and `observed`; outcomes are `pending`, `succeeded`, `failed`,
+`conflict`, and `ambiguous`. An interrupted caller cannot erase an accepted
+receipt. Restart reconciliation uses persisted action and transition evidence
+to complete or classify it without repeating a proven mutation. The authorized
+single-receipt query returns the same sanitized `not_found` result for missing
+and unauthorized targets and reads only persisted Controller state.
+
 ## 5. End-to-End Data Flow
 
 1. Admission reads Linear by identifier or scans a bounded eligible Todo set.
@@ -847,7 +885,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 29; migration history is code, not a
+inspection. The current schema is version 30; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees
@@ -1016,7 +1054,9 @@ restart or subsequent state advance; payload drift fails closed. A run,
 transition, and parked attention event can own only one validated answer, so
 concurrent contradictory actions fail closed.
 
-The operator-action lifecycle is monotonic: `validated` records authority
+`operator_actions` remains the action-specific compatibility journal and is
+atomically mirrored into the common `operation_receipts` contract. The legacy
+operator-action lifecycle is monotonic: `validated` records authority
 before mutation, `applied` binds the resulting state and transition sequence,
 and `observed` records a typed terminal result. Timestamps and sanitized
 payload/applied-evidence/outcome digests make incomplete or ambiguous outcomes
@@ -1093,10 +1133,11 @@ future HTTP ----------------------/
                            external adapters
 ```
 
-Controller application services first define authorization, repository
-onboarding, configuration transactions, legal-action offers, operation receipts,
-idempotency, and audit evidence independently of presentation. CLI, TUI, and any
-future HTTP adapter call those same typed services. A presentation adapter may
+Controller application services define authorization, legal-action offers,
+operation receipts, idempotency, and audit evidence independently of
+presentation; repository onboarding and configuration transactions remain
+later foundations. CLI, TUI, and any future HTTP adapter call the same typed
+services. A presentation adapter may
 authenticate, validate, bound, and render requests; it may not duplicate state
 transitions, authorization, scheduling, or external-write policy.
 
@@ -1150,7 +1191,8 @@ around it. The principal table groups are:
 | `heavy_capacity_authority`, `repository_slots`, `heavy_permits`, `run_scheduling` | Effective capacity, per-repository exclusion, local-heavy-work ownership, and durable runnable order |
 | `queue_snapshot`, `scheduling_decisions` | Bounded replaceable queue projection and append-only authority-changing decision evidence |
 | `automatic_retry_schedules`, `operator_attention_outbox` | Restart-stable retry policy and immutable versioned operator-attention events; legacy delivery fields are storage-only evidence |
-| `operator_actions` | Explicit authenticated recovery intent and its validated/applied/observed provenance, separate from automatic workflow evidence |
+| `operator_actions` | Action-specific authenticated recovery intent and legacy validated/applied/observed provenance, separate from automatic workflow evidence |
+| `operation_receipts` | Scope-neutral accepted/applied/observed operation identity, outcome, and sanitized result evidence; legacy operator actions are backfilled and mirrored here |
 
 ### Current state versus evidence
 

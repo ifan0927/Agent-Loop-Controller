@@ -680,6 +680,90 @@ func TestExplicitSessionResumeSurvivesControllerRestart(t *testing.T) {
 	}
 }
 
+func TestLegalDecisionOfferPersistsReceiptBeforeResumeAndReplaysAfterRestart(t *testing.T) {
+	lab := newLocalLab(t)
+	identity := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
+	lab.snapshot.Task.Repository = "owner/repo"
+	lab.snapshot.NormalizedJSON, _ = json.Marshal(lab.snapshot.Task)
+	normalizedSum := sha256.Sum256(lab.snapshot.NormalizedJSON)
+	lab.snapshot.TaskHash = hex.EncodeToString(normalizedSum[:])
+	lab.repository.CanonicalRepository = lab.snapshot.Task.Repository
+	lab.repository.ProfileID = "repository-profile:" + lab.repository.CanonicalRepository
+	lab.repository.AllowedOperatorLogins = []string{identity.Login}
+	lab.repository.TrustedOperatorActors = []application.TrustedActorIdentity{{Login: identity.Login, DatabaseID: identity.DatabaseID, NodeID: identity.NodeID, Type: identity.ActorType}}
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	process := &durableFakeProcess{needsDecision: true}
+	controller := newController(t, store, lab, process, gitadapter.Workspace{})
+	run, err := controller.Start(context.Background(), startInput(lab))
+	if err != nil || run.State != domain.StateAwaitingHumanDecision {
+		t.Fatalf("run=%+v err=%v", run, err)
+	}
+	parked, err := store.Inspect(context.Background(), run.ID)
+	if err != nil || len(parked.Timeline) == 0 {
+		t.Fatalf("inspection=%+v err=%v", parked, err)
+	}
+	run = parked.Run
+	attention, err := application.HumanDecisionAttentionEvent(run, parked.Timeline[len(parked.Timeline)-1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AppendOperatorAttention(context.Background(), attention); err != nil {
+		t.Fatal(err)
+	}
+	authorizer, err := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: identity})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legal, err := application.NewLegalActionService(store, authorizer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requester := application.Requester{ID: identity.Login, Kind: "github_login", DatabaseID: identity.DatabaseID, NodeID: identity.NodeID, ActorType: identity.ActorType}
+	offers, err := legal.ListLegalActionOffers(context.Background(), application.LegalActionOfferQuery{Requester: requester, RunID: run.ID})
+	if err != nil || len(offers) != 1 || offers[0].Action != application.OperationDecide {
+		t.Fatalf("offers=%+v err=%v", offers, err)
+	}
+	if _, invalidErr := legal.ExecuteDecision(context.Background(), application.LegalActionExecutionCommand{Requester: requester, OfferID: offers[0].OfferID}, application.LegalDecisionInput{ChoiceID: "not-offered", Instructions: "Do not accept this input."}, controller); invalidErr == nil {
+		t.Fatal("unoffered decision choice was accepted")
+	}
+	before, err := store.Inspect(context.Background(), run.ID)
+	if err != nil || len(before.OperatorActions) != 0 || process.resumeCalls != 0 {
+		t.Fatalf("invalid decision persisted authority: actions=%+v resume_calls=%d err=%v", before.OperatorActions, process.resumeCalls, err)
+	}
+	receipt, err := legal.ExecuteDecision(context.Background(), application.LegalActionExecutionCommand{Requester: requester, OfferID: offers[0].OfferID}, application.LegalDecisionInput{ChoiceID: "inclusive", Instructions: "Use inclusive min and max bounds."}, controller)
+	if err != nil || receipt.Phase != application.OperationPhaseObserved || receipt.Outcome != application.OperationOutcomeSucceeded || receipt.OperationType != application.OperationDecide || receipt.TargetID != run.ID {
+		t.Fatalf("receipt=%+v err=%v", receipt, err)
+	}
+	inspection, err := store.Inspect(context.Background(), run.ID)
+	if err != nil || len(inspection.OperatorActions) != 1 || inspection.OperatorActions[0].ExpectedAuthorityDigest != offers[0].AuthorityDigest || inspection.OperatorActions[0].Status != application.OperatorActionStatusObserved {
+		t.Fatalf("actions=%+v err=%v", inspection.OperatorActions, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	query, err := application.NewOperationReceiptQueryService(store, authorizer, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := query.Get(context.Background(), requester, receipt.OperationID)
+	if err != nil || persisted != receipt {
+		t.Fatalf("persisted=%+v receipt=%+v err=%v", persisted, receipt, err)
+	}
+	restartedLegal, _ := application.NewLegalActionService(store, authorizer)
+	replayed, err := restartedLegal.ExecuteDecision(context.Background(), application.LegalActionExecutionCommand{Requester: requester, OfferID: offers[0].OfferID}, application.LegalDecisionInput{ChoiceID: "inclusive", Instructions: "Use inclusive min and max bounds."}, newController(t, store, lab, process, gitadapter.Workspace{}))
+	if err != nil || replayed != receipt || process.resumeCalls != 1 {
+		t.Fatalf("replayed=%+v receipt=%+v resume_calls=%d err=%v", replayed, receipt, process.resumeCalls, err)
+	}
+}
+
 func TestPersistedDecisionTamperFailsBeforeResume(t *testing.T) {
 	lab := newLocalLab(t)
 	store, err := storeadapter.Open(lab.db)

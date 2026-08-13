@@ -350,7 +350,7 @@ that bypass safety solely to make fault injection easier.
 ## Database Migrations
 
 SQLite migrations are ordered in `internal/adapters/sqlite/store.go`; the current
-schema version is 29. Opening a database applies missing forward migrations in a
+schema version is 30. Opening a database applies missing forward migrations in a
 transaction. A database newer than the binary fails closed.
 
 When adding a migration:

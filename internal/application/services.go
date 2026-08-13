@@ -226,6 +226,37 @@ func (s CommandService) Continue(ctx context.Context, command ContinueCommand) (
 	if run.IdempotencyKey != command.IdempotencyKey {
 		return CommandResult{}, serviceError(ErrorConflict, "run idempotency authority does not match the request", nil)
 	}
+	var decisionAction *OperatorActionRecord
+	var decisionActions *OperatorActionService
+	if command.ExpectedState == domain.StateAwaitingHumanDecision && command.Decision != nil {
+		actionStore, ok := s.store.(OperatorActionStore)
+		if ok {
+			inspection, inspectErr := s.store.Inspect(ctx, run.ID)
+			if inspectErr != nil {
+				return CommandResult{}, classifyServiceError(inspectErr)
+			}
+			if _, decisionErr := validateDecisionRequestEvidence(inspection, *command.Decision); decisionErr != nil {
+				return CommandResult{}, serviceError(ErrorConflict, "decision is not authorized by persisted request evidence", decisionErr)
+			}
+			event, found, attentionErr := actionStore.CurrentOperatorAttention(ctx, run.ID)
+			if attentionErr != nil {
+				return CommandResult{}, classifyServiceError(attentionErr)
+			}
+			if !found || !slices.Contains(legalActionIDsForInspection(run, inspection, event), OperatorAttentionActionDecide) {
+				return CommandResult{}, serviceError(ErrorConflict, "human decision is not a current legal action", nil)
+			}
+			decisionActions, err = NewOperatorActionService(actionStore)
+			if err != nil {
+				return CommandResult{}, serviceError(ErrorInternal, "decision operation receipt is unavailable", err)
+			}
+			digest := DecisionOperationInputDigest(*command.Decision)
+			action, _, prepareErr := decisionActions.Prepare(ctx, OperatorActionInput{Requester: command.Requester, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, RunIdempotencyKey: run.IdempotencyKey, TransitionSequence: latestTransitionSequence(inspection.Timeline), ActionType: OperatorActionDecide, ReasonCode: event.ReasonCode, AttentionEventKey: event.EventKey, RequestDigest: digest})
+			if prepareErr != nil {
+				return CommandResult{}, prepareErr
+			}
+			decisionAction = &action
+		}
+	}
 	heavyCtx, releaseHeavy, err := s.enterHeavyWork(ctx, run)
 	if err != nil {
 		return CommandResult{}, err
@@ -239,6 +270,28 @@ func (s CommandService) Continue(ctx context.Context, command ContinueCommand) (
 	if err != nil {
 		return CommandResult{}, classifyServiceError(err)
 	}
+	if decisionAction != nil && decisionActions != nil {
+		inspection, inspectErr := s.store.Inspect(ctx, run.ID)
+		if inspectErr != nil {
+			return CommandResult{}, classifyServiceError(inspectErr)
+		}
+		action := *decisionAction
+		sequence := latestTransitionSequence(inspection.Timeline)
+		evidence := digestText("decision-applied-v1\x00" + action.ActionID + "\x00" + string(run.State) + "\x00" + fmt.Sprint(sequence))
+		if action.Status == OperatorActionStatusValidated {
+			action, _, err = decisionActions.RecordApplied(ctx, OperatorActionMutationResult{ActionID: action.ActionID, ExpectedStatus: OperatorActionStatusValidated, ResultStatus: OperatorActionResultApplied, ResultingState: run.State, ResultingTransitionSequence: sequence, EvidenceDigest: evidence, At: time.Now().UTC()})
+			if err != nil {
+				return CommandResult{}, err
+			}
+		}
+		if action.Status == OperatorActionStatusApplied {
+			outcome := digestText("decision-observed-v1\x00" + action.ActionID + "\x00" + action.EvidenceDigest)
+			_, _, err = decisionActions.RecordObserved(ctx, OperatorActionMutationResult{ActionID: action.ActionID, ExpectedStatus: OperatorActionStatusApplied, ResultStatus: OperatorActionResultSucceeded, ResultingState: action.ResultingState, ResultingTransitionSequence: action.ResultingTransitionSequence, EvidenceDigest: outcome, At: time.Now().UTC()})
+			if err != nil {
+				return CommandResult{}, err
+			}
+		}
+	}
 	if command.ExpectedState == domain.StateAwaitingHumanDecision && command.Decision != nil && HeavyWorkRequired(run.State) {
 		resumeCtx, releaseResume, acquireErr := s.enterHeavyWork(ctx, run)
 		if acquireErr != nil {
@@ -251,6 +304,14 @@ func (s CommandService) Continue(ctx context.Context, command ContinueCommand) (
 		}
 	}
 	return CommandResult{Run: projectRunResult(run)}, nil
+}
+
+func DecisionOperationInputDigest(decision Decision) string {
+	raw, _ := json.Marshal(struct {
+		ChoiceID     string `json:"choice_id"`
+		Instructions string `json:"instructions"`
+	}{decision.ChoiceID, decision.Instructions})
+	return digestText("decision-operation-input-v1\x00" + string(raw))
 }
 
 func (s CommandService) enterHeavyWork(ctx context.Context, run Run) (context.Context, func(), error) {
@@ -411,8 +472,24 @@ func (s QueryService) inspectAuthorized(ctx context.Context, runID string) (Insp
 	if err != nil {
 		return InspectionResult{}, classifyServiceError(err)
 	}
+	currentAttentionKey := ""
+	if currentStore, ok := s.store.(CurrentOperatorAttentionQuery); ok {
+		current, found, currentErr := currentStore.CurrentOperatorAttention(ctx, runID)
+		if currentErr != nil {
+			return InspectionResult{}, classifyServiceError(currentErr)
+		}
+		if found {
+			currentAttentionKey = current.EventKey
+			if !slices.ContainsFunc(attention, func(event OperatorAttentionEvent) bool { return event.EventKey == current.EventKey }) {
+				if len(attention) >= maxOperatorAttentionProjection {
+					attention = attention[1:]
+				}
+				attention = append(attention, current)
+			}
+		}
+	}
 	inspection.OperatorAttention = attention
-	return projectInspection(inspection), nil
+	return projectInspection(inspection, currentAttentionKey), nil
 }
 
 // GetRunDetail reads and authorizes one run entirely through the application
@@ -877,7 +954,11 @@ type ThreadStatusResult struct {
 	ObservedAt     time.Time `json:"observed_at,omitempty"`
 }
 
-func projectInspection(value RunInspection) InspectionResult {
+func projectInspection(value RunInspection, currentAttentionKeys ...string) InspectionResult {
+	currentAttentionKey := ""
+	if len(currentAttentionKeys) > 0 {
+		currentAttentionKey = currentAttentionKeys[0]
+	}
 	pullRequestObservations := projectPullRequestObservations(value)
 	githubTotal := value.GitHubEvidenceTotal
 	if githubTotal < len(githubEvidenceHistory(value)) {
@@ -930,7 +1011,11 @@ func projectInspection(value RunInspection) InspectionResult {
 	}
 	for _, event := range value.OperatorAttention {
 		profile := projectedOperatorAttentionProfile(event)
-		result.OperatorAttentionEvents = append(result.OperatorAttentionEvents, OperatorAttentionEventResult{SchemaVersion: event.SchemaVersion, EventKey: event.EventKey, EventType: event.EventType, RunID: event.RunID, LinearIdentifier: event.LinearIdentifier, RepositoryProfileID: profile.ID, RepositoryProfileName: profile.Name, ControllerState: event.ControllerState, Severity: event.Severity, ReasonCode: event.ReasonCode, AllowedActions: append([]OperatorAttentionActionID{}, event.AllowedActions...), PayloadDigest: event.PayloadDigest, EvidenceDigest: event.EvidenceDigest, OccurredAt: event.OccurredAt, ObservedAt: event.ObservedAt})
+		allowedActions := append([]OperatorAttentionActionID{}, event.AllowedActions...)
+		if event.EventKey == currentAttentionKey {
+			allowedActions = legalActionIDsForInspection(value.Run, value, event)
+		}
+		result.OperatorAttentionEvents = append(result.OperatorAttentionEvents, OperatorAttentionEventResult{SchemaVersion: event.SchemaVersion, EventKey: event.EventKey, EventType: event.EventType, RunID: event.RunID, LinearIdentifier: event.LinearIdentifier, RepositoryProfileID: profile.ID, RepositoryProfileName: profile.Name, ControllerState: event.ControllerState, Severity: event.Severity, ReasonCode: event.ReasonCode, AllowedActions: allowedActions, PayloadDigest: event.PayloadDigest, EvidenceDigest: event.EvidenceDigest, OccurredAt: event.OccurredAt, ObservedAt: event.ObservedAt})
 	}
 	for _, action := range value.OperatorActions {
 		result.OperatorActions = append(result.OperatorActions, OperatorActionResult{ActionID: action.ActionID, ActionType: action.ActionType, Repository: action.Repository, ExpectedState: action.ExpectedState, TransitionSequence: action.TransitionSequence, RequesterLogin: sanitizeUntrustedContent(action.Requester.ID), RequesterDatabaseID: action.Requester.DatabaseID, RequesterNodeID: sanitizeUntrustedContent(action.Requester.NodeID), RequesterActorType: sanitizeUntrustedContent(action.Requester.ActorType), ReasonCode: action.ReasonCode, AttentionEventKey: action.AttentionEventKey, Status: action.Status, ResultStatus: action.ResultStatus, ResultingState: action.ResultingState, ResultingTransitionSequence: action.ResultingTransitionSequence, PayloadDigest: action.PayloadDigest, EvidenceDigest: action.EvidenceDigest, OutcomeDigest: action.OutcomeDigest, NextEligibleAt: action.NextEligibleAt, ReceivedAt: action.ReceivedAt, ValidatedAt: action.ValidatedAt, AppliedAt: action.AppliedAt, ObservedAt: action.ObservedAt})

@@ -25,10 +25,12 @@ const (
 type OperatorAttentionActionID string
 
 const (
-	OperatorAttentionActionRetry         OperatorAttentionActionID = "retry"
-	OperatorAttentionActionAbandon       OperatorAttentionActionID = "abandon"
-	OperatorAttentionActionDecide        OperatorAttentionActionID = "decide"
-	OperatorAttentionActionRecoverCIWait OperatorAttentionActionID = "recover_ci_wait"
+	OperatorAttentionActionRetry               OperatorAttentionActionID = "retry"
+	OperatorAttentionActionAbandon             OperatorAttentionActionID = "abandon"
+	OperatorAttentionActionDecide              OperatorAttentionActionID = "decide"
+	OperatorAttentionActionRecoverCIWait       OperatorAttentionActionID = "recover_ci_wait"
+	OperatorAttentionActionRecoverOwnedPush    OperatorAttentionActionID = "recover_owned_push"
+	OperatorAttentionActionAcceptExternalMerge OperatorAttentionActionID = "accept_external_merge"
 )
 
 const (
@@ -435,7 +437,14 @@ func allowedOperatorAttentionActionsFor(eventType, state, reason string, failure
 		return actions
 	}
 	if eventType == OperatorAttentionManualIntervention && state == string(domain.StateManualIntervention) && isManualInterventionReason(reason) {
-		return []OperatorAttentionActionID{OperatorAttentionActionAbandon}
+		actions := []OperatorAttentionActionID{OperatorAttentionActionAbandon}
+		if reason == "owned_push_recovery" {
+			actions = append(actions, OperatorAttentionActionRecoverOwnedPush)
+		}
+		if reason == "external_merge_recovery" {
+			actions = append(actions, OperatorAttentionActionAcceptExternalMerge)
+		}
+		return actions
 	}
 	if eventType == OperatorAttentionHumanDecision && state == string(domain.StateAwaitingHumanDecision) && reason == "human_decision_required" {
 		return []OperatorAttentionActionID{OperatorAttentionActionDecide}
@@ -450,7 +459,7 @@ func allowedOperatorAttentionActionsFor(eventType, state, reason string, failure
 }
 
 func isManualInterventionReason(reason string) bool {
-	return reason == "manual_intervention" || reason == string(domain.TrustedReviewTopologyUnsupported) || reason == string(domain.TrustedReviewTopologySplitReview) || reason == TrustedReviewFeedbackDriftReason || reason == TrustedReviewFeedbackConflictReason
+	return reason == "manual_intervention" || reason == "owned_push_recovery" || reason == "external_merge_recovery" || reason == string(domain.TrustedReviewTopologyUnsupported) || reason == string(domain.TrustedReviewTopologySplitReview) || reason == TrustedReviewFeedbackDriftReason || reason == TrustedReviewFeedbackConflictReason
 }
 
 // operatorRetryableState is shared by attention projection and the command
@@ -495,7 +504,7 @@ func sanitizedOperatorAttentionReason(eventType, value string) string {
 		OperatorAttentionAdmissionAuthority:    {"admission_authority_conflict": true, "mutation_authority_conflict": true},
 		OperatorAttentionRetry:                 {RetryReasonProcessStart: true, RetryReasonUnavailable: true, RetryReasonAuthority: true, RetryReasonIntegrity: true, RetryReasonManual: true, RetryReasonTerminal: true, RetryReasonPersistence: true, RetryReasonBudgetExhausted: true},
 		OperatorAttentionCleanupResidue:        {"cleanup_residue": true},
-		OperatorAttentionManualIntervention:    {"manual_intervention": true, string(domain.TrustedReviewTopologyUnsupported): true, string(domain.TrustedReviewTopologySplitReview): true, TrustedReviewFeedbackDriftReason: true, TrustedReviewFeedbackConflictReason: true},
+		OperatorAttentionManualIntervention:    {"manual_intervention": true, "owned_push_recovery": true, "external_merge_recovery": true, string(domain.TrustedReviewTopologyUnsupported): true, string(domain.TrustedReviewTopologySplitReview): true, TrustedReviewFeedbackDriftReason: true, TrustedReviewFeedbackConflictReason: true},
 		OperatorAttentionHumanDecision:         {"human_decision_required": true},
 		OperatorAttentionCISlow:                {"ci_wait_slow": true},
 		OperatorAttentionCIWaitRecovery:        {"legacy_ci_topology_drift": true},

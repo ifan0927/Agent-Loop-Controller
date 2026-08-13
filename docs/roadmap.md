@@ -114,6 +114,7 @@ to cover at least 90 percent of routine local work:
 
 ```text
 completed controller, bounded-concurrency, and authorization foundation
+  -> operation receipts and legal actions
   -> remaining controller operator foundations
   -> local TUI operator console
   -> optional future adapters only when justified
@@ -129,27 +130,27 @@ legacy installations have a bounded reversible migration rather than a second
 runtime path.
 
 Implementation work is created one dependency-ready issue at a time. Local
-operator identity and application authorization are complete. The next
-foundation is operation receipts and legal-action offers. Do not create
+operator identity, application authorization, operation receipts, and
+legal-action offers are complete. The next foundation is worker heartbeat and
+runtime observation. Do not create
 speculative TUI, HTTP, or frontend slices before their Controller contracts
 exist.
 
 ### Phase 1: controller operator foundations
 
-Bounded multi-repository concurrency and local operator authorization are
-complete. The remaining
+Bounded multi-repository concurrency, local operator authorization, operation
+receipts, and legal-action offers are complete. The remaining
 presentation-independent sequence is:
 
-1. operation receipts and legal-action offers;
-2. worker heartbeat and runtime observation;
-3. configuration generation and compare-and-swap apply;
-4. typed configuration lifecycle;
-5. repository lifecycle and readiness;
-6. restart-safe onboarding saga;
-7. existing-checkout adoption;
-8. empty-repository initialization;
-9. routine Controller projections;
-10. activity and audit integrity.
+1. worker heartbeat and runtime observation;
+2. configuration generation and compare-and-swap apply;
+3. typed configuration lifecycle;
+4. repository lifecycle and readiness;
+5. restart-safe onboarding saga;
+6. existing-checkout adoption;
+7. empty-repository initialization;
+8. routine Controller projections;
+9. activity and audit integrity.
 
 These services own policy, authorization, idempotency, reconciliation, and
 sanitized evidence independently of presentation. GitHub repository creation,
