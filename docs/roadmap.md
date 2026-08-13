@@ -113,7 +113,7 @@ the retired read-only monitoring roadmap with a staged operator product intended
 to cover at least 90 percent of routine local work:
 
 ```text
-completed controller and bounded-concurrency foundation
+completed controller, bounded-concurrency, and authorization foundation
   -> remaining controller operator foundations
   -> local TUI operator console
   -> optional future adapters only when justified
@@ -128,28 +128,28 @@ implemented `ifan-loop` executable and launchd identity remain a compatibility
 surface until the installation-safe migration in
 [#104](https://github.com/ifan0927/Agent-Loop-Controller/issues/104) completes.
 
-Implementation work is created one dependency-ready issue at a time. The next
-foundation is
-[#103](https://github.com/ifan0927/Agent-Loop-Controller/issues/103), local
-operator identity and application authorization. Do not create speculative TUI,
-HTTP, or frontend slices before their Controller contracts exist.
+Implementation work is created one dependency-ready issue at a time. Local
+operator identity and application authorization are complete. The next
+foundation is operation receipts and legal-action offers. Do not create
+speculative TUI, HTTP, or frontend slices before their Controller contracts
+exist.
 
 ### Phase 1: controller operator foundations
 
-Bounded multi-repository concurrency is complete. The remaining
+Bounded multi-repository concurrency and local operator authorization are
+complete. The remaining
 presentation-independent sequence is:
 
-1. local operator identity and application authorization;
-2. operation receipts and legal-action offers;
-3. worker heartbeat and runtime observation;
-4. configuration generation and compare-and-swap apply;
-5. typed configuration lifecycle;
-6. repository lifecycle and readiness;
-7. restart-safe onboarding saga;
-8. existing-checkout adoption;
-9. empty-repository initialization;
-10. routine Controller projections;
-11. activity and audit integrity.
+1. operation receipts and legal-action offers;
+2. worker heartbeat and runtime observation;
+3. configuration generation and compare-and-swap apply;
+4. typed configuration lifecycle;
+5. repository lifecycle and readiness;
+6. restart-safe onboarding saga;
+7. existing-checkout adoption;
+8. empty-repository initialization;
+9. routine Controller projections;
+10. activity and audit integrity.
 
 These services own policy, authorization, idempotency, reconciliation, and
 sanitized evidence independently of presentation. GitHub repository creation,

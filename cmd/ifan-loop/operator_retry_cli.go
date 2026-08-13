@@ -38,11 +38,12 @@ func controllerRetry(args []string) error {
 		return err
 	}
 	defer store.Close()
-	run, err := store.GetRun(context.Background(), runID)
+	queries, err := configuredQueryService(loaded, store)
 	if err != nil {
-		return application.ClassifyError(err)
+		return err
 	}
-	if _, err := application.NewQueryService(store).Status(context.Background(), application.QueryInput{Requester: requester.value(), RunID: run.ID, Repository: run.Repository}); err != nil {
+	run, err := queries.ResolveRunTarget(context.Background(), application.QueryInput{Requester: requester.value(), RunID: runID})
+	if err != nil {
 		return err
 	}
 	if err := validateProductionPersistedBinding(run, loaded.Registry); err != nil {

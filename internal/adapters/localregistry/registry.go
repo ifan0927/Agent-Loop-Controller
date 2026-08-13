@@ -2,6 +2,7 @@ package localregistry
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -17,6 +18,8 @@ import (
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/verifier"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
 const CurrentVersion = 1
@@ -517,6 +520,22 @@ func (r Registry) Resolve(name string) (Binding, error) {
 		return Binding{}, fmt.Errorf("unknown canonical repository: %s", name)
 	}
 	return repo, nil
+}
+
+// RepositoryAuthority exposes only the current immutable authorization fields
+// required by application collection queries. Local paths and adapter details
+// never cross this boundary.
+func (r Registry) RepositoryAuthority(_ context.Context, name string) (application.RepositoryAuthority, bool, error) {
+	binding, err := r.Resolve(name)
+	if err != nil {
+		return application.RepositoryAuthority{}, false, nil
+	}
+	trusted := make([]domain.GitHubUserIdentity, 0, len(binding.OperatorIdentityPolicy.TrustedActors))
+	for _, actor := range binding.OperatorIdentityPolicy.TrustedActors {
+		trusted = append(trusted, domain.GitHubUserIdentity{Login: actor.Login, DatabaseID: actor.DatabaseID, NodeID: actor.NodeID, ActorType: actor.Type})
+	}
+	return application.RepositoryAuthority{Repository: binding.CanonicalRepository, ProfileID: binding.ProfileID, BindingDigest: binding.RepositoryBindingDigest,
+		AllowedLogins: append([]string(nil), binding.OperatorIdentityPolicy.AllowedLogins...), TrustedOperators: trusted, Enabled: true}, true, nil
 }
 
 // ResolveLinearLabel resolves the controller-configured short label from a

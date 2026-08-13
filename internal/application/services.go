@@ -41,6 +41,10 @@ func serviceError(category ErrorCategory, message string, cause error) error {
 	return &ServiceError{Category: category, Message: message, cause: cause}
 }
 
+func hiddenTargetError() error {
+	return serviceError(ErrorNotFound, "resource is not available", nil)
+}
+
 type Requester struct {
 	ID         string `json:"id"`
 	Kind       string `json:"kind"`
@@ -323,8 +327,9 @@ type QueryInput struct {
 	Repository string    `json:"repository"`
 }
 
-// RunSummaryQuery is a repository-scoped, bounded read request. Cursor is an
-// opaque value issued by a previous RunSummaryPage.
+// RunSummaryQuery is a bounded authorized read request. An empty repository
+// selects the configured operator's controller-wide frozen-run scopes. Cursor
+// is an opaque value issued by a previous RunSummaryPage.
 type RunSummaryQuery struct {
 	Requester  Requester `json:"requester"`
 	Repository string    `json:"repository"`
@@ -338,35 +343,71 @@ type RunDetailQuery struct {
 }
 
 type runSummaryCursor struct {
-	Version   string    `json:"version"`
-	CreatedAt time.Time `json:"created_at"`
-	RunID     string    `json:"run_id"`
+	Version     string    `json:"version"`
+	Repository  string    `json:"repository,omitempty"`
+	ScopeDigest string    `json:"scope_digest"`
+	CreatedAt   time.Time `json:"created_at"`
+	RunID       string    `json:"run_id"`
+}
+
+type AuthorizedRunQuery struct {
+	Scopes          AuthorizedScopeSet
+	Repository      string
+	BeforeCreatedAt time.Time
+	BeforeRunID     string
+	Limit           int
+}
+
+type AuthorizedRunPage struct {
+	Runs       []Run
+	TotalCount int
+}
+
+type RepositoryAuthoritySource interface {
+	RepositoryAuthority(context.Context, string) (RepositoryAuthority, bool, error)
 }
 
 type QueryStore interface {
-	GetRun(context.Context, string) (Run, error)
-	ListRuns(context.Context, string, time.Time, string, int) ([]Run, error)
+	GetRunScopeAuthority(context.Context, string) (RunScopeAuthority, error)
+	GetAuthorizedRun(context.Context, string, AuthorizedScopeSet) (Run, error)
+	ListRunScopeAuthorities(context.Context) ([]RunScopeAuthority, error)
+	ListAuthorizedRuns(context.Context, AuthorizedRunQuery) (AuthorizedRunPage, error)
 	Inspect(context.Context, string) (RunInspection, error)
 	OperatorAttentionQuery
 }
 
-type QueryService struct{ store QueryStore }
+type QueryService struct {
+	store        QueryStore
+	authorizer   *AuthorizationService
+	repositories RepositoryAuthoritySource
+}
 
 func NewQueryService(store QueryStore) QueryService { return QueryService{store: store} }
+
+func NewScopedQueryService(store QueryStore, authorizer *AuthorizationService, repositories RepositoryAuthoritySource) (QueryService, error) {
+	if store == nil || authorizer == nil || repositories == nil {
+		return QueryService{}, errors.New("scoped query dependencies are required")
+	}
+	return QueryService{store: store, authorizer: authorizer, repositories: repositories}, nil
+}
 
 func (s QueryService) Status(ctx context.Context, input QueryInput) (InspectionResult, error) {
 	return s.Inspect(ctx, input)
 }
 
 func (s QueryService) Inspect(ctx context.Context, input QueryInput) (InspectionResult, error) {
-	if _, err := s.authorize(ctx, input); err != nil {
+	if _, err := s.authorizeDetail(ctx, input); err != nil {
 		return InspectionResult{}, err
 	}
-	inspection, err := s.store.Inspect(ctx, input.RunID)
+	return s.inspectAuthorized(ctx, input.RunID)
+}
+
+func (s QueryService) inspectAuthorized(ctx context.Context, runID string) (InspectionResult, error) {
+	inspection, err := s.store.Inspect(ctx, runID)
 	if err != nil {
 		return InspectionResult{}, classifyServiceError(err)
 	}
-	attention, err := s.store.ListOperatorAttention(ctx, OperatorAttentionQueryInput{RunID: input.RunID, Limit: maxOperatorAttentionProjection})
+	attention, err := s.store.ListOperatorAttention(ctx, OperatorAttentionQueryInput{RunID: runID, Limit: maxOperatorAttentionProjection})
 	if err != nil {
 		return InspectionResult{}, classifyServiceError(err)
 	}
@@ -380,19 +421,16 @@ func (s QueryService) GetRunDetail(ctx context.Context, query RunDetailQuery) (I
 	if query.RunID == "" {
 		return InspectionResult{}, serviceError(ErrorInvalidInput, "run is required", nil)
 	}
-	run, err := s.store.GetRun(ctx, query.RunID)
+	_, err := s.ResolveRunTarget(ctx, QueryInput{Requester: query.Requester, RunID: query.RunID})
 	if err != nil {
-		return InspectionResult{}, classifyServiceError(err)
+		return InspectionResult{}, err
 	}
-	return s.Inspect(ctx, QueryInput{Requester: query.Requester, RunID: query.RunID, Repository: run.Repository})
+	return s.inspectAuthorized(ctx, query.RunID)
 }
 
-// ListRunSummaries returns a deterministic, repository-scoped page. It reads
-// one extra row only to decide whether a following cursor exists.
+// ListRunSummaries returns a deterministic scope-filtered page. It reads one
+// extra authorized row only to decide whether a following cursor exists.
 func (s QueryService) ListRunSummaries(ctx context.Context, query RunSummaryQuery) (RunSummaryPage, error) {
-	if query.Repository == "" {
-		return RunSummaryPage{}, serviceError(ErrorInvalidInput, "repository is required", nil)
-	}
 	limit := query.Limit
 	if limit == 0 {
 		limit = defaultRunSummaryLimit
@@ -400,23 +438,31 @@ func (s QueryService) ListRunSummaries(ctx context.Context, query RunSummaryQuer
 	if limit < 1 || limit > maximumRunSummaryLimit {
 		return RunSummaryPage{}, serviceError(ErrorInvalidInput, "limit must be between 1 and 100", nil)
 	}
+	scopes, err := s.runCollectionScopes(ctx, query)
+	if err != nil {
+		return RunSummaryPage{}, err
+	}
 	cursor, err := decodeRunSummaryCursor(query.Cursor)
 	if err != nil {
 		return RunSummaryPage{}, err
 	}
-	runs, err := s.store.ListRuns(ctx, query.Repository, cursor.CreatedAt, cursor.RunID, limit+1)
+	if query.Cursor != "" && (cursor.Repository != query.Repository || cursor.ScopeDigest != scopes.Digest()) {
+		return RunSummaryPage{}, serviceError(ErrorInvalidInput, "cursor is invalid", nil)
+	}
+	stored, err := s.store.ListAuthorizedRuns(ctx, AuthorizedRunQuery{Scopes: scopes, Repository: query.Repository, BeforeCreatedAt: cursor.CreatedAt, BeforeRunID: cursor.RunID, Limit: limit + 1})
 	if err != nil {
 		return RunSummaryPage{}, classifyServiceError(err)
 	}
-	for _, run := range runs {
-		if run.Repository != query.Repository {
+	for _, run := range stored.Runs {
+		if query.Repository != "" && run.Repository != query.Repository {
 			return RunSummaryPage{}, serviceError(ErrorInternal, "run list repository mismatch", nil)
 		}
-		if err := authorizePersistedRequester(run, query.Requester); err != nil {
-			return RunSummaryPage{}, err
+		if !scopes.AllowsRun(run.ID, run.RepositoryBindingDigest) {
+			return RunSummaryPage{}, serviceError(ErrorInternal, "run list scope mismatch", nil)
 		}
 	}
-	page := RunSummaryPage{SchemaVersion: querySchemaVersion, Repository: query.Repository}
+	page := RunSummaryPage{SchemaVersion: querySchemaVersion, Repository: query.Repository, TotalCount: stored.TotalCount}
+	runs := stored.Runs
 	if len(runs) > limit {
 		page.HasMore = true
 		runs = runs[:limit]
@@ -425,9 +471,38 @@ func (s QueryService) ListRunSummaries(ctx context.Context, query RunSummaryQuer
 		page.Runs = append(page.Runs, projectRunSummary(run))
 	}
 	if page.HasMore && len(runs) > 0 {
-		page.NextCursor = encodeRunSummaryCursor(runSummaryCursor{Version: querySchemaVersion, CreatedAt: runs[len(runs)-1].CreatedAt, RunID: runs[len(runs)-1].ID})
+		page.NextCursor = encodeRunSummaryCursor(runSummaryCursor{Version: querySchemaVersion, Repository: query.Repository, ScopeDigest: scopes.Digest(), CreatedAt: runs[len(runs)-1].CreatedAt, RunID: runs[len(runs)-1].ID})
 	}
 	return page, nil
+}
+
+func (s QueryService) runCollectionScopes(ctx context.Context, query RunSummaryQuery) (AuthorizedScopeSet, error) {
+	if s.authorizer == nil || s.repositories == nil {
+		return AuthorizedScopeSet{}, serviceError(ErrorInternal, "scoped run query authority is unavailable", nil)
+	}
+	requester, err := s.authorizer.ResolveConfiguredRequester(query.Requester)
+	if err != nil {
+		return AuthorizedScopeSet{}, hiddenTargetError()
+	}
+	if query.Repository == "" {
+		authorities, err := s.store.ListRunScopeAuthorities(ctx)
+		if err != nil {
+			return AuthorizedScopeSet{}, classifyServiceError(err)
+		}
+		return s.authorizer.ControllerRunScopes(requester, authorities)
+	}
+	authority, found, err := s.repositories.RepositoryAuthority(ctx, query.Repository)
+	if err != nil {
+		return AuthorizedScopeSet{}, classifyServiceError(err)
+	}
+	if !found || authority.Repository != query.Repository {
+		return AuthorizedScopeSet{}, hiddenTargetError()
+	}
+	scopes, err := s.authorizer.RepositoryScopes(requester, authority)
+	if err != nil {
+		return AuthorizedScopeSet{}, hiddenTargetError()
+	}
+	return scopes, nil
 }
 
 func decodeRunSummaryCursor(value string) (runSummaryCursor, error) {
@@ -439,7 +514,7 @@ func decodeRunSummaryCursor(value string) (runSummaryCursor, error) {
 		return runSummaryCursor{}, serviceError(ErrorInvalidInput, "cursor is invalid", nil)
 	}
 	var cursor runSummaryCursor
-	if err := json.Unmarshal(raw, &cursor); err != nil || cursor.Version != querySchemaVersion || cursor.CreatedAt.IsZero() || cursor.RunID == "" {
+	if err := json.Unmarshal(raw, &cursor); err != nil || cursor.Version != querySchemaVersion || !validAuthorityDigest(cursor.ScopeDigest) || cursor.CreatedAt.IsZero() || cursor.RunID == "" {
 		return runSummaryCursor{}, serviceError(ErrorInvalidInput, "cursor is invalid", nil)
 	}
 	return cursor, nil
@@ -450,29 +525,60 @@ func encodeRunSummaryCursor(cursor runSummaryCursor) string {
 	return base64.RawURLEncoding.EncodeToString(raw)
 }
 
-func (s QueryService) authorize(ctx context.Context, input QueryInput) (Run, error) {
+func (s QueryService) authorizeDetail(ctx context.Context, input QueryInput) (Run, error) {
 	if input.RunID == "" || input.Repository == "" {
 		return Run{}, serviceError(ErrorInvalidInput, "run and repository are required", nil)
 	}
-	run, err := s.store.GetRun(ctx, input.RunID)
+	return s.ResolveRunTarget(ctx, input)
+}
+
+// ResolveRunTarget authenticates the configured or legacy CLI requester,
+// reads only frozen authority, and applies that scope in persistence before it
+// returns the complete aggregate. Repository is optional for ID-only routes.
+func (s QueryService) ResolveRunTarget(ctx context.Context, input QueryInput) (Run, error) {
+	if input.RunID == "" {
+		return Run{}, serviceError(ErrorInvalidInput, "run is required", nil)
+	}
+	var configured ConfiguredRequester
+	if s.authorizer != nil {
+		resolved, err := s.authorizer.ResolveConfiguredRequester(input.Requester)
+		if err != nil {
+			return Run{}, hiddenTargetError()
+		}
+		configured = resolved
+	}
+	authority, err := s.store.GetRunScopeAuthority(ctx, input.RunID)
 	if err != nil {
+		if errors.Is(err, ErrRunNotFound) {
+			return Run{}, hiddenTargetError()
+		}
 		return Run{}, classifyServiceError(err)
 	}
-	if run.Repository != input.Repository {
-		return Run{}, serviceError(ErrorConflict, "run repository does not match the request", nil)
+	if input.Repository != "" && authority.Repository != input.Repository {
+		return Run{}, hiddenTargetError()
 	}
-	if err := authorizePersistedRequester(run, input.Requester); err != nil {
-		return Run{}, err
+	var scopes AuthorizedScopeSet
+	if s.authorizer != nil {
+		scopes, err = s.authorizer.RunScopes(configured, authority)
+	} else {
+		scopes, err = cliRequesterRunScopes(input.Requester, authority)
+	}
+	if err != nil {
+		return Run{}, hiddenTargetError()
+	}
+	run, err := s.store.GetAuthorizedRun(ctx, input.RunID, scopes)
+	if err != nil {
+		if errors.Is(err, ErrRunNotFound) {
+			return Run{}, hiddenTargetError()
+		}
+		return Run{}, classifyServiceError(err)
 	}
 	return run, nil
 }
 
 func authorizePersistedRequester(run Run, requester Requester) error {
-	var repository LocalRepository
-	if err := json.Unmarshal([]byte(run.RepositoryConfigJSON), &repository); err != nil {
-		return serviceError(ErrorConflict, "persisted repository authority is invalid", err)
-	}
-	return requester.authorize(repository.AllowedOperatorLogins, repository.TrustedOperatorActors)
+	_, err := (&AuthorizationService{}).FrozenRunScopes(requester, run)
+	return err
 }
 
 func AuthorizePersistedRequester(run Run, requester Requester) error {
@@ -511,6 +617,7 @@ type RunSummaryPage struct {
 	SchemaVersion string       `json:"schema_version"`
 	Repository    string       `json:"repository"`
 	Runs          []RunSummary `json:"runs"`
+	TotalCount    int          `json:"total_count"`
 	NextCursor    string       `json:"next_cursor,omitempty"`
 	HasMore       bool         `json:"has_more"`
 }

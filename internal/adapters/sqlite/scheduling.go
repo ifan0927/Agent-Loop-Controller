@@ -118,22 +118,27 @@ func (s *Store) Capacity(ctx context.Context, now time.Time) (application.Capaci
 	return projection, nil
 }
 
-func (s *Store) ListSchedulingRuns(ctx context.Context, limit int) ([]application.SchedulingRun, error) {
-	if limit < 1 || limit > application.MaxSchedulingQueryItems {
+func (s *Store) ListSchedulingRuns(ctx context.Context, scopes application.AuthorizedScopeSet, limit int) ([]application.SchedulingRun, error) {
+	if limit < 1 || limit > application.MaxSchedulingQueryItems || scopes.Empty() {
 		return nil, errors.New("scheduling run query limit is invalid")
 	}
+	where, args, err := authorizedRunWhereColumns(scopes, "r.repository", "r.repository_binding_digest", "r.run_id", "", false)
+	if err != nil {
+		return nil, err
+	}
 	var missing int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs r LEFT JOIN run_scheduling rs ON rs.run_id=r.run_id WHERE r.current_state NOT IN ('rejected','failed','completed') AND rs.run_id IS NULL`).Scan(&missing); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs r LEFT JOIN run_scheduling rs ON rs.run_id=r.run_id WHERE r.current_state NOT IN ('rejected','failed','completed') AND (`+where+`) AND rs.run_id IS NULL`, args...).Scan(&missing); err != nil {
 		return nil, err
 	}
 	if missing != 0 {
 		return nil, errors.New("nonterminal run is missing scheduling projection")
 	}
+	queryArgs := append(append([]any(nil), args...), limit)
 	rows, err := s.db.QueryContext(ctx, `SELECT r.run_id,r.repository_binding_digest,r.current_state,rs.runnable_since,rs.supervisor_state,rs.quarantined,
 		EXISTS(SELECT 1 FROM heavy_permits hp WHERE hp.run_id=r.run_id)
 		FROM run_scheduling rs JOIN runs r ON r.run_id=rs.run_id
-		WHERE r.current_state NOT IN ('rejected','failed','completed')
-		ORDER BY rs.runnable_since_unix_ns,r.run_id LIMIT ?`, limit)
+		WHERE r.current_state NOT IN ('rejected','failed','completed') AND (`+where+`)
+		ORDER BY rs.runnable_since_unix_ns,r.run_id LIMIT ?`, queryArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -159,12 +164,51 @@ func (s *Store) ListSchedulingRuns(ctx context.Context, limit int) ([]applicatio
 	return result, rows.Err()
 }
 
-func (s *Store) ListSchedulingDecisions(ctx context.Context, limit int) ([]application.SchedulingDecision, error) {
-	if limit < 1 || limit > application.MaxSchedulingQueryItems {
+func (s *Store) GetSchedulingRun(ctx context.Context, scopes application.AuthorizedScopeSet, runID string) (application.SchedulingRun, error) {
+	if strings.TrimSpace(runID) == "" || scopes.Empty() {
+		return application.SchedulingRun{}, errors.New("scheduling run lookup is invalid")
+	}
+	where, args, err := authorizedRunWhereColumns(scopes, "r.repository", "r.repository_binding_digest", "r.run_id", "", false)
+	if err != nil {
+		return application.SchedulingRun{}, err
+	}
+	args = append(args, runID)
+	var run application.SchedulingRun
+	var state, runnable string
+	var quarantined, hasPermit int
+	err = s.db.QueryRowContext(ctx, `SELECT r.run_id,r.repository_binding_digest,r.current_state,rs.runnable_since,rs.supervisor_state,rs.quarantined,
+		EXISTS(SELECT 1 FROM heavy_permits hp WHERE hp.run_id=r.run_id)
+		FROM run_scheduling rs JOIN runs r ON r.run_id=rs.run_id
+		WHERE (`+where+`) AND r.run_id=?`, args...).
+		Scan(&run.RunID, &run.RepositoryBindingDigest, &state, &runnable, &run.SupervisorState, &quarantined, &hasPermit)
+	if errors.Is(err, sql.ErrNoRows) {
+		return application.SchedulingRun{}, application.ErrRunNotFound
+	}
+	if err != nil {
+		return application.SchedulingRun{}, err
+	}
+	run.State = domain.State(state)
+	run.RunnableSince = parseTime(runnable)
+	run.Quarantined = quarantined != 0
+	run.HasHeavyPermit = hasPermit != 0
+	run.WaitingForCapacity = run.SupervisorState == "waiting"
+	if run.RunID == "" || strings.TrimSpace(run.RepositoryBindingDigest) == "" || run.RunnableSince.IsZero() || !validSupervisorState(run.SupervisorState) {
+		return application.SchedulingRun{}, errors.New("scheduling run projection is corrupt")
+	}
+	return run, nil
+}
+
+func (s *Store) ListSchedulingDecisions(ctx context.Context, scopes application.AuthorizedScopeSet, limit int) ([]application.SchedulingDecision, error) {
+	if limit < 1 || limit > application.MaxSchedulingQueryItems || scopes.Empty() {
 		return nil, errors.New("scheduling decision query limit is invalid")
 	}
+	where, args, err := authorizedRunWhereColumns(scopes, "repository_profile_id", "repository_binding_digest", "run_id", "", true)
+	if err != nil {
+		return nil, err
+	}
+	args = append(args, limit)
 	rows, err := s.db.QueryContext(ctx, `SELECT decision_id,snapshot_digest,observed_at,capacity_identity,issue_uuid,issue_sequence,priority,repository_profile_id,run_id,repository_binding_digest,classification,reason_code,repository_slot_version,heavy_permit_version,admission_lease_version
-		FROM scheduling_decisions ORDER BY observed_at DESC,decision_id DESC LIMIT ?`, limit)
+		FROM scheduling_decisions WHERE `+where+` ORDER BY observed_at DESC,decision_id DESC LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
 	}

@@ -79,6 +79,53 @@ feedback is retained as immutable identity/body-digest lifecycle evidence; a
 bounded normalized finding derived from it may be sent to Codex. The prompt
 cannot replace the authority record.
 
+### Application authorization scopes
+
+Configuration version 5 defines one controller-level operator as the complete
+immutable GitHub `User` tuple: login, database ID, node ID, and actor type. It
+is distinct from the automatic-admission requester and from any future
+presentation session. Domain and application packages contain no browser,
+cookie, or transport-session concept.
+
+Application authorization uses a closed set of authority scopes rather than
+roles or a generic permission language:
+
+- `controller` covers controller-wide readiness, configuration, supervisor,
+  capacity, and audit projections and requires the exact configured operator;
+- `repository` derives from the current repository profile authority and
+  remains readable when a later lifecycle adapter disables admission;
+- `run` derives from the repository authority frozen into that run, so mutable
+  enablement or profile removal cannot rewrite historical run authority;
+- `onboarding` derives from the configured operator before repository binding
+  and from the resulting repository authority after binding.
+
+Collection authorization follows one order:
+
+```text
+resolve configured requester
+  -> derive authorized scopes
+  -> filter persisted rows by scope
+  -> count and order
+  -> paginate
+  -> sanitize and project
+```
+
+SQLite run and scheduling collection ports require an application-produced
+scope set. Hidden rows cannot affect totals, page gaps, `has_more`, or cursor
+position. Run cursors bind the query filter and current scope digest, so
+authority drift requires a new first-page query. Repository/run scheduling
+projections expose only their own wait/supervisor state; controller capacity and
+sibling identities require controller scope.
+
+Direct unknown and unauthorized run or repository targets return the same
+sanitized application `not_found` result. Visibility of an attention event,
+identifier, or cursor grants no mutation authority. Sensitive commands do not
+accept scope snapshots as bearer grants: each command re-reads current
+repository authority or the target run's frozen authority and preserves its
+existing exact-head, CAS, lease, idempotency, and reconciliation checks. The
+current CLI requester flags remain compatible by entering these same
+application contracts.
+
 ## 5. End-to-End Data Flow
 
 1. Admission reads Linear by identifier or scans a bounded eligible Todo set.
@@ -848,10 +895,10 @@ switches enable PR create, review reply, and squash merge writes.
 
 ### Bootstrap and configuration
 
-`internal/adapters/bootstrap` loads strict configuration versions 1-4,
+`internal/adapters/bootstrap` loads strict configuration versions 1-5,
 canonicalizes and cross-checks repositories and GitHub profiles, validates path
 isolation, derives stable digests, and produces a credential-safe readiness
-projection. Version 4 is current; older versions are compatibility inputs, not
+projection. Version 5 is current; older versions are compatibility inputs, not
 recommended templates.
 
 ### Filesystem and artifact handling

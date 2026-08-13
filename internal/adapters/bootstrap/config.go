@@ -18,13 +18,15 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/githubapp"
 	linearadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/linear"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/localregistry"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
 const (
 	LegacyVersion  = 1
 	VersionTwo     = 2
 	VersionThree   = 3
-	CurrentVersion = 4
+	VersionFour    = 4
+	CurrentVersion = 5
 
 	minimumDeliveryPollInterval = 30 * time.Second
 	maximumDeliveryPollInterval = 5 * time.Minute
@@ -50,6 +52,7 @@ type Controller struct {
 	DatabasePath string
 	CodexBinary  string
 	RunTimeout   time.Duration
+	Operator     domain.GitHubUserIdentity
 }
 
 type GitHubProfile struct {
@@ -114,8 +117,9 @@ type readinessFile struct {
 }
 
 type readinessController struct {
-	DatabaseConfigured bool `json:"database_configured"`
-	CodexConfigured    bool `json:"codex_configured"`
+	DatabaseConfigured bool                `json:"database_configured"`
+	CodexConfigured    bool                `json:"codex_configured"`
+	Operator           *readinessRequester `json:"operator,omitempty"`
 }
 
 type readinessLinear struct {
@@ -188,8 +192,12 @@ func (b Bootstrap) Readiness() any {
 		admission.HeavyCapacity = configured.HeavyCapacity
 		admission.Requester = &readinessRequester{DatabaseID: configured.Requester.DatabaseID, NodeID: configured.Requester.NodeID, Login: configured.Requester.Login, Type: configured.Requester.Type}
 	}
+	controller := readinessController{DatabaseConfigured: b.Controller.DatabasePath != "", CodexConfigured: b.Controller.CodexBinary != ""}
+	if b.Controller.Operator.Validate() == nil {
+		controller.Operator = &readinessRequester{DatabaseID: b.Controller.Operator.DatabaseID, NodeID: b.Controller.Operator.NodeID, Login: b.Controller.Operator.Login, Type: b.Controller.Operator.ActorType}
+	}
 	return readinessFile{Version: b.Version, ConfigurationDigest: b.Digest, Offline: true,
-		Controller: readinessController{DatabaseConfigured: b.Controller.DatabasePath != "", CodexConfigured: b.Controller.CodexBinary != ""},
+		Controller: controller,
 		Linear:     readinessLinear{TeamKey: b.Linear.TeamKey, CredentialSourceType: linearadapter.CredentialSourceType(b.Linear.CredentialSourceRef)}, Repositories: repositories, GitHubProfiles: profiles,
 		Automation: readinessAutomation{LinearTodoAdmission: admission}}
 }
@@ -254,9 +262,10 @@ type requesterFile struct {
 }
 
 type controllerFile struct {
-	DatabasePath string `json:"database_path"`
-	CodexBinary  string `json:"codex_binary"`
-	RunTimeout   string `json:"run_timeout"`
+	DatabasePath string        `json:"database_path"`
+	CodexBinary  string        `json:"codex_binary"`
+	RunTimeout   string        `json:"run_timeout"`
+	Operator     requesterFile `json:"operator"`
 }
 
 type profileFile struct {
@@ -280,7 +289,7 @@ func Load(path string) (Bootstrap, error) {
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return Bootstrap{}, invalid("controller configuration must contain one strict JSON value")
 	}
-	if raw.Version != LegacyVersion && raw.Version != VersionTwo && raw.Version != VersionThree && raw.Version != CurrentVersion {
+	if raw.Version != LegacyVersion && raw.Version != VersionTwo && raw.Version != VersionThree && raw.Version != VersionFour && raw.Version != CurrentVersion {
 		return Bootstrap{}, invalid("unsupported controller configuration version")
 	}
 	controller, err := decodeController(raw.Controller)
@@ -301,6 +310,14 @@ func Load(path string) (Bootstrap, error) {
 	}
 	if err := crossCheck(registry, profiles); err != nil {
 		return Bootstrap{}, err
+	}
+	operator, err := decodeConfiguredOperator(raw.Controller.Operator, raw.Version)
+	if err != nil {
+		return Bootstrap{}, err
+	}
+	controller.Operator = operator
+	if operator.Validate() == nil && !operatorTrustedByEveryProfile(operator, registry) {
+		return Bootstrap{}, conflict("configured operator is not trusted by every repository profile")
 	}
 	automation, err := decodeAutomation(raw, registry)
 	if err != nil {
@@ -335,7 +352,7 @@ func decodeRegistry(raw configFile) (localregistry.Registry, string, error) {
 			return localregistry.Registry{}, "", invalid("repository registry is invalid")
 		}
 		return registry, registryPath, nil
-	case VersionTwo, VersionThree, CurrentVersion:
+	case VersionTwo, VersionThree, VersionFour, CurrentVersion:
 		if len(raw.RepositoryRegistryFile) != 0 {
 			return localregistry.Registry{}, "", invalid("controller configuration must use inline repositories")
 		}
@@ -365,9 +382,9 @@ func decodeRegistry(raw configFile) (localregistry.Registry, string, error) {
 // credential source. The configuration remains inert until the worker composes
 // its admission and delivery mechanisms.
 func decodeAutomation(raw configFile, registry localregistry.Registry) (Automation, error) {
-	if raw.Version != VersionThree && raw.Version != CurrentVersion {
+	if raw.Version != VersionThree && raw.Version != VersionFour && raw.Version != CurrentVersion {
 		if len(raw.Automation) != 0 {
-			return Automation{}, invalid("automatic admission requires controller configuration version 3 or 4")
+			return Automation{}, invalid("automatic admission requires controller configuration version 3, 4, or 5")
 		}
 		return Automation{}, nil
 	}
@@ -486,6 +503,32 @@ func validWorkflowState(state workflowStateFile, name, stateType string) bool {
 
 func validRequester(requester localregistry.TrustedActorIdentity) bool {
 	return requester.DatabaseID > 0 && requester.NodeID != "" && requester.Login != "" && requester.Type == "User"
+}
+
+func decodeConfiguredOperator(raw requesterFile, version int) (domain.GitHubUserIdentity, error) {
+	operator := domain.GitHubUserIdentity{Login: raw.Login, DatabaseID: raw.DatabaseID, NodeID: raw.NodeID, ActorType: raw.Type}
+	if version != CurrentVersion {
+		if raw != (requesterFile{}) {
+			return domain.GitHubUserIdentity{}, invalid("configured operator requires controller configuration version 5")
+		}
+		return domain.GitHubUserIdentity{}, nil
+	}
+	if operator.Validate() != nil {
+		return domain.GitHubUserIdentity{}, invalid("configured operator identity is invalid")
+	}
+	return operator, nil
+}
+
+func operatorTrustedByEveryProfile(operator domain.GitHubUserIdentity, registry localregistry.Registry) bool {
+	for _, binding := range registry.Bindings() {
+		if !slices.ContainsFunc(binding.OperatorIdentityPolicy.AllowedLogins, func(login string) bool { return strings.EqualFold(login, operator.Login) }) ||
+			!slices.ContainsFunc(binding.OperatorIdentityPolicy.TrustedActors, func(actor localregistry.TrustedActorIdentity) bool {
+				return actor.DatabaseID == operator.DatabaseID && actor.NodeID == operator.NodeID && strings.EqualFold(actor.Login, operator.Login) && actor.Type == operator.ActorType
+			}) {
+			return false
+		}
+	}
+	return true
 }
 
 func requesterTrustedByEveryProfile(requester localregistry.TrustedActorIdentity, registry localregistry.Registry) bool {

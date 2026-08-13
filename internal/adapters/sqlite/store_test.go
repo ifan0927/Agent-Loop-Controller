@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -676,6 +677,8 @@ func TestListRunsUsesRepositoryScopedDeterministicCursor(t *testing.T) {
 	defer store.Close()
 	ctx := context.Background()
 	base := time.Date(2026, 7, 13, 0, 0, 0, 0, time.UTC)
+	bindingHash := sha256.Sum256([]byte("legacy-repository-binding:owner/repo"))
+	bindingDigest := hex.EncodeToString(bindingHash[:])
 	for index, id := range []string{"run-a", "run-b", "run-c"} {
 		input := application.CreateRunInput{Run: application.Run{ID: id, IssueID: fmt.Sprintf("ISSUE-%d", index), IdempotencyKey: fmt.Sprintf("key-%d", index), SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "ifan/test"}}
 		if _, _, err := store.CreateRun(ctx, input); err != nil {
@@ -685,17 +688,151 @@ func TestListRunsUsesRepositoryScopedDeterministicCursor(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	page, err := store.ListRuns(ctx, "owner/repo", time.Time{}, "", 2)
-	if err != nil || len(page) != 2 || page[0].ID != "run-c" || page[1].ID != "run-b" {
+	scopes := repositoryRunScopes(t, bindingDigest)
+	page, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Repository: "owner/repo", Limit: 2})
+	if err != nil || page.TotalCount != 3 || len(page.Runs) != 2 || page.Runs[0].ID != "run-c" || page.Runs[1].ID != "run-b" {
 		t.Fatalf("first page=%+v err=%v", page, err)
 	}
-	next, err := store.ListRuns(ctx, "owner/repo", page[1].CreatedAt, page[1].ID, 2)
-	if err != nil || len(next) != 1 || next[0].ID != "run-a" {
+	next, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Repository: "owner/repo", BeforeCreatedAt: page.Runs[1].CreatedAt, BeforeRunID: page.Runs[1].ID, Limit: 2})
+	if err != nil || next.TotalCount != 3 || len(next.Runs) != 1 || next.Runs[0].ID != "run-a" {
 		t.Fatalf("next page=%+v err=%v", next, err)
 	}
-	if _, err := store.ListRuns(ctx, "owner/repo", time.Time{}, "", 102); err == nil {
+	if _, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Repository: "owner/repo", Limit: 102}); err == nil {
 		t.Fatal("unbounded list limit was accepted")
 	}
+}
+
+func TestAuthorizedRunPaginationIgnoresHiddenSentinels(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	base := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	type fixture struct {
+		id, repository string
+		second         int
+	}
+	fixtures := []fixture{
+		{"hidden-after", "sibling/private", 0},
+		{"authorized-1", "owner/repo", 1},
+		{"hidden-within-1", "sibling/private", 2},
+		{"authorized-2", "owner/repo", 3},
+		{"hidden-within-2", "sibling/private", 4},
+		{"authorized-3", "owner/repo", 5},
+		{"hidden-before", "sibling/private", 6},
+	}
+	for index, fixture := range fixtures {
+		input := application.CreateRunInput{Run: application.Run{ID: fixture.id, IssueID: fmt.Sprintf("ISSUE-SENTINEL-%d", index), IdempotencyKey: fmt.Sprintf("sentinel-key-%d", index), SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: fixture.repository, RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "ifan/test"}}
+		if _, _, err := store.CreateRun(ctx, input); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.db.ExecContext(ctx, `UPDATE runs SET created_at=? WHERE run_id=?`, formatTime(base.Add(time.Duration(fixture.second)*time.Second)), fixture.id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bindingHash := sha256.Sum256([]byte("legacy-repository-binding:owner/repo"))
+	scopes := repositoryRunScopes(t, hex.EncodeToString(bindingHash[:]))
+	first, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Limit: 2})
+	if err != nil || first.TotalCount != 3 || len(first.Runs) != 2 {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	for index, want := range []string{"authorized-3", "authorized-2"} {
+		if first.Runs[index].ID != want {
+			t.Fatalf("authorized order=%+v", first.Runs)
+		}
+	}
+	if run, err := store.GetAuthorizedRun(ctx, "authorized-2", scopes); err != nil || run.ID != "authorized-2" {
+		t.Fatalf("authorized lookup run=%+v err=%v", run, err)
+	}
+	if _, err := store.GetAuthorizedRun(ctx, "hidden-within-1", scopes); !errors.Is(err, application.ErrRunNotFound) {
+		t.Fatalf("hidden lookup error=%v", err)
+	}
+	second, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, BeforeCreatedAt: first.Runs[1].CreatedAt, BeforeRunID: first.Runs[1].ID, Limit: 3})
+	if err != nil || second.TotalCount != 3 || len(second.Runs) != 1 || second.Runs[0].ID != "authorized-1" {
+		t.Fatalf("second=%+v err=%v", second, err)
+	}
+}
+
+func TestAuthorizedRunLookupBindsFrozenRunIDAndAuthorityDigest(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	binding := strings.Repeat("a", 64)
+	repository := application.LocalRepository{CanonicalRepository: "owner/repo", AllowedOperatorLogins: []string{"operator"}, TrustedOperatorActors: []application.TrustedActorIdentity{{Login: "operator", DatabaseID: 7, NodeID: "U_7", Type: "User"}}}
+	raw, _ := json.Marshal(repository)
+	input := application.CreateRunInput{Run: application.Run{ID: "frozen-authority-run", IssueID: "ISSUE-FROZEN", IdempotencyKey: "frozen-key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: repository.CanonicalRepository, RepositoryConfigJSON: string(raw), RepositoryBindingDigest: binding, BaseBranch: "main", WorkingBranch: "ifan/test"}}
+	if _, _, err := store.CreateRun(ctx, input); err != nil {
+		t.Fatal(err)
+	}
+	scopes := frozenRunScopes(t, input.Run.ID, input.Run.Repository, binding)
+	if _, err := store.GetAuthorizedRun(ctx, input.Run.ID, scopes); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE runs SET repository_binding_digest=? WHERE run_id=?`, strings.Repeat("b", 64), input.Run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetAuthorizedRun(ctx, input.Run.ID, scopes); !errors.Is(err, application.ErrRunNotFound) {
+		t.Fatalf("stale frozen scope lookup error=%v", err)
+	}
+}
+
+func repositoryRunScopes(t *testing.T, bindingDigest string) application.AuthorizedScopeSet {
+	t.Helper()
+	user := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "U_7", ActorType: "User"}
+	authorizer, err := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: user})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requester, err := authorizer.ResolveConfiguredRequester(application.Requester{ID: user.Login, Kind: "github_login", DatabaseID: user.DatabaseID, NodeID: user.NodeID, ActorType: user.ActorType})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopes, err := authorizer.RepositoryScopes(requester, application.RepositoryAuthority{Repository: "owner/repo", ProfileID: "repository-profile:owner/repo", BindingDigest: bindingDigest, AllowedLogins: []string{user.Login}, TrustedOperators: []domain.GitHubUserIdentity{user}, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return scopes
+}
+
+func controllerRunScopes(t *testing.T) application.AuthorizedScopeSet {
+	t.Helper()
+	user := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "U_7", ActorType: "User"}
+	authorizer, err := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: user})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requester, err := authorizer.ResolveConfiguredRequester(application.Requester{ID: user.Login, Kind: "github_login", DatabaseID: user.DatabaseID, NodeID: user.NodeID, ActorType: user.ActorType})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopes, err := authorizer.ControllerScopes(requester)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return scopes
+}
+
+func frozenRunScopes(t *testing.T, runID, repository, bindingDigest string) application.AuthorizedScopeSet {
+	t.Helper()
+	user := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "U_7", ActorType: "User"}
+	authorizer, err := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: user})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requester, err := authorizer.ResolveConfiguredRequester(application.Requester{ID: user.Login, Kind: "github_login", DatabaseID: user.DatabaseID, NodeID: user.NodeID, ActorType: user.ActorType})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopes, err := authorizer.RunScopes(requester, application.RunScopeAuthority{RunID: runID, Repository: repository, BindingDigest: bindingDigest, AllowedLogins: []string{user.Login}, TrustedOperators: []domain.GitHubUserIdentity{user}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return scopes
 }
 
 func TestLinearSourceDriftHaltsTheExactActiveRun(t *testing.T) {

@@ -160,7 +160,7 @@ func TestLoadVersionThreeDisabledAutomationIsCompatibleAndOffline(t *testing.T) 
 	root := canonicalTempDir(t)
 	configPath, secretPath := writeV2Fixture(t, root, "github-app-profile:fixture", 7)
 	config := readJSONFixture(t, configPath)
-	config["version"] = CurrentVersion
+	upgradeCurrentFixture(config)
 	config["automation"] = map[string]any{"linear_todo_admission": map[string]any{
 		"enabled": false,
 		// Disabled authority deliberately does not validate or resolve operational values.
@@ -187,6 +187,59 @@ func TestLoadVersionThreeDisabledAutomationIsCompatibleAndOffline(t *testing.T) 
 	writeJSONFixture(t, configPath, config)
 	if _, err := Load(configPath); err == nil || !strings.Contains(err.Error(), "invalid_config") {
 		t.Fatalf("disabled unknown field error=%v", err)
+	}
+}
+
+func TestLoadVersionFiveRequiresDistinctConfiguredOperatorAuthority(t *testing.T) {
+	root := canonicalTempDir(t)
+	configPath, _ := writeV2Fixture(t, root, "github-app-profile:fixture", 7)
+	config := readJSONFixture(t, configPath)
+	upgradeCurrentFixture(config)
+	writeJSONFixture(t, configPath, config)
+	loaded, err := Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Controller.Operator.Login != "ifan0927" || loaded.Controller.Operator.DatabaseID != 1 || loaded.Controller.Operator.NodeID != "node" || loaded.Controller.Operator.ActorType != "User" {
+		t.Fatalf("operator=%+v", loaded.Controller.Operator)
+	}
+	readiness, _ := json.Marshal(loaded.Readiness())
+	if !strings.Contains(string(readiness), `"operator":{"database_id":1,"node_id":"node","login":"ifan0927","type":"User"}`) {
+		t.Fatalf("readiness=%s", readiness)
+	}
+
+	delete(config["controller"].(map[string]any), "operator")
+	writeJSONFixture(t, configPath, config)
+	if _, err := Load(configPath); err == nil || !strings.Contains(err.Error(), "configured operator") {
+		t.Fatalf("missing operator error=%v", err)
+	}
+
+	config["controller"].(map[string]any)["operator"] = map[string]any{"database_id": 2, "node_id": "lookalike", "login": "ifan0927", "type": "User"}
+	writeJSONFixture(t, configPath, config)
+	if _, err := Load(configPath); err == nil || !strings.Contains(err.Error(), "identity_conflict") {
+		t.Fatalf("lookalike operator error=%v", err)
+	}
+
+	config["version"] = VersionFour
+	writeJSONFixture(t, configPath, config)
+	if _, err := Load(configPath); err == nil || !strings.Contains(err.Error(), "requires controller configuration version 5") {
+		t.Fatalf("legacy operator error=%v", err)
+	}
+}
+
+func TestLoadVersionFourRemainsReadableWithoutControllerOperator(t *testing.T) {
+	root := canonicalTempDir(t)
+	configPath, _ := writeV2Fixture(t, root, "github-app-profile:fixture", 7)
+	config := readJSONFixture(t, configPath)
+	config["version"] = VersionFour
+	writeJSONFixture(t, configPath, config)
+
+	loaded, err := Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Version != VersionFour || loaded.Controller.Operator.Validate() == nil {
+		t.Fatalf("version=%d legacy operator=%+v", loaded.Version, loaded.Controller.Operator)
 	}
 }
 
@@ -229,7 +282,7 @@ func TestLoadVersionThreeEnabledAutomationValidatesAuthorityAndSanitizesInspect(
 	root := canonicalTempDir(t)
 	configPath, secretPath := writeV2Fixture(t, root, "github-app-profile:fixture", 7)
 	config := readJSONFixture(t, configPath)
-	config["version"] = CurrentVersion
+	upgradeCurrentFixture(config)
 	config["automation"] = map[string]any{"linear_todo_admission": validAdmissionFixture()}
 	writeJSONFixture(t, configPath, config)
 
@@ -424,7 +477,7 @@ func enabledAutomationConfig(t *testing.T) (string, map[string]any) {
 	root := canonicalTempDir(t)
 	configPath, _ := writeV2Fixture(t, root, "github-app-profile:fixture", 7)
 	config := readJSONFixture(t, configPath)
-	config["version"] = CurrentVersion
+	upgradeCurrentFixture(config)
 	config["automation"] = map[string]any{"linear_todo_admission": validAdmissionFixture()}
 	return configPath, config
 }
@@ -439,6 +492,11 @@ func validAdmissionFixture() map[string]any {
 		"requester":         map[string]any{"database_id": 1, "node_id": "node", "login": "ifan0927", "type": "User"},
 		"notification_mode": "local_outbox", "credential_source_ref": "secret://env/IFAN_LOOP_LINEAR_TOKEN",
 	}
+}
+
+func upgradeCurrentFixture(config map[string]any) {
+	config["version"] = CurrentVersion
+	config["controller"].(map[string]any)["operator"] = map[string]any{"database_id": 1, "node_id": "node", "login": "ifan0927", "type": "User"}
 }
 
 func writeFixture(t *testing.T, root, profileID string, appID int64) (string, string) {

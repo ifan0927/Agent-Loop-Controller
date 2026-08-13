@@ -35,9 +35,89 @@ type runListCall struct {
 	before runSummaryCursor
 }
 
+type serviceRepositoryAuthorities struct {
+	authority RepositoryAuthority
+	found     bool
+}
+
+type authorityFirstStore struct {
+	serviceStore
+	authorityReads int
+	aggregateReads int
+	legacyReads    int
+}
+
+func (s *authorityFirstStore) GetRun(ctx context.Context, id string) (Run, error) {
+	s.legacyReads++
+	return s.serviceStore.GetRun(ctx, id)
+}
+
+func (s *authorityFirstStore) GetRunScopeAuthority(ctx context.Context, id string) (RunScopeAuthority, error) {
+	s.authorityReads++
+	return s.serviceStore.GetRunScopeAuthority(ctx, id)
+}
+
+func (s *authorityFirstStore) GetAuthorizedRun(ctx context.Context, id string, scopes AuthorizedScopeSet) (Run, error) {
+	s.aggregateReads++
+	return s.serviceStore.GetAuthorizedRun(ctx, id, scopes)
+}
+
+func (s serviceRepositoryAuthorities) RepositoryAuthority(context.Context, string) (RepositoryAuthority, bool, error) {
+	return s.authority, s.found, nil
+}
+
 func (s serviceStore) GetRun(context.Context, string) (Run, error) { return s.run, s.getErr }
+func (s serviceStore) GetRunScopeAuthority(_ context.Context, id string) (RunScopeAuthority, error) {
+	if s.getErr != nil {
+		return RunScopeAuthority{}, s.getErr
+	}
+	run := s.run
+	if run.ID != id {
+		for _, candidate := range s.runs {
+			if candidate.ID == id {
+				run = candidate
+				break
+			}
+		}
+	}
+	if run.ID != id {
+		return RunScopeAuthority{}, ErrRunNotFound
+	}
+	return frozenRunScopeAuthority(run)
+}
+func (s serviceStore) GetAuthorizedRun(_ context.Context, id string, scopes AuthorizedScopeSet) (Run, error) {
+	if s.getErr != nil {
+		return Run{}, s.getErr
+	}
+	run := s.run
+	if run.ID != id {
+		for _, candidate := range s.runs {
+			if candidate.ID == id {
+				run = candidate
+				break
+			}
+		}
+	}
+	if run.ID != id || !scopes.AllowsRun(run.ID, run.RepositoryBindingDigest) {
+		return Run{}, ErrRunNotFound
+	}
+	return run, nil
+}
 func (s serviceStore) GetRunByIdempotency(context.Context, string) (Run, bool, error) {
 	return Run{}, false, nil
+}
+func (s serviceStore) ListRunScopeAuthorities(context.Context) ([]RunScopeAuthority, error) {
+	result := make([]RunScopeAuthority, 0, len(s.runs))
+	for _, run := range s.runs {
+		var repository LocalRepository
+		_ = json.Unmarshal([]byte(run.RepositoryConfigJSON), &repository)
+		trusted := make([]domain.GitHubUserIdentity, 0, len(repository.TrustedOperatorActors))
+		for _, actor := range repository.TrustedOperatorActors {
+			trusted = append(trusted, domain.GitHubUserIdentity{Login: actor.Login, DatabaseID: actor.DatabaseID, NodeID: actor.NodeID, ActorType: actor.Type})
+		}
+		result = append(result, RunScopeAuthority{RunID: run.ID, Repository: run.Repository, BindingDigest: run.RepositoryBindingDigest, AllowedLogins: repository.AllowedOperatorLogins, TrustedOperators: trusted})
+	}
+	return result, nil
 }
 func (s serviceStore) Inspect(context.Context, string) (RunInspection, error) {
 	return s.inspection, nil
@@ -62,11 +142,21 @@ func (s serviceStore) AppendOperatorAttention(_ context.Context, event OperatorA
 	}
 	return true, nil
 }
-func (s serviceStore) ListRuns(_ context.Context, _ string, before time.Time, beforeID string, limit int) ([]Run, error) {
+func (s serviceStore) ListAuthorizedRuns(_ context.Context, input AuthorizedRunQuery) (AuthorizedRunPage, error) {
 	if s.listCall != nil {
-		s.listCall.limit, s.listCall.before = limit, runSummaryCursor{CreatedAt: before, RunID: beforeID}
+		s.listCall.limit, s.listCall.before = input.Limit, runSummaryCursor{CreatedAt: input.BeforeCreatedAt, RunID: input.BeforeRunID}
 	}
-	return s.runs, nil
+	filtered := make([]Run, 0, len(s.runs))
+	for _, run := range s.runs {
+		if (input.Repository == "" || input.Repository == run.Repository) && input.Scopes.AllowsRun(run.ID, run.RepositoryBindingDigest) {
+			filtered = append(filtered, run)
+		}
+	}
+	total := len(filtered)
+	if len(filtered) > input.Limit {
+		filtered = filtered[:input.Limit]
+	}
+	return AuthorizedRunPage{Runs: filtered, TotalCount: total}, nil
 }
 func (s serviceStore) SaveGitHubReadSuccess(_ context.Context, _ string, _ string, _ domain.State, _ string, _ []GitHubRequestObservation, _ domain.PullRequest, _ GitHubInstallationMetadata, _ domain.GitHubReadEvidence, _ []TrustedReviewFeedbackRecord, observed *domain.HumanApprovalObservation, approval *domain.HumanApproval, next domain.State, reason string) error {
 	if s.approvalSaved != nil {
@@ -206,6 +296,9 @@ func authorizeTestRun(run Run) Run {
 	}
 	raw, _ := json.Marshal(LocalRepository{CanonicalRepository: run.Repository, ProfileID: run.ProfileID, AllowedOperatorLogins: []string{"operator"}})
 	run.RepositoryConfigJSON = string(raw)
+	if !validAuthorityDigest(run.RepositoryBindingDigest) {
+		run.RepositoryBindingDigest = digestText("legacy-repository-binding:" + strings.ToLower(run.Repository))
+	}
 	return run
 }
 
@@ -426,29 +519,43 @@ func TestQueryServiceSourceCheckoutAttentionUsesEmptyArrayAndGenericUnknownReaso
 
 func TestQueryServiceListsBoundedSummariesWithOpaqueCursor(t *testing.T) {
 	now := time.Now().UTC().Round(0)
+	operator := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 33, NodeID: "U_33", ActorType: "User"}
+	authority := repositoryAuthority(operator, true)
 	runs := []Run{
-		authorizeTestRun(Run{ID: "run-3", Repository: "owner/repo", CreatedAt: now, UpdatedAt: now}),
-		authorizeTestRun(Run{ID: "run-2", Repository: "owner/repo", CreatedAt: now.Add(-time.Second), UpdatedAt: now}),
-		authorizeTestRun(Run{ID: "run-1", Repository: "owner/repo", CreatedAt: now.Add(-2 * time.Second), UpdatedAt: now}),
+		authorizeTestRun(Run{ID: "run-3", Repository: "owner/repo", RepositoryBindingDigest: authority.BindingDigest, CreatedAt: now, UpdatedAt: now}),
+		authorizeTestRun(Run{ID: "run-2", Repository: "owner/repo", RepositoryBindingDigest: authority.BindingDigest, CreatedAt: now.Add(-time.Second), UpdatedAt: now}),
+		authorizeTestRun(Run{ID: "run-1", Repository: "owner/repo", RepositoryBindingDigest: authority.BindingDigest, CreatedAt: now.Add(-2 * time.Second), UpdatedAt: now}),
 	}
 	call := &runListCall{}
 	store := serviceStore{runs: runs, listCall: call}
-	page, err := NewQueryService(store).ListRunSummaries(context.Background(), RunSummaryQuery{Requester: Requester{ID: "operator", Kind: "github_login"}, Repository: "owner/repo", Limit: 2})
+	authorizer, _ := NewAuthorizationService(ConfiguredOperatorIdentity{User: operator})
+	queries, err := NewScopedQueryService(store, authorizer, serviceRepositoryAuthorities{authority: authority, found: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if page.SchemaVersion != "v1" || len(page.Runs) != 2 || !page.HasMore || page.NextCursor == "" || call.limit != 3 || page.Runs[0].RunID != "run-3" {
+	requester := requesterForUser(operator)
+	page, err := queries.ListRunSummaries(context.Background(), RunSummaryQuery{Requester: requester, Repository: "owner/repo", Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.SchemaVersion != "v1" || len(page.Runs) != 2 || page.TotalCount != 3 || !page.HasMore || page.NextCursor == "" || call.limit != 3 || page.Runs[0].RunID != "run-3" {
 		t.Fatalf("page=%+v limit=%d", page, call.limit)
 	}
 	cursor, err := decodeRunSummaryCursor(page.NextCursor)
 	if err != nil || cursor.RunID != "run-2" || !cursor.CreatedAt.Equal(now.Add(-time.Second)) {
 		t.Fatalf("cursor=%+v err=%v", cursor, err)
 	}
-	if _, err := NewQueryService(store).ListRunSummaries(context.Background(), RunSummaryQuery{Requester: Requester{ID: "operator", Kind: "github_login"}, Repository: "owner/repo", Limit: 101}); err == nil {
+	if _, err := queries.ListRunSummaries(context.Background(), RunSummaryQuery{Requester: requester, Repository: "owner/repo", Limit: 101}); err == nil {
 		t.Fatal("limit above the bounded maximum was accepted")
 	}
-	if _, err := NewQueryService(store).ListRunSummaries(context.Background(), RunSummaryQuery{Requester: Requester{ID: "operator", Kind: "github_login"}, Repository: "owner/repo", Cursor: "not-a-cursor"}); err == nil {
+	if _, err := queries.ListRunSummaries(context.Background(), RunSummaryQuery{Requester: requester, Repository: "owner/repo", Cursor: "not-a-cursor"}); err == nil {
 		t.Fatal("invalid cursor was accepted")
+	}
+	driftedAuthority := authority
+	driftedAuthority.BindingDigest = strings.Repeat("c", 64)
+	driftedQueries, _ := NewScopedQueryService(store, authorizer, serviceRepositoryAuthorities{authority: driftedAuthority, found: true})
+	if _, err := driftedQueries.ListRunSummaries(context.Background(), RunSummaryQuery{Requester: requester, Repository: "owner/repo", Cursor: page.NextCursor}); err == nil || !strings.Contains(err.Error(), "cursor is invalid") {
+		t.Fatalf("authority-drifted cursor error=%v", err)
 	}
 }
 
@@ -477,6 +584,110 @@ func TestGetRunDetailClassifiesNotFound(t *testing.T) {
 	_, err := NewQueryService(store).GetRunDetail(context.Background(), RunDetailQuery{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: "missing"})
 	if err == nil {
 		t.Fatal("missing run was accepted")
+	}
+}
+
+func TestRunDetailUnknownAndUnauthorizedAreNonDisclosing(t *testing.T) {
+	unknown := NewQueryService(serviceStore{getErr: ErrRunNotFound})
+	_, unknownErr := unknown.GetRunDetail(context.Background(), RunDetailQuery{Requester: Requester{ID: "intruder", Kind: "github_login"}, RunID: "private-run"})
+
+	run := authorizeTestRun(Run{ID: "private-run", Repository: "owner/private"})
+	unauthorized := NewQueryService(serviceStore{run: run, inspection: RunInspection{Run: run}})
+	_, unauthorizedErr := unauthorized.GetRunDetail(context.Background(), RunDetailQuery{Requester: Requester{ID: "intruder", Kind: "github_login"}, RunID: run.ID})
+
+	var missing, denied *ServiceError
+	if !errors.As(unknownErr, &missing) || !errors.As(unauthorizedErr, &denied) || missing.Category != ErrorNotFound || denied.Category != ErrorNotFound || missing.Message != denied.Message || unknownErr.Error() != unauthorizedErr.Error() {
+		t.Fatalf("unknown=%v unauthorized=%v", unknownErr, unauthorizedErr)
+	}
+}
+
+func TestScopedRunDetailAuthorizesBeforeAggregateLookup(t *testing.T) {
+	operator := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "U_7", ActorType: "User"}
+	other := domain.GitHubUserIdentity{Login: "other", DatabaseID: 8, NodeID: "U_8", ActorType: "User"}
+	makeRun := func(user domain.GitHubUserIdentity) Run {
+		repository := LocalRepository{CanonicalRepository: "owner/private", AllowedOperatorLogins: []string{user.Login}, TrustedOperatorActors: []TrustedActorIdentity{{Login: user.Login, DatabaseID: user.DatabaseID, NodeID: user.NodeID, Type: user.ActorType}}}
+		raw, _ := json.Marshal(repository)
+		return Run{ID: "private-run", Repository: repository.CanonicalRepository, RepositoryConfigJSON: string(raw), RepositoryBindingDigest: strings.Repeat("a", 64)}
+	}
+	authorizer, _ := NewAuthorizationService(ConfiguredOperatorIdentity{User: operator})
+
+	allowedRun := makeRun(operator)
+	allowedStore := &authorityFirstStore{serviceStore: serviceStore{run: allowedRun, inspection: RunInspection{Run: allowedRun}}}
+	allowed, _ := NewScopedQueryService(allowedStore, authorizer, serviceRepositoryAuthorities{})
+	if _, err := allowed.GetRunDetail(context.Background(), RunDetailQuery{Requester: requesterForUser(operator), RunID: allowedRun.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if allowedStore.authorityReads != 1 || allowedStore.aggregateReads != 1 || allowedStore.legacyReads != 0 {
+		t.Fatalf("authority=%d aggregate=%d legacy=%d", allowedStore.authorityReads, allowedStore.aggregateReads, allowedStore.legacyReads)
+	}
+
+	deniedRun := makeRun(other)
+	deniedStore := &authorityFirstStore{serviceStore: serviceStore{run: deniedRun}}
+	denied, _ := NewScopedQueryService(deniedStore, authorizer, serviceRepositoryAuthorities{})
+	_, deniedErr := denied.GetRunDetail(context.Background(), RunDetailQuery{Requester: requesterForUser(operator), RunID: deniedRun.ID})
+	if deniedStore.authorityReads != 1 || deniedStore.aggregateReads != 0 || deniedStore.legacyReads != 0 {
+		t.Fatalf("denied authority=%d aggregate=%d legacy=%d", deniedStore.authorityReads, deniedStore.aggregateReads, deniedStore.legacyReads)
+	}
+
+	missingStore := &authorityFirstStore{serviceStore: serviceStore{getErr: ErrRunNotFound}}
+	missing, _ := NewScopedQueryService(missingStore, authorizer, serviceRepositoryAuthorities{})
+	_, missingErr := missing.GetRunDetail(context.Background(), RunDetailQuery{Requester: requesterForUser(operator), RunID: deniedRun.ID})
+	if deniedErr == nil || missingErr == nil || deniedErr.Error() != missingErr.Error() || missingStore.aggregateReads != 0 || missingStore.legacyReads != 0 {
+		t.Fatalf("denied=%v missing=%v missing aggregate=%d legacy=%d", deniedErr, missingErr, missingStore.aggregateReads, missingStore.legacyReads)
+	}
+}
+
+func TestRunCollectionUnknownAndUnauthorizedFiltersAreNonDisclosing(t *testing.T) {
+	operator := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "U_7", ActorType: "User"}
+	authorizer, _ := NewAuthorizationService(ConfiguredOperatorIdentity{User: operator})
+	store := serviceStore{}
+	unknown, _ := NewScopedQueryService(store, authorizer, serviceRepositoryAuthorities{})
+	_, unknownErr := unknown.ListRunSummaries(context.Background(), RunSummaryQuery{Requester: requesterForUser(operator), Repository: "owner/private"})
+	deniedAuthority := repositoryAuthority(domain.GitHubUserIdentity{Login: "other", DatabaseID: 8, NodeID: "U_8", ActorType: "User"}, true)
+	deniedAuthority.Repository = "owner/private"
+	denied, _ := NewScopedQueryService(store, authorizer, serviceRepositoryAuthorities{authority: deniedAuthority, found: true})
+	_, deniedErr := denied.ListRunSummaries(context.Background(), RunSummaryQuery{Requester: requesterForUser(operator), Repository: "owner/private"})
+	var missing, unauthorized *ServiceError
+	if !errors.As(unknownErr, &missing) || !errors.As(deniedErr, &unauthorized) || missing.Category != ErrorNotFound || unauthorized.Category != ErrorNotFound || unknownErr.Error() != deniedErr.Error() {
+		t.Fatalf("unknown=%v unauthorized=%v", unknownErr, deniedErr)
+	}
+}
+
+func TestControllerRunCollectionDerivesFrozenRunScopesBeforePagination(t *testing.T) {
+	operator := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "U_7", ActorType: "User"}
+	other := domain.GitHubUserIdentity{Login: "other", DatabaseID: 8, NodeID: "U_8", ActorType: "User"}
+	makeRun := func(id string, user domain.GitHubUserIdentity, binding byte) Run {
+		repository := LocalRepository{CanonicalRepository: "repository/" + id, AllowedOperatorLogins: []string{user.Login}, TrustedOperatorActors: []TrustedActorIdentity{{Login: user.Login, DatabaseID: user.DatabaseID, NodeID: user.NodeID, Type: user.ActorType}}}
+		raw, _ := json.Marshal(repository)
+		return Run{ID: id, Repository: repository.CanonicalRepository, RepositoryConfigJSON: string(raw), RepositoryBindingDigest: strings.Repeat(string(binding), 64), CreatedAt: time.Now().UTC()}
+	}
+	store := serviceStore{runs: []Run{makeRun("hidden-before", other, 'b'), makeRun("visible-2", operator, 'c'), makeRun("hidden-within", other, 'd'), makeRun("visible-1", operator, 'e')}}
+	authorizer, _ := NewAuthorizationService(ConfiguredOperatorIdentity{User: operator})
+	queries, _ := NewScopedQueryService(store, authorizer, serviceRepositoryAuthorities{})
+	page, err := queries.ListRunSummaries(context.Background(), RunSummaryQuery{Requester: requesterForUser(operator), Limit: 10})
+	if err != nil || page.TotalCount != 2 || len(page.Runs) != 2 || page.Runs[0].RunID != "visible-2" || page.Runs[1].RunID != "visible-1" {
+		t.Fatalf("page=%+v err=%v", page, err)
+	}
+}
+
+func TestMutationReauthorizesFrozenTargetInsteadOfTrustingStaleScope(t *testing.T) {
+	operator := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "U_7", ActorType: "User"}
+	run := Run{ID: "run", Repository: "owner/repo", State: domain.StateAwaitingHumanDecision, IdempotencyKey: "key", RepositoryBindingDigest: strings.Repeat("a", 64)}
+	repository := LocalRepository{CanonicalRepository: run.Repository, AllowedOperatorLogins: []string{operator.Login}, TrustedOperatorActors: []TrustedActorIdentity{{Login: operator.Login, DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, Type: operator.ActorType}}}
+	raw, _ := json.Marshal(repository)
+	run.RepositoryConfigJSON = string(raw)
+	authorizer, _ := NewAuthorizationService(ConfiguredOperatorIdentity{User: operator})
+	staleScopes, err := authorizer.FrozenRunScopes(requesterForUser(operator), run)
+	if err != nil || staleScopes.Empty() {
+		t.Fatalf("stale scope setup=%+v err=%v", staleScopes, err)
+	}
+	repository.TrustedOperatorActors[0].NodeID = "U_CHANGED"
+	raw, _ = json.Marshal(repository)
+	run.RepositoryConfigJSON = string(raw)
+	controller := &serviceController{}
+	_, err = NewCommandService(controller, serviceStore{run: run}).Continue(context.Background(), ContinueCommand{Requester: requesterForUser(operator), RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey})
+	if err == nil || controller.continued != 0 {
+		t.Fatalf("stale scope crossed mutation boundary err=%v continued=%d", err, controller.continued)
 	}
 }
 
