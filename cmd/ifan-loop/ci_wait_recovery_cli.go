@@ -46,7 +46,11 @@ func controllerRecoverCIWait(args []string) error {
 	if err != nil {
 		return application.ClassifyError(err)
 	}
-	if _, err := application.NewQueryService(store).Status(context.Background(), application.QueryInput{Requester: requester.value(), RunID: run.ID, Repository: run.Repository}); err != nil {
+	queries, err := configuredQueryService(loaded, store)
+	if err != nil {
+		return err
+	}
+	if _, err := queries.Status(context.Background(), application.QueryInput{Requester: requester.value(), RunID: run.ID, Repository: run.Repository}); err != nil {
 		return err
 	}
 	if err := validateProductionPersistedBinding(run, loaded.Registry); err != nil {

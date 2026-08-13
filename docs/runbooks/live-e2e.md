@@ -29,10 +29,11 @@ The active tracker is
   controller source used to build the installed binary.
 - A current-user-owned, non-symlink installed binary exists outside a repository
   checkout.
-- Version 4 mode-`0600` configuration validates and enables automatic admission
-  with the exact IFAN team, Todo/In Progress state IDs, fixed trusted requester,
-  bounded scan/poll/lease limits, an explicitly chosen `heavy_capacity`,
-  `local_outbox`, and file credential source. Use capacity one for this
+- Version 5 mode-`0600` configuration validates one complete immutable
+  controller operator and enables automatic admission with the exact IFAN team,
+  Todo/In Progress state IDs, separate fixed trusted requester, bounded
+  scan/poll/lease limits, an explicitly chosen `heavy_capacity`, `local_outbox`,
+  and file credential source. Use capacity one for this
   single-fixture procedure; bounded-concurrency acceptance uses separate
   disposable repositories and evidence.
 - `config validate`, `config inspect`, `config doctor`, LaunchAgent `doctor`,

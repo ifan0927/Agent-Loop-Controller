@@ -75,19 +75,28 @@ configuration. Never repair a run by editing SQLite or artifact JSON.
 
 ## 4. Configuration
 
-Configuration version 4 is current. Versions 1 through 3 remain readable for
-compatibility, but new installations should use `config init` and version 4.
+Configuration version 5 is current. Versions 1 through 4 remain readable for
+compatibility, but new installations should use `config init` and version 5.
 The starter is intentionally incomplete and automatic admission is disabled.
 
 The strict JSON document contains:
 
 | Section | Responsibility |
 | --- | --- |
-| `controller` | Database path, Codex executable, and local action timeout |
+| `controller` | Database path, Codex executable, local action timeout, and one complete immutable GitHub `User` operator identity |
 | `linear` | Allowed GraphQL endpoint, credential source reference, team key, and bounded request settings |
 | `github_app_profiles` | App/installation/repository identities, PEM reference, request bounds, and narrow write switches |
 | `repositories` | Canonical owner/name, origins and local roots, base branch, verifier IDs, profile reference, and trusted actors |
 | `automation.linear_todo_admission` | Disabled/enabled authority, exact workflow states, independent admission/delivery poll bounds, admission lease bounds, generic `heavy_capacity`, fixed requester, durable local event adapter mode, and credential reference |
+
+Version 5 requires `controller.operator` with `login`, `database_id`, `node_id`,
+and `type: "User"`. This controller-wide configured operator is a separate
+configuration authority from `automation.linear_todo_admission.requester`, even
+when both tuples identify the same human. It must also be present in every
+current repository profile's allowed login and trusted immutable actor policy.
+Issue content, Linear fields, and CLI repository selectors cannot supply or
+override it. Older configuration versions retain compatibility CLI behavior
+but do not provide the configured controller-scope identity.
 
 Repository profiles are selectable one at a time per run. They may coexist in
 one configuration, but paths must not overlap and a run freezes the selected
@@ -114,11 +123,11 @@ Duplicate or contradictory identities and incomplete bounded scans still fail
 closed for operator attention.
 
 `heavy_capacity` is a positive integer from 1 through 32 and defaults to `2` in
-version 4. It bounds local Codex, verification, fresh review, and repair work;
+versions 4 and 5. It bounds local Codex, verification, fresh review, and repair work;
 external CI/Linear waits and human/manual waits do not consume it. Changes take
 effect on worker restart. Lowering capacity drains without canceling current
 holders. Version-3 `max_active_runs: 1` remains readable as capacity one for
-upgrade compatibility; version 4 rejects that retired field.
+upgrade compatibility; versions 4 and 5 reject that retired field.
 
 `automation.linear_todo_admission.poll_interval` controls only idle Linear Todo
 admission scans and remains bounded from `1m` through `1h` (`5m` in the starter
@@ -170,7 +179,13 @@ Every production command authenticates a complete immutable requester:
 --requester-type User
 ```
 
-These values must match the trusted actor in the frozen repository profile.
+These values must match the current or frozen target authority. Existing CLI
+flags remain a compatibility authentication surface, but the application maps
+them into the same typed requester and target-specific authorization contracts
+used by other presentation adapters. Controller-wide queries additionally
+require the exact version-5 configured operator. Unknown and unauthorized run
+or repository detail/filter targets both return the same sanitized `not_found`
+result.
 
 ## 6. Normal Operator Workflow
 
@@ -298,7 +313,7 @@ The version string does not prove configuration or CLI capability readiness.
 
 **Purpose**
 
-Create an absent secret-free version 4 starter configuration and private
+Create an absent secret-free version 5 starter configuration and private
 credential directory.
 
 **When to use**

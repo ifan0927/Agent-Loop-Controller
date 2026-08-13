@@ -82,19 +82,19 @@ func TestSchedulingProjectionQueriesAreReadOnlyBoundedAndOrdered(t *testing.T) {
 			t.Fatalf("reservation %s reserved=%t err=%v", id, reserved, err)
 		}
 	}
-	runs, err := store.ListSchedulingRuns(ctx, 2)
+	runs, err := store.ListSchedulingRuns(ctx, controllerRunScopes(t), 2)
 	if err != nil || len(runs) != 2 || runs[0].RunID != "projection-IFAN-207" || runs[1].RunID != "projection-IFAN-208" || !runs[0].HasHeavyPermit || runs[0].WaitingForCapacity {
 		t.Fatalf("runs=%+v err=%v", runs, err)
 	}
-	decisions, err := store.ListSchedulingDecisions(ctx, 2)
+	decisions, err := store.ListSchedulingDecisions(ctx, controllerRunScopes(t), 2)
 	if err != nil || len(decisions) != 2 || decisions[0].IssueSequence != 209 || decisions[1].IssueSequence != 208 {
 		t.Fatalf("decisions=%+v err=%v", decisions, err)
 	}
 	for _, invalid := range []int{0, application.MaxSchedulingQueryItems + 1} {
-		if _, err := store.ListSchedulingRuns(ctx, invalid); err == nil {
+		if _, err := store.ListSchedulingRuns(ctx, controllerRunScopes(t), invalid); err == nil {
 			t.Fatalf("scheduling run query accepted limit %d", invalid)
 		}
-		if _, err := store.ListSchedulingDecisions(ctx, invalid); err == nil {
+		if _, err := store.ListSchedulingDecisions(ctx, controllerRunScopes(t), invalid); err == nil {
 			t.Fatalf("scheduling decision query accepted limit %d", invalid)
 		}
 	}
@@ -102,12 +102,55 @@ func TestSchedulingProjectionQueriesAreReadOnlyBoundedAndOrdered(t *testing.T) {
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM run_scheduling`).Scan(&schedulingRowsBefore); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.ListSchedulingRuns(ctx, 1); err != nil {
+	if _, err := store.ListSchedulingRuns(ctx, controllerRunScopes(t), 1); err != nil {
 		t.Fatal(err)
 	}
 	var schedulingRowsAfter int
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM run_scheduling`).Scan(&schedulingRowsAfter); err != nil || schedulingRowsAfter != schedulingRowsBefore {
 		t.Fatalf("read-only query changed scheduling rows: before=%d after=%d err=%v", schedulingRowsBefore, schedulingRowsAfter, err)
+	}
+}
+
+func TestRepositorySchedulingScopeDoesNotDiscloseSiblingRunsOrDecisions(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if _, err := store.ConfigureHeavyCapacity(ctx, 2, "projection-two", now); err != nil {
+		t.Fatal(err)
+	}
+	lease, acquired, err := store.AcquireLinearTodoAdmissionLease(ctx, "scheduler", time.Minute, now)
+	if err != nil || !acquired {
+		t.Fatalf("lease=%+v acquired=%t err=%v", lease, acquired, err)
+	}
+	bindings := []string{digestBytes([]byte("visible-binding")), digestBytes([]byte("sibling-binding"))}
+	for index, id := range []string{"IFAN-301", "IFAN-302"} {
+		reservation := automaticAdmissionReservation(fixtureUUID(id), "scoped-"+id, id, lease)
+		reservation.Input.Repository.RepositoryBindingDigest = bindings[index]
+		reservation.Scheduling = schedulingReservation(id, "projection-two", 2, now.Add(time.Duration(index)*time.Second))
+		reservation.Scheduling.IssueSequence = 301 + index
+		if _, _, reserved, err := store.ReserveLinearTodoAdmission(ctx, reservation); err != nil || !reserved {
+			t.Fatalf("reservation %s reserved=%t err=%v", id, reserved, err)
+		}
+	}
+	scopes := repositoryRunScopes(t, bindings[0])
+	runs, err := store.ListSchedulingRuns(ctx, scopes, 10)
+	if err != nil || len(runs) != 1 || runs[0].RunID != "scoped-IFAN-301" {
+		t.Fatalf("runs=%+v err=%v", runs, err)
+	}
+	visible, err := store.GetSchedulingRun(ctx, scopes, "scoped-IFAN-301")
+	if err != nil || visible.RunID != "scoped-IFAN-301" {
+		t.Fatalf("visible=%+v err=%v", visible, err)
+	}
+	if _, err := store.GetSchedulingRun(ctx, scopes, "scoped-IFAN-302"); !errors.Is(err, application.ErrRunNotFound) {
+		t.Fatalf("sibling lookup error=%v", err)
+	}
+	decisions, err := store.ListSchedulingDecisions(ctx, scopes, 10)
+	if err != nil || len(decisions) != 1 || decisions[0].RunID != "scoped-IFAN-301" {
+		t.Fatalf("decisions=%+v err=%v", decisions, err)
 	}
 }
 
@@ -129,13 +172,13 @@ func TestSchedulingProjectionQueriesFailClosedForMissingOrCorruptEvidence(t *tes
 	if _, err := store.db.ExecContext(ctx, `DELETE FROM run_scheduling WHERE run_id=?`, reservation.Input.Task.RunID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.ListSchedulingRuns(ctx, 10); err == nil {
+	if _, err := store.ListSchedulingRuns(ctx, controllerRunScopes(t), 10); err == nil {
 		t.Fatal("missing scheduling row was projected as healthy")
 	}
 	if _, err := store.db.ExecContext(ctx, `UPDATE scheduling_decisions SET reason_code='raw /private/path' WHERE run_id=?`, reservation.Input.Task.RunID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.ListSchedulingDecisions(ctx, 10); err == nil {
+	if _, err := store.ListSchedulingDecisions(ctx, controllerRunScopes(t), 10); err == nil {
 		t.Fatal("corrupt scheduling decision was projected")
 	}
 }

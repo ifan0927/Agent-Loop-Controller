@@ -60,7 +60,8 @@ the state machine.
 ## Current Capabilities
 
 - Versioned, secret-free local configuration with inline repository profiles
-  and narrow GitHub App authorities.
+  and narrow GitHub App authorities, including one complete immutable
+  controller-operator identity distinct from automatic admission.
 - Manual Linear admission and disabled-by-default automatic Todo admission.
 - Deterministically ordered bounded worker scheduling with one nonterminal run
   per repository, a configurable local-heavy-work capacity, durable leases and
@@ -79,6 +80,10 @@ the state machine.
   exhausted typed retries, interrupted delivery, graceful parked-run
   abandonment with proven managed-child termination, residue attention, and
   verified external merges.
+- Presentation-independent controller, repository, frozen-run, and onboarding
+  authorization scopes; scope-aware run and scheduler collections filter before
+  counting, ordering, and pagination, and detail reads do not distinguish an
+  unknown target from an unauthorized one.
 - macOS LaunchAgent and headless system LaunchDaemon tooling for building,
   installing, validating, starting, observing, and stopping exactly one local
   non-root supervisor process.
@@ -156,8 +161,9 @@ isolated live-E2E milestones are complete. The current product focus is the
 remaining Controller operator foundations followed by a local TUI operator
 console in this repository under
 [roadmap #99](https://github.com/ifan0927/Agent-Loop-Controller/issues/99).
-The next foundation is local operator identity and application authorization in
-[issue #103](https://github.com/ifan0927/Agent-Loop-Controller/issues/103).
+Local operator identity and application authorization are implemented. The next
+dependency-ready foundation is Controller-owned operation receipts and
+legal-action offers.
 The TUI and `agentctl operator` are planned, not current behavior. HTTP, a Web
 UI, outbound notifications, Hermes runtime integration, public API/webhook
 admission, and cross-repository transactions remain deferred or exploratory.

@@ -367,7 +367,11 @@ func driveProductionRun(ctx context.Context, loaded bootstrap.Bootstrap, store *
 	if err != nil {
 		return application.ProductionDriveResult{}, application.ClassifyError(err)
 	}
-	if _, err := application.NewQueryService(store).Status(ctx, application.QueryInput{Requester: requester, RunID: run.ID, Repository: run.Repository}); err != nil {
+	queries, err := configuredQueryService(loaded, store)
+	if err != nil {
+		return application.ProductionDriveResult{}, err
+	}
+	if _, err := queries.Status(ctx, application.QueryInput{Requester: requester, RunID: run.ID, Repository: run.Repository}); err != nil {
 		return application.ProductionDriveResult{}, err
 	}
 	if err := validateProductionPersistedBinding(run, loaded.Registry); err != nil {
@@ -469,11 +473,28 @@ func controllerInspect(command string, args []string) error {
 		return err
 	}
 	defer store.Close()
-	result, err := application.NewQueryService(store).GetRunDetail(context.Background(), application.RunDetailQuery{Requester: requester.value(), RunID: runID})
+	queries, err := configuredQueryService(loaded, store)
+	if err != nil {
+		return err
+	}
+	result, err := queries.GetRunDetail(context.Background(), application.RunDetailQuery{Requester: requester.value(), RunID: runID})
 	if err != nil {
 		return err
 	}
 	return printJSON(result)
+}
+
+func configuredQueryService(loaded bootstrap.Bootstrap, store application.QueryStore) (application.QueryService, error) {
+	if loaded.Controller.Operator.Validate() != nil {
+		// Versions 1 through 4 remain readable through the legacy CLI boundary.
+		// They do not grant the version-5 controller scope.
+		return application.NewQueryService(store), nil
+	}
+	authorizer, err := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: loaded.Controller.Operator})
+	if err != nil {
+		return application.QueryService{}, err
+	}
+	return application.NewScopedQueryService(store, authorizer, loaded.Registry)
 }
 
 func controllerContinue(args []string) error {
@@ -485,7 +506,11 @@ func controllerContinue(args []string) error {
 	if err := validateProductionPersistedBinding(command.run, loaded.Registry); err != nil {
 		return application.ClassifyError(err)
 	}
-	if _, err := application.NewQueryService(store).Status(context.Background(), application.QueryInput{Requester: command.requester, RunID: command.run.ID, Repository: command.repository}); err != nil {
+	queries, err := configuredQueryService(loaded, store)
+	if err != nil {
+		return err
+	}
+	if _, err := queries.Status(context.Background(), application.QueryInput{Requester: command.requester, RunID: command.run.ID, Repository: command.repository}); err != nil {
 		return err
 	}
 	supervisorLock, err := acquireWorkerProcessLock(filepath.Dir(loaded.Controller.DatabasePath))
@@ -653,7 +678,11 @@ func controllerAbandon(args []string) error {
 		return application.ClassifyError(err)
 	}
 	requesterValue := requester.value()
-	if _, err := application.NewQueryService(store).Status(context.Background(), application.QueryInput{Requester: requesterValue, RunID: run.ID, Repository: run.Repository}); err != nil {
+	queries, err := configuredQueryService(loaded, store)
+	if err != nil {
+		return err
+	}
+	if _, err := queries.Status(context.Background(), application.QueryInput{Requester: requesterValue, RunID: run.ID, Repository: run.Repository}); err != nil {
 		return err
 	}
 	if err := validateProductionPersistedBinding(run, loaded.Registry); err != nil {
@@ -1003,7 +1032,11 @@ func githubRead(args []string) error {
 		return err
 	}
 	defer store.Close()
-	if _, err := application.NewQueryService(store).Status(context.Background(), application.QueryInput{Requester: requesterIdentity.value(), RunID: *runID, Repository: *repository}); err != nil {
+	queries, err := configuredQueryService(loaded, store)
+	if err != nil {
+		return err
+	}
+	if _, err := queries.Status(context.Background(), application.QueryInput{Requester: requesterIdentity.value(), RunID: *runID, Repository: *repository}); err != nil {
 		return err
 	}
 	inspection, err := store.Inspect(context.Background(), *runID)

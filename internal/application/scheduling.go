@@ -282,6 +282,6 @@ type SchedulingAuthorityStore interface {
 // later transport adapters. Queries never reconcile authorities or trigger
 // external observation.
 type SchedulingProjectionReader interface {
-	ListSchedulingRuns(context.Context, int) ([]SchedulingRun, error)
-	ListSchedulingDecisions(context.Context, int) ([]SchedulingDecision, error)
+	ListSchedulingRuns(context.Context, AuthorizedScopeSet, int) ([]SchedulingRun, error)
+	ListSchedulingDecisions(context.Context, AuthorizedScopeSet, int) ([]SchedulingDecision, error)
 }

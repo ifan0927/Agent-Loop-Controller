@@ -109,7 +109,7 @@ type configInitOutput struct {
 }
 
 // configTemplate intentionally contains no credentials or private-key paths.
-// It remains a strict v4 JSON document, but has no repository or GitHub App
+// It remains a strict v5 JSON document, but has no repository or GitHub App
 // profiles; an operator must add those before validation and execution.
 type configTemplate struct {
 	Version           int                      `json:"version"`
@@ -137,9 +137,17 @@ type configTemplateLinearTodoAdmission struct {
 }
 
 type configTemplateControl struct {
-	DatabasePath string `json:"database_path"`
-	CodexBinary  string `json:"codex_binary"`
-	RunTimeout   string `json:"run_timeout"`
+	DatabasePath string                 `json:"database_path"`
+	CodexBinary  string                 `json:"codex_binary"`
+	RunTimeout   string                 `json:"run_timeout"`
+	Operator     configTemplateOperator `json:"operator"`
+}
+
+type configTemplateOperator struct {
+	Login      string `json:"login"`
+	DatabaseID int64  `json:"database_id"`
+	NodeID     string `json:"node_id"`
+	Type       string `json:"type"`
 }
 
 type configTemplateLinear struct {
@@ -245,11 +253,12 @@ func createCredentialDirectory(path string) error {
 
 func newConfigTemplate(root string) configTemplate {
 	return configTemplate{
-		Version: 4,
+		Version: bootstrap.CurrentVersion,
 		Controller: configTemplateControl{
 			DatabasePath: filepath.Join(root, "controller.db"),
 			CodexBinary:  "codex",
 			RunTimeout:   "30m",
+			Operator:     configTemplateOperator{Type: "User"},
 		},
 		Linear: configTemplateLinear{
 			APIURL:              "https://api.linear.app/graphql",

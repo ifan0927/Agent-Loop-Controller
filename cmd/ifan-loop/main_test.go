@@ -270,7 +270,7 @@ func TestLocalContinueAuthorizesBeforeRegistryRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = localContinue([]string{"run-auth-first", "--db", path, "--registry", filepath.Join(t.TempDir(), "missing.json"), "--requester", "intruder", "--requester-database-id", "44", "--requester-node-id", "intruder-node", "--requester-type", "User", "--repository", "owner/repo", "--expected-state", "received", "--idempotency-key", "key"})
-	if err == nil || !strings.Contains(err.Error(), "not authorized") {
+	if err == nil || !strings.Contains(err.Error(), "not_found: resource is not available") {
 		t.Fatalf("unauthorized continue exposed registry error=%v", err)
 	}
 }
@@ -288,7 +288,7 @@ func TestLocalContinueRejectsCallerRepositoryBeforeRegistryRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = localContinue([]string{"run-repository", "--db", path, "--registry", filepath.Join(t.TempDir(), "missing.json"), "--requester", "ifan0927", "--requester-database-id", "33", "--requester-node-id", "MDQ6VXNlcjMz", "--requester-type", "User", "--repository", "owner/other", "--expected-state", "received", "--idempotency-key", "key"})
-	if err == nil || !strings.Contains(err.Error(), "repository does not match") {
+	if err == nil || !strings.Contains(err.Error(), "not_found: resource is not available") {
 		t.Fatalf("repository mismatch exposed registry error=%v", err)
 	}
 }
@@ -385,7 +385,7 @@ func TestControllerStatusProjectsIdempotencyKeyOnlyToAuthorizedOperator(t *testi
 		t.Fatalf("controller status output=%s", output)
 	}
 
-	if err := controller([]string{"inspect", "run-status", "--config", configPath, "--requester", "intruder", "--requester-database-id", "44", "--requester-node-id", "intruder-node", "--requester-type", "User"}); err == nil || !strings.Contains(err.Error(), "not authorized") {
+	if err := controller([]string{"inspect", "run-status", "--config", configPath, "--requester", "intruder", "--requester-database-id", "44", "--requester-node-id", "intruder-node", "--requester-type", "User"}); err == nil || !strings.Contains(err.Error(), "not_found: resource is not available") {
 		t.Fatalf("unauthorized controller inspect error=%v", err)
 	}
 }
@@ -443,7 +443,7 @@ func TestLocalStatusRejectsUnauthorizedRequester(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = localInspect("status", []string{"run-auth", "--db", path, "--requester", "intruder", "--requester-database-id", "44", "--requester-node-id", "intruder-node", "--requester-type", "User"})
-	if err == nil || !strings.Contains(err.Error(), "not authorized") {
+	if err == nil || !strings.Contains(err.Error(), "not_found: resource is not available") {
 		t.Fatalf("unauthorized status error=%v", err)
 	}
 }

@@ -762,6 +762,37 @@ func (s *Store) GetRun(ctx context.Context, id string) (application.Run, error) 
 	return run, err
 }
 
+// GetRunScopeAuthority reads only the frozen identity fields needed to decide
+// whether the caller may look up the complete run aggregate.
+func (s *Store) GetRunScopeAuthority(ctx context.Context, id string) (application.RunScopeAuthority, error) {
+	var runID, repository, bindingDigest, raw string
+	err := s.db.QueryRowContext(ctx, `SELECT run_id,repository,repository_binding_digest,repository_config_json FROM runs WHERE run_id=?`, id).
+		Scan(&runID, &repository, &bindingDigest, &raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return application.RunScopeAuthority{}, application.ErrRunNotFound
+	}
+	if err != nil {
+		return application.RunScopeAuthority{}, err
+	}
+	return decodeRunScopeAuthority(runID, repository, bindingDigest, raw)
+}
+
+func (s *Store) GetAuthorizedRun(ctx context.Context, id string, scopes application.AuthorizedScopeSet) (application.Run, error) {
+	if strings.TrimSpace(id) == "" || scopes.Empty() {
+		return application.Run{}, errors.New("authorized run lookup is invalid")
+	}
+	where, args, err := authorizedRunWhere(scopes, "")
+	if err != nil {
+		return application.Run{}, err
+	}
+	args = append(args, id)
+	run, err := scanRun(s.db.QueryRowContext(ctx, runSelect+` WHERE (`+where+`) AND run_id=?`, args...))
+	if errors.Is(err, sql.ErrNoRows) {
+		return application.Run{}, application.ErrRunNotFound
+	}
+	return run, err
+}
+
 func (s *Store) GetRunByIdempotency(ctx context.Context, key string) (application.Run, bool, error) {
 	run, err := s.getByIdempotency(ctx, key)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -770,35 +801,127 @@ func (s *Store) GetRunByIdempotency(ctx context.Context, key string) (applicatio
 	return run, err == nil, err
 }
 
-// ListRuns returns a deterministic page ordered by newest creation time and run ID.
-// The application query service owns cursor validation and authorization.
-func (s *Store) ListRuns(ctx context.Context, repository string, beforeCreatedAt time.Time, beforeID string, limit int) ([]application.Run, error) {
-	if limit < 1 || limit > 101 {
-		return nil, errors.New("run list limit is out of bounds")
-	}
-	query := runSelect + ` WHERE repository=?`
-	args := []any{repository}
-	if !beforeCreatedAt.IsZero() {
-		query += ` AND (created_at < ? OR (created_at = ? AND run_id < ?))`
-		before := formatTime(beforeCreatedAt)
-		args = append(args, before, before, beforeID)
-	}
-	query += ` ORDER BY created_at DESC, run_id DESC LIMIT ?`
-	args = append(args, limit)
-	rows, err := s.db.QueryContext(ctx, query, args...)
+func (s *Store) ListRunScopeAuthorities(ctx context.Context) ([]application.RunScopeAuthority, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT run_id,repository,repository_binding_digest,repository_config_json FROM runs`)
 	if err != nil {
 		return nil, err
+	}
+	defer rows.Close()
+	authorities := []application.RunScopeAuthority{}
+	for rows.Next() {
+		var runID, repository, bindingDigest, raw string
+		if err := rows.Scan(&runID, &repository, &bindingDigest, &raw); err != nil {
+			return nil, err
+		}
+		authority, err := decodeRunScopeAuthority(runID, repository, bindingDigest, raw)
+		if err != nil {
+			// A corrupt frozen authority cannot grant a run scope and must not
+			// change the visible collection produced for other valid runs.
+			continue
+		}
+		authorities = append(authorities, authority)
+	}
+	return authorities, rows.Err()
+}
+
+func decodeRunScopeAuthority(runID, repository, bindingDigest, raw string) (application.RunScopeAuthority, error) {
+	var configured application.LocalRepository
+	if err := json.Unmarshal([]byte(raw), &configured); err != nil {
+		return application.RunScopeAuthority{}, errors.New("frozen run authority is corrupt")
+	}
+	legacy := application.Run{Repository: repository, RepositoryBindingDigest: bindingDigest}
+	ensureRepositoryBindingDigest(&legacy)
+	trusted := make([]domain.GitHubUserIdentity, 0, len(configured.TrustedOperatorActors))
+	for _, actor := range configured.TrustedOperatorActors {
+		trusted = append(trusted, domain.GitHubUserIdentity{Login: actor.Login, DatabaseID: actor.DatabaseID, NodeID: actor.NodeID, ActorType: actor.Type})
+	}
+	return application.RunScopeAuthority{RunID: runID, Repository: repository, BindingDigest: legacy.RepositoryBindingDigest,
+		AllowedLogins: append([]string(nil), configured.AllowedOperatorLogins...), TrustedOperators: trusted}, nil
+}
+
+// ListAuthorizedRuns filters authority before counting, ordering, and
+// pagination. Hidden rows therefore cannot influence page shape or cursors.
+func (s *Store) ListAuthorizedRuns(ctx context.Context, input application.AuthorizedRunQuery) (application.AuthorizedRunPage, error) {
+	if input.Limit < 1 || input.Limit > 101 || input.Scopes.Empty() {
+		return application.AuthorizedRunPage{}, errors.New("authorized run list query is invalid")
+	}
+	where, args, err := authorizedRunWhere(input.Scopes, input.Repository)
+	if err != nil {
+		return application.AuthorizedRunPage{}, err
+	}
+	var total int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE `+where, args...).Scan(&total); err != nil {
+		return application.AuthorizedRunPage{}, err
+	}
+	query := runSelect + ` WHERE ` + where
+	pageArgs := append([]any(nil), args...)
+	if !input.BeforeCreatedAt.IsZero() {
+		query += ` AND (created_at < ? OR (created_at = ? AND run_id < ?))`
+		before := formatTime(input.BeforeCreatedAt)
+		pageArgs = append(pageArgs, before, before, input.BeforeRunID)
+	}
+	query += ` ORDER BY created_at DESC, run_id DESC LIMIT ?`
+	pageArgs = append(pageArgs, input.Limit)
+	rows, err := s.db.QueryContext(ctx, query, pageArgs...)
+	if err != nil {
+		return application.AuthorizedRunPage{}, err
 	}
 	defer rows.Close()
 	runs := []application.Run{}
 	for rows.Next() {
 		run, err := scanRun(rows)
 		if err != nil {
-			return nil, err
+			return application.AuthorizedRunPage{}, err
 		}
 		runs = append(runs, run)
 	}
-	return runs, rows.Err()
+	if err := rows.Err(); err != nil {
+		return application.AuthorizedRunPage{}, err
+	}
+	return application.AuthorizedRunPage{Runs: runs, TotalCount: total}, nil
+}
+
+func authorizedRunWhere(scopes application.AuthorizedScopeSet, repository string) (string, []any, error) {
+	return authorizedRunWhereColumns(scopes, "repository", "repository_binding_digest", "run_id", repository, false)
+}
+
+func authorizedRunWhereColumns(scopes application.AuthorizedScopeSet, repositoryColumn, bindingColumn, runIDColumn, repository string, controllerAllowed bool) (string, []any, error) {
+	where := ""
+	args := []any{}
+	if controllerAllowed && scopes.HasController() {
+		where = "1=1"
+	} else {
+		bindings, runs := scopes.RepositoryBindingDigests(), scopes.RunPredicates()
+		conditions := []string{}
+		if len(bindings) > 0 {
+			conditions = append(conditions, bindingColumn+` IN (`+placeholders(len(bindings))+`)`)
+			for _, binding := range bindings {
+				args = append(args, binding)
+			}
+		}
+		if len(runs) > 0 {
+			runConditions := make([]string, 0, len(runs))
+			for _, run := range runs {
+				runConditions = append(runConditions, `(`+runIDColumn+`=? AND `+bindingColumn+`=?)`)
+				args = append(args, run.RunID, run.BindingDigest)
+			}
+			conditions = append(conditions, `(`+strings.Join(runConditions, " OR ")+`)`)
+		}
+		if len(conditions) == 0 {
+			where = "0=1"
+		} else {
+			where = "(" + strings.Join(conditions, " OR ") + ")"
+		}
+	}
+	if repository != "" {
+		where += " AND " + repositoryColumn + "=?"
+		args = append(args, repository)
+	}
+	return where, args, nil
+}
+
+func placeholders(count int) string {
+	return strings.TrimRight(strings.Repeat("?,", count), ",")
 }
 
 func (s *Store) GetRunByIssue(ctx context.Context, issueID string) (application.Run, bool, error) {
