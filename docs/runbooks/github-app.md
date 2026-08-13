@@ -5,6 +5,11 @@ controller's GitHub App. General command use and delivery behavior belong in
 [Operations](../operations.md); authority and evidence design belong in
 [Architecture](../architecture.md).
 
+Command examples use the currently implemented `ifan-loop` compatibility
+executable. The canonical `agentctl` migration is tracked in
+[issue #104](https://github.com/ifan0927/Agent-Loop-Controller/issues/104) and
+must not be performed independently of launchd installation compatibility.
+
 ## Safety Boundary
 
 - Create a dedicated GitHub App; do not use a personal access token or `gh`

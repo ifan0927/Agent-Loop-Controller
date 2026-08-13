@@ -29,8 +29,8 @@ durable, explicit, restart-safe, and inspectable.
 | Hermes | Conversation, future trigger, notification, and status interface; it is not yet connected to the runtime |
 | Controller | Durable state, authority snapshots, evidence, orchestration, retries, reconciliation, and owned cleanup |
 
-I-Fan remains the final human authority. The controller never approves its own
-work or resolves a human review conversation.
+The configured human operator remains the final approval authority. The
+controller never approves its own work or resolves a human review conversation.
 
 ## End-to-End Workflow
 
@@ -43,7 +43,7 @@ eligible Linear Todo
   -> repository verification bound to candidate HEAD
   -> fresh independent Codex review bound to the same HEAD
   -> push one owned branch and open/adopt one owned PR
-  -> observe required CI and trusted I-Fan review feedback
+  -> observe required CI and trusted human-review feedback
   -> repair, re-verify, re-review, and reply when changes are requested
   -> wait for conversation resolution and exact-HEAD human approval
   -> guarded squash merge
@@ -106,6 +106,13 @@ Prerequisites are Go from [`go.mod`](go.mod), Git, a compatible authenticated
 Codex CLI, Linear access, and a selected-repository GitHub App. Production
 configuration is macOS-local by default.
 
+`agentctl` is the approved canonical executable name. The current implemented
+compatibility executable remains `ifan-loop` until the running launchd
+installation identity can be migrated without creating a second worker or
+losing restart evidence; that bounded migration is tracked in
+[issue #104](https://github.com/ifan0927/Agent-Loop-Controller/issues/104).
+The commands below intentionally describe current behavior.
+
 ```sh
 mkdir -p ./bin
 go build -o ./bin/ifan-loop ./cmd/ifan-loop
@@ -144,14 +151,16 @@ normal workflow.
 ## Project Status
 
 The production MVP and the automatic-admission, trusted-feedback, source-sync,
-recovery, headless supervision, and second isolated live-E2E milestones are
-complete. The current product focus is a controller-owned repository and
-configuration lifecycle, followed by a local authenticated Operator API and a
-separately maintained Web UI under
+recovery, headless supervision, bounded multi-repository scheduling, and second
+isolated live-E2E milestones are complete. The current product focus is the
+remaining Controller operator foundations followed by a local TUI operator
+console in this repository under
 [roadmap #99](https://github.com/ifan0927/Agent-Loop-Controller/issues/99).
-These operator-product capabilities are planned, not current behavior. Outbound
-notifications, Hermes runtime integration, public API/webhook admission, and
-cross-repository transactions remain deferred or exploratory.
+The next foundation is local operator identity and application authorization in
+[issue #103](https://github.com/ifan0927/Agent-Loop-Controller/issues/103).
+The TUI and `agentctl operator` are planned, not current behavior. HTTP, a Web
+UI, outbound notifications, Hermes runtime integration, public API/webhook
+admission, and cross-repository transactions remain deferred or exploratory.
 
 See [Roadmap](docs/roadmap.md) for status categories and current tracking.
 

@@ -156,7 +156,7 @@ func (c *ProductionCoordinator) Abandon(ctx context.Context, command ProductionA
 		return ProductionAbandonResult{}, err
 	}
 	// Once operator intent is durable, request cancellation is cleanup residue,
-	// not authority to strand the singleton slot. Cleanup gets a narrower budget
+	// not authority to strand the repository slot. Cleanup gets a narrower budget
 	// than terminalization, while lease loss still cancels every subsequent
 	// action.
 	stopLease()

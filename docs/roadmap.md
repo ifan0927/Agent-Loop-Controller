@@ -8,19 +8,21 @@ the workflow authority.
 
 The intended experience is:
 
-- I-Fan and Hermes shape a coding-ready task and observe progress;
+- a human operator or a future conversation adapter shapes a coding-ready task
+  and observes progress;
 - Linear owns task definition, priority, acceptance criteria, and lifecycle;
 - the controller admits work, persists authority/evidence, and orchestrates the
   one legal next action;
 - Codex implements, resumes, repairs, and performs a fresh independent review;
 - GitHub owns repository delivery, CI, human review, and merge evidence;
-- I-Fan makes ambiguous product decisions and final review/approval decisions;
+- the configured human operator makes ambiguous product decisions and final
+  review/approval decisions;
 - restarts and partial failures recover from durable evidence rather than human
   reconstruction.
 
-The product is local-first today, but its application contracts should permit a
-future authenticated operator interface without turning the browser, Hermes, or
-an agent into the source of truth.
+The product is local-first and TUI-first. Its application contracts remain
+replaceable enough for future adapters without making a terminal UI, browser,
+Hermes, or an agent the source of truth.
 
 ## Guiding Principles
 
@@ -66,22 +68,22 @@ an agent into the source of truth.
 This milestone is recorded by the closed
 [production MVP roadmap](https://github.com/ifan0927/Agent-Loop-Controller/issues/1).
 
-### Completed: local automatic admission and trusted feedback implementation
+### Completed: automatic admission, trusted feedback, and bounded concurrency
 
-- Disabled-by-default Linear Todo admission with deterministic
-  priority/identifier/UUID ordering and serial handoff.
+- Disabled-by-default Linear Todo admission with deterministic cross-repository
+  priority/identifier/UUID ordering and one-candidate reservation decisions.
 - Short global admission lease, atomic reservation/mutation journal, one-active-
   run-per-repository slots, generic bounded local-heavy-work permits, durable
   retry schedule, worker, macOS LaunchAgent controls, and non-root headless
   LaunchDaemon supervision.
 - Sanitized transport-neutral operator-attention events and queue-decision
   projection.
-- Trusted I-Fan inline review feedback lifecycle, same-session repair, fresh
+- Trusted human-review feedback lifecycle, same-session repair, fresh
   review, idempotent GitHub App reply, and conversation-resolution wait.
 - Exact merge-SHA source checkout synchronization and partial cleanup recovery.
 - Graceful parked-run abandon with proven managed-child termination and guarded
   local/remote ownership cleanup,
-  terminal residue attention, worker slot release, owned repair-push recovery,
+  terminal residue attention, repository-slot release, owned repair-push recovery,
   and verified external merge acceptance.
 - Typed exhausted-retry recovery with durable operator intent and automatic
   worker resume through the normal driver.
@@ -111,72 +113,94 @@ the retired read-only monitoring roadmap with a staged operator product intended
 to cover at least 90 percent of routine local work:
 
 ```text
-controller operator capabilities
-  -> authenticated loopback Operator API
-  -> separately maintained Web UI frontend
+completed controller and bounded-concurrency foundation
+  -> remaining controller operator foundations
+  -> local TUI operator console
+  -> optional future adapters only when justified
+     |- Operator API
+     |- Web UI
+     `- Hermes
 ```
 
-Only the umbrella is open initially. Implementation work should be decomposed
-after the preceding phase has a stable enough contract; the frontend must not
-drive speculative controller or API design.
+`agentctl` is the canonical target executable name. The intended runtime entry
+points are `agentctl controller worker` and `agentctl operator`. The currently
+implemented `ifan-loop` executable and launchd identity remain a compatibility
+surface until the installation-safe migration in
+[#104](https://github.com/ifan0927/Agent-Loop-Controller/issues/104) completes.
+
+Implementation work is created one dependency-ready issue at a time. The next
+foundation is
+[#103](https://github.com/ifan0927/Agent-Loop-Controller/issues/103), local
+operator identity and application authorization. Do not create speculative TUI,
+HTTP, or frontend slices before their Controller contracts exist.
 
 ### Phase 1: controller operator foundations
 
-The controller first needs presentation-independent application services for:
+Bounded multi-repository concurrency is complete. The remaining
+presentation-independent sequence is:
 
-- restart-safe onboarding of a manually created empty GitHub repository into a
-  managed local checkout, initial base revision, Linear `repo:<slug>` label, and
-  validated repository profile;
-- safe adoption of an existing local checkout with a matching GitHub origin,
-  without moving it or rewriting user-owned Git state;
-- configuration draft, validation, change preview, compare-and-swap apply,
-  rollback, and readiness observation;
-- repository add, edit, disable, and guarded removal;
-- existing human-decision, retry, abandon, reconcile, cleanup, and other narrow
-  operator commands behind one consistent authorization, idempotency, and audit
-  boundary.
+1. local operator identity and application authorization;
+2. operation receipts and legal-action offers;
+3. worker heartbeat and runtime observation;
+4. configuration generation and compare-and-swap apply;
+5. typed configuration lifecycle;
+6. repository lifecycle and readiness;
+7. restart-safe onboarding saga;
+8. existing-checkout adoption;
+9. empty-repository initialization;
+10. routine Controller projections;
+11. activity and audit integrity.
 
-GitHub repository creation, source templates, and browser secret provisioning
-are not part of this phase.
+These services own policy, authorization, idempotency, reconciliation, and
+sanitized evidence independently of presentation. GitHub repository creation,
+source templates, and UI secret provisioning are not part of this phase.
 
-### Phase 2: local WebUI Operator API
+### Phase 2: local TUI operator console
 
-The Controller repository owns a loopback-first authenticated HTTP adapter and
-versioned OpenAPI contract. It exposes sanitized health, queue, repository,
-onboarding, run, evidence, attention, configuration, and audit queries plus only
-the typed commands already authorized by controller application services. It
-must not expose arbitrary commands, SQL, filesystem browsing, generic config
-patches, or alternate workflow transitions.
+The initial TUI is a presentation adapter in this repository and Go module. It
+runs as a separate process from the worker, reads durable Controller state
+through typed application projections, and invokes only Controller-owned legal
+actions. Closing or crashing the TUI must not stop Controller execution.
+
+When implementation begins, use Bubble Tea v2, Bubbles v2, and Lip Gloss v2.
+Do not add those dependencies before an implementation issue requires them.
+The likely navigation surface is Overview, Runs, Queue, Attention,
+Repositories, Onboarding, Settings, and System/Audit, but stable Controller
+projections determine screen details.
+
+The fixed product metric remains ten complete operator-intent scenarios from
+[#100](https://github.com/ifan0927/Agent-Loop-Controller/issues/100), worth ten
+points each. At least 9/10 substantiates the 90-percent claim; v1 targets 10/10.
+A scenario counts only when the complete human goal is supported without raw
+SQLite, config-file editing, artifacts, logs, filesystem inspection, or ad-hoc
+Controller internals. Manual admission may remain CLI-only and outside the
+denominator.
+
+TUI verification starts with Go model/update/application tests and deterministic
+View or golden tests, then adds a bounded set of VHS critical-flow acceptance
+tests. VHS is development tooling, not a runtime dependency.
+
+### Phase 3: optional future adapters
+
+HTTP, a Web UI, or Hermes may later adapt the same Controller application
+contracts when a demonstrated consumer needs browser, remote, conversation, or
+integration transport. They are not prerequisites for the local TUI. Future
+adapters must not derive policy, own worker lifecycle, or introduce a second
+state machine.
 
 GitHub approval and review resolution remain in GitHub. General Linear issue
-editing remains in Linear. Privileged installation/upgrade and break-glass
-recovery remain explicit CLI/operator procedures.
-
-### Phase 3: separate Web UI frontend
-
-The frontend is maintained in a separate repository and initially runs locally
-as a React, strict TypeScript, Vite, and Ant Design application. Vite proxies
-`/api/v1` to the local Controller API. The Controller repository owns the
-OpenAPI source; the frontend generates and commits its TypeScript API types.
-
-The initial pages are Overview, Runs, Attention, Repositories, repository
-onboarding, Settings, and System/Audit. The frontend presents controller-owned
-legal actions and observed results; it does not infer authority or implement a
-second state machine.
-
-The first local-only version does not require frontend release artifacts,
-digest manifests, compatibility packaging, SSR, a Node production backend, or
-a separate BFF.
+editing remains in Linear. Privileged installation/upgrade, secret management,
+and break-glass recovery remain explicit CLI/operator procedures.
 
 ## Near-Term Goals
 
 ### Planned: outbound notification delivery
 
-The Web UI has no notification inbox, delivery history, read state, or inbound
-chat authority. It only shows current state and operator attention. After the
-controller, API, and frontend foundation is usable, outbound notifications may
-be planned separately, with Discord as the likely first adapter. Delivery and
-acknowledgement must remain subordinate to controller state.
+The local operator product has no notification inbox, delivery history, read
+state, or inbound chat authority. After the Controller foundations and TUI are
+usable, outbound notifications may be planned separately, with Discord as a
+possible adapter. Delivery and acknowledgement must remain subordinate to
+Controller state.
 
 ### Planned: Hermes application integration
 
@@ -185,12 +209,13 @@ queries for conversation, trigger, status, and notification workflows. It must
 not execute Mac shell commands, read worktrees, approve GitHub reviews, resolve
 human threads, or own controller state.
 
-### Planned: broader multi-repository operation
+### Planned: multi-repository lifecycle and visibility
 
-Configuration already supports multiple repository profiles while each run
-selects exactly one. Onboarding and operator visibility should make those
-profiles easier to manage without introducing cross-repository transactions or
-one issue spanning multiple PRs.
+Bounded multi-repository scheduling is implemented while each run still selects
+exactly one repository. The remaining operator foundations and TUI should make
+repository onboarding, readiness, lifecycle, capacity, and active-run state
+visible without introducing cross-repository transactions or one issue spanning
+multiple PRs.
 
 ## Longer-Term Direction
 

@@ -57,8 +57,8 @@ cat >"$registry" <<JSON
 	  "github_installation_id": 1,
 	  "expected_repository_id": 1,
 	  "operator_identity_policy": {
-	    "allowed_logins": ["ifan0927"],
-	    "trusted_actors": [{"database_id": 1, "node_id": "MDQ6VXNlcjE=", "login": "ifan0927", "type": "User"}]
+	    "allowed_logins": ["fixture-operator"],
+	    "trusted_actors": [{"database_id": 1, "node_id": "MDQ6VXNlcjE=", "login": "fixture-operator", "type": "User"}]
 	  }
     }
   ]
