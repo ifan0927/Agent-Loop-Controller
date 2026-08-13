@@ -2,6 +2,7 @@ package application
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -114,6 +115,18 @@ func TestManualInterventionAttentionIsStableAndAdvertisesAbandonOnly(t *testing.
 	second, err := ManualInterventionAttentionEvent(run, transition)
 	if err != nil || first.EventKey != second.EventKey || first.PayloadDigest != second.PayloadDigest || !equalOperatorAttentionActions(first.AllowedActions, []OperatorAttentionActionID{OperatorAttentionActionAbandon}) {
 		t.Fatalf("first=%+v second=%+v err=%v", first, second, err)
+	}
+}
+
+func TestRecoveryEligibleManualAttentionPreservesLegacyImmutableEventIdentity(t *testing.T) {
+	now := time.Date(2026, 8, 13, 1, 0, 0, 0, time.UTC)
+	run := operatorAttentionTestRun(t, domain.StateManualIntervention)
+	for _, reason := range []string{"remote branch diverged", "GitHub pull request closed or merged outside the controller gate"} {
+		transition := Transition{Sequence: 11, From: domain.StatePushingBranch, To: domain.StateManualIntervention, Reason: reason, EvidenceReference: "persisted-evidence", BoundHead: run.CandidateHead, CreatedAt: now}
+		event, err := ManualInterventionAttentionEvent(run, transition)
+		if err != nil || event.ReasonCode != "manual_intervention" || !slices.Equal(event.AllowedActions, []OperatorAttentionActionID{OperatorAttentionActionAbandon}) {
+			t.Fatalf("reason=%q event=%+v err=%v", reason, event, err)
+		}
 	}
 }
 

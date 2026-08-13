@@ -23,7 +23,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 29
+const schemaVersion = 30
 
 type Store struct {
 	db                   *sql.DB
@@ -161,6 +161,8 @@ func (s *Store) migrate(ctx context.Context, supportedVersion int) error {
 			statements = migrationV28
 		case 29:
 			statements = migrationV29
+		case 30:
+			statements = migrationV30
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -186,6 +188,11 @@ func (s *Store) migrate(ctx context.Context, supportedVersion int) error {
 		}
 		if version == 28 {
 			if err := migrateOperatorAttentionV28Tx(ctx, tx); err != nil {
+				return err
+			}
+		}
+		if version == 30 {
+			if err := backfillOperationReceiptsV30Tx(ctx, tx); err != nil {
 				return err
 			}
 		}
@@ -368,6 +375,109 @@ var migrationV29 = []string{
 			DELETE FROM repository_slots WHERE run_id=NEW.run_id;
 			UPDATE run_scheduling SET supervisor_state='terminal',quarantined=0,reason_code='',updated_at=NEW.updated_at WHERE run_id=NEW.run_id;
 		END`,
+}
+
+// migrationV30 introduces the scope-neutral durable operation envelope while
+// preserving operator_actions as the private run-specific authority journal.
+var migrationV30 = []string{
+	`ALTER TABLE operator_actions ADD COLUMN request_digest TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE operator_actions ADD COLUMN expected_authority_digest TEXT NOT NULL DEFAULT ''`,
+	`UPDATE operator_actions SET request_digest=payload_digest WHERE request_digest=''`,
+	`ALTER TABLE operator_actions RENAME TO operator_actions_v29`,
+	`DROP INDEX operator_actions_run`,
+	`CREATE TABLE operator_actions (
+		action_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, payload_digest TEXT NOT NULL,
+		request_digest TEXT NOT NULL, expected_authority_digest TEXT NOT NULL,
+		run_id TEXT NOT NULL REFERENCES runs(run_id), repository TEXT NOT NULL, expected_state TEXT NOT NULL,
+		run_idempotency_key TEXT NOT NULL, transition_sequence INTEGER NOT NULL,
+		action_type TEXT NOT NULL CHECK(action_type IN ('decide','retry','abandon','recover_ci_wait','recover_owned_push','accept_external_merge')),
+		requester_login TEXT NOT NULL, requester_database_id INTEGER NOT NULL, requester_node_id TEXT NOT NULL,
+		requester_actor_type TEXT NOT NULL, reason_code TEXT NOT NULL, attention_event_key TEXT NOT NULL,
+		status TEXT NOT NULL CHECK(status IN ('validated','applied','observed')),
+		result_status TEXT NOT NULL CHECK(result_status IN ('pending','applied','succeeded','failed','ambiguous')),
+		resulting_state TEXT NOT NULL DEFAULT '', resulting_transition_sequence INTEGER NOT NULL DEFAULT 0,
+		evidence_digest TEXT NOT NULL DEFAULT '', outcome_digest TEXT NOT NULL DEFAULT '', received_at TEXT NOT NULL,
+		validated_at TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT '', observed_at TEXT NOT NULL DEFAULT '',
+		next_eligible_at TEXT NOT NULL DEFAULT '', UNIQUE(run_id,transition_sequence,attention_event_key))`,
+	`INSERT INTO operator_actions(action_id,idempotency_key,payload_digest,request_digest,expected_authority_digest,run_id,repository,expected_state,run_idempotency_key,transition_sequence,action_type,requester_login,requester_database_id,requester_node_id,requester_actor_type,reason_code,attention_event_key,status,result_status,resulting_state,resulting_transition_sequence,evidence_digest,outcome_digest,received_at,validated_at,applied_at,observed_at,next_eligible_at)
+		SELECT action_id,idempotency_key,payload_digest,request_digest,expected_authority_digest,run_id,repository,expected_state,run_idempotency_key,transition_sequence,action_type,requester_login,requester_database_id,requester_node_id,requester_actor_type,reason_code,attention_event_key,status,result_status,resulting_state,resulting_transition_sequence,evidence_digest,outcome_digest,received_at,validated_at,applied_at,observed_at,next_eligible_at FROM operator_actions_v29`,
+	`DROP TABLE operator_actions_v29`,
+	`CREATE INDEX operator_actions_run ON operator_actions(run_id,transition_sequence,action_id)`,
+	`CREATE TABLE operation_receipts (
+		operation_id TEXT PRIMARY KEY,
+		authority_key TEXT NOT NULL UNIQUE,
+		operation_anchor_digest TEXT NOT NULL,
+		operation_type TEXT NOT NULL CHECK(operation_type IN ('decide','retry','abandon','recover_ci_wait','recover_owned_push','accept_external_merge')),
+		scope_kind TEXT NOT NULL CHECK(scope_kind IN ('controller','repository','run','onboarding')),
+		target_id TEXT NOT NULL,
+		requester_login TEXT NOT NULL,
+		requester_database_id INTEGER NOT NULL,
+		requester_node_id TEXT NOT NULL,
+		requester_actor_type TEXT NOT NULL,
+		request_digest TEXT NOT NULL,
+		expected_authority_digest TEXT NOT NULL,
+		target_binding_digest TEXT NOT NULL,
+		phase TEXT NOT NULL CHECK(phase IN ('accepted','applied','observed')),
+		outcome TEXT NOT NULL CHECK(outcome IN ('pending','succeeded','failed','conflict','ambiguous')),
+		resulting_authority_digest TEXT NOT NULL DEFAULT '',
+		resulting_state TEXT NOT NULL DEFAULT '',
+		resulting_version INTEGER NOT NULL DEFAULT 0 CHECK(resulting_version >= 0),
+		evidence_digest TEXT NOT NULL DEFAULT '',
+		result_digest TEXT NOT NULL DEFAULT '',
+		accepted_at TEXT NOT NULL,
+		applied_at TEXT NOT NULL DEFAULT '',
+		settled_at TEXT NOT NULL DEFAULT '',
+		source_action_id TEXT NOT NULL DEFAULT ''
+	)`,
+	`CREATE INDEX operation_receipts_target ON operation_receipts(scope_kind,target_id,accepted_at,operation_id)`,
+	`CREATE UNIQUE INDEX operation_receipts_source_action ON operation_receipts(source_action_id) WHERE source_action_id<>''`,
+}
+
+func backfillOperationReceiptsV30Tx(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `SELECT action_id,idempotency_key,payload_digest,request_digest,expected_authority_digest,run_id,repository,expected_state,run_idempotency_key,transition_sequence,action_type,requester_login,requester_database_id,requester_node_id,requester_actor_type,reason_code,attention_event_key,status,result_status,resulting_state,resulting_transition_sequence,evidence_digest,outcome_digest,next_eligible_at,received_at,validated_at,applied_at,observed_at FROM operator_actions ORDER BY action_id`)
+	if err != nil {
+		return err
+	}
+	type backfill struct {
+		action  application.OperatorActionRecord
+		binding string
+	}
+	var records []backfill
+	for rows.Next() {
+		var item backfill
+		var expected, actionType, resulting, eligible, received, validated, applied, observed string
+		if err := rows.Scan(&item.action.ActionID, &item.action.IdempotencyKey, &item.action.PayloadDigest, &item.action.RequestDigest, &item.action.ExpectedAuthorityDigest, &item.action.RunID, &item.action.Repository, &expected, &item.action.RunIdempotencyKey, &item.action.TransitionSequence, &actionType, &item.action.Requester.ID, &item.action.Requester.DatabaseID, &item.action.Requester.NodeID, &item.action.Requester.ActorType, &item.action.ReasonCode, &item.action.AttentionEventKey, &item.action.Status, &item.action.ResultStatus, &resulting, &item.action.ResultingTransitionSequence, &item.action.EvidenceDigest, &item.action.OutcomeDigest, &eligible, &received, &validated, &applied, &observed); err != nil {
+			rows.Close()
+			return err
+		}
+		item.action.Requester.Kind = "github_login"
+		item.action.ExpectedState = domain.State(expected)
+		item.action.ActionType = application.OperatorActionType(actionType)
+		item.action.ResultingState = domain.State(resulting)
+		item.action.NextEligibleAt = parseTime(eligible)
+		item.action.ReceivedAt, item.action.ValidatedAt, item.action.AppliedAt, item.action.ObservedAt = parseTime(received), parseTime(validated), parseTime(applied), parseTime(observed)
+		if err := tx.QueryRowContext(ctx, `SELECT repository_binding_digest FROM runs WHERE run_id=?`, item.action.RunID).Scan(&item.binding); err != nil {
+			rows.Close()
+			return err
+		}
+		if !validOperatorActionDigest(item.binding) {
+			item.binding = application.LegacyRunAuthorityDigest(item.action.Repository)
+		}
+		records = append(records, item)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, item := range records {
+		receipt, err := application.OperationReceiptForOperatorAction(item.action, item.binding)
+		if err != nil {
+			return fmt.Errorf("backfill operator action %s: %w", item.action.ActionID, err)
+		}
+		if err := insertOperationReceiptTx(ctx, tx, receipt, item.action.ActionID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 var migrationV3 = []string{

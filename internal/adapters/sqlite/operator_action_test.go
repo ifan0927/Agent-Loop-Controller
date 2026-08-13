@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -41,12 +42,20 @@ func TestOperatorActionJournalBindsAuthorityReplaysAndSurvivesRestart(t *testing
 	if err != nil || created || restarted.ActionID != first.ActionID || restarted.Status != application.OperatorActionStatusValidated {
 		t.Fatalf("restarted=%+v created=%t err=%v", restarted, created, err)
 	}
+	receipt, err := scanOperationReceipt(store.db.QueryRow(operationReceiptSelect+` WHERE source_action_id=?`, first.ActionID))
+	if err != nil || receipt.OperationType != application.OperationAbandon || receipt.Phase != application.OperationPhaseAccepted || receipt.Outcome != application.OperationOutcomePending {
+		t.Fatalf("accepted receipt=%+v err=%v", receipt, err)
+	}
 
 	evidence := strings.Repeat("a", 64)
 	appliedResult := application.OperatorActionMutationResult{ActionID: first.ActionID, ExpectedStatus: application.OperatorActionStatusValidated, ResultStatus: application.OperatorActionResultApplied, ResultingState: run.State, ResultingTransitionSequence: sequence, EvidenceDigest: evidence, At: time.Now().UTC()}
 	applied, changed, err := service.RecordApplied(context.Background(), appliedResult)
 	if err != nil || !changed || applied.Status != application.OperatorActionStatusApplied {
 		t.Fatalf("applied=%+v changed=%t err=%v", applied, changed, err)
+	}
+	receipt, err = scanOperationReceipt(store.db.QueryRow(operationReceiptSelect+` WHERE source_action_id=?`, first.ActionID))
+	if err != nil || receipt.Phase != application.OperationPhaseApplied || receipt.Outcome != application.OperationOutcomePending {
+		t.Fatalf("applied receipt=%+v err=%v", receipt, err)
 	}
 	if replay, changed, err := service.RecordApplied(context.Background(), appliedResult); err != nil || changed || replay.Status != application.OperatorActionStatusApplied {
 		t.Fatalf("applied replay=%+v changed=%t err=%v", replay, changed, err)
@@ -62,6 +71,10 @@ func TestOperatorActionJournalBindsAuthorityReplaysAndSurvivesRestart(t *testing
 	}
 	if replay, changed, err := service.RecordObserved(context.Background(), observedResult); err != nil || changed || replay.Status != application.OperatorActionStatusObserved {
 		t.Fatalf("observed replay=%+v changed=%t err=%v", replay, changed, err)
+	}
+	receipt, err = scanOperationReceipt(store.db.QueryRow(operationReceiptSelect+` WHERE source_action_id=?`, first.ActionID))
+	if err != nil || receipt.Phase != application.OperationPhaseObserved || receipt.Outcome != application.OperationOutcomeSucceeded || receipt.EvidenceDigest != evidence || receipt.ResultDigest != outcome {
+		t.Fatalf("observed receipt=%+v err=%v", receipt, err)
 	}
 	inspection, err := application.NewQueryService(store).Inspect(context.Background(), application.QueryInput{Requester: input.Requester, RunID: run.ID, Repository: run.Repository})
 	if err != nil || len(inspection.OperatorActions) != 1 || inspection.OperatorActions[0].ActionID != first.ActionID {
@@ -189,9 +202,21 @@ func TestOperatorActionConcurrentContradictoryAnswersFailClosed(t *testing.T) {
 	if (one.err == nil) == (two.err == nil) || one.created == two.created {
 		t.Fatalf("one=%+v two=%+v", one, two)
 	}
+	conflict := one.err
+	if conflict == nil {
+		conflict = two.err
+	}
+	var serviceErr *application.ServiceError
+	if !errors.As(conflict, &serviceErr) || serviceErr.Category != application.ErrorConflict {
+		t.Fatalf("conflict=%v", conflict)
+	}
 	inspection, err := firstStore.Inspect(context.Background(), run.ID)
 	if err != nil || len(inspection.OperatorActions) != 1 {
 		t.Fatalf("actions=%+v err=%v", inspection.OperatorActions, err)
+	}
+	var receipts int
+	if err := firstStore.db.QueryRow(`SELECT COUNT(*) FROM operation_receipts WHERE target_id=?`, run.ID).Scan(&receipts); err != nil || receipts != 1 {
+		t.Fatalf("receipts=%d err=%v", receipts, err)
 	}
 }
 
@@ -293,13 +318,16 @@ func TestOperatorActionMigrationFromV23CreatesEmptyJournal(t *testing.T) {
 	if _, err := store.db.Exec(`DROP TABLE operator_actions`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.db.Exec(`DROP TABLE operation_receipts`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := store.db.Exec(`ALTER TABLE automatic_retry_schedules DROP COLUMN failure_evidence_ref`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.Exec(`ALTER TABLE attempts DROP COLUMN process_control_key`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.Exec(`DELETE FROM schema_migrations WHERE version IN (24,25,26,27,28,29)`); err != nil {
+	if _, err := store.db.Exec(`DELETE FROM schema_migrations WHERE version IN (24,25,26,27,28,29,30)`); err != nil {
 		t.Fatal(err)
 	}
 	store.Close()

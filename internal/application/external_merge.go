@@ -91,6 +91,10 @@ func (c *ProductionCoordinator) AcceptExternalMerge(ctx context.Context, command
 	if verified.CandidateSHA != run.CandidateHead || verified.MergeSHA != pr.MergeSHA || !validFullSHA(verified.BaseSHA) || !validFullSHA(verified.TreeSHA) {
 		return ProductionAcceptExternalMergeResult{}, serviceError(ErrorConflict, "external merge verification result is not bound to the run", nil)
 	}
+	action, actions, err := c.prepareLegalRecoveryAction(ctx, command.Requester, run, inspection, OperatorActionAcceptExternalMerge)
+	if err != nil {
+		return ProductionAcceptExternalMergeResult{}, err
+	}
 	merge := MergeRecord{RunID: run.ID, PRNumber: pr.Number, PreMergeSHA: run.CandidateHead, BaseSHA: run.BaseSHA, Method: "external", MergeSHA: pr.MergeSHA, MergedAt: pr.MergedAt.UTC()}
 	delivery, ok := c.store.(DeliveryStore)
 	if !ok {
@@ -109,6 +113,11 @@ func (c *ProductionCoordinator) AcceptExternalMerge(ctx context.Context, command
 	updated, err := c.store.GetRun(ctx, run.ID)
 	if err != nil {
 		return ProductionAcceptExternalMergeResult{}, classifyServiceError(err)
+	}
+	if action != nil {
+		if err := settleLegalRecoveryAction(ctx, actions, *action, updated, latestTransitionSequenceForRun(ctx, c.store, run.ID), "accept-external-merge"); err != nil {
+			return ProductionAcceptExternalMergeResult{}, err
+		}
 	}
 	return ProductionAcceptExternalMergeResult{Action: ProductionReconcileLinear, Run: projectRunResult(updated), PullRequest: pr.Number, MergeSHA: merge.MergeSHA, Verification: verified, Idempotent: idempotent}, nil
 }

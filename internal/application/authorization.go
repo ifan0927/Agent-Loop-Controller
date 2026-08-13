@@ -173,6 +173,18 @@ func (s AuthorizedScopeSet) AllowsRun(runID, repositoryBindingDigest string) boo
 	})
 }
 
+func (s AuthorizedScopeSet) AllowsOperationTarget(target OperationReceiptTarget) bool {
+	if s.Empty() || strings.TrimSpace(target.TargetID) == "" || !validAuthorityDigest(target.TargetBindingDigest) {
+		return false
+	}
+	if target.Scope == ScopeRun {
+		return s.AllowsRun(target.TargetID, target.TargetBindingDigest)
+	}
+	return slices.ContainsFunc(s.scopes, func(scope AuthorityScope) bool {
+		return scope.Kind == target.Scope && scope.ID == target.TargetID && scope.AuthorityDigest == target.TargetBindingDigest
+	})
+}
+
 func scopeValues(scopes []AuthorityScope, kind AuthorityScopeKind, value func(AuthorityScope) string) []string {
 	result := make([]string, 0, len(scopes))
 	for _, scope := range scopes {
@@ -415,6 +427,10 @@ func identityDigest(identity domain.GitHubUserIdentity) string {
 func digestText(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
+}
+
+func LegacyRunAuthorityDigest(repository string) string {
+	return digestText("legacy-run-authority\x00" + strings.ToLower(repository))
 }
 
 func validAuthorityDigest(value string) bool {

@@ -84,6 +84,9 @@ the state machine.
   authorization scopes; scope-aware run and scheduler collections filter before
   counting, ordering, and pagination, and detail reads do not distinguish an
   unknown target from an unauthorized one.
+- Persisted-state legal-action offers for decision, retry, abandon, CI-wait,
+  owned-push, and external-merge recovery, backed by a scope-neutral operation
+  receipt lifecycle that survives reconnects and controller restarts.
 - macOS LaunchAgent and headless system LaunchDaemon tooling for building,
   installing, validating, starting, observing, and stopping exactly one local
   non-root supervisor process.
@@ -161,9 +164,9 @@ isolated live-E2E milestones are complete. The current product focus is the
 remaining Controller operator foundations followed by a local TUI operator
 console in this repository under
 [roadmap #99](https://github.com/ifan0927/Agent-Loop-Controller/issues/99).
-Local operator identity and application authorization are implemented. The next
-dependency-ready foundation is Controller-owned operation receipts and
-legal-action offers.
+Local operator identity, application authorization, operation receipts, and
+legal-action offers are implemented. Worker heartbeat and runtime observation
+are the next dependency-ready foundation.
 The TUI and `agentctl operator` are planned, not current behavior. HTTP, a Web
 UI, outbound notifications, Hermes runtime integration, public API/webhook
 admission, and cross-repository transactions remain deferred or exploratory.
