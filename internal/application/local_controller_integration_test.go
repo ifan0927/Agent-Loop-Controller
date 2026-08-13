@@ -758,6 +758,17 @@ func TestLegalDecisionOfferPersistsReceiptBeforeResumeAndReplaysAfterRestart(t *
 		t.Fatalf("persisted=%+v receipt=%+v err=%v", persisted, receipt, err)
 	}
 	restartedLegal, _ := application.NewLegalActionService(store, authorizer)
+	for _, drift := range []application.LegalDecisionInput{
+		{ChoiceID: "exclusive", Instructions: "Use exclusive bounds."},
+		{ChoiceID: "inclusive", Instructions: "Use different instructions."},
+		{ChoiceID: "not-offered", Instructions: "Use an unavailable choice."},
+	} {
+		_, driftErr := restartedLegal.ExecuteDecision(context.Background(), application.LegalActionExecutionCommand{Requester: requester, OfferID: offers[0].OfferID}, drift, newController(t, store, lab, process, gitadapter.Workspace{}))
+		var serviceErr *application.ServiceError
+		if !errors.As(driftErr, &serviceErr) || serviceErr.Category != application.ErrorConflict || process.resumeCalls != 1 {
+			t.Fatalf("drift=%+v resume_calls=%d err=%v", drift, process.resumeCalls, driftErr)
+		}
+	}
 	replayed, err := restartedLegal.ExecuteDecision(context.Background(), application.LegalActionExecutionCommand{Requester: requester, OfferID: offers[0].OfferID}, application.LegalDecisionInput{ChoiceID: "inclusive", Instructions: "Use inclusive min and max bounds."}, newController(t, store, lab, process, gitadapter.Workspace{}))
 	if err != nil || replayed != receipt || process.resumeCalls != 1 {
 		t.Fatalf("replayed=%+v receipt=%+v resume_calls=%d err=%v", replayed, receipt, process.resumeCalls, err)

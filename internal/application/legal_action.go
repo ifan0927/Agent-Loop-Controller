@@ -204,9 +204,13 @@ func (s *LegalActionService) ExecuteDecision(ctx context.Context, command LegalA
 	if err != nil {
 		return OperationReceipt{}, err
 	}
+	decision := &Decision{ChoiceID: input.ChoiceID, Instructions: input.Instructions}
+	requestDigest := DecisionOperationInputDigest(*decision)
 	ctx = withLegalActionExecutionAuthority(ctx, offer)
 	if receipt, action, found, lookupErr := s.actionReceiptForOffer(ctx, run, offer); lookupErr != nil {
 		return OperationReceipt{}, lookupErr
+	} else if found && action.RequestDigest != requestDigest {
+		return OperationReceipt{}, serviceError(ErrorConflict, "decision operation payload changed", nil)
 	} else if found && action.Status == OperatorActionStatusObserved {
 		return receipt, nil
 	} else if found && run.State != domain.StateAwaitingHumanDecision {
@@ -231,7 +235,6 @@ func (s *LegalActionService) ExecuteDecision(ctx context.Context, command LegalA
 	if !ok {
 		return OperationReceipt{}, serviceError(ErrorInternal, "decision execution store is unavailable", nil)
 	}
-	decision := &Decision{ChoiceID: input.ChoiceID, Instructions: input.Instructions}
 	if _, err := NewCommandService(controller, store).Continue(ctx, ContinueCommand{Requester: command.Requester, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey, Decision: decision}); err != nil {
 		return OperationReceipt{}, err
 	}
