@@ -269,7 +269,7 @@ func controllerRun(args []string) error {
 	}
 	// Keep the terminal JSON result reserved for the driver's durable stop
 	// result, but make the restart-safe run ID available while it waits for
-	// external checks or I-Fan's approval.
+	// external checks or the configured human operator's approval.
 	fmt.Fprintf(os.Stderr, "automatic delivery driver started for run %s\n", started.Run.RunID)
 	driveCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()

@@ -20,7 +20,7 @@ func TestPRBodyContainsLinearMagicWordAndOwnership(t *testing.T) {
 
 func TestEveryCodeChangeInvalidatesApproval(t *testing.T) {
 	pr := PullRequest{Number: 2, HeadSHA: "new"}
-	approval := HumanApproval{PRNumber: 2, Approver: "I-Fan", Source: "github_review", ApprovedSHA: "old", CIStatus: "pass", ReviewSHA: "old"}
+	approval := HumanApproval{PRNumber: 2, Approver: "reviewer", Source: "github_review", ApprovedSHA: "old", CIStatus: "pass", ReviewSHA: "old"}
 	if err := approval.Authorizes(pr, "new"); err == nil {
 		t.Fatal("approval for old head authorized new code")
 	}

@@ -16,8 +16,8 @@ The active tracker is
 - Use one fresh coding-ready IFAN fixture issue.
 - Start with `controller worker`; do not use `controller run IFAN-xxx` or
   low-level recovery commands to advance the normal flow.
-- I-Fan alone creates/moves the issue, submits trusted feedback, resolves the
-  conversation, and gives final exact-head approval.
+- The configured human operator alone creates/moves the issue, submits trusted
+  feedback, resolves the conversation, and gives final exact-head approval.
 - Retain sanitized evidence; never retain credentials, headers, private key
   material, raw token responses, or unnecessary private paths.
 
@@ -53,7 +53,8 @@ The active tracker is
 
 ### Linear fixture issue
 
-I-Fan creates one fresh issue in team IFAN and current cycle with:
+The configured human operator creates one fresh issue in team IFAN and the
+current cycle with:
 
 - state Todo;
 - label `agent:codex` and no `agent:hermes`;
@@ -93,7 +94,8 @@ Do not overwrite an existing plist.
    mutation intent, move only that issue to In Progress, and create one run.
 3. Observe one isolated worktree, Codex implementation, exact-head verification,
    fresh independent review, branch push, one owned PR, and passing required CI.
-4. I-Fan submits one exact-current-head inline root `CHANGES_REQUESTED` review
+4. The configured human reviewer submits one exact-current-head inline root
+   `CHANGES_REQUESTED` review
    with a small verifiable code change.
 5. Observe one trusted feedback record, bounded same-session repair, new
    candidate head, invalidation of old evidence, passing verification/fresh
@@ -101,8 +103,8 @@ Do not overwrite an existing plist.
 6. While the conversation remains unresolved, restart only the worker/supervised
    process. Confirm restart resumes a read-only wait without duplicate repair,
    reply, push, PR, or merge.
-7. I-Fan reviews the repair, resolves the satisfied conversation, and approves
-   the exact repaired head.
+7. The configured human reviewer reviews the repair, resolves the satisfied
+   conversation, and approves the exact repaired head.
 8. Observe protected squash merge, Linear completion observation, source
    checkout fast-forward to the persisted merge SHA, owned worktree/local/remote
    branch cleanup, and terminal `completed`.
@@ -123,8 +125,8 @@ Before the controlled restart, retain sanitized evidence showing:
 - unresolved conversation and absence of merge intent/result.
 
 After restart, prove the same run and identities resume, attempt/reply/side-
-effect counts do not duplicate, and the driver remains read-only until I-Fan's
-external actions change GitHub authority.
+effect counts do not duplicate, and the driver remains read-only until the
+configured human reviewer's external actions change GitHub authority.
 
 ## Evidence Checklist
 

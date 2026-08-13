@@ -8,6 +8,6 @@ go run "$repo_root/cmd/ifan-loop" local start \
   --issue "$lab/simulated-issue.json" \
   --registry "$lab/repository-registry.json" \
   --db "$lab/controller.db" --repository fixture-owner/test-project \
-  --requester ifan0927 --requester-database-id 1 --requester-node-id MDQ6VXNlcjE= --requester-type User
+  --requester fixture-operator --requester-database-id 1 --requester-node-id MDQ6VXNlcjE= --requester-type User
 
 printf 'Local durable lab retained at %s\n' "$lab"

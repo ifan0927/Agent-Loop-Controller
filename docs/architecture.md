@@ -19,7 +19,7 @@ an autonomous policy-improvement loop.
 ## 2. System Context
 
 ```text
-Manual CLI / automatic worker / future Hermes or API adapter
+Current CLI / automatic worker / future local TUI or adapter
                            |
                     admission signal
                            v
@@ -42,9 +42,10 @@ Linear task read -> immutable CodingTask + repository authority snapshot
 
 Linear is the authoritative task source. Git and GitHub are authoritative for
 repository and delivery facts. SQLite is authoritative for controller intent,
-state, ownership, and recorded observations. I-Fan is authoritative for
-structured task decisions, review-thread resolution, and final GitHub approval.
-Codex output is input to validation; it is never authority by itself.
+state, ownership, and recorded observations. The configured human operator is
+authoritative for structured task decisions, review-thread resolution, and
+final GitHub approval. Codex output is input to validation; it is never
+authority by itself.
 
 ## 3. Component Responsibilities
 
@@ -53,7 +54,7 @@ Codex output is input to validation; it is never authority by itself.
 | `internal/domain` | Pure contracts, state topology, evidence semantics, and validation | CLI, SQLite, HTTP, filesystem, or process details |
 | `internal/application` | Use cases, authorization, orchestration, reconciliation, and ports | Flag parsing, concrete API clients, SQL, or shell execution |
 | `internal/adapters` | SQLite, Git, Codex/process, Linear, GitHub App, configuration, verifier, and fixture implementations | Product policy beyond each typed port |
-| `cmd/ifan-loop` | Composition root, CLI routing, flags, signal/time bounds, and JSON rendering | Alternate state transitions or duplicated domain policy |
+| `cmd/ifan-loop` | Current compatibility composition root, CLI routing, flags, signal/time bounds, and JSON rendering; `agentctl` is the canonical migration target | Alternate state transitions or duplicated domain policy |
 | `contracts` | Versioned JSON schemas embedded into the binary for Codex outcomes | Workflow state or external side effects |
 
 ## 4. Trust and Authority Model
@@ -68,7 +69,7 @@ Authority is deliberately split:
 | Test success | Latest complete verifier batch for the exact candidate HEAD |
 | Internal review | Latest successful fresh review for that exact HEAD |
 | CI and PR topology | Direct GitHub App observation for the owned PR and exact HEAD |
-| Human review feedback | Trusted immutable I-Fan actor/review/comment/thread evidence |
+| Human review feedback | Configured trusted reviewer actor/review/comment/thread evidence |
 | Final approval | Trusted GitHub review identity approving the exact current HEAD |
 | Merge | Conditional GitHub result, or explicit evidence-gated external-merge acceptance |
 | Controller progress and ownership | SQLite state, transitions, leases, intents, and evidence rows |
@@ -111,6 +112,14 @@ issue identity, repository/base/working branch, goal, acceptance criteria,
 out-of-scope items, controller-owned verifier IDs, source revision, and policy.
 Validation protects safe Git branch syntax, non-empty criteria, verifier-ID
 syntax, mandatory human approval, squash merge, and no silent scope expansion.
+
+The `IFAN` Linear team key and `IFAN-*` issue identifiers remain exact external
+runtime compatibility contracts, and `github.com/ifan0927` remains the current
+repository/module identity. They do not define generic product or operator
+terminology. The `ifan-loop` executable, launchd label, managed-process marker,
+and review-reply marker are legacy installation or persisted/external
+compatibility identities; their safe neutral migration is isolated in
+[issue #104](https://github.com/ifan0927/Agent-Loop-Controller/issues/104).
 
 ### State machine and legal transitions
 
@@ -160,7 +169,7 @@ fresh review; it does not mutate the original task snapshot.
 ### Trusted review feedback lifecycle
 
 Only an exact-head root inline `CHANGES_REQUESTED` comment by the configured
-trusted I-Fan identity can enter the lifecycle:
+trusted reviewer identity can enter the lifecycle:
 
 ```text
 observed -> selected_for_repair -> repair_verified
@@ -250,8 +259,8 @@ its existing compare-and-swap, fresh-read, lease, and idempotency gates.
 ### Human decision states
 
 - `awaiting_human_decision`: one persisted offered choice must be submitted.
-- `awaiting_human_approval`: no CLI approval action exists; I-Fan acts in
-  GitHub and the controller observes it.
+- `awaiting_human_approval`: no CLI approval action exists; the configured
+  human reviewer acts in GitHub and the controller observes it.
 
 ### Manual intervention
 
@@ -839,10 +848,10 @@ switches enable PR create, review reply, and squash merge writes.
 
 ### Bootstrap and configuration
 
-`internal/adapters/bootstrap` loads strict configuration versions 1-3,
+`internal/adapters/bootstrap` loads strict configuration versions 1-4,
 canonicalizes and cross-checks repositories and GitHub profiles, validates path
 isolation, derives stable digests, and produces a credential-safe readiness
-projection. Version 3 is current; older versions are compatibility inputs, not
+projection. Version 4 is current; older versions are compatibility inputs, not
 recommended templates.
 
 ### Filesystem and artifact handling
@@ -963,7 +972,7 @@ next controller claims the same authenticated inode before signaling.
 After action intent is durable, caller cancellation no longer controls the
 bounded terminalization context. Cleanup has a narrower deadline than the
 terminal transition, so exhausting its budget becomes residue rather than
-stranding the singleton slot. Crash replay repairs an action result from the
+stranding the repository slot. Crash replay repairs an action result from the
 persisted terminal transition before returning idempotent success.
 Cleanup begins only after the authenticated identity
 proves exit; missing, corrupt, or mismatched stop evidence, an orphan launch
@@ -995,36 +1004,57 @@ workflow state.
 
 ### Planned local operator interface boundary
 
-The planned Web UI does not introduce another workflow engine. Controller-owned
-application services must first define repository onboarding, configuration
-transactions, legal operator commands, idempotency, and audit evidence without
-depending on HTTP or browser presentation. A loopback authenticated Operator API
-then adapts those same commands and sanitized queries under a versioned OpenAPI
-contract. HTTP handlers may authenticate, validate, bound, and render requests;
-they may not duplicate state transitions, authorization, or external-write
-policy.
+The planned routine local operator interface is a TUI over Controller-owned
+application contracts:
 
-The frontend is planned as a separate source repository and a local Vite
-process during initial development. That repository boundary is for independent
-UI maintenance, not for a second backend or deployment authority. The browser
-never accesses SQLite, controller configuration, credentials, worktrees, or
-arbitrary local paths directly. It may submit only controller-advertised typed
-commands and must present the observed post-command state.
+```text
+current CLI ----\
+                 +--> Controller application services / projections
+planned TUI ----/                 |
+future HTTP ----------------------/
+                                  v
+                         domain + persistence
+                                  |
+                                  v
+                           external adapters
+```
 
-Repository onboarding is a persisted controller saga rather than one HTTP
-request. A new-project flow begins from an existing empty GitHub repository,
-creates the managed local checkout and initial base revision, creates or adopts
-the exact Linear `repo:<slug>` label, validates the repository profile, applies
-configuration, and observes worker readiness. An existing-project flow validates
-and adopts a matching local checkout and GitHub origin without rewriting
-user-owned Git state. Partial progress is resumed or reconciled; external
-resources are not destructively rolled back by implication.
+Controller application services first define authorization, repository
+onboarding, configuration transactions, legal-action offers, operation receipts,
+idempotency, and audit evidence independently of presentation. CLI, TUI, and any
+future HTTP adapter call those same typed services. A presentation adapter may
+authenticate, validate, bound, and render requests; it may not duplicate state
+transitions, authorization, scheduling, or external-write policy.
 
-GitHub repository creation, project templates, browser secret provisioning,
-GitHub approval or review resolution, general Linear issue editing, privileged
-helper installation, and break-glass recovery remain outside the Web UI. The UI
-has no notification inbox; future outbound channels such as Discord remain
-separate adapters without workflow authority.
+The initial TUI belongs in this repository, Go module, and product binary. Its
+canonical planned entrypoint is `agentctl operator`; the worker's planned
+canonical entrypoint is `agentctl controller worker`. They run as separate
+processes. The TUI does not start, stop, own, or supervise the worker, and its
+exit cannot stop Controller execution. Both processes rely on durable Controller
+state plus Controller-owned authorization, CAS, leases, idempotency, receipts,
+and reconciliation rather than shared in-memory authority.
+
+The TUI never accesses SQLite, Controller configuration, credentials, GitHub,
+Linear, worktrees, artifacts, raw logs, or arbitrary local paths to assemble
+workflow policy. It consumes bounded sanitized projections and only the legal
+actions offered by Controller application services. It is not a database
+administration tool, orchestrator, or second state machine.
+
+Repository onboarding remains a persisted Controller saga. A new-project flow
+begins from an existing empty GitHub repository, creates the managed local
+checkout and initial base revision, creates or adopts the exact Linear
+`repo:<slug>` label, validates the repository profile, applies configuration,
+and observes worker readiness. An existing-project flow validates and adopts a
+matching local checkout and GitHub origin without rewriting user-owned Git
+state. Partial progress is resumed or reconciled; external resources are not
+destructively rolled back by implication.
+
+GitHub repository creation, project templates, UI secret provisioning, GitHub
+approval or review resolution, general Linear issue editing, privileged helper
+installation, and break-glass recovery remain outside the TUI. It has no
+notification inbox. HTTP, a Web UI, Hermes, and future outbound channels remain
+optional adapters introduced only by demonstrated consumers; they are not TUI
+prerequisites and never gain workflow authority.
 
 ## 10. Persistence Model
 
@@ -1118,7 +1148,8 @@ There are three distinct human acts:
 1. A structured implementation decision chooses an option the current Codex
    outcome explicitly offered.
 2. GitHub review feedback may request a bounded code repair. The controller
-   authenticates and replies, but I-Fan decides whether to resolve the thread.
+   authenticates and replies, but the human reviewer decides whether to resolve
+   the thread.
 3. GitHub approval authorizes only the exact current head after CI and internal
    review pass.
 
@@ -1136,8 +1167,8 @@ resolution is not approval, and an approval for an old head is stale.
 - Never discover or use personal `gh` credentials for production delivery.
 - Never adopt a path, branch, PR, comment, approval, or merge by similarity;
   require durable identity and exact evidence.
-- Never allow Codex, Hermes, the controller, or a GitHub App to impersonate
-  I-Fan's decision, review resolution, or approval.
+- Never allow Codex, Hermes, the controller, or a GitHub App to impersonate the
+  configured human operator's decision, review resolution, or approval.
 - Never make a later SHA inherit evidence from an earlier SHA.
 - Never clean or synchronize a resource whose ownership and expected state are
   not proven.
@@ -1154,11 +1185,11 @@ resolution is not approval, and an approval for an old head is stale.
 - Linear admission and completion observation are implemented, but completion
   remains external automation/human authority.
 - GitHub writes require a narrowly permissioned selected-repository App.
-- Transactional repository onboarding and WebUI-oriented configuration mutation
-  services, the local Operator API, Web UI, notification transport, Hermes
+- Transactional repository onboarding, typed configuration mutation services,
+  the local TUI, optional HTTP/Web adapters, notification transport, Hermes
   runtime integration, public API, webhooks, and multi-tenant authorization are
   not implemented.
 - External live E2E acceptance remains restricted to isolated fixture
   repositories. The automatic-delivery acceptance and repair-aware independent
-  review are complete; future live gates must follow the staged controller,
-  Operator API, and frontend contracts without broadening production authority.
+  review are complete; future live gates must follow the staged Controller and
+  operator-interface contracts without broadening production authority.

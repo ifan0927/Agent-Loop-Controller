@@ -2,7 +2,7 @@
 
 All user-facing discussion is in Traditional Chinese. All code comments and
 committed technical documentation are in English unless a document explicitly
-targets I-Fan or Hermes in Traditional Chinese.
+requires Traditional Chinese.
 
 ## Repository task workflow
 
@@ -21,26 +21,35 @@ targets I-Fan or Hermes in Traditional Chinese.
 
 Build a deterministic, human-gated controller that translates a coding-ready
 Linear issue into an isolated Codex Exec delivery loop. The controller owns
-workflow state and evidence. Codex owns code reasoning and implementation.
+workflow state and evidence. Codex owns code reasoning and implementation. The
+preferred routine local operator experience is a TUI over Controller-owned
+application contracts; it is not another workflow authority.
 
-## MVP boundaries
+## Product and authority boundaries
 
 - Linear is the task source of truth.
 - The controller is a deterministic state machine, not an LLM agent.
 - Every run uses a dedicated worktree and the Linear-provided branch name.
 - Implementation uses a resumable `codex exec` session.
 - A fresh, independent Codex Exec review run must pass before a PR is opened.
-- I-Fan is the final approval gate. Agents never approve their own work.
+- The configured human operator is the final approval authority. Agents never
+  approve their own work or resolve a human review conversation.
 - Any code change after a review invalidates that review and requires a new one.
+- The worker may manage bounded concurrent work across repositories, but each
+  repository has at most one nonterminal run and every heavy step requires
+  Controller-owned scheduling authority.
 - Controller policy, Git state, tests, CI, and GitHub state are authoritative;
   an agent's natural-language claim is not evidence by itself.
 
-## Out of scope for the MVP
+## Current product non-goals
 
-- Cron admission, Linear webhooks, and Hermes-triggered execution.
+- Linear webhooks, Hermes-triggered execution, and notification-driven workflow
+  authority.
 - Deployment, production operations, and destructive data changes.
 - Automatic workflow or prompt evolution (Loop 4).
 - Multi-repository transactions, multi-PR issues, and multi-tenant operation.
+- HTTP, browser, hosted, remote, or multi-user infrastructure solely to separate
+  the local TUI from the Controller.
 - Reimplementing Codex reasoning, context management, or memory.
 
 ## Engineering rules
@@ -66,7 +75,52 @@ workflow state and evidence. Codex owns code reasoning and implementation.
   `--strict-config` to couple a run to unrelated global configuration fields.
 - Make state transitions explicit, idempotent, persisted, and auditable.
 - Do not add speculative abstractions. Every changed line must support a current
-  contract, test, or documented MVP boundary.
+  contract, test, or documented product boundary.
+
+## Operator interface rules
+
+- `agentctl` is the canonical target CLI and executable name for all new
+  product-facing contracts. The implemented compatibility executable remains
+  `ifan-loop` until the installation-safe migration in issue #104 is complete;
+  do not perform a partial rename.
+- The intended routine entrypoint is `agentctl operator`. The intended worker
+  entrypoint is `agentctl controller worker`.
+- The initial TUI belongs in this repository, Go module, and product binary. Do
+  not create a separate TUI repository, service, or backend.
+- The worker and TUI are separate processes. The TUI must not start, stop, own,
+  or supervise the worker; exiting the TUI must not stop Controller execution.
+- CLI, TUI, and any future HTTP adapter call the same typed Controller-owned
+  application services and projections. Presentation adapters must not derive
+  workflow policy from SQLite, GitHub, Linear, worktrees, artifacts, logs, or
+  arbitrary filesystem reads.
+- The TUI consumes Controller-owned authorization decisions, legal-action
+  offers, operation receipts, idempotency, and reconciliation. It does not add
+  a second state machine or hidden transitions.
+- The CLI remains supported for scripting, diagnostics, tests, explicit manual
+  admission where retained, privileged lifecycle operations, break-glass work,
+  and bounded low-level recovery.
+- HTTP, OpenAPI, browser sessions, and a Web UI are deferred adapters. Add them
+  only when a demonstrated consumer requires a transport boundary.
+
+## TUI dependency and verification authority
+
+- Do not add TUI dependencies before an implementation issue requires them.
+- When implementation begins, use the pinned v2 module families
+  `charm.land/bubbletea/v2`, `charm.land/bubbles/v2`, and
+  `charm.land/lipgloss/v2`; do not use v1 examples without adapting them.
+- Resolve dependency behavior in this order: existing project code and tests;
+  exact versions in `go.mod`; source for those versions in the local Go module
+  cache; official documentation, migration guides, and examples for the same
+  versions. Never rely on remembered framework APIs when exact source resolves
+  the question.
+- `go.mod` is authoritative. Do not treat upstream `main` as the pinned API,
+  clone framework source into this repository, or add a local `replace` merely
+  to expose upstream source. If deeper investigation is necessary, inspect the
+  matching released tag outside this repository.
+- Future TUI verification uses three layers: Go model/update/application tests,
+  deterministic View or golden tests, and a bounded set of VHS critical-flow
+  terminal acceptance tests. VHS is development tooling, not a runtime
+  dependency, and is not required for every small change.
 
 ## Documentation Governance
 

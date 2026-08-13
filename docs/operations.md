@@ -1,5 +1,14 @@
 # Operations
 
+The implemented executable and launchd installation identity are currently
+`ifan-loop`. `agentctl` is the approved canonical destination, but replacing the
+binary path and legacy service label requires the explicit compatibility
+migration tracked in
+[issue #104](https://github.com/ifan0927/Agent-Loop-Controller/issues/104).
+Until that migration is implemented, every command below intentionally uses the
+current executable name. Do not install a second `agentctl` worker beside an
+existing `ifan-loop` LaunchAgent or LaunchDaemon.
+
 ## 1. Prerequisites
 
 Production operation currently targets one local macOS user. Prepare:
@@ -1379,7 +1388,7 @@ operator-owned checkout deliberately, then re-inspect.
 **Purpose**
 
 Gracefully terminalize one eligible parked run while preserving evidence and
-releasing the singleton worker slot even when cleanup leaves residue.
+releasing the repository slot even when cleanup leaves residue.
 
 **When to use**
 
@@ -2121,12 +2130,13 @@ material task change as free-form decision instructions.
 
 1. The controller opens one PR only after verification and fresh review pass.
 2. Required CI and review topology are polled by the driver.
-3. I-Fan may submit an exact-head inline root `CHANGES_REQUESTED` review. The
-   controller authenticates it, repairs, re-verifies/re-reviews, pushes a new
-   head, and posts one fixed reply.
-4. I-Fan reviews the repair and resolves the conversation when satisfied. The
-   controller never resolves it.
-5. I-Fan approves the exact current head. Old-head approvals are stale.
+3. The configured human reviewer may submit an exact-head inline root
+   `CHANGES_REQUESTED` review. The controller authenticates it, repairs,
+   re-verifies/re-reviews, pushes a new head, and posts one fixed reply.
+4. The configured human reviewer reviews the repair and resolves the
+   conversation when satisfied. The controller never resolves it.
+5. The configured human reviewer approves the exact current head. Old-head
+   approvals are stale.
 6. GitHub branch protection remains the final mergeability authority; the
    controller conditionally squash-merges only when all current gates pass.
 
@@ -2262,7 +2272,7 @@ There is no automatic backup command or migration rollback command.
 | Review findings loop | Inspect normalized finding source and persisted decisions. Every accepted clarification must be bound into fresh review; do not mark findings resolved in SQLite. |
 | CI pending | Wait. The driver polls at the configured bound. |
 | CI failed | A supported actionable failure becomes repair input; infrastructure/ambiguous failure may require attention. Inspect exact-head check evidence. |
-| Stale approval | Ask I-Fan to review and approve the current head after all code changes; old approval cannot be reused. |
+| Stale approval | Ask the configured human reviewer to review and approve the current head after all code changes; old approval cannot be reused. |
 | Remote branch divergence | Stop and inspect ownership/PR/head. Use `recover-owned-push` only for its proven owned-PR repair case; never force an unrelated ref. |
 | PR ownership conflict | Do not adopt by branch/title. Verify marker, body digest, IDs, head/base, and persisted intent; otherwise remain fail-closed. |
 | Merge conflict or rejection | Read `awaiting_github_mergeability`/manual evidence and GitHub protection. Resolve repository/human conditions; do not bypass protection. |

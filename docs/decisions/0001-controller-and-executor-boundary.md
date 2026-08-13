@@ -6,10 +6,10 @@ Accepted for the MVP.
 
 ## Context
 
-I-Fan needs a reusable coding delivery loop spanning Linear, Hermes, Mac Codex,
-GitHub, and a final human approval. Official Codex integrations can
-run coding tasks, but do not define all I-Fan-specific admission, review,
-decision, merge, and cleanup policies.
+The project needs a reusable coding delivery loop spanning Linear, Hermes, Mac
+Codex, GitHub, and a final human approval. Official Codex integrations can run
+coding tasks, but do not define the project's admission, review, decision,
+merge, and cleanup policies.
 
 ## Decision
 
@@ -22,9 +22,9 @@ uses a structured general `codex exec` review run rather than the CLI 0.144.1
 built-in review subcommand. Controller-owned evidence and exact Git head SHAs
 govern progression.
 
-Linear remains task source of truth, GitHub remains code/CI/merge source of truth,
-Hermes remains planning and notification interface, and I-Fan remains the final
-approval gate.
+Linear remains task source of truth, GitHub remains code/CI/merge source of
+truth, Hermes remains a planned conversation and notification interface, and
+the configured human operator remains the final approval authority.
 
 ## Consequences
 

@@ -212,12 +212,12 @@ func authorizeMergeEvidence(run Run, pr domain.PullRequest, snapshot domain.Revi
 		return errors.New("merge requires passing required checks")
 	}
 	if fixture {
-		if approval.Approver != "ifan0927" || approval.Source != "fixture_explicit_approval" {
+		if approval.Approver != "fixture-operator" || approval.Source != "fixture_explicit_approval" {
 			return errors.New("fixture approval source is invalid")
 		}
 		copy := approval
 		copy.Source = "github_pull_request_review"
-		copy.Actor = domain.ActorIdentity{DatabaseID: 1, NodeID: "fixture-ifan", Login: "ifan0927", Type: "User"}
+		copy.Actor = domain.ActorIdentity{DatabaseID: 1, NodeID: "fixture-operator", Login: "fixture-operator", Type: "User"}
 		copy.ReviewDatabaseID, copy.ReviewNodeID = 1, "fixture-review"
 		if copy.ApprovedAt.IsZero() {
 			copy.ApprovedAt = time.Unix(1, 0).UTC()

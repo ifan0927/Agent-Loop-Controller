@@ -1,5 +1,10 @@
 # Development
 
+The current composition package and test commands use the implemented
+compatibility name `ifan-loop`. `agentctl` is the canonical target name, and
+[issue #104](https://github.com/ifan0927/Agent-Loop-Controller/issues/104) owns
+the installation-safe package, executable, script, test, and launchd migration.
+
 ## Repository Layout
 
 ```text
@@ -309,7 +314,7 @@ The acceptance matrix requires:
 | Delivery | One owned branch/PR, required CI at exact head |
 | Human feedback | Trusted root `CHANGES_REQUESTED`, one repair, new evidence, one fixed reply |
 | Restart | Read-only unresolved-thread wait resumes without duplicate repair/reply/merge |
-| Human authority | I-Fan resolves and approves exact repaired head in GitHub |
+| Human authority | The configured human reviewer resolves and approves the exact repaired head in GitHub |
 | Completion | Guarded merge, Linear completion observation, exact source sync, owned cleanup |
 | Confidentiality | Sanitized retained evidence and clean credential scan |
 
