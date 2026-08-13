@@ -37,7 +37,7 @@ func localFixtureDeliver(args []string) error {
 		return err
 	}
 	if runID == "" || *dbPath == "" || *registryPath == "" {
-		return errors.New("usage: ifan-loop local fixture-deliver <run-id> --db <controller.db> --registry <repository-registry.json> --approval <approval.json>")
+		return errors.New("usage: agentctl local fixture-deliver <run-id> --db <controller.db> --registry <repository-registry.json> --approval <approval.json>")
 	}
 	store, err := sqlitestore.Open(*dbPath)
 	if err != nil {

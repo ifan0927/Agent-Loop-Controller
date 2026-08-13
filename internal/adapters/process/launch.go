@@ -13,11 +13,13 @@ import (
 )
 
 const (
-	managedLaunchArgument    = "--ifan-loop-managed-launch"
-	managedLaunchEnvironment = "IFAN_LOOP_INTERNAL_MANAGED_LAUNCH"
-	managedLaunchGateFD      = 3
+	managedLaunchArgument          = "--agentctl-managed-launch"
+	managedLaunchEnvironment       = "AGENTCTL_INTERNAL_MANAGED_LAUNCH"
+	legacyManagedLaunchArgument    = "--ifan-loop-managed-launch"
+	legacyManagedLaunchEnvironment = "IFAN_LOOP_INTERNAL_MANAGED_LAUNCH"
+	managedLaunchGateFD            = 3
 
-	managedTestParentLifetimeEnvironment = "IFAN_LOOP_INTERNAL_TEST_PARENT_LIFETIME"
+	managedTestParentLifetimeEnvironment = "AGENTCTL_INTERNAL_TEST_PARENT_LIFETIME"
 	managedTestParentLifetimeFD          = 4
 )
 
@@ -26,7 +28,7 @@ const (
 // requested program until its parent persists lifecycle identity and releases
 // the gate. Parent death closes the pipe and makes the helper exit instead.
 func init() {
-	if os.Getenv(managedLaunchEnvironment) != "1" || len(os.Args) < 3 || os.Args[1] != managedLaunchArgument {
+	if !managedLaunchRequested(os.Args, os.Getenv) {
 		return
 	}
 	if !awaitManagedLaunchGate() {
@@ -36,7 +38,7 @@ func init() {
 	if testParentLifetime != nil {
 		defer testParentLifetime.Close()
 	}
-	environment := withoutEnvironment(os.Environ(), []string{managedLaunchEnvironment, managedTestParentLifetimeEnvironment})
+	environment := withoutEnvironment(os.Environ(), []string{managedLaunchEnvironment, legacyManagedLaunchEnvironment, managedTestParentLifetimeEnvironment})
 	program := os.Args[2]
 	supervisorSignals := make(chan os.Signal, 2)
 	signal.Notify(supervisorSignals, os.Interrupt, syscall.SIGTERM)
@@ -79,6 +81,14 @@ func init() {
 		os.Exit(exitErr.ExitCode())
 	}
 	os.Exit(125)
+}
+
+func managedLaunchRequested(args []string, getenv func(string) string) bool {
+	if len(args) < 3 || getenv == nil {
+		return false
+	}
+	return args[1] == managedLaunchArgument && getenv(managedLaunchEnvironment) == "1" ||
+		args[1] == legacyManagedLaunchArgument && getenv(legacyManagedLaunchEnvironment) == "1"
 }
 
 func openTestParentLifetime() *os.File {

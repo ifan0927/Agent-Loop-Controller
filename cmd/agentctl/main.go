@@ -69,7 +69,7 @@ func main() {
 
 func controller(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: ifan-loop controller <start|run|drive|worker|launchagent|launchdaemon|status|inspect|continue|retry|recover-ci-wait|recover-owned-push|accept-external-merge|abandon|push|open-pr|reconcile|merge|reconcile-linear|cleanup> ...")
+		return errors.New("usage: agentctl controller <start|run|drive|worker|launchagent|launchdaemon|status|inspect|continue|retry|recover-ci-wait|recover-owned-push|accept-external-merge|abandon|push|open-pr|reconcile|merge|reconcile-linear|cleanup> ...")
 	}
 	switch args[0] {
 	case "start":
@@ -117,7 +117,7 @@ func controller(args []string) error {
 
 func linear(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: ifan-loop linear start <IFAN-issue> [--config <controller.json>] --requester <login>")
+		return fmt.Errorf("usage: agentctl linear start <IFAN-issue> [--config <controller.json>] --requester <login>")
 	}
 	switch args[0] {
 	case "start":
@@ -455,7 +455,7 @@ func controllerInspect(command string, args []string) error {
 		runID = flags.Arg(0)
 	}
 	if runID == "" || flags.NArg() != 0 || !requester.complete() {
-		return fmt.Errorf("usage: ifan-loop controller %s <run-id> [--config <controller.json>] --requester <login> --requester-database-id <id> --requester-node-id <node-id> --requester-type User", command)
+		return fmt.Errorf("usage: agentctl controller %s <run-id> [--config <controller.json>] --requester <login> --requester-database-id <id> --requester-node-id <node-id> --requester-type User", command)
 	}
 	path, err := resolveConfigPath(*configPath)
 	if err != nil {
@@ -1129,7 +1129,7 @@ func (a githubReadAdapter) SquashMerge(ctx context.Context, request application.
 
 func local(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: ifan-loop local <start|continue|status|inspect|fixture-deliver>")
+		return fmt.Errorf("usage: agentctl local <start|continue|status|inspect|fixture-deliver>")
 	}
 	switch args[0] {
 	case "start":
@@ -1241,7 +1241,7 @@ func localContinue(args []string) error {
 		runID = flags.Arg(0)
 	}
 	if runID == "" || *dbPath == "" || *registryPath == "" || !requesterIdentity.complete() || *repository == "" || *expectedState == "" || *idempotencyKey == "" {
-		return fmt.Errorf("usage: ifan-loop local continue <run-id> --db <controller.db> --registry <repository-registry.json> --requester <login> --repository <owner/repo> --expected-state <state> --idempotency-key <key> [--decision <decision.json>]")
+		return fmt.Errorf("usage: agentctl local continue <run-id> --db <controller.db> --registry <repository-registry.json> --requester <login> --repository <owner/repo> --expected-state <state> --idempotency-key <key> [--decision <decision.json>]")
 	}
 	normalizedDBPath, err := normalizeControllerDatabasePath(*dbPath)
 	if err != nil {
@@ -1460,7 +1460,7 @@ func localInspect(command string, args []string) error {
 		runID = flags.Arg(0)
 	}
 	if runID == "" || *dbPath == "" || !requesterIdentity.complete() {
-		return fmt.Errorf("usage: ifan-loop local %s <run-id> --db <controller.db>", command)
+		return fmt.Errorf("usage: agentctl local %s <run-id> --db <controller.db>", command)
 	}
 	store, err := sqlitestore.Open(*dbPath)
 	if err != nil {
@@ -1644,5 +1644,5 @@ func decodeTask(reader io.Reader) (domain.CodingTask, error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: ifan-loop <version|plan|spike|local|linear|controller|config|github-read> [options]")
+	fmt.Fprintln(os.Stderr, "usage: agentctl <version|plan|spike|local|linear|controller|config|github-read> [options]")
 }

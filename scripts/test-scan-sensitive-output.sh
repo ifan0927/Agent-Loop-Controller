@@ -3,7 +3,7 @@ set -eu
 
 repo_root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)"
 scanner="$repo_root/scripts/scan-sensitive-output.sh"
-test_root="$(mktemp -d "${TMPDIR:-/tmp}/ifan-loop-sensitive-scan.XXXXXX")"
+test_root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-sensitive-scan.XXXXXX")"
 trap 'rm -rf "$test_root"' EXIT HUP INT TERM
 
 failure_code='sensitive_output_scan:prohibited_material_detected'

@@ -1,13 +1,10 @@
 # Operations
 
-The implemented executable and launchd installation identity are currently
-`ifan-loop`. `agentctl` is the approved canonical destination, but replacing the
-binary path and legacy service label requires the explicit compatibility
-migration tracked in
-[issue #104](https://github.com/ifan0927/Agent-Loop-Controller/issues/104).
-Until that migration is implemented, every command below intentionally uses the
-current executable name. Do not install a second `agentctl` worker beside an
-existing `ifan-loop` LaunchAgent or LaunchDaemon.
+The canonical executable is `agentctl`; new launchd installations use
+`io.agent-loop-controller.worker`. A host that still has `ifan-loop` or
+`com.ifan.agent-loop-controller.worker` must use the explicit migration in
+section 8. Do not manually install or bootstrap the neutral identity beside a
+legacy LaunchAgent or LaunchDaemon.
 
 ## 1. Prerequisites
 
@@ -32,8 +29,8 @@ For development:
 
 ```sh
 mkdir -p ./bin
-go build -o ./bin/ifan-loop ./cmd/ifan-loop
-./bin/ifan-loop version
+go build -o ./bin/agentctl ./cmd/agentctl
+./bin/agentctl version
 ```
 
 For LaunchAgent supervision, install a worker-owned non-symlink executable
@@ -43,8 +40,8 @@ group/world write bit. Example:
 
 ```sh
 mkdir -p "$HOME/.local/bin"
-go build -o "$HOME/.local/bin/ifan-loop" ./cmd/ifan-loop
-chmod 755 "$HOME/.local/bin/ifan-loop"
+go build -o "$HOME/.local/bin/agentctl" ./cmd/agentctl
+chmod 755 "$HOME/.local/bin/agentctl"
 ```
 
 Stop the worker before replacing the installed binary. Re-run configuration and
@@ -192,11 +189,11 @@ result.
 ### Configure and validate
 
 ```sh
-ifan-loop config init
+agentctl config init
 # Complete controller.json and provision external credentials.
-ifan-loop config validate
-ifan-loop config inspect
-ifan-loop config doctor
+agentctl config validate
+agentctl config inspect
+agentctl config doctor
 ```
 
 Before enabling a live target, verify the selected repository identity, clean
@@ -209,7 +206,7 @@ Enable `automation.linear_todo_admission` only after validation. Then either run
 the worker in the foreground:
 
 ```sh
-ifan-loop controller worker
+agentctl controller worker
 ```
 
 or install and supervise it with the launchd commands in section 8. The
@@ -226,8 +223,8 @@ automatic Todo E2E trigger.
 The start/worker output exposes a run ID. Use requester-authorized queries:
 
 ```sh
-ifan-loop controller status '<run-id>' <requester flags>
-ifan-loop controller inspect '<run-id>' <requester flags>
+agentctl controller status '<run-id>' <requester flags>
+agentctl controller inspect '<run-id>' <requester flags>
 ```
 
 The current implementation returns the same detailed safe projection for both
@@ -252,7 +249,7 @@ The database, not the process, owns progress. Start the worker again to resume
 the one automatic run, or explicitly run:
 
 ```sh
-ifan-loop controller drive '<run-id>' <requester flags>
+agentctl controller drive '<run-id>' <requester flags>
 ```
 
 Use `drive` when the prior foreground process ended because of a host restart,
@@ -280,7 +277,7 @@ Before an upgrade, compatibility check, or incident record.
 **Syntax**
 
 ```sh
-ifan-loop version
+agentctl version
 ```
 
 **Required arguments and flags**
@@ -290,7 +287,7 @@ None.
 **Example**
 
 ```sh
-ifan-loop version
+agentctl version
 ```
 
 **What it does**
@@ -323,7 +320,7 @@ Once for a new operator installation.
 **Syntax**
 
 ```sh
-ifan-loop config init [--config <controller.json>]
+agentctl config init [--config <controller.json>]
 ```
 
 **Required arguments and flags**
@@ -333,7 +330,7 @@ None; `--config` overrides the default path.
 **Example**
 
 ```sh
-ifan-loop config init
+agentctl config init
 ```
 
 **What it does**
@@ -368,7 +365,7 @@ Before editing or scripting around the default location.
 **Syntax**
 
 ```sh
-ifan-loop config path [--config <controller.json>]
+agentctl config path [--config <controller.json>]
 ```
 
 **Required arguments and flags**
@@ -378,7 +375,7 @@ None.
 **Example**
 
 ```sh
-ifan-loop config path
+agentctl config path
 ```
 
 **What it does**
@@ -410,7 +407,7 @@ After every configuration change and before starting a worker.
 **Syntax**
 
 ```sh
-ifan-loop config validate [--config <controller.json>]
+agentctl config validate [--config <controller.json>]
 ```
 
 **Required arguments and flags**
@@ -420,7 +417,7 @@ None.
 **Example**
 
 ```sh
-ifan-loop config validate --config /absolute/private/controller.json
+agentctl config validate --config /absolute/private/controller.json
 ```
 
 **What it does**
@@ -454,7 +451,7 @@ To confirm configuration/profile digests and enabled automation bounds.
 **Syntax**
 
 ```sh
-ifan-loop config inspect [--config <controller.json>]
+agentctl config inspect [--config <controller.json>]
 ```
 
 **Required arguments and flags**
@@ -464,7 +461,7 @@ None.
 **Example**
 
 ```sh
-ifan-loop config inspect
+agentctl config inspect
 ```
 
 **What it does**
@@ -498,7 +495,7 @@ After provisioning or rotating the Linear credential and before worker start.
 **Syntax**
 
 ```sh
-ifan-loop config doctor [--config <controller.json>]
+agentctl config doctor [--config <controller.json>]
 ```
 
 **Required arguments and flags**
@@ -508,7 +505,7 @@ None.
 **Example**
 
 ```sh
-ifan-loop config doctor
+agentctl config doctor
 ```
 
 **What it does**
@@ -543,7 +540,7 @@ supervisor.
 **Syntax**
 
 ```sh
-ifan-loop controller worker [--config <controller.json>] [--once]
+agentctl controller worker [--config <controller.json>] [--once]
 ```
 
 **Required arguments and flags**
@@ -555,7 +552,7 @@ network, process, verification, and control timeouts remain bounded.
 **Example**
 
 ```sh
-ifan-loop controller worker --once
+agentctl controller worker --once
 ```
 
 **What it does**
@@ -624,7 +621,7 @@ acceptance tests.
 **Syntax**
 
 ```sh
-ifan-loop controller run <IFAN-issue> [--config <file>] <requester flags> \
+agentctl controller run <IFAN-issue> [--config <file>] <requester flags> \
   [--poll-interval <duration>] [--max-immediate-actions <n>] \
   [--max-runtime <duration>]
 ```
@@ -637,7 +634,7 @@ immediate actions to `32`, and runtime to `24h` (maximum `168h`).
 **Example**
 
 ```sh
-ifan-loop controller run IFAN-123 \
+agentctl controller run IFAN-123 \
   --requester operator --requester-database-id 123 \
   --requester-node-id '<node-id>' --requester-type User
 ```
@@ -674,7 +671,7 @@ After a foreground process or host restart, or after a valid human decision.
 **Syntax**
 
 ```sh
-ifan-loop controller drive <run-id> [--config <file>] <requester flags> \
+agentctl controller drive <run-id> [--config <file>] <requester flags> \
   [--poll-interval <duration>] [--max-immediate-actions <n>] \
   [--max-runtime <duration>]
 ```
@@ -686,7 +683,7 @@ Run ID and complete requester identity; policy bounds match `controller run`.
 **Example**
 
 ```sh
-ifan-loop controller drive '<run-id>' <requester flags>
+agentctl controller drive '<run-id>' <requester flags>
 ```
 
 **What it does**
@@ -720,7 +717,7 @@ Routine observation and before any recovery action.
 **Syntax**
 
 ```sh
-ifan-loop controller status <run-id> [--config <file>] <requester flags>
+agentctl controller status <run-id> [--config <file>] <requester flags>
 ```
 
 **Required arguments and flags**
@@ -730,7 +727,7 @@ Run ID and complete requester identity.
 **Example**
 
 ```sh
-ifan-loop controller status '<run-id>' <requester flags>
+agentctl controller status '<run-id>' <requester flags>
 ```
 
 **What it does**
@@ -789,7 +786,7 @@ Before every low-level or typed recovery command.
 **Syntax**
 
 ```sh
-ifan-loop controller inspect <run-id> [--config <file>] <requester flags>
+agentctl controller inspect <run-id> [--config <file>] <requester flags>
 ```
 
 **Required arguments and flags**
@@ -799,7 +796,7 @@ Run ID and complete requester identity.
 **Example**
 
 ```sh
-ifan-loop controller inspect '<run-id>' <requester flags>
+agentctl controller inspect '<run-id>' <requester flags>
 ```
 
 **What it does**
@@ -837,7 +834,7 @@ inspection.
 **Syntax**
 
 ```sh
-ifan-loop controller continue <run-id> [--config <file>] <requester flags> \
+agentctl controller continue <run-id> [--config <file>] <requester flags> \
   --repository <owner/name> --expected-state awaiting_human_decision \
   --idempotency-key <persisted-key> --decision <decision.json>
 ```
@@ -857,7 +854,7 @@ decision file when answering a human gate. The JSON shape is:
 **Example**
 
 ```sh
-ifan-loop controller continue '<run-id>' <requester flags> \
+agentctl controller continue '<run-id>' <requester flags> \
   --repository owner/repository \
   --expected-state awaiting_human_decision \
   --idempotency-key '<persisted-key>' --decision /private/decision.json
@@ -903,7 +900,7 @@ resume it with `controller drive`.
 The shared syntax for most commands is:
 
 ```sh
-ifan-loop controller <command> <run-id> [--config <file>] <requester flags> \
+agentctl controller <command> <run-id> [--config <file>] <requester flags> \
   --repository <owner/name> --expected-state <persisted-state> \
   --idempotency-key <persisted-key>
 ```
@@ -931,7 +928,7 @@ inspection and recovery path instead of this command.
 **Syntax**
 
 ```sh
-ifan-loop controller retry '<run-id>' [--config <file>] <requester flags>
+agentctl controller retry '<run-id>' [--config <file>] <requester flags>
 ```
 
 **Required arguments and flags**
@@ -944,7 +941,7 @@ caller-supplied replacements.
 **Example**
 
 ```sh
-ifan-loop controller retry '<run-id>' \
+agentctl controller retry '<run-id>' \
   --requester ifan0927 --requester-database-id 123 \
   --requester-node-id '<github-node-id>' --requester-type User
 ```
@@ -981,7 +978,7 @@ This one-purpose compatibility recovery applies only to a pre-fix run parked at
 `pr_open` or `reconciling_reviews` by the historical check-topology-drift read.
 
 ```sh
-ifan-loop controller recover-ci-wait '<run-id>' [--config <file>] \
+agentctl controller recover-ci-wait '<run-id>' [--config <file>] \
   --requester '<login>' --requester-database-id '<id>' \
   --requester-node-id '<node-id>' --requester-type User
 ```
@@ -1018,7 +1015,7 @@ All shared authority flags.
 **Example**
 
 ```sh
-ifan-loop controller continue '<run-id>' <requester flags> \
+agentctl controller continue '<run-id>' <requester flags> \
   --repository owner/repo --expected-state executing \
   --idempotency-key '<persisted-key>'
 ```
@@ -1061,7 +1058,7 @@ All shared authority flags.
 **Example**
 
 ```sh
-ifan-loop controller push '<run-id>' <requester flags> \
+agentctl controller push '<run-id>' <requester flags> \
   --repository owner/repo --expected-state pushing_branch \
   --idempotency-key '<persisted-key>'
 ```
@@ -1106,7 +1103,7 @@ All shared authority flags.
 **Example**
 
 ```sh
-ifan-loop controller recover-owned-push '<run-id>' <requester flags> \
+agentctl controller recover-owned-push '<run-id>' <requester flags> \
   --repository owner/repo --expected-state manual_intervention \
   --idempotency-key '<persisted-key>'
 ```
@@ -1151,7 +1148,7 @@ All shared authority flags; GitHub App `pull_requests_write=true`.
 **Example**
 
 ```sh
-ifan-loop controller open-pr '<run-id>' <requester flags> \
+agentctl controller open-pr '<run-id>' <requester flags> \
   --repository owner/repo --expected-state opening_pr \
   --idempotency-key '<persisted-key>'
 ```
@@ -1194,7 +1191,7 @@ All shared authority flags and readable GitHub App configuration.
 **Example**
 
 ```sh
-ifan-loop controller reconcile '<run-id>' <requester flags> \
+agentctl controller reconcile '<run-id>' <requester flags> \
   --repository owner/repo --expected-state awaiting_human_approval \
   --idempotency-key '<persisted-key>'
 ```
@@ -1240,7 +1237,7 @@ All shared authority flags; GitHub App `squash_merge_write=true`.
 **Example**
 
 ```sh
-ifan-loop controller merge '<run-id>' <requester flags> \
+agentctl controller merge '<run-id>' <requester flags> \
   --repository owner/repo --expected-state merging \
   --idempotency-key '<persisted-key>'
 ```
@@ -1286,7 +1283,7 @@ All shared authority flags.
 **Example**
 
 ```sh
-ifan-loop controller accept-external-merge '<run-id>' <requester flags> \
+agentctl controller accept-external-merge '<run-id>' <requester flags> \
   --repository owner/repo --expected-state manual_intervention \
   --idempotency-key '<persisted-key>'
 ```
@@ -1331,7 +1328,7 @@ All shared authority flags and Linear credential readiness.
 **Example**
 
 ```sh
-ifan-loop controller reconcile-linear '<run-id>' <requester flags> \
+agentctl controller reconcile-linear '<run-id>' <requester flags> \
   --repository owner/repo --expected-state awaiting_linear_completion \
   --idempotency-key '<persisted-key>'
 ```
@@ -1375,7 +1372,7 @@ All shared authority flags.
 **Example**
 
 ```sh
-ifan-loop controller cleanup '<run-id>' <requester flags> \
+agentctl controller cleanup '<run-id>' <requester flags> \
   --repository owner/repo --expected-state cleaning \
   --idempotency-key '<persisted-key>'
 ```
@@ -1423,7 +1420,7 @@ Run ID, config path when non-default, and the complete requester identity flags.
 **Example**
 
 ```sh
-ifan-loop controller abandon '<run-id>' <requester flags>
+agentctl controller abandon '<run-id>' <requester flags>
 ```
 
 **What it does**
@@ -1520,8 +1517,8 @@ driver is intentionally not desired. Prefer `controller run` otherwise.
 **Syntax**
 
 ```sh
-ifan-loop linear start <IFAN-issue> [--config <file>] <requester flags>
-ifan-loop controller start <IFAN-issue> [--config <file>] <requester flags>
+agentctl linear start <IFAN-issue> [--config <file>] <requester flags>
+agentctl controller start <IFAN-issue> [--config <file>] <requester flags>
 ```
 
 **Required arguments and flags**
@@ -1532,7 +1529,7 @@ same implementation.
 **Example**
 
 ```sh
-ifan-loop linear start IFAN-123 <requester flags>
+agentctl linear start IFAN-123 <requester flags>
 ```
 
 **What it does**
@@ -1569,7 +1566,7 @@ Only for focused adapter diagnosis or an explicitly authorized isolated smoke.
 **Syntax**
 
 ```sh
-ifan-loop github-read [--config <file>] --run-id <run-id> \
+agentctl github-read [--config <file>] --run-id <run-id> \
   <requester flags> --repository <owner/name> \
   --expected-state <state> --idempotency-key <persisted-key> \
   --pr <number> --expected-head <sha>
@@ -1583,7 +1580,7 @@ number, and exact expected head.
 **Example**
 
 ```sh
-ifan-loop github-read --run-id '<run-id>' <requester flags> \
+agentctl github-read --run-id '<run-id>' <requester flags> \
   --repository owner/repo --expected-state awaiting_human_approval \
   --idempotency-key '<persisted-key>' --pr 1 --expected-head '<sha>'
 ```
@@ -1623,7 +1620,7 @@ The embedded LaunchAgent runs exactly:
 <absolute-binary> controller worker --config <absolute-config>
 ```
 
-It uses label `com.ifan.agent-loop-controller.worker`, `RunAtLoad`, restart only
+It uses label `io.agent-loop-controller.worker`, `RunAtLoad`, restart only
 after unsuccessful exit, 30-second throttle, umask `0077`, and private stdout/
 stderr files. No token, requester, issue, branch, shell, checkout, or environment
 entry is rendered into the plist.
@@ -1638,7 +1635,8 @@ Bootout is process control only and does not mark a run failed or abandoned.
 All LaunchAgent commands share:
 
 ```text
---binary <absolute-installed-binary>   default /usr/local/bin/ifan-loop
+--binary <absolute-installed-binary>   default /usr/local/bin/agentctl
+--legacy-binary <absolute-legacy>      default /usr/local/bin/ifan-loop; migration/rollback only
 --config <absolute-controller.json>    default controller configuration
 --plist <absolute-plist>               default user LaunchAgents path
 --domain gui/<uid>                     default current GUI user
@@ -1659,7 +1657,7 @@ Before render/install and after upgrades.
 **Syntax**
 
 ```sh
-ifan-loop controller launchagent doctor [common flags]
+agentctl controller launchagent doctor [common flags]
 ```
 
 **Required arguments and flags**
@@ -1669,7 +1667,7 @@ No positional arguments; supply the actual installed binary and configuration.
 **Example**
 
 ```sh
-ifan-loop controller launchagent doctor --binary "$HOME/.local/bin/ifan-loop"
+agentctl controller launchagent doctor --binary "$HOME/.local/bin/agentctl"
 ```
 
 **What it does**
@@ -1701,7 +1699,7 @@ Immediately before first install.
 **Syntax**
 
 ```sh
-ifan-loop controller launchagent validate [common flags]
+agentctl controller launchagent validate [common flags]
 ```
 
 **Required arguments and flags**
@@ -1711,7 +1709,7 @@ No positional arguments.
 **Example**
 
 ```sh
-ifan-loop controller launchagent validate --binary "$HOME/.local/bin/ifan-loop"
+agentctl controller launchagent validate --binary "$HOME/.local/bin/agentctl"
 ```
 
 **What it does**
@@ -1744,7 +1742,7 @@ For review and `plutil -lint` before install.
 **Syntax**
 
 ```sh
-ifan-loop controller launchagent build [common flags]
+agentctl controller launchagent build [common flags]
 ```
 
 **Required arguments and flags**
@@ -1754,7 +1752,7 @@ No positional arguments.
 **Example**
 
 ```sh
-ifan-loop controller launchagent build --binary "$HOME/.local/bin/ifan-loop" > /tmp/worker.plist
+agentctl controller launchagent build --binary "$HOME/.local/bin/agentctl" > /tmp/worker.plist
 plutil -lint /tmp/worker.plist
 ```
 
@@ -1787,7 +1785,7 @@ After doctor/validate and independent `plutil` review.
 **Syntax**
 
 ```sh
-ifan-loop controller launchagent install [common flags]
+agentctl controller launchagent install [common flags]
 ```
 
 **Required arguments and flags**
@@ -1797,7 +1795,7 @@ No positional arguments.
 **Example**
 
 ```sh
-ifan-loop controller launchagent install --binary "$HOME/.local/bin/ifan-loop"
+agentctl controller launchagent install --binary "$HOME/.local/bin/agentctl"
 ```
 
 **What it does**
@@ -1830,7 +1828,7 @@ After installation and before bootstrap.
 **Syntax**
 
 ```sh
-ifan-loop controller launchagent plist-validate [common flags]
+agentctl controller launchagent plist-validate [common flags]
 ```
 
 **Required arguments and flags**
@@ -1840,7 +1838,7 @@ No positional arguments.
 **Example**
 
 ```sh
-ifan-loop controller launchagent plist-validate --binary "$HOME/.local/bin/ifan-loop"
+agentctl controller launchagent plist-validate --binary "$HOME/.local/bin/agentctl"
 ```
 
 **What it does**
@@ -1873,7 +1871,7 @@ After installed-plist validation.
 **Syntax**
 
 ```sh
-ifan-loop controller launchagent bootstrap [common flags]
+agentctl controller launchagent bootstrap [common flags]
 ```
 
 **Required arguments and flags**
@@ -1883,7 +1881,7 @@ No positional arguments.
 **Example**
 
 ```sh
-ifan-loop controller launchagent bootstrap --binary "$HOME/.local/bin/ifan-loop"
+agentctl controller launchagent bootstrap --binary "$HOME/.local/bin/agentctl"
 ```
 
 **What it does**
@@ -1916,7 +1914,7 @@ After every control timeout, start, stop, or unexpected worker exit.
 **Syntax**
 
 ```sh
-ifan-loop controller launchagent status [common flags]
+agentctl controller launchagent status [common flags]
 ```
 
 **Required arguments and flags**
@@ -1926,7 +1924,7 @@ No positional arguments.
 **Example**
 
 ```sh
-ifan-loop controller launchagent status --binary "$HOME/.local/bin/ifan-loop"
+agentctl controller launchagent status --binary "$HOME/.local/bin/agentctl"
 ```
 
 **What it does**
@@ -1960,7 +1958,7 @@ After status shows a safe kickstart action.
 **Syntax**
 
 ```sh
-ifan-loop controller launchagent kickstart [common flags]
+agentctl controller launchagent kickstart [common flags]
 ```
 
 **Required arguments and flags**
@@ -1970,7 +1968,7 @@ No positional arguments.
 **Example**
 
 ```sh
-ifan-loop controller launchagent kickstart --binary "$HOME/.local/bin/ifan-loop"
+agentctl controller launchagent kickstart --binary "$HOME/.local/bin/agentctl"
 ```
 
 **What it does**
@@ -2004,7 +2002,7 @@ Before upgrades, log rotation, configuration maintenance, or uninstall.
 **Syntax**
 
 ```sh
-ifan-loop controller launchagent bootout [common flags]
+agentctl controller launchagent bootout [common flags]
 ```
 
 **Required arguments and flags**
@@ -2014,7 +2012,7 @@ No positional arguments.
 **Example**
 
 ```sh
-ifan-loop controller launchagent bootout --binary "$HOME/.local/bin/ifan-loop"
+agentctl controller launchagent bootout --binary "$HOME/.local/bin/agentctl"
 ```
 
 **What it does**
@@ -2041,20 +2039,113 @@ not another automatic control operation.
 
 `status`, `bootstrap`, `controller drive`.
 
+### Legacy executable and launchd identity migration
+
+The repository-controlled migration is available on both
+`controller launchagent` and `controller launchdaemon` as
+`migration-status`, `migrate`, and `rollback`. It changes only executable/plist
+supervision identity: the Controller database, configuration, credentials,
+worktrees, artifacts, workflow state, leases, and evidence remain in place.
+
+`migration-status` is read-only and classifies the selected supervisor as one
+of `legacy_running`, `legacy_installed_stopped`, `neutral_running`,
+`neutral_only`, `neither_installed`, `both_configured`,
+`interrupted_migration`, `rollback_interrupted`, `rolled_back`, or an explicit
+conflict/attention state. It observes both labels in both supported supervisor
+domains; a stopped plist still counts as configured. Unknown state and any
+dual-worker topology fail closed.
+
+Before `migrate`, build and validate a separate neutral binary. Do not replace
+or delete the legacy binary: its exact path must still match the legacy plist
+and remains the bounded rollback executable.
+
+For a per-login LaunchAgent:
+
+```sh
+NEW_BIN="$HOME/.local/bin/agentctl"
+LEGACY_BIN="$HOME/.local/bin/ifan-loop"
+CONFIG="$HOME/Library/Application Support/agent-loop-controller/controller.json"
+
+"$NEW_BIN" controller launchagent migration-status \
+  --binary "$NEW_BIN" --legacy-binary "$LEGACY_BIN" --config "$CONFIG"
+"$NEW_BIN" controller launchagent migrate \
+  --binary "$NEW_BIN" --legacy-binary "$LEGACY_BIN" --config "$CONFIG"
+"$NEW_BIN" controller launchagent status \
+  --binary "$NEW_BIN" --legacy-binary "$LEGACY_BIN" --config "$CONFIG"
+```
+
+For a headless LaunchDaemon, run status as the worker user and only the bounded
+mutation under root:
+
+```sh
+NEW_BIN="$HOME/.local/bin/agentctl"
+LEGACY_BIN="$HOME/.local/bin/ifan-loop"
+CONFIG="$HOME/Library/Application Support/agent-loop-controller/controller.json"
+WORKER_USER="$(id -un)"
+
+"$NEW_BIN" controller launchdaemon migration-status \
+  --binary "$NEW_BIN" --legacy-binary "$LEGACY_BIN" \
+  --config "$CONFIG" --user "$WORKER_USER"
+sudo "$NEW_BIN" controller launchdaemon migrate \
+  --binary "$NEW_BIN" --legacy-binary "$LEGACY_BIN" \
+  --config "$CONFIG" --user "$WORKER_USER"
+"$NEW_BIN" controller launchdaemon status \
+  --binary "$NEW_BIN" --legacy-binary "$LEGACY_BIN" \
+  --config "$CONFIG" --user "$WORKER_USER"
+```
+
+`migrate` boots out the exact legacy label at most once, observes that label as
+absent, and takes the authenticated `worker.lock` before changing any plist.
+It moves the legacy plist to `<legacy-plist>.agentctl-rollback`, installs or
+restores the exact neutral plist, releases the fence, and bootstraps the neutral
+label. If interruption occurs after legacy stop, plist backup, neutral install,
+or bootstrap, rerun `migration-status`; only rerun `migrate` when it returns
+that next safe action. A missing plist or stale heartbeat never proves process
+absence.
+
+Rollback uses the same flags:
+
+```sh
+sudo "$NEW_BIN" controller launchdaemon rollback \
+  --binary "$NEW_BIN" --legacy-binary "$LEGACY_BIN" \
+  --config "$CONFIG" --user "$WORKER_USER"
+```
+
+Omit `sudo` and `--user` for LaunchAgent rollback. The command first boots out
+and proves absence of the neutral label, obtains the worker fence, moves the
+neutral plist to `<neutral-plist>.agentctl-disabled`, restores the legacy plist,
+and only then bootstraps the legacy service. An already rolled-back topology is
+idempotent. Never invoke the old binary's bootstrap command directly after a
+neutral plist has been prepared; the old implementation cannot know the new
+label.
+
+No `ifan-loop` executable alias is installed. Retain the actual legacy binary
+and `.agentctl-rollback` plist until all of these are true: neutral status
+returns `worker_identity_verified: true`, proving the current launchd PID is
+bound to the private process-start identity; one deliberate
+neutral service restart or reboot has adopted the same SQLite state; every run
+that was nonterminal during migration has reached a newly observed durable stop
+with no authenticated pre-migration managed process left; and the operator no
+longer requires immediate rollback. Only then may the operator remove those two
+exact legacy files. Legacy managed-launch and review-reply marker reads remain
+for in-flight/local and external idempotency evidence; that compatibility is
+independent of the executable file's removal.
+
 ### Headless system LaunchDaemon
 
 Use `controller launchdaemon` when the Mac must restore the worker after boot
 without a graphical login. It supports the same
-`build|render|install|doctor|validate|plist-validate|bootstrap|kickstart|status|bootout`
+`build|render|install|doctor|validate|plist-validate|bootstrap|kickstart|status|bootout|migration-status|migrate|rollback`
 operations as the LaunchAgent surface, but the domain is fixed to `system`.
 There is no `--domain` flag and `user/<uid>` is never accepted.
 
 All LaunchDaemon commands share:
 
 ```text
---binary <absolute-installed-binary>   default /usr/local/bin/ifan-loop
+--binary <absolute-installed-binary>   default /usr/local/bin/agentctl
+--legacy-binary <absolute-legacy>      default /usr/local/bin/ifan-loop; migration/rollback only
 --config <absolute-controller.json>    default below the worker user's home
---plist <absolute-plist>               default /Library/LaunchDaemons/com.ifan.agent-loop-controller.worker.plist
+--plist <absolute-plist>               default /Library/LaunchDaemons/io.agent-loop-controller.worker.plist
 --user <account>                       worker account; required under root
 --working-directory <absolute-dir>     default worker user's home
 --timeout <duration>                   default 15s, maximum 2m
@@ -2075,11 +2166,11 @@ Set exact paths first and retain the `.rollback` file until the reboot and
 rollback gates have both passed:
 
 ```sh
-BIN="$HOME/.local/bin/ifan-loop"
+BIN="$HOME/.local/bin/agentctl"
 CONFIG="$HOME/Library/Application Support/agent-loop-controller/controller.json"
 WORKER_USER="$(id -un)"
-AGENT_PLIST="$HOME/Library/LaunchAgents/com.ifan.agent-loop-controller.worker.plist"
-DAEMON_PLIST="/Library/LaunchDaemons/com.ifan.agent-loop-controller.worker.plist"
+AGENT_PLIST="$HOME/Library/LaunchAgents/io.agent-loop-controller.worker.plist"
+DAEMON_PLIST="/Library/LaunchDaemons/io.agent-loop-controller.worker.plist"
 
 "$BIN" controller launchagent bootout --binary "$BIN" --config "$CONFIG" --plist "$AGENT_PLIST"
 "$BIN" controller launchagent status --binary "$BIN" --config "$CONFIG" --plist "$AGENT_PLIST"

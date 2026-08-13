@@ -118,7 +118,7 @@ func (r OSRunner) runWithTestParentLifetime(ctx context.Context, spec Spec, envi
 	}
 	defer stderrFile.Close()
 
-	excludedEnvironment := append(append([]string(nil), spec.ExcludedEnv...), managedLaunchEnvironment, managedTestParentLifetimeEnvironment)
+	excludedEnvironment := append(append([]string(nil), spec.ExcludedEnv...), managedLaunchEnvironment, legacyManagedLaunchEnvironment, managedTestParentLifetimeEnvironment)
 	baseEnvironment := environment
 	if len(spec.EnvironmentAllowlist) > 0 {
 		baseEnvironment = restrictEnvironment(environment, spec.EnvironmentAllowlist, excludedEnvironment)
@@ -164,7 +164,7 @@ func (r OSRunner) runWithTestParentLifetime(ctx context.Context, spec Spec, envi
 		}
 		command = exec.Command(executable, append([]string{managedLaunchArgument, program}, spec.Args...)...)
 		command.ExtraFiles = []*os.File{launchGateReader}
-		commandEnvironment = append(withoutEnvironment(commandEnvironment, []string{managedLaunchEnvironment, managedTestParentLifetimeEnvironment}), managedLaunchEnvironment+"=1")
+		commandEnvironment = append(withoutEnvironment(commandEnvironment, []string{managedLaunchEnvironment, legacyManagedLaunchEnvironment, managedTestParentLifetimeEnvironment}), managedLaunchEnvironment+"=1")
 		if testParentLifetimeReader != nil {
 			command.ExtraFiles = append(command.ExtraFiles, testParentLifetimeReader)
 			commandEnvironment = append(commandEnvironment, managedTestParentLifetimeEnvironment+"=1")

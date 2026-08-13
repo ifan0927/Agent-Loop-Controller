@@ -1,14 +1,14 @@
 # Development
 
-The current composition package and test commands use the implemented
-compatibility name `ifan-loop`. `agentctl` is the canonical target name, and
-[issue #104](https://github.com/ifan0927/Agent-Loop-Controller/issues/104) owns
-the installation-safe package, executable, script, test, and launchd migration.
+The canonical composition package, test target, and executable are
+`cmd/agentctl` and `agentctl`. Legacy executable, launchd, managed-process, and
+review-marker strings may appear only in focused compatibility tests or
+dual-read/migration code.
 
 ## Repository Layout
 
 ```text
-cmd/ifan-loop/          CLI, composition root, worker, launchd supervisors, fixtures
+cmd/agentctl/          CLI, composition root, worker, launchd supervisors, fixtures
 contracts/              embedded implementation/review JSON schemas
 internal/domain/        pure contracts, state topology, evidence validation
 internal/application/   use cases, orchestration, policy, and ports
@@ -29,7 +29,7 @@ Local verification requires the Go version declared by `go.mod`, Git, and
 running the canonical gate.
 
 ```sh
-go build ./cmd/ifan-loop
+go build ./cmd/agentctl
 gofmt -w cmd internal
 go test ./...
 go test -race ./...
@@ -43,6 +43,11 @@ formatting without rewriting, normal tests, race tests, vet, the deterministic
 GitHub read fixture, and credential-pattern scanning. GitHub Actions invokes the
 same script on pull requests and pushes to `main` with read-only contents
 permission.
+
+Launchd migration tests use temporary plist trees, synthetic `launchctl`
+observations, isolated controller databases, and real advisory-lock behavior.
+They must never bootstrap, boot out, replace, or inspect private contents of a
+host's installed service as a test side effect.
 
 ## Test Strategy
 
@@ -69,7 +74,7 @@ Package tests live beside their code. Run a focused package while iterating:
 go test ./internal/domain -count=1
 go test ./internal/application -count=1
 go test ./internal/adapters/sqlite -count=1
-go test ./cmd/ifan-loop -count=1
+go test ./cmd/agentctl -count=1
 ```
 
 Changes to state transitions require domain topology tests plus application
@@ -144,7 +149,7 @@ It emits no matched bytes, lines, file names, or input paths. Exit status `1`
 reports only the fixed `prohibited_material_detected` reason code; scanner
 failures use a separate fixed reason code and exit status `2`. Credential-source
 files are intentionally not scanner inputs. Check their ownership, type, link,
-size, and permission topology with `ifan-loop config doctor` instead.
+size, and permission topology with `agentctl config doctor` instead.
 It supplements code review; it is not proof that arbitrary sensitive personal
 data is absent.
 
@@ -183,7 +188,7 @@ validating this matrix.
 local bare origin and fake GitHub/Linear evidence. It requires:
 
 ```sh
-ifan-loop local fixture-deliver <run-id> \
+agentctl local fixture-deliver <run-id> \
   --db <controller.db> --registry <repository-registry.json> \
   --approval <explicit-fixture-approval.json>
 ```
@@ -208,7 +213,7 @@ directory or a newly created temporary directory.
 Build and print a deterministic delivery plan without executing Codex:
 
 ```sh
-ifan-loop plan --task <coding-task.json> \
+agentctl plan --task <coding-task.json> \
   [--workspace <absolute-worktree>] [--artifacts <absolute-root>] \
   [--codex-binary <binary>]
 ```
@@ -222,7 +227,7 @@ Run the original disposable implementation/verification/commit/fresh-review
 vertical slice:
 
 ```sh
-ifan-loop spike --task <coding-task.json> --workspace <disposable-repo> \
+agentctl spike --task <coding-task.json> --workspace <disposable-repo> \
   --artifacts <new-empty-directory> [--codex-binary <binary>] \
   [--timeout <duration>]
 ```
@@ -240,7 +245,7 @@ is:
 Run fixture admission and the durable local controller:
 
 ```sh
-ifan-loop local start \
+agentctl local start \
   --issue <simulated-issue.json> \
   --registry <repository-registry.json> \
   --db <controller.db> --repository <owner/name> \
@@ -261,7 +266,7 @@ The convenience script creates and retains a lab:
 Resume one local run with explicit persisted authority:
 
 ```sh
-ifan-loop local continue <run-id> \
+agentctl local continue <run-id> \
   --db <controller.db> --registry <repository-registry.json> \
   --repository <owner/name> --expected-state <state> \
   --idempotency-key <key> <requester flags> \
@@ -280,8 +285,8 @@ The script below exercises an explicit decision and second-process resume:
 Read the detailed fixture projection:
 
 ```sh
-ifan-loop local status <run-id> --db <controller.db> <requester flags>
-ifan-loop local inspect <run-id> --db <controller.db> <requester flags>
+agentctl local status <run-id> --db <controller.db> <requester flags>
+agentctl local inspect <run-id> --db <controller.db> <requester flags>
 ```
 
 Both currently return the same detailed result. They are read-only.
@@ -432,7 +437,7 @@ git diff --check
 ```
 
 Also verify relative links and anchors, compare every documented CLI name/flag
-with `cmd/ifan-loop`, search retired terminology and obsolete commands, and run
+with `cmd/agentctl`, search retired terminology and obsolete commands, and run
 the sensitive-output scan. Documentation must not contain credentials, real
 personal IDs, authorization headers, private evidence, or absolute personal
 paths.

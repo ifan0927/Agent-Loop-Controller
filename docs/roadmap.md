@@ -122,11 +122,11 @@ completed controller, bounded-concurrency, and authorization foundation
      `- Hermes
 ```
 
-`agentctl` is the canonical target executable name. The intended runtime entry
-points are `agentctl controller worker` and `agentctl operator`. The currently
-implemented `ifan-loop` executable and launchd identity remain a compatibility
-surface until the installation-safe migration in
-[#104](https://github.com/ifan0927/Agent-Loop-Controller/issues/104) completes.
+`agentctl` is the implemented canonical executable. The worker entrypoint is
+`agentctl controller worker`; `agentctl operator` remains the intended future
+TUI entrypoint. New launchd installations use the neutral service identity, and
+legacy installations have a bounded reversible migration rather than a second
+runtime path.
 
 Implementation work is created one dependency-ready issue at a time. Local
 operator identity and application authorization are complete. The next

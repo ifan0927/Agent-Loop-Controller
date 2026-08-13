@@ -21,3 +21,15 @@ func TestReviewReplyMarkerAndFixedBodyAreDeterministic(t *testing.T) {
 		t.Fatalf("changed=%q err=%v", changed, err)
 	}
 }
+
+func TestReviewReplyMarkersWriteNeutralAndReadLegacyEvidence(t *testing.T) {
+	head := strings.Repeat("a", 40)
+	marker, digest, err := ReviewReplyMarker("run", 7, "THREAD", 9, "COMMENT", strings.Repeat("b", 64), head)
+	if err != nil || !strings.Contains(marker, reviewReplyMarkerPrefix) || strings.Contains(marker, legacyReviewReplyMarkerPrefix) {
+		t.Fatalf("marker=%q digest=%q err=%v", marker, digest, err)
+	}
+	legacy := "<!-- " + legacyReviewReplyMarkerPrefix + digest + " -->"
+	if got := ReviewReplyMarkerDigest("historical reply\n\n" + legacy); got != digest {
+		t.Fatalf("legacy marker digest=%q want=%q", got, digest)
+	}
+}

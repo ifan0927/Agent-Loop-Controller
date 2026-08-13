@@ -54,7 +54,7 @@ authority by itself.
 | `internal/domain` | Pure contracts, state topology, evidence semantics, and validation | CLI, SQLite, HTTP, filesystem, or process details |
 | `internal/application` | Use cases, authorization, orchestration, reconciliation, and ports | Flag parsing, concrete API clients, SQL, or shell execution |
 | `internal/adapters` | SQLite, Git, Codex/process, Linear, GitHub App, configuration, verifier, and fixture implementations | Product policy beyond each typed port |
-| `cmd/ifan-loop` | Current compatibility composition root, CLI routing, flags, signal/time bounds, and JSON rendering; `agentctl` is the canonical migration target | Alternate state transitions or duplicated domain policy |
+| `cmd/agentctl` | Canonical composition root, CLI routing, flags, signal/time bounds, launchd compatibility migration, and JSON rendering | Alternate state transitions or duplicated domain policy |
 | `contracts` | Versioned JSON schemas embedded into the binary for Codex outcomes | Workflow state or external side effects |
 
 ## 4. Trust and Authority Model
@@ -163,10 +163,21 @@ syntax, mandatory human approval, squash merge, and no silent scope expansion.
 The `IFAN` Linear team key and `IFAN-*` issue identifiers remain exact external
 runtime compatibility contracts, and `github.com/ifan0927` remains the current
 repository/module identity. They do not define generic product or operator
-terminology. The `ifan-loop` executable, launchd label, managed-process marker,
-and review-reply marker are legacy installation or persisted/external
-compatibility identities; their safe neutral migration is isolated in
-[issue #104](https://github.com/ifan0927/Agent-Loop-Controller/issues/104).
+terminology. New local runtime identities are `agentctl`,
+`io.agent-loop-controller.worker`, the neutral managed-launch protocol, and the
+neutral review-reply marker. The process adapter and GitHub reader still accept
+the corresponding legacy markers where authenticated in-flight process or
+external idempotency evidence may outlive installation migration; new records
+never write the personalized forms.
+
+| Retained legacy identity | Classification and removal boundary |
+| --- | --- |
+| `ifan-loop` executable path | Migration detection and rollback input only; no alias is built or installed. The exact old binary may be removed after the documented restart/adoption and rollback-retention gates. |
+| `com.ifan.agent-loop-controller.worker` | Installed/loaded legacy supervisor detection and reversible plist restore only. New templates and services use the neutral label. |
+| `--ifan-loop-managed-launch` / `IFAN_LOOP_INTERNAL_MANAGED_LAUNCH` | Required compatibility read for an already-started authenticated managed helper. New helpers write only the `agentctl` protocol. |
+| `ifan-loop-review-reply:v1:` | Required compatibility read for existing GitHub reply idempotency evidence. New replies write only `agentctl-review-reply:v1:`. |
+| `secret://env/IFAN_LOOP_LINEAR_TOKEN` and scrubbed `IFAN_LOOP_*` secret names | Existing explicit configuration compatibility and deny-list protection. New configuration defaults to the neutral file credential source; legacy names are never injected into managed children. |
+| `I-Fan`, `IFAN`, `IFAN-*`, and `ifan0927` | External Linear/GitHub identity or historical fixture evidence, not local product naming. |
 
 ### State machine and legal transitions
 
@@ -912,7 +923,9 @@ private evidence, not query output.
 
 The CLI embeds separate exact LaunchAgent and LaunchDaemon plist templates and
 implements safe render/install, static validation, bounded `launchctl` control,
-and sanitized results. The LaunchAgent supervises one logged-in user's worker;
+and sanitized results. Both templates use the neutral
+`io.agent-loop-controller.worker` label and canonical `agentctl controller
+worker` argv. The LaunchAgent supervises one logged-in user's worker;
 the system LaunchDaemon supports pre-login headless recovery but pins
 `UserName`, `HOME`, and `WorkingDirectory` so the worker remains the configured
 non-root user. The system plist is root-owned; configuration, credentials,
@@ -920,8 +933,10 @@ database, artifacts, status, and logs remain owned by the worker user. Secrets
 never enter a plist.
 
 Only `gui/<uid>` and `system` are supported supervisor domains. A user-domain
-service is not a substitute for either contract. Bootstrap checks the opposite
-installed and loaded topology and fails closed on conflict. Independently, the
+service is not a substitute for either contract. Install, bootstrap, kickstart,
+and status inspect both neutral and legacy labels in the selected and opposite
+domains, including stopped installed plists, and fail closed on unverified or
+dual topology. Independently, the
 worker acquires a private advisory lock for its complete process lifetime before
 constructing the scheduler runtime; a second LaunchAgent, LaunchDaemon, or
 manual worker therefore exits before it can scan or recover work. This process
@@ -930,6 +945,18 @@ continue` and experimental `local continue` acquire the same lock before they
 authorize permit adoption, and an interrupted managed attempt must be stopped
 and reconciled before its permit changes owner. SQLite authorities and
 journals—not launchd or the process lock—remain workflow authority.
+
+The explicit launchd identity migration first observes all four label/domain
+combinations, boots out only the selected legacy service, proves exact-label
+absence, and then takes the same worker lock before changing plist identities.
+The legacy plist is retained under the non-loadable
+`.agentctl-rollback` suffix; an interrupted migration is resumed from that
+artifact. Rollback proves neutral absence under the same fence, preserves the
+neutral plist under `.agentctl-disabled`, restores the legacy plist, and only
+then bootstraps the legacy label. Atomic hard-link-and-unlink moves make an
+interrupted file transition detectable without overwriting an unknown path.
+Neither direction opens or rewrites SQLite, configuration, credentials,
+artifacts, or run evidence.
 
 The normal worker has no wall-clock expiry. SIGINT/SIGTERM stops new cadence,
 cancels active production drivers and child processes, releases the admission

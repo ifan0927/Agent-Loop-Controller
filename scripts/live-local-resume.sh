@@ -34,7 +34,7 @@ cat >"$issue" <<'JSON'
 }
 JSON
 
-start_output="$(go run "$repo_root/cmd/ifan-loop" local start \
+start_output="$(go run "$repo_root/cmd/agentctl" local start \
   --issue "$issue" \
   --registry "$lab/repository-registry.json" \
   --db "$lab/controller.db" --repository fixture-owner/test-project \
@@ -51,7 +51,7 @@ cat >"$decision" <<JSON
 }
 JSON
 
-go run "$repo_root/cmd/ifan-loop" local continue "$run_id" \
+go run "$repo_root/cmd/agentctl" local continue "$run_id" \
   --db "$lab/controller.db" \
   --registry "$lab/repository-registry.json" \
   --decision "$decision"

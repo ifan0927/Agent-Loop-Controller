@@ -27,6 +27,12 @@ func launchAgentInstall(args []string) error {
 		result.Reason = reasons[0]
 		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: reasons[0]})
 	}
+	ctx, cancel := localContext(options.timeout)
+	defer cancel()
+	if err := verifyNoLaunchDaemonService(ctx, launchAgentControlFactory(options.timeout), options); err != nil {
+		result.Reason, _ = launchAgentControlErrorCode(err)
+		return writeLaunchAgentControlResult(result, err)
+	}
 	desired := []byte(renderLaunchAgentPlist(options.binary, options.config, filepath.Join(filepath.Dir(options.config), launchAgentLogDirectory, launchAgentStdoutLogName), filepath.Join(filepath.Dir(options.config), launchAgentLogDirectory, launchAgentStderrLogName)))
 	parent, parentErr := openLaunchAgentParent(options.plist)
 	if parentErr != nil {
@@ -34,8 +40,6 @@ func launchAgentInstall(args []string) error {
 		return writeLaunchAgentControlResult(result, &launchAgentControlError{Code: result.Reason})
 	}
 	defer parent.Close()
-	ctx, cancel := localContext(options.timeout)
-	defer cancel()
 	name := filepath.Base(options.plist)
 	existing, openErr := openLaunchAgentFileAt(parent, name)
 	if openErr == nil {
@@ -271,12 +275,8 @@ func launchAgentBootstrap(args []string) error {
 	if err != nil {
 		return writeLaunchAgentControlResult(launchAgentPlistErrorResult(options, "bootstrap", err), err)
 	}
-	if launchAgentPathExists(launchDaemonPlistPath()) {
-		err := &launchAgentControlError{Code: "launchdaemon_conflict"}
-		return writeLaunchAgentControlResult(launchAgentControlErrorResult(options, "bootstrap", "unknown", inspection.RunAtLoad, err, "status"), err)
-	}
 	control := launchAgentControlFactory(options.timeout)
-	if err := verifyNoLaunchDaemonService(ctx, control); err != nil {
+	if err := verifyNoLaunchDaemonService(ctx, control, options); err != nil {
 		return writeLaunchAgentControlResult(launchAgentControlErrorResult(options, "bootstrap", "unknown", inspection.RunAtLoad, err, "status"), err)
 	}
 	target := launchAgentTarget(options)
@@ -317,7 +317,7 @@ func launchAgentKickstart(args []string) error {
 		return writeLaunchAgentControlResult(launchAgentPlistErrorResult(options, "kickstart", err), err)
 	}
 	control := launchAgentControlFactory(options.timeout)
-	if err := verifyNoLaunchDaemonService(ctx, control); err != nil {
+	if err := verifyNoLaunchDaemonService(ctx, control, options); err != nil {
 		return writeLaunchAgentControlResult(launchAgentControlErrorResult(options, "kickstart", "unknown", inspection.RunAtLoad, err, "status"), err)
 	}
 	target := launchAgentTarget(options)
@@ -381,12 +381,24 @@ func launchAgentStatus(args []string) error {
 		}
 	}
 	result := launchAgentControlResultFor(options, "status", observed.State, outcome, next, "", runAtLoad, false)
+	legacyPlist, _ := legacyLaunchAgentPath(options.plist)
+	legacy, legacyErr := control.Status(ctx, options.domain+"/"+legacyLaunchdLabel)
+	result.LegacyInstalled = launchAgentPathExists(legacyPlist)
+	result.LegacyObservedState = legacy.State
+	if legacyErr != nil {
+		result.Outcome, result.NextSafeAction, result.Reason = "attention_required", "migration-status", "legacy_state_unverified"
+	} else if result.LegacyInstalled || legacy.State != "absent" {
+		result.Outcome, result.NextSafeAction, result.Reason = "attention_required", "migrate", "legacy_service_conflict"
+	}
 	daemon, daemonErr := control.Status(ctx, "system/"+launchAgentLabel)
+	legacyDaemon, legacyDaemonErr := control.Status(ctx, "system/"+legacyLaunchdLabel)
 	if daemonErr != nil {
 		result.Outcome = "attention_required"
 		result.NextSafeAction = "status"
 		result.Reason = "launchdaemon_state_unverified"
-	} else if launchAgentPathExists(launchDaemonPlistPath()) || daemon.State != "absent" {
+	} else if legacyDaemonErr != nil {
+		result.Outcome, result.NextSafeAction, result.Reason = "attention_required", "status", "launchdaemon_state_unverified"
+	} else if launchAgentPathExists(launchDaemonPlistPath()) || launchAgentPathExists(legacyLaunchDaemonPlistPath()) || daemon.State != "absent" || legacyDaemon.State != "absent" {
 		result.Outcome = "attention_required"
 		result.NextSafeAction = "bootout_launchdaemon"
 		result.Reason = "launchdaemon_conflict"
@@ -398,23 +410,28 @@ func launchAgentStatus(args []string) error {
 			result.WorkerStatus = snapshot.Status
 			result.WorkerPreviousStatus = snapshot.PreviousStatus
 			result.WorkerStatusObservedAt = snapshot.ObservedAt.UTC().Format(time.RFC3339Nano)
+			result.WorkerIdentityVerified = true
 		}
 	}
 	return writeLaunchAgentControlResult(result, nil)
 }
 
-func verifyNoLaunchDaemonService(ctx context.Context, control launchAgentControl) error {
-	if launchAgentPathExists(launchDaemonPlistPath()) {
-		return &launchAgentControlError{Code: "launchdaemon_conflict"}
-	}
-	observed, err := control.Status(ctx, "system/"+launchAgentLabel)
+func verifyNoLaunchDaemonService(ctx context.Context, control launchAgentControl, options launchAgentOptions) error {
+	legacyPlist, err := legacyLaunchAgentPath(options.plist)
 	if err != nil {
-		return &launchAgentControlError{Code: "launchdaemon_state_unverified"}
+		return &launchAgentControlError{Code: "legacy_state_unverified"}
 	}
-	if observed.State != "absent" {
-		return &launchAgentControlError{Code: "launchdaemon_conflict"}
+	err = verifyNoLaunchdCompatibilityConflict(ctx, control, options.domain, "system", legacyPlist, launchDaemonPlistPath(), legacyLaunchDaemonPlistPath())
+	var controlErr *launchAgentControlError
+	if errors.As(err, &controlErr) {
+		switch controlErr.Code {
+		case "opposite_supervisor_conflict":
+			return &launchAgentControlError{Code: "launchdaemon_conflict"}
+		case "opposite_supervisor_state_unverified":
+			return &launchAgentControlError{Code: "launchdaemon_state_unverified"}
+		}
 	}
-	return nil
+	return err
 }
 
 func launchAgentBootout(args []string) error {

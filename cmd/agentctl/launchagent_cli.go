@@ -16,8 +16,12 @@ import (
 )
 
 const (
-	launchAgentLabel         = "com.ifan.agent-loop-controller.worker"
-	defaultInstalledBinary   = "/usr/local/bin/ifan-loop"
+	launchAgentLabel         = "io.agent-loop-controller.worker"
+	legacyLaunchdLabel       = "com.ifan.agent-loop-controller.worker"
+	defaultInstalledBinary   = "/usr/local/bin/agentctl"
+	defaultLegacyBinary      = "/usr/local/bin/ifan-loop"
+	launchdRollbackSuffix    = ".agentctl-rollback"
+	launchdDisabledSuffix    = ".agentctl-disabled"
 	launchAgentLogDirectory  = "logs"
 	launchAgentStdoutLogName = "worker.stdout.log"
 	launchAgentStderrLogName = "worker.stderr.log"
@@ -35,7 +39,7 @@ type launchAgentDoctorOutput struct {
 
 func controllerLaunchAgent(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: ifan-loop controller launchagent <build|render|install|doctor|validate|plist-validate|bootstrap|kickstart|status|bootout> [options]")
+		return launchAgentUsage()
 	}
 	switch args[0] {
 	case "build", "render":
@@ -56,19 +60,30 @@ func controllerLaunchAgent(args []string) error {
 		return launchAgentStatus(args[1:])
 	case "bootout":
 		return launchAgentBootout(args[1:])
+	case "migration-status":
+		return launchAgentMigrationStatus(args[1:])
+	case "migrate":
+		return launchAgentMigrate(args[1:])
+	case "rollback":
+		return launchAgentRollback(args[1:])
 	default:
-		return errors.New("usage: ifan-loop controller launchagent <build|render|install|doctor|validate|plist-validate|bootstrap|kickstart|status|bootout> [options]")
+		return launchAgentUsage()
 	}
 }
 
+func launchAgentUsage() error {
+	return errors.New("usage: agentctl controller launchagent <build|render|install|doctor|validate|plist-validate|bootstrap|kickstart|status|bootout|migration-status|migrate|rollback> [options]")
+}
+
 type launchAgentOptions struct {
-	binary, config, plist, domain string
-	timeout                       time.Duration
+	binary, legacyBinary, config, plist, domain string
+	timeout                                     time.Duration
 }
 
 func parseLaunchAgentOptions(name string, args []string) (launchAgentOptions, error) {
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
 	binary := flags.String("binary", defaultInstalledBinary, "absolute installed controller binary")
+	legacyBinary := flags.String("legacy-binary", defaultLegacyBinary, "absolute installed legacy controller binary used only for migration or rollback")
 	config := configPathFlag(flags)
 	plist := flags.String("plist", "", "target user LaunchAgent plist path")
 	domain := flags.String("domain", "", "GUI launchd domain (default: gui/<current uid>)")
@@ -94,7 +109,7 @@ func parseLaunchAgentOptions(name string, args []string) (launchAgentOptions, er
 	if *timeout <= 0 || *timeout > maxLaunchAgentControlTimeout {
 		return launchAgentOptions{}, errors.New("--timeout must be greater than zero and no more than 2m")
 	}
-	return launchAgentOptions{binary: *binary, config: configPath, plist: plistPath, domain: domainValue, timeout: *timeout}, nil
+	return launchAgentOptions{binary: *binary, legacyBinary: *legacyBinary, config: configPath, plist: plistPath, domain: domainValue, timeout: *timeout}, nil
 }
 
 func resolveLaunchAgentDomain(override string) (string, error) {
@@ -121,6 +136,13 @@ func resolveLaunchAgentPath(override string) (string, error) {
 		return "", errors.New("default LaunchAgent home is unavailable")
 	}
 	return filepath.Join(home, "Library", "LaunchAgents", launchAgentLabel+".plist"), nil
+}
+
+func legacyLaunchAgentPath(neutralPlist string) (string, error) {
+	if !validLaunchAgentPath(neutralPlist) {
+		return "", errors.New("neutral LaunchAgent path is invalid")
+	}
+	return filepath.Join(filepath.Dir(neutralPlist), legacyLaunchdLabel+".plist"), nil
 }
 
 func launchAgentRender(args []string) error {
@@ -166,6 +188,21 @@ func launchAgentDoctor(args []string, installValidation bool) error {
 // safe to display and never contain a path, credential source, token, or OS
 // error text.
 func launchAgentReasons(options launchAgentOptions, installValidation bool) []string {
+	reasons := launchAgentWorkerAssetReasons(options)
+	legacyPlist, _ := legacyLaunchAgentPath(options.plist)
+	if launchAgentPathExists(legacyPlist) {
+		reasons = append(reasons, "legacy_service_conflict")
+	}
+	if launchAgentPathExists(launchDaemonPlistPath()) || launchAgentPathExists(legacyLaunchDaemonPlistPath()) {
+		reasons = append(reasons, "launchdaemon_conflict")
+	}
+	if installValidation && launchAgentPathExists(options.plist) {
+		reasons = append(reasons, "plist_exists")
+	}
+	return reasons
+}
+
+func launchAgentWorkerAssetReasons(options launchAgentOptions) []string {
 	reasons := make([]string, 0, 8)
 	if !safeExecutable(options.binary) {
 		reasons = append(reasons, "binary_unsafe")
@@ -191,12 +228,6 @@ func launchAgentReasons(options launchAgentOptions, installValidation bool) []st
 		reasons = append(reasons, "log_directory_unsafe")
 	} else if !safeLogLeaf(filepath.Join(filepath.Dir(options.config), launchAgentLogDirectory, launchAgentStdoutLogName)) || !safeLogLeaf(filepath.Join(filepath.Dir(options.config), launchAgentLogDirectory, launchAgentStderrLogName)) {
 		reasons = append(reasons, "log_file_unsafe")
-	}
-	if launchAgentPathExists(launchDaemonPlistPath()) {
-		reasons = append(reasons, "launchdaemon_conflict")
-	}
-	if installValidation && launchAgentPathExists(options.plist) {
-		reasons = append(reasons, "plist_exists")
 	}
 	return reasons
 }

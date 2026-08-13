@@ -50,6 +50,22 @@ func TestLaunchDaemonInstallAndValidateExactRootOwnedDocument(t *testing.T) {
 	}
 }
 
+func TestLaunchDaemonInstallRejectsLoadedLegacyService(t *testing.T) {
+	options, args := launchDaemonTestOptions(t)
+	absent := launchAgentObservation{State: "absent"}
+	fake := &scriptedLaunchAgentControl{
+		statusFallback: &absent,
+		statusByTarget: map[string][]launchAgentObservation{
+			"system/" + legacyLaunchdLabel: {{State: "running", ProcessID: os.Getpid()}},
+		},
+	}
+	launchAgentControlFactory = func(time.Duration) launchAgentControl { return fake }
+	output, err := captureConfigOutput(func() error { return launchDaemonInstall(args) })
+	if err == nil || !strings.Contains(output, `"reason": "legacy_service_conflict"`) || launchAgentPathExists(options.plist) {
+		t.Fatalf("output=%s err=%v targets=%v", output, err, fake.targetCalls)
+	}
+}
+
 func TestLaunchDaemonMutationsRequirePrivilege(t *testing.T) {
 	_, args := launchDaemonTestOptions(t)
 	launchDaemonRootUID = -1
@@ -164,7 +180,7 @@ func launchDaemonTestOptions(t *testing.T) (launchDaemonOptions, []string) {
 			t.Fatal(err)
 		}
 	}
-	binary := filepath.Join(root, "ifan-loop")
+	binary := filepath.Join(root, "agentctl")
 	config := filepath.Join(root, "controller.json")
 	if err := os.WriteFile(binary, []byte("binary"), 0o700); err != nil {
 		t.Fatal(err)
@@ -197,6 +213,10 @@ func launchDaemonTestOptions(t *testing.T) (launchDaemonOptions, []string) {
 	launchDaemonRootUID = uid
 	launchDaemonAssetReasons = func(launchDaemonOptions) []string { return nil }
 	launchDaemonDirectory = parent
+	absent := launchAgentObservation{State: "absent"}
+	launchAgentControlFactory = func(time.Duration) launchAgentControl {
+		return &scriptedLaunchAgentControl{statusFallback: &absent}
+	}
 	plist := filepath.Join(parent, launchAgentLabel+".plist")
 	args := []string{"--binary", binary, "--config", config, "--plist", plist, "--user", account.Username, "--working-directory", home, "--timeout", "1s"}
 	return launchDaemonOptions{binary: binary, config: config, plist: plist, username: account.Username, uid: uid, home: home, workingDirectory: home, timeout: time.Second}, args

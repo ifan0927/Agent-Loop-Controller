@@ -9,7 +9,10 @@ import (
 	"time"
 )
 
-const reviewReplyMarkerPrefix = "ifan-loop-review-reply:v1:"
+const (
+	reviewReplyMarkerPrefix       = "agentctl-review-reply:v1:"
+	legacyReviewReplyMarkerPrefix = "ifan-loop-review-reply:v1:"
+)
 
 // ReviewReply is the minimum remote evidence needed to reconcile one reply.
 // Its body is not retained: callers compare only a controller marker digest.
@@ -40,11 +43,17 @@ func ReviewReplyBody(head, marker string) (string, error) {
 }
 
 func ReviewReplyMarkerDigest(body string) string {
-	start := strings.LastIndex(body, "<!-- "+reviewReplyMarkerPrefix)
+	prefix := reviewReplyMarkerPrefix
+	start := strings.LastIndex(body, "<!-- "+prefix)
+	legacyStart := strings.LastIndex(body, "<!-- "+legacyReviewReplyMarkerPrefix)
+	if legacyStart > start {
+		start = legacyStart
+		prefix = legacyReviewReplyMarkerPrefix
+	}
 	if start < 0 {
 		return ""
 	}
-	value := strings.TrimSuffix(strings.TrimPrefix(body[start:], "<!-- "+reviewReplyMarkerPrefix), " -->")
+	value := strings.TrimSuffix(strings.TrimPrefix(body[start:], "<!-- "+prefix), " -->")
 	if len(value) != 64 {
 		return ""
 	}

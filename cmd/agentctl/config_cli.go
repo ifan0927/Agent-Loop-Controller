@@ -47,7 +47,7 @@ func resolveConfigPath(override string) (string, error) {
 
 func configCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: ifan-loop config <init|path|validate|inspect|doctor> [--config <controller.json>]")
+		return errors.New("usage: agentctl config <init|path|validate|inspect|doctor> [--config <controller.json>]")
 	}
 	switch args[0] {
 	case "init":
@@ -59,7 +59,7 @@ func configCommand(args []string) error {
 	case "doctor":
 		return runtimeDoctor(args[1:])
 	default:
-		return errors.New("usage: ifan-loop config <init|path|validate|inspect|doctor> [--config <controller.json>]")
+		return errors.New("usage: agentctl config <init|path|validate|inspect|doctor> [--config <controller.json>]")
 	}
 }
 
