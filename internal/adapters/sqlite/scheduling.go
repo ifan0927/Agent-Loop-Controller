@@ -122,7 +122,7 @@ func (s *Store) ListSchedulingRuns(ctx context.Context, scopes application.Autho
 	if limit < 1 || limit > application.MaxSchedulingQueryItems || scopes.Empty() {
 		return nil, errors.New("scheduling run query limit is invalid")
 	}
-	where, args, err := authorizedRunWhereColumns(scopes, "r.repository", "r.repository_binding_digest", "r.run_id", "", true)
+	where, args, err := authorizedRunWhereColumns(scopes, "r.repository", "r.repository_binding_digest", "r.run_id", "", false)
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +168,7 @@ func (s *Store) GetSchedulingRun(ctx context.Context, scopes application.Authori
 	if strings.TrimSpace(runID) == "" || scopes.Empty() {
 		return application.SchedulingRun{}, errors.New("scheduling run lookup is invalid")
 	}
-	where, args, err := authorizedRunWhereColumns(scopes, "r.repository", "r.repository_binding_digest", "r.run_id", "", true)
+	where, args, err := authorizedRunWhereColumns(scopes, "r.repository", "r.repository_binding_digest", "r.run_id", "", false)
 	if err != nil {
 		return application.SchedulingRun{}, err
 	}

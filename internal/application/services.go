@@ -368,7 +368,6 @@ type RepositoryAuthoritySource interface {
 }
 
 type QueryStore interface {
-	GetRun(context.Context, string) (Run, error)
 	GetRunScopeAuthority(context.Context, string) (RunScopeAuthority, error)
 	GetAuthorizedRun(context.Context, string, AuthorizedScopeSet) (Run, error)
 	ListRunScopeAuthorities(context.Context) ([]RunScopeAuthority, error)
@@ -422,7 +421,7 @@ func (s QueryService) GetRunDetail(ctx context.Context, query RunDetailQuery) (I
 	if query.RunID == "" {
 		return InspectionResult{}, serviceError(ErrorInvalidInput, "run is required", nil)
 	}
-	_, err := s.authorizeRunTarget(ctx, query.Requester, query.RunID, "")
+	_, err := s.ResolveRunTarget(ctx, QueryInput{Requester: query.Requester, RunID: query.RunID})
 	if err != nil {
 		return InspectionResult{}, err
 	}
@@ -530,50 +529,49 @@ func (s QueryService) authorizeDetail(ctx context.Context, input QueryInput) (Ru
 	if input.RunID == "" || input.Repository == "" {
 		return Run{}, serviceError(ErrorInvalidInput, "run and repository are required", nil)
 	}
-	return s.authorizeRunTarget(ctx, input.Requester, input.RunID, input.Repository)
+	return s.ResolveRunTarget(ctx, input)
 }
 
-func (s QueryService) authorizeRunTarget(ctx context.Context, requester Requester, runID, repository string) (Run, error) {
-	if s.authorizer != nil {
-		configured, err := s.authorizer.ResolveConfiguredRequester(requester)
-		if err != nil {
-			return Run{}, hiddenTargetError()
-		}
-		authority, err := s.store.GetRunScopeAuthority(ctx, runID)
-		if err != nil {
-			if errors.Is(err, ErrRunNotFound) {
-				return Run{}, hiddenTargetError()
-			}
-			return Run{}, classifyServiceError(err)
-		}
-		if repository != "" && authority.Repository != repository {
-			return Run{}, hiddenTargetError()
-		}
-		scopes, err := s.authorizer.RunScopes(configured, authority)
-		if err != nil {
-			return Run{}, hiddenTargetError()
-		}
-		run, err := s.store.GetAuthorizedRun(ctx, runID, scopes)
-		if err != nil {
-			if errors.Is(err, ErrRunNotFound) {
-				return Run{}, hiddenTargetError()
-			}
-			return Run{}, classifyServiceError(err)
-		}
-		return run, nil
+// ResolveRunTarget authenticates the configured or legacy CLI requester,
+// reads only frozen authority, and applies that scope in persistence before it
+// returns the complete aggregate. Repository is optional for ID-only routes.
+func (s QueryService) ResolveRunTarget(ctx context.Context, input QueryInput) (Run, error) {
+	if input.RunID == "" {
+		return Run{}, serviceError(ErrorInvalidInput, "run is required", nil)
 	}
-	run, err := s.store.GetRun(ctx, runID)
+	var configured ConfiguredRequester
+	if s.authorizer != nil {
+		resolved, err := s.authorizer.ResolveConfiguredRequester(input.Requester)
+		if err != nil {
+			return Run{}, hiddenTargetError()
+		}
+		configured = resolved
+	}
+	authority, err := s.store.GetRunScopeAuthority(ctx, input.RunID)
 	if err != nil {
 		if errors.Is(err, ErrRunNotFound) {
 			return Run{}, hiddenTargetError()
 		}
 		return Run{}, classifyServiceError(err)
 	}
-	if repository != "" && run.Repository != repository {
+	if input.Repository != "" && authority.Repository != input.Repository {
 		return Run{}, hiddenTargetError()
 	}
-	if _, err := (&AuthorizationService{}).FrozenRunScopes(requester, run); err != nil {
+	var scopes AuthorizedScopeSet
+	if s.authorizer != nil {
+		scopes, err = s.authorizer.RunScopes(configured, authority)
+	} else {
+		scopes, err = cliRequesterRunScopes(input.Requester, authority)
+	}
+	if err != nil {
 		return Run{}, hiddenTargetError()
+	}
+	run, err := s.store.GetAuthorizedRun(ctx, input.RunID, scopes)
+	if err != nil {
+		if errors.Is(err, ErrRunNotFound) {
+			return Run{}, hiddenTargetError()
+		}
+		return Run{}, classifyServiceError(err)
 	}
 	return run, nil
 }

@@ -83,15 +83,7 @@ func (s serviceStore) GetRunScopeAuthority(_ context.Context, id string) (RunSco
 	if run.ID != id {
 		return RunScopeAuthority{}, ErrRunNotFound
 	}
-	var repository LocalRepository
-	if err := json.Unmarshal([]byte(run.RepositoryConfigJSON), &repository); err != nil {
-		return RunScopeAuthority{}, err
-	}
-	trusted := make([]domain.GitHubUserIdentity, 0, len(repository.TrustedOperatorActors))
-	for _, actor := range repository.TrustedOperatorActors {
-		trusted = append(trusted, domain.GitHubUserIdentity{Login: actor.Login, DatabaseID: actor.DatabaseID, NodeID: actor.NodeID, ActorType: actor.Type})
-	}
-	return RunScopeAuthority{RunID: run.ID, Repository: run.Repository, BindingDigest: run.RepositoryBindingDigest, AllowedLogins: repository.AllowedOperatorLogins, TrustedOperators: trusted}, nil
+	return frozenRunScopeAuthority(run)
 }
 func (s serviceStore) GetAuthorizedRun(_ context.Context, id string, scopes AuthorizedScopeSet) (Run, error) {
 	if s.getErr != nil {
@@ -304,6 +296,9 @@ func authorizeTestRun(run Run) Run {
 	}
 	raw, _ := json.Marshal(LocalRepository{CanonicalRepository: run.Repository, ProfileID: run.ProfileID, AllowedOperatorLogins: []string{"operator"}})
 	run.RepositoryConfigJSON = string(raw)
+	if !validAuthorityDigest(run.RepositoryBindingDigest) {
+		run.RepositoryBindingDigest = digestText("legacy-repository-binding:" + strings.ToLower(run.Repository))
+	}
 	return run
 }
 

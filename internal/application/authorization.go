@@ -24,9 +24,10 @@ const (
 )
 
 type AuthorityScope struct {
-	Kind            AuthorityScopeKind `json:"kind"`
-	ID              string             `json:"id"`
-	AuthorityDigest string             `json:"authority_digest"`
+	Kind                AuthorityScopeKind `json:"kind"`
+	ID                  string             `json:"id"`
+	AuthorityDigest     string             `json:"authority_digest"`
+	TargetBindingDigest string             `json:"target_binding_digest,omitempty"`
 }
 
 func (s AuthorityScope) Validate() error {
@@ -37,6 +38,9 @@ func (s AuthorityScope) Validate() error {
 	}
 	if strings.TrimSpace(s.ID) == "" || strings.ContainsRune(s.ID, '\x00') || !validAuthorityDigest(s.AuthorityDigest) {
 		return errors.New("authority scope is incomplete")
+	}
+	if s.Kind == ScopeRun && (strings.TrimSpace(s.TargetBindingDigest) == "" || strings.ContainsRune(s.TargetBindingDigest, '\x00')) {
+		return errors.New("run authority scope target is incomplete")
 	}
 	return nil
 }
@@ -82,11 +86,12 @@ type OnboardingAuthority struct {
 }
 
 type RunScopeAuthority struct {
-	RunID            string
-	Repository       string
-	BindingDigest    string
-	AllowedLogins    []string
-	TrustedOperators []domain.GitHubUserIdentity
+	RunID                   string
+	Repository              string
+	BindingDigest           string
+	PersistenceBindingValue string
+	AllowedLogins           []string
+	TrustedOperators        []domain.GitHubUserIdentity
 }
 
 func (a RunScopeAuthority) Validate() error {
@@ -99,6 +104,13 @@ func (a RunScopeAuthority) Validate() error {
 		}
 	}
 	return nil
+}
+
+func (a RunScopeAuthority) targetBindingValue() string {
+	if a.PersistenceBindingValue != "" {
+		return a.PersistenceBindingValue
+	}
+	return a.BindingDigest
 }
 
 func (a OnboardingAuthority) Validate() error {
@@ -142,7 +154,7 @@ func (s AuthorizedScopeSet) RunPredicates() []AuthorizedRunPredicate {
 	result := make([]AuthorizedRunPredicate, 0, len(s.scopes))
 	for _, scope := range s.scopes {
 		if scope.Kind == ScopeRun {
-			result = append(result, AuthorizedRunPredicate{RunID: scope.ID, BindingDigest: scope.AuthorityDigest})
+			result = append(result, AuthorizedRunPredicate{RunID: scope.ID, BindingDigest: scope.TargetBindingDigest})
 		}
 	}
 	return result
@@ -218,7 +230,7 @@ func (s *AuthorizationService) ControllerRunScopes(requester ConfiguredRequester
 			continue
 		}
 		if runAuthorityAllows(authority, requester.identity) {
-			scopes = append(scopes, AuthorityScope{Kind: ScopeRun, ID: authority.RunID, AuthorityDigest: authority.BindingDigest})
+			scopes = append(scopes, AuthorityScope{Kind: ScopeRun, ID: authority.RunID, AuthorityDigest: authority.BindingDigest, TargetBindingDigest: authority.targetBindingValue()})
 		}
 	}
 	return newAuthorizedScopeSet(requester.identity, scopes...)
@@ -237,7 +249,7 @@ func (s *AuthorizationService) RunScopes(requester ConfiguredRequester, authorit
 	if !runAuthorityAllows(authority, requester.identity) {
 		return AuthorizedScopeSet{}, serviceError(ErrorConflict, "requester is not authorized for the run", nil)
 	}
-	return newAuthorizedScopeSet(requester.identity, AuthorityScope{Kind: ScopeRun, ID: authority.RunID, AuthorityDigest: authority.BindingDigest})
+	return newAuthorizedScopeSet(requester.identity, AuthorityScope{Kind: ScopeRun, ID: authority.RunID, AuthorityDigest: authority.BindingDigest, TargetBindingDigest: authority.targetBindingValue()})
 }
 
 func (s *AuthorizationService) ConfiguredFrozenRunScopes(requester ConfiguredRequester, run Run) (AuthorizedScopeSet, error) {
@@ -246,6 +258,30 @@ func (s *AuthorizationService) ConfiguredFrozenRunScopes(requester ConfiguredReq
 		return AuthorizedScopeSet{}, err
 	}
 	return s.RunScopes(requester, authority)
+}
+
+// cliRequesterRunScopes preserves the existing requester-flag compatibility
+// boundary while producing the same frozen-run predicate used by scoped
+// persistence. Version-5 callers resolve the configured requester separately.
+func cliRequesterRunScopes(requester Requester, authority RunScopeAuthority) (AuthorizedScopeSet, error) {
+	if strings.TrimSpace(authority.RunID) == "" || strings.TrimSpace(authority.Repository) == "" || !validAuthorityDigest(authority.BindingDigest) || len(authority.AllowedLogins) == 0 {
+		return AuthorizedScopeSet{}, serviceError(ErrorConflict, "frozen run authority is invalid", nil)
+	}
+	trusted := make([]TrustedActorIdentity, 0, len(authority.TrustedOperators))
+	for _, operator := range authority.TrustedOperators {
+		trusted = append(trusted, TrustedActorIdentity{Login: operator.Login, DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, Type: operator.ActorType})
+	}
+	if err := requester.authorize(authority.AllowedLogins, trusted); err != nil {
+		return AuthorizedScopeSet{}, err
+	}
+	identity, err := requester.githubUserIdentity()
+	if err != nil {
+		if len(trusted) != 0 {
+			return AuthorizedScopeSet{}, err
+		}
+		identity = domain.GitHubUserIdentity{Login: requester.ID, DatabaseID: 1, NodeID: "legacy:" + requester.ID, ActorType: "User"}
+	}
+	return newAuthorizedScopeSet(identity, AuthorityScope{Kind: ScopeRun, ID: authority.RunID, AuthorityDigest: authority.BindingDigest, TargetBindingDigest: authority.targetBindingValue()})
 }
 
 func (s *AuthorizationService) RepositoryScopes(requester ConfiguredRequester, authority RepositoryAuthority) (AuthorizedScopeSet, error) {
@@ -297,11 +333,15 @@ func (s *AuthorizationService) FrozenRunScopes(requester Requester, run Run) (Au
 		}
 		identity = domain.GitHubUserIdentity{Login: requester.ID, DatabaseID: 1, NodeID: "legacy:" + requester.ID, ActorType: "User"}
 	}
-	digest := run.RepositoryBindingDigest
+	targetBinding := run.RepositoryBindingDigest
+	digest := targetBinding
 	if !validAuthorityDigest(digest) {
 		digest = digestText("legacy-run-authority\x00" + strings.ToLower(run.Repository))
 	}
-	return newAuthorizedScopeSet(identity, AuthorityScope{Kind: ScopeRun, ID: run.ID, AuthorityDigest: digest})
+	if targetBinding == "" {
+		targetBinding = digest
+	}
+	return newAuthorizedScopeSet(identity, AuthorityScope{Kind: ScopeRun, ID: run.ID, AuthorityDigest: digest, TargetBindingDigest: targetBinding})
 }
 
 func frozenRunScopeAuthority(run Run) (RunScopeAuthority, error) {
@@ -313,11 +353,15 @@ func frozenRunScopeAuthority(run Run) (RunScopeAuthority, error) {
 	for _, actor := range repository.TrustedOperatorActors {
 		trusted = append(trusted, domain.GitHubUserIdentity{Login: actor.Login, DatabaseID: actor.DatabaseID, NodeID: actor.NodeID, ActorType: actor.Type})
 	}
-	digest := run.RepositoryBindingDigest
+	targetBinding := run.RepositoryBindingDigest
+	digest := targetBinding
 	if !validAuthorityDigest(digest) {
 		digest = digestText("legacy-run-authority\x00" + strings.ToLower(run.Repository))
 	}
-	return RunScopeAuthority{RunID: run.ID, Repository: run.Repository, BindingDigest: digest, AllowedLogins: append([]string(nil), repository.AllowedOperatorLogins...), TrustedOperators: trusted}, nil
+	if targetBinding == "" {
+		targetBinding = digest
+	}
+	return RunScopeAuthority{RunID: run.ID, Repository: run.Repository, BindingDigest: digest, PersistenceBindingValue: targetBinding, AllowedLogins: append([]string(nil), repository.AllowedOperatorLogins...), TrustedOperators: trusted}, nil
 }
 
 func repositoryAllows(authority RepositoryAuthority, requester domain.GitHubUserIdentity) bool {

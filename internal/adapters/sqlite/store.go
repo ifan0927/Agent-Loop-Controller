@@ -831,11 +831,20 @@ func decodeRunScopeAuthority(runID, repository, bindingDigest, raw string) (appl
 	}
 	legacy := application.Run{Repository: repository, RepositoryBindingDigest: bindingDigest}
 	ensureRepositoryBindingDigest(&legacy)
+	targetBinding := legacy.RepositoryBindingDigest
+	authorityDigest := targetBinding
+	if len(authorityDigest) != sha256.Size*2 {
+		sum := sha256.Sum256([]byte("legacy-run-authority\x00" + strings.ToLower(repository)))
+		authorityDigest = hex.EncodeToString(sum[:])
+	} else if _, err := hex.DecodeString(authorityDigest); err != nil {
+		sum := sha256.Sum256([]byte("legacy-run-authority\x00" + strings.ToLower(repository)))
+		authorityDigest = hex.EncodeToString(sum[:])
+	}
 	trusted := make([]domain.GitHubUserIdentity, 0, len(configured.TrustedOperatorActors))
 	for _, actor := range configured.TrustedOperatorActors {
 		trusted = append(trusted, domain.GitHubUserIdentity{Login: actor.Login, DatabaseID: actor.DatabaseID, NodeID: actor.NodeID, ActorType: actor.Type})
 	}
-	return application.RunScopeAuthority{RunID: runID, Repository: repository, BindingDigest: legacy.RepositoryBindingDigest,
+	return application.RunScopeAuthority{RunID: runID, Repository: repository, BindingDigest: authorityDigest, PersistenceBindingValue: targetBinding,
 		AllowedLogins: append([]string(nil), configured.AllowedOperatorLogins...), TrustedOperators: trusted}, nil
 }
 
