@@ -165,8 +165,10 @@ remaining Controller operator foundations followed by a local TUI operator
 console in this repository under
 [roadmap #99](https://github.com/ifan0927/Agent-Loop-Controller/issues/99).
 Local operator identity, application authorization, operation receipts, and
-legal-action offers are implemented. Worker heartbeat and runtime observation
-are the next dependency-ready foundation.
+legal-action offers are implemented. Activity-independent worker heartbeat and
+controller-authorized runtime observation are also implemented; configuration
+generation and desired/effective convergence are the next dependency-ready
+foundation.
 The TUI and `agentctl operator` are planned, not current behavior. HTTP, a Web
 UI, outbound notifications, Hermes runtime integration, public API/webhook
 admission, and cross-repository transactions remain deferred or exploratory.

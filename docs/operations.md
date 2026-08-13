@@ -578,13 +578,25 @@ which also fences restart-only permit adoption. The worker reports
 bounded worker and queue-decision evidence;
 `status` is `running`, `driving`, `parked`, or `stopping`, and a stopping result
 includes `previous_status`. The worker atomically replaces the private
-`<controller-config>.worker-status.json` snapshot on each transition rather
-than appending cadence logs. `controller launchagent status` projects its
-`worker_status`, `worker_previous_status`, and observation timestamp while the
-supervisor process is observed running and its launchctl PID matches the
-snapshot PID and OS process-start identity. A missing or stale snapshot falls
-back to launchd's sanitized `running` observation rather than projecting the
-previous worker instance, including after PID reuse.
+`<controller-config>.worker-status.json` heartbeat after initialization, on
+each activity transition, and every fixed 15 seconds even while quiet or
+parked. The current schema binds the worker instance, PID, OS process-start
+identity, binary build identity, exact loaded configuration digest, sanitized
+activity, cycle metadata, and observation time. It stores no configuration
+generation. Each publication uses a bounded exclusive mode-`0600` temporary
+leaf, complete write and fsync, and atomic replacement; routine heartbeats do
+not append logs or SQLite audit rows.
+
+The controller-scope runtime observation classifies this evidence as `fresh`,
+`stale`, `offline`, `unknown`, or `conflict`, separately from worker activity.
+Age through 45 seconds is fresh only when the live PID and exact process-start
+identity match; age over 45 seconds is stale. Missing processes, PID reuse,
+unsafe or invalid evidence, unavailable identity, and future timestamps fail
+closed to finite reasons. A schema-v1 activity snapshot remains recognizable
+legacy evidence but can never satisfy heartbeat freshness. LaunchAgent and
+LaunchDaemon status use this same observation and additionally require the
+heartbeat PID to match launchd's observed service PID. Their JSON does not
+expose PID, process-start identity, UID, heartbeat path, or raw file errors.
 
 **Possible durable stop states**
 
@@ -600,7 +612,12 @@ SIGINT/SIGTERM cancels active drivers and their children, performs bounded lease
 cleanup, closes SQLite, and emits a sanitized `stopped: canceled` result. It
 does not rewrite runs as failed or abandoned. An unexpected failure exits
 nonzero so launchd can restart and resume from persisted state without duplicate
-admission.
+admission. Failure to create, encode, write, synchronize, close, or atomically
+publish the canonical heartbeat also cancels and joins worker dispatch, then
+exits nonzero; there is no heartbeat-degraded mode that continues delivery.
+A fresh heartbeat proves local runtime liveness and its loaded digest only. It
+does not prove aggregate Controller `ready` or `restart_required` configuration
+convergence.
 
 **Related commands**
 
@@ -1930,7 +1947,12 @@ agentctl controller launchagent status --binary "$HOME/.local/bin/agentctl"
 **What it does**
 
 Returns a finite observed state/outcome/next action without exposing raw
-`launchctl` output.
+`launchctl` output. While the service is running it also returns the canonical
+runtime liveness, sanitized activity, finite reason, heartbeat age/observation
+time, worker/build identity, and loaded configuration digest. The projection
+requires the configured controller operator authority and checks both the
+heartbeat process identity and launchd's observed PID. `parked` may therefore
+be `fresh`; workload activity is not runtime readiness.
 
 **Possible durable stop states**
 

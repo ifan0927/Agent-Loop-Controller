@@ -51,6 +51,20 @@ var buildAutomaticWorkerRuntime = newAutomaticWorkerRuntime
 var emitAutomaticWorkerOutput = func(output workerOutput) error { return printJSON(output) }
 var observeAutomaticWorkerStoreClosed = func() {}
 var workerEffectiveUID = os.Geteuid
+var newWorkerHeartbeatTicker = func(interval time.Duration) workerHeartbeatTicker {
+	return realWorkerHeartbeatTicker{Ticker: time.NewTicker(interval)}
+}
+
+type workerHeartbeatTicker interface {
+	C() <-chan time.Time
+	Stop()
+}
+
+type realWorkerHeartbeatTicker struct {
+	*time.Ticker
+}
+
+func (t realWorkerHeartbeatTicker) C() <-chan time.Time { return t.Ticker.C }
 
 func (d automaticWorkerDriver) Drive(ctx context.Context, command application.ProductionDriveCommand) (application.ProductionDriveResult, error) {
 	return driveProductionRun(ctx, d.loaded, d.store, command.Requester, command.RunID, d.policy)
@@ -109,8 +123,7 @@ func controllerWorker(args []string) error {
 			_ = store.Close()
 		}
 	}()
-	fprintfWorkerStart(instanceID, loaded.Digest)
-	reporter, err := newWorkerStatusReporter(path, instanceID)
+	reporter, err := newWorkerStatusReporter(path, instanceID, version, loaded.Digest)
 	if err != nil {
 		return errors.New("automatic admission worker status is unavailable")
 	}
@@ -120,7 +133,9 @@ func controllerWorker(args []string) error {
 	if *once {
 		workerCapacity = 1
 	}
-	result, err := runBoundedAdmissionWorkerAtObserved(ctx, *once, configured.PollInterval, workerCapacity, runtime.dispatch, waitAdmissionWorker, func() time.Time { return time.Now().UTC() }, reporter.Observe)
+	result, err := runBoundedAdmissionWorkerWithHeartbeat(ctx, *once, configured.PollInterval, workerCapacity, runtime.dispatch, reporter, func() {
+		fprintfWorkerStart(instanceID, loaded.Digest)
+	})
 	if err != nil {
 		return application.ClassifyError(err)
 	}
@@ -130,6 +145,53 @@ func controllerWorker(args []string) error {
 	}
 	storeOpen = false
 	return emitAutomaticWorkerOutput(output)
+}
+
+func runBoundedAdmissionWorkerWithHeartbeat(ctx context.Context, once bool, poll time.Duration, capacity int, dispatch admissionWorkerDispatch, reporter *workerStatusReporter, started func()) (admissionWorkerResult, error) {
+	if reporter == nil {
+		return admissionWorkerResult{}, errors.New("automatic admission worker heartbeat is unavailable")
+	}
+	initial := admissionWorkerResult{Status: workerStatusRunning}
+	ticker := newWorkerHeartbeatTicker(application.WorkerHeartbeatCadence)
+	if ticker == nil || ticker.C() == nil {
+		return initial, errors.New("automatic admission worker heartbeat is unavailable")
+	}
+	if err := reporter.Observe(initial); err != nil {
+		ticker.Stop()
+		return initial, err
+	}
+	if started != nil {
+		started()
+	}
+	workerCtx, cancelWorker := context.WithCancel(ctx)
+	defer cancelWorker()
+	heartbeatFailure := make(chan error, 1)
+	heartbeatStopped := make(chan struct{})
+	go func() {
+		defer close(heartbeatStopped)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case <-ticker.C():
+				if err := reporter.Heartbeat(); err != nil {
+					heartbeatFailure <- err
+					cancelWorker()
+					return
+				}
+			}
+		}
+	}()
+	result, runErr := runBoundedAdmissionWorkerAtObserved(workerCtx, once, poll, capacity, dispatch, waitAdmissionWorker, func() time.Time { return time.Now().UTC() }, reporter.Observe)
+	cancelWorker()
+	<-heartbeatStopped
+	select {
+	case heartbeatErr := <-heartbeatFailure:
+		return result, heartbeatErr
+	default:
+		return result, runErr
+	}
 }
 
 type workerProcessLock struct {

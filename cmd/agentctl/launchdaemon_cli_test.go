@@ -8,6 +8,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/bootstrap"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
 func TestLaunchDaemonTemplatePinsNonRootIdentityAndSecretFreeEnvironment(t *testing.T) {
@@ -120,6 +123,31 @@ func TestLaunchDaemonKickstartAndStatusRejectLoadedLaunchAgent(t *testing.T) {
 	output, err = captureConfigOutput(func() error { return launchDaemonStatus(args) })
 	if err != nil || !strings.Contains(output, `"outcome": "attention_required"`) || !strings.Contains(output, `"reason": "launchagent_conflict"`) {
 		t.Fatalf("status output=%s err=%v calls=%v", output, err, fake.calls)
+	}
+}
+
+func TestLaunchDaemonStatusUsesCanonicalWorkerHeartbeatObservation(t *testing.T) {
+	options, args := launchDaemonTestOptions(t)
+	reporter, err := newWorkerStatusReporter(options.config, "daemon-worker", version, strings.Repeat("d", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reporter.Observe(admissionWorkerResult{Status: workerStatusParked, PreviousStatus: workerStatusDriving, Cycles: 3}); err != nil {
+		t.Fatal(err)
+	}
+	originalLoad := loadWorkerRuntimeConfiguration
+	loadWorkerRuntimeConfiguration = func(string) (bootstrap.Bootstrap, error) {
+		return bootstrap.Bootstrap{Controller: bootstrap.Controller{Operator: domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "U_7", ActorType: "User"}}}, nil
+	}
+	t.Cleanup(func() { loadWorkerRuntimeConfiguration = originalLoad })
+	absent := launchAgentObservation{State: "absent"}
+	fake := &scriptedLaunchAgentControl{statusFallback: &absent, statusByTarget: map[string][]launchAgentObservation{
+		"system/" + launchAgentLabel: {{State: "running", ProcessID: os.Getpid()}},
+	}}
+	launchAgentControlFactory = func(time.Duration) launchAgentControl { return fake }
+	output, err := captureConfigOutput(func() error { return launchDaemonStatus(args) })
+	if err != nil || !strings.Contains(output, `"worker_liveness": "fresh"`) || !strings.Contains(output, `"worker_status": "parked"`) || !strings.Contains(output, `"worker_identity_verified": true`) || !strings.Contains(output, `"worker_build_identity": "`+version+`"`) || !strings.Contains(output, `"loaded_configuration_digest": "`+strings.Repeat("d", 64)+`"`) {
+		t.Fatalf("output=%s err=%v", output, err)
 	}
 }
 

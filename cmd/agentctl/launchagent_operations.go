@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"golang.org/x/sys/unix"
 )
 
@@ -404,16 +405,34 @@ func launchAgentStatus(args []string) error {
 		result.Reason = "launchdaemon_conflict"
 	}
 	if observed.State == "running" {
-		result.WorkerStatus = workerStatusRunning
-		started, identityErr := processStartIdentity(observed.ProcessID)
-		if snapshot, snapshotErr := readWorkerStatusSnapshot(options.config); identityErr == nil && snapshotErr == nil && snapshot.ProcessID == observed.ProcessID && snapshot.ProcessStartID == started && observed.ProcessID > 0 {
-			result.WorkerStatus = snapshot.Status
-			result.WorkerPreviousStatus = snapshot.PreviousStatus
-			result.WorkerStatusObservedAt = snapshot.ObservedAt.UTC().Format(time.RFC3339Nano)
-			result.WorkerIdentityVerified = true
-		}
+		observation, observationErr := observeConfiguredWorkerRuntime(ctx, options.config, os.Getuid(), observed.ProcessID, time.Now().UTC())
+		applyRuntimeObservation(&result, observation, observationErr)
 	}
 	return writeLaunchAgentControlResult(result, nil)
+}
+
+func applyRuntimeObservation(result *launchAgentControlResult, observation application.RuntimeObservation, err error) {
+	if result == nil {
+		return
+	}
+	if err != nil {
+		result.WorkerStatus = string(application.RuntimeActivityUnknown)
+		result.WorkerLiveness = string(application.RuntimeLivenessUnknown)
+		result.WorkerRuntimeReason = string(application.RuntimeReasonHeartbeatUnavailable)
+		return
+	}
+	result.WorkerStatus = string(observation.Activity)
+	result.WorkerPreviousStatus = string(observation.PreviousActivity)
+	result.WorkerLiveness = string(observation.Liveness)
+	result.WorkerRuntimeReason = string(observation.Reason)
+	result.WorkerInstanceID = observation.WorkerInstanceID
+	result.WorkerBuildIdentity = observation.BuildIdentity
+	result.LoadedConfigurationDigest = observation.LoadedConfigurationDigest
+	result.WorkerHeartbeatAgeSeconds = observation.HeartbeatAgeSeconds
+	if observation.LastObservedAt != nil {
+		result.WorkerStatusObservedAt = observation.LastObservedAt.UTC().Format(time.RFC3339Nano)
+	}
+	result.WorkerIdentityVerified = observation.Liveness == application.RuntimeLivenessFresh || observation.Liveness == application.RuntimeLivenessStale
 }
 
 func verifyNoLaunchDaemonService(ctx context.Context, control launchAgentControl, options launchAgentOptions) error {
