@@ -178,6 +178,11 @@ func linearStart(args []string) error {
 	if err != nil {
 		return err
 	}
+	heartbeatCtx, heartbeat, err := startManualControllerHeartbeat(context.Background(), loaded.Path, loaded.Digest)
+	if err != nil {
+		return err
+	}
+	defer heartbeat.Stop()
 	convergence, err := configuredConvergenceService(store, loaded, 0, false)
 	if err != nil {
 		return errors.New("configuration convergence authority is unavailable")
@@ -186,15 +191,21 @@ func linearStart(args []string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := localContext(loaded.Controller.RunTimeout)
+	ctx, cancel := context.WithTimeout(heartbeatCtx, loaded.Controller.RunTimeout)
 	defer cancel()
 	ctx = application.WithHeavyPermitOwner(ctx, permitOwner)
 	result, _, err := service.Start(ctx, application.LinearStartCommand{Requester: requesterIdentity.value(), Identifier: identifier})
 	if err != nil {
+		if heartbeatErr := heartbeat.Stop(); heartbeatErr != nil {
+			return heartbeatErr
+		}
 		return err
 	}
 	if _, err := store.ReconcileSchedulingAuthorities(context.Background(), time.Now().UTC()); err != nil {
 		return errors.New("controller scheduling authority could not be settled")
+	}
+	if err := heartbeat.Stop(); err != nil {
+		return err
 	}
 	return printJSON(result.Run)
 }
@@ -257,6 +268,11 @@ func controllerRun(args []string) error {
 	if err != nil {
 		return err
 	}
+	heartbeatCtx, heartbeat, err := startManualControllerHeartbeat(context.Background(), loaded.Path, loaded.Digest)
+	if err != nil {
+		return err
+	}
+	defer heartbeat.Stop()
 	convergence, err := configuredConvergenceService(store, loaded, 0, false)
 	if err != nil {
 		return errors.New("configuration convergence authority is unavailable")
@@ -265,11 +281,14 @@ func controllerRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	startCtx, cancelStart := localContext(loaded.Controller.RunTimeout)
+	startCtx, cancelStart := context.WithTimeout(heartbeatCtx, loaded.Controller.RunTimeout)
 	startCtx = application.WithHeavyPermitOwner(startCtx, policy.HeavyPermitOwner)
 	started, _, err := admission.Start(startCtx, application.LinearStartCommand{Requester: requester.value(), Identifier: identifier})
 	cancelStart()
 	if err != nil {
+		if heartbeatErr := heartbeat.Stop(); heartbeatErr != nil {
+			return heartbeatErr
+		}
 		return err
 	}
 	if _, err := store.ReconcileSchedulingAuthorities(context.Background(), time.Now().UTC()); err != nil {
@@ -279,12 +298,18 @@ func controllerRun(args []string) error {
 	// result, but make the restart-safe run ID available while it waits for
 	// external checks or the configured human operator's approval.
 	fmt.Fprintf(os.Stderr, "automatic delivery driver started for run %s\n", started.Run.RunID)
-	driveCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	driveCtx, stop := signal.NotifyContext(heartbeatCtx, os.Interrupt)
 	defer stop()
 	driveCtx, cancelDrive := context.WithTimeout(driveCtx, *maxRuntime)
 	defer cancelDrive()
 	result, err := driveProductionRun(driveCtx, loaded, store, requester.value(), started.Run.RunID, policy)
 	if err != nil {
+		if heartbeatErr := heartbeat.Stop(); heartbeatErr != nil {
+			return heartbeatErr
+		}
+		return err
+	}
+	if err := heartbeat.Stop(); err != nil {
 		return err
 	}
 	return printJSON(result)

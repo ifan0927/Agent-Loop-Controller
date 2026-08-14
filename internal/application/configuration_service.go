@@ -46,7 +46,11 @@ func (s *ConfigurationService) Initialize(ctx context.Context) (ConfigurationAut
 		if err := s.files.PublishLocator(authority.DatabasePath); err != nil {
 			return ConfigurationAuthority{}, serviceError(ErrorConflict, "configuration authority locator conflicts", nil)
 		}
-		return s.Reconcile(ctx)
+		authority, err = s.Reconcile(ctx)
+		if err == nil {
+			s.prune(ctx)
+		}
+		return authority, err
 	}
 
 	payload, candidate, err := s.files.ReadLive()
@@ -57,6 +61,9 @@ func (s *ConfigurationService) Initialize(ctx context.Context) (ConfigurationAut
 		return ConfigurationAuthority{}, serviceError(ErrorInternal, "configuration baseline evidence could not be retained", nil)
 	}
 	baseline := ConfigurationBaselineInput{Candidate: candidate, CanonicalConfigPath: s.files.CanonicalConfigPath(), ObservedAt: s.now().UTC()}
+	if err := s.files.PublishBaselineBinding(candidate); err != nil {
+		return ConfigurationAuthority{}, serviceError(ErrorConflict, "configuration baseline binding conflicts", nil)
+	}
 	if err := s.store.PrepareConfigurationBaseline(ctx, baseline); err != nil {
 		return ConfigurationAuthority{}, serviceError(ErrorConflict, "configuration baseline binding conflicts", nil)
 	}
@@ -76,6 +83,7 @@ func (s *ConfigurationService) Initialize(ctx context.Context) (ConfigurationAut
 		}
 		return ConfigurationAuthority{}, serviceError(ErrorInternal, "configuration baseline could not be persisted", nil)
 	}
+	s.prune(ctx)
 	return authority, nil
 }
 
@@ -96,6 +104,14 @@ func (s *ConfigurationService) Reconcile(ctx context.Context) (ConfigurationAuth
 	if intent.State == ConfigurationApplyAmbiguous {
 		return authority, serviceError(ErrorConflict, "configuration apply is ambiguous", nil)
 	}
+	replacementLock, acquired, lockErr := s.files.AcquireReplacement(intent.OperationID)
+	if lockErr != nil {
+		return authority, serviceError(ErrorInternal, "configuration replacement authority is unavailable", nil)
+	}
+	if !acquired {
+		return authority, serviceError(ErrorConflict, "configuration apply is still active", nil)
+	}
+	defer replacementLock.Release()
 	generations, listErr := s.store.ListConfigurationGenerations(ctx)
 	if listErr != nil {
 		return ConfigurationAuthority{}, serviceError(ErrorInternal, "configuration generation evidence is unavailable", nil)
@@ -149,7 +165,7 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 	// when the effect was accepted. This read-only path preserves response-loss
 	// replay even when that effect changed the configured operator.
 	payloadDigest := sha256.Sum256(command.Payload)
-	if replay, ok := s.settledConfigurationReplay(ctx, command, ValidatedConfigurationCandidate{Digest: hex.EncodeToString(payloadDigest[:])}); ok {
+	if replay, ok := s.configurationReplay(ctx, command, ValidatedConfigurationCandidate{Digest: hex.EncodeToString(payloadDigest[:])}); ok {
 		return replay, nil
 	}
 	authority, configured, scopes, err := s.authorize(ctx, command.Requester)
@@ -211,7 +227,22 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 		return ConfigurationApplyResult{}, serviceError(ErrorInternal, "configuration target evidence could not be retained", nil)
 	}
 	receipt := proposedReceipt
-	generation, acceptedReceipt, _, err := s.store.BeginConfigurationApply(ctx, ConfigurationApplyAcceptance{ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Candidate: candidate, Requester: configured.identity, Receipt: receipt, AcceptedAt: receipt.AcceptedAt})
+	replacementLock, acquired, lockErr := s.files.AcquireReplacement(receipt.OperationID)
+	if lockErr != nil {
+		return ConfigurationApplyResult{}, serviceError(ErrorInternal, "configuration replacement authority is unavailable", nil)
+	}
+	if !acquired {
+		if replay, ok := s.configurationReplay(ctx, command, candidate); ok {
+			return replay, nil
+		}
+		return ConfigurationApplyResult{}, serviceError(ErrorConflict, "configuration apply is still active", nil)
+	}
+	defer func() {
+		if replacementLock != nil {
+			_ = replacementLock.Release()
+		}
+	}()
+	generation, acceptedReceipt, created, err := s.store.BeginConfigurationApply(ctx, ConfigurationApplyAcceptance{ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Candidate: candidate, Requester: configured.identity, Receipt: receipt, AcceptedAt: receipt.AcceptedAt})
 	if err != nil {
 		s.removeUnreferencedRaw(ctx, candidate.Digest)
 		return ConfigurationApplyResult{}, classifyConfigurationStoreError(err)
@@ -219,7 +250,15 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 	if generation.State != ConfigurationGenerationAccepted {
 		return ConfigurationApplyResult{Generation: generation, Receipt: acceptedReceipt}, nil
 	}
+	if !created {
+		// Another exact caller owns the sole filesystem phase. Startup or a later
+		// retry reconciles an interrupted accepted intent before replay reaches
+		// this point; a concurrent replay must never touch its deterministic stage.
+		return ConfigurationApplyResult{Generation: generation, Receipt: acceptedReceipt}, nil
+	}
 	if err := s.files.ReplaceLive(generation.OperationID, desiredPayload, command.Payload); err != nil {
+		_ = replacementLock.Release()
+		replacementLock = nil
 		settled, reconcileErr := s.Reconcile(ctx)
 		if reconcileErr != nil {
 			return ConfigurationApplyResult{}, reconcileErr
@@ -232,6 +271,8 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 	}
 	verifiedPayload, verified, readErr := s.files.ReadLive()
 	if readErr != nil || !bytes.Equal(verifiedPayload, command.Payload) || verified.Digest != candidate.Digest || verified.Size != candidate.Size || verified.SchemaVersion != candidate.SchemaVersion {
+		_ = replacementLock.Release()
+		replacementLock = nil
 		settled, reconcileErr := s.Reconcile(ctx)
 		if reconcileErr != nil {
 			return ConfigurationApplyResult{}, reconcileErr
@@ -265,6 +306,11 @@ func (s *ConfigurationService) removeUnreferencedRaw(ctx context.Context, digest
 }
 
 func (s *ConfigurationService) settledConfigurationReplay(ctx context.Context, command ConfigurationApplyCommand, candidate ValidatedConfigurationCandidate) (ConfigurationApplyResult, bool) {
+	result, ok := s.configurationReplay(ctx, command, candidate)
+	return result, ok && result.Receipt.Phase == OperationPhaseObserved
+}
+
+func (s *ConfigurationService) configurationReplay(ctx context.Context, command ConfigurationApplyCommand, candidate ValidatedConfigurationCandidate) (ConfigurationApplyResult, bool) {
 	identity, err := command.Requester.githubUserIdentity()
 	if err != nil {
 		return ConfigurationApplyResult{}, false
@@ -276,7 +322,7 @@ func (s *ConfigurationService) settledConfigurationReplay(ctx context.Context, c
 	}
 	proposed := configurationApplyReceiptFor(command.ExpectedGenerationID, command.ExpectedDigest, configured, scopes, candidate, s.now().UTC())
 	receipt, err := s.store.GetAuthorizedOperationReceipt(ctx, proposed.OperationID, scopes)
-	if err != nil || receipt.Phase != OperationPhaseObserved {
+	if err != nil {
 		return ConfigurationApplyResult{}, false
 	}
 	generations, err := s.store.ListConfigurationGenerations(ctx)
@@ -342,12 +388,7 @@ func (s *ConfigurationService) ReconcileRuntime(ctx context.Context, now time.Ti
 	if s.runtime == nil {
 		return authority, RuntimeObservation{}, serviceError(ErrorInternal, "runtime observation is unavailable", nil)
 	}
-	operator, ok := configurationGenerationOperator(authority.Desired)
-	if !ok {
-		return authority, RuntimeObservation{}, serviceError(ErrorConflict, "configured operator authority is unavailable", nil)
-	}
-	requester := Requester{ID: operator.Login, Kind: "github_login", DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, ActorType: operator.ActorType}
-	runtime, err := s.runtime.Observe(ctx, requester, now.UTC())
+	runtime, err := s.runtime.ObserveConfigurationRuntime(ctx, now.UTC())
 	if err != nil {
 		return authority, RuntimeObservation{}, err
 	}
@@ -533,14 +574,27 @@ func generationByID(generations []ConfigurationGeneration, id int64) (Configurat
 }
 
 func (s *ConfigurationService) prune(ctx context.Context) {
+	claims, err := s.store.ConfigurationRawPruneClaims(ctx)
+	if err != nil {
+		return
+	}
+	for _, digest := range claims {
+		s.completeRawPrune(ctx, digest)
+	}
 	digests, err := s.store.ConfigurationRawPruneCandidates(ctx, ConfigurationRawRetainCount)
 	if err != nil {
 		return
 	}
 	for _, digest := range digests {
-		if s.files.RemoveRaw(digest) != nil {
+		claimed, claimErr := s.store.ClaimConfigurationRawPrune(ctx, digest)
+		if claimErr != nil || !claimed {
 			continue
 		}
-		_ = s.store.MarkConfigurationRawPruned(ctx, digest)
+		s.completeRawPrune(ctx, digest)
 	}
+}
+
+func (s *ConfigurationService) completeRawPrune(ctx context.Context, digest string) {
+	removed := s.files.RemoveRaw(digest) == nil
+	_ = s.store.CompleteConfigurationRawPrune(ctx, digest, removed)
 }

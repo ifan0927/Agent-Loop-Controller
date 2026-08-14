@@ -461,6 +461,38 @@ func TestManagedConfigurationUsesTrustedLocatorAfterLiveDrift(t *testing.T) {
 	}
 }
 
+func TestManualSupervisorHeartbeatMakesAdmissionReadyWhileHoldingWorkerLock(t *testing.T) {
+	root := resolvedTempDir(t)
+	configPath, databasePath := writeControllerStatusConfig(t, root)
+	loaded, err := loadManagedConfiguration(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := acquireWorkerProcessLock(filepath.Dir(databasePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	_, heartbeat, err := startManualControllerHeartbeat(context.Background(), loaded.Path, loaded.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer heartbeat.Stop()
+	store, err := sqlitestore.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	convergence, err := configuredConvergenceService(store, loaded, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := convergence.CheckNewAdmission(context.Background())
+	if err != nil || !decision.Allowed || decision.Reason != application.ConfigurationReasonReady || decision.Authority.Digest != loaded.Digest {
+		t.Fatalf("decision=%+v err=%v", decision, err)
+	}
+}
+
 func TestManagedConfigurationRejectsAlternatePathForOwnedStore(t *testing.T) {
 	root := resolvedTempDir(t)
 	configPath, _ := writeControllerStatusConfig(t, root)
@@ -502,6 +534,9 @@ func TestManagedConfigurationFinishesBaselineAfterLocatorPublicationCrash(t *tes
 	if err := files.RetainRaw(candidate.Digest, payload); err != nil {
 		t.Fatal(err)
 	}
+	if err := files.PublishBaselineBinding(candidate); err != nil {
+		t.Fatal(err)
+	}
 	store, err := sqlitestore.Open(databasePath)
 	if err != nil {
 		t.Fatal(err)
@@ -527,6 +562,105 @@ func TestManagedConfigurationFinishesBaselineAfterLocatorPublicationCrash(t *tes
 	defer store.Close()
 	if authority, found, err := store.ConfigurationAuthority(context.Background()); err != nil || !found || authority.Desired.Digest != loaded.Digest {
 		t.Fatalf("authority=%+v found=%t err=%v", authority, found, err)
+	}
+}
+
+func TestManagedConfigurationResumesBaselineBindingBeforeDatabaseAnchor(t *testing.T) {
+	root := resolvedTempDir(t)
+	configPath, databasePath := writeControllerStatusConfig(t, root)
+	payload, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := configurationadapter.NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := files.ValidateBaseline(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := files.RetainRaw(candidate.Digest, payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := files.PublishBaselineBinding(candidate); err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlitestore.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadManagedConfiguration(configPath)
+	if err != nil || loaded.Digest != candidate.Digest || loaded.Controller.DatabasePath != databasePath {
+		t.Fatalf("loaded=%+v err=%v", loaded, err)
+	}
+	store, err = sqlitestore.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if authority, found, err := store.ConfigurationAuthority(context.Background()); err != nil || !found || authority.Desired.Digest != candidate.Digest {
+		t.Fatalf("authority=%+v found=%t err=%v", authority, found, err)
+	}
+}
+
+func TestManagedConfigurationRejectsLiveRelocationAfterPreparedBaseline(t *testing.T) {
+	root := resolvedTempDir(t)
+	configPath, databasePath := writeControllerStatusConfig(t, root)
+	payload, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := configurationadapter.NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := files.ValidateBaseline(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := files.RetainRaw(candidate.Digest, payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := files.PublishBaselineBinding(candidate); err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlitestore.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PrepareConfigurationBaseline(context.Background(), application.ConfigurationBaselineInput{Candidate: candidate, CanonicalConfigPath: configPath, ObservedAt: time.Now().UTC()}); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var changed map[string]any
+	if err := json.Unmarshal(payload, &changed); err != nil {
+		t.Fatal(err)
+	}
+	attackerDatabase := filepath.Join(root, "attacker.db")
+	changed["controller"].(map[string]any)["database_path"] = attackerDatabase
+	changedPayload, err := json.Marshal(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, changedPayload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadManagedConfiguration(configPath); err == nil || !strings.Contains(err.Error(), "baseline binding conflicts") {
+		t.Fatalf("baseline relocation error=%v", err)
+	}
+	if _, err := os.Lstat(attackerDatabase); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("alternate database was created: %v", err)
+	}
+	boundConfig, boundDatabase, bound, err := sqlitestore.InspectConfigurationBindingReadOnly(context.Background(), databasePath)
+	if err != nil || !bound || boundConfig != configPath || boundDatabase != databasePath {
+		t.Fatalf("bound config=%q database=%q bound=%t err=%v", boundConfig, boundDatabase, bound, err)
 	}
 }
 

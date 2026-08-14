@@ -221,7 +221,9 @@ type ConfigurationGenerationStore interface {
 	ObserveConfigurationDrift(context.Context, ConfigurationDriftObservation) (bool, error)
 	ListConfigurationGenerations(context.Context) ([]ConfigurationGeneration, error)
 	ConfigurationRawPruneCandidates(context.Context, int) ([]string, error)
-	MarkConfigurationRawPruned(context.Context, string) error
+	ConfigurationRawPruneClaims(context.Context) ([]string, error)
+	ClaimConfigurationRawPrune(context.Context, string) (bool, error)
+	CompleteConfigurationRawPrune(context.Context, string, bool) error
 	ListNonterminalRuns(context.Context) ([]Run, error)
 }
 
@@ -233,14 +235,20 @@ type ConfigurationFileAuthority interface {
 	RetainRaw(string, []byte) error
 	ReadRaw(string, int64) ([]byte, error)
 	HasRaw(string, int64) bool
+	PublishBaselineBinding(ValidatedConfigurationCandidate) error
+	AcquireReplacement(string) (ConfigurationReplacementLock, bool, error)
 	ReplaceLive(string, []byte, []byte) error
 	ReconcileReplacement(string, []byte, []byte) ([]byte, ValidatedConfigurationCandidate, error)
 	RemoveRaw(string) error
 	PublishLocator(string) error
 }
 
+type ConfigurationReplacementLock interface {
+	Release() error
+}
+
 type ConfigurationRuntimeObserver interface {
-	Observe(context.Context, Requester, time.Time) (RuntimeObservation, error)
+	ObserveConfigurationRuntime(context.Context, time.Time) (RuntimeObservation, error)
 }
 
 type ConfigurationApplyCommand struct {

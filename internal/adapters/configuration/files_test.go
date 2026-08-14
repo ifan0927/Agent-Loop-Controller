@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 )
 
 func TestPrivateRawLocatorAndAtomicLiveReplacement(t *testing.T) {
@@ -52,6 +54,48 @@ func TestPrivateRawLocatorAndAtomicLiveReplacement(t *testing.T) {
 	}
 	if info, err := os.Lstat(configPath); err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("live mode=%v err=%v", info.Mode(), err)
+	}
+}
+
+func TestBaselineBindingIsPrivateExclusiveAndIdempotent(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	configPath := filepath.Join(root, "controller.json")
+	if err := os.WriteFile(configPath, []byte("baseline"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := application.ValidatedConfigurationCandidate{Digest: configurationDigest([]byte("baseline")), Size: int64(len("baseline")), SchemaVersion: 5, DatabasePath: filepath.Join(root, "controller.db")}
+	publicationErrors := make(chan error, 8)
+	var publications sync.WaitGroup
+	for index := 0; index < 8; index++ {
+		publications.Add(1)
+		go func() {
+			defer publications.Done()
+			publicationErrors <- files.PublishBaselineBinding(candidate)
+		}()
+	}
+	publications.Wait()
+	close(publicationErrors)
+	for err := range publicationErrors {
+		if err != nil {
+			t.Fatalf("idempotent publication: %v", err)
+		}
+	}
+	binding, found, err := ReadBaselineBinding(configPath)
+	if err != nil || !found || binding.DatabasePath != candidate.DatabasePath || binding.Digest != candidate.Digest || binding.Size != candidate.Size || binding.Schema != candidate.SchemaVersion {
+		t.Fatalf("binding=%+v found=%t err=%v", binding, found, err)
+	}
+	info, err := os.Lstat(filepath.Join(files.root, "baseline.json"))
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || linkCount(info) != 1 {
+		t.Fatalf("binding info=%+v err=%v", info, err)
+	}
+	conflict := candidate
+	conflict.DatabasePath = filepath.Join(root, "alternate.db")
+	if err := files.PublishBaselineBinding(conflict); err == nil {
+		t.Fatal("conflicting baseline binding was accepted")
 	}
 }
 

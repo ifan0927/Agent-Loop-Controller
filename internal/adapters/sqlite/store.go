@@ -547,6 +547,10 @@ var migrationV31 = []string{
 		observed_at TEXT NOT NULL,
 		UNIQUE(event_type,generation_id,operation_id,digest,evidence_digest)
 	)`,
+	`CREATE TABLE configuration_raw_prune_claims (
+		digest TEXT PRIMARY KEY,
+		claimed_at TEXT NOT NULL
+	)`,
 }
 
 func backfillOperationReceiptsV30Tx(ctx context.Context, tx *sql.Tx) error {

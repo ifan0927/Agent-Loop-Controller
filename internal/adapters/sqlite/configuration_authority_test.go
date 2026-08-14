@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 func removeConfigurationV31(t *testing.T, db *sql.DB) {
 	t.Helper()
 	for _, statement := range []string{
+		`DROP TABLE IF EXISTS configuration_raw_prune_claims`,
 		`DROP TABLE IF EXISTS configuration_convergence_events`,
 		`DROP TABLE IF EXISTS configuration_apply_intents`,
 		`DROP TABLE IF EXISTS configuration_authority`,
@@ -210,6 +212,69 @@ func TestConfigurationReceiptSettlementFailureRollsBackDesiredAtomically(t *test
 	}
 }
 
+func TestConfigurationRawPruneClaimAndApplyAcceptanceAreMutuallyExclusive(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	operator := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
+	databasePath := filepath.Join(t.TempDir(), "owned.db")
+	input := application.ConfigurationBaselineInput{Candidate: application.ValidatedConfigurationCandidate{Digest: strings.Repeat("a", 64), Size: 42, SchemaVersion: 5, DatabasePath: databasePath, Operator: operator}, CanonicalConfigPath: filepath.Join(t.TempDir(), "controller.json"), ObservedAt: now}
+	if err := store.PrepareConfigurationBaseline(ctx, input); err != nil {
+		t.Fatal(err)
+	}
+	authority, _, err := store.AdoptConfigurationBaseline(ctx, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchorIndex := 0
+	begin := func(digest string, at time.Time) (application.ConfigurationGeneration, error) {
+		anchorIndex++
+		anchor := strings.Repeat(string(rune('0'+anchorIndex)), 64)
+		receipt := application.NewOperationReceipt(application.OperationReceiptInput{OperationType: application.OperationApplyConfiguration, Scope: application.ScopeController, TargetID: application.ConfigurationTargetID, Requester: operator, RequestDigest: digest, ExpectedAuthorityDigest: authority.Desired.Digest, OperationAnchorDigest: anchor, TargetBindingDigest: strings.Repeat("d", 64), AcceptedAt: at})
+		generation, _, _, beginErr := store.BeginConfigurationApply(ctx, application.ConfigurationApplyAcceptance{ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Candidate: application.ValidatedConfigurationCandidate{Digest: digest, Size: 43, SchemaVersion: 5, DatabasePath: databasePath, Operator: operator}, Requester: operator, Receipt: receipt, AcceptedAt: at})
+		return generation, beginErr
+	}
+	commit := func(generation application.ConfigurationGeneration, at time.Time) {
+		settled, _, _, settleErr := store.SettleConfigurationApply(ctx, application.ConfigurationApplySettlement{GenerationID: generation.GenerationID, ParentID: generation.ParentID, OperationID: generation.OperationID, Outcome: application.ConfigurationApplyCommitted, Reason: application.ConfigurationReasonRestartRequired, EvidenceDigest: strings.Repeat("9", 64), SettledAt: at})
+		if settleErr != nil {
+			t.Fatal(settleErr)
+		}
+		authority = settled
+	}
+	oldDigest := strings.Repeat("b", 64)
+	old, err := begin(oldDigest, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit(old, now.Add(2*time.Second))
+	current, err := begin(strings.Repeat("c", 64), now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit(current, now.Add(4*time.Second))
+	claimed, err := store.ClaimConfigurationRawPrune(ctx, oldDigest)
+	if err != nil || !claimed {
+		t.Fatalf("claimed=%t err=%v", claimed, err)
+	}
+	if _, err := begin(oldDigest, now.Add(5*time.Second)); !errors.Is(err, application.ErrConfigurationAuthorityConflict) {
+		t.Fatalf("apply during prune claim error=%v", err)
+	}
+	if err := store.CompleteConfigurationRawPrune(ctx, oldDigest, true); err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := begin(strings.Repeat("e", 64), now.Add(6*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := store.ClaimConfigurationRawPrune(ctx, accepted.Digest); err != nil || claimed {
+		t.Fatalf("accepted digest prune claimed=%t err=%v", claimed, err)
+	}
+}
+
 func TestConfigurationApplyAndAdmissionShareSQLiteCASAuthority(t *testing.T) {
 	newReady := func(t *testing.T) (*Store, application.ConfigurationAuthority, domain.GitHubUserIdentity, string) {
 		t.Helper()
@@ -271,6 +336,24 @@ func TestConfigurationApplyAndAdmissionShareSQLiteCASAuthority(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, created, err := store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: "run-after-drift", IssueID: "IFAN-4", IdempotencyKey: "run-after-drift", SourceRevision: "source", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: `{}`, BaseBranch: "main", WorkingBranch: "ifan/run"}, ConfigurationAuthority: token})
+		if err == nil || created {
+			t.Fatalf("created=%t err=%v", created, err)
+		}
+	})
+
+	t.Run("cleared drift does not revive prior admission token", func(t *testing.T) {
+		store, authority, _, _ := newReady(t)
+		token := application.ConfigurationAdmissionAuthority{GenerationID: authority.Desired.GenerationID, Digest: authority.Desired.Digest, AuthorityVersion: authority.Version, ValidThrough: time.Now().UTC().Add(time.Minute)}
+		entered := application.ConfigurationDriftObservation{ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, ObservedDigest: strings.Repeat("f", 64), Drifted: true, Reason: application.ConfigurationReasonExternalDrift, ObservedAt: time.Now().UTC()}
+		if _, err := store.ObserveConfigurationDrift(context.Background(), entered); err != nil {
+			t.Fatal(err)
+		}
+		cleared := entered
+		cleared.Drifted, cleared.Reason, cleared.ObservedDigest, cleared.ObservedAt = false, application.ConfigurationReasonReady, authority.Desired.Digest, entered.ObservedAt.Add(time.Second)
+		if _, err := store.ObserveConfigurationDrift(context.Background(), cleared); err != nil {
+			t.Fatal(err)
+		}
+		_, created, err := store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: "run-after-drift-clear", IssueID: "IFAN-5", IdempotencyKey: "run-after-drift-clear", SourceRevision: "source", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: `{}`, BaseBranch: "main", WorkingBranch: "ifan/run"}, ConfigurationAuthority: token})
 		if err == nil || created {
 			t.Fatalf("created=%t err=%v", created, err)
 		}

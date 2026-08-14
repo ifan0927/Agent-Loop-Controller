@@ -77,6 +77,35 @@ func loadManagedConfiguration(path string) (bootstrap.Bootstrap, error) {
 		}
 		return loaded, nil
 	}
+	baselineBinding, prepared, err := configurationadapter.ReadBaselineBinding(path)
+	if err != nil {
+		return bootstrap.Bootstrap{}, err
+	}
+	if prepared {
+		boundConfig, boundDatabase, bound, inspectErr := sqlitestore.InspectConfigurationBindingReadOnly(context.Background(), baselineBinding.DatabasePath)
+		if inspectErr != nil || bound && (boundConfig != path || boundDatabase != baselineBinding.DatabasePath) {
+			return bootstrap.Bootstrap{}, errors.New("configuration baseline binding conflicts")
+		}
+		payload, candidate, readErr := files.ReadLive()
+		loaded, loadErr := bootstrap.ValidateBytes(path, payload)
+		if readErr != nil || loadErr != nil || candidate.DatabasePath != baselineBinding.DatabasePath || candidate.Digest != baselineBinding.Digest || candidate.Size != baselineBinding.Size || candidate.SchemaVersion != baselineBinding.Schema || loaded.Controller.DatabasePath != baselineBinding.DatabasePath || loaded.Digest != baselineBinding.Digest {
+			return bootstrap.Bootstrap{}, errors.New("configuration baseline binding conflicts")
+		}
+		store, openErr := sqlitestore.Open(baselineBinding.DatabasePath)
+		if openErr != nil {
+			return bootstrap.Bootstrap{}, errors.New("configuration authority store is unavailable")
+		}
+		defer store.Close()
+		service, serviceErr := application.NewConfigurationService(store, files, nil)
+		if serviceErr != nil {
+			return bootstrap.Bootstrap{}, serviceErr
+		}
+		authority, initializeErr := service.Initialize(context.Background())
+		if initializeErr != nil || authority.Desired.Digest != baselineBinding.Digest {
+			return bootstrap.Bootstrap{}, errors.New("configuration baseline conflicts")
+		}
+		return loaded, nil
+	}
 
 	loaded, err := bootstrap.Load(path)
 	if err != nil {
@@ -106,11 +135,7 @@ func configuredConvergenceService(store *sqlitestore.Store, loaded bootstrap.Boo
 	if err != nil {
 		return nil, err
 	}
-	authorizer, err := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: loaded.Controller.Operator})
-	if err != nil {
-		return application.NewConfigurationService(store, files, nil)
-	}
-	runtime, err := application.NewRuntimeObservationService(workerHeartbeatReader{configPath: loaded.Path, expectedUID: os.Getuid(), expectedProcessID: expectedProcessID, supervisorProcessRequired: supervisorRequired}, workerProcessIdentityObserver{}, authorizer)
+	runtime, err := application.NewConfigurationRuntimeObservationService(workerHeartbeatReader{configPath: loaded.Path, expectedUID: os.Getuid(), expectedProcessID: expectedProcessID, supervisorProcessRequired: supervisorRequired}, workerProcessIdentityObserver{})
 	if err != nil {
 		return nil, err
 	}

@@ -250,7 +250,7 @@ func TestLoadVersionFourDerivesDeterministicMigrationOperator(t *testing.T) {
 	}
 }
 
-func TestLegacyMigrationOperatorDoesNotRequireCrossRepositoryActorIntersection(t *testing.T) {
+func TestLegacyMigrationOperatorNeverElevatesRepositoryOnlyActor(t *testing.T) {
 	root := canonicalTempDir(t)
 	repository := func(name, login string, databaseID int64) localregistry.Repository {
 		base := filepath.Join(root, name)
@@ -267,7 +267,7 @@ func TestLegacyMigrationOperatorDoesNotRequireCrossRepositoryActorIntersection(t
 		t.Fatal(err)
 	}
 	operator, err := deriveLegacyConfiguredOperator(registry)
-	if err != nil || operator.Login != "alpha" || operator.DatabaseID != 1 {
+	if err != nil || operator.Validate() == nil {
 		t.Fatalf("operator=%+v err=%v", operator, err)
 	}
 }

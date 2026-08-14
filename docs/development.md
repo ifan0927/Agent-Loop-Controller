@@ -313,7 +313,7 @@ The acceptance matrix requires:
 | Boundary | Required evidence |
 | --- | --- |
 | Automatic admission | Bounded scan, priority selection, atomic run/slot/permit reservation, exact Todo-to-In-Progress mutation, and one nonterminal run per repository |
-| Configuration authority | Same-byte prepared baseline, read-only locator binding, v31 migration, CAS/no-op/replay, intent-before-exchange crash matrix, captured-parent/fsync proof, raw retention, drift/effective convergence, and transactional admission fencing |
+| Configuration authority | Same-byte filesystem binding/database-anchor/locator baseline crash matrix, read-only binding proof, v31 migration, CAS/no-op/concurrent replay, intent-before-exchange crash matrix, captured-parent/fsync proof, durable prune claims, legacy non-elevation, manual-supervisor heartbeat, drift/effective convergence, and transactional admission fencing |
 | Bounded concurrency | Generic capacity above two, same-repository exclusion, drain-on-reduction, sibling failure isolation, and restart reconstruction |
 | Implementation | Owned worktree, resumable session, exact candidate, successful verifier batch |
 | Internal review | Fresh independent read-only review bound to candidate head; after repair, exact expected-finding dispositions cover both repair and full branch deltas |
@@ -339,8 +339,9 @@ controller process. Cover at least:
 - verifier start/interruption and full batch recording;
 - fresh-review findings atomic handoff;
 - Linear admission mutation intent/observation;
-- configuration raw staging, baseline-anchor/locator publication, intent
-  acceptance, captured-parent exchange/fsync/reread,
+- configuration raw staging, filesystem baseline binding, database anchor,
+  locator publication, prune claim/removal, intent acceptance, captured-parent
+  exchange/fsync/reread,
   desired settlement, effective observation, and retention pruning;
 - push, PR create/adopt, review reply, and merge intent/observation;
 - pending CI/approval/thread resolution polling;

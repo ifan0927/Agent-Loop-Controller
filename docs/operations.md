@@ -56,6 +56,7 @@ The default macOS controller root is:
   controller.json       secret-free configuration, mode 0600
   controller.db         authoritative workflow state and evidence
   authority/            private configuration authority, mode 0700
+    baseline.json       immutable pre-locator baseline binding, mode 0600
     locator.json        canonical config/database binding, mode 0600
     generations/        bounded raw recovery evidence, mode 0700
       <sha256>.json     immutable exact generation bytes, mode 0600
@@ -97,21 +98,26 @@ when both tuples identify the same human. It must also be present in every
 current repository profile's allowed login and trusted immutable actor policy.
 Issue content, Linear fields, and CLI repository selectors cannot supply or
 override it. For a legacy version 1 through 4 baseline, the Controller derives
-one deterministic migration operator from the complete immutable actors
-already trusted by its repository profiles. This migration-only authority does
-not retroactively change legacy run/query authorization; it may authorize the
-exact current-schema transition, after which version 5's explicit
-`controller.operator` is authoritative.
+a migration operator only if one immutable actor is already trusted by every
+repository profile. This migration-only authority does not retroactively change
+legacy run/query authorization; it may authorize the exact current-schema
+transition, after which version 5's explicit `controller.operator` is
+authoritative. If legacy profiles have no common actor, startup and admission
+convergence remain available, but configuration apply/history has no
+controller-scope requester; the Controller never promotes an actor trusted by
+only one repository.
 
 The first production worker or management composition adopts an already-valid
 live file exactly once as the baseline generation. It does not rewrite the
 file. `config validate` and `config inspect` remain offline and never open
 SQLite, create the `authority/` directory, reconcile an apply, or observe a
-worker. Baseline preparation first records the exact live-path/database/digest
-binding in that database, then publishes the private locator, and finally
-settles the generation. After a crash, startup accepts that locator only after
-a read-only schema-and-binding proof; it never creates or migrates an unproven
-locator target. After baseline, the locator and retained desired bytes bind the
+worker. Baseline preparation first publishes an immutable private binding
+intent for the exact live path, database path, digest, size, and schema. It then
+records the matching anchor in that database, publishes the private locator,
+and finally settles the generation. After a crash, startup accepts either the
+pre-locator intent or locator only after a read-only schema-and-binding proof;
+it never creates or migrates an unproven target or follows a newly edited live
+database path. After baseline, the locator and retained desired bytes bind the
 canonical configuration to its existing database. An alternate configuration
 path, database relocation, invalid live file, or out-of-band digest change is a
 conflict; startup never re-baselines, follows an edited database path, adopts
@@ -121,9 +127,9 @@ The Controller now owns internal generation/CAS apply and convergence
 contracts, but this milestone intentionally exposes no raw apply, draft,
 preview, rollback, or drift-repair CLI. A committed future typed configuration
 change requires the existing explicit worker restart procedure because workers
-load configuration only at process startup. Raw generation files and locator
-contents are private recovery evidence: do not read, copy, edit, prune, or use
-them as an operator API.
+load configuration only at process startup. Raw generation files, baseline
+binding, and locator contents are private recovery evidence: do not read, copy,
+edit, prune, or use them as an operator API.
 
 Repository profiles are selectable one at a time per run. They may coexist in
 one configuration, but paths must not overlap and a run freezes the selected
@@ -604,10 +610,13 @@ deadline wakes the worker even when the admission scan cadence is slower.
 Human waits are not repeatedly driven. Manual `continue`, `controller run`, and
 `controller drive` use the same heavy permit authority. A direct driver and the
 automatic worker are mutually excluded by the database-directory process lock,
-which also fences restart-only permit adoption. The worker reports
-bounded worker and queue-decision evidence;
+which also fences restart-only permit adoption. While holding that lock,
+`linear start` and `controller run` act as the sole manual supervisor and
+publish their own process-bound heartbeat before checking new-admission
+convergence; heartbeat failure cancels their work and fails the command. The
+automatic worker reports bounded worker and queue-decision evidence;
 `status` is `running`, `driving`, `parked`, or `stopping`, and a stopping result
-includes `previous_status`. The worker atomically replaces the private
+includes `previous_status`. The active supervisor atomically replaces the private
 `<controller-config>.worker-status.json` heartbeat after initialization, on
 each activity transition, and every fixed 15 seconds even while quiet or
 parked. The current schema binds the worker instance, PID, OS process-start

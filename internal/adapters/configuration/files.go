@@ -22,6 +22,7 @@ import (
 const (
 	maximumConfigurationBytes = 256 << 10
 	locatorVersion            = 1
+	baselineBindingVersion    = 1
 )
 
 type Files struct {
@@ -37,6 +38,30 @@ type locator struct {
 	Version      int    `json:"version"`
 	ConfigPath   string `json:"config_path"`
 	DatabasePath string `json:"database_path"`
+}
+
+type BaselineBinding struct {
+	Version      int    `json:"version"`
+	ConfigPath   string `json:"config_path"`
+	DatabasePath string `json:"database_path"`
+	Digest       string `json:"digest"`
+	Size         int64  `json:"size"`
+	Schema       int    `json:"schema_version"`
+}
+
+type replacementLock struct{ file *os.File }
+
+func (l *replacementLock) Release() error {
+	if l == nil || l.file == nil {
+		return nil
+	}
+	unlockErr := syscall.Flock(int(l.file.Fd()), syscall.LOCK_UN)
+	closeErr := l.file.Close()
+	l.file = nil
+	if unlockErr != nil {
+		return unlockErr
+	}
+	return closeErr
 }
 
 func NewFiles(configPath string) (*Files, error) {
@@ -108,9 +133,13 @@ func (f *Files) RetainRaw(digest string, payload []byte) error {
 }
 
 func readRetainedAfterPublication(path string, uid int) ([]byte, error) {
+	return readAfterExclusivePublication(path, uid, maximumConfigurationBytes)
+}
+
+func readAfterExclusivePublication(path string, uid, limit int) ([]byte, error) {
 	var last error
 	for attempt := 0; attempt < 32; attempt++ {
-		payload, err := readPrivateRegular(path, uid, maximumConfigurationBytes, true)
+		payload, err := readPrivateRegular(path, uid, limit, true)
 		if err == nil || errors.Is(err, os.ErrNotExist) {
 			return payload, err
 		}
@@ -131,6 +160,40 @@ func (f *Files) HasRaw(digest string, size int64) bool {
 	return err == nil && int64(len(payload)) == size && configurationDigest(payload) == digest
 }
 
+func (f *Files) PublishBaselineBinding(candidate application.ValidatedConfigurationCandidate) error {
+	value := BaselineBinding{Version: baselineBindingVersion, ConfigPath: f.configPath, DatabasePath: candidate.DatabasePath, Digest: candidate.Digest, Size: candidate.Size, Schema: candidate.SchemaVersion}
+	if validateBaselineBinding(value) != nil {
+		return errors.New("configuration baseline binding is invalid")
+	}
+	if err := f.ensureRoots(); err != nil {
+		return err
+	}
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return errors.New("configuration baseline binding is invalid")
+	}
+	payload = append(payload, '\n')
+	path := filepath.Join(f.root, "baseline.json")
+	if existing, err := readAfterExclusivePublication(path, f.uid, 4096); err == nil {
+		current, decodeErr := decodeBaselineBinding(existing)
+		if decodeErr != nil || current != value {
+			return errors.New("configuration baseline binding conflicts")
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return errors.New("configuration baseline binding is unsafe")
+	}
+	if err := atomicPrivateWrite(path, payload, f.uid, true); !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	existing, readErr := readAfterExclusivePublication(path, f.uid, 4096)
+	current, decodeErr := decodeBaselineBinding(existing)
+	if readErr != nil || decodeErr != nil || current != value {
+		return errors.New("configuration baseline binding conflicts")
+	}
+	return nil
+}
+
 func (f *Files) ReadRaw(digest string, size int64) ([]byte, error) {
 	if !validDigest(digest) || size < 0 || size > maximumConfigurationBytes {
 		return nil, errors.New("configuration raw evidence is invalid")
@@ -140,6 +203,34 @@ func (f *Files) ReadRaw(digest string, size int64) ([]byte, error) {
 		return nil, errors.New("configuration raw evidence is unavailable")
 	}
 	return payload, nil
+}
+
+func (f *Files) AcquireReplacement(operationID string) (application.ConfigurationReplacementLock, bool, error) {
+	stage, err := f.replacementStagePath(operationID)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := f.ensureRoots(); err != nil {
+		return nil, false, err
+	}
+	path := filepath.Join(f.root, strings.Replace(filepath.Base(stage), "swap", "lock", 1))
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, false, errors.New("configuration replacement lock is unavailable")
+	}
+	info, statErr := file.Stat()
+	if statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || !ownedBy(info, f.uid) || linkCount(info) != 1 {
+		file.Close()
+		return nil, false, errors.New("configuration replacement lock is unsafe")
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		file.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, false, nil
+		}
+		return nil, false, errors.New("configuration replacement lock is unavailable")
+	}
+	return &replacementLock{file: file}, true, nil
 }
 
 func (f *Files) ReplaceLive(operationID string, expected, payload []byte) error {
@@ -281,7 +372,7 @@ func (f *Files) PublishLocator(databasePath string) error {
 	}
 	payload = append(payload, '\n')
 	path := filepath.Join(f.root, "locator.json")
-	if existing, err := readPrivateRegular(path, f.uid, 4096, true); err == nil {
+	if existing, err := readAfterExclusivePublication(path, f.uid, 4096); err == nil {
 		current, decodeErr := decodeLocator(existing)
 		if decodeErr != nil || current != value {
 			return errors.New("configuration authority locator conflicts")
@@ -290,7 +381,15 @@ func (f *Files) PublishLocator(databasePath string) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return errors.New("configuration authority locator is unsafe")
 	}
-	return atomicPrivateWrite(path, payload, f.uid, true)
+	if err := atomicPrivateWrite(path, payload, f.uid, true); !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	existing, readErr := readAfterExclusivePublication(path, f.uid, 4096)
+	current, decodeErr := decodeLocator(existing)
+	if readErr != nil || decodeErr != nil || current != value {
+		return errors.New("configuration authority locator conflicts")
+	}
+	return nil
 }
 
 // ReadLocator resolves only the fixed locator beside the requested canonical
@@ -313,6 +412,42 @@ func ReadLocator(configPath string) (string, string, bool, error) {
 		return "", "", false, errors.New("configuration authority locator conflicts")
 	}
 	return value.ConfigPath, value.DatabasePath, true, nil
+}
+
+func ReadBaselineBinding(configPath string) (BaselineBinding, bool, error) {
+	files, err := NewFiles(configPath)
+	if err != nil {
+		return BaselineBinding{}, false, err
+	}
+	payload, err := readPrivateRegular(filepath.Join(files.root, "baseline.json"), files.uid, 4096, true)
+	if errors.Is(err, os.ErrNotExist) {
+		return BaselineBinding{}, false, nil
+	}
+	if err != nil {
+		return BaselineBinding{}, false, errors.New("configuration baseline binding is unsafe")
+	}
+	value, err := decodeBaselineBinding(payload)
+	if err != nil || value.ConfigPath != configPath {
+		return BaselineBinding{}, false, errors.New("configuration baseline binding conflicts")
+	}
+	return value, true, nil
+}
+
+func decodeBaselineBinding(payload []byte) (BaselineBinding, error) {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	var value BaselineBinding
+	if err := decoder.Decode(&value); err != nil || decoder.Decode(&struct{}{}) != io.EOF || validateBaselineBinding(value) != nil {
+		return BaselineBinding{}, errors.New("invalid baseline binding")
+	}
+	return value, nil
+}
+
+func validateBaselineBinding(value BaselineBinding) error {
+	if value.Version != baselineBindingVersion || !filepath.IsAbs(value.ConfigPath) || filepath.Clean(value.ConfigPath) != value.ConfigPath || !filepath.IsAbs(value.DatabasePath) || filepath.Clean(value.DatabasePath) != value.DatabasePath || !validDigest(value.Digest) || value.Size < 0 || value.Size > maximumConfigurationBytes || value.Schema < 1 || value.Schema > bootstrap.CurrentVersion {
+		return errors.New("invalid baseline binding")
+	}
+	return nil
 }
 
 func decodeLocator(payload []byte) (locator, error) {

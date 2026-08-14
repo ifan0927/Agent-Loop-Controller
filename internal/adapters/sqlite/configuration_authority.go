@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
 const configurationGenerationSelect = `SELECT generation_id,COALESCE(parent_generation_id,0),digest,target_size,schema_version,origin,requester_login,requester_database_id,requester_node_id,requester_actor_type,configured_operator_login,configured_operator_database_id,configured_operator_node_id,configured_operator_actor_type,COALESCE(operation_id,''),lifecycle,raw_retained,created_at,committed_at,effective_at,superseded_at,settled_at,reason_code FROM configuration_generations`
@@ -105,7 +106,8 @@ func (s *Store) PrepareConfigurationBaseline(ctx context.Context, input applicat
 }
 
 func validateConfigurationBaselineInput(input application.ConfigurationBaselineInput) error {
-	if input.ObservedAt.IsZero() || !validConfigurationMetadata(input.Candidate.Digest, input.Candidate.Size, input.Candidate.SchemaVersion) || strings.TrimSpace(input.CanonicalConfigPath) == "" || strings.TrimSpace(input.Candidate.DatabasePath) == "" || input.Candidate.Operator.Validate() != nil {
+	legacyWithoutOperator := input.Candidate.SchemaVersion < 5 && input.Candidate.Operator == (domain.GitHubUserIdentity{})
+	if input.ObservedAt.IsZero() || !validConfigurationMetadata(input.Candidate.Digest, input.Candidate.Size, input.Candidate.SchemaVersion) || strings.TrimSpace(input.CanonicalConfigPath) == "" || strings.TrimSpace(input.Candidate.DatabasePath) == "" || input.Candidate.Operator.Validate() != nil && !legacyWithoutOperator {
 		return errors.New("configuration baseline input is invalid")
 	}
 	return nil
@@ -188,6 +190,13 @@ func (s *Store) BeginConfigurationApply(ctx context.Context, input application.C
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, application.ErrConfigurationApplyInProgress
 	}
 	if authority.Desired.GenerationID != input.ExpectedGenerationID || authority.Desired.Digest != input.ExpectedDigest || authority.DatabasePath != input.Candidate.DatabasePath {
+		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, application.ErrConfigurationAuthorityConflict
+	}
+	var pruneClaim int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM configuration_raw_prune_claims WHERE digest=?`, input.Candidate.Digest).Scan(&pruneClaim); err != nil {
+		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, err
+	}
+	if pruneClaim != 0 {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, application.ErrConfigurationAuthorityConflict
 	}
 	runs, err := listNonterminalRunsQuery(ctx, tx)
@@ -446,6 +455,11 @@ func (s *Store) ObserveConfigurationDrift(ctx context.Context, observation appli
 	if _, err := tx.ExecContext(ctx, `INSERT INTO configuration_convergence_events(event_type,generation_id,digest,reason_code,evidence_digest,observed_at) VALUES(?,?,?,?,?,?)`, eventType, observation.ExpectedGenerationID, observation.ObservedDigest, string(observation.Reason), evidence, formatTime(observation.ObservedAt)); err != nil {
 		return false, err
 	}
+	if result, err := tx.ExecContext(ctx, `UPDATE configuration_authority SET authority_version=authority_version+1,updated_at=? WHERE authority_id=1 AND desired_generation_id=?`, formatTime(observation.ObservedAt), observation.ExpectedGenerationID); err != nil {
+		return false, err
+	} else if changed, rowsErr := result.RowsAffected(); rowsErr != nil || changed != 1 {
+		return false, application.ErrConfigurationAuthorityConflict
+	}
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
@@ -519,18 +533,91 @@ func (s *Store) ConfigurationRawPruneCandidates(ctx context.Context, keep int) (
 	return result, nil
 }
 
-func (s *Store) MarkConfigurationRawPruned(ctx context.Context, digest string) error {
-	if !validConfigurationDigest(digest) {
-		return errors.New("configuration raw digest is invalid")
+func (s *Store) ConfigurationRawPruneClaims(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT digest FROM configuration_raw_prune_claims ORDER BY claimed_at,digest`)
+	if err != nil {
+		return nil, err
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE configuration_generations SET raw_retained=0 WHERE digest=? AND raw_retained=1 AND lifecycle IN ('superseded','failed') AND generation_id<>(SELECT desired_generation_id FROM configuration_authority WHERE authority_id=1) AND generation_id NOT IN (SELECT generation_id FROM configuration_apply_intents WHERE status IN ('accepted','ambiguous'))`, digest)
+	defer rows.Close()
+	var digests []string
+	for rows.Next() {
+		var digest string
+		if err := rows.Scan(&digest); err != nil {
+			return nil, err
+		}
+		digests = append(digests, digest)
+	}
+	return digests, rows.Err()
+}
+
+func (s *Store) ClaimConfigurationRawPrune(ctx context.Context, digest string) (bool, error) {
+	if !validConfigurationDigest(digest) {
+		return false, errors.New("configuration raw prune digest is invalid")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var existing int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM configuration_raw_prune_claims WHERE digest=?`, digest).Scan(&existing); err != nil {
+		return false, err
+	}
+	if existing != 0 {
+		return true, tx.Commit()
+	}
+	protected, err := configurationRawProtectedTx(ctx, tx, digest)
+	if err != nil || protected {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO configuration_raw_prune_claims(digest,claimed_at) VALUES(?,?)`, digest, nowText()); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+func (s *Store) CompleteConfigurationRawPrune(ctx context.Context, digest string, removed bool) error {
+	if !validConfigurationDigest(digest) {
+		return errors.New("configuration raw prune digest is invalid")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if changed, err := result.RowsAffected(); err != nil || changed == 0 {
-		return application.ErrConfigurationAuthorityConflict
+	defer tx.Rollback()
+	var claimed int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM configuration_raw_prune_claims WHERE digest=?`, digest).Scan(&claimed); err != nil {
+		return err
 	}
-	return nil
+	if claimed == 0 {
+		return tx.Commit()
+	}
+	if removed {
+		protected, err := configurationRawProtectedTx(ctx, tx, digest)
+		if err != nil {
+			return err
+		}
+		if protected {
+			return application.ErrConfigurationAuthorityConflict
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE configuration_generations SET raw_retained=0 WHERE digest=? AND lifecycle IN ('superseded','failed')`, digest); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM configuration_raw_prune_claims WHERE digest=?`, digest); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func configurationRawProtectedTx(ctx context.Context, tx *sql.Tx, digest string) (bool, error) {
+	var protected int
+	err := tx.QueryRowContext(ctx, `SELECT CASE WHEN
+		EXISTS(SELECT 1 FROM configuration_authority a JOIN configuration_generations g ON g.generation_id=a.desired_generation_id WHERE g.digest=?) OR
+		EXISTS(SELECT 1 FROM configuration_apply_intents WHERE status IN ('accepted','ambiguous') AND (parent_digest=? OR target_digest=?)) OR
+		EXISTS(SELECT 1 FROM configuration_generations WHERE digest=? AND lifecycle IN ('accepted','pending_restart','effective','ambiguous'))
+		THEN 1 ELSE 0 END`, digest, digest, digest, digest).Scan(&protected)
+	return protected != 0, err
 }
 
 func scanConfigurationGeneration(row rowScanner) (application.ConfigurationGeneration, error) {

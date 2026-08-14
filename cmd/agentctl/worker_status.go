@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/bootstrap"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 )
@@ -47,6 +48,63 @@ type workerStatusReporter struct {
 	hasLatest           bool
 	failed              error
 	publish             func(workerStatusSnapshot) error
+}
+
+type manualControllerHeartbeat struct {
+	cancel   context.CancelFunc
+	stopped  chan struct{}
+	failure  chan error
+	stopOnce sync.Once
+	stopErr  error
+}
+
+func startManualControllerHeartbeat(parent context.Context, configPath, configurationDigest string) (context.Context, *manualControllerHeartbeat, error) {
+	reporter, err := newWorkerStatusReporter(configPath, "manual-"+uuid.NewString(), version, configurationDigest)
+	if err != nil {
+		return nil, nil, errors.New("manual controller heartbeat is unavailable")
+	}
+	ticker := newWorkerHeartbeatTicker(application.WorkerHeartbeatCadence)
+	if ticker == nil || ticker.C() == nil {
+		return nil, nil, errors.New("manual controller heartbeat is unavailable")
+	}
+	if err := reporter.Observe(admissionWorkerResult{Status: workerStatusRunning}); err != nil {
+		ticker.Stop()
+		return nil, nil, err
+	}
+	ctx, cancel := context.WithCancel(parent)
+	heartbeat := &manualControllerHeartbeat{cancel: cancel, stopped: make(chan struct{}), failure: make(chan error, 1)}
+	go func() {
+		defer close(heartbeat.stopped)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C():
+				if err := reporter.Heartbeat(); err != nil {
+					heartbeat.failure <- err
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return ctx, heartbeat, nil
+}
+
+func (h *manualControllerHeartbeat) Stop() error {
+	if h == nil {
+		return nil
+	}
+	h.stopOnce.Do(func() {
+		h.cancel()
+		<-h.stopped
+		select {
+		case h.stopErr = <-h.failure:
+		default:
+		}
+	})
+	return h.stopErr
 }
 
 func newWorkerStatusReporter(configPath, instanceID, buildIdentity, configurationDigest string) (*workerStatusReporter, error) {

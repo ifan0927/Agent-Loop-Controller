@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -574,21 +573,18 @@ func deriveLegacyConfiguredOperator(registry localregistry.Registry) (domain.Git
 		return domain.GitHubUserIdentity{}, conflict("legacy configuration has no controller migration authority")
 	}
 	var candidates []domain.GitHubUserIdentity
-	seen := map[string]struct{}{}
-	for _, binding := range bindings {
-		for _, actor := range binding.OperatorIdentityPolicy.TrustedActors {
-			candidate := domain.GitHubUserIdentity{Login: actor.Login, DatabaseID: actor.DatabaseID, NodeID: actor.NodeID, ActorType: actor.Type}
-			key := strings.ToLower(candidate.Login) + "\x00" + candidate.NodeID + "\x00" + candidate.ActorType + "\x00" + strconv.FormatInt(candidate.DatabaseID, 10)
-			if candidate.Validate() == nil {
-				if _, exists := seen[key]; !exists {
-					seen[key] = struct{}{}
-					candidates = append(candidates, candidate)
-				}
-			}
+	for _, actor := range bindings[0].OperatorIdentityPolicy.TrustedActors {
+		candidate := domain.GitHubUserIdentity{Login: actor.Login, DatabaseID: actor.DatabaseID, NodeID: actor.NodeID, ActorType: actor.Type}
+		if candidate.Validate() == nil && operatorTrustedByEveryProfile(candidate, registry) {
+			candidates = append(candidates, candidate)
 		}
 	}
 	if len(candidates) == 0 {
-		return domain.GitHubUserIdentity{}, conflict("legacy configuration has no controller migration authority")
+		// A legacy file never declared Controller-wide authority. Preserve its
+		// repository-scoped admission semantics without elevating one repository's
+		// actor; configuration apply remains unavailable until a safe shared actor
+		// exists through an explicit future migration/recovery contract.
+		return domain.GitHubUserIdentity{}, nil
 	}
 	slices.SortFunc(candidates, func(left, right domain.GitHubUserIdentity) int {
 		if order := strings.Compare(strings.ToLower(left.Login), strings.ToLower(right.Login)); order != 0 {

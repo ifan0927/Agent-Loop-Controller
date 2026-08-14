@@ -484,8 +484,11 @@ Worker runtime liveness is a separate application contract from workload
 activity and configuration convergence. After strict configuration, process
 lock, credential topology, SQLite compatibility, supervisor fencing,
 scheduling reconciliation, and production dispatcher construction succeed,
-the worker publishes schema-v2 private heartbeat evidence immediately and on a
-fixed 15-second cadence. Activity transitions may publish immediately but do
+the active supervisor publishes schema-v2 private heartbeat evidence
+immediately and on a fixed 15-second cadence. This is normally the automatic
+worker; the mutually exclusive manual `linear start` and `controller run`
+supervisors publish the same process-bound evidence for their own lifetime.
+Activity transitions may publish immediately but do
 not reset that cadence. The single supervisor heartbeat covers all bounded
 repository dispatches; there is no per-run heartbeat. Publication failure
 cancels and joins dispatch and fails the worker nonzero, while SQLite workflow
@@ -509,9 +512,10 @@ never invents generation identity.
 Controller-owned configuration authority is established on the first
 production configuration/store composition. The bootstrap adapter validates
 one exact bounded byte payload, the private configuration adapter retains those
-same bytes, SQLite durably prepares the matching baseline binding, and only
-then may the private locator be published. Startup proves a locator target in
-read-only mode against that prepared binding before opening or migrating the
+same bytes and exclusively publishes a filesystem baseline-binding intent,
+SQLite durably prepares the matching database anchor, and only then may the
+private locator be published. Startup proves a locator or pre-locator binding
+target in read-only mode against that prepared binding before opening or migrating the
 database; SQLite then atomically assigns one baseline generation without
 rewriting the live file. The mode-`0600` locator beside the configuration binds
 the canonical live path to its owning database so a later invalid or
@@ -520,7 +524,10 @@ selected store. Raw
 generation payloads remain mode-`0600` beneath a current-user mode-`0700`
 authority directory; SQLite contains metadata, receipts, and sanitized events
 only. Current plus nine recent settled payloads are retained, while current and
-unresolved evidence are never pruned.
+unresolved evidence are never pruned. Deletion first acquires a durable digest
+claim in SQLite; apply acceptance checks that claim in its transaction, so a
+digest cannot become accepted while its raw leaf is being removed. Startup
+finishes interrupted claims idempotently.
 
 The presentation-independent apply service authorizes from the committed
 desired generation's configured operator, strictly validates current-schema
@@ -545,8 +552,9 @@ before reservation. Manual Linear admission checks before issue collection and
 again immediately before run creation. The second decision carries a
 generation/digest/authority-version token that SQLite validates in the same
 transaction as the new run or reservation. The token expires with the exact
-heartbeat freshness window, and a durable drift-entered transition invalidates
-older tokens. Apply acceptance uses the same SQLite write authority, so
+heartbeat freshness window, and every durable drift-entered or drift-cleared
+transition advances authority version and invalidates older tokens. Apply
+acceptance uses the same SQLite write authority, so
 admission cannot cross an accepted configuration change. Missing authority,
 pending restart, drift, unresolved apply,
 stale/offline runtime, and unavailable evidence fail closed without releasing
@@ -1021,14 +1029,17 @@ switches enable PR create, review reply, and squash merge writes.
 canonicalizes and cross-checks repositories and GitHub profiles, validates path
 isolation, derives stable digests, and produces a credential-safe readiness
 projection. Version 5 is current; older versions are compatibility inputs, not
-recommended templates. For a legacy baseline it deterministically derives a
-migration-only controller operator from the complete immutable trusted actors
-already configured across repository profiles. That authority does not alter
-legacy run/query authorization. Its same-byte validation seam is reused by baseline,
+recommended templates. For a legacy baseline it derives a migration-only
+controller operator only when the same immutable actor is already trusted by
+every repository profile. A disjoint legacy policy remains readable and can
+converge through the Controller's internal admission gate, but it supplies no
+controller-scope apply/history authority; a repository-only actor is never
+elevated. Existing legacy run/query authorization is unchanged. Its same-byte
+validation seam is reused by baseline,
 live reread, retained desired evidence, and current-schema apply validation.
-`internal/adapters/configuration` owns the trusted locator, immutable raw
-generation files, retention, captured-parent exchange evidence, and atomic live
-replacement; it does not expose a raw history API.
+`internal/adapters/configuration` owns the baseline-binding intent, trusted
+locator, immutable raw generation files, retention, captured-parent exchange
+evidence, and atomic live replacement; it does not expose a raw history API.
 
 ### Filesystem and artifact handling
 

@@ -122,7 +122,17 @@ func NewRuntimeObservationService(reader RuntimeHeartbeatReader, processes Runti
 	return &RuntimeObservationService{reader: reader, processes: processes, authorizer: authorizer}, nil
 }
 
+func NewConfigurationRuntimeObservationService(reader RuntimeHeartbeatReader, processes RuntimeProcessObserver) (*RuntimeObservationService, error) {
+	if reader == nil || processes == nil {
+		return nil, errors.New("configuration runtime observation dependencies are required")
+	}
+	return &RuntimeObservationService{reader: reader, processes: processes}, nil
+}
+
 func (s *RuntimeObservationService) Observe(ctx context.Context, requester Requester, now time.Time) (RuntimeObservation, error) {
+	if s == nil || s.authorizer == nil {
+		return RuntimeObservation{}, hiddenTargetError()
+	}
 	configured, err := s.authorizer.ResolveConfiguredRequester(requester)
 	if err != nil {
 		return RuntimeObservation{}, hiddenTargetError()
@@ -131,6 +141,17 @@ func (s *RuntimeObservationService) Observe(ctx context.Context, requester Reque
 	if err != nil || !scopes.HasController() {
 		return RuntimeObservation{}, hiddenTargetError()
 	}
+	if err := ctx.Err(); err != nil {
+		return RuntimeObservation{}, classifyServiceError(err)
+	}
+	evidence, state := s.reader.ReadRuntimeHeartbeat(ctx)
+	return s.classify(ctx, evidence, state, now.UTC()), nil
+}
+
+// ObserveConfigurationRuntime is Controller-internal evidence collection for
+// configuration convergence and admission fencing. Presentation queries must
+// continue through Observe so requester authorization remains mandatory.
+func (s *RuntimeObservationService) ObserveConfigurationRuntime(ctx context.Context, now time.Time) (RuntimeObservation, error) {
 	if err := ctx.Err(); err != nil {
 		return RuntimeObservation{}, classifyServiceError(err)
 	}

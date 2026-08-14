@@ -30,6 +30,21 @@ type configurationFilesFixture struct {
 	retainError    bool
 	removeError    bool
 	rereadError    bool
+	replacementMu  sync.Mutex
+	replaceStarted chan struct{}
+	replaceRelease chan struct{}
+	replaceCalls   int
+}
+
+type configurationFixtureLock struct{ mutex *sync.Mutex }
+
+func (l configurationFixtureLock) Release() error { l.mutex.Unlock(); return nil }
+
+func (f *configurationFilesFixture) AcquireReplacement(string) (application.ConfigurationReplacementLock, bool, error) {
+	if !f.replacementMu.TryLock() {
+		return nil, false, nil
+	}
+	return configurationFixtureLock{mutex: &f.replacementMu}, true, nil
 }
 
 func (f *configurationFilesFixture) CanonicalConfigPath() string { return f.path }
@@ -54,6 +69,22 @@ func TestLegacyConfigurationBaselineCanAuthorizeCurrentSchemaTransition(t *testi
 	}
 	if generations, err := store.ListConfigurationGenerations(context.Background()); err != nil || len(generations) != 2 {
 		t.Fatalf("generations=%+v err=%v", generations, err)
+	}
+}
+
+func TestLegacyConfigurationWithoutUniversalOperatorStillConverges(t *testing.T) {
+	service, _, files, runtime, _ := configurationServiceFixture(t)
+	files.baselineSchema = 4
+	files.operator = domain.GitHubUserIdentity{}
+	authority, err := service.Initialize(context.Background())
+	if err != nil || authority.Desired.ConfiguredOperator.Validate() == nil {
+		t.Fatalf("authority=%+v err=%v", authority, err)
+	}
+	now := time.Now().UTC()
+	runtime.observation = freshConfigurationRuntime(authority.Desired.Digest, now)
+	decision, err := service.CheckNewAdmission(context.Background())
+	if err != nil || !decision.Allowed || decision.Reason != application.ConfigurationReasonReady {
+		t.Fatalf("decision=%+v err=%v", decision, err)
 	}
 }
 func (f *configurationFilesFixture) ValidateCurrent(payload []byte) (application.ValidatedConfigurationCandidate, error) {
@@ -103,6 +134,21 @@ func (f *configurationFilesFixture) HasRaw(digest string, size int64) bool {
 }
 func (f *configurationFilesFixture) ReplaceLive(_ string, expected, payload []byte) error {
 	f.mu.Lock()
+	if !bytes.Equal(f.live, expected) {
+		f.mu.Unlock()
+		return errors.New("expected parent changed")
+	}
+	f.replaceCalls++
+	first := f.replaceCalls == 1
+	started, release := f.replaceStarted, f.replaceRelease
+	f.mu.Unlock()
+	if first && started != nil {
+		close(started)
+	}
+	if first && release != nil {
+		<-release
+	}
+	f.mu.Lock()
 	defer f.mu.Unlock()
 	if !bytes.Equal(f.live, expected) {
 		return errors.New("expected parent changed")
@@ -128,6 +174,52 @@ func (f *configurationFilesFixture) ReplaceLive(_ string, expected, payload []by
 		return nil
 	}
 }
+
+func TestConcurrentExactConfigurationReplayHasOneFilesystemMutation(t *testing.T) {
+	service, _, files, _, requester := configurationServiceFixture(t)
+	authority, err := service.Initialize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	files.replaceStarted = make(chan struct{})
+	files.replaceRelease = make(chan struct{})
+	command := application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: []byte("concurrent exact replay")}
+	firstResult := make(chan application.ConfigurationApplyResult, 1)
+	firstError := make(chan error, 1)
+	go func() {
+		result, applyErr := service.Apply(context.Background(), command)
+		firstResult <- result
+		firstError <- applyErr
+	}()
+	select {
+	case <-files.replaceStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first apply did not reach filesystem phase")
+	}
+	replayed, err := service.Apply(context.Background(), command)
+	if err != nil || replayed.Generation.State != application.ConfigurationGenerationAccepted || replayed.Receipt.Phase != application.OperationPhaseAccepted {
+		t.Fatalf("accepted replay=%+v err=%v", replayed, err)
+	}
+	close(files.replaceRelease)
+	select {
+	case err := <-firstError:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first apply did not finish")
+	}
+	first := <-firstResult
+	if first.Generation.GenerationID != replayed.Generation.GenerationID || first.Receipt.OperationID != replayed.Receipt.OperationID {
+		t.Fatalf("first=%+v replay=%+v", first, replayed)
+	}
+	files.mu.Lock()
+	replaceCalls := files.replaceCalls
+	files.mu.Unlock()
+	if replaceCalls != 1 {
+		t.Fatalf("filesystem replacements=%d", replaceCalls)
+	}
+}
 func (f *configurationFilesFixture) ReconcileReplacement(_ string, _, _ []byte) ([]byte, application.ValidatedConfigurationCandidate, error) {
 	return f.ReadLive()
 }
@@ -141,6 +233,9 @@ func (f *configurationFilesFixture) RemoveRaw(digest string) error {
 	return nil
 }
 func (f *configurationFilesFixture) PublishLocator(string) error { return nil }
+func (f *configurationFilesFixture) PublishBaselineBinding(application.ValidatedConfigurationCandidate) error {
+	return nil
+}
 func (f *configurationFilesFixture) candidate(payload []byte, schema int) application.ValidatedConfigurationCandidate {
 	return application.ValidatedConfigurationCandidate{Digest: configurationTestDigest(payload), Size: int64(len(payload)), SchemaVersion: schema, DatabasePath: f.database, Operator: f.operator, Repositories: map[string]application.ConfigurationRepositoryAuthority{}}
 }
@@ -172,7 +267,7 @@ func (s *configurationFaultStore) SettleConfigurationApply(ctx context.Context, 
 	return s.Store.SettleConfigurationApply(ctx, input)
 }
 
-func (f *configurationRuntimeFixture) Observe(context.Context, application.Requester, time.Time) (application.RuntimeObservation, error) {
+func (f *configurationRuntimeFixture) ObserveConfigurationRuntime(context.Context, time.Time) (application.RuntimeObservation, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.observation, nil
