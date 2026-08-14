@@ -535,7 +535,10 @@ authority directory; SQLite contains metadata, receipts, and sanitized events
 only. Current plus nine recent settled payloads are retained, while current and
 unresolved evidence are never pruned. Deletion first acquires a durable digest
 claim in SQLite; apply acceptance checks that claim in its transaction, so a
-digest cannot become accepted while its raw leaf is being removed. Startup
+digest cannot become accepted while its raw leaf is being removed. Raw target
+publication, prune deletion/metadata completion, and live replacement also
+share one filesystem mutation lock, so an apply cannot recreate a claimed raw
+leaf between deletion and metadata settlement. Startup
 finishes interrupted claims idempotently.
 
 The presentation-independent apply service authorizes from the committed

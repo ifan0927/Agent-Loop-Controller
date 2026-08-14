@@ -313,7 +313,7 @@ The acceptance matrix requires:
 | Boundary | Required evidence |
 | --- | --- |
 | Automatic admission | Bounded scan, priority selection, atomic run/slot/permit reservation, exact Todo-to-In-Progress mutation, and one nonterminal run per repository |
-| Configuration authority | Same-byte filesystem binding/database-anchor/locator baseline crash matrix, bounded forward-migration read-only binding proof, v31 migration, atomic no-op authority/receipt CAS, concurrent replay, intent-before-exchange crash matrix, captured-parent/exchange/cleanup fsync proof, durable prune claims, legacy non-elevation, manual-supervisor heartbeat, drift/effective convergence, and fail-closed direct plus automatic admission fencing |
+| Configuration authority | Same-byte filesystem binding/database-anchor/locator baseline crash matrix, bounded forward-migration read-only binding proof, v31 migration, atomic no-op authority/receipt CAS, concurrent replay, intent-before-exchange crash matrix, captured-parent/exchange/cleanup fsync proof, durable prune claims plus serialized same-digest restaging, legacy non-elevation, manual-supervisor heartbeat, drift/effective convergence, and fail-closed direct plus automatic admission fencing |
 | Bounded concurrency | Generic capacity above two, same-repository exclusion, drain-on-reduction, sibling failure isolation, and restart reconstruction |
 | Implementation | Owned worktree, resumable session, exact candidate, successful verifier batch |
 | Internal review | Fresh independent read-only review bound to candidate head; after repair, exact expected-finding dispositions cover both repair and full branch deltas |

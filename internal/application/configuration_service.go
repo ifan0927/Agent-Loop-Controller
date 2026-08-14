@@ -111,7 +111,11 @@ func (s *ConfigurationService) Reconcile(ctx context.Context) (ConfigurationAuth
 	if !acquired {
 		return authority, serviceError(ErrorConflict, "configuration apply is still active", nil)
 	}
-	defer replacementLock.Release()
+	defer func() {
+		if replacementLock != nil {
+			_ = replacementLock.Release()
+		}
+	}()
 	generations, listErr := s.store.ListConfigurationGenerations(ctx)
 	if listErr != nil {
 		return ConfigurationAuthority{}, serviceError(ErrorInternal, "configuration generation evidence is unavailable", nil)
@@ -143,7 +147,7 @@ func (s *ConfigurationService) Reconcile(ctx context.Context) (ConfigurationAuth
 		return ConfigurationAuthority{}, serviceError(ErrorConflict, "configuration reconciliation conflicts", nil)
 	}
 	if settlement.Outcome == ConfigurationApplyCommitted || settlement.Outcome == ConfigurationApplyFailed {
-		s.prune(ctx)
+		s.pruneLocked(ctx)
 	}
 	return settled, nil
 }
@@ -223,9 +227,6 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 	if err := ConfigurationCompatibleWithActiveRuns(authority.Desired.ConfiguredOperator, candidate, runs); err != nil {
 		return ConfigurationApplyResult{}, serviceError(ErrorConflict, err.Error(), nil)
 	}
-	if err := s.files.RetainRaw(candidate.Digest, command.Payload); err != nil {
-		return ConfigurationApplyResult{}, serviceError(ErrorInternal, "configuration target evidence could not be retained", nil)
-	}
 	receipt := proposedReceipt
 	replacementLock, acquired, lockErr := s.files.AcquireReplacement(receipt.OperationID)
 	if lockErr != nil {
@@ -242,6 +243,9 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 			_ = replacementLock.Release()
 		}
 	}()
+	if err := s.files.RetainRaw(candidate.Digest, command.Payload); err != nil {
+		return ConfigurationApplyResult{}, serviceError(ErrorInternal, "configuration target evidence could not be retained", nil)
+	}
 	generation, acceptedReceipt, created, err := s.store.BeginConfigurationApply(ctx, ConfigurationApplyAcceptance{ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Candidate: candidate, Requester: configured.identity, Receipt: receipt, AcceptedAt: receipt.AcceptedAt})
 	if err != nil {
 		s.removeUnreferencedRaw(ctx, candidate.Digest)
@@ -288,7 +292,7 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 	if err != nil {
 		return ConfigurationApplyResult{}, serviceError(ErrorConflict, "configuration settlement requires reconciliation", nil)
 	}
-	s.prune(ctx)
+	s.pruneLocked(ctx)
 	return ConfigurationApplyResult{Generation: settled.Desired, Receipt: settledReceipt}, nil
 }
 
@@ -560,6 +564,15 @@ func generationByID(generations []ConfigurationGeneration, id int64) (Configurat
 }
 
 func (s *ConfigurationService) prune(ctx context.Context) {
+	mutationLock, acquired, lockErr := s.files.AcquireMutation()
+	if lockErr != nil || !acquired {
+		return
+	}
+	defer mutationLock.Release()
+	s.pruneLocked(ctx)
+}
+
+func (s *ConfigurationService) pruneLocked(ctx context.Context) {
 	claims, err := s.store.ConfigurationRawPruneClaims(ctx)
 	if err != nil {
 		return

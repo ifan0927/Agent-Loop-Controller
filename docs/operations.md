@@ -134,6 +134,12 @@ load configuration only at process startup. Raw generation files, baseline
 binding, and locator contents are private recovery evidence: do not read, copy,
 edit, prune, or use them as an operator API.
 
+Raw retention and pruning are serialized with configuration publication under
+one private filesystem mutation authority. A competing apply returns a safe
+conflict, while deferred pruning is retried by normal startup or later apply
+reconciliation. Operators must not recreate a deleted digest leaf or remove the
+private lock file.
+
 The database does not provide a legacy admission fallback once it has schema
 31 or newer. If configuration authority is absent, both manual run creation and
 automatic reservation fail closed. Tests and offline fixtures must establish an

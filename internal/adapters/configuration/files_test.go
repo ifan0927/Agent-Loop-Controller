@@ -230,6 +230,36 @@ func TestRawRetentionIsConcurrentIdempotentAndRejectsUnsafeEvidence(t *testing.T
 	}
 }
 
+func TestRawPruneAndLiveReplacementShareOneFilesystemMutationLock(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	configPath := filepath.Join(root, "controller.json")
+	if err := os.WriteFile(configPath, []byte("parent"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pruneLock, acquired, err := files.AcquireMutation()
+	if err != nil || !acquired {
+		t.Fatalf("prune lock acquired=%t err=%v", acquired, err)
+	}
+	if replacement, acquired, err := files.AcquireReplacement("operation-0123456789abcdef0123456789abcdef"); err != nil || acquired || replacement != nil {
+		t.Fatalf("replacement crossed prune lock: lock=%v acquired=%t err=%v", replacement, acquired, err)
+	}
+	if err := pruneLock.Release(); err != nil {
+		t.Fatal(err)
+	}
+	replacement, acquired, err := files.AcquireReplacement("operation-0123456789abcdef0123456789abcdef")
+	if err != nil || !acquired {
+		t.Fatalf("replacement lock acquired=%t err=%v", acquired, err)
+	}
+	defer replacement.Release()
+	if prune, acquired, err := files.AcquireMutation(); err != nil || acquired || prune != nil {
+		t.Fatalf("prune crossed replacement lock: lock=%v acquired=%t err=%v", prune, acquired, err)
+	}
+}
+
 func TestLocatorRejectsSymlinkAndModeConflicts(t *testing.T) {
 	root := canonicalTempDirectory(t)
 	configPath := filepath.Join(root, "controller.json")

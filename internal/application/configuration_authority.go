@@ -246,6 +246,7 @@ type ConfigurationFileAuthority interface {
 	ReadRaw(string, int64) ([]byte, error)
 	HasRaw(string, int64) bool
 	PublishBaselineBinding(ValidatedConfigurationCandidate) error
+	AcquireMutation() (ConfigurationReplacementLock, bool, error)
 	AcquireReplacement(string) (ConfigurationReplacementLock, bool, error)
 	ReplaceLive(string, []byte, []byte) error
 	ReconcileReplacement(string, []byte, []byte) ([]byte, ValidatedConfigurationCandidate, error)

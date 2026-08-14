@@ -206,14 +206,17 @@ func (f *Files) ReadRaw(digest string, size int64) ([]byte, error) {
 }
 
 func (f *Files) AcquireReplacement(operationID string) (application.ConfigurationReplacementLock, bool, error) {
-	stage, err := f.replacementStagePath(operationID)
-	if err != nil {
+	if _, err := f.replacementStagePath(operationID); err != nil {
 		return nil, false, err
 	}
+	return f.AcquireMutation()
+}
+
+func (f *Files) AcquireMutation() (application.ConfigurationReplacementLock, bool, error) {
 	if err := f.ensureRoots(); err != nil {
 		return nil, false, err
 	}
-	path := filepath.Join(f.root, strings.Replace(filepath.Base(stage), "swap", "lock", 1))
+	path := filepath.Join(f.root, "mutation.lock")
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, false, errors.New("configuration replacement lock is unavailable")

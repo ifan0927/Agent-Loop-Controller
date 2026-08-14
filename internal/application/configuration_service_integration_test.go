@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -34,17 +35,25 @@ type configurationFilesFixture struct {
 	replaceStarted chan struct{}
 	replaceRelease chan struct{}
 	replaceCalls   int
+	removeBlock    sync.Once
+	removeStarted  chan string
+	removeRelease  chan struct{}
+	removeUnlocked bool
 }
 
 type configurationFixtureLock struct{ mutex *sync.Mutex }
 
 func (l configurationFixtureLock) Release() error { l.mutex.Unlock(); return nil }
 
-func (f *configurationFilesFixture) AcquireReplacement(string) (application.ConfigurationReplacementLock, bool, error) {
+func (f *configurationFilesFixture) AcquireMutation() (application.ConfigurationReplacementLock, bool, error) {
 	if !f.replacementMu.TryLock() {
 		return nil, false, nil
 	}
 	return configurationFixtureLock{mutex: &f.replacementMu}, true, nil
+}
+
+func (f *configurationFilesFixture) AcquireReplacement(string) (application.ConfigurationReplacementLock, bool, error) {
+	return f.AcquireMutation()
 }
 
 func (f *configurationFilesFixture) CanonicalConfigPath() string { return f.path }
@@ -224,12 +233,26 @@ func (f *configurationFilesFixture) ReconcileReplacement(_ string, _, _ []byte) 
 	return f.ReadLive()
 }
 func (f *configurationFilesFixture) RemoveRaw(digest string) error {
+	if f.replacementMu.TryLock() {
+		f.replacementMu.Unlock()
+		f.mu.Lock()
+		f.removeUnlocked = true
+		f.mu.Unlock()
+	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if f.removeError {
+		f.mu.Unlock()
 		return errors.New("injected prune failure")
 	}
 	delete(f.raw, digest)
+	started, release := f.removeStarted, f.removeRelease
+	f.mu.Unlock()
+	if started != nil && release != nil {
+		f.removeBlock.Do(func() {
+			started <- digest
+			<-release
+		})
+	}
 	return nil
 }
 func (f *configurationFilesFixture) PublishLocator(string) error { return nil }
@@ -570,6 +593,91 @@ func TestConfigurationServiceRetainsCurrentPlusNineSettledRawGenerations(t *test
 	files.mu.Unlock()
 	if retainedWithUnresolved != application.ConfigurationRawRetainCount+1 {
 		t.Fatalf("retained with unresolved=%d", retainedWithUnresolved)
+	}
+}
+
+func TestConfigurationPruneSerializesDeleteMetadataAndSameDigestRestaging(t *testing.T) {
+	service, store, files, _, requester := configurationServiceFixture(t)
+	ctx := context.Background()
+	authority, err := service.Initialize(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files.removeError = true
+	for index := 0; index < application.ConfigurationRawRetainCount+2; index++ {
+		payload := []byte("serialized-prune-generation-" + strconv.Itoa(index))
+		result, applyErr := service.Apply(ctx, application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: payload})
+		if applyErr != nil {
+			t.Fatal(applyErr)
+		}
+		authority, _, err = store.ConfigurationAuthority(ctx)
+		if err != nil || authority.Desired.GenerationID != result.Generation.GenerationID {
+			t.Fatalf("authority=%+v err=%v", authority, err)
+		}
+	}
+	files.mu.Lock()
+	payloads := make(map[string][]byte, len(files.raw))
+	for digest, payload := range files.raw {
+		payloads[digest] = append([]byte(nil), payload...)
+	}
+	files.removeError = false
+	files.removeStarted = make(chan string, 1)
+	files.removeRelease = make(chan struct{})
+	files.mu.Unlock()
+
+	pruneDone := make(chan error, 1)
+	go func() {
+		_, initializeErr := service.Initialize(ctx)
+		pruneDone <- initializeErr
+	}()
+	var prunedDigest string
+	select {
+	case prunedDigest = <-files.removeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("prune did not reach the filesystem deletion boundary")
+	}
+	prunedPayload := payloads[prunedDigest]
+	if len(prunedPayload) == 0 || files.HasRaw(prunedDigest, int64(len(prunedPayload))) {
+		t.Fatalf("pruned digest=%q still has raw evidence", prunedDigest)
+	}
+	_, applyErr := service.Apply(ctx, application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: prunedPayload})
+	if applyErr == nil || !strings.Contains(applyErr.Error(), "still active") {
+		t.Fatalf("same-digest restaging crossed active prune: %v", applyErr)
+	}
+	if files.HasRaw(prunedDigest, int64(len(prunedPayload))) {
+		t.Fatal("blocked same-digest apply recreated pruned raw evidence")
+	}
+	close(files.removeRelease)
+	select {
+	case err := <-pruneDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("serialized prune did not finish")
+	}
+	files.mu.Lock()
+	retained := len(files.raw)
+	removeUnlocked := files.removeUnlocked
+	files.mu.Unlock()
+	if retained != application.ConfigurationRawRetainCount {
+		t.Fatalf("retained raw snapshots=%d", retained)
+	}
+	if removeUnlocked {
+		t.Fatal("raw pruning ran without filesystem mutation authority")
+	}
+	generations, err := store.ListConfigurationGenerations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retainedMetadata := 0
+	for _, generation := range generations {
+		if generation.RawRetained {
+			retainedMetadata++
+		}
+	}
+	if retainedMetadata != application.ConfigurationRawRetainCount {
+		t.Fatalf("retained metadata=%d", retainedMetadata)
 	}
 }
 
