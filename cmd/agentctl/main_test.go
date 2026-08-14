@@ -535,14 +535,20 @@ func TestManagedConfigurationFinishesBaselineAfterLocatorPublicationCrash(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
+	store, err := sqlitestore.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := files.BindDatabaseIdentity(databasePath, store.DatabaseIdentity()); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
 	if err := files.RetainRaw(candidate.Digest, payload); err != nil {
+		store.Close()
 		t.Fatal(err)
 	}
 	if err := files.PublishBaselineBinding(candidate); err != nil {
-		t.Fatal(err)
-	}
-	store, err := sqlitestore.Open(databasePath)
-	if err != nil {
+		store.Close()
 		t.Fatal(err)
 	}
 	if err := store.PrepareConfigurationBaseline(context.Background(), application.ConfigurationBaselineInput{Candidate: candidate, CanonicalConfigPath: configPath, ObservedAt: time.Now().UTC()}); err != nil {
@@ -584,14 +590,20 @@ func TestManagedConfigurationResumesBaselineBindingBeforeDatabaseAnchor(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
+	store, err := sqlitestore.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := files.BindDatabaseIdentity(databasePath, store.DatabaseIdentity()); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
 	if err := files.RetainRaw(candidate.Digest, payload); err != nil {
+		store.Close()
 		t.Fatal(err)
 	}
 	if err := files.PublishBaselineBinding(candidate); err != nil {
-		t.Fatal(err)
-	}
-	store, err := sqlitestore.Open(databasePath)
-	if err != nil {
+		store.Close()
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
@@ -626,14 +638,20 @@ func TestManagedConfigurationRejectsLiveRelocationAfterPreparedBaseline(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
+	store, err := sqlitestore.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := files.BindDatabaseIdentity(databasePath, store.DatabaseIdentity()); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
 	if err := files.RetainRaw(candidate.Digest, payload); err != nil {
+		store.Close()
 		t.Fatal(err)
 	}
 	if err := files.PublishBaselineBinding(candidate); err != nil {
-		t.Fatal(err)
-	}
-	store, err := sqlitestore.Open(databasePath)
-	if err != nil {
+		store.Close()
 		t.Fatal(err)
 	}
 	if err := store.PrepareConfigurationBaseline(context.Background(), application.ConfigurationBaselineInput{Candidate: candidate, CanonicalConfigPath: configPath, ObservedAt: time.Now().UTC()}); err != nil {
@@ -668,7 +686,7 @@ func TestManagedConfigurationRejectsLiveRelocationAfterPreparedBaseline(t *testi
 	}
 }
 
-func TestManagedConfigurationRejectsLocatorBeforeCreatingTargetDatabase(t *testing.T) {
+func TestManagedConfigurationRejectsUnboundLocatorTarget(t *testing.T) {
 	root := resolvedTempDir(t)
 	configPath, _ := writeControllerStatusConfig(t, root)
 	attackerDatabase := filepath.Join(root, "attacker.db")
@@ -676,11 +694,8 @@ func TestManagedConfigurationRejectsLocatorBeforeCreatingTargetDatabase(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := files.PublishLocator(attackerDatabase); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := loadManagedConfiguration(configPath); err == nil || !strings.Contains(err.Error(), "locator conflicts") {
-		t.Fatalf("locator error=%v", err)
+	if err := files.PublishLocator(attackerDatabase); err == nil {
+		t.Fatal("unbound locator target was published")
 	}
 	if _, err := os.Lstat(attackerDatabase); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("locator target was created: %v", err)

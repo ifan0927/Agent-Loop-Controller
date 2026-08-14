@@ -168,6 +168,16 @@ type ValidatedConfigurationCandidate struct {
 	Repositories  map[string]ConfigurationRepositoryAuthority
 }
 
+// DatabaseFileIdentity is private filesystem authority for the exact SQLite
+// inode opened by production composition. It is never caller or presentation
+// input.
+type DatabaseFileIdentity struct {
+	Device uint64 `json:"device"`
+	Inode  uint64 `json:"inode"`
+}
+
+func (i DatabaseFileIdentity) Valid() bool { return i.Device != 0 && i.Inode != 0 }
+
 type ConfigurationBaselineInput struct {
 	Candidate           ValidatedConfigurationCandidate
 	CanonicalConfigPath string

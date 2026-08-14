@@ -23,12 +23,16 @@ func inspectConfigurationBindingReadOnly(ctx context.Context, path string, suppo
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return "", "", false, errors.New("configuration database binding is invalid")
 	}
-	info, err := os.Lstat(path)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
 		return "", "", false, errors.New("configuration database binding is unsafe")
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || int(stat.Uid) != os.Getuid() || stat.Nlink != 1 {
+	defer file.Close()
+	identity, err := safeDatabaseFileIdentity(file)
+	if err != nil {
+		return "", "", false, errors.New("configuration database binding is unsafe")
+	}
+	if info, statErr := file.Stat(); statErr != nil || info.Mode().Perm() != 0o600 {
 		return "", "", false, errors.New("configuration database binding is unsafe")
 	}
 	dsn := (&url.URL{Scheme: "file", Path: path}).String() + "?mode=ro&_pragma=query_only(1)&_pragma=busy_timeout(5000)"
@@ -38,12 +42,28 @@ func inspectConfigurationBindingReadOnly(ctx context.Context, path string, suppo
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(1)
-	var version int
-	if err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil || supportedVersion < 31 || version < 31 || version > supportedVersion {
+	conn, err := db.Conn(ctx)
+	if err != nil {
 		return "", "", false, errors.New("configuration database binding is unavailable")
 	}
+	defer conn.Close()
+	if err := conn.QueryRowContext(ctx, `SELECT 1`).Scan(new(int)); err != nil || !databasePathStillIdentifies(path, identity) {
+		return "", "", false, errors.New("configuration database binding changed while opening")
+	}
+	var version int
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil || supportedVersion < 31 || version < 31 || version > supportedVersion {
+		return "", "", false, errors.New("configuration database binding is unavailable")
+	}
+	return configurationBindingQuery(ctx, conn)
+}
+
+type configurationBindingQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func configurationBindingQuery(ctx context.Context, db configurationBindingQuerier) (string, string, bool, error) {
 	var configPath, databasePath string
-	err = db.QueryRowContext(ctx, `SELECT canonical_config_path,database_path FROM configuration_authority WHERE authority_id=1`).Scan(&configPath, &databasePath)
+	err := db.QueryRowContext(ctx, `SELECT canonical_config_path,database_path FROM configuration_authority WHERE authority_id=1`).Scan(&configPath, &databasePath)
 	if err == nil {
 		return configPath, databasePath, true, nil
 	}

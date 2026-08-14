@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -134,6 +136,70 @@ func TestConfigurationBindingProofAllowsTrustedForwardMigrationOnly(t *testing.T
 	}
 	if _, _, _, err := inspectConfigurationBindingReadOnly(context.Background(), path, 30); err == nil {
 		t.Fatal("pre-authority schema accepted trusted binding proof")
+	}
+}
+
+func TestConfigurationAuthorityOpenDoesNotMigrateReplacementAfterProof(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "controller.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, "controller.json")
+	input := application.ConfigurationBaselineInput{
+		Candidate: application.ValidatedConfigurationCandidate{
+			Digest: strings.Repeat("a", 64), Size: 42, SchemaVersion: 5, DatabasePath: path,
+			Operator: domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"},
+		},
+		CanonicalConfigPath: configPath,
+		ObservedAt:          time.Now().UTC(),
+	}
+	if err := store.PrepareConfigurationBaseline(context.Background(), input); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if _, _, err := store.AdoptConfigurationBaseline(context.Background(), input); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	expected := store.DatabaseIdentity()
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	replacementPath := filepath.Join(root, "replacement.db")
+	replacement, err := openWithSupportedSchema(replacementPath, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replacement.Close(); err != nil {
+		t.Fatal(err)
+	}
+	displacedPath := filepath.Join(root, "proved.db")
+	opened, err := openConfigurationAuthority(context.Background(), path, configPath, expected, false, func() {
+		if renameErr := os.Rename(path, displacedPath); renameErr != nil {
+			t.Fatal(renameErr)
+		}
+		if renameErr := os.Rename(replacementPath, path); renameErr != nil {
+			t.Fatal(renameErr)
+		}
+	})
+	if opened != nil {
+		opened.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("replacement open err=%v", err)
+	}
+
+	db, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: path}).String()+"?mode=ro&_pragma=query_only(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var version int
+	if err := db.QueryRow(`SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil || version != 30 {
+		t.Fatalf("replacement schema version=%d err=%v", version, err)
 	}
 }
 

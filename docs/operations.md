@@ -111,12 +111,16 @@ The first production worker or management composition adopts an already-valid
 live file exactly once as the baseline generation. It does not rewrite the
 file. `config validate` and `config inspect` remain offline and never open
 SQLite, create the `authority/` directory, reconcile an apply, or observe a
-worker. Baseline preparation first publishes an immutable private binding
-intent for the exact live path, database path, digest, size, and schema. It then
+worker. Baseline preparation holds the private filesystem mutation authority
+while it retains raw evidence and publishes an immutable private binding intent
+for the exact live path, database path, database device/inode identity, digest,
+size, and schema. It then
 records the matching anchor in that database, publishes the private locator,
 and finally settles the generation. After a crash, startup accepts either the
-pre-locator intent or locator only after a read-only schema-and-binding proof;
-it never creates or migrates an unproven target or follows a newly edited live
+pre-locator intent or locator only after proving that exact private file
+identity and its schema/binding on one query-only SQLite connection. Writes and
+forward migration are enabled only on that same connection without reopening
+the pathname. It never creates or migrates an unproven target or follows a newly edited live
 database path. The proof accepts database schemas from the configuration-
 authority floor through the current binary's supported schema so a trusted
 older store can be migrated normally; it rejects pre-authority and newer

@@ -29,6 +29,7 @@ type configurationFilesFixture struct {
 	replaceMode    string
 	baselineSchema int
 	retainError    bool
+	baselineError  bool
 	removeError    bool
 	rereadError    bool
 	replacementMu  sync.Mutex
@@ -78,6 +79,37 @@ func TestLegacyConfigurationBaselineCanAuthorizeCurrentSchemaTransition(t *testi
 	}
 	if generations, err := store.ListConfigurationGenerations(context.Background()); err != nil || len(generations) != 2 {
 		t.Fatalf("generations=%+v err=%v", generations, err)
+	}
+}
+
+func TestBaselineInitializationDoesNotRetainRawWithoutMutationAuthority(t *testing.T) {
+	service, _, files, _, _ := configurationServiceFixture(t)
+	files.replacementMu.Lock()
+	_, err := service.Initialize(context.Background())
+	files.replacementMu.Unlock()
+	if err == nil || !strings.Contains(err.Error(), "baseline is still active") {
+		t.Fatalf("initialize err=%v", err)
+	}
+	files.mu.Lock()
+	defer files.mu.Unlock()
+	if len(files.raw) != 0 {
+		t.Fatalf("raw evidence retained without mutation authority: %v", files.raw)
+	}
+}
+
+func TestBaselineBindingConflictRemovesUnreferencedRawWhileLocked(t *testing.T) {
+	service, _, files, _, _ := configurationServiceFixture(t)
+	files.baselineError = true
+	if _, err := service.Initialize(context.Background()); err == nil || !strings.Contains(err.Error(), "binding conflicts") {
+		t.Fatalf("initialize err=%v", err)
+	}
+	files.mu.Lock()
+	defer files.mu.Unlock()
+	if len(files.raw) != 0 {
+		t.Fatalf("unreferenced baseline raw remained: %v", files.raw)
+	}
+	if files.removeUnlocked {
+		t.Fatal("baseline raw cleanup ran outside mutation authority")
 	}
 }
 
@@ -257,6 +289,9 @@ func (f *configurationFilesFixture) RemoveRaw(digest string) error {
 }
 func (f *configurationFilesFixture) PublishLocator(string) error { return nil }
 func (f *configurationFilesFixture) PublishBaselineBinding(application.ValidatedConfigurationCandidate) error {
+	if f.baselineError {
+		return errors.New("injected baseline binding conflict")
+	}
 	return nil
 }
 func (f *configurationFilesFixture) candidate(payload []byte, schema int) application.ValidatedConfigurationCandidate {

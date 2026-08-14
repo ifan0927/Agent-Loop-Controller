@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -27,6 +28,7 @@ const schemaVersion = 31
 
 type Store struct {
 	db                   *sql.DB
+	databaseIdentity     application.DatabaseFileIdentity
 	heavySupervisorMu    sync.RWMutex
 	heavySupervisorOwner string
 }
@@ -36,6 +38,41 @@ func Open(path string) (*Store, error) {
 }
 
 func openWithSupportedSchema(path string, supportedVersion int) (*Store, error) {
+	return openPinnedStore(context.Background(), path, supportedVersion, true, application.DatabaseFileIdentity{}, nil, nil)
+}
+
+// OpenConfigurationAuthority proves the exact private database inode and its
+// configuration binding on one query-only SQLite connection, then migrates
+// that same connection. No pathname reopen occurs between proof and effects.
+func OpenConfigurationAuthority(ctx context.Context, path, configPath string, expected application.DatabaseFileIdentity, allowUnbound bool) (*Store, error) {
+	return openConfigurationAuthority(ctx, path, configPath, expected, allowUnbound, nil)
+}
+
+func openConfigurationAuthority(ctx context.Context, path, configPath string, expected application.DatabaseFileIdentity, allowUnbound bool, beforeEffects func()) (*Store, error) {
+	verify := func(db *sql.Conn) error {
+		var version int
+		if err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil || version < 31 || version > schemaVersion {
+			return errors.New("configuration database binding is unavailable")
+		}
+		boundConfig, boundDatabase, found, err := configurationBindingQuery(ctx, db)
+		if err != nil {
+			return err
+		}
+		if found {
+			if boundConfig != configPath || boundDatabase != path {
+				return errors.New("configuration database binding conflicts")
+			}
+			return nil
+		}
+		if !allowUnbound {
+			return errors.New("configuration database binding is unavailable")
+		}
+		return nil
+	}
+	return openPinnedStore(ctx, path, schemaVersion, false, expected, verify, beforeEffects)
+}
+
+func openPinnedStore(ctx context.Context, path string, supportedVersion int, create bool, expected application.DatabaseFileIdentity, verify func(*sql.Conn) error, beforeEffects func()) (*Store, error) {
 	if supportedVersion < 1 || supportedVersion > schemaVersion {
 		return nil, errors.New("supported SQLite schema version is invalid")
 	}
@@ -44,33 +81,120 @@ func openWithSupportedSchema(path string, supportedVersion int) (*Store, error) 
 		return nil, err
 	}
 	path = absolute
-	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return nil, errors.New("SQLite database path must not be a symlink")
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
+	flags := os.O_RDWR | syscall.O_NOFOLLOW
+	if create {
+		flags |= os.O_CREATE
 	}
-	db, err := sql.Open("sqlite", sqliteDSN(path))
+	file, err := os.OpenFile(path, flags, 0o600)
+	if err != nil {
+		return nil, errors.New("SQLite database path is unavailable")
+	}
+	closeFile := true
+	defer func() {
+		if closeFile {
+			_ = file.Close()
+		}
+	}()
+	identity, err := safeDatabaseFileIdentity(file)
+	if err != nil || expected.Valid() && identity != expected {
+		return nil, errors.New("SQLite database path is unsafe")
+	}
+	if expected.Valid() {
+		if info, statErr := file.Stat(); statErr != nil || info.Mode().Perm() != 0o600 {
+			return nil, errors.New("SQLite database path is unsafe")
+		}
+	}
+	db, err := sql.Open("sqlite", pinnedSQLiteDSN(path))
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	store := &Store{db: db}
-	if err := store.migrate(context.Background(), supportedVersion); err != nil {
+	conn, err := db.Conn(ctx)
+	if err != nil {
 		db.Close()
 		return nil, err
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
+	closeDatabase := true
+	defer func() {
+		if closeDatabase {
+			_ = conn.Close()
+			_ = db.Close()
+		}
+	}()
+	if err := conn.QueryRowContext(ctx, `SELECT 1`).Scan(new(int)); err != nil || !databasePathStillIdentifies(path, identity) {
+		return nil, errors.New("SQLite database identity changed while opening")
+	}
+	if verify != nil {
+		if err := verify(conn); err != nil {
+			return nil, err
+		}
+	}
+	if beforeEffects != nil {
+		beforeEffects()
+	}
+	if _, err := conn.ExecContext(ctx, `PRAGMA query_only = OFF`); err != nil {
+		return nil, err
+	}
+	if err := migrateSQLite(ctx, conn, supportedVersion); err != nil {
 		db.Close()
 		return nil, err
 	}
-	return store, nil
+	if !databasePathStillIdentifies(path, identity) {
+		return nil, errors.New("SQLite database identity changed while opening")
+	}
+	if err := file.Chmod(0o600); err != nil {
+		return nil, err
+	}
+	if err := conn.Close(); err != nil {
+		return nil, err
+	}
+	if err := file.Close(); err != nil {
+		return nil, err
+	}
+	closeFile, closeDatabase = false, false
+	return &Store{db: db, databaseIdentity: identity}, nil
 }
 
 func sqliteDSN(path string) string {
 	return (&url.URL{Scheme: "file", Path: path}).String() + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
 }
 
+func pinnedSQLiteDSN(path string) string {
+	return (&url.URL{Scheme: "file", Path: path}).String() + "?mode=rw&_pragma=query_only(1)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+}
+
+func safeDatabaseFileIdentity(file *os.File) (application.DatabaseFileIdentity, error) {
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return application.DatabaseFileIdentity{}, errors.New("SQLite database path is unsafe")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || int(stat.Uid) != os.Getuid() || stat.Nlink != 1 {
+		return application.DatabaseFileIdentity{}, errors.New("SQLite database path is unsafe")
+	}
+	identity := application.DatabaseFileIdentity{Device: uint64(stat.Dev), Inode: uint64(stat.Ino)}
+	if !identity.Valid() {
+		return application.DatabaseFileIdentity{}, errors.New("SQLite database path is unsafe")
+	}
+	return identity, nil
+}
+
+func databasePathStillIdentifies(path string, expected application.DatabaseFileIdentity) bool {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	current := application.DatabaseFileIdentity{Device: uint64(stat.Dev), Inode: uint64(stat.Ino)}
+	return current == expected
+}
+
 func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) DatabaseIdentity() application.DatabaseFileIdentity { return s.databaseIdentity }
 
 func (s *Store) SchemaVersion(ctx context.Context) (int, error) {
 	var version int
@@ -78,11 +202,16 @@ func (s *Store) SchemaVersion(ctx context.Context) (int, error) {
 	return version, err
 }
 
-func (s *Store) migrate(ctx context.Context, supportedVersion int) error {
-	if _, err := s.db.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
+type sqliteTransactioner interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
+}
+
+func migrateSQLite(ctx context.Context, db sqliteTransactioner, supportedVersion int) error {
+	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
 		return err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}

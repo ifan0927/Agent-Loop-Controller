@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
@@ -39,12 +40,13 @@ func TestPrivateRawLocatorAndAtomicLiveReplacement(t *testing.T) {
 		}
 	}
 	databasePath := filepath.Join(root, "controller.db")
+	bindTestDatabase(t, files, databasePath)
 	if err := files.PublishLocator(databasePath); err != nil {
 		t.Fatal(err)
 	}
-	config, database, found, err := ReadLocator(configPath)
-	if err != nil || !found || config != configPath || database != databasePath {
-		t.Fatalf("config=%q database=%q found=%t err=%v", config, database, found, err)
+	locator, found, err := ReadLocator(configPath)
+	if err != nil || !found || locator.ConfigPath != configPath || locator.DatabasePath != databasePath || locator.DatabaseIdentity != files.databaseIdentity {
+		t.Fatalf("locator=%+v found=%t err=%v", locator, found, err)
 	}
 	replacement := []byte("new live bytes")
 	if err := files.ReplaceLive("operation-0123456789abcdef0123456789abcdef", []byte("parent"), replacement); err != nil {
@@ -69,6 +71,7 @@ func TestBaselineBindingIsPrivateExclusiveAndIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	candidate := application.ValidatedConfigurationCandidate{Digest: configurationDigest([]byte("baseline")), Size: int64(len("baseline")), SchemaVersion: 5, DatabasePath: filepath.Join(root, "controller.db")}
+	bindTestDatabase(t, files, candidate.DatabasePath)
 	publicationErrors := make(chan error, 8)
 	var publications sync.WaitGroup
 	for index := 0; index < 8; index++ {
@@ -97,6 +100,35 @@ func TestBaselineBindingIsPrivateExclusiveAndIdempotent(t *testing.T) {
 	conflict.DatabasePath = filepath.Join(root, "alternate.db")
 	if err := files.PublishBaselineBinding(conflict); err == nil {
 		t.Fatal("conflicting baseline binding was accepted")
+	}
+}
+
+func TestDatabaseReplacementInvalidatesBaselineAndLocatorPublication(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	configPath := filepath.Join(root, "controller.json")
+	if err := os.WriteFile(configPath, []byte("baseline"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(root, "controller.db")
+	bindTestDatabase(t, files, databasePath)
+	if err := os.Rename(databasePath, filepath.Join(root, "original.db")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(databasePath, []byte("replacement database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	candidate := application.ValidatedConfigurationCandidate{
+		Digest: configurationDigest([]byte("baseline")), Size: int64(len("baseline")), SchemaVersion: 5, DatabasePath: databasePath,
+	}
+	if err := files.PublishBaselineBinding(candidate); err == nil {
+		t.Fatal("baseline binding accepted a replaced database inode")
+	}
+	if err := files.PublishLocator(databasePath); err == nil {
+		t.Fatal("locator accepted a replaced database inode")
 	}
 }
 
@@ -273,10 +305,12 @@ func TestLocatorRejectsSymlinkAndModeConflicts(t *testing.T) {
 	if err := files.ensureRoots(); err != nil {
 		t.Fatal(err)
 	}
+	databasePath := filepath.Join(root, "controller.db")
+	bindTestDatabase(t, files, databasePath)
 	if err := os.Chmod(files.root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := files.PublishLocator(filepath.Join(root, "controller.db")); err == nil {
+	if err := files.PublishLocator(databasePath); err == nil {
 		t.Fatal("unsafe authority directory mode was accepted")
 	}
 }
@@ -291,4 +325,23 @@ func canonicalTempDirectory(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func bindTestDatabase(t *testing.T, files *Files, path string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte("fixture database identity"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("database stat identity is unavailable")
+	}
+	identity := application.DatabaseFileIdentity{Device: uint64(stat.Dev), Inode: uint64(stat.Ino)}
+	if err := files.BindDatabaseIdentity(path, identity); err != nil {
+		t.Fatal(err)
+	}
 }

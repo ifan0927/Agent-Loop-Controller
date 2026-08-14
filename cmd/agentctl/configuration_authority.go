@@ -20,20 +20,19 @@ func loadManagedConfiguration(path string) (bootstrap.Bootstrap, error) {
 	if err != nil {
 		return bootstrap.Bootstrap{}, errors.New("configuration authority is unavailable")
 	}
-	_, locatedDatabase, located, err := configurationadapter.ReadLocator(path)
+	locator, located, err := configurationadapter.ReadLocator(path)
 	if err != nil {
 		return bootstrap.Bootstrap{}, err
 	}
 	if located {
-		boundConfig, boundDatabase, bound, inspectErr := sqlitestore.InspectConfigurationBindingReadOnly(context.Background(), locatedDatabase)
-		if inspectErr != nil || !bound || boundConfig != path || boundDatabase != locatedDatabase {
-			return bootstrap.Bootstrap{}, errors.New("configuration authority locator conflicts")
-		}
-		store, err := sqlitestore.Open(locatedDatabase)
+		store, err := sqlitestore.OpenConfigurationAuthority(context.Background(), locator.DatabasePath, path, locator.DatabaseIdentity, false)
 		if err != nil {
 			return bootstrap.Bootstrap{}, errors.New("configuration authority store is unavailable")
 		}
 		defer store.Close()
+		if err := files.BindDatabaseIdentity(locator.DatabasePath, store.DatabaseIdentity()); err != nil {
+			return bootstrap.Bootstrap{}, errors.New("configuration authority locator conflicts")
+		}
 		authority, found, err := store.ConfigurationAuthority(context.Background())
 		if err != nil {
 			return bootstrap.Bootstrap{}, errors.New("configuration authority store is unavailable")
@@ -47,7 +46,7 @@ func loadManagedConfiguration(path string) (bootstrap.Bootstrap, error) {
 			// preparation but before generation adoption. The locator still fixes
 			// both paths, so only the matching live configuration may finish it.
 			loaded, loadErr := bootstrap.Load(path)
-			if loadErr != nil || loaded.Controller.DatabasePath != locatedDatabase {
+			if loadErr != nil || loaded.Controller.DatabasePath != locator.DatabasePath {
 				return bootstrap.Bootstrap{}, errors.New("configuration authority locator conflicts")
 			}
 			adopted, adoptErr := service.Initialize(context.Background())
@@ -56,7 +55,7 @@ func loadManagedConfiguration(path string) (bootstrap.Bootstrap, error) {
 			}
 			return loaded, nil
 		}
-		if authority.CanonicalConfigPath != path || authority.DatabasePath != locatedDatabase {
+		if authority.CanonicalConfigPath != path || authority.DatabasePath != locator.DatabasePath {
 			return bootstrap.Bootstrap{}, errors.New("configuration authority locator conflicts")
 		}
 		// Reconciliation may deliberately return conflict after durably marking
@@ -82,20 +81,19 @@ func loadManagedConfiguration(path string) (bootstrap.Bootstrap, error) {
 		return bootstrap.Bootstrap{}, err
 	}
 	if prepared {
-		boundConfig, boundDatabase, bound, inspectErr := sqlitestore.InspectConfigurationBindingReadOnly(context.Background(), baselineBinding.DatabasePath)
-		if inspectErr != nil || bound && (boundConfig != path || boundDatabase != baselineBinding.DatabasePath) {
-			return bootstrap.Bootstrap{}, errors.New("configuration baseline binding conflicts")
-		}
 		payload, candidate, readErr := files.ReadLive()
 		loaded, loadErr := bootstrap.ValidateBytes(path, payload)
 		if readErr != nil || loadErr != nil || candidate.DatabasePath != baselineBinding.DatabasePath || candidate.Digest != baselineBinding.Digest || candidate.Size != baselineBinding.Size || candidate.SchemaVersion != baselineBinding.Schema || loaded.Controller.DatabasePath != baselineBinding.DatabasePath || loaded.Digest != baselineBinding.Digest {
 			return bootstrap.Bootstrap{}, errors.New("configuration baseline binding conflicts")
 		}
-		store, openErr := sqlitestore.Open(baselineBinding.DatabasePath)
+		store, openErr := sqlitestore.OpenConfigurationAuthority(context.Background(), baselineBinding.DatabasePath, path, baselineBinding.DatabaseIdentity, true)
 		if openErr != nil {
 			return bootstrap.Bootstrap{}, errors.New("configuration authority store is unavailable")
 		}
 		defer store.Close()
+		if err := files.BindDatabaseIdentity(baselineBinding.DatabasePath, store.DatabaseIdentity()); err != nil {
+			return bootstrap.Bootstrap{}, errors.New("configuration baseline binding conflicts")
+		}
 		service, serviceErr := application.NewConfigurationService(store, files, nil)
 		if serviceErr != nil {
 			return bootstrap.Bootstrap{}, serviceErr
@@ -116,6 +114,9 @@ func loadManagedConfiguration(path string) (bootstrap.Bootstrap, error) {
 		return bootstrap.Bootstrap{}, err
 	}
 	defer store.Close()
+	if err := files.BindDatabaseIdentity(loaded.Controller.DatabasePath, store.DatabaseIdentity()); err != nil {
+		return bootstrap.Bootstrap{}, err
+	}
 	service, err := application.NewConfigurationService(store, files, nil)
 	if err != nil {
 		return bootstrap.Bootstrap{}, err
@@ -133,6 +134,9 @@ func loadManagedConfiguration(path string) (bootstrap.Bootstrap, error) {
 func configuredConvergenceService(store *sqlitestore.Store, loaded bootstrap.Bootstrap, expectedProcessID int, supervisorRequired bool) (*application.ConfigurationService, error) {
 	files, err := configurationadapter.NewFiles(loaded.Path)
 	if err != nil {
+		return nil, err
+	}
+	if err := files.BindDatabaseIdentity(loaded.Controller.DatabasePath, store.DatabaseIdentity()); err != nil {
 		return nil, err
 	}
 	runtime, err := application.NewConfigurationRuntimeObservationService(workerHeartbeatReader{configPath: loaded.Path, expectedUID: os.Getuid(), expectedProcessID: expectedProcessID, supervisorProcessRequired: supervisorRequired}, workerProcessIdentityObserver{})

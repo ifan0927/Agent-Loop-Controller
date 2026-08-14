@@ -52,6 +52,27 @@ func (s *ConfigurationService) Initialize(ctx context.Context) (ConfigurationAut
 		}
 		return authority, err
 	}
+	mutationLock, acquired, lockErr := s.files.AcquireMutation()
+	if lockErr != nil {
+		return ConfigurationAuthority{}, serviceError(ErrorInternal, "configuration baseline authority is unavailable", nil)
+	}
+	if !acquired {
+		return ConfigurationAuthority{}, serviceError(ErrorConflict, "configuration baseline is still active", nil)
+	}
+	defer func() {
+		if mutationLock != nil {
+			_ = mutationLock.Release()
+		}
+	}()
+	// The first read happened before filesystem serialization. Recheck SQLite
+	// so a concurrent winner is adopted instead of staging a parallel baseline.
+	if _, currentFound, currentErr := s.store.ConfigurationAuthority(ctx); currentErr != nil {
+		return ConfigurationAuthority{}, serviceError(ErrorInternal, "configuration authority is unavailable", nil)
+	} else if currentFound {
+		_ = mutationLock.Release()
+		mutationLock = nil
+		return s.Initialize(ctx)
+	}
 
 	payload, candidate, err := s.files.ReadLive()
 	if err != nil {
@@ -62,6 +83,7 @@ func (s *ConfigurationService) Initialize(ctx context.Context) (ConfigurationAut
 	}
 	baseline := ConfigurationBaselineInput{Candidate: candidate, CanonicalConfigPath: s.files.CanonicalConfigPath(), ObservedAt: s.now().UTC()}
 	if err := s.files.PublishBaselineBinding(candidate); err != nil {
+		s.removeUnreferencedRaw(ctx, candidate.Digest)
 		return ConfigurationAuthority{}, serviceError(ErrorConflict, "configuration baseline binding conflicts", nil)
 	}
 	if err := s.store.PrepareConfigurationBaseline(ctx, baseline); err != nil {
@@ -83,7 +105,7 @@ func (s *ConfigurationService) Initialize(ctx context.Context) (ConfigurationAut
 		}
 		return ConfigurationAuthority{}, serviceError(ErrorInternal, "configuration baseline could not be persisted", nil)
 	}
-	s.prune(ctx)
+	s.pruneLocked(ctx)
 	return authority, nil
 }
 

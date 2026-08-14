@@ -26,27 +26,31 @@ const (
 )
 
 type Files struct {
-	configPath string
-	root       string
-	rawRoot    string
-	uid        int
-	beforeSwap func()
-	syncDir    func(string) error
+	configPath       string
+	root             string
+	rawRoot          string
+	uid              int
+	databasePath     string
+	databaseIdentity application.DatabaseFileIdentity
+	beforeSwap       func()
+	syncDir          func(string) error
 }
 
-type locator struct {
-	Version      int    `json:"version"`
-	ConfigPath   string `json:"config_path"`
-	DatabasePath string `json:"database_path"`
+type AuthorityLocator struct {
+	Version          int                              `json:"version"`
+	ConfigPath       string                           `json:"config_path"`
+	DatabasePath     string                           `json:"database_path"`
+	DatabaseIdentity application.DatabaseFileIdentity `json:"database_identity"`
 }
 
 type BaselineBinding struct {
-	Version      int    `json:"version"`
-	ConfigPath   string `json:"config_path"`
-	DatabasePath string `json:"database_path"`
-	Digest       string `json:"digest"`
-	Size         int64  `json:"size"`
-	Schema       int    `json:"schema_version"`
+	Version          int                              `json:"version"`
+	ConfigPath       string                           `json:"config_path"`
+	DatabasePath     string                           `json:"database_path"`
+	DatabaseIdentity application.DatabaseFileIdentity `json:"database_identity"`
+	Digest           string                           `json:"digest"`
+	Size             int64                            `json:"size"`
+	Schema           int                              `json:"schema_version"`
 }
 
 type replacementLock struct{ file *os.File }
@@ -77,6 +81,14 @@ func NewFiles(configPath string) (*Files, error) {
 }
 
 func (f *Files) CanonicalConfigPath() string { return f.configPath }
+
+func (f *Files) BindDatabaseIdentity(databasePath string, identity application.DatabaseFileIdentity) error {
+	if !filepath.IsAbs(databasePath) || filepath.Clean(databasePath) != databasePath || !identity.Valid() || !pathHasDatabaseIdentity(databasePath, identity, f.uid) {
+		return errors.New("configuration database identity conflicts")
+	}
+	f.databasePath, f.databaseIdentity = databasePath, identity
+	return nil
+}
 
 func (f *Files) ValidateBaseline(payload []byte) (application.ValidatedConfigurationCandidate, error) {
 	loaded, err := bootstrap.ValidateBytes(f.configPath, payload)
@@ -161,7 +173,10 @@ func (f *Files) HasRaw(digest string, size int64) bool {
 }
 
 func (f *Files) PublishBaselineBinding(candidate application.ValidatedConfigurationCandidate) error {
-	value := BaselineBinding{Version: baselineBindingVersion, ConfigPath: f.configPath, DatabasePath: candidate.DatabasePath, Digest: candidate.Digest, Size: candidate.Size, Schema: candidate.SchemaVersion}
+	if candidate.DatabasePath != f.databasePath || !pathHasDatabaseIdentity(f.databasePath, f.databaseIdentity, f.uid) {
+		return errors.New("configuration baseline binding conflicts")
+	}
+	value := BaselineBinding{Version: baselineBindingVersion, ConfigPath: f.configPath, DatabasePath: candidate.DatabasePath, DatabaseIdentity: f.databaseIdentity, Digest: candidate.Digest, Size: candidate.Size, Schema: candidate.SchemaVersion}
 	if validateBaselineBinding(value) != nil {
 		return errors.New("configuration baseline binding is invalid")
 	}
@@ -367,13 +382,13 @@ func (f *Files) RemoveRaw(digest string) error {
 }
 
 func (f *Files) PublishLocator(databasePath string) error {
-	if !filepath.IsAbs(databasePath) || filepath.Clean(databasePath) != databasePath {
+	if !filepath.IsAbs(databasePath) || filepath.Clean(databasePath) != databasePath || databasePath != f.databasePath || !pathHasDatabaseIdentity(databasePath, f.databaseIdentity, f.uid) {
 		return errors.New("configuration authority locator is invalid")
 	}
 	if err := f.ensureRoots(); err != nil {
 		return err
 	}
-	value := locator{Version: locatorVersion, ConfigPath: f.configPath, DatabasePath: databasePath}
+	value := AuthorityLocator{Version: locatorVersion, ConfigPath: f.configPath, DatabasePath: databasePath, DatabaseIdentity: f.databaseIdentity}
 	payload, err := json.Marshal(value)
 	if err != nil {
 		return errors.New("configuration authority locator is invalid")
@@ -402,24 +417,24 @@ func (f *Files) PublishLocator(databasePath string) error {
 
 // ReadLocator resolves only the fixed locator beside the requested canonical
 // configuration path. It never follows a caller-provided database redirect.
-func ReadLocator(configPath string) (string, string, bool, error) {
+func ReadLocator(configPath string) (AuthorityLocator, bool, error) {
 	files, err := NewFiles(configPath)
 	if err != nil {
-		return "", "", false, err
+		return AuthorityLocator{}, false, err
 	}
 	path := filepath.Join(files.root, "locator.json")
 	payload, err := readPrivateRegular(path, files.uid, 4096, true)
 	if errors.Is(err, os.ErrNotExist) {
-		return "", "", false, nil
+		return AuthorityLocator{}, false, nil
 	}
 	if err != nil {
-		return "", "", false, errors.New("configuration authority locator is unsafe")
+		return AuthorityLocator{}, false, errors.New("configuration authority locator is unsafe")
 	}
 	value, err := decodeLocator(payload)
 	if err != nil || value.ConfigPath != configPath {
-		return "", "", false, errors.New("configuration authority locator conflicts")
+		return AuthorityLocator{}, false, errors.New("configuration authority locator conflicts")
 	}
-	return value.ConfigPath, value.DatabasePath, true, nil
+	return value, true, nil
 }
 
 func ReadBaselineBinding(configPath string) (BaselineBinding, bool, error) {
@@ -452,18 +467,18 @@ func decodeBaselineBinding(payload []byte) (BaselineBinding, error) {
 }
 
 func validateBaselineBinding(value BaselineBinding) error {
-	if value.Version != baselineBindingVersion || !filepath.IsAbs(value.ConfigPath) || filepath.Clean(value.ConfigPath) != value.ConfigPath || !filepath.IsAbs(value.DatabasePath) || filepath.Clean(value.DatabasePath) != value.DatabasePath || !validDigest(value.Digest) || value.Size < 0 || value.Size > maximumConfigurationBytes || value.Schema < 1 || value.Schema > bootstrap.CurrentVersion {
+	if value.Version != baselineBindingVersion || !filepath.IsAbs(value.ConfigPath) || filepath.Clean(value.ConfigPath) != value.ConfigPath || !filepath.IsAbs(value.DatabasePath) || filepath.Clean(value.DatabasePath) != value.DatabasePath || !value.DatabaseIdentity.Valid() || !validDigest(value.Digest) || value.Size < 0 || value.Size > maximumConfigurationBytes || value.Schema < 1 || value.Schema > bootstrap.CurrentVersion {
 		return errors.New("invalid baseline binding")
 	}
 	return nil
 }
 
-func decodeLocator(payload []byte) (locator, error) {
+func decodeLocator(payload []byte) (AuthorityLocator, error) {
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
-	var value locator
-	if err := decoder.Decode(&value); err != nil || decoder.Decode(&struct{}{}) != io.EOF || value.Version != locatorVersion || !filepath.IsAbs(value.ConfigPath) || filepath.Clean(value.ConfigPath) != value.ConfigPath || !filepath.IsAbs(value.DatabasePath) || filepath.Clean(value.DatabasePath) != value.DatabasePath {
-		return locator{}, errors.New("invalid locator")
+	var value AuthorityLocator
+	if err := decoder.Decode(&value); err != nil || decoder.Decode(&struct{}{}) != io.EOF || value.Version != locatorVersion || !filepath.IsAbs(value.ConfigPath) || filepath.Clean(value.ConfigPath) != value.ConfigPath || !filepath.IsAbs(value.DatabasePath) || filepath.Clean(value.DatabasePath) != value.DatabasePath || !value.DatabaseIdentity.Valid() {
+		return AuthorityLocator{}, errors.New("invalid locator")
 	}
 	return value, nil
 }
@@ -483,6 +498,22 @@ func (f *Files) rawPath(digest string) string {
 		return filepath.Join(f.rawRoot, "invalid")
 	}
 	return filepath.Join(f.rawRoot, digest+".json")
+}
+
+func pathHasDatabaseIdentity(path string, expected application.DatabaseFileIdentity, uid int) bool {
+	if !expected.Valid() {
+		return false
+	}
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || !ownedBy(info, uid) || linkCount(info) != 1 {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	current := application.DatabaseFileIdentity{Device: uint64(stat.Dev), Inode: uint64(stat.Ino)}
+	return current == expected
 }
 
 func candidateFromBootstrap(loaded bootstrap.Bootstrap, size int) application.ValidatedConfigurationCandidate {

@@ -517,17 +517,20 @@ never invents generation identity.
 
 Controller-owned configuration authority is established on the first
 production configuration/store composition. The bootstrap adapter validates
-one exact bounded byte payload, the private configuration adapter retains those
-same bytes and exclusively publishes a filesystem baseline-binding intent,
+one exact bounded byte payload, then holds the private filesystem mutation
+authority while the configuration adapter retains those same bytes and
+exclusively publishes a baseline-binding intent,
 SQLite durably prepares the matching database anchor, and only then may the
 private locator be published. Startup proves a locator or pre-locator binding
-target in read-only mode against that prepared binding before opening or
-migrating the database. That proof accepts only the configuration-authority
+target's persisted device/inode identity and prepared binding on one query-only
+SQLite connection before enabling writes or migrating that same connection;
+there is no path-based reopen between proof and effects. That proof accepts only the configuration-authority
 schema floor through the binary's supported schema, allowing a trusted older
 store to receive normal forward migrations while rejecting pre-authority and
 newer unsupported stores. SQLite then atomically assigns one baseline generation without
-rewriting the live file. The mode-`0600` locator beside the configuration binds
-the canonical live path to its owning database so a later invalid or
+rewriting the live file. The mode-`0600` baseline binding and locator beside the
+configuration bind the canonical live path to its owning database path and
+exact private file identity so a later invalid or
 database-path-drifted file cannot create, redirect, or migrate an attacker-
 selected store. Raw
 generation payloads remain mode-`0600` beneath a current-user mode-`0700`
