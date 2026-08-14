@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -331,8 +332,14 @@ func ValidateBytes(canonicalPath string, data []byte) (Bootstrap, error) {
 	if err != nil {
 		return Bootstrap{}, err
 	}
+	if raw.Version != CurrentVersion {
+		operator, err = deriveLegacyConfiguredOperator(registry)
+		if err != nil {
+			return Bootstrap{}, err
+		}
+	}
 	controller.Operator = operator
-	if operator.Validate() == nil && !operatorTrustedByEveryProfile(operator, registry) {
+	if raw.Version == CurrentVersion && operator.Validate() == nil && !operatorTrustedByEveryProfile(operator, registry) {
 		return Bootstrap{}, conflict("configured operator is not trusted by every repository profile")
 	}
 	automation, err := decodeAutomation(raw, registry)
@@ -559,6 +566,43 @@ func operatorTrustedByEveryProfile(operator domain.GitHubUserIdentity, registry 
 		}
 	}
 	return true
+}
+
+func deriveLegacyConfiguredOperator(registry localregistry.Registry) (domain.GitHubUserIdentity, error) {
+	bindings := registry.Bindings()
+	if len(bindings) == 0 {
+		return domain.GitHubUserIdentity{}, conflict("legacy configuration has no controller migration authority")
+	}
+	var candidates []domain.GitHubUserIdentity
+	seen := map[string]struct{}{}
+	for _, binding := range bindings {
+		for _, actor := range binding.OperatorIdentityPolicy.TrustedActors {
+			candidate := domain.GitHubUserIdentity{Login: actor.Login, DatabaseID: actor.DatabaseID, NodeID: actor.NodeID, ActorType: actor.Type}
+			key := strings.ToLower(candidate.Login) + "\x00" + candidate.NodeID + "\x00" + candidate.ActorType + "\x00" + strconv.FormatInt(candidate.DatabaseID, 10)
+			if candidate.Validate() == nil {
+				if _, exists := seen[key]; !exists {
+					seen[key] = struct{}{}
+					candidates = append(candidates, candidate)
+				}
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return domain.GitHubUserIdentity{}, conflict("legacy configuration has no controller migration authority")
+	}
+	slices.SortFunc(candidates, func(left, right domain.GitHubUserIdentity) int {
+		if order := strings.Compare(strings.ToLower(left.Login), strings.ToLower(right.Login)); order != 0 {
+			return order
+		}
+		if left.DatabaseID < right.DatabaseID {
+			return -1
+		}
+		if left.DatabaseID > right.DatabaseID {
+			return 1
+		}
+		return strings.Compare(left.NodeID, right.NodeID)
+	})
+	return candidates[0], nil
 }
 
 func requesterTrustedByEveryProfile(requester localregistry.TrustedActorIdentity, registry localregistry.Registry) bool {

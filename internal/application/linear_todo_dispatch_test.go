@@ -994,6 +994,24 @@ func TestLinearTodoDispatcherConfigurationFencePreventsScanWithoutAttentionNoise
 	}
 }
 
+func TestLinearTodoDispatcherRechecksConfigurationBeforeReservation(t *testing.T) {
+	candidate := dispatchCandidate("fenced-after-scan", "IFAN-144", 1)
+	dispatcher, store, scanner, _, starter, driver := newDispatchLab(t, candidate)
+	gate := &admissionDecisionSequence{decisions: []NewAdmissionDecision{
+		{Allowed: true, Reason: ConfigurationReasonReady, Authority: ConfigurationAdmissionAuthority{GenerationID: 1, Digest: strings.Repeat("a", 64), AuthorityVersion: 1, ValidThrough: time.Now().UTC().Add(time.Hour)}},
+		{Allowed: false, Reason: ConfigurationReasonRestartRequired},
+	}}
+	dispatcher.policy.AdmissionGate = gate
+
+	result, err := dispatcher.Dispatch(context.Background())
+	if err != nil || result.Outcome != LinearTodoDispatchWaiting || scanner.calls != 1 || store.reserveCalls != 0 || len(starter.calls) != 0 || len(driver.calls) != 0 || gate.calls != 2 {
+		t.Fatalf("result=%+v scans=%d reserve=%d starter=%+v driver=%+v gate=%d err=%v", result, scanner.calls, store.reserveCalls, starter.calls, driver.calls, gate.calls, err)
+	}
+	if result.QueueDecision == nil || result.QueueDecision.Reason != LinearTodoQueueDecisionConfigurationFenced {
+		t.Fatalf("queue decision=%+v", result.QueueDecision)
+	}
+}
+
 func TestLinearTodoDispatcherConfigurationFenceDoesNotInterruptExistingRun(t *testing.T) {
 	candidate := dispatchCandidate("fenced-existing", "IFAN-143", 1)
 	dispatcher, store, scanner, _, _, driver := newDispatchLab(t, candidate)
@@ -1090,7 +1108,8 @@ func TestLinearTodoDispatcherTreatsReservationCapacityRaceAsWaiting(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := dispatcher.reserveStartAndDrive(context.Background(), &lease, linearTodoDispatchCandidate{candidate: scanner.scan.Candidates[0], snapshot: snapshot, repository: repository}, scanner.scan.Digest)
+	admission, _ := dispatcher.policy.AdmissionGate.CheckNewAdmission(context.Background())
+	result, err := dispatcher.reserveStartAndDrive(context.Background(), &lease, linearTodoDispatchCandidate{candidate: scanner.scan.Candidates[0], snapshot: snapshot, repository: repository}, scanner.scan.Digest, admission.Authority)
 	if err != nil || result.Outcome != LinearTodoDispatchWaiting || result.QueueDecision == nil || result.QueueDecision.Reason != LinearTodoQueueDecisionCapacityFull || len(store.attention) != 0 || len(starter.calls) != 0 || len(driver.calls) != 0 {
 		t.Fatalf("result=%+v attention=%+v starter=%+v driver=%+v err=%v", result, store.attention, starter.calls, driver.calls, err)
 	}

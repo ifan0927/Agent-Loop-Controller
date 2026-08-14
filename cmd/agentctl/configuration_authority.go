@@ -25,6 +25,10 @@ func loadManagedConfiguration(path string) (bootstrap.Bootstrap, error) {
 		return bootstrap.Bootstrap{}, err
 	}
 	if located {
+		boundConfig, boundDatabase, bound, inspectErr := sqlitestore.InspectConfigurationBindingReadOnly(context.Background(), locatedDatabase)
+		if inspectErr != nil || !bound || boundConfig != path || boundDatabase != locatedDatabase {
+			return bootstrap.Bootstrap{}, errors.New("configuration authority locator conflicts")
+		}
 		store, err := sqlitestore.Open(locatedDatabase)
 		if err != nil {
 			return bootstrap.Bootstrap{}, errors.New("configuration authority store is unavailable")
@@ -39,9 +43,9 @@ func loadManagedConfiguration(path string) (bootstrap.Bootstrap, error) {
 			return bootstrap.Bootstrap{}, err
 		}
 		if !found {
-			// A crash may publish the exclusive locator immediately before the
-			// baseline transaction. The locator still fixes both paths, so only
-			// the matching live configuration may finish that first adoption.
+			// A crash may publish the exclusive locator after baseline binding
+			// preparation but before generation adoption. The locator still fixes
+			// both paths, so only the matching live configuration may finish it.
 			loaded, loadErr := bootstrap.Load(path)
 			if loadErr != nil || loaded.Controller.DatabasePath != locatedDatabase {
 				return bootstrap.Bootstrap{}, errors.New("configuration authority locator conflicts")

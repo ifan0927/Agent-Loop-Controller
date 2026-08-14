@@ -490,9 +490,10 @@ func controllerInspect(command string, args []string) error {
 }
 
 func configuredQueryService(loaded bootstrap.Bootstrap, store application.QueryStore) (application.QueryService, error) {
-	if loaded.Controller.Operator.Validate() != nil {
+	if loaded.Version != bootstrap.CurrentVersion || loaded.Controller.Operator.Validate() != nil {
 		// Versions 1 through 4 remain readable through the legacy CLI boundary.
-		// They do not grant the version-5 controller scope.
+		// Their derived migration operator authorizes configuration transition
+		// only; it does not retroactively change historical query authority.
 		return application.NewQueryService(store), nil
 	}
 	authorizer, err := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: loaded.Controller.Operator})

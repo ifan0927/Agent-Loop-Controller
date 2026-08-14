@@ -213,6 +213,7 @@ type ConfigurationDriftObservation struct {
 
 type ConfigurationGenerationStore interface {
 	ConfigurationAuthority(context.Context) (ConfigurationAuthority, bool, error)
+	PrepareConfigurationBaseline(context.Context, ConfigurationBaselineInput) error
 	AdoptConfigurationBaseline(context.Context, ConfigurationBaselineInput) (ConfigurationAuthority, bool, error)
 	BeginConfigurationApply(context.Context, ConfigurationApplyAcceptance) (ConfigurationGeneration, OperationReceipt, bool, error)
 	SettleConfigurationApply(context.Context, ConfigurationApplySettlement) (ConfigurationAuthority, OperationReceipt, bool, error)
@@ -232,7 +233,8 @@ type ConfigurationFileAuthority interface {
 	RetainRaw(string, []byte) error
 	ReadRaw(string, int64) ([]byte, error)
 	HasRaw(string, int64) bool
-	ReplaceLive([]byte) error
+	ReplaceLive(string, []byte, []byte) error
+	ReconcileReplacement(string, []byte, []byte) ([]byte, ValidatedConfigurationCandidate, error)
 	RemoveRaw(string) error
 	PublishLocator(string) error
 }
@@ -266,8 +268,20 @@ type ConfigurationConvergenceProjection struct {
 }
 
 type NewAdmissionDecision struct {
-	Allowed bool
-	Reason  ConfigurationReason
+	Allowed   bool
+	Reason    ConfigurationReason
+	Authority ConfigurationAdmissionAuthority
+}
+
+type ConfigurationAdmissionAuthority struct {
+	GenerationID     int64     `json:"generation_id"`
+	Digest           string    `json:"digest"`
+	AuthorityVersion int64     `json:"authority_version"`
+	ValidThrough     time.Time `json:"valid_through"`
+}
+
+func (a ConfigurationAdmissionAuthority) Valid() bool {
+	return a.GenerationID > 0 && a.AuthorityVersion > 0 && validAuthorityDigest(a.Digest) && !a.ValidThrough.IsZero()
 }
 
 type NewAdmissionGate interface {
@@ -281,7 +295,7 @@ func (g StaticNewAdmissionGate) CheckNewAdmission(context.Context) (NewAdmission
 }
 
 func AllowNewAdmissionForTest() NewAdmissionGate {
-	return StaticNewAdmissionGate{Decision: NewAdmissionDecision{Allowed: true, Reason: ConfigurationReasonReady}}
+	return StaticNewAdmissionGate{Decision: NewAdmissionDecision{Allowed: true, Reason: ConfigurationReasonReady, Authority: ConfigurationAdmissionAuthority{GenerationID: 1, Digest: strings.Repeat("0", 64), AuthorityVersion: 1, ValidThrough: time.Now().UTC().Add(time.Hour)}}}
 }
 
 func configurationDigest(parts ...string) string {
@@ -310,15 +324,18 @@ func configurationRequester(candidate ValidatedConfigurationCandidate) (domain.G
 	return candidate.Operator, true
 }
 
-func compatibleWithActiveRuns(candidate ValidatedConfigurationCandidate, runs []Run) error {
+func ConfigurationCompatibleWithActiveRuns(currentOperator domain.GitHubUserIdentity, candidate ValidatedConfigurationCandidate, runs []Run) error {
+	if len(runs) > 0 && !currentOperator.Equal(candidate.Operator) {
+		return errors.New("configuration changes controller operator authority required by an active run")
+	}
 	for _, run := range runs {
 		configured, ok := candidate.Repositories[strings.ToLower(strings.TrimSpace(run.Repository))]
 		if !ok {
-			return serviceError(ErrorConflict, "configuration changes authority required by an active run", nil)
+			return errors.New("configuration changes authority required by an active run")
 		}
 		var frozen LocalRepository
 		if strings.TrimSpace(run.RepositoryConfigJSON) == "" || decodeStrictJSON([]byte(run.RepositoryConfigJSON), &frozen) != nil {
-			return serviceError(ErrorConflict, "active run authority is unavailable", nil)
+			return errors.New("active run authority is unavailable")
 		}
 		if run.Repository != configured.CanonicalRepository || run.BaseBranch != configured.BaseBranch ||
 			frozen.ProfileID != configured.ProfileID || frozen.ProfileDigest != configured.ProfileDigest ||
@@ -328,7 +345,7 @@ func compatibleWithActiveRuns(candidate ValidatedConfigurationCandidate, runs []
 			frozen.GitHubAppID != configured.GitHubAppID || frozen.GitHubInstallationID != configured.GitHubInstallationID ||
 			frozen.ExpectedRepositoryID != configured.ExpectedRepositoryID || !slices.Equal(frozen.VerifierIDs, configured.VerifierIDs) ||
 			!slices.Equal(frozen.AllowedOperatorLogins, configured.AllowedOperatorLogins) || !slices.Equal(frozen.TrustedOperatorActors, configured.TrustedOperatorActors) {
-			return serviceError(ErrorConflict, "configuration changes authority required by an active run", nil)
+			return errors.New("configuration changes authority required by an active run")
 		}
 	}
 	return nil

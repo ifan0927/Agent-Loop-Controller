@@ -499,6 +499,15 @@ var migrationV31 = []string{
 		reason_code TEXT NOT NULL DEFAULT '',
 		CHECK((origin='baseline' AND parent_generation_id IS NULL AND operation_id IS NULL AND requester_login='' AND requester_database_id=0 AND requester_node_id='' AND requester_actor_type='') OR (origin='apply' AND parent_generation_id IS NOT NULL AND operation_id IS NOT NULL))
 	)`,
+	`CREATE TABLE configuration_baseline_anchor (
+		authority_id INTEGER PRIMARY KEY CHECK(authority_id=1),
+		canonical_config_path TEXT NOT NULL,
+		database_path TEXT NOT NULL,
+		digest TEXT NOT NULL,
+		target_size INTEGER NOT NULL CHECK(target_size BETWEEN 0 AND 262144),
+		schema_version INTEGER NOT NULL CHECK(schema_version BETWEEN 1 AND 5),
+		prepared_at TEXT NOT NULL
+	)`,
 	`CREATE INDEX configuration_generations_created ON configuration_generations(created_at,generation_id)`,
 	`CREATE TRIGGER configuration_generation_identity_immutable BEFORE UPDATE ON configuration_generations
 		WHEN NEW.parent_generation_id IS NOT OLD.parent_generation_id OR NEW.digest<>OLD.digest OR NEW.target_size<>OLD.target_size OR NEW.schema_version<>OLD.schema_version OR NEW.origin<>OLD.origin OR NEW.requester_login<>OLD.requester_login OR NEW.requester_database_id<>OLD.requester_database_id OR NEW.requester_node_id<>OLD.requester_node_id OR NEW.requester_actor_type<>OLD.requester_actor_type OR NEW.configured_operator_login<>OLD.configured_operator_login OR NEW.configured_operator_database_id<>OLD.configured_operator_database_id OR NEW.configured_operator_node_id<>OLD.configured_operator_node_id OR NEW.configured_operator_actor_type<>OLD.configured_operator_actor_type OR NEW.operation_id IS NOT OLD.operation_id OR NEW.created_at<>OLD.created_at
@@ -914,6 +923,9 @@ func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput)
 		return application.Run{}, false, err
 	}
 	defer tx.Rollback()
+	if err := requireConfigurationAdmissionAuthorityTx(ctx, tx, input.ConfigurationAuthority); err != nil {
+		return application.Run{}, false, err
+	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO runs(run_id,issue_id,idempotency_key,source_revision,raw_issue_json,raw_issue_hash,
 		normalized_task_json,task_hash,repository,repository_config_json,profile_id,profile_snapshot_version,profile_digest,profile_snapshot_json,registry_version,registry_digest,repository_binding_digest,base_branch,working_branch,worktree_path,artifact_root,current_state,implementation_model,review_model,created_at,updated_at)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, run.ID, run.IssueID, run.IdempotencyKey, run.SourceRevision, run.RawIssueJSON,

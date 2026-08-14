@@ -19,6 +19,7 @@ func removeConfigurationV31(t *testing.T, db *sql.DB) {
 		`DROP TABLE IF EXISTS configuration_convergence_events`,
 		`DROP TABLE IF EXISTS configuration_apply_intents`,
 		`DROP TABLE IF EXISTS configuration_authority`,
+		`DROP TABLE IF EXISTS configuration_baseline_anchor`,
 		`DROP TRIGGER IF EXISTS configuration_generation_identity_immutable`,
 		`DROP TABLE IF EXISTS configuration_generations`,
 	} {
@@ -53,7 +54,7 @@ func TestConfigurationV31MigratesV30AndPreservesReceipts(t *testing.T) {
 	if target, err := store.GetOperationReceiptTarget(context.Background(), receipt.OperationID); err != nil || target.TargetID != receipt.TargetID {
 		t.Fatalf("target=%+v err=%v", target, err)
 	}
-	for _, table := range []string{"configuration_generations", "configuration_authority", "configuration_apply_intents", "configuration_convergence_events"} {
+	for _, table := range []string{"configuration_baseline_anchor", "configuration_generations", "configuration_authority", "configuration_apply_intents", "configuration_convergence_events"} {
 		var count int
 		if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("table=%s count=%d err=%v", table, count, err)
@@ -68,6 +69,9 @@ func TestConcurrentConfigurationBaselineCreatesExactlyOneGeneration(t *testing.T
 	}
 	defer store.Close()
 	input := application.ConfigurationBaselineInput{Candidate: application.ValidatedConfigurationCandidate{Digest: strings.Repeat("a", 64), Size: 42, SchemaVersion: 5, DatabasePath: filepath.Join(t.TempDir(), "owned.db"), Operator: domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}}, CanonicalConfigPath: filepath.Join(t.TempDir(), "controller.json"), ObservedAt: time.Now().UTC()}
+	if err := store.PrepareConfigurationBaseline(context.Background(), input); err != nil {
+		t.Fatal(err)
+	}
 	var wait sync.WaitGroup
 	created := make(chan bool, 8)
 	errorsSeen := make(chan error, 8)
@@ -110,11 +114,15 @@ func TestConfigurationDriftEvidenceRecordsTransitionsNotPollingCadence(t *testin
 	defer store.Close()
 	now := time.Now().UTC()
 	desired := strings.Repeat("a", 64)
-	authority, _, err := store.AdoptConfigurationBaseline(context.Background(), application.ConfigurationBaselineInput{
+	input := application.ConfigurationBaselineInput{
 		Candidate:           application.ValidatedConfigurationCandidate{Digest: desired, Size: 42, SchemaVersion: 5, DatabasePath: filepath.Join(t.TempDir(), "owned.db"), Operator: domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}},
 		CanonicalConfigPath: filepath.Join(t.TempDir(), "controller.json"),
 		ObservedAt:          now,
-	})
+	}
+	if err := store.PrepareConfigurationBaseline(context.Background(), input); err != nil {
+		t.Fatal(err)
+	}
+	authority, _, err := store.AdoptConfigurationBaseline(context.Background(), input)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,10 +162,14 @@ func TestConfigurationReceiptSettlementFailureRollsBackDesiredAtomically(t *test
 	now := time.Now().UTC()
 	operator := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
 	databasePath := filepath.Join(t.TempDir(), "owned.db")
-	baseline, _, err := store.AdoptConfigurationBaseline(ctx, application.ConfigurationBaselineInput{
+	input := application.ConfigurationBaselineInput{
 		Candidate:           application.ValidatedConfigurationCandidate{Digest: strings.Repeat("a", 64), Size: 42, SchemaVersion: 5, DatabasePath: databasePath, Operator: operator},
 		CanonicalConfigPath: filepath.Join(t.TempDir(), "controller.json"), ObservedAt: now,
-	})
+	}
+	if err := store.PrepareConfigurationBaseline(ctx, input); err != nil {
+		t.Fatal(err)
+	}
+	baseline, _, err := store.AdoptConfigurationBaseline(ctx, input)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,4 +208,83 @@ func TestConfigurationReceiptSettlementFailureRollsBackDesiredAtomically(t *test
 	if err != nil || !changed || settled.Desired.GenerationID != generation.GenerationID || settledReceipt.Phase != application.OperationPhaseObserved {
 		t.Fatalf("settled=%+v receipt=%+v changed=%t err=%v", settled, settledReceipt, changed, err)
 	}
+}
+
+func TestConfigurationApplyAndAdmissionShareSQLiteCASAuthority(t *testing.T) {
+	newReady := func(t *testing.T) (*Store, application.ConfigurationAuthority, domain.GitHubUserIdentity, string) {
+		t.Helper()
+		store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		now := time.Now().UTC()
+		operator := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
+		databasePath := filepath.Join(t.TempDir(), "owned.db")
+		input := application.ConfigurationBaselineInput{Candidate: application.ValidatedConfigurationCandidate{Digest: strings.Repeat("a", 64), Size: 42, SchemaVersion: 5, DatabasePath: databasePath, Operator: operator}, CanonicalConfigPath: filepath.Join(t.TempDir(), "controller.json"), ObservedAt: now}
+		if err := store.PrepareConfigurationBaseline(context.Background(), input); err != nil {
+			t.Fatal(err)
+		}
+		authority, _, err := store.AdoptConfigurationBaseline(context.Background(), input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		authority, _, err = store.ObserveConfigurationEffective(context.Background(), application.ConfigurationEffectiveObservation{ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, WorkerInstanceID: "worker", BuildIdentity: "build", ObservedAt: now.Add(time.Second), EvidenceDigest: strings.Repeat("e", 64)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return store, authority, operator, databasePath
+	}
+	beginApply := func(t *testing.T, store *Store, authority application.ConfigurationAuthority, operator domain.GitHubUserIdentity, databasePath string) error {
+		t.Helper()
+		now := time.Now().UTC()
+		receipt := application.NewOperationReceipt(application.OperationReceiptInput{OperationType: application.OperationApplyConfiguration, Scope: application.ScopeController, TargetID: application.ConfigurationTargetID, Requester: operator, RequestDigest: strings.Repeat("b", 64), ExpectedAuthorityDigest: authority.Desired.Digest, OperationAnchorDigest: strings.Repeat("c", 64), TargetBindingDigest: strings.Repeat("d", 64), AcceptedAt: now})
+		_, _, _, err := store.BeginConfigurationApply(context.Background(), application.ConfigurationApplyAcceptance{ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Candidate: application.ValidatedConfigurationCandidate{Digest: strings.Repeat("b", 64), Size: 43, SchemaVersion: 5, DatabasePath: databasePath, Operator: operator, Repositories: map[string]application.ConfigurationRepositoryAuthority{}}, Requester: operator, Receipt: receipt, AcceptedAt: now})
+		return err
+	}
+
+	t.Run("accepted apply invalidates admission token", func(t *testing.T) {
+		store, authority, operator, databasePath := newReady(t)
+		token := application.ConfigurationAdmissionAuthority{GenerationID: authority.Desired.GenerationID, Digest: authority.Desired.Digest, AuthorityVersion: authority.Version, ValidThrough: time.Now().UTC().Add(time.Minute)}
+		if err := beginApply(t, store, authority, operator, databasePath); err != nil {
+			t.Fatal(err)
+		}
+		_, created, err := store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: "run-after-apply", IssueID: "IFAN-1", IdempotencyKey: "run-after-apply", SourceRevision: "source", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: `{}`, BaseBranch: "main", WorkingBranch: "ifan/run"}, ConfigurationAuthority: token})
+		if err == nil || created {
+			t.Fatalf("created=%t err=%v", created, err)
+		}
+	})
+
+	t.Run("expired runtime evidence invalidates admission token", func(t *testing.T) {
+		store, authority, _, _ := newReady(t)
+		token := application.ConfigurationAdmissionAuthority{GenerationID: authority.Desired.GenerationID, Digest: authority.Desired.Digest, AuthorityVersion: authority.Version, ValidThrough: time.Now().UTC().Add(-time.Second)}
+		_, created, err := store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: "run-after-expiry", IssueID: "IFAN-3", IdempotencyKey: "run-after-expiry", SourceRevision: "source", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: `{}`, BaseBranch: "main", WorkingBranch: "ifan/run"}, ConfigurationAuthority: token})
+		if err == nil || created {
+			t.Fatalf("created=%t err=%v", created, err)
+		}
+	})
+
+	t.Run("durable drift invalidates prior admission token", func(t *testing.T) {
+		store, authority, _, _ := newReady(t)
+		token := application.ConfigurationAdmissionAuthority{GenerationID: authority.Desired.GenerationID, Digest: authority.Desired.Digest, AuthorityVersion: authority.Version, ValidThrough: time.Now().UTC().Add(time.Minute)}
+		if _, err := store.ObserveConfigurationDrift(context.Background(), application.ConfigurationDriftObservation{ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, ObservedDigest: strings.Repeat("f", 64), Drifted: true, Reason: application.ConfigurationReasonExternalDrift, ObservedAt: time.Now().UTC()}); err != nil {
+			t.Fatal(err)
+		}
+		_, created, err := store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: "run-after-drift", IssueID: "IFAN-4", IdempotencyKey: "run-after-drift", SourceRevision: "source", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: `{}`, BaseBranch: "main", WorkingBranch: "ifan/run"}, ConfigurationAuthority: token})
+		if err == nil || created {
+			t.Fatalf("created=%t err=%v", created, err)
+		}
+	})
+
+	t.Run("accepted admission is visible to apply transaction", func(t *testing.T) {
+		store, authority, operator, databasePath := newReady(t)
+		token := application.ConfigurationAdmissionAuthority{GenerationID: authority.Desired.GenerationID, Digest: authority.Desired.Digest, AuthorityVersion: authority.Version, ValidThrough: time.Now().UTC().Add(time.Minute)}
+		_, created, err := store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: "run-before-apply", IssueID: "IFAN-2", IdempotencyKey: "run-before-apply", SourceRevision: "source", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: `{}`, BaseBranch: "main", WorkingBranch: "ifan/run"}, ConfigurationAuthority: token})
+		if err != nil || !created {
+			t.Fatalf("created=%t err=%v", created, err)
+		}
+		if err := beginApply(t, store, authority, operator, databasePath); err == nil {
+			t.Fatal("apply ignored concurrently admitted run")
+		}
+	})
 }

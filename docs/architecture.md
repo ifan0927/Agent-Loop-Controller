@@ -509,10 +509,14 @@ never invents generation identity.
 Controller-owned configuration authority is established on the first
 production configuration/store composition. The bootstrap adapter validates
 one exact bounded byte payload, the private configuration adapter retains those
-same bytes, and SQLite atomically assigns one baseline generation without
-rewriting the live file. A private mode-`0600` locator beside the configuration
-binds the canonical live path to its owning database so a later invalid or
-database-path-drifted file cannot redirect startup into a fresh store. Raw
+same bytes, SQLite durably prepares the matching baseline binding, and only
+then may the private locator be published. Startup proves a locator target in
+read-only mode against that prepared binding before opening or migrating the
+database; SQLite then atomically assigns one baseline generation without
+rewriting the live file. The mode-`0600` locator beside the configuration binds
+the canonical live path to its owning database so a later invalid or
+database-path-drifted file cannot create, redirect, or migrate an attacker-
+selected store. Raw
 generation payloads remain mode-`0600` beneath a current-user mode-`0700`
 authority directory; SQLite contains metadata, receipts, and sanitized events
 only. Current plus nine recent settled payloads are retained, while current and
@@ -521,22 +525,32 @@ unresolved evidence are never pruned.
 The presentation-independent apply service authorizes from the committed
 desired generation's configured operator, strictly validates current-schema
 candidate bytes, compares expected generation and digest, protects every
-nonterminal run's frozen repository authority, retains the target, and commits
-one apply intent and operation receipt before same-directory atomic live-file
-replacement. Exact reread selects the new desired generation. Startup and
-pre-apply reconciliation settle an interrupted intent from exact parent bytes,
-exact target bytes, or an ambiguous third/unsafe observation; drift is never
-adopted or overwritten. A matching fresh heartbeat durably selects only the
-current desired generation as effective. The resulting finite projection is
+nonterminal run's frozen repository and configured-operator authority, retains
+the target, and commits one apply intent and operation receipt before a same-
+directory atomic exchange. The exchange captures the exact displaced inode;
+an unexpected concurrent edit is restored instead of overwritten. The
+captured parent remains as private operation evidence until directory sync and
+exact reread prove the target. Startup and pre-apply reconciliation settle an
+interrupted intent from exact parent/target evidence or an ambiguous third or
+unsafe observation; drift is never adopted or overwritten. A matching fresh
+heartbeat durably selects only the current desired generation as effective.
+The resulting finite projection is
 `ready`, `restart_required`, `starting`, `stale`, `offline`, `unknown`, or
 `conflict`, separate from worker activity and capacity.
 
 Every production new-admission path uses this application-owned convergence
 gate. Automatic dispatch may continue driving an already-admitted run, but it
-checks the gate before candidate scan or Linear mutation. Manual Linear
-admission checks before issue collection. Missing authority, pending restart,
-drift, unresolved apply, stale/offline runtime, and unavailable evidence fail
-closed without releasing permits or changing existing runs.
+checks the gate before candidate scan or Linear mutation and again immediately
+before reservation. Manual Linear admission checks before issue collection and
+again immediately before run creation. The second decision carries a
+generation/digest/authority-version token that SQLite validates in the same
+transaction as the new run or reservation. The token expires with the exact
+heartbeat freshness window, and a durable drift-entered transition invalidates
+older tokens. Apply acceptance uses the same SQLite write authority, so
+admission cannot cross an accepted configuration change. Missing authority,
+pending restart, drift, unresolved apply,
+stale/offline runtime, and unavailable evidence fail closed without releasing
+permits or changing existing runs.
 
 An authenticated `retry` action is deliberately narrower than general recovery:
 it accepts only a current `retry_budget_exhausted` attention whose retained
@@ -1007,11 +1021,14 @@ switches enable PR create, review reply, and squash merge writes.
 canonicalizes and cross-checks repositories and GitHub profiles, validates path
 isolation, derives stable digests, and produces a credential-safe readiness
 projection. Version 5 is current; older versions are compatibility inputs, not
-recommended templates. Its same-byte validation seam is reused by baseline,
+recommended templates. For a legacy baseline it deterministically derives a
+migration-only controller operator from the complete immutable trusted actors
+already configured across repository profiles. That authority does not alter
+legacy run/query authorization. Its same-byte validation seam is reused by baseline,
 live reread, retained desired evidence, and current-schema apply validation.
 `internal/adapters/configuration` owns the trusted locator, immutable raw
-generation files, retention, and atomic live replacement; it does not expose a
-raw history API.
+generation files, retention, captured-parent exchange evidence, and atomic live
+replacement; it does not expose a raw history API.
 
 ### Filesystem and artifact handling
 

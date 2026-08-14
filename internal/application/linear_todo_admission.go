@@ -62,11 +62,12 @@ type LinearTodoAdmissionJournal struct {
 // full admission snapshot. Reserving it is persistence only: it does not
 // materialize artifacts, provision a worktree, start Codex, or mutate Linear.
 type LinearTodoAdmissionReservation struct {
-	Lease      LinearTodoAdmissionLease
-	ScanDigest string
-	IssueUUID  string
-	Input      LocalStartInput
-	Scheduling SchedulingReservation
+	Lease                  LinearTodoAdmissionLease
+	ScanDigest             string
+	IssueUUID              string
+	Input                  LocalStartInput
+	Scheduling             SchedulingReservation
+	ConfigurationAuthority ConfigurationAdmissionAuthority
 }
 
 // LinearTodoAdmissionJournalTransition carries the only mutable journal

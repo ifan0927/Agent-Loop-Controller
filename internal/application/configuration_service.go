@@ -56,6 +56,10 @@ func (s *ConfigurationService) Initialize(ctx context.Context) (ConfigurationAut
 	if err := s.files.RetainRaw(candidate.Digest, payload); err != nil {
 		return ConfigurationAuthority{}, serviceError(ErrorInternal, "configuration baseline evidence could not be retained", nil)
 	}
+	baseline := ConfigurationBaselineInput{Candidate: candidate, CanonicalConfigPath: s.files.CanonicalConfigPath(), ObservedAt: s.now().UTC()}
+	if err := s.store.PrepareConfigurationBaseline(ctx, baseline); err != nil {
+		return ConfigurationAuthority{}, serviceError(ErrorConflict, "configuration baseline binding conflicts", nil)
+	}
 	if err := s.files.PublishLocator(candidate.DatabasePath); err != nil {
 		return ConfigurationAuthority{}, serviceError(ErrorConflict, "configuration authority locator conflicts", nil)
 	}
@@ -65,7 +69,7 @@ func (s *ConfigurationService) Initialize(ctx context.Context) (ConfigurationAut
 	if err != nil || !bytes.Equal(payload, current) || verified.Digest != candidate.Digest || verified.Size != candidate.Size || verified.SchemaVersion != candidate.SchemaVersion {
 		return ConfigurationAuthority{}, serviceError(ErrorConflict, "live configuration changed during baseline adoption", nil)
 	}
-	authority, _, err = s.store.AdoptConfigurationBaseline(ctx, ConfigurationBaselineInput{Candidate: candidate, CanonicalConfigPath: s.files.CanonicalConfigPath(), ObservedAt: s.now().UTC()})
+	authority, _, err = s.store.AdoptConfigurationBaseline(ctx, baseline)
 	if err != nil {
 		if errors.Is(err, ErrConfigurationAuthorityConflict) {
 			return ConfigurationAuthority{}, serviceError(ErrorConflict, "configuration baseline conflicts", nil)
@@ -105,7 +109,7 @@ func (s *ConfigurationService) Reconcile(ctx context.Context) (ConfigurationAuth
 	if targetErr != nil || parentErr != nil {
 		return s.settleAmbiguous(ctx, authority, intent, ConfigurationReasonAuthorityConflict)
 	}
-	payload, live, liveErr := s.files.ReadLive()
+	payload, live, liveErr := s.files.ReconcileReplacement(intent.OperationID, parentPayload, targetPayload)
 	settlement := ConfigurationApplySettlement{GenerationID: intent.GenerationID, ParentID: intent.ParentID, OperationID: intent.OperationID, SettledAt: s.now().UTC()}
 	switch {
 	case liveErr == nil && bytes.Equal(payload, targetPayload) && live.Digest == intent.TargetDigest && live.Size == target.Size && live.SchemaVersion == target.SchemaVersion:
@@ -200,8 +204,8 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 	if err != nil {
 		return ConfigurationApplyResult{}, serviceError(ErrorInternal, "active run authority is unavailable", nil)
 	}
-	if err := compatibleWithActiveRuns(candidate, runs); err != nil {
-		return ConfigurationApplyResult{}, err
+	if err := ConfigurationCompatibleWithActiveRuns(authority.Desired.ConfiguredOperator, candidate, runs); err != nil {
+		return ConfigurationApplyResult{}, serviceError(ErrorConflict, err.Error(), nil)
 	}
 	if err := s.files.RetainRaw(candidate.Digest, command.Payload); err != nil {
 		return ConfigurationApplyResult{}, serviceError(ErrorInternal, "configuration target evidence could not be retained", nil)
@@ -215,7 +219,7 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 	if generation.State != ConfigurationGenerationAccepted {
 		return ConfigurationApplyResult{Generation: generation, Receipt: acceptedReceipt}, nil
 	}
-	if err := s.files.ReplaceLive(command.Payload); err != nil {
+	if err := s.files.ReplaceLive(generation.OperationID, desiredPayload, command.Payload); err != nil {
 		settled, reconcileErr := s.Reconcile(ctx)
 		if reconcileErr != nil {
 			return ConfigurationApplyResult{}, reconcileErr
@@ -410,7 +414,11 @@ func (s *ConfigurationService) CheckNewAdmission(ctx context.Context) (NewAdmiss
 		return NewAdmissionDecision{Allowed: false, Reason: ConfigurationReasonRuntimeUnknown}, nil
 	}
 	projection := s.project(authority, runtime)
-	return NewAdmissionDecision{Allowed: projection.State == ConfigurationReady, Reason: projection.Reason}, nil
+	decision := NewAdmissionDecision{Allowed: projection.State == ConfigurationReady, Reason: projection.Reason}
+	if decision.Allowed && runtime.LastObservedAt != nil {
+		decision.Authority = ConfigurationAdmissionAuthority{GenerationID: authority.Desired.GenerationID, Digest: authority.Desired.Digest, AuthorityVersion: authority.Version, ValidThrough: runtime.LastObservedAt.UTC().Add(WorkerHeartbeatStaleAfter)}
+	}
+	return decision, nil
 }
 
 func (s *ConfigurationService) History(ctx context.Context, requester Requester) ([]ConfigurationGeneration, error) {

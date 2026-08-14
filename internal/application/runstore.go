@@ -51,6 +51,7 @@ type Run struct {
 
 type CreateRunInput struct {
 	Run
+	ConfigurationAuthority ConfigurationAdmissionAuthority
 }
 
 type Transition struct {

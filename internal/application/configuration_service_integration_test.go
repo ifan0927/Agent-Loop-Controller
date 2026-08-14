@@ -1,6 +1,7 @@
 package application_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -18,21 +19,42 @@ import (
 )
 
 type configurationFilesFixture struct {
-	mu          sync.Mutex
-	path        string
-	database    string
-	operator    domain.GitHubUserIdentity
-	live        []byte
-	raw         map[string][]byte
-	replaceMode string
-	retainError bool
-	removeError bool
-	rereadError bool
+	mu             sync.Mutex
+	path           string
+	database       string
+	operator       domain.GitHubUserIdentity
+	live           []byte
+	raw            map[string][]byte
+	replaceMode    string
+	baselineSchema int
+	retainError    bool
+	removeError    bool
+	rereadError    bool
 }
 
 func (f *configurationFilesFixture) CanonicalConfigPath() string { return f.path }
 func (f *configurationFilesFixture) ValidateBaseline(payload []byte) (application.ValidatedConfigurationCandidate, error) {
-	return f.candidate(payload, 5), nil
+	schema := f.baselineSchema
+	if schema == 0 {
+		schema = 5
+	}
+	return f.candidate(payload, schema), nil
+}
+
+func TestLegacyConfigurationBaselineCanAuthorizeCurrentSchemaTransition(t *testing.T) {
+	service, store, files, _, requester := configurationServiceFixture(t)
+	files.baselineSchema = 4
+	authority, err := service.Initialize(context.Background())
+	if err != nil || authority.Desired.SchemaVersion != 4 || authority.Desired.ConfiguredOperator.Login != requester.ID {
+		t.Fatalf("authority=%+v err=%v", authority, err)
+	}
+	result, err := service.Apply(context.Background(), application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: []byte("current schema transition")})
+	if err != nil || result.Generation.SchemaVersion != 5 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if generations, err := store.ListConfigurationGenerations(context.Background()); err != nil || len(generations) != 2 {
+		t.Fatalf("generations=%+v err=%v", generations, err)
+	}
 }
 func (f *configurationFilesFixture) ValidateCurrent(payload []byte) (application.ValidatedConfigurationCandidate, error) {
 	return f.candidate(payload, 5), nil
@@ -45,7 +67,11 @@ func (f *configurationFilesFixture) ReadLive() ([]byte, application.ValidatedCon
 		return nil, application.ValidatedConfigurationCandidate{}, errors.New("injected exact reread failure")
 	}
 	payload := append([]byte(nil), f.live...)
-	return payload, f.candidate(payload, 5), nil
+	schema := f.baselineSchema
+	if schema == 0 {
+		schema = 5
+	}
+	return payload, f.candidate(payload, schema), nil
 }
 func (f *configurationFilesFixture) RetainRaw(digest string, payload []byte) error {
 	f.mu.Lock()
@@ -75,26 +101,35 @@ func (f *configurationFilesFixture) HasRaw(digest string, size int64) bool {
 	payload, err := f.ReadRaw(digest, size)
 	return err == nil && configurationTestDigest(payload) == digest
 }
-func (f *configurationFilesFixture) ReplaceLive(payload []byte) error {
+func (f *configurationFilesFixture) ReplaceLive(_ string, expected, payload []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if !bytes.Equal(f.live, expected) {
+		return errors.New("expected parent changed")
+	}
 	switch f.replaceMode {
 	case "before", "file_sync":
-		return errors.New("before rename")
+		return errors.New("before exchange")
 	case "after", "directory_sync":
 		f.live = append([]byte(nil), payload...)
-		return errors.New("lost response after rename")
+		f.baselineSchema = 5
+		return errors.New("lost response after exchange")
 	case "third":
 		f.live = []byte("third digest")
 		return errors.New("ambiguous replacement")
 	case "reread":
 		f.live = append([]byte(nil), payload...)
+		f.baselineSchema = 5
 		f.rereadError = true
 		return nil
 	default:
 		f.live = append([]byte(nil), payload...)
+		f.baselineSchema = 5
 		return nil
 	}
+}
+func (f *configurationFilesFixture) ReconcileReplacement(_ string, _, _ []byte) ([]byte, application.ValidatedConfigurationCandidate, error) {
+	return f.ReadLive()
 }
 func (f *configurationFilesFixture) RemoveRaw(digest string) error {
 	f.mu.Lock()
@@ -203,8 +238,8 @@ func TestConfigurationServiceReconcilesEveryReplacementCrashBoundary(t *testing.
 		wantState   application.ConfigurationGenerationState
 		ambiguous   bool
 	}{
-		{name: "before rename", mode: "before", wantError: true, wantDesired: 1, wantState: application.ConfigurationGenerationFailed},
-		{name: "after rename lost response", mode: "after", wantDesired: 2, wantState: application.ConfigurationGenerationPendingRestart},
+		{name: "before exchange", mode: "before", wantError: true, wantDesired: 1, wantState: application.ConfigurationGenerationFailed},
+		{name: "after exchange lost response", mode: "after", wantDesired: 2, wantState: application.ConfigurationGenerationPendingRestart},
 		{name: "third digest", mode: "third", wantError: true, wantDesired: 1, wantState: application.ConfigurationGenerationAmbiguous, ambiguous: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -236,7 +271,7 @@ func TestConfigurationServiceFaultBoundariesRemainReplayable(t *testing.T) {
 		mode string
 	}{
 		{name: "intent before live replacement", mode: "before"},
-		{name: "live rename response loss", mode: "after"},
+		{name: "live exchange response loss", mode: "after"},
 		{name: "file sync failure before publication", mode: "file_sync"},
 		{name: "directory sync failure after publication", mode: "directory_sync"},
 		{name: "exact reread response loss", mode: "reread"},
@@ -393,18 +428,18 @@ func TestConfigurationServiceRetainsCurrentPlusNineSettledRawGenerations(t *test
 func TestConfigurationApplyPreservesExistingRunAndDatabaseAuthority(t *testing.T) {
 	service, store, files, _, requester := configurationServiceFixture(t)
 	ctx := context.Background()
-	authority, err := service.Initialize(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	originalLive := append([]byte(nil), files.live...)
-	_, _, err = store.CreateRun(ctx, application.CreateRunInput{Run: application.Run{
+	_, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: application.Run{
 		ID: "active-run", IssueID: "IFAN-1", IdempotencyKey: "active-run-key", SourceRevision: "source", TaskHash: "task",
 		Repository: "owner/repo", RepositoryConfigJSON: `{}`, BaseBranch: "main", WorkingBranch: "ifan/active-run",
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	authority, err := service.Initialize(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalLive := append([]byte(nil), files.live...)
 	_, err = service.Apply(ctx, application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: []byte("removes active authority")})
 	if err == nil || !strings.Contains(err.Error(), "active run") {
 		t.Fatalf("active-run compatibility error=%v", err)
@@ -412,6 +447,12 @@ func TestConfigurationApplyPreservesExistingRunAndDatabaseAuthority(t *testing.T
 	if string(files.live) != string(originalLive) {
 		t.Fatal("rejected active-run apply changed the live file")
 	}
+	files.operator = domain.GitHubUserIdentity{Login: "future", DatabaseID: 9, NodeID: "USER_9", ActorType: "User"}
+	_, err = service.Apply(ctx, application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: []byte("retargets controller operator")})
+	if err == nil || !strings.Contains(err.Error(), "operator authority") {
+		t.Fatalf("active-run operator compatibility error=%v", err)
+	}
+	files.operator = domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
 
 	files.database = filepath.Join(filepath.Dir(files.database), "relocated.db")
 	_, err = service.Apply(ctx, application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: []byte("database relocation")})

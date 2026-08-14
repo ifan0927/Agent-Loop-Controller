@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 )
@@ -67,10 +68,51 @@ func configurationIncompleteIntent(ctx context.Context, query queryRower) (appli
 	return intent, true, nil
 }
 
+func (s *Store) PrepareConfigurationBaseline(ctx context.Context, input application.ConfigurationBaselineInput) error {
+	if err := validateConfigurationBaselineInput(input); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if authority, found, authorityErr := configurationAuthorityQuery(ctx, tx); authorityErr != nil {
+		return authorityErr
+	} else if found {
+		if authority.CanonicalConfigPath != input.CanonicalConfigPath || authority.DatabasePath != input.Candidate.DatabasePath || authority.Desired.Digest != input.Candidate.Digest {
+			return application.ErrConfigurationAuthorityConflict
+		}
+		return tx.Commit()
+	}
+	var configPath, databasePath, digest string
+	var size int64
+	var schema int
+	err = tx.QueryRowContext(ctx, `SELECT canonical_config_path,database_path,digest,target_size,schema_version FROM configuration_baseline_anchor WHERE authority_id=1`).Scan(&configPath, &databasePath, &digest, &size, &schema)
+	if err == nil {
+		if configPath != input.CanonicalConfigPath || databasePath != input.Candidate.DatabasePath || digest != input.Candidate.Digest || size != input.Candidate.Size || schema != input.Candidate.SchemaVersion {
+			return application.ErrConfigurationAuthorityConflict
+		}
+		return tx.Commit()
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO configuration_baseline_anchor(authority_id,canonical_config_path,database_path,digest,target_size,schema_version,prepared_at) VALUES(1,?,?,?,?,?,?)`, input.CanonicalConfigPath, input.Candidate.DatabasePath, input.Candidate.Digest, input.Candidate.Size, input.Candidate.SchemaVersion, formatTime(input.ObservedAt)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func validateConfigurationBaselineInput(input application.ConfigurationBaselineInput) error {
+	if input.ObservedAt.IsZero() || !validConfigurationMetadata(input.Candidate.Digest, input.Candidate.Size, input.Candidate.SchemaVersion) || strings.TrimSpace(input.CanonicalConfigPath) == "" || strings.TrimSpace(input.Candidate.DatabasePath) == "" || input.Candidate.Operator.Validate() != nil {
+		return errors.New("configuration baseline input is invalid")
+	}
+	return nil
+}
+
 func (s *Store) AdoptConfigurationBaseline(ctx context.Context, input application.ConfigurationBaselineInput) (application.ConfigurationAuthority, bool, error) {
-	if input.ObservedAt.IsZero() || !validConfigurationMetadata(input.Candidate.Digest, input.Candidate.Size, input.Candidate.SchemaVersion) ||
-		strings.TrimSpace(input.CanonicalConfigPath) == "" || strings.TrimSpace(input.Candidate.DatabasePath) == "" ||
-		input.Candidate.SchemaVersion == 5 && input.Candidate.Operator.Validate() != nil {
+	if err := validateConfigurationBaselineInput(input); err != nil {
 		return application.ConfigurationAuthority{}, false, errors.New("configuration baseline input is invalid")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -85,6 +127,12 @@ func (s *Store) AdoptConfigurationBaseline(ctx context.Context, input applicatio
 			return application.ConfigurationAuthority{}, false, application.ErrConfigurationAuthorityConflict
 		}
 		return existing, false, tx.Commit()
+	}
+	var anchorConfig, anchorDatabase, anchorDigest string
+	var anchorSize int64
+	var anchorSchema int
+	if err := tx.QueryRowContext(ctx, `SELECT canonical_config_path,database_path,digest,target_size,schema_version FROM configuration_baseline_anchor WHERE authority_id=1`).Scan(&anchorConfig, &anchorDatabase, &anchorDigest, &anchorSize, &anchorSchema); err != nil || anchorConfig != input.CanonicalConfigPath || anchorDatabase != input.Candidate.DatabasePath || anchorDigest != input.Candidate.Digest || anchorSize != input.Candidate.Size || anchorSchema != input.Candidate.SchemaVersion {
+		return application.ConfigurationAuthority{}, false, application.ErrConfigurationAuthorityConflict
 	}
 	result, err := tx.ExecContext(ctx, `INSERT INTO configuration_generations(parent_generation_id,digest,target_size,schema_version,origin,configured_operator_login,configured_operator_database_id,configured_operator_node_id,configured_operator_actor_type,operation_id,lifecycle,raw_retained,created_at,committed_at,settled_at,reason_code) VALUES(NULL,?,?,?,?,?,?,?,?,NULL,'pending_restart',1,?,?,?,?)`, input.Candidate.Digest, input.Candidate.Size, input.Candidate.SchemaVersion, string(application.ConfigurationOriginBaseline), input.Candidate.Operator.Login, input.Candidate.Operator.DatabaseID, input.Candidate.Operator.NodeID, input.Candidate.Operator.ActorType, formatTime(input.ObservedAt), formatTime(input.ObservedAt), formatTime(input.ObservedAt), string(application.ConfigurationReasonBaselinePending))
 	if err != nil {
@@ -142,6 +190,13 @@ func (s *Store) BeginConfigurationApply(ctx context.Context, input application.C
 	if authority.Desired.GenerationID != input.ExpectedGenerationID || authority.Desired.Digest != input.ExpectedDigest || authority.DatabasePath != input.Candidate.DatabasePath {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, application.ErrConfigurationAuthorityConflict
 	}
+	runs, err := listNonterminalRunsQuery(ctx, tx)
+	if err != nil {
+		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, err
+	}
+	if application.ConfigurationCompatibleWithActiveRuns(authority.Desired.ConfiguredOperator, input.Candidate, runs) != nil {
+		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, application.ErrConfigurationAuthorityConflict
+	}
 	if err := insertOperationReceiptTx(ctx, tx, input.Receipt, ""); err != nil {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, err
 	}
@@ -168,6 +223,38 @@ func (s *Store) BeginConfigurationApply(ctx context.Context, input application.C
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, err
 	}
 	return generation, input.Receipt, true, nil
+}
+
+func requireConfigurationAdmissionAuthorityTx(ctx context.Context, tx *sql.Tx, expected application.ConfigurationAdmissionAuthority) error {
+	var version int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil {
+		return err
+	}
+	if version < 31 {
+		return nil
+	}
+	authority, found, err := configurationAuthorityQuery(ctx, tx)
+	if err != nil {
+		return err
+	}
+	// Stores created before configuration authority is established retain their
+	// legacy/test behavior. Every production composition establishes authority
+	// before it can reach a new-admission path.
+	if !found {
+		return nil
+	}
+	if !expected.Valid() || time.Now().UTC().After(expected.ValidThrough) || authority.Incomplete != nil || authority.Desired.GenerationID != expected.GenerationID || authority.Desired.Digest != expected.Digest || authority.Version != expected.AuthorityVersion || authority.EffectiveID != authority.Desired.GenerationID || authority.Desired.State != application.ConfigurationGenerationEffective {
+		return application.ErrConfigurationAuthorityConflict
+	}
+	var lastDrift string
+	err = tx.QueryRowContext(ctx, `SELECT event_type FROM configuration_convergence_events WHERE generation_id=? AND event_type IN ('drift_entered','drift_cleared') ORDER BY event_id DESC LIMIT 1`, authority.Desired.GenerationID).Scan(&lastDrift)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if lastDrift == "drift_entered" {
+		return application.ErrConfigurationAuthorityConflict
+	}
+	return nil
 }
 
 func (s *Store) SettleConfigurationApply(ctx context.Context, settlement application.ConfigurationApplySettlement) (application.ConfigurationAuthority, application.OperationReceipt, bool, error) {

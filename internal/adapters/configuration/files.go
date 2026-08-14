@@ -29,6 +29,8 @@ type Files struct {
 	root       string
 	rawRoot    string
 	uid        int
+	beforeSwap func()
+	syncDir    func(string) error
 }
 
 type locator struct {
@@ -140,14 +142,112 @@ func (f *Files) ReadRaw(digest string, size int64) ([]byte, error) {
 	return payload, nil
 }
 
-func (f *Files) ReplaceLive(payload []byte) error {
-	if len(payload) > maximumConfigurationBytes {
+func (f *Files) ReplaceLive(operationID string, expected, payload []byte) error {
+	if len(payload) > maximumConfigurationBytes || len(expected) > maximumConfigurationBytes {
 		return errors.New("configuration payload is too large")
 	}
-	if _, err := readPrivateRegular(f.configPath, f.uid, maximumConfigurationBytes, false); err != nil {
+	live, err := readPrivateRegular(f.configPath, f.uid, maximumConfigurationBytes, false)
+	if err != nil || !bytes.Equal(live, expected) {
 		return errors.New("live configuration replacement is unsafe")
 	}
-	return atomicPrivateWrite(f.configPath, payload, f.uid, false)
+	stage, err := f.replacementStagePath(operationID)
+	if err != nil {
+		return err
+	}
+	if err := atomicPrivateWrite(stage, payload, f.uid, true); err != nil {
+		return errors.New("configuration replacement staging failed")
+	}
+	if f.beforeSwap != nil {
+		f.beforeSwap()
+	}
+	// The exchange atomically captures the exact inode being replaced. A
+	// concurrent third-party edit becomes the private stage and is restored.
+	if err := atomicSwap(stage, f.configPath); err != nil {
+		_ = os.Remove(stage)
+		return errors.New("configuration atomic exchange failed")
+	}
+	replaced, readErr := readPrivateRegular(stage, f.uid, maximumConfigurationBytes, true)
+	if readErr != nil || !bytes.Equal(replaced, expected) {
+		if swapErr := atomicSwap(stage, f.configPath); swapErr != nil {
+			return errors.New("configuration replacement conflict is ambiguous")
+		}
+		if f.syncParent() != nil {
+			return errors.New("configuration replacement conflict is ambiguous")
+		}
+		_ = os.Remove(stage)
+		_ = f.syncParent()
+		return errors.New("live configuration changed before replacement")
+	}
+	if err := f.syncParent(); err != nil {
+		// Keep the captured parent beside the live target. Reconciliation must
+		// prove directory durability before it may commit desired authority.
+		return errors.New("configuration directory synchronization is unproven")
+	}
+	if err := os.Remove(stage); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return errors.New("configuration replacement cleanup failed")
+	}
+	_ = f.syncParent()
+	return nil
+}
+
+func (f *Files) ReconcileReplacement(operationID string, expectedParent, target []byte) ([]byte, application.ValidatedConfigurationCandidate, error) {
+	stage, err := f.replacementStagePath(operationID)
+	if err != nil {
+		return nil, application.ValidatedConfigurationCandidate{}, err
+	}
+	live, candidate, liveErr := f.ReadLive()
+	staged, stageErr := readPrivateRegular(stage, f.uid, maximumConfigurationBytes, true)
+	if errors.Is(stageErr, os.ErrNotExist) {
+		return live, candidate, liveErr
+	}
+	if liveErr != nil || stageErr != nil {
+		return nil, application.ValidatedConfigurationCandidate{}, errors.New("configuration replacement evidence is unsafe")
+	}
+	parentLive, targetLive := bytes.Equal(live, expectedParent), bytes.Equal(live, target)
+	parentStaged, targetStaged := bytes.Equal(staged, expectedParent), bytes.Equal(staged, target)
+	switch {
+	case targetLive && parentStaged:
+		if f.syncParent() != nil {
+			return nil, application.ValidatedConfigurationCandidate{}, errors.New("configuration directory synchronization is unproven")
+		}
+	case targetLive && !parentStaged:
+		// A crash after exchange captured unexpected external drift. Restore it
+		// before returning the third digest for ambiguous settlement.
+		if atomicSwap(stage, f.configPath) != nil || f.syncParent() != nil {
+			return nil, application.ValidatedConfigurationCandidate{}, errors.New("configuration replacement conflict is ambiguous")
+		}
+		live, candidate, liveErr = f.ReadLive()
+		if liveErr != nil {
+			return nil, application.ValidatedConfigurationCandidate{}, liveErr
+		}
+	case (parentLive || !targetLive) && targetStaged:
+		// Publication never happened or a detected conflict was already restored.
+	default:
+		return nil, application.ValidatedConfigurationCandidate{}, errors.New("configuration replacement evidence conflicts")
+	}
+	if err := os.Remove(stage); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, application.ValidatedConfigurationCandidate{}, errors.New("configuration replacement cleanup failed")
+	}
+	if f.syncParent() != nil {
+		return nil, application.ValidatedConfigurationCandidate{}, errors.New("configuration replacement cleanup is unproven")
+	}
+	return live, candidate, nil
+}
+
+func (f *Files) replacementStagePath(operationID string) (string, error) {
+	suffix, found := strings.CutPrefix(operationID, "operation-")
+	decoded, decodeErr := hex.DecodeString(suffix)
+	if !found || len(suffix) != 32 || decodeErr != nil || len(decoded) != 16 {
+		return "", errors.New("configuration operation identity is invalid")
+	}
+	return filepath.Join(filepath.Dir(f.configPath), ".agentctl-config-swap-"+suffix), nil
+}
+
+func (f *Files) syncParent() error {
+	if f.syncDir != nil {
+		return f.syncDir(filepath.Dir(f.configPath))
+	}
+	return syncDirectory(filepath.Dir(f.configPath))
 }
 
 func (f *Files) RemoveRaw(digest string) error {

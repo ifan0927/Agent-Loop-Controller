@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/bootstrap"
 	configurationadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/configuration"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/localissue"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/localregistry"
@@ -481,24 +483,69 @@ func TestManagedConfigurationRejectsAlternatePathForOwnedStore(t *testing.T) {
 func TestManagedConfigurationFinishesBaselineAfterLocatorPublicationCrash(t *testing.T) {
 	root := resolvedTempDir(t)
 	configPath, databasePath := writeControllerStatusConfig(t, root)
+	loadedBeforeCrash, err := bootstrap.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	files, err := configurationadapter.NewFiles(configPath)
 	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := files.ValidateBaseline(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := files.RetainRaw(candidate.Digest, payload); err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlitestore.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PrepareConfigurationBaseline(context.Background(), application.ConfigurationBaselineInput{Candidate: candidate, CanonicalConfigPath: configPath, ObservedAt: time.Now().UTC()}); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := files.PublishLocator(databasePath); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := loadManagedConfiguration(configPath)
-	if err != nil || loaded.Controller.DatabasePath != databasePath {
+	if err != nil || loaded.Controller.DatabasePath != databasePath || loaded.Digest != loadedBeforeCrash.Digest {
 		t.Fatalf("loaded=%+v err=%v", loaded, err)
 	}
-	store, err := sqlitestore.Open(databasePath)
+	store, err = sqlitestore.Open(databasePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
 	if authority, found, err := store.ConfigurationAuthority(context.Background()); err != nil || !found || authority.Desired.Digest != loaded.Digest {
 		t.Fatalf("authority=%+v found=%t err=%v", authority, found, err)
+	}
+}
+
+func TestManagedConfigurationRejectsLocatorBeforeCreatingTargetDatabase(t *testing.T) {
+	root := resolvedTempDir(t)
+	configPath, _ := writeControllerStatusConfig(t, root)
+	attackerDatabase := filepath.Join(root, "attacker.db")
+	files, err := configurationadapter.NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := files.PublishLocator(attackerDatabase); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadManagedConfiguration(configPath); err == nil || !strings.Contains(err.Error(), "locator conflicts") {
+		t.Fatalf("locator error=%v", err)
+	}
+	if _, err := os.Lstat(attackerDatabase); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("locator target was created: %v", err)
 	}
 }
 

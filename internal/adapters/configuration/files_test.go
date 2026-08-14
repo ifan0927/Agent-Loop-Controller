@@ -44,7 +44,7 @@ func TestPrivateRawLocatorAndAtomicLiveReplacement(t *testing.T) {
 		t.Fatalf("config=%q database=%q found=%t err=%v", config, database, found, err)
 	}
 	replacement := []byte("new live bytes")
-	if err := files.ReplaceLive(replacement); err != nil {
+	if err := files.ReplaceLive("operation-0123456789abcdef0123456789abcdef", []byte("parent"), replacement); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := os.ReadFile(configPath); err != nil || !bytes.Equal(got, replacement) {
@@ -52,6 +52,60 @@ func TestPrivateRawLocatorAndAtomicLiveReplacement(t *testing.T) {
 	}
 	if info, err := os.Lstat(configPath); err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("live mode=%v err=%v", info.Mode(), err)
+	}
+}
+
+func TestAtomicReplacementRestoresConcurrentExternalDrift(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	configPath := filepath.Join(root, "controller.json")
+	parent, target, drift := []byte("parent"), []byte("target"), []byte("external drift")
+	if err := os.WriteFile(configPath, parent, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files.beforeSwap = func() {
+		if err := os.WriteFile(configPath, drift, 0o600); err != nil {
+			t.Error(err)
+		}
+	}
+	err = files.ReplaceLive("operation-fedcba9876543210fedcba9876543210", parent, target)
+	if err == nil {
+		t.Fatal("concurrent drift was overwritten")
+	}
+	live, readErr := os.ReadFile(configPath)
+	if readErr != nil || !bytes.Equal(live, drift) {
+		t.Fatalf("live=%q err=%v", live, readErr)
+	}
+}
+
+func TestAtomicReplacementRetainsCapturedParentUntilDirectorySyncIsProven(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	configPath := filepath.Join(root, "controller.json")
+	parent, target := []byte("parent"), []byte("target")
+	if err := os.WriteFile(configPath, parent, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files.syncDir = func(string) error { return os.ErrInvalid }
+	operationID := "operation-00112233445566778899aabbccddeeff"
+	if err := files.ReplaceLive(operationID, parent, target); err == nil {
+		t.Fatal("unproven directory synchronization committed replacement")
+	}
+	stage, err := files.replacementStagePath(operationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if live, err := os.ReadFile(configPath); err != nil || !bytes.Equal(live, target) {
+		t.Fatalf("live=%q err=%v", live, err)
+	}
+	if captured, err := os.ReadFile(stage); err != nil || !bytes.Equal(captured, parent) {
+		t.Fatalf("captured parent=%q err=%v", captured, err)
 	}
 }
 

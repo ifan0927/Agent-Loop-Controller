@@ -96,7 +96,15 @@ func (s *Store) LinearTodoAdmissionLeaseHeld(ctx context.Context, lease applicat
 }
 
 func (s *Store) ListNonterminalRuns(ctx context.Context) ([]application.Run, error) {
-	rows, err := s.db.QueryContext(ctx, runSelect+` WHERE current_state NOT IN ('rejected','failed','completed') ORDER BY created_at,run_id`)
+	return listNonterminalRunsQuery(ctx, s.db)
+}
+
+type queryContexter interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func listNonterminalRunsQuery(ctx context.Context, query queryContexter) ([]application.Run, error) {
+	rows, err := query.QueryContext(ctx, runSelect+` WHERE current_state NOT IN ('rejected','failed','completed') ORDER BY created_at,run_id`)
 	if err != nil {
 		return nil, err
 	}
@@ -146,6 +154,9 @@ func (s *Store) ReserveLinearTodoAdmission(ctx context.Context, reservation appl
 	defer tx.Rollback()
 	now := time.Now().UTC()
 	if err := requireAutomaticAdmissionLeaseTx(ctx, tx, reservation.Lease, now); err != nil {
+		return application.Run{}, application.LinearTodoAdmissionJournal{}, false, err
+	}
+	if err := requireConfigurationAdmissionAuthorityTx(ctx, tx, reservation.ConfigurationAuthority); err != nil {
 		return application.Run{}, application.LinearTodoAdmissionJournal{}, false, err
 	}
 	if err := requireNoAdmissionJournalCorruption(ctx, tx); err != nil {

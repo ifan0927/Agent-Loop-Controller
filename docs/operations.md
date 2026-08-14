@@ -96,14 +96,22 @@ configuration authority from `automation.linear_todo_admission.requester`, even
 when both tuples identify the same human. It must also be present in every
 current repository profile's allowed login and trusted immutable actor policy.
 Issue content, Linear fields, and CLI repository selectors cannot supply or
-override it. Older configuration versions retain compatibility CLI behavior
-but do not provide the configured controller-scope identity.
+override it. For a legacy version 1 through 4 baseline, the Controller derives
+one deterministic migration operator from the complete immutable actors
+already trusted by its repository profiles. This migration-only authority does
+not retroactively change legacy run/query authorization; it may authorize the
+exact current-schema transition, after which version 5's explicit
+`controller.operator` is authoritative.
 
 The first production worker or management composition adopts an already-valid
 live file exactly once as the baseline generation. It does not rewrite the
 file. `config validate` and `config inspect` remain offline and never open
 SQLite, create the `authority/` directory, reconcile an apply, or observe a
-worker. After baseline, the private locator and retained desired bytes bind the
+worker. Baseline preparation first records the exact live-path/database/digest
+binding in that database, then publishes the private locator, and finally
+settles the generation. After a crash, startup accepts that locator only after
+a read-only schema-and-binding proof; it never creates or migrates an unproven
+locator target. After baseline, the locator and retained desired bytes bind the
 canonical configuration to its existing database. An alternate configuration
 path, database relocation, invalid live file, or out-of-band digest change is a
 conflict; startup never re-baselines, follows an edited database path, adopts
