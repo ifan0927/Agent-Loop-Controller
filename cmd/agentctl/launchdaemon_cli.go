@@ -596,12 +596,8 @@ func launchDaemonStatus(args []string) error {
 		result.Reason = "launchagent_conflict"
 	}
 	if observed.State == "running" {
-		result.WorkerStatus = workerStatusRunning
-		started, identityErr := processStartIdentity(observed.ProcessID)
-		if snapshot, snapshotErr := readWorkerStatusSnapshot(options.config); identityErr == nil && snapshotErr == nil && snapshot.ProcessID == observed.ProcessID && snapshot.ProcessStartID == started && observed.ProcessID > 0 {
-			result.WorkerStatus, result.WorkerPreviousStatus, result.WorkerStatusObservedAt = snapshot.Status, snapshot.PreviousStatus, snapshot.ObservedAt.UTC().Format(time.RFC3339Nano)
-			result.WorkerIdentityVerified = true
-		}
+		observation, observationErr := observeConfiguredWorkerRuntime(ctx, options.config, options.uid, observed.ProcessID, time.Now().UTC())
+		applyRuntimeObservation(&result, observation, observationErr)
 	}
 	return writeLaunchAgentControlResult(result, nil)
 }

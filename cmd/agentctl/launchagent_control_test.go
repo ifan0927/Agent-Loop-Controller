@@ -9,6 +9,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/bootstrap"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
 type scriptedLaunchAgentControl struct {
@@ -412,18 +415,25 @@ func TestLaunchAgentStatusDoesNotExposeRawLaunchctlOutput(t *testing.T) {
 
 func TestLaunchAgentStatusProjectsLiveSanitizedWorkerSnapshot(t *testing.T) {
 	root := resolvedTempDir(t)
-	config := filepath.Join(root, "controller.json")
+	config, _ := writeControllerStatusConfig(t, root)
 	binary := filepath.Join(root, "agentctl")
 	plist := filepath.Join(root, "worker.plist")
 	writeLaunchAgentFixture(t, binary, config, plist, true)
-	reporter, err := newWorkerStatusReporter(config, "worker-status-fixture")
+	reporter, err := newWorkerStatusReporter(config, "worker-status-fixture", version, strings.Repeat("a", 64))
 	if err != nil {
 		t.Fatal(err)
 	}
-	reporter.now = func() time.Time { return time.Date(2026, 7, 16, 12, 30, 0, 0, time.UTC) }
+	now := time.Now().UTC()
+	reporter.now = func() time.Time { return now }
+	originalProcessStartID := reporter.processStartID
 	if err := reporter.Observe(admissionWorkerResult{Status: workerStatusParked, PreviousStatus: workerStatusDriving, Cycles: 2}); err != nil {
 		t.Fatal(err)
 	}
+	originalLoad := loadWorkerRuntimeConfiguration
+	loadWorkerRuntimeConfiguration = func(string) (bootstrap.Bootstrap, error) {
+		return bootstrap.Bootstrap{Controller: bootstrap.Controller{Operator: domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "U_7", ActorType: "User"}}}, nil
+	}
+	t.Cleanup(func() { loadWorkerRuntimeConfiguration = originalLoad })
 	oldFactory := launchAgentControlFactory
 	defer func() { launchAgentControlFactory = oldFactory }()
 	fake := &scriptedLaunchAgentControl{statuses: []launchAgentObservation{{State: "running", ProcessID: os.Getpid()}, {State: "absent"}}}
@@ -431,7 +441,7 @@ func TestLaunchAgentStatusProjectsLiveSanitizedWorkerSnapshot(t *testing.T) {
 	output, err := captureConfigOutput(func() error {
 		return launchAgentStatus([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
 	})
-	if err != nil || !strings.Contains(output, `"worker_status": "parked"`) || !strings.Contains(output, `"worker_previous_status": "driving"`) || !strings.Contains(output, `"worker_status_observed_at": "2026-07-16T12:30:00Z"`) || !strings.Contains(output, `"worker_identity_verified": true`) {
+	if err != nil || !strings.Contains(output, `"worker_status": "parked"`) || !strings.Contains(output, `"worker_previous_status": "driving"`) || !strings.Contains(output, `"worker_status_observed_at": "`+now.Format(time.RFC3339Nano)+`"`) || !strings.Contains(output, `"worker_liveness": "fresh"`) || !strings.Contains(output, `"worker_runtime_reason": "heartbeat_fresh"`) || !strings.Contains(output, `"worker_identity_verified": true`) || !strings.Contains(output, `"loaded_configuration_digest": "`+strings.Repeat("a", 64)+`"`) {
 		t.Fatalf("output=%s err=%v", output, err)
 	}
 	reporter.processStartID = "1"
@@ -442,8 +452,19 @@ func TestLaunchAgentStatusProjectsLiveSanitizedWorkerSnapshot(t *testing.T) {
 	stale, err := captureConfigOutput(func() error {
 		return launchAgentStatus([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
 	})
-	if err != nil || !strings.Contains(stale, `"worker_status": "running"`) || strings.Contains(stale, `"worker_status_observed_at"`) || strings.Contains(stale, `"worker_status": "parked"`) || strings.Contains(stale, `"worker_identity_verified"`) {
-		t.Fatalf("stale output=%s err=%v", stale, err)
+	if err != nil || !strings.Contains(stale, `"worker_status": "parked"`) || !strings.Contains(stale, `"worker_liveness": "conflict"`) || !strings.Contains(stale, `"worker_runtime_reason": "process_identity_conflict"`) || strings.Contains(stale, `"worker_identity_verified"`) {
+		t.Fatalf("conflict output=%s err=%v", stale, err)
+	}
+	reporter.processStartID = originalProcessStartID
+	if err := reporter.Observe(admissionWorkerResult{Status: workerStatusParked, PreviousStatus: workerStatusDriving, Cycles: 2}); err != nil {
+		t.Fatal(err)
+	}
+	fake.statuses = []launchAgentObservation{{State: "running", ProcessID: 0}, {State: "absent"}}
+	unknown, err := captureConfigOutput(func() error {
+		return launchAgentStatus([]string{"--binary", binary, "--config", config, "--plist", plist, "--domain", "gui/501", "--timeout", "1s"})
+	})
+	if err != nil || !strings.Contains(unknown, `"worker_status": "parked"`) || !strings.Contains(unknown, `"worker_liveness": "unknown"`) || !strings.Contains(unknown, `"worker_runtime_reason": "process_identity_unavailable"`) || strings.Contains(unknown, `"worker_identity_verified"`) {
+		t.Fatalf("missing supervisor PID output=%s err=%v", unknown, err)
 	}
 }
 

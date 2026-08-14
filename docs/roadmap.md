@@ -131,26 +131,26 @@ runtime path.
 
 Implementation work is created one dependency-ready issue at a time. Local
 operator identity, application authorization, operation receipts, and
-legal-action offers are complete. The next foundation is worker heartbeat and
-runtime observation. Do not create
+legal-action offers are complete. Activity-independent worker heartbeat and
+controller-authorized runtime observation are complete. The next foundation is
+configuration generation and compare-and-swap apply. Do not create
 speculative TUI, HTTP, or frontend slices before their Controller contracts
 exist.
 
 ### Phase 1: controller operator foundations
 
 Bounded multi-repository concurrency, local operator authorization, operation
-receipts, and legal-action offers are complete. The remaining
+receipts, legal-action offers, and worker runtime observation are complete. The remaining
 presentation-independent sequence is:
 
-1. worker heartbeat and runtime observation;
-2. configuration generation and compare-and-swap apply;
-3. typed configuration lifecycle;
-4. repository lifecycle and readiness;
-5. restart-safe onboarding saga;
-6. existing-checkout adoption;
-7. empty-repository initialization;
-8. routine Controller projections;
-9. activity and audit integrity.
+1. configuration generation and compare-and-swap apply;
+2. typed configuration lifecycle;
+3. repository lifecycle and readiness;
+4. restart-safe onboarding saga;
+5. existing-checkout adoption;
+6. empty-repository initialization;
+7. routine Controller projections;
+8. activity and audit integrity.
 
 These services own policy, authorization, idempotency, reconciliation, and
 sanitized evidence independently of presentation. GitHub repository creation,

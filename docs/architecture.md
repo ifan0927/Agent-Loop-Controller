@@ -479,6 +479,31 @@ the database-directory process lock, so lease gaps are not treated as proof
 that the prior supervisor exited. The worker retains one
 admission/poll supervisor beyond heavy capacity so waiting runs cannot starve an
 idle repository.
+
+Worker runtime liveness is a separate application contract from workload
+activity and configuration convergence. After strict configuration, process
+lock, credential topology, SQLite compatibility, supervisor fencing,
+scheduling reconciliation, and production dispatcher construction succeed,
+the worker publishes schema-v2 private heartbeat evidence immediately and on a
+fixed 15-second cadence. Activity transitions may publish immediately but do
+not reset that cadence. The single supervisor heartbeat covers all bounded
+repository dispatches; there is no per-run heartbeat. Publication failure
+cancels and joins dispatch and fails the worker nonzero, while SQLite workflow
+state and ordinary restart reconciliation remain recovery authority.
+
+The heartbeat atomically replaces the prior private telemetry leaf and binds
+the worker instance, PID, OS process-start identity, binary build identity,
+exact loaded configuration digest, sanitized activity, cycle metadata, and
+observation time. It is not an append-only audit stream. Schema-v1
+activity-driven snapshots are finite legacy inputs and never current heartbeat
+evidence. The controller-authorized runtime observation service uses injected
+time plus a narrow process-identity observer to return `fresh`, `stale`,
+`offline`, `unknown`, or `conflict`; only age at or below 45 seconds with an
+exact live process match is fresh. Its sanitized projection omits PID,
+process-start identity, UID, local paths, launchd output, raw errors, logs, and
+credentials. Loaded digest evidence deliberately has no generation ID: fresh
+runtime liveness does not yet mean aggregate `ready` or `restart_required`.
+
 An authenticated `retry` action is deliberately narrower than general recovery:
 it accepts only a current `retry_budget_exhausted` attention whose retained
 failure class is `process_start`, with matching failed-attempt or verifier
@@ -1009,11 +1034,15 @@ Private stdout/stderr leaves use a fixed startup truncation threshold; normal
 cadence does not produce per-cycle log records.
 Sanitized worker output reports `running`, `driving`, `parked`, or `stopping`;
 the final stopping record also identifies the immediately previous state. A
-private atomically replaced status snapshot next to the controller config makes
-the current state observable without appending one log record per poll;
-Supervisor status projects it only while launchd observes the worker running
-and the snapshot's PID plus OS process-start identity match launchd's current
-process, so restart races and PID reuse cannot adopt a previous worker's state.
+private atomically replaced heartbeat next to the controller config makes the
+current runtime observable without appending one log or database record per
+cadence. LaunchAgent and LaunchDaemon status enter the same controller-scope
+runtime observation contract, verify the heartbeat PID and OS process-start
+identity, and require the heartbeat PID to equal launchd's current process.
+Restart races, stale files, legacy activity snapshots, and PID reuse therefore
+cannot be adopted as a fresh worker. Privileged launchd mutation remains in the
+CLI/runbook boundary; runtime observation adds no start, stop, install,
+restart, or migration authority.
 
 ### Operator-attention boundary
 

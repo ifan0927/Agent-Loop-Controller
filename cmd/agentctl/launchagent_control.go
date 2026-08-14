@@ -22,22 +22,28 @@ const (
 )
 
 type launchAgentControlResult struct {
-	Step                   string `json:"step"`
-	Label                  string `json:"label"`
-	ObservedState          string `json:"observed_state"`
-	RunAtLoad              bool   `json:"run_at_load"`
-	Outcome                string `json:"outcome"`
-	NextSafeAction         string `json:"next_safe_action"`
-	Reason                 string `json:"reason,omitempty"`
-	TimedOut               bool   `json:"timed_out,omitempty"`
-	ProcessLifetime        string `json:"process_lifetime"`
-	LogPolicy              string `json:"log_policy"`
-	WorkerStatus           string `json:"worker_status,omitempty"`
-	WorkerPreviousStatus   string `json:"worker_previous_status,omitempty"`
-	WorkerStatusObservedAt string `json:"worker_status_observed_at,omitempty"`
-	WorkerIdentityVerified bool   `json:"worker_identity_verified,omitempty"`
-	LegacyInstalled        bool   `json:"legacy_installed,omitempty"`
-	LegacyObservedState    string `json:"legacy_observed_state,omitempty"`
+	Step                      string `json:"step"`
+	Label                     string `json:"label"`
+	ObservedState             string `json:"observed_state"`
+	RunAtLoad                 bool   `json:"run_at_load"`
+	Outcome                   string `json:"outcome"`
+	NextSafeAction            string `json:"next_safe_action"`
+	Reason                    string `json:"reason,omitempty"`
+	TimedOut                  bool   `json:"timed_out,omitempty"`
+	ProcessLifetime           string `json:"process_lifetime"`
+	LogPolicy                 string `json:"log_policy"`
+	WorkerStatus              string `json:"worker_status,omitempty"`
+	WorkerPreviousStatus      string `json:"worker_previous_status,omitempty"`
+	WorkerStatusObservedAt    string `json:"worker_status_observed_at,omitempty"`
+	WorkerIdentityVerified    bool   `json:"worker_identity_verified,omitempty"`
+	WorkerLiveness            string `json:"worker_liveness,omitempty"`
+	WorkerRuntimeReason       string `json:"worker_runtime_reason,omitempty"`
+	WorkerInstanceID          string `json:"worker_instance_id,omitempty"`
+	WorkerBuildIdentity       string `json:"worker_build_identity,omitempty"`
+	LoadedConfigurationDigest string `json:"loaded_configuration_digest,omitempty"`
+	WorkerHeartbeatAgeSeconds *int64 `json:"worker_heartbeat_age_seconds,omitempty"`
+	LegacyInstalled           bool   `json:"legacy_installed,omitempty"`
+	LegacyObservedState       string `json:"legacy_observed_state,omitempty"`
 }
 
 type launchAgentObservation struct {
