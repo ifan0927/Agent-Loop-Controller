@@ -11,7 +11,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"syscall"
 
@@ -146,23 +145,11 @@ func (f *Files) RetainRaw(digest string, payload []byte) error {
 }
 
 func readRetainedAfterPublication(path string, uid int) ([]byte, error) {
-	return readAfterExclusivePublication(path, uid, maximumConfigurationBytes)
+	return readPrivateRegular(path, uid, maximumConfigurationBytes, true)
 }
 
 func readAfterExclusivePublication(path string, uid, limit int) ([]byte, error) {
-	var last error
-	for attempt := 0; attempt < 32; attempt++ {
-		payload, err := readPrivateRegular(path, uid, limit, true)
-		if err == nil || errors.Is(err, os.ErrNotExist) {
-			return payload, err
-		}
-		last = err
-		// Exclusive publication uses a temporary hard link and immediately
-		// removes it. Yield only across that bounded two-link window; a durable
-		// hard-link attack remains unsafe after the retry bound.
-		runtime.Gosched()
-	}
-	return nil, last
+	return readPrivateRegular(path, uid, limit, true)
 }
 
 func (f *Files) HasRaw(digest string, size int64) bool {
@@ -235,13 +222,17 @@ func (f *Files) AcquireMutation() (application.ConfigurationReplacementLock, boo
 	if err := f.ensureRoots(); err != nil {
 		return nil, false, err
 	}
-	file, err := os.Open(f.root)
+	// Every cooperating Controller process locks the stable filesystem-root
+	// inode. A same-UID rename can replace any user-owned descendant pathname,
+	// but it cannot give a second Controller a different mutation authority.
+	lockRoot := filepath.VolumeName(f.configPath) + string(filepath.Separator)
+	file, err := os.Open(lockRoot)
 	if err != nil {
 		return nil, false, errors.New("configuration replacement lock is unavailable")
 	}
 	info, statErr := file.Stat()
-	current, pathErr := os.Lstat(f.root)
-	if statErr != nil || pathErr != nil || !info.IsDir() || info.Mode().Perm() != 0o700 || !ownedBy(info, f.uid) || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(info, current) {
+	current, pathErr := os.Lstat(lockRoot)
+	if statErr != nil || pathErr != nil || !info.IsDir() || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(info, current) {
 		file.Close()
 		return nil, false, errors.New("configuration replacement lock is unsafe")
 	}
@@ -252,11 +243,16 @@ func (f *Files) AcquireMutation() (application.ConfigurationReplacementLock, boo
 		}
 		return nil, false, errors.New("configuration replacement lock is unavailable")
 	}
-	current, pathErr = os.Lstat(f.root)
+	current, pathErr = os.Lstat(lockRoot)
 	if pathErr != nil || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(info, current) {
 		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
 		file.Close()
 		return nil, false, errors.New("configuration replacement lock is unsafe")
+	}
+	if err := f.cleanupPublicationTemps(); err != nil {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		file.Close()
+		return nil, false, errors.New("configuration publication cleanup is unsafe")
 	}
 	return &replacementLock{file: file}, true, nil
 }
@@ -389,6 +385,33 @@ func (f *Files) RemoveRaw(digest string) error {
 		return errors.New("configuration raw evidence could not be pruned")
 	}
 	return f.syncAuthorityDirectory(f.rawRoot)
+}
+
+func (f *Files) ListRawDigests() ([]string, error) {
+	if err := f.ensureRoots(); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(f.rawRoot)
+	if err != nil {
+		return nil, errors.New("configuration raw evidence is unavailable")
+	}
+	digests := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		digest, found := strings.CutSuffix(name, ".json")
+		if !found || !validDigest(digest) {
+			return nil, errors.New("configuration raw directory is unsafe")
+		}
+		payload, err := readPrivateRegular(filepath.Join(f.rawRoot, name), f.uid, maximumConfigurationBytes, true)
+		if err != nil || configurationDigest(payload) != digest {
+			return nil, errors.New("configuration raw evidence is unsafe")
+		}
+		digests = append(digests, digest)
+	}
+	if err := f.syncAuthorityDirectory(f.rawRoot); err != nil {
+		return nil, errors.New("configuration raw evidence durability is unavailable")
+	}
+	return digests, nil
 }
 
 func (f *Files) PublishLocator(databasePath string) error {
@@ -608,7 +631,7 @@ func atomicPrivateWrite(path string, payload []byte, uid int, requireAbsent bool
 	if err := inspectPrivateDirectory(parent, uid, false); err != nil {
 		return errors.New("configuration write directory is unsafe")
 	}
-	temp, err := os.CreateTemp(parent, ".agentctl-config-*")
+	temp, err := os.CreateTemp(parent, ".agentctl-config-tmp-*")
 	if err != nil {
 		return errors.New("configuration staging failed")
 	}
@@ -624,16 +647,13 @@ func atomicPrivateWrite(path string, payload []byte, uid int, requireAbsent bool
 		return errors.New("configuration staging failed")
 	}
 	if requireAbsent {
-		// Link publishes the fully synced inode only when the immutable target is
-		// absent. Unlike rename, it cannot overwrite a concurrent winner.
-		if err := os.Link(tempPath, path); err != nil {
+		// The OS no-replace rename publishes one fully synced, single-link inode
+		// atomically. There is no crash window with both temp and final hard links.
+		if err := atomicPublishExclusive(tempPath, path); err != nil {
 			if errors.Is(err, os.ErrExist) {
 				return os.ErrExist
 			}
 			return errors.New("configuration exclusive publication failed")
-		}
-		if err := os.Remove(tempPath); err != nil {
-			return errors.New("configuration staging cleanup failed")
 		}
 		tempPath = ""
 	} else if err := os.Rename(tempPath, path); err != nil {
@@ -649,6 +669,39 @@ func atomicPrivateWrite(path string, payload []byte, uid int, requireAbsent bool
 	}
 	if _, err := readPrivateRegular(path, uid, len(payload), true); err != nil {
 		return errors.New("configuration replacement verification failed")
+	}
+	return nil
+}
+
+func (f *Files) cleanupPublicationTemps() error {
+	seen := map[string]struct{}{}
+	for _, directory := range []string{filepath.Dir(f.configPath), f.root, f.rawRoot} {
+		if _, duplicate := seen[directory]; duplicate {
+			continue
+		}
+		seen[directory] = struct{}{}
+		entries, err := os.ReadDir(directory)
+		if err != nil {
+			return err
+		}
+		removed := false
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.Name(), ".agentctl-config-tmp-") {
+				continue
+			}
+			path := filepath.Join(directory, entry.Name())
+			info, err := os.Lstat(path)
+			if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || !ownedBy(info, f.uid) || linkCount(info) != 1 {
+				return errors.New("unsafe configuration publication temp")
+			}
+			if err := os.Remove(path); err != nil {
+				return err
+			}
+			removed = true
+		}
+		if removed && syncDirectory(directory) != nil {
+			return errors.New("configuration publication cleanup is unproven")
+		}
 	}
 	return nil
 }

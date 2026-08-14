@@ -113,6 +113,35 @@ func TestBaselineBindingConflictRemovesUnreferencedRawWhileLocked(t *testing.T) 
 	}
 }
 
+func TestConfigurationStartupRemovesRawWithoutDurableAnchor(t *testing.T) {
+	service, _, files, _, _ := configurationServiceFixture(t)
+	baselineOrphan := []byte("crashed baseline staging")
+	files.raw[configurationTestDigest(baselineOrphan)] = baselineOrphan
+	authority, err := service.Initialize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	files.mu.Lock()
+	if len(files.raw) != 1 {
+		files.mu.Unlock()
+		t.Fatalf("raw after baseline recovery=%v", files.raw)
+	}
+	applyOrphan := []byte("crashed apply staging")
+	files.raw[configurationTestDigest(applyOrphan)] = applyOrphan
+	files.mu.Unlock()
+	if _, err := service.Initialize(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	files.mu.Lock()
+	defer files.mu.Unlock()
+	if len(files.raw) != 1 {
+		t.Fatalf("raw after apply recovery=%v", files.raw)
+	}
+	if _, found := files.raw[authority.Desired.Digest]; !found {
+		t.Fatal("durably anchored desired raw was removed")
+	}
+}
+
 func TestLegacyConfigurationWithoutUniversalOperatorStillConverges(t *testing.T) {
 	service, _, files, runtime, _ := configurationServiceFixture(t)
 	files.baselineSchema = 4
@@ -172,6 +201,15 @@ func (f *configurationFilesFixture) ReadRaw(digest string, size int64) ([]byte, 
 func (f *configurationFilesFixture) HasRaw(digest string, size int64) bool {
 	payload, err := f.ReadRaw(digest, size)
 	return err == nil && configurationTestDigest(payload) == digest
+}
+func (f *configurationFilesFixture) ListRawDigests() ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	digests := make([]string, 0, len(f.raw))
+	for digest := range f.raw {
+		digests = append(digests, digest)
+	}
+	return digests, nil
 }
 func (f *configurationFilesFixture) ReplaceLive(_ string, expected, payload []byte) error {
 	f.mu.Lock()

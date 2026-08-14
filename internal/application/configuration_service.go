@@ -78,6 +78,7 @@ func (s *ConfigurationService) Initialize(ctx context.Context) (ConfigurationAut
 	if err != nil {
 		return ConfigurationAuthority{}, serviceError(ErrorConflict, "live configuration cannot be adopted", nil)
 	}
+	s.removeUnreferencedRaws(ctx, candidate.Digest)
 	if err := s.files.RetainRaw(candidate.Digest, payload); err != nil {
 		return ConfigurationAuthority{}, serviceError(ErrorInternal, "configuration baseline evidence could not be retained", nil)
 	}
@@ -265,6 +266,7 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 			_ = replacementLock.Release()
 		}
 	}()
+	s.removeUnreferencedRaws(ctx)
 	if err := s.files.RetainRaw(candidate.Digest, command.Payload); err != nil {
 		return ConfigurationApplyResult{}, serviceError(ErrorInternal, "configuration target evidence could not be retained", nil)
 	}
@@ -329,6 +331,32 @@ func (s *ConfigurationService) removeUnreferencedRaw(ctx context.Context, digest
 		}
 	}
 	_ = s.files.RemoveRaw(digest)
+}
+
+func (s *ConfigurationService) removeUnreferencedRaws(ctx context.Context, preserve ...string) {
+	generations, err := s.store.ListConfigurationGenerations(ctx)
+	if err != nil {
+		return
+	}
+	referenced := make(map[string]struct{}, len(generations)+len(preserve))
+	for _, digest := range preserve {
+		referenced[digest] = struct{}{}
+	}
+	for _, generation := range generations {
+		if generation.RawRetained {
+			referenced[generation.Digest] = struct{}{}
+		}
+	}
+	digests, err := s.files.ListRawDigests()
+	if err != nil {
+		return
+	}
+	for _, digest := range digests {
+		if _, found := referenced[digest]; found {
+			continue
+		}
+		_ = s.files.RemoveRaw(digest)
+	}
 }
 
 func (s *ConfigurationService) settledConfigurationReplay(ctx context.Context, command ConfigurationApplyCommand, candidate ValidatedConfigurationCandidate) (ConfigurationApplyResult, bool) {
@@ -613,6 +641,7 @@ func (s *ConfigurationService) pruneLocked(ctx context.Context) {
 		}
 		s.completeRawPrune(ctx, digest)
 	}
+	s.removeUnreferencedRaws(ctx)
 }
 
 func (s *ConfigurationService) completeRawPrune(ctx context.Context, digest string) {

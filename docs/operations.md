@@ -143,13 +143,17 @@ binding, and locator contents are private recovery evidence: do not read, copy,
 edit, prune, or use them as an operator API.
 
 Raw retention and pruning are serialized with configuration publication by a
-flock on the private authority directory itself; there is no replaceable lock-
-file pathname. Existing identical publications and already-absent prune retries
-must re-sync their parent directory before they can report durable success. A
-competing apply returns a safe
-conflict, while deferred pruning is retried by normal startup or later apply
-reconciliation. Operators must not recreate a deleted digest leaf or remove the
-private authority directory while a configuration mutation may be active.
+flock on the stable filesystem-root inode; there is no user-replaceable
+lock-file, configuration-parent, or authority-subtree lock pathname. Existing
+identical publications and already-absent prune retries must re-sync their
+parent directory before they can report durable success. Exclusive raw,
+binding, and locator publication uses the platform's atomic no-replace rename,
+so a crash cannot leave the final leaf hard-linked to a temporary alias.
+Restart cleanup removes interrupted temporary leaves and raw digest leaves
+that never acquired a retained SQLite generation anchor. A competing apply
+returns a safe conflict, while deferred pruning is retried by normal startup or
+later apply reconciliation. Operators must not recreate or remove private
+configuration evidence while a mutation may be active.
 
 The database does not provide a legacy admission fallback once it has schema
 31 or newer. If configuration authority is absent, both manual run creation and

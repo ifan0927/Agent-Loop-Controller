@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -319,6 +320,93 @@ func TestMutationAuthorityDoesNotDependOnReplaceableLockPath(t *testing.T) {
 	}
 	if second, secondAcquired, secondErr := files.AcquireMutation(); secondErr != nil || secondAcquired || second != nil {
 		t.Fatalf("replacement lock path bypassed authority: lock=%v acquired=%t err=%v", second, secondAcquired, secondErr)
+	}
+}
+
+func TestMutationAuthoritySurvivesAuthorityRootReplacement(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	configPath := filepath.Join(root, "controller.json")
+	if err := os.WriteFile(configPath, []byte("parent"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, acquired, err := files.AcquireMutation()
+	if err != nil || !acquired {
+		t.Fatalf("mutation authority acquired=%t err=%v", acquired, err)
+	}
+	defer lock.Release()
+	if err := os.Rename(files.root, filepath.Join(root, "displaced-authority")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(files.root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if second, secondAcquired, secondErr := files.AcquireMutation(); secondErr != nil || secondAcquired || second != nil {
+		t.Fatalf("replacement authority root admitted a parallel mutation lock: lock=%v acquired=%t err=%v", second, secondAcquired, secondErr)
+	}
+}
+
+func TestExclusivePublicationHasNoHardLinkCrashState(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	target := filepath.Join(root, "exclusive.json")
+	payload := []byte("exclusive publication")
+	if err := atomicPrivateWrite(target, payload, os.Getuid(), true, nil); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(target)
+	if err != nil || linkCount(info) != 1 {
+		t.Fatalf("published info=%+v err=%v", info, err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".agentctl-config-tmp-") {
+			t.Fatalf("publication left temporary alias %q", entry.Name())
+		}
+	}
+	if err := atomicPrivateWrite(target, []byte("replacement"), os.Getuid(), true, nil); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("exclusive conflict err=%v", err)
+	}
+	if got, err := os.ReadFile(target); err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("published payload=%q err=%v", got, err)
+	}
+}
+
+func TestMutationAuthorityCleansInterruptedPublicationTemps(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	configPath := filepath.Join(root, "controller.json")
+	if err := os.WriteFile(configPath, []byte("parent"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := files.ensureRoots(); err != nil {
+		t.Fatal(err)
+	}
+	var temps []string
+	for _, directory := range []string{root, files.root, files.rawRoot} {
+		path := filepath.Join(directory, ".agentctl-config-tmp-interrupted")
+		if err := os.WriteFile(path, []byte("private staged bytes"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		temps = append(temps, path)
+	}
+	lock, acquired, err := files.AcquireMutation()
+	if err != nil || !acquired {
+		t.Fatalf("mutation authority acquired=%t err=%v", acquired, err)
+	}
+	defer lock.Release()
+	for _, path := range temps {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("interrupted publication temp %q remains: %v", path, err)
+		}
 	}
 }
 

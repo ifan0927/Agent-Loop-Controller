@@ -545,12 +545,19 @@ unresolved evidence are never pruned. Deletion first acquires a durable digest
 claim in SQLite; apply acceptance checks that claim in its transaction, so a
 digest cannot become accepted while its raw leaf is being removed. Raw target
 publication, prune deletion/metadata completion, and live replacement also
-flock the private authority directory itself, so replacing a lock-file pathname
-cannot split mutation authority and an apply cannot recreate a claimed raw
-leaf between deletion and metadata settlement. Startup
-finishes interrupted claims idempotently. Existing identical raw, baseline,
-and locator publications re-sync their parent directory before success; an
-already-absent prune retry does the same before settling metadata.
+flock the stable filesystem-root inode. The authority does not depend on any
+user-replaceable lock-file, configuration-parent, or authority-subtree
+pathname, so replacing a descendant cannot give a second Controller process a
+parallel mutation authority. An apply therefore cannot recreate a claimed raw
+leaf between deletion and metadata settlement. Startup finishes interrupted
+claims idempotently and removes raw digest leaves that have no retained SQLite
+generation anchor. Existing identical raw, baseline, and locator publications
+re-sync their parent directory before success; an already-absent prune retry
+does the same before settling metadata. Exclusive publications use an OS
+no-replace rename, so the fully synced temporary inode becomes the single-link
+final inode without a temp/final hard-link crash window. Restart cleanup
+removes interrupted pre-publication temporary leaves while holding mutation
+authority.
 
 The presentation-independent apply service authorizes from the committed
 desired generation's configured operator, strictly validates current-schema

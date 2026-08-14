@@ -261,6 +261,7 @@ type ConfigurationFileAuthority interface {
 	ReplaceLive(string, []byte, []byte) error
 	ReconcileReplacement(string, []byte, []byte) ([]byte, ValidatedConfigurationCandidate, error)
 	RemoveRaw(string) error
+	ListRawDigests() ([]string, error)
 	PublishLocator(string) error
 }
 
