@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,13 +13,18 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/libc"
+	moderncsqlite "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
@@ -38,17 +44,17 @@ func Open(path string) (*Store, error) {
 }
 
 func openWithSupportedSchema(path string, supportedVersion int) (*Store, error) {
-	return openPinnedStore(context.Background(), path, supportedVersion, true, application.DatabaseFileIdentity{}, nil, nil)
+	return openPinnedStore(context.Background(), path, supportedVersion, true, application.DatabaseFileIdentity{}, nil, openPinnedStoreHooks{})
 }
 
 // OpenConfigurationAuthority proves the exact private database inode and its
 // configuration binding on one query-only SQLite connection, then migrates
 // that same connection. No pathname reopen occurs between proof and effects.
 func OpenConfigurationAuthority(ctx context.Context, path, configPath string, expected application.DatabaseFileIdentity, allowUnbound bool) (*Store, error) {
-	return openConfigurationAuthority(ctx, path, configPath, expected, allowUnbound, nil)
+	return openConfigurationAuthority(ctx, path, configPath, expected, allowUnbound, openPinnedStoreHooks{})
 }
 
-func openConfigurationAuthority(ctx context.Context, path, configPath string, expected application.DatabaseFileIdentity, allowUnbound bool, beforeEffects func()) (*Store, error) {
+func openConfigurationAuthority(ctx context.Context, path, configPath string, expected application.DatabaseFileIdentity, allowUnbound bool, hooks openPinnedStoreHooks) (*Store, error) {
 	verify := func(db *sql.Conn) error {
 		var version int
 		if err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil || version < 31 || version > schemaVersion {
@@ -69,10 +75,16 @@ func openConfigurationAuthority(ctx context.Context, path, configPath string, ex
 		}
 		return nil
 	}
-	return openPinnedStore(ctx, path, schemaVersion, false, expected, verify, beforeEffects)
+	return openPinnedStore(ctx, path, schemaVersion, false, expected, verify, hooks)
 }
 
-func openPinnedStore(ctx context.Context, path string, supportedVersion int, create bool, expected application.DatabaseFileIdentity, verify func(*sql.Conn) error, beforeEffects func()) (*Store, error) {
+type openPinnedStoreHooks struct {
+	beforeConnectionOpen func()
+	afterConnectionOpen  func()
+	beforeEffects        func()
+}
+
+func openPinnedStore(ctx context.Context, path string, supportedVersion int, create bool, expected application.DatabaseFileIdentity, verify func(*sql.Conn) error, hooks openPinnedStoreHooks) (*Store, error) {
 	if supportedVersion < 1 || supportedVersion > schemaVersion {
 		return nil, errors.New("supported SQLite schema version is invalid")
 	}
@@ -104,11 +116,12 @@ func openPinnedStore(ctx context.Context, path string, supportedVersion int, cre
 			return nil, errors.New("SQLite database path is unsafe")
 		}
 	}
-	db, err := sql.Open("sqlite", pinnedSQLiteDSN(path))
-	if err != nil {
-		return nil, err
-	}
+	connector := &pinnedSQLiteConnector{driver: &moderncsqlite.Driver{}, dsn: pinnedSQLiteDSN(path), expected: identity, beforeIdentityCheck: hooks.afterConnectionOpen}
+	db := sql.OpenDB(connector)
 	db.SetMaxOpenConns(1)
+	if hooks.beforeConnectionOpen != nil {
+		hooks.beforeConnectionOpen()
+	}
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		db.Close()
@@ -121,7 +134,11 @@ func openPinnedStore(ctx context.Context, path string, supportedVersion int, cre
 			_ = db.Close()
 		}
 	}()
-	if err := conn.QueryRowContext(ctx, `SELECT 1`).Scan(new(int)); err != nil || !databasePathStillIdentifies(path, identity) {
+	if err := conn.QueryRowContext(ctx, `SELECT 1`).Scan(new(int)); err != nil {
+		return nil, errors.New("SQLite database identity changed while opening")
+	}
+	connectionIdentity, err := sqliteConnectionFileIdentity(conn)
+	if err != nil || connectionIdentity != identity || !databasePathStillIdentifies(path, identity) {
 		return nil, errors.New("SQLite database identity changed while opening")
 	}
 	if verify != nil {
@@ -129,8 +146,8 @@ func openPinnedStore(ctx context.Context, path string, supportedVersion int, cre
 			return nil, err
 		}
 	}
-	if beforeEffects != nil {
-		beforeEffects()
+	if hooks.beforeEffects != nil {
+		hooks.beforeEffects()
 	}
 	if _, err := conn.ExecContext(ctx, `PRAGMA query_only = OFF`); err != nil {
 		return nil, err
@@ -139,6 +156,7 @@ func openPinnedStore(ctx context.Context, path string, supportedVersion int, cre
 		db.Close()
 		return nil, err
 	}
+	connector.allowWrites.Store(true)
 	if !databasePathStillIdentifies(path, identity) {
 		return nil, errors.New("SQLite database identity changed while opening")
 	}
@@ -153,6 +171,107 @@ func openPinnedStore(ctx context.Context, path string, supportedVersion int, cre
 	}
 	closeFile, closeDatabase = false, false
 	return &Store{db: db, databaseIdentity: identity}, nil
+}
+
+// moderncConnectionHeader mirrors the first two fields of the connection in
+// the exact pinned modernc.org/sqlite version. SQLite's public file-control
+// API then exposes the real VFS handle, allowing fstat of the connection's
+// actual main database rather than another pathname open.
+type moderncConnectionHeader struct {
+	database uintptr
+	tls      *libc.TLS
+}
+
+type pinnedSQLiteConnector struct {
+	driver              *moderncsqlite.Driver
+	dsn                 string
+	expected            application.DatabaseFileIdentity
+	beforeIdentityCheck func()
+	allowWrites         atomic.Bool
+}
+
+func (c *pinnedSQLiteConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	connection, err := c.driver.Open(c.dsn)
+	if err != nil {
+		return nil, err
+	}
+	if c.beforeIdentityCheck != nil {
+		c.beforeIdentityCheck()
+	}
+	identity, err := moderncDriverConnectionIdentity(connection)
+	if err != nil || identity != c.expected {
+		_ = connection.Close()
+		return nil, errors.New("SQLite database identity changed while opening")
+	}
+	if c.allowWrites.Load() {
+		execer, ok := connection.(driver.ExecerContext)
+		if !ok {
+			_ = connection.Close()
+			return nil, errors.New("SQLite driver connection is unavailable")
+		}
+		if _, err := execer.ExecContext(ctx, `PRAGMA query_only = OFF`, nil); err != nil {
+			_ = connection.Close()
+			return nil, err
+		}
+	}
+	return connection, nil
+}
+
+func (c *pinnedSQLiteConnector) Driver() driver.Driver { return c.driver }
+
+func sqliteConnectionFileIdentity(conn *sql.Conn) (application.DatabaseFileIdentity, error) {
+	var identity application.DatabaseFileIdentity
+	err := conn.Raw(func(driverConnection any) error {
+		var err error
+		identity, err = moderncDriverConnectionIdentity(driverConnection)
+		return err
+	})
+	return identity, err
+}
+
+func moderncDriverConnectionIdentity(driverConnection any) (application.DatabaseFileIdentity, error) {
+	var identity application.DatabaseFileIdentity
+	err := func() error {
+		typeOf := reflect.TypeOf(driverConnection)
+		valueOf := reflect.ValueOf(driverConnection)
+		if typeOf == nil || typeOf.Kind() != reflect.Pointer || typeOf.Elem().PkgPath() != "modernc.org/sqlite" || typeOf.Elem().Name() != "conn" || valueOf.IsNil() {
+			return errors.New("SQLite driver connection identity is unavailable")
+		}
+		header := (*moderncConnectionHeader)(unsafe.Pointer(valueOf.Pointer()))
+		if header.database == 0 || header.tls == nil {
+			return errors.New("SQLite driver connection identity is unavailable")
+		}
+		databaseName, err := libc.CString("main")
+		if err != nil {
+			return errors.New("SQLite driver connection identity is unavailable")
+		}
+		defer libc.Xfree(header.tls, databaseName)
+		allocationSize := int(unsafe.Sizeof(uintptr(0)))
+		filePointer := header.tls.Alloc(allocationSize)
+		defer header.tls.Free(allocationSize)
+		libc.AssignPtrUintptr(filePointer, 0)
+		if result := sqlite3.Xsqlite3_file_control(header.tls, header.database, databaseName, int32(sqlite3.SQLITE_FCNTL_FILE_POINTER), filePointer); result != sqlite3.SQLITE_OK {
+			return errors.New("SQLite driver connection identity is unavailable")
+		}
+		mainFile := libc.AtomicLoadNUintptr(filePointer, 0)
+		if mainFile == 0 {
+			return errors.New("SQLite driver connection identity is unavailable")
+		}
+		fileDescriptor := libc.AtomicLoadNInt32(mainFile+unsafe.Offsetof(sqlite3.TunixFile{}.Fh), 0)
+		var stat syscall.Stat_t
+		if fileDescriptor < 0 || syscall.Fstat(int(fileDescriptor), &stat) != nil || int(stat.Uid) != os.Getuid() || stat.Nlink != 1 {
+			return errors.New("SQLite driver connection identity is unavailable")
+		}
+		identity = application.DatabaseFileIdentity{Device: uint64(stat.Dev), Inode: uint64(stat.Ino)}
+		if !identity.Valid() {
+			return errors.New("SQLite driver connection identity is unavailable")
+		}
+		return nil
+	}()
+	return identity, err
 }
 
 func sqliteDSN(path string) string {

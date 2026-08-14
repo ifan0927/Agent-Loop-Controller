@@ -523,8 +523,13 @@ exclusively publishes a baseline-binding intent,
 SQLite durably prepares the matching database anchor, and only then may the
 private locator be published. Startup proves a locator or pre-locator binding
 target's persisted device/inode identity and prepared binding on one query-only
-SQLite connection before enabling writes or migrating that same connection;
-there is no path-based reopen between proof and effects. That proof accepts only the configuration-authority
+SQLite connection before enabling writes or migrating that same connection.
+The adapter obtains SQLite's actual main-database VFS file descriptor and
+`fstat`s it; every pool reconnect repeats that exact identity check before
+writes are enabled. There is no path-based reopen between proof and effects,
+and every later production composition reopens only with the persisted
+identity constraint.
+That proof accepts only the configuration-authority
 schema floor through the binary's supported schema, allowing a trusted older
 store to receive normal forward migrations while rejecting pre-authority and
 newer unsupported stores. SQLite then atomically assigns one baseline generation without
@@ -540,9 +545,12 @@ unresolved evidence are never pruned. Deletion first acquires a durable digest
 claim in SQLite; apply acceptance checks that claim in its transaction, so a
 digest cannot become accepted while its raw leaf is being removed. Raw target
 publication, prune deletion/metadata completion, and live replacement also
-share one filesystem mutation lock, so an apply cannot recreate a claimed raw
+flock the private authority directory itself, so replacing a lock-file pathname
+cannot split mutation authority and an apply cannot recreate a claimed raw
 leaf between deletion and metadata settlement. Startup
-finishes interrupted claims idempotently.
+finishes interrupted claims idempotently. Existing identical raw, baseline,
+and locator publications re-sync their parent directory before success; an
+already-absent prune retry does the same before settling metadata.
 
 The presentation-independent apply service authorizes from the committed
 desired generation's configured operator, strictly validates current-schema

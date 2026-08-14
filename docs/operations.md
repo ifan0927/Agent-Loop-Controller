@@ -118,9 +118,13 @@ size, and schema. It then
 records the matching anchor in that database, publishes the private locator,
 and finally settles the generation. After a crash, startup accepts either the
 pre-locator intent or locator only after proving that exact private file
-identity and its schema/binding on one query-only SQLite connection. Writes and
-forward migration are enabled only on that same connection without reopening
-the pathname. It never creates or migrates an unproven target or follows a newly edited live
+identity and its schema/binding on one query-only SQLite connection. The
+adapter checks the actual SQLite VFS file descriptor, not another pathname
+lookup, and repeats that check on any pool reconnect. Writes and forward
+migration are enabled only on that same connection without reopening
+the pathname. Every later production store composition re-proves the persisted
+database identity instead of using a path-only open. It never creates or
+migrates an unproven target or follows a newly edited live
 database path. The proof accepts database schemas from the configuration-
 authority floor through the current binary's supported schema so a trusted
 older store can be migrated normally; it rejects pre-authority and newer
@@ -138,11 +142,14 @@ load configuration only at process startup. Raw generation files, baseline
 binding, and locator contents are private recovery evidence: do not read, copy,
 edit, prune, or use them as an operator API.
 
-Raw retention and pruning are serialized with configuration publication under
-one private filesystem mutation authority. A competing apply returns a safe
+Raw retention and pruning are serialized with configuration publication by a
+flock on the private authority directory itself; there is no replaceable lock-
+file pathname. Existing identical publications and already-absent prune retries
+must re-sync their parent directory before they can report durable success. A
+competing apply returns a safe
 conflict, while deferred pruning is retried by normal startup or later apply
 reconciliation. Operators must not recreate a deleted digest leaf or remove the
-private lock file.
+private authority directory while a configuration mutation may be active.
 
 The database does not provide a legacy admission fallback once it has schema
 31 or newer. If configuration authority is absent, both manual run creation and

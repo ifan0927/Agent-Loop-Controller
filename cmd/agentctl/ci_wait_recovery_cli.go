@@ -10,7 +10,6 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/githubapp"
 	linearadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/linear"
 	processadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/process"
-	sqlitestore "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 )
 
@@ -36,7 +35,7 @@ func controllerRecoverCIWait(args []string) error {
 	if err != nil {
 		return err
 	}
-	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
+	store, err := openManagedConfigurationStore(loaded)
 	if err != nil {
 		return err
 	}

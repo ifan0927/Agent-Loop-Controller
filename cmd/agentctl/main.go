@@ -159,7 +159,7 @@ func linearStart(args []string) error {
 	}
 	defer supervisorLock.Close()
 	permitOwner := "direct:" + uuid.NewString()
-	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
+	store, err := openManagedConfigurationStore(loaded)
 	if err != nil {
 		return err
 	}
@@ -249,7 +249,7 @@ func controllerRun(args []string) error {
 	}
 	defer supervisorLock.Close()
 	policy.HeavyPermitOwner = "direct:" + uuid.NewString()
-	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
+	store, err := openManagedConfigurationStore(loaded)
 	if err != nil {
 		return err
 	}
@@ -353,7 +353,7 @@ func controllerDrive(args []string) error {
 	}
 	defer supervisorLock.Close()
 	policy.HeavyPermitOwner = "direct:" + uuid.NewString()
-	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
+	store, err := openManagedConfigurationStore(loaded)
 	if err != nil {
 		return err
 	}
@@ -498,7 +498,7 @@ func controllerInspect(command string, args []string) error {
 	if err != nil {
 		return err
 	}
-	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
+	store, err := openManagedConfigurationStore(loaded)
 	if err != nil {
 		return err
 	}
@@ -692,7 +692,7 @@ func controllerAbandon(args []string) error {
 	if err != nil {
 		return err
 	}
-	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
+	store, err := openManagedConfigurationStore(loaded)
 	if err != nil {
 		return err
 	}
@@ -956,7 +956,7 @@ func productionCommandWithDecision(args []string, name string, allowDecision boo
 	if err != nil {
 		return productionCLICommand{}, bootstrap.Bootstrap{}, nil, err
 	}
-	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
+	store, err := openManagedConfigurationStore(loaded)
 	if err != nil {
 		return productionCLICommand{}, bootstrap.Bootstrap{}, nil, err
 	}
@@ -1053,7 +1053,7 @@ func githubRead(args []string) error {
 	if err != nil {
 		return err
 	}
-	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
+	store, err := openManagedConfigurationStore(loaded)
 	if err != nil {
 		return err
 	}

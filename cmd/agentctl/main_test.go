@@ -516,6 +516,35 @@ func TestManagedConfigurationRejectsAlternatePathForOwnedStore(t *testing.T) {
 	}
 }
 
+func TestManagedStoreReopenRejectsDatabaseReplacementAfterConfigurationLoad(t *testing.T) {
+	root := resolvedTempDir(t)
+	configPath, databasePath := writeControllerStatusConfig(t, root)
+	loaded, err := loadManagedConfiguration(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(databasePath, filepath.Join(root, "proved.db")); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := sqlitestore.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replacement.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := openManagedConfigurationStore(loaded)
+	if store != nil {
+		store.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "store is unavailable") {
+		t.Fatalf("replacement reopen err=%v", err)
+	}
+	if _, _, bound, inspectErr := sqlitestore.InspectConfigurationBindingReadOnly(context.Background(), databasePath); inspectErr != nil || bound {
+		t.Fatalf("replacement binding accepted=%t err=%v", bound, inspectErr)
+	}
+}
+
 func TestManagedConfigurationFinishesBaselineAfterLocatorPublicationCrash(t *testing.T) {
 	root := resolvedTempDir(t)
 	configPath, databasePath := writeControllerStatusConfig(t, root)

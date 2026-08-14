@@ -292,6 +292,110 @@ func TestRawPruneAndLiveReplacementShareOneFilesystemMutationLock(t *testing.T) 
 	}
 }
 
+func TestMutationAuthorityDoesNotDependOnReplaceableLockPath(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	configPath := filepath.Join(root, "controller.json")
+	if err := os.WriteFile(configPath, []byte("parent"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, acquired, err := files.AcquireMutation()
+	if err != nil || !acquired {
+		t.Fatalf("mutation authority acquired=%t err=%v", acquired, err)
+	}
+	defer lock.Release()
+	legacyPath := filepath.Join(files.root, "mutation.lock")
+	if err := os.WriteFile(legacyPath, []byte("first"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(legacyPath, filepath.Join(files.root, "displaced.lock")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPath, []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if second, secondAcquired, secondErr := files.AcquireMutation(); secondErr != nil || secondAcquired || second != nil {
+		t.Fatalf("replacement lock path bypassed authority: lock=%v acquired=%t err=%v", second, secondAcquired, secondErr)
+	}
+}
+
+func TestAuthorityPublicationRetryReprovesDirectoryDurability(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	configPath := filepath.Join(root, "controller.json")
+	payload := []byte("baseline")
+	if err := os.WriteFile(configPath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(root, "controller.db")
+	bindTestDatabase(t, files, databasePath)
+	candidate := application.ValidatedConfigurationCandidate{Digest: configurationDigest(payload), Size: int64(len(payload)), SchemaVersion: 5, DatabasePath: databasePath}
+
+	for name, publish := range map[string]func() error{
+		"raw":      func() error { return files.RetainRaw(candidate.Digest, payload) },
+		"baseline": func() error { return files.PublishBaselineBinding(candidate) },
+		"locator":  func() error { return files.PublishLocator(databasePath) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			failed := false
+			files.syncAuthority = func(path string) error {
+				if !failed {
+					failed = true
+					return errors.New("injected directory sync failure")
+				}
+				return syncDirectory(path)
+			}
+			if err := publish(); err == nil {
+				t.Fatal("publication did not surface directory sync failure")
+			}
+			if err := publish(); err != nil {
+				t.Fatalf("publication retry did not re-prove durability: %v", err)
+			}
+			files.syncAuthority = nil
+		})
+	}
+}
+
+func TestRawRemovalRetrySyncsAlreadyAbsentDirectoryEntry(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	configPath := filepath.Join(root, "controller.json")
+	if err := os.WriteFile(configPath, []byte("parent"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("retained")
+	digest := configurationDigest(payload)
+	if err := files.RetainRaw(digest, payload); err != nil {
+		t.Fatal(err)
+	}
+	failed := false
+	files.syncAuthority = func(path string) error {
+		if !failed {
+			failed = true
+			return errors.New("injected directory sync failure")
+		}
+		return syncDirectory(path)
+	}
+	if err := files.RemoveRaw(digest); err == nil {
+		t.Fatal("raw removal did not surface directory sync failure")
+	}
+	if _, err := os.Lstat(files.rawPath(digest)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("raw leaf still exists after unlink: %v", err)
+	}
+	if err := files.RemoveRaw(digest); err != nil {
+		t.Fatalf("absent raw retry did not sync directory: %v", err)
+	}
+}
+
 func TestLocatorRejectsSymlinkAndModeConflicts(t *testing.T) {
 	root := canonicalTempDirectory(t)
 	configPath := filepath.Join(root, "controller.json")

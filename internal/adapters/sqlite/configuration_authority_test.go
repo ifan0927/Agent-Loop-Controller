@@ -177,14 +177,14 @@ func TestConfigurationAuthorityOpenDoesNotMigrateReplacementAfterProof(t *testin
 		t.Fatal(err)
 	}
 	displacedPath := filepath.Join(root, "proved.db")
-	opened, err := openConfigurationAuthority(context.Background(), path, configPath, expected, false, func() {
+	opened, err := openConfigurationAuthority(context.Background(), path, configPath, expected, false, openPinnedStoreHooks{beforeEffects: func() {
 		if renameErr := os.Rename(path, displacedPath); renameErr != nil {
 			t.Fatal(renameErr)
 		}
 		if renameErr := os.Rename(replacementPath, path); renameErr != nil {
 			t.Fatal(renameErr)
 		}
-	})
+	}})
 	if opened != nil {
 		opened.Close()
 	}
@@ -200,6 +200,104 @@ func TestConfigurationAuthorityOpenDoesNotMigrateReplacementAfterProof(t *testin
 	var version int
 	if err := db.QueryRow(`SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil || version != 30 {
 		t.Fatalf("replacement schema version=%d err=%v", version, err)
+	}
+}
+
+func TestConfigurationAuthorityOpenRejectsConnectionInodeABASwap(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "controller.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, "controller.json")
+	input := application.ConfigurationBaselineInput{
+		Candidate: application.ValidatedConfigurationCandidate{
+			Digest: strings.Repeat("a", 64), Size: 42, SchemaVersion: 5, DatabasePath: path,
+			Operator: domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"},
+		},
+		CanonicalConfigPath: configPath,
+		ObservedAt:          time.Now().UTC(),
+	}
+	if err := store.PrepareConfigurationBaseline(context.Background(), input); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if _, _, err := store.AdoptConfigurationBaseline(context.Background(), input); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	expected := store.DatabaseIdentity()
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	replacementPath := filepath.Join(root, "replacement.db")
+	replacement, err := openWithSupportedSchema(replacementPath, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replacement.Close(); err != nil {
+		t.Fatal(err)
+	}
+	displacedPath := filepath.Join(root, "proved.db")
+	opened, err := openConfigurationAuthority(context.Background(), path, configPath, expected, false, openPinnedStoreHooks{
+		beforeConnectionOpen: func() {
+			if renameErr := os.Rename(path, displacedPath); renameErr != nil {
+				t.Fatal(renameErr)
+			}
+			if renameErr := os.Rename(replacementPath, path); renameErr != nil {
+				t.Fatal(renameErr)
+			}
+		},
+		afterConnectionOpen: func() {
+			if renameErr := os.Rename(path, replacementPath); renameErr != nil {
+				t.Fatal(renameErr)
+			}
+			if renameErr := os.Rename(displacedPath, path); renameErr != nil {
+				t.Fatal(renameErr)
+			}
+		},
+	})
+	if opened != nil {
+		opened.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("ABA connection open err=%v", err)
+	}
+
+	db, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: replacementPath}).String()+"?mode=ro&_pragma=query_only(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var version int
+	if err := db.QueryRow(`SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil || version != 30 {
+		t.Fatalf("ABA replacement schema version=%d err=%v", version, err)
+	}
+}
+
+func TestPinnedStoreRejectsReplacementOnPoolReconnect(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "controller.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.db.SetMaxIdleConns(0)
+	if err := os.Rename(path, filepath.Join(root, "original.db")); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replacement.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SchemaVersion(context.Background()); err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("pool reconnect err=%v", err)
 	}
 }
 

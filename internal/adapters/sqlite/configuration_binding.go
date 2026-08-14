@@ -10,8 +10,10 @@ import (
 	"syscall"
 )
 
-// InspectConfigurationBindingReadOnly proves a locator target without
-// creating or migrating it. It accepts either completed authority or the
+// InspectConfigurationBindingReadOnly is diagnostic inspection without
+// creating or migrating a target. Production composition must use
+// OpenConfigurationAuthority so proof and effects share an inode-bound
+// connection. This accepts either completed authority or the
 // prepared baseline anchor that exists before locator publication. A trusted
 // binding from the configuration-authority schema may be older than this
 // binary so Open can perform the normal forward migration afterwards.

@@ -131,6 +131,21 @@ func loadManagedConfiguration(path string) (bootstrap.Bootstrap, error) {
 	return loaded, nil
 }
 
+// openManagedConfigurationStore reopens only the exact private database
+// identity published by successful authority initialization. Production
+// callers must not fall back to a path-only SQLite open after proof.
+func openManagedConfigurationStore(loaded bootstrap.Bootstrap) (*sqlitestore.Store, error) {
+	locator, found, err := configurationadapter.ReadLocator(loaded.Path)
+	if err != nil || !found || locator.DatabasePath != loaded.Controller.DatabasePath {
+		return nil, errors.New("configuration authority locator conflicts")
+	}
+	store, err := sqlitestore.OpenConfigurationAuthority(context.Background(), locator.DatabasePath, loaded.Path, locator.DatabaseIdentity, false)
+	if err != nil {
+		return nil, errors.New("configuration authority store is unavailable")
+	}
+	return store, nil
+}
+
 func configuredConvergenceService(store *sqlitestore.Store, loaded bootstrap.Bootstrap, expectedProcessID int, supervisorRequired bool) (*application.ConfigurationService, error) {
 	files, err := configurationadapter.NewFiles(loaded.Path)
 	if err != nil {

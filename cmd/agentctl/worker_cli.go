@@ -266,7 +266,7 @@ func newAutomaticWorkerRuntime(loaded bootstrap.Bootstrap, instanceID string) (a
 	if err != nil {
 		return automaticWorkerRuntime{}, errors.New("automatic admission configuration is unavailable")
 	}
-	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
+	store, err := openManagedConfigurationStore(loaded)
 	if err != nil {
 		return automaticWorkerRuntime{}, errors.New("automatic admission state store is unavailable")
 	}

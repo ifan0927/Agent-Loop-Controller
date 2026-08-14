@@ -34,6 +34,7 @@ type Files struct {
 	databaseIdentity application.DatabaseFileIdentity
 	beforeSwap       func()
 	syncDir          func(string) error
+	syncAuthority    func(string) error
 }
 
 type AuthorityLocator struct {
@@ -128,17 +129,17 @@ func (f *Files) RetainRaw(digest string, payload []byte) error {
 	path := f.rawPath(digest)
 	if existing, err := readRetainedAfterPublication(path, f.uid); err == nil {
 		if bytes.Equal(existing, payload) {
-			return nil
+			return f.syncAuthorityDirectory(f.rawRoot)
 		}
 		return errors.New("configuration raw evidence conflicts")
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return errors.New("configuration raw evidence is unsafe")
 	}
-	err := atomicPrivateWrite(path, payload, f.uid, true)
+	err := atomicPrivateWrite(path, payload, f.uid, true, f.syncAuthorityDirectory)
 	if errors.Is(err, os.ErrExist) {
 		existing, readErr := readRetainedAfterPublication(path, f.uid)
 		if readErr == nil && bytes.Equal(existing, payload) {
-			return nil
+			return f.syncAuthorityDirectory(f.rawRoot)
 		}
 	}
 	return err
@@ -169,7 +170,7 @@ func (f *Files) HasRaw(digest string, size int64) bool {
 		return false
 	}
 	payload, err := readPrivateRegular(f.rawPath(digest), f.uid, maximumConfigurationBytes, true)
-	return err == nil && int64(len(payload)) == size && configurationDigest(payload) == digest
+	return err == nil && int64(len(payload)) == size && configurationDigest(payload) == digest && f.syncAuthorityDirectory(f.rawRoot) == nil
 }
 
 func (f *Files) PublishBaselineBinding(candidate application.ValidatedConfigurationCandidate) error {
@@ -194,11 +195,11 @@ func (f *Files) PublishBaselineBinding(candidate application.ValidatedConfigurat
 		if decodeErr != nil || current != value {
 			return errors.New("configuration baseline binding conflicts")
 		}
-		return nil
+		return f.syncAuthorityDirectory(f.root)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return errors.New("configuration baseline binding is unsafe")
 	}
-	if err := atomicPrivateWrite(path, payload, f.uid, true); !errors.Is(err, os.ErrExist) {
+	if err := atomicPrivateWrite(path, payload, f.uid, true, f.syncAuthorityDirectory); !errors.Is(err, os.ErrExist) {
 		return err
 	}
 	existing, readErr := readAfterExclusivePublication(path, f.uid, 4096)
@@ -206,7 +207,7 @@ func (f *Files) PublishBaselineBinding(candidate application.ValidatedConfigurat
 	if readErr != nil || decodeErr != nil || current != value {
 		return errors.New("configuration baseline binding conflicts")
 	}
-	return nil
+	return f.syncAuthorityDirectory(f.root)
 }
 
 func (f *Files) ReadRaw(digest string, size int64) ([]byte, error) {
@@ -216,6 +217,9 @@ func (f *Files) ReadRaw(digest string, size int64) ([]byte, error) {
 	payload, err := readPrivateRegular(f.rawPath(digest), f.uid, maximumConfigurationBytes, true)
 	if err != nil || int64(len(payload)) != size || configurationDigest(payload) != digest {
 		return nil, errors.New("configuration raw evidence is unavailable")
+	}
+	if err := f.syncAuthorityDirectory(f.rawRoot); err != nil {
+		return nil, errors.New("configuration raw evidence durability is unavailable")
 	}
 	return payload, nil
 }
@@ -231,13 +235,13 @@ func (f *Files) AcquireMutation() (application.ConfigurationReplacementLock, boo
 	if err := f.ensureRoots(); err != nil {
 		return nil, false, err
 	}
-	path := filepath.Join(f.root, "mutation.lock")
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	file, err := os.Open(f.root)
 	if err != nil {
 		return nil, false, errors.New("configuration replacement lock is unavailable")
 	}
 	info, statErr := file.Stat()
-	if statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || !ownedBy(info, f.uid) || linkCount(info) != 1 {
+	current, pathErr := os.Lstat(f.root)
+	if statErr != nil || pathErr != nil || !info.IsDir() || info.Mode().Perm() != 0o700 || !ownedBy(info, f.uid) || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(info, current) {
 		file.Close()
 		return nil, false, errors.New("configuration replacement lock is unsafe")
 	}
@@ -247,6 +251,12 @@ func (f *Files) AcquireMutation() (application.ConfigurationReplacementLock, boo
 			return nil, false, nil
 		}
 		return nil, false, errors.New("configuration replacement lock is unavailable")
+	}
+	current, pathErr = os.Lstat(f.root)
+	if pathErr != nil || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(info, current) {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		file.Close()
+		return nil, false, errors.New("configuration replacement lock is unsafe")
 	}
 	return &replacementLock{file: file}, true, nil
 }
@@ -263,7 +273,7 @@ func (f *Files) ReplaceLive(operationID string, expected, payload []byte) error 
 	if err != nil {
 		return err
 	}
-	if err := atomicPrivateWrite(stage, payload, f.uid, true); err != nil {
+	if err := atomicPrivateWrite(stage, payload, f.uid, true, nil); err != nil {
 		return errors.New("configuration replacement staging failed")
 	}
 	if f.beforeSwap != nil {
@@ -371,14 +381,14 @@ func (f *Files) RemoveRaw(digest string) error {
 	path := f.rawPath(digest)
 	if _, err := readPrivateRegular(path, f.uid, maximumConfigurationBytes, true); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil
+			return f.syncAuthorityDirectory(f.rawRoot)
 		}
 		return errors.New("configuration raw evidence is unsafe")
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return errors.New("configuration raw evidence could not be pruned")
 	}
-	return syncDirectory(f.rawRoot)
+	return f.syncAuthorityDirectory(f.rawRoot)
 }
 
 func (f *Files) PublishLocator(databasePath string) error {
@@ -400,11 +410,11 @@ func (f *Files) PublishLocator(databasePath string) error {
 		if decodeErr != nil || current != value {
 			return errors.New("configuration authority locator conflicts")
 		}
-		return nil
+		return f.syncAuthorityDirectory(f.root)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return errors.New("configuration authority locator is unsafe")
 	}
-	if err := atomicPrivateWrite(path, payload, f.uid, true); !errors.Is(err, os.ErrExist) {
+	if err := atomicPrivateWrite(path, payload, f.uid, true, f.syncAuthorityDirectory); !errors.Is(err, os.ErrExist) {
 		return err
 	}
 	existing, readErr := readAfterExclusivePublication(path, f.uid, 4096)
@@ -412,7 +422,7 @@ func (f *Files) PublishLocator(databasePath string) error {
 	if readErr != nil || decodeErr != nil || current != value {
 		return errors.New("configuration authority locator conflicts")
 	}
-	return nil
+	return f.syncAuthorityDirectory(f.root)
 }
 
 // ReadLocator resolves only the fixed locator beside the requested canonical
@@ -434,6 +444,9 @@ func ReadLocator(configPath string) (AuthorityLocator, bool, error) {
 	if err != nil || value.ConfigPath != configPath {
 		return AuthorityLocator{}, false, errors.New("configuration authority locator conflicts")
 	}
+	if err := files.syncAuthorityDirectory(files.root); err != nil {
+		return AuthorityLocator{}, false, errors.New("configuration authority locator durability is unavailable")
+	}
 	return value, true, nil
 }
 
@@ -452,6 +465,9 @@ func ReadBaselineBinding(configPath string) (BaselineBinding, bool, error) {
 	value, err := decodeBaselineBinding(payload)
 	if err != nil || value.ConfigPath != configPath {
 		return BaselineBinding{}, false, errors.New("configuration baseline binding conflicts")
+	}
+	if err := files.syncAuthorityDirectory(files.root); err != nil {
+		return BaselineBinding{}, false, errors.New("configuration baseline binding durability is unavailable")
 	}
 	return value, true, nil
 }
@@ -587,7 +603,7 @@ func readPrivateRegular(path string, uid, limit int, privateMode bool) ([]byte, 
 	return payload, nil
 }
 
-func atomicPrivateWrite(path string, payload []byte, uid int, requireAbsent bool) error {
+func atomicPrivateWrite(path string, payload []byte, uid int, requireAbsent bool, syncer func(string) error) error {
 	parent := filepath.Dir(path)
 	if err := inspectPrivateDirectory(parent, uid, false); err != nil {
 		return errors.New("configuration write directory is unsafe")
@@ -625,13 +641,23 @@ func atomicPrivateWrite(path string, payload []byte, uid int, requireAbsent bool
 	} else {
 		tempPath = ""
 	}
-	if err := syncDirectory(parent); err != nil {
+	if syncer == nil {
+		syncer = syncDirectory
+	}
+	if err := syncer(parent); err != nil {
 		return errors.New("configuration directory synchronization failed")
 	}
 	if _, err := readPrivateRegular(path, uid, len(payload), true); err != nil {
 		return errors.New("configuration replacement verification failed")
 	}
 	return nil
+}
+
+func (f *Files) syncAuthorityDirectory(path string) error {
+	if f.syncAuthority != nil {
+		return f.syncAuthority(path)
+	}
+	return syncDirectory(path)
 }
 
 func syncDirectory(path string) error {
