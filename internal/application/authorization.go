@@ -146,6 +146,15 @@ func (s AuthorizedScopeSet) HasController() bool {
 	return slices.ContainsFunc(s.scopes, func(scope AuthorityScope) bool { return scope.Kind == ScopeController })
 }
 
+func (s AuthorizedScopeSet) ControllerOperationTarget() (OperationReceiptTarget, bool) {
+	for _, scope := range s.scopes {
+		if scope.Kind == ScopeController {
+			return OperationReceiptTarget{Scope: ScopeController, TargetID: ConfigurationTargetID, TargetBindingDigest: scope.AuthorityDigest}, true
+		}
+	}
+	return OperationReceiptTarget{}, false
+}
+
 func (s AuthorizedScopeSet) RepositoryBindingDigests() []string {
 	return scopeValues(s.scopes, ScopeRepository, func(scope AuthorityScope) string { return scope.AuthorityDigest })
 }
@@ -179,6 +188,9 @@ func (s AuthorizedScopeSet) AllowsOperationTarget(target OperationReceiptTarget)
 	}
 	if target.Scope == ScopeRun {
 		return s.AllowsRun(target.TargetID, target.TargetBindingDigest)
+	}
+	if target.Scope == ScopeController && target.TargetID == ConfigurationTargetID {
+		return s.HasController()
 	}
 	return slices.ContainsFunc(s.scopes, func(scope AuthorityScope) bool {
 		return scope.Kind == target.Scope && scope.ID == target.TargetID && scope.AuthorityDigest == target.TargetBindingDigest

@@ -55,6 +55,10 @@ The default macOS controller root is:
 ~/Library/Application Support/agent-loop-controller/
   controller.json       secret-free configuration, mode 0600
   controller.db         authoritative workflow state and evidence
+  authority/            private configuration authority, mode 0700
+    locator.json        canonical config/database binding, mode 0600
+    generations/        bounded raw recovery evidence, mode 0700
+      <sha256>.json     immutable exact generation bytes, mode 0600
   secrets/              private directory, mode 0700
     linear-token        regular single-link file, mode 0600
   logs/                 private launchd worker logs, mode 0700
@@ -94,6 +98,24 @@ current repository profile's allowed login and trusted immutable actor policy.
 Issue content, Linear fields, and CLI repository selectors cannot supply or
 override it. Older configuration versions retain compatibility CLI behavior
 but do not provide the configured controller-scope identity.
+
+The first production worker or management composition adopts an already-valid
+live file exactly once as the baseline generation. It does not rewrite the
+file. `config validate` and `config inspect` remain offline and never open
+SQLite, create the `authority/` directory, reconcile an apply, or observe a
+worker. After baseline, the private locator and retained desired bytes bind the
+canonical configuration to its existing database. An alternate configuration
+path, database relocation, invalid live file, or out-of-band digest change is a
+conflict; startup never re-baselines, follows an edited database path, adopts
+drift, or rewrites the file.
+
+The Controller now owns internal generation/CAS apply and convergence
+contracts, but this milestone intentionally exposes no raw apply, draft,
+preview, rollback, or drift-repair CLI. A committed future typed configuration
+change requires the existing explicit worker restart procedure because workers
+load configuration only at process startup. Raw generation files and locator
+contents are private recovery evidence: do not read, copy, edit, prune, or use
+them as an operator API.
 
 Repository profiles are selectable one at a time per run. They may coexist in
 one configuration, but paths must not overlap and a run freezes the selected
@@ -615,9 +637,17 @@ nonzero so launchd can restart and resume from persisted state without duplicate
 admission. Failure to create, encode, write, synchronize, close, or atomically
 publish the canonical heartbeat also cancels and joins worker dispatch, then
 exits nonzero; there is no heartbeat-degraded mode that continues delivery.
-A fresh heartbeat proves local runtime liveness and its loaded digest only. It
-does not prove aggregate Controller `ready` or `restart_required` configuration
-convergence.
+A fresh heartbeat proves local runtime liveness and its loaded digest only.
+Controller convergence additionally requires exact live/desired equality, no
+unresolved apply, a durable effective observation for the current desired
+generation, and the matching fresh identity-verified heartbeat. A safely
+committed desired digest with a fresh worker still reporting the prior digest
+is `restart_required`; use the existing LaunchAgent/LaunchDaemon stop/start or
+kickstart procedure in this runbook. A fresh matching digest awaiting durable
+CAS settlement is `starting`, never another restart request. Drift or ambiguous
+evidence is `conflict` and has no force-overwrite procedure in this milestone.
+Automatic and manual new admission remain fenced until the projection is
+`ready`; compatible existing runs continue under frozen authority.
 
 **Related commands**
 
@@ -2399,6 +2429,8 @@ There is no automatic backup command or migration rollback command.
 | Symptom | Meaning and safe response |
 | --- | --- |
 | Configuration invalid | Run `config validate`; correct the strict JSON/reference/path error. Do not weaken validators or insert placeholder identities. |
+| Configuration restart required | Use the existing supervised worker restart procedure, then wait for a fresh matching heartbeat and durable effective observation. Do not edit SQLite or the private locator. |
+| Configuration drift or ambiguous apply | Stop new admission and preserve `authority/` evidence. Do not rebaseline, copy a raw generation over the live file, change the locator, or force overwrite; typed recovery is intentionally deferred. |
 | Unauthorized requester | Use the immutable GitHub `User` identity configured and frozen for the run. A matching login alone is insufficient. |
 | Linear source drift | Inspect the source revision and changed task/branch/repository facts. Resolve the human/manual gate; do not overwrite the snapshot. |
 | Repository/profile drift | Restore the exact frozen authority or deliberately terminate/recover through supported policy. Unrelated config edits must not retarget the run. |

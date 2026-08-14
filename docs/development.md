@@ -313,6 +313,7 @@ The acceptance matrix requires:
 | Boundary | Required evidence |
 | --- | --- |
 | Automatic admission | Bounded scan, priority selection, atomic run/slot/permit reservation, exact Todo-to-In-Progress mutation, and one nonterminal run per repository |
+| Configuration authority | Same-byte baseline, v31 migration, CAS/no-op/replay, intent-before-rename crash matrix, raw retention, drift/effective convergence, and admission fencing |
 | Bounded concurrency | Generic capacity above two, same-repository exclusion, drain-on-reduction, sibling failure isolation, and restart reconstruction |
 | Implementation | Owned worktree, resumable session, exact candidate, successful verifier batch |
 | Internal review | Fresh independent read-only review bound to candidate head; after repair, exact expected-finding dispositions cover both repair and full branch deltas |
@@ -338,6 +339,8 @@ controller process. Cover at least:
 - verifier start/interruption and full batch recording;
 - fresh-review findings atomic handoff;
 - Linear admission mutation intent/observation;
+- configuration raw staging, intent acceptance, live rename/fsync/reread,
+  desired settlement, effective observation, and retention pruning;
 - push, PR create/adopt, review reply, and merge intent/observation;
 - pending CI/approval/thread resolution polling;
 - Linear completion observation;
@@ -350,7 +353,7 @@ that bypass safety solely to make fault injection easier.
 ## Database Migrations
 
 SQLite migrations are ordered in `internal/adapters/sqlite/store.go`; the current
-schema version is 30. Opening a database applies missing forward migrations in a
+schema version is 31. Opening a database applies missing forward migrations in a
 transaction. A database newer than the binary fails closed.
 
 When adding a migration:

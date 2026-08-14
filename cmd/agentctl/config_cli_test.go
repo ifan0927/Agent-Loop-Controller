@@ -215,7 +215,7 @@ func TestConfigDoctorReportsCredentialReadinessWithoutLeakingSourceOrToken(t *te
 
 func TestConfigValidateAndInspectDoNotReadFileCredential(t *testing.T) {
 	root := resolvedTempDir(t)
-	path, _ := writeControllerStatusConfig(t, root)
+	path, databasePath := writeControllerStatusConfig(t, root)
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -237,6 +237,12 @@ func TestConfigValidateAndInspectDoNotReadFileCredential(t *testing.T) {
 		if err != nil || !strings.Contains(output, `"offline": true`) || !strings.Contains(output, `"credential_source_type": "file"`) || strings.Contains(output, "secret://") {
 			t.Fatalf("command=%s output=%s err=%v", command, output, err)
 		}
+	}
+	if _, err := os.Lstat(databasePath); !os.IsNotExist(err) {
+		t.Fatalf("offline config command opened SQLite: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "authority")); !os.IsNotExist(err) {
+		t.Fatalf("offline config command created generation authority: %v", err)
 	}
 }
 

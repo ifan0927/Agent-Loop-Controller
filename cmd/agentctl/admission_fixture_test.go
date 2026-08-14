@@ -690,6 +690,7 @@ func newOfflineAdmissionDispatcherWithResolver(scanner application.LinearTodoCan
 		OwnerNonce:         owner,
 		Requester:          application.Requester{ID: "operator", Kind: "github_login"},
 		AttentionProfile:   application.OperatorAttentionProfile{ID: "offline", Name: "offline-fixture"},
+		AdmissionGate:      application.AllowNewAdmissionForTest(),
 	})
 }
 

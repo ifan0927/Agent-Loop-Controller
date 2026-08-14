@@ -243,6 +243,23 @@ func TestLoadVersionFourRemainsReadableWithoutControllerOperator(t *testing.T) {
 	}
 }
 
+func TestValidateCurrentBytesRejectsLegacyReadableSchema(t *testing.T) {
+	root := canonicalTempDir(t)
+	configPath, _ := writeV2Fixture(t, root, "github-app-profile:fixture", 7)
+	config := readJSONFixture(t, configPath)
+	config["version"] = VersionFour
+	payload, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateBytes(configPath, payload); err != nil {
+		t.Fatalf("legacy load validation failed: %v", err)
+	}
+	if _, err := ValidateCurrentBytes(configPath, payload); err == nil || !strings.Contains(err.Error(), "current schema") {
+		t.Fatalf("current apply validation error=%v", err)
+	}
+}
+
 func TestLoadVersionThreeMapsSingletonAuthorityToCapacityOne(t *testing.T) {
 	root := canonicalTempDir(t)
 	configPath, _ := writeV2Fixture(t, root, "github-app-profile:fixture", 7)

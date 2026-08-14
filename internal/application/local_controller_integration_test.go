@@ -1298,7 +1298,7 @@ func TestProductionDriverRoutesFreshReviewFindingsIntoBoundedSameSessionRepair(t
 	process := &durableFakeProcess{reviewFindings: true}
 	local := newController(t, store, lab, process, gitadapter.Workspace{})
 	reader := &productionLinearReader{source: productionLinearSource()}
-	admission, err := application.NewLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, local)
+	admission, err := application.NewGatedLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, local, application.AllowNewAdmissionForTest())
 	if err != nil {
 		t.Fatal(err)
 	}

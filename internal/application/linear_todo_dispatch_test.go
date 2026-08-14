@@ -682,7 +682,7 @@ func newDispatchLab(t *testing.T, candidates ...LinearTodoCandidate) (*LinearTod
 	store := &dispatchStore{now: now}
 	starter := &dispatchStarter{reader: reader}
 	driver := &dispatchDriver{}
-	policy := LinearTodoDispatchPolicy{CandidateAuthority: dispatchAuthority(), StartAuthority: dispatchStartAuthority(), LeaseTTL: time.Minute, LeaseRenewal: 20 * time.Second, OwnerNonce: "dispatch-owner", Requester: Requester{ID: "operator", Kind: "github_login"}, AttentionProfile: OperatorAttentionProfile{ID: "automation", Name: "linear"}}
+	policy := LinearTodoDispatchPolicy{CandidateAuthority: dispatchAuthority(), StartAuthority: dispatchStartAuthority(), LeaseTTL: time.Minute, LeaseRenewal: 20 * time.Second, OwnerNonce: "dispatch-owner", Requester: Requester{ID: "operator", Kind: "github_login"}, AttentionProfile: OperatorAttentionProfile{ID: "automation", Name: "linear"}, AdmissionGate: AllowNewAdmissionForTest()}
 	dispatcher, err := NewLinearTodoDispatcher(scanner, reader, dispatchResolver{repository: repository}, starter, store, &dispatchController{store: store}, driver, policy)
 	if err != nil {
 		t.Fatal(err)
@@ -977,6 +977,32 @@ func TestLinearTodoDispatcherExistingRunPreventsHigherPriorityPreemption(t *test
 	}
 	if result.QueueDecision == nil || result.QueueDecision.Reason != LinearTodoQueueDecisionActiveRun || result.QueueDecision.CandidateCount != 0 || !result.QueueDecision.ExistingRunPreventedScan {
 		t.Fatalf("queue decision=%+v", result.QueueDecision)
+	}
+}
+
+func TestLinearTodoDispatcherConfigurationFencePreventsScanWithoutAttentionNoise(t *testing.T) {
+	candidate := dispatchCandidate("fenced", "IFAN-142", 1)
+	dispatcher, store, scanner, _, starter, driver := newDispatchLab(t, candidate)
+	dispatcher.policy.AdmissionGate = StaticNewAdmissionGate{Decision: NewAdmissionDecision{Allowed: false, Reason: ConfigurationReasonRestartRequired}}
+
+	result, err := dispatcher.Dispatch(context.Background())
+	if err != nil || result.Outcome != LinearTodoDispatchWaiting || scanner.calls != 0 || store.reserveCalls != 0 || len(starter.calls) != 0 || len(driver.calls) != 0 || len(store.attention) != 0 {
+		t.Fatalf("result=%+v scans=%d reserve=%d starter=%+v driver=%+v attention=%+v err=%v", result, scanner.calls, store.reserveCalls, starter.calls, driver.calls, store.attention, err)
+	}
+	if result.QueueDecision == nil || result.QueueDecision.Reason != LinearTodoQueueDecisionConfigurationFenced {
+		t.Fatalf("queue decision=%+v", result.QueueDecision)
+	}
+}
+
+func TestLinearTodoDispatcherConfigurationFenceDoesNotInterruptExistingRun(t *testing.T) {
+	candidate := dispatchCandidate("fenced-existing", "IFAN-143", 1)
+	dispatcher, store, scanner, _, _, driver := newDispatchLab(t, candidate)
+	dispatcher.policy.AdmissionGate = StaticNewAdmissionGate{Decision: NewAdmissionDecision{Allowed: false, Reason: ConfigurationReasonExternalDrift}}
+	store.run = authorizeDispatchRun(Run{ID: "run-fenced-existing", IssueID: "IFAN-199", IdempotencyKey: "existing-key", Repository: "owner/repo", State: domain.StateExecuting})
+
+	result, err := dispatcher.Dispatch(context.Background())
+	if err != nil || result.Outcome != LinearTodoDispatchDriven || scanner.calls != 0 || len(driver.calls) != 1 || store.run.IssueID != "IFAN-199" {
+		t.Fatalf("result=%+v scans=%d driver=%+v run=%+v err=%v", result, scanner.calls, driver.calls, store.run, err)
 	}
 }
 

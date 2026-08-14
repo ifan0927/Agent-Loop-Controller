@@ -40,6 +40,7 @@ const (
 	LinearTodoQueueDecisionCapacityFull        = "capacity_full"
 	LinearTodoQueueDecisionAdmissionBusy       = "admission_busy"
 	LinearTodoQueueDecisionNoEligibleCandidate = "no_eligible_candidate"
+	LinearTodoQueueDecisionConfigurationFenced = "configuration_fenced"
 )
 
 // LinearTodoQueueDecision is sanitized, bounded evidence for one admission
@@ -64,7 +65,7 @@ func (d LinearTodoQueueDecision) Validate() error {
 	case LinearTodoQueueDecisionNoCandidate, LinearTodoQueueDecisionActiveRun,
 		LinearTodoQueueDecisionIncompleteScan, LinearTodoQueueDecisionSelectedPriority, LinearTodoQueueDecisionSchedulerAttention,
 		LinearTodoQueueDecisionRetryAttention, LinearTodoQueueDecisionCapacityFull, LinearTodoQueueDecisionAdmissionBusy,
-		LinearTodoQueueDecisionNoEligibleCandidate:
+		LinearTodoQueueDecisionNoEligibleCandidate, LinearTodoQueueDecisionConfigurationFenced:
 	default:
 		return errors.New("queue decision reason is invalid")
 	}
@@ -132,6 +133,7 @@ type LinearTodoDispatchPolicy struct {
 	AttentionProfile     OperatorAttentionProfile
 	Retry                AutomaticRetryPolicy
 	ExternalPollInterval time.Duration
+	AdmissionGate        NewAdmissionGate
 }
 
 // LinearTodoDispatchResult contains sanitized control-flow evidence. The
@@ -181,7 +183,7 @@ type LinearTodoDispatcher struct {
 }
 
 func NewLinearTodoDispatcher(scanner LinearTodoCandidateScanner, reader LinearIssueReader, resolver LinearAdmissionRepositoryResolver, starter LinearReservedIssueStarter, store linearTodoDispatchStore, controller LocalRunController, driver LinearTodoDispatchDriver, policy LinearTodoDispatchPolicy) (*LinearTodoDispatcher, error) {
-	if scanner == nil || reader == nil || resolver == nil || starter == nil || store == nil || controller == nil || driver == nil {
+	if scanner == nil || reader == nil || resolver == nil || starter == nil || store == nil || controller == nil || driver == nil || policy.AdmissionGate == nil {
 		return nil, errors.New("Linear Todo dispatcher dependencies are required")
 	}
 	if err := validateLinearTodoDispatchPolicy(policy); err != nil {
@@ -371,6 +373,11 @@ func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatch
 	if capacity.Available == 0 {
 		result := LinearTodoDispatchResult{Outcome: LinearTodoDispatchWaiting, NextRunnableAt: persistedNextRunnableAt}
 		return withQueueDecision(result, queueDecision(LinearTodoQueueDecisionCapacityFull, 0, false)), nil
+	}
+	admission, gateErr := d.policy.AdmissionGate.CheckNewAdmission(ctx)
+	if gateErr != nil || !admission.Allowed {
+		result := LinearTodoDispatchResult{Outcome: LinearTodoDispatchWaiting, NextRunnableAt: persistedNextRunnableAt}
+		return withQueueDecision(result, queueDecision(LinearTodoQueueDecisionConfigurationFenced, 0, false)), nil
 	}
 
 	if !d.renewLease(ctx, &lease) {

@@ -6,7 +6,6 @@ import (
 	"flag"
 	"time"
 
-	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/bootstrap"
 	gitadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/git"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/githubapp"
 	linearadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/linear"
@@ -33,7 +32,7 @@ func controllerRecoverCIWait(args []string) error {
 	if err != nil {
 		return err
 	}
-	loaded, err := bootstrap.Load(path)
+	loaded, err := loadManagedConfiguration(path)
 	if err != nil {
 		return err
 	}

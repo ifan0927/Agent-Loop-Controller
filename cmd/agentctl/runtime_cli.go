@@ -33,7 +33,7 @@ func runtimeDoctor(args []string) error {
 	if err != nil {
 		return err
 	}
-	loaded, err := bootstrap.Load(path)
+	loaded, err := loadManagedConfiguration(path)
 	if err != nil {
 		return err
 	}

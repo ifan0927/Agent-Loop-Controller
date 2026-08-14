@@ -508,5 +508,6 @@ func newAcceptanceRetryDispatcher(scanner application.LinearTodoCandidateScanner
 		Requester:          requester,
 		AttentionProfile:   application.OperatorAttentionProfile{ID: "offline", Name: "offline-retry-fixture"},
 		Retry:              application.AutomaticRetryPolicy{MaxAttempts: 1, InitialDelay: time.Second, MaximumDelay: time.Second},
+		AdmissionGate:      application.AllowNewAdmissionForTest(),
 	})
 }

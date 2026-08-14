@@ -23,7 +23,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 30
+const schemaVersion = 31
 
 type Store struct {
 	db                   *sql.DB
@@ -163,6 +163,8 @@ func (s *Store) migrate(ctx context.Context, supportedVersion int) error {
 			statements = migrationV29
 		case 30:
 			statements = migrationV30
+		case 31:
+			statements = migrationV31
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -431,6 +433,111 @@ var migrationV30 = []string{
 	)`,
 	`CREATE INDEX operation_receipts_target ON operation_receipts(scope_kind,target_id,accepted_at,operation_id)`,
 	`CREATE UNIQUE INDEX operation_receipts_source_action ON operation_receipts(source_action_id) WHERE source_action_id<>''`,
+}
+
+// migrationV31 establishes one Controller-wide configuration generation
+// authority. Raw configuration bytes remain in the private file adapter; only
+// immutable metadata, transaction state, and sanitized convergence evidence
+// are stored in SQLite.
+var migrationV31 = []string{
+	`DROP INDEX operation_receipts_target`,
+	`DROP INDEX operation_receipts_source_action`,
+	`ALTER TABLE operation_receipts RENAME TO operation_receipts_v30`,
+	`CREATE TABLE operation_receipts (
+		operation_id TEXT PRIMARY KEY,
+		authority_key TEXT NOT NULL UNIQUE,
+		operation_anchor_digest TEXT NOT NULL,
+		operation_type TEXT NOT NULL CHECK(operation_type IN ('decide','retry','abandon','recover_ci_wait','recover_owned_push','accept_external_merge','apply_configuration')),
+		scope_kind TEXT NOT NULL CHECK(scope_kind IN ('controller','repository','run','onboarding')),
+		target_id TEXT NOT NULL,
+		requester_login TEXT NOT NULL,
+		requester_database_id INTEGER NOT NULL,
+		requester_node_id TEXT NOT NULL,
+		requester_actor_type TEXT NOT NULL,
+		request_digest TEXT NOT NULL,
+		expected_authority_digest TEXT NOT NULL,
+		target_binding_digest TEXT NOT NULL,
+		phase TEXT NOT NULL CHECK(phase IN ('accepted','applied','observed')),
+		outcome TEXT NOT NULL CHECK(outcome IN ('pending','succeeded','failed','conflict','ambiguous')),
+		resulting_authority_digest TEXT NOT NULL DEFAULT '',
+		resulting_state TEXT NOT NULL DEFAULT '',
+		resulting_version INTEGER NOT NULL DEFAULT 0 CHECK(resulting_version >= 0),
+		evidence_digest TEXT NOT NULL DEFAULT '',
+		result_digest TEXT NOT NULL DEFAULT '',
+		accepted_at TEXT NOT NULL,
+		applied_at TEXT NOT NULL DEFAULT '',
+		settled_at TEXT NOT NULL DEFAULT '',
+		source_action_id TEXT NOT NULL DEFAULT ''
+	)`,
+	`INSERT INTO operation_receipts SELECT * FROM operation_receipts_v30`,
+	`DROP TABLE operation_receipts_v30`,
+	`CREATE INDEX operation_receipts_target ON operation_receipts(scope_kind,target_id,accepted_at,operation_id)`,
+	`CREATE UNIQUE INDEX operation_receipts_source_action ON operation_receipts(source_action_id) WHERE source_action_id<>''`,
+	`CREATE TABLE configuration_generations (
+		generation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+		parent_generation_id INTEGER REFERENCES configuration_generations(generation_id),
+		digest TEXT NOT NULL,
+		target_size INTEGER NOT NULL CHECK(target_size BETWEEN 0 AND 262144),
+		schema_version INTEGER NOT NULL CHECK(schema_version BETWEEN 1 AND 5),
+		origin TEXT NOT NULL CHECK(origin IN ('baseline','apply')),
+		requester_login TEXT NOT NULL DEFAULT '',
+		requester_database_id INTEGER NOT NULL DEFAULT 0,
+		requester_node_id TEXT NOT NULL DEFAULT '',
+		requester_actor_type TEXT NOT NULL DEFAULT '',
+		configured_operator_login TEXT NOT NULL DEFAULT '',
+		configured_operator_database_id INTEGER NOT NULL DEFAULT 0,
+		configured_operator_node_id TEXT NOT NULL DEFAULT '',
+		configured_operator_actor_type TEXT NOT NULL DEFAULT '',
+		operation_id TEXT REFERENCES operation_receipts(operation_id),
+		lifecycle TEXT NOT NULL CHECK(lifecycle IN ('accepted','pending_restart','effective','superseded','failed','ambiguous')),
+		raw_retained INTEGER NOT NULL CHECK(raw_retained IN (0,1)),
+		created_at TEXT NOT NULL,
+		committed_at TEXT NOT NULL DEFAULT '',
+		effective_at TEXT NOT NULL DEFAULT '',
+		superseded_at TEXT NOT NULL DEFAULT '',
+		settled_at TEXT NOT NULL DEFAULT '',
+		reason_code TEXT NOT NULL DEFAULT '',
+		CHECK((origin='baseline' AND parent_generation_id IS NULL AND operation_id IS NULL AND requester_login='' AND requester_database_id=0 AND requester_node_id='' AND requester_actor_type='') OR (origin='apply' AND parent_generation_id IS NOT NULL AND operation_id IS NOT NULL))
+	)`,
+	`CREATE INDEX configuration_generations_created ON configuration_generations(created_at,generation_id)`,
+	`CREATE TRIGGER configuration_generation_identity_immutable BEFORE UPDATE ON configuration_generations
+		WHEN NEW.parent_generation_id IS NOT OLD.parent_generation_id OR NEW.digest<>OLD.digest OR NEW.target_size<>OLD.target_size OR NEW.schema_version<>OLD.schema_version OR NEW.origin<>OLD.origin OR NEW.requester_login<>OLD.requester_login OR NEW.requester_database_id<>OLD.requester_database_id OR NEW.requester_node_id<>OLD.requester_node_id OR NEW.requester_actor_type<>OLD.requester_actor_type OR NEW.configured_operator_login<>OLD.configured_operator_login OR NEW.configured_operator_database_id<>OLD.configured_operator_database_id OR NEW.configured_operator_node_id<>OLD.configured_operator_node_id OR NEW.configured_operator_actor_type<>OLD.configured_operator_actor_type OR NEW.operation_id IS NOT OLD.operation_id OR NEW.created_at<>OLD.created_at
+		BEGIN SELECT RAISE(ABORT,'configuration generation identity is immutable'); END`,
+	`CREATE TABLE configuration_authority (
+		authority_id INTEGER PRIMARY KEY CHECK(authority_id=1),
+		canonical_config_path TEXT NOT NULL,
+		database_path TEXT NOT NULL,
+		desired_generation_id INTEGER NOT NULL REFERENCES configuration_generations(generation_id),
+		effective_generation_id INTEGER REFERENCES configuration_generations(generation_id),
+		authority_version INTEGER NOT NULL CHECK(authority_version > 0),
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	)`,
+	`CREATE TABLE configuration_apply_intents (
+		generation_id INTEGER PRIMARY KEY REFERENCES configuration_generations(generation_id),
+		parent_generation_id INTEGER NOT NULL REFERENCES configuration_generations(generation_id),
+		parent_digest TEXT NOT NULL,
+		target_digest TEXT NOT NULL,
+		operation_id TEXT NOT NULL UNIQUE REFERENCES operation_receipts(operation_id),
+		status TEXT NOT NULL CHECK(status IN ('accepted','committed','failed','ambiguous')),
+		accepted_at TEXT NOT NULL,
+		settled_at TEXT NOT NULL DEFAULT '',
+		reason_code TEXT NOT NULL DEFAULT ''
+	)`,
+	`CREATE UNIQUE INDEX configuration_one_incomplete_apply ON configuration_apply_intents((1)) WHERE status IN ('accepted','ambiguous')`,
+	`CREATE TABLE configuration_convergence_events (
+		event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+		event_type TEXT NOT NULL CHECK(event_type IN ('baseline_established','apply_accepted','apply_committed','apply_failed','apply_ambiguous','desired_changed','effective_observed','drift_entered','drift_cleared','convergence_conflict')),
+		generation_id INTEGER REFERENCES configuration_generations(generation_id),
+		operation_id TEXT NOT NULL DEFAULT '',
+		digest TEXT NOT NULL DEFAULT '',
+		worker_instance_id TEXT NOT NULL DEFAULT '',
+		build_identity TEXT NOT NULL DEFAULT '',
+		reason_code TEXT NOT NULL,
+		evidence_digest TEXT NOT NULL,
+		observed_at TEXT NOT NULL,
+		UNIQUE(event_type,generation_id,operation_id,digest,evidence_digest)
+	)`,
 }
 
 func backfillOperationReceiptsV30Tx(ctx context.Context, tx *sql.Tx) error {

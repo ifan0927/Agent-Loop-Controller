@@ -87,7 +87,7 @@ func controllerWorker(args []string) error {
 	if err != nil {
 		return err
 	}
-	loaded, err := bootstrap.Load(path)
+	loaded, err := loadManagedConfiguration(path)
 	if err != nil {
 		return err
 	}
@@ -278,6 +278,20 @@ func newAutomaticWorkerRuntime(loaded bootstrap.Bootstrap, instanceID string) (a
 		_ = store.Close()
 		return automaticWorkerRuntime{}, errors.New("automatic admission scheduling authority is unavailable")
 	}
+	convergence, err := configuredConvergenceService(store, loaded, 0, false)
+	if err != nil {
+		_ = store.Close()
+		return automaticWorkerRuntime{}, errors.New("configuration convergence authority is unavailable")
+	}
+	if _, reconcileErr := convergence.Initialize(context.Background()); reconcileErr != nil {
+		// An ambiguous or drifted configuration is a fenced operating state,
+		// not a worker crash. The gate below remains fail-closed while existing
+		// runs can continue under frozen authority.
+		if _, found, authorityErr := store.ConfigurationAuthority(context.Background()); authorityErr != nil || !found {
+			_ = store.Close()
+			return automaticWorkerRuntime{}, errors.New("configuration convergence authority is unavailable")
+		}
+	}
 	requester := application.Requester{ID: configured.Requester.Login, Kind: "github_login", DatabaseID: configured.Requester.DatabaseID, NodeID: configured.Requester.NodeID, ActorType: configured.Requester.Type}
 	dispatcher, err := application.NewLinearTodoDispatcher(client, client, linearRegistryResolver{registry: loaded.Registry}, client, store, newLocalController(store, loaded.Controller.CodexBinary, ""), automaticWorkerDriver{loaded: loaded, store: store, policy: automaticWorkerDriverPolicy(configured, instanceID)}, application.LinearTodoDispatchPolicy{
 		CandidateAuthority:   application.LinearTodoCandidateAuthority{TeamID: configured.TeamID, TeamKey: configured.TeamKey, TodoState: application.LinearState{ID: configured.TodoState.ID, Name: configured.TodoState.Name, Type: configured.TodoState.Type}, InProgressState: application.LinearState{ID: configured.InProgressState.ID, Name: configured.InProgressState.Name, Type: configured.InProgressState.Type}, MaxCandidates: configured.MaxCandidates, MaxPages: configured.MaxPages},
@@ -288,6 +302,7 @@ func newAutomaticWorkerRuntime(loaded bootstrap.Bootstrap, instanceID string) (a
 		Requester:            requester,
 		AttentionProfile:     application.OperatorAttentionProfile{ID: "automation", Name: "linear-todo-admission"},
 		ExternalPollInterval: configured.DeliveryPollInterval,
+		AdmissionGate:        convergence,
 	})
 	if err != nil {
 		_ = store.Close()

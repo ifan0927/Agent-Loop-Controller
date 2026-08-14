@@ -86,6 +86,7 @@ func TestLinearAdmissionFreezesControllerOwnedTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	service.gate = AllowNewAdmissionForTest()
 	result, observations, err := service.Start(context.Background(), LinearStartCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, Identifier: "IFAN-42"})
 	if err != nil {
 		t.Fatal(err)
@@ -108,6 +109,19 @@ func TestLinearAdmissionFreezesControllerOwnedTask(t *testing.T) {
 	}
 }
 
+func TestLinearAdmissionFenceRunsBeforeExternalIssueCollection(t *testing.T) {
+	repository := LocalRepository{CanonicalRepository: "owner/repo", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
+	reader := &admissionReader{source: validLinearSource()}
+	service, err := NewGatedLinearAdmissionService(reader, admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}, &admissionStore{}, &admissionController{}, StaticNewAdmissionGate{Decision: NewAdmissionDecision{Allowed: false, Reason: ConfigurationReasonExternalDrift}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = service.Start(context.Background(), LinearStartCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, Identifier: "IFAN-42"})
+	if err == nil || reader.calls != 0 {
+		t.Fatalf("err=%v reader calls=%d", err, reader.calls)
+	}
+}
+
 func TestLinearAdmissionSourceDriftRequiresManualDecision(t *testing.T) {
 	repository := LocalRepository{CanonicalRepository: "owner/repo", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
 	original := validLinearSource()
@@ -125,6 +139,7 @@ func TestLinearAdmissionSourceDriftRequiresManualDecision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	service.gate = AllowNewAdmissionForTest()
 	_, _, err = service.Start(context.Background(), LinearStartCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, Identifier: "IFAN-42"})
 	if err == nil || !strings.Contains(err.Error(), "human decision") || !store.marked || store.markedRunID != existing.ID || store.markedState != domain.StateExecuting || store.markedSource != existing.SourceRevision || controller.started != 0 {
 		t.Fatalf("err=%v marked=%t run=%s state=%s source=%s started=%d", err, store.marked, store.markedRunID, store.markedState, store.markedSource, controller.started)
@@ -511,6 +526,7 @@ func TestLinearAdmissionConcurrentSourceDriftIsDurablyHalted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	service.gate = AllowNewAdmissionForTest()
 	_, _, err = service.Start(context.Background(), LinearStartCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, Identifier: "IFAN-42"})
 	if err == nil || !strings.Contains(err.Error(), "human decision") || !store.marked || store.markedRunID != existing.ID || store.markedSource != existing.SourceRevision {
 		t.Fatalf("err=%v marked=%t run=%s", err, store.marked, store.markedRunID)
@@ -531,6 +547,7 @@ func TestLinearAdmissionConcurrentIdenticalTriggerReturnsExistingRun(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	service.gate = AllowNewAdmissionForTest()
 	result, _, err := service.Start(context.Background(), LinearStartCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, Identifier: "IFAN-42"})
 	if err != nil || result.Run.RunID != existing.ID || controller.continued != 0 {
 		t.Fatalf("result=%+v err=%v continued=%d", result, err, controller.continued)

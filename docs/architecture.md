@@ -501,8 +501,42 @@ time plus a narrow process-identity observer to return `fresh`, `stale`,
 `offline`, `unknown`, or `conflict`; only age at or below 45 seconds with an
 exact live process match is fresh. Its sanitized projection omits PID,
 process-start identity, UID, local paths, launchd output, raw errors, logs, and
-credentials. Loaded digest evidence deliberately has no generation ID: fresh
-runtime liveness does not yet mean aggregate `ready` or `restart_required`.
+credentials. Loaded digest evidence deliberately has no generation ID. The
+configuration convergence service correlates only a fresh, identity-verified
+loaded digest to the current desired generation under SQLite CAS; the worker
+never invents generation identity.
+
+Controller-owned configuration authority is established on the first
+production configuration/store composition. The bootstrap adapter validates
+one exact bounded byte payload, the private configuration adapter retains those
+same bytes, and SQLite atomically assigns one baseline generation without
+rewriting the live file. A private mode-`0600` locator beside the configuration
+binds the canonical live path to its owning database so a later invalid or
+database-path-drifted file cannot redirect startup into a fresh store. Raw
+generation payloads remain mode-`0600` beneath a current-user mode-`0700`
+authority directory; SQLite contains metadata, receipts, and sanitized events
+only. Current plus nine recent settled payloads are retained, while current and
+unresolved evidence are never pruned.
+
+The presentation-independent apply service authorizes from the committed
+desired generation's configured operator, strictly validates current-schema
+candidate bytes, compares expected generation and digest, protects every
+nonterminal run's frozen repository authority, retains the target, and commits
+one apply intent and operation receipt before same-directory atomic live-file
+replacement. Exact reread selects the new desired generation. Startup and
+pre-apply reconciliation settle an interrupted intent from exact parent bytes,
+exact target bytes, or an ambiguous third/unsafe observation; drift is never
+adopted or overwritten. A matching fresh heartbeat durably selects only the
+current desired generation as effective. The resulting finite projection is
+`ready`, `restart_required`, `starting`, `stale`, `offline`, `unknown`, or
+`conflict`, separate from worker activity and capacity.
+
+Every production new-admission path uses this application-owned convergence
+gate. Automatic dispatch may continue driving an already-admitted run, but it
+checks the gate before candidate scan or Linear mutation. Manual Linear
+admission checks before issue collection. Missing authority, pending restart,
+drift, unresolved apply, stale/offline runtime, and unavailable evidence fail
+closed without releasing permits or changing existing runs.
 
 An authenticated `retry` action is deliberately narrower than general recovery:
 it accepts only a current `retry_budget_exhausted` attention whose retained
@@ -910,7 +944,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 30; migration history is code, not a
+inspection. The current schema is version 31; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees
@@ -973,7 +1007,11 @@ switches enable PR create, review reply, and squash merge writes.
 canonicalizes and cross-checks repositories and GitHub profiles, validates path
 isolation, derives stable digests, and produces a credential-safe readiness
 projection. Version 5 is current; older versions are compatibility inputs, not
-recommended templates.
+recommended templates. Its same-byte validation seam is reused by baseline,
+live reread, retained desired evidence, and current-schema apply validation.
+`internal/adapters/configuration` owns the trusted locator, immutable raw
+generation files, retention, and atomic live replacement; it does not expose a
+raw history API.
 
 ### Filesystem and artifact handling
 
@@ -1222,6 +1260,7 @@ around it. The principal table groups are:
 | `automatic_retry_schedules`, `operator_attention_outbox` | Restart-stable retry policy and immutable versioned operator-attention events; legacy delivery fields are storage-only evidence |
 | `operator_actions` | Action-specific authenticated recovery intent and legacy validated/applied/observed provenance, separate from automatic workflow evidence |
 | `operation_receipts` | Scope-neutral accepted/applied/observed operation identity, outcome, and sanitized result evidence; legacy operator actions are backfilled and mirrored here |
+| configuration generation, authority, apply-intent, and convergence tables | Immutable desired/effective metadata, one Controller-wide CAS transaction, reconciliation state, and meaningful sanitized transitions; raw bytes remain outside SQLite |
 
 ### Current state versus evidence
 
@@ -1330,10 +1369,10 @@ resolution is not approval, and an approval for an old head is stale.
 - Linear admission and completion observation are implemented, but completion
   remains external automation/human authority.
 - GitHub writes require a narrowly permissioned selected-repository App.
-- Transactional repository onboarding, typed configuration mutation services,
-  the local TUI, optional HTTP/Web adapters, notification transport, Hermes
-  runtime integration, public API, webhooks, and multi-tenant authorization are
-  not implemented.
+- Typed drafts/semantic preview/rollback and drift recovery, transactional
+  repository onboarding, the local TUI, optional HTTP/Web adapters,
+  notification transport, Hermes runtime integration, public API, webhooks,
+  and multi-tenant authorization are not implemented.
 - External live E2E acceptance remains restricted to isolated fixture
   repositories. The automatic-delivery acceptance and repair-aware independent
   review are complete; future live gates must follow the staged Controller and

@@ -193,7 +193,7 @@ func TestOfflineAcceptanceProductionAbandonTerminalizesWithResidueAndReplaysClea
 	source.Identifier = "IFAN-ABANDON"
 	reader := &productionLinearReader{source: source}
 	controller := &acceptancePersistingController{store: store, persist: false}
-	admission, err := application.NewLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, controller)
+	admission, err := application.NewGatedLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, controller, application.AllowNewAdmissionForTest())
 	if err != nil {
 		store.Close()
 		t.Fatal(err)
@@ -268,7 +268,7 @@ func TestOfflineAcceptanceProductionAbandonTerminalizesWithResidueAndReplaysClea
 		t.Fatal(err)
 	}
 	controller = &acceptancePersistingController{store: store, persist: false}
-	admission, err = application.NewLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, controller)
+	admission, err = application.NewGatedLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, controller, application.AllowNewAdmissionForTest())
 	if err != nil {
 		store.Close()
 		t.Fatal(err)
@@ -356,7 +356,7 @@ func TestOfflineAcceptanceProductionAbandonCompletesOwnedCleanup(t *testing.T) {
 	source.Identifier = "IFAN-ABANDON-COMPLETE"
 	reader := &productionLinearReader{source: source}
 	controller := &acceptancePersistingController{store: store, persist: false}
-	admission, err := application.NewLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, controller)
+	admission, err := application.NewGatedLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, controller, application.AllowNewAdmissionForTest())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -535,7 +535,7 @@ func TestOfflineAcceptanceRepairDeadlineAnchorsAndCancellationDoesNotExpirePolic
 			t.Fatalf("reopened repair anchor=%v want=%v err=%v", acceptanceRepairAnchorFromTimeline(persisted.Timeline), anchor, err)
 		}
 		controller := newControllerWithRepairClock(t, reopened, stack.lab, stack.process, gitadapter.Workspace{}, func() time.Time { return anchor.Add(31 * time.Minute) })
-		admission, err := application.NewLinearAdmissionService(stack.reader, productionLinearResolver{repository: stack.repository}, reopened, controller)
+		admission, err := application.NewGatedLinearAdmissionService(stack.reader, productionLinearResolver{repository: stack.repository}, reopened, controller, application.AllowNewAdmissionForTest())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -576,7 +576,7 @@ func TestOfflineAcceptanceRepairDeadlineAnchorsAndCancellationDoesNotExpirePolic
 			t.Fatalf("reopened repair anchor=%v want=%v err=%v", acceptanceRepairAnchorFromTimeline(persisted.Timeline), anchor, err)
 		}
 		controller := newControllerWithRepairClock(t, reopened, stack.lab, stack.process, gitadapter.Workspace{}, func() time.Time { return anchor.Add(time.Minute) })
-		admission, err := application.NewLinearAdmissionService(stack.reader, productionLinearResolver{repository: stack.repository}, reopened, controller)
+		admission, err := application.NewGatedLinearAdmissionService(stack.reader, productionLinearResolver{repository: stack.repository}, reopened, controller, application.AllowNewAdmissionForTest())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -624,7 +624,7 @@ func newAcceptanceProductionStack(t *testing.T, reviewFindings bool) acceptanceP
 	local := newController(t, store, lab, process, gitadapter.Workspace{})
 	source := productionLinearSource()
 	reader := &productionLinearReader{source: source}
-	admission, err := application.NewLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, local)
+	admission, err := application.NewGatedLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, local, application.AllowNewAdmissionForTest())
 	if err != nil {
 		t.Fatal(err)
 	}

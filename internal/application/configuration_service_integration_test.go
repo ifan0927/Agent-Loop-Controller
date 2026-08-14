@@ -1,0 +1,520 @@
+package application_test
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	sqlitestore "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
+)
+
+type configurationFilesFixture struct {
+	mu          sync.Mutex
+	path        string
+	database    string
+	operator    domain.GitHubUserIdentity
+	live        []byte
+	raw         map[string][]byte
+	replaceMode string
+	retainError bool
+	removeError bool
+	rereadError bool
+}
+
+func (f *configurationFilesFixture) CanonicalConfigPath() string { return f.path }
+func (f *configurationFilesFixture) ValidateBaseline(payload []byte) (application.ValidatedConfigurationCandidate, error) {
+	return f.candidate(payload, 5), nil
+}
+func (f *configurationFilesFixture) ValidateCurrent(payload []byte) (application.ValidatedConfigurationCandidate, error) {
+	return f.candidate(payload, 5), nil
+}
+func (f *configurationFilesFixture) ReadLive() ([]byte, application.ValidatedConfigurationCandidate, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.rereadError {
+		f.rereadError = false
+		return nil, application.ValidatedConfigurationCandidate{}, errors.New("injected exact reread failure")
+	}
+	payload := append([]byte(nil), f.live...)
+	return payload, f.candidate(payload, 5), nil
+}
+func (f *configurationFilesFixture) RetainRaw(digest string, payload []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.retainError {
+		return errors.New("injected raw retention failure")
+	}
+	if configurationTestDigest(payload) != digest {
+		return errors.New("digest conflict")
+	}
+	if existing, ok := f.raw[digest]; ok && string(existing) != string(payload) {
+		return errors.New("raw conflict")
+	}
+	f.raw[digest] = append([]byte(nil), payload...)
+	return nil
+}
+func (f *configurationFilesFixture) ReadRaw(digest string, size int64) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	payload, ok := f.raw[digest]
+	if !ok || int64(len(payload)) != size {
+		return nil, errors.New("missing raw")
+	}
+	return append([]byte(nil), payload...), nil
+}
+func (f *configurationFilesFixture) HasRaw(digest string, size int64) bool {
+	payload, err := f.ReadRaw(digest, size)
+	return err == nil && configurationTestDigest(payload) == digest
+}
+func (f *configurationFilesFixture) ReplaceLive(payload []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	switch f.replaceMode {
+	case "before", "file_sync":
+		return errors.New("before rename")
+	case "after", "directory_sync":
+		f.live = append([]byte(nil), payload...)
+		return errors.New("lost response after rename")
+	case "third":
+		f.live = []byte("third digest")
+		return errors.New("ambiguous replacement")
+	case "reread":
+		f.live = append([]byte(nil), payload...)
+		f.rereadError = true
+		return nil
+	default:
+		f.live = append([]byte(nil), payload...)
+		return nil
+	}
+}
+func (f *configurationFilesFixture) RemoveRaw(digest string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.removeError {
+		return errors.New("injected prune failure")
+	}
+	delete(f.raw, digest)
+	return nil
+}
+func (f *configurationFilesFixture) PublishLocator(string) error { return nil }
+func (f *configurationFilesFixture) candidate(payload []byte, schema int) application.ValidatedConfigurationCandidate {
+	return application.ValidatedConfigurationCandidate{Digest: configurationTestDigest(payload), Size: int64(len(payload)), SchemaVersion: schema, DatabasePath: f.database, Operator: f.operator, Repositories: map[string]application.ConfigurationRepositoryAuthority{}}
+}
+
+type configurationRuntimeFixture struct {
+	mu          sync.Mutex
+	observation application.RuntimeObservation
+}
+
+type configurationFaultStore struct {
+	*sqlitestore.Store
+	failBegin  bool
+	failSettle bool
+}
+
+func (s *configurationFaultStore) BeginConfigurationApply(ctx context.Context, input application.ConfigurationApplyAcceptance) (application.ConfigurationGeneration, application.OperationReceipt, bool, error) {
+	if s.failBegin {
+		s.failBegin = false
+		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, errors.New("injected intent failure")
+	}
+	return s.Store.BeginConfigurationApply(ctx, input)
+}
+
+func (s *configurationFaultStore) SettleConfigurationApply(ctx context.Context, input application.ConfigurationApplySettlement) (application.ConfigurationAuthority, application.OperationReceipt, bool, error) {
+	if s.failSettle {
+		s.failSettle = false
+		return application.ConfigurationAuthority{}, application.OperationReceipt{}, false, errors.New("injected settlement failure")
+	}
+	return s.Store.SettleConfigurationApply(ctx, input)
+}
+
+func (f *configurationRuntimeFixture) Observe(context.Context, application.Requester, time.Time) (application.RuntimeObservation, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.observation, nil
+}
+
+func TestConfigurationServiceBaselineApplyReplayConvergenceAndDrift(t *testing.T) {
+	service, store, files, runtime, requester := configurationServiceFixture(t)
+	ctx := context.Background()
+	authority, err := service.Initialize(ctx)
+	if err != nil || authority.Desired.GenerationID != 1 || authority.Desired.Origin != application.ConfigurationOriginBaseline || authority.Desired.Requester.Validate() == nil || authority.Desired.ConfiguredOperator.Login != requester.ID {
+		t.Fatalf("authority=%+v err=%v", authority, err)
+	}
+	now := time.Now().UTC()
+	runtime.observation = freshConfigurationRuntime(authority.Desired.Digest, now)
+	projection, err := service.Projection(ctx, requester, now)
+	if err != nil || projection.State != application.ConfigurationReady || projection.EffectiveGenerationID != authority.Desired.GenerationID {
+		t.Fatalf("projection=%+v err=%v", projection, err)
+	}
+
+	target := []byte("target configuration generation")
+	result, err := service.Apply(ctx, application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: target})
+	if err != nil || result.NoOp || result.Generation.GenerationID != 2 || result.Generation.State != application.ConfigurationGenerationPendingRestart || result.Receipt.Outcome != application.OperationOutcomeSucceeded {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	projection, err = service.Projection(ctx, requester, now)
+	if err != nil || projection.State != application.ConfigurationRestartRequired {
+		t.Fatalf("restart projection=%+v err=%v", projection, err)
+	}
+	runtime.observation = freshConfigurationRuntime(result.Generation.Digest, now.Add(time.Second))
+	projection, err = service.Projection(ctx, requester, now.Add(time.Second))
+	if err != nil || projection.State != application.ConfigurationReady || projection.EffectiveGenerationID != result.Generation.GenerationID {
+		t.Fatalf("ready projection=%+v err=%v", projection, err)
+	}
+	replay, err := service.Apply(ctx, application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: target})
+	if err != nil || replay.Generation.GenerationID != result.Generation.GenerationID || replay.Receipt.OperationID != result.Receipt.OperationID {
+		t.Fatalf("replay=%+v err=%v", replay, err)
+	}
+	noOp, err := service.Apply(ctx, application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: result.Generation.GenerationID, ExpectedDigest: result.Generation.Digest, Payload: target})
+	if err != nil || !noOp.NoOp || noOp.Generation.GenerationID != result.Generation.GenerationID {
+		t.Fatalf("no-op=%+v err=%v", noOp, err)
+	}
+	if generations, err := store.ListConfigurationGenerations(ctx); err != nil || len(generations) != 2 {
+		t.Fatalf("generations=%+v err=%v", generations, err)
+	}
+	files.mu.Lock()
+	files.live = []byte("external drift")
+	files.mu.Unlock()
+	projection, err = service.Projection(ctx, requester, now.Add(2*time.Second))
+	if err != nil || projection.State != application.ConfigurationConflict || projection.Reason != application.ConfigurationReasonExternalDrift {
+		t.Fatalf("drift projection=%+v err=%v", projection, err)
+	}
+	if decision, err := service.CheckNewAdmission(ctx); err != nil || decision.Allowed {
+		t.Fatalf("gate=%+v err=%v", decision, err)
+	}
+}
+
+func TestConfigurationServiceReconcilesEveryReplacementCrashBoundary(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		mode        string
+		wantError   bool
+		wantDesired int64
+		wantState   application.ConfigurationGenerationState
+		ambiguous   bool
+	}{
+		{name: "before rename", mode: "before", wantError: true, wantDesired: 1, wantState: application.ConfigurationGenerationFailed},
+		{name: "after rename lost response", mode: "after", wantDesired: 2, wantState: application.ConfigurationGenerationPendingRestart},
+		{name: "third digest", mode: "third", wantError: true, wantDesired: 1, wantState: application.ConfigurationGenerationAmbiguous, ambiguous: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service, store, files, _, requester := configurationServiceFixture(t)
+			authority, err := service.Initialize(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			files.replaceMode = test.mode
+			result, applyErr := service.Apply(context.Background(), application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: []byte("next generation")})
+			if (applyErr != nil) != test.wantError {
+				t.Fatalf("result=%+v err=%v", result, applyErr)
+			}
+			current, found, err := store.ConfigurationAuthority(context.Background())
+			if err != nil || !found || current.Desired.GenerationID != test.wantDesired || (current.Incomplete != nil) != test.ambiguous {
+				t.Fatalf("authority=%+v found=%t err=%v", current, found, err)
+			}
+			generations, err := store.ListConfigurationGenerations(context.Background())
+			if err != nil || len(generations) != 2 || generations[0].State != test.wantState {
+				t.Fatalf("generations=%+v err=%v", generations, err)
+			}
+		})
+	}
+}
+
+func TestConfigurationServiceFaultBoundariesRemainReplayable(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		mode string
+	}{
+		{name: "intent before live replacement", mode: "before"},
+		{name: "live rename response loss", mode: "after"},
+		{name: "file sync failure before publication", mode: "file_sync"},
+		{name: "directory sync failure after publication", mode: "directory_sync"},
+		{name: "exact reread response loss", mode: "reread"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service, store, files, _, requester := configurationServiceFixture(t)
+			authority, err := service.Initialize(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			files.replaceMode = test.mode
+			_, _ = service.Apply(context.Background(), application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: []byte("fault target")})
+			current, found, err := store.ConfigurationAuthority(context.Background())
+			if err != nil || !found || current.Incomplete != nil {
+				t.Fatalf("authority=%+v found=%t err=%v", current, found, err)
+			}
+			beforePublication := test.mode == "before" || test.mode == "file_sync"
+			if beforePublication && current.Desired.GenerationID != authority.Desired.GenerationID {
+				t.Fatalf("before-rename desired=%d", current.Desired.GenerationID)
+			}
+			if !beforePublication && current.Desired.GenerationID == authority.Desired.GenerationID {
+				t.Fatalf("target was not reconciled: %+v", current)
+			}
+		})
+	}
+}
+
+func TestConfigurationServiceCleansFailedPreIntentStagingAndReconcilesSettlementFailure(t *testing.T) {
+	baseService, store, files, runtime, requester := configurationServiceFixture(t)
+	authority, err := baseService.Initialize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	faults := &configurationFaultStore{Store: store, failBegin: true}
+	service, err := application.NewConfigurationService(faults, files, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := []byte("pre-intent target")
+	if _, err := service.Apply(context.Background(), application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: target}); err == nil {
+		t.Fatal("injected intent failure unexpectedly succeeded")
+	}
+	if files.HasRaw(configurationTestDigest(target), int64(len(target))) {
+		t.Fatal("unreferenced pre-intent staging was retained")
+	}
+	if generations, err := store.ListConfigurationGenerations(context.Background()); err != nil || len(generations) != 1 {
+		t.Fatalf("generations=%+v err=%v", generations, err)
+	}
+
+	faults.failSettle = true
+	target = []byte("settlement target")
+	if _, err := service.Apply(context.Background(), application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: target}); err == nil {
+		t.Fatal("injected settlement failure unexpectedly succeeded")
+	}
+	current, err := service.Reconcile(context.Background())
+	if err != nil || current.Desired.Digest != configurationTestDigest(target) || current.Incomplete != nil {
+		t.Fatalf("reconciled=%+v err=%v", current, err)
+	}
+}
+
+func TestConfigurationServiceRawRetentionFailureNeverAcceptsIntent(t *testing.T) {
+	service, store, files, _, requester := configurationServiceFixture(t)
+	authority, err := service.Initialize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	files.retainError = true
+	if _, err := service.Apply(context.Background(), application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: []byte("unretained target")}); err == nil {
+		t.Fatal("raw retention failure unexpectedly succeeded")
+	}
+	if generations, err := store.ListConfigurationGenerations(context.Background()); err != nil || len(generations) != 1 {
+		t.Fatalf("generations=%+v err=%v", generations, err)
+	}
+}
+
+func TestConfigurationServiceRetainsCurrentPlusNineSettledRawGenerations(t *testing.T) {
+	service, store, files, _, requester := configurationServiceFixture(t)
+	ctx := context.Background()
+	authority, err := service.Initialize(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 12; index++ {
+		payload := []byte("generation-" + time.Unix(int64(index+1), 0).UTC().Format(time.RFC3339Nano))
+		result, err := service.Apply(ctx, application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: payload})
+		if err != nil {
+			t.Fatalf("apply %d: %v", index, err)
+		}
+		authority, _, err = store.ConfigurationAuthority(ctx)
+		if err != nil || authority.Desired.GenerationID != result.Generation.GenerationID {
+			t.Fatalf("authority=%+v err=%v", authority, err)
+		}
+	}
+	files.mu.Lock()
+	retained := len(files.raw)
+	_, currentPresent := files.raw[authority.Desired.Digest]
+	files.mu.Unlock()
+	if retained != application.ConfigurationRawRetainCount || !currentPresent {
+		t.Fatalf("retained=%d current=%t", retained, currentPresent)
+	}
+	generations, err := store.ListConfigurationGenerations(ctx)
+	if err != nil || len(generations) != 13 {
+		t.Fatalf("generations=%d err=%v", len(generations), err)
+	}
+	retainedMetadata := 0
+	for _, generation := range generations {
+		if generation.RawRetained {
+			retainedMetadata++
+		}
+	}
+	if retainedMetadata != application.ConfigurationRawRetainCount {
+		t.Fatalf("retained metadata=%d", retainedMetadata)
+	}
+	files.removeError = true
+	for index := 0; index < 2; index++ {
+		payload := []byte("prune-failure-" + string(rune('a'+index)))
+		result, applyErr := service.Apply(ctx, application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: payload})
+		if applyErr != nil {
+			t.Fatal(applyErr)
+		}
+		authority = application.ConfigurationAuthority{Desired: result.Generation}
+	}
+	files.mu.Lock()
+	retainedAfterPruneFailure := len(files.raw)
+	files.mu.Unlock()
+	if retainedAfterPruneFailure != application.ConfigurationRawRetainCount+2 {
+		t.Fatalf("retained after prune failure=%d", retainedAfterPruneFailure)
+	}
+	files.removeError = false
+	result, err := service.Apply(ctx, application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: []byte("prune retry")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority = application.ConfigurationAuthority{Desired: result.Generation}
+	files.mu.Lock()
+	retainedAfterPruneRetry := len(files.raw)
+	files.mu.Unlock()
+	if retainedAfterPruneRetry != application.ConfigurationRawRetainCount {
+		t.Fatalf("retained after prune retry=%d", retainedAfterPruneRetry)
+	}
+	files.replaceMode = "third"
+	_, err = service.Apply(ctx, application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: []byte("unresolved generation beyond bound")})
+	if err == nil {
+		t.Fatal("ambiguous replacement unexpectedly succeeded")
+	}
+	files.mu.Lock()
+	retainedWithUnresolved := len(files.raw)
+	files.mu.Unlock()
+	if retainedWithUnresolved != application.ConfigurationRawRetainCount+1 {
+		t.Fatalf("retained with unresolved=%d", retainedWithUnresolved)
+	}
+}
+
+func TestConfigurationApplyPreservesExistingRunAndDatabaseAuthority(t *testing.T) {
+	service, store, files, _, requester := configurationServiceFixture(t)
+	ctx := context.Background()
+	authority, err := service.Initialize(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalLive := append([]byte(nil), files.live...)
+	_, _, err = store.CreateRun(ctx, application.CreateRunInput{Run: application.Run{
+		ID: "active-run", IssueID: "IFAN-1", IdempotencyKey: "active-run-key", SourceRevision: "source", TaskHash: "task",
+		Repository: "owner/repo", RepositoryConfigJSON: `{}`, BaseBranch: "main", WorkingBranch: "ifan/active-run",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Apply(ctx, application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: []byte("removes active authority")})
+	if err == nil || !strings.Contains(err.Error(), "active run") {
+		t.Fatalf("active-run compatibility error=%v", err)
+	}
+	if string(files.live) != string(originalLive) {
+		t.Fatal("rejected active-run apply changed the live file")
+	}
+
+	files.database = filepath.Join(filepath.Dir(files.database), "relocated.db")
+	_, err = service.Apply(ctx, application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: []byte("database relocation")})
+	if err == nil || !strings.Contains(err.Error(), "relocation") {
+		t.Fatalf("database relocation error=%v", err)
+	}
+	if generations, listErr := store.ListConfigurationGenerations(ctx); listErr != nil || len(generations) != 1 {
+		t.Fatalf("rejected generations=%+v err=%v", generations, listErr)
+	}
+}
+
+func TestConfigurationCandidateOperatorCannotAuthorizeOwnApply(t *testing.T) {
+	service, store, files, _, currentRequester := configurationServiceFixture(t)
+	authority, err := service.Initialize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	files.operator = domain.GitHubUserIdentity{Login: "future", DatabaseID: 9, NodeID: "USER_9", ActorType: "User"}
+	futureRequester := application.Requester{ID: "future", Kind: "github_login", DatabaseID: 9, NodeID: "USER_9", ActorType: "User"}
+	_, err = service.Apply(context.Background(), application.ConfigurationApplyCommand{Requester: futureRequester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: []byte("future operator candidate")})
+	if err == nil {
+		t.Fatal("future candidate operator authorized its own apply")
+	}
+	if generations, listErr := store.ListConfigurationGenerations(context.Background()); listErr != nil || len(generations) != 1 {
+		t.Fatalf("generations=%+v err=%v current=%+v", generations, listErr, currentRequester)
+	}
+}
+
+func TestConfigurationResponseLossReplaySurvivesOperatorChange(t *testing.T) {
+	service, _, files, _, currentRequester := configurationServiceFixture(t)
+	authority, err := service.Initialize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	files.operator = domain.GitHubUserIdentity{Login: "future", DatabaseID: 9, NodeID: "USER_9", ActorType: "User"}
+	command := application.ConfigurationApplyCommand{Requester: currentRequester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: []byte("operator transition")}
+	result, err := service.Apply(context.Background(), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := service.Apply(context.Background(), command)
+	if err != nil || replay.Generation.GenerationID != result.Generation.GenerationID || replay.Receipt.OperationID != result.Receipt.OperationID {
+		t.Fatalf("replay=%+v err=%v", replay, err)
+	}
+}
+
+func TestConfigurationProjectionAndHistoryNeverExposeRawOrPrivatePaths(t *testing.T) {
+	service, _, files, runtime, requester := configurationServiceFixture(t)
+	authority, err := service.Initialize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	runtime.observation = freshConfigurationRuntime(authority.Desired.Digest, now)
+	projection, err := service.Projection(context.Background(), requester, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	history, err := service.History(context.Background(), requester)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(struct {
+		Authority  application.ConfigurationAuthority             `json:"authority"`
+		Projection application.ConfigurationConvergenceProjection `json:"projection"`
+		History    []application.ConfigurationGeneration          `json:"history"`
+	}{authority, projection, history})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := string(encoded)
+	for _, secret := range []string{files.path, files.database, string(files.live), "canonical_config_path", "database_path"} {
+		if strings.Contains(output, secret) {
+			t.Fatalf("configuration output leaked private evidence %q: %s", secret, output)
+		}
+	}
+}
+
+func configurationServiceFixture(t *testing.T) (*application.ConfigurationService, *sqlitestore.Store, *configurationFilesFixture, *configurationRuntimeFixture, application.Requester) {
+	t.Helper()
+	database := filepath.Join(t.TempDir(), "controller.db")
+	store, err := sqlitestore.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	operator := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
+	files := &configurationFilesFixture{path: filepath.Join(filepath.Dir(database), "controller.json"), database: database, operator: operator, live: []byte("baseline configuration"), raw: map[string][]byte{}}
+	runtime := &configurationRuntimeFixture{}
+	service, err := application.NewConfigurationService(store, files, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requester := application.Requester{ID: operator.Login, Kind: "github_login", DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, ActorType: operator.ActorType}
+	return service, store, files, runtime, requester
+}
+
+func freshConfigurationRuntime(digest string, observedAt time.Time) application.RuntimeObservation {
+	observedAt = observedAt.UTC()
+	return application.RuntimeObservation{Liveness: application.RuntimeLivenessFresh, Activity: application.RuntimeActivityRunning, WorkerInstanceID: "worker-instance", BuildIdentity: "build-v1", LoadedConfigurationDigest: digest, LastObservedAt: &observedAt, Reason: application.RuntimeReasonHeartbeatFresh}
+}
+
+func configurationTestDigest(payload []byte) string {
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:])
+}

@@ -149,7 +149,7 @@ func linearStart(args []string) error {
 	if err != nil {
 		return err
 	}
-	loaded, err := bootstrap.Load(path)
+	loaded, err := loadManagedConfiguration(path)
 	if err != nil {
 		return err
 	}
@@ -178,7 +178,11 @@ func linearStart(args []string) error {
 	if err != nil {
 		return err
 	}
-	service, err := application.NewLinearAdmissionService(reader, linearRegistryResolver{registry: loaded.Registry}, store, newLocalController(store, loaded.Controller.CodexBinary, ""))
+	convergence, err := configuredConvergenceService(store, loaded, 0, false)
+	if err != nil {
+		return errors.New("configuration convergence authority is unavailable")
+	}
+	service, err := application.NewGatedLinearAdmissionService(reader, linearRegistryResolver{registry: loaded.Registry}, store, newLocalController(store, loaded.Controller.CodexBinary, ""), convergence)
 	if err != nil {
 		return err
 	}
@@ -224,7 +228,7 @@ func controllerRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	loaded, err := bootstrap.Load(path)
+	loaded, err := loadManagedConfiguration(path)
 	if err != nil {
 		return err
 	}
@@ -253,7 +257,11 @@ func controllerRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	admission, err := application.NewLinearAdmissionService(reader, linearRegistryResolver{registry: loaded.Registry}, store, newLocalController(store, loaded.Controller.CodexBinary, ""))
+	convergence, err := configuredConvergenceService(store, loaded, 0, false)
+	if err != nil {
+		return errors.New("configuration convergence authority is unavailable")
+	}
+	admission, err := application.NewGatedLinearAdmissionService(reader, linearRegistryResolver{registry: loaded.Registry}, store, newLocalController(store, loaded.Controller.CodexBinary, ""), convergence)
 	if err != nil {
 		return err
 	}
@@ -310,7 +318,7 @@ func controllerDrive(args []string) error {
 	if err != nil {
 		return err
 	}
-	loaded, err := bootstrap.Load(path)
+	loaded, err := loadManagedConfiguration(path)
 	if err != nil {
 		return err
 	}
@@ -461,7 +469,7 @@ func controllerInspect(command string, args []string) error {
 	if err != nil {
 		return err
 	}
-	loaded, err := bootstrap.Load(path)
+	loaded, err := loadManagedConfiguration(path)
 	if err != nil {
 		return err
 	}
@@ -654,7 +662,7 @@ func controllerAbandon(args []string) error {
 	if err != nil {
 		return err
 	}
-	loaded, err := bootstrap.Load(path)
+	loaded, err := loadManagedConfiguration(path)
 	if err != nil {
 		return err
 	}
@@ -918,7 +926,7 @@ func productionCommandWithDecision(args []string, name string, allowDecision boo
 	if err != nil {
 		return productionCLICommand{}, bootstrap.Bootstrap{}, nil, err
 	}
-	loaded, err := bootstrap.Load(path)
+	loaded, err := loadManagedConfiguration(path)
 	if err != nil {
 		return productionCLICommand{}, bootstrap.Bootstrap{}, nil, err
 	}
@@ -1015,7 +1023,7 @@ func githubRead(args []string) error {
 	if err != nil {
 		return err
 	}
-	loaded, err := bootstrap.Load(path)
+	loaded, err := loadManagedConfiguration(path)
 	if err != nil {
 		return err
 	}

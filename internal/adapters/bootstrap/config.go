@@ -62,6 +62,7 @@ type GitHubProfile struct {
 }
 
 type Bootstrap struct {
+	Path                string
 	Version             int
 	Digest              string
 	Controller          Controller
@@ -280,6 +281,21 @@ func Load(path string) (Bootstrap, error) {
 	if err != nil {
 		return Bootstrap{}, err
 	}
+	return ValidateBytes(canonicalPath, data)
+}
+
+// ValidateBytes applies the same strict, offline bootstrap contract to one
+// already captured payload. The canonical path supplies only the local
+// authority root used by path validation; the payload is never reread here.
+// This seam lets configuration transactions prove that validation, digesting,
+// and private retention all refer to the same exact bytes.
+func ValidateBytes(canonicalPath string, data []byte) (Bootstrap, error) {
+	if _, err := canonicalConfigLocation(canonicalPath); err != nil {
+		return Bootstrap{}, err
+	}
+	if len(data) > 256<<10 {
+		return Bootstrap{}, invalid("controller configuration is too large")
+	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	var raw configFile
@@ -327,7 +343,21 @@ func Load(path string) (Bootstrap, error) {
 		return Bootstrap{}, conflict("automatic admission team does not match the Linear profile")
 	}
 	digest := sha256.Sum256(data)
-	return Bootstrap{Version: raw.Version, Digest: hex.EncodeToString(digest[:]), Controller: controller, Linear: linear, Registry: registry, GitHubProfiles: profiles, RegistryPath: registryPath, CredentialDirectory: filepath.Join(filepath.Dir(canonicalPath), "secrets"), Automation: automation}, nil
+	return Bootstrap{Path: canonicalPath, Version: raw.Version, Digest: hex.EncodeToString(digest[:]), Controller: controller, Linear: linear, Registry: registry, GitHubProfiles: profiles, RegistryPath: registryPath, CredentialDirectory: filepath.Join(filepath.Dir(canonicalPath), "secrets"), Automation: automation}, nil
+}
+
+// ValidateCurrentBytes is the mutation boundary for a new configuration
+// candidate. Historical supported schemas remain valid for one-time baseline
+// adoption, but every later apply must use the current schema.
+func ValidateCurrentBytes(canonicalPath string, data []byte) (Bootstrap, error) {
+	loaded, err := ValidateBytes(canonicalPath, data)
+	if err != nil {
+		return Bootstrap{}, err
+	}
+	if loaded.Version != CurrentVersion {
+		return Bootstrap{}, invalid("configuration apply requires the current schema version")
+	}
+	return loaded, nil
 }
 
 func decodeRegistry(raw configFile) (localregistry.Registry, string, error) {
@@ -638,14 +668,49 @@ func readRegularConfig(path string) ([]byte, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	data, err := os.ReadFile(canonical)
+	before, err := os.Lstat(canonical)
+	if err != nil {
+		return nil, "", unsafe("controller configuration is unreadable")
+	}
+	file, err := os.Open(canonical)
+	if err != nil {
+		return nil, "", unsafe("controller configuration is unreadable")
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(before, opened) || opened.Mode()&os.ModeSymlink != 0 || !opened.Mode().IsRegular() {
+		return nil, "", unsafe("configuration changed while it was being read")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, (256<<10)+1))
 	if err != nil {
 		return nil, "", unsafe("controller configuration is unreadable")
 	}
 	if len(data) > 256<<10 {
 		return nil, "", invalid("controller configuration is too large")
 	}
+	after, err := file.Stat()
+	current, currentErr := os.Lstat(canonical)
+	if err != nil || currentErr != nil || !os.SameFile(opened, after) || !os.SameFile(opened, current) ||
+		after.Size() != int64(len(data)) || after.Size() != opened.Size() || !after.ModTime().Equal(opened.ModTime()) {
+		return nil, "", unsafe("configuration changed while it was being read")
+	}
 	return data, canonical, nil
+}
+
+func canonicalConfigLocation(path string) (string, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return "", unsafe("configuration path must be absolute and canonical")
+	}
+	parent := filepath.Dir(path)
+	info, err := os.Lstat(parent)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return "", unsafe("configuration parent must be a non-symlink directory")
+	}
+	resolved, err := filepath.EvalSymlinks(parent)
+	if err != nil || resolved != parent {
+		return "", unsafe("configuration parent path is ambiguous")
+	}
+	return path, nil
 }
 
 func canonicalRegularPath(path string) (string, error) {

@@ -163,7 +163,7 @@ func newLifecycleFixture(t *testing.T, roots int) *lifecycleFixture {
 	controller := &fixtureController{store: store, repairedHead: fixtureSHA('b')}
 	source := fixtureLinearSource()
 	reader := &fixtureLinearReader{source: source}
-	admission, err := application.NewLinearAdmissionService(reader, fixtureResolver{repository: repo}, store, controller)
+	admission, err := application.NewGatedLinearAdmissionService(reader, fixtureResolver{repository: repo}, store, controller, application.AllowNewAdmissionForTest())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +209,7 @@ func newLifecycleFixture(t *testing.T, roots int) *lifecycleFixture {
 
 func (f *lifecycleFixture) restart(t *testing.T) {
 	t.Helper()
-	admission, err := application.NewLinearAdmissionService(&fixtureLinearReader{source: fixtureLinearSource()}, fixtureResolver{repository: f.repository}, f.store, f.controller)
+	admission, err := application.NewGatedLinearAdmissionService(&fixtureLinearReader{source: fixtureLinearSource()}, fixtureResolver{repository: f.repository}, f.store, f.controller, application.AllowNewAdmissionForTest())
 	if err != nil {
 		t.Fatal(err)
 	}

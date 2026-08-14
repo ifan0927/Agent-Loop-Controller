@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	configurationadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/configuration"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/localissue"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/localregistry"
 	sqlitestore "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite"
@@ -428,6 +429,77 @@ func writeControllerStatusConfig(t *testing.T, root string) (configPath, dbPath 
 		t.Fatal(err)
 	}
 	return configPath, dbPath
+}
+
+func TestManagedConfigurationUsesTrustedLocatorAfterLiveDrift(t *testing.T) {
+	root := resolvedTempDir(t)
+	configPath, databasePath := writeControllerStatusConfig(t, root)
+	baseline, err := loadManagedConfiguration(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baseline.Controller.DatabasePath != databasePath {
+		t.Fatalf("baseline database=%q", baseline.Controller.DatabasePath)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":99,"controller":{"database_path":"/tmp/attacker.db"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	retained, err := loadManagedConfiguration(configPath)
+	if err != nil || retained.Digest != baseline.Digest || retained.Controller.DatabasePath != databasePath {
+		t.Fatalf("retained=%+v err=%v", retained, err)
+	}
+	store, err := sqlitestore.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	authority, found, err := store.ConfigurationAuthority(context.Background())
+	if err != nil || !found || authority.Desired.Digest != baseline.Digest || authority.CanonicalConfigPath != configPath {
+		t.Fatalf("authority=%+v found=%t err=%v", authority, found, err)
+	}
+}
+
+func TestManagedConfigurationRejectsAlternatePathForOwnedStore(t *testing.T) {
+	root := resolvedTempDir(t)
+	configPath, _ := writeControllerStatusConfig(t, root)
+	if _, err := loadManagedConfiguration(configPath); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alternate := filepath.Join(root, "alternate.json")
+	if err := os.WriteFile(alternate, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadManagedConfiguration(alternate); err == nil || !strings.Contains(err.Error(), "locator conflicts") {
+		t.Fatalf("alternate path error=%v", err)
+	}
+}
+
+func TestManagedConfigurationFinishesBaselineAfterLocatorPublicationCrash(t *testing.T) {
+	root := resolvedTempDir(t)
+	configPath, databasePath := writeControllerStatusConfig(t, root)
+	files, err := configurationadapter.NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := files.PublishLocator(databasePath); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadManagedConfiguration(configPath)
+	if err != nil || loaded.Controller.DatabasePath != databasePath {
+		t.Fatalf("loaded=%+v err=%v", loaded, err)
+	}
+	store, err := sqlitestore.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if authority, found, err := store.ConfigurationAuthority(context.Background()); err != nil || !found || authority.Desired.Digest != loaded.Digest {
+		t.Fatalf("authority=%+v found=%t err=%v", authority, found, err)
+	}
 }
 
 func TestLocalStatusRejectsUnauthorizedRequester(t *testing.T) {
