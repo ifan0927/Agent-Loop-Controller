@@ -17,7 +17,7 @@ import (
 )
 
 func TestOperatorAttentionOutboxIsAppendOnlyIdempotentAndBounded(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestOperatorAttentionOutboxIsAppendOnlyIdempotentAndBounded(t *testing.T) {
 
 func TestOperatorAttentionOutboxConcurrentInsertAndSanitizedProjectionParity(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestOperatorAttentionOutboxConcurrentInsertAndSanitizedProjectionParity(t *
 
 func TestOperatorAttentionMigrationPreservesLegacyEvidenceAndNormalizesEnvelope(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestOperatorAttentionMigrationPreservesLegacyEvidenceAndNormalizesEnvelope(
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +199,7 @@ func TestOperatorAttentionMigrationPreservesLegacyEvidenceAndNormalizesEnvelope(
 
 func TestOperatorAttentionMigrationAcceptsFrozenLegacyProfileContract(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +239,7 @@ func TestOperatorAttentionMigrationAcceptsFrozenLegacyProfileContract(t *testing
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +251,7 @@ func TestOperatorAttentionMigrationAcceptsFrozenLegacyProfileContract(t *testing
 }
 
 func TestManualInterventionReplayBindsTransitionInsteadOfMutableRunTimestamp(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

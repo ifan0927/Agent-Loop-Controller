@@ -21,6 +21,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/localissue"
 	processadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/process"
 	storeadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite/sqlitetest"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/verifier"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
@@ -290,7 +291,7 @@ func TestUnprovenCodexProcessGroupRemainsStartedForOperatorAbandonment(t *testin
 	defer store.Close()
 	process := &durableFakeProcess{failImplementationWithUnprovenProcessGroup: true}
 	controller := newController(t, store, lab, process, gitadapter.Workspace{})
-	if _, err := controller.Start(context.Background(), startInput(lab)); err == nil {
+	if _, err := controller.Start(context.Background(), startInput(t, lab)); err == nil {
 		t.Fatal("unproven process-group exit must stop continuation")
 	}
 	inspection, err := store.Inspect(context.Background(), lab.snapshot.Task.RunID)
@@ -321,7 +322,7 @@ func TestUnprovenReviewProcessGroupCannotBeRepeated(t *testing.T) {
 	defer store.Close()
 	process := &durableFakeProcess{failReviewWithUnprovenProcessGroup: true}
 	controller := newController(t, store, lab, process, gitadapter.Workspace{})
-	if _, err := controller.Start(context.Background(), startInput(lab)); err == nil {
+	if _, err := controller.Start(context.Background(), startInput(t, lab)); err == nil {
 		t.Fatal("unproven review process-group exit must stop continuation")
 	}
 	inspection, err := store.Inspect(context.Background(), lab.snapshot.Task.RunID)
@@ -348,9 +349,21 @@ func newController(t *testing.T, store application.RunStore, lab localLab, proce
 	registry := verifier.NewRegistry(map[string]verifier.Command{"fixture-go-test": {Program: "go", Args: []string{"test", "./..."}}}, processadapter.OSRunner{}, workspace)
 	return application.NewLocalController(store, testWorktrees{}, codex.NewExecutor(process, "codex"), registry, git, "codex", lab.worktrees)
 }
-func startInput(lab localLab) application.LocalStartInput {
+func startInput(t *testing.T, lab localLab) application.LocalStartInput {
+	t.Helper()
+	store, err := storeadapter.Open(lab.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, err := sqlitetest.EstablishReadyConfigurationAuthority(context.Background(), store, lab.db)
+	if closeErr := store.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
 	s := lab.snapshot
-	return application.LocalStartInput{Task: s.Task, RawIssueJSON: s.RawJSON, RawIssueHash: s.RawHash, NormalizedJSON: s.NormalizedJSON, TaskHash: s.TaskHash, IdempotencyKey: s.IdempotencyKey, Repository: lab.repository, RunRoot: lab.runs, WorktreeRoot: lab.worktrees}
+	return application.LocalStartInput{Task: s.Task, RawIssueJSON: s.RawJSON, RawIssueHash: s.RawHash, NormalizedJSON: s.NormalizedJSON, TaskHash: s.TaskHash, IdempotencyKey: s.IdempotencyKey, Repository: lab.repository, RunRoot: lab.runs, WorktreeRoot: lab.worktrees, ConfigurationAuthority: authority}
 }
 
 func TestLocalDurableHappyPathAndDuplicateStart(t *testing.T) {
@@ -362,7 +375,7 @@ func TestLocalDurableHappyPathAndDuplicateStart(t *testing.T) {
 	defer store.Close()
 	process := &durableFakeProcess{}
 	controller := newController(t, store, lab, process, gitadapter.Workspace{})
-	run, err := controller.Start(context.Background(), startInput(lab))
+	run, err := controller.Start(context.Background(), startInput(t, lab))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,7 +390,7 @@ func TestLocalDurableHappyPathAndDuplicateStart(t *testing.T) {
 	if attempts != 2 {
 		t.Fatalf("attempts=%d", attempts)
 	}
-	if _, err := controller.Start(context.Background(), startInput(lab)); err != nil {
+	if _, err := controller.Start(context.Background(), startInput(t, lab)); err != nil {
 		t.Fatal(err)
 	}
 	after, _ := store.Inspect(context.Background(), run.ID)
@@ -407,7 +420,7 @@ func TestArtifactRootRejectsPrecreatedDirectoryAndSymlink(t *testing.T) {
 			}
 			defer store.Close()
 			process := &durableFakeProcess{}
-			_, err = newController(t, store, lab, process, gitadapter.Workspace{}).Start(context.Background(), startInput(lab))
+			_, err = newController(t, store, lab, process, gitadapter.Workspace{}).Start(context.Background(), startInput(t, lab))
 			if err == nil || !strings.Contains(err.Error(), "existed before") {
 				t.Fatalf("error=%v", err)
 			}
@@ -427,7 +440,7 @@ func TestRestartRejectsAttemptsSymlinkEscape(t *testing.T) {
 	defer store.Close()
 	process := &durableFakeProcess{needsDecision: true}
 	controller := newController(t, store, lab, process, gitadapter.Workspace{})
-	run, err := controller.Start(context.Background(), startInput(lab))
+	run, err := controller.Start(context.Background(), startInput(t, lab))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -471,7 +484,7 @@ func TestFailedVerifierEvidenceIsDurableAndInspectable(t *testing.T) {
 	workspace := gitadapter.Workspace{}
 	registry := verifier.NewRegistry(map[string]verifier.Command{"fixture-go-test": {Program: "go", Args: []string{"test", "./..."}}}, exitVerifierProcess{}, workspace)
 	controller := application.NewLocalController(store, testWorktrees{}, codex.NewExecutor(process, "codex"), registry, workspace, "codex", lab.worktrees)
-	run, err := controller.Start(context.Background(), startInput(lab))
+	run, err := controller.Start(context.Background(), startInput(t, lab))
 	if err == nil {
 		t.Fatal("expected verifier failure")
 	}
@@ -516,7 +529,7 @@ func TestMissingVerifierExecutablePersistsNotStartedEvidence(t *testing.T) {
 	workspace := gitadapter.Workspace{}
 	registry := verifier.NewRegistry(map[string]verifier.Command{"fixture-go-test": {Program: "definitely-missing-verifier", Args: []string{"--fixture"}}}, processadapter.OSRunner{}, workspace)
 	controller := application.NewLocalController(store, testWorktrees{}, codex.NewExecutor(&durableFakeProcess{}, "codex"), registry, workspace, "codex", lab.worktrees)
-	run, err := controller.Start(context.Background(), startInput(lab))
+	run, err := controller.Start(context.Background(), startInput(t, lab))
 	if err == nil || run.State != domain.StateVerifying {
 		t.Fatalf("run=%+v err=%v", run, err)
 	}
@@ -567,7 +580,7 @@ func TestCandidateVerificationFailureThenSuccessfulRestartAdvances(t *testing.T)
 	verificationProcess := &failSecondVerifierProcess{}
 	registry := verifier.NewRegistry(map[string]verifier.Command{"fixture-go-test": {Program: "go", Args: []string{"test", "./..."}}}, verificationProcess, workspace)
 	controller := application.NewLocalController(store, testWorktrees{}, codex.NewExecutor(codexProcess, "codex"), registry, workspace, "codex", lab.worktrees)
-	run, err := controller.Start(context.Background(), startInput(lab))
+	run, err := controller.Start(context.Background(), startInput(t, lab))
 	if err == nil {
 		t.Fatal("expected transient candidate verification failure")
 	}
@@ -609,7 +622,7 @@ func TestRestartRecoversProvisionedOwnedWorktree(t *testing.T) {
 	registry := verifier.NewRegistry(map[string]verifier.Command{"fixture-go-test": {Program: "go", Args: []string{"test", "./..."}}}, processadapter.OSRunner{}, workspace)
 	crashing := &crashAfterWorktree{once: true}
 	controller := application.NewLocalController(store, crashing, codex.NewExecutor(process, "codex"), registry, workspace, "codex", lab.worktrees)
-	run, err := controller.Start(context.Background(), startInput(lab))
+	run, err := controller.Start(context.Background(), startInput(t, lab))
 	if err == nil {
 		t.Fatal("expected worktree boundary crash")
 	}
@@ -647,7 +660,7 @@ func TestExplicitSessionResumeSurvivesControllerRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	process := &durableFakeProcess{needsDecision: true}
-	run, err := newController(t, store, lab, process, gitadapter.Workspace{}).Start(context.Background(), startInput(lab))
+	run, err := newController(t, store, lab, process, gitadapter.Workspace{}).Start(context.Background(), startInput(t, lab))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -697,7 +710,7 @@ func TestLegalDecisionOfferPersistsReceiptBeforeResumeAndReplaysAfterRestart(t *
 	}
 	process := &durableFakeProcess{needsDecision: true}
 	controller := newController(t, store, lab, process, gitadapter.Workspace{})
-	run, err := controller.Start(context.Background(), startInput(lab))
+	run, err := controller.Start(context.Background(), startInput(t, lab))
 	if err != nil || run.State != domain.StateAwaitingHumanDecision {
 		t.Fatalf("run=%+v err=%v", run, err)
 	}
@@ -785,7 +798,7 @@ func TestPersistedDecisionTamperFailsBeforeResume(t *testing.T) {
 	process := &durableFakeProcess{needsDecision: true}
 	wrapper := &failAfterTransitionStore{RunStore: store, from: domain.StateAwaitingHumanDecision, to: domain.StateExecuting, remaining: 1}
 	controller := newController(t, wrapper, lab, process, gitadapter.Workspace{})
-	run, err := controller.Start(context.Background(), startInput(lab))
+	run, err := controller.Start(context.Background(), startInput(t, lab))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -819,7 +832,7 @@ func TestTransientFailedReviewCanRetrySameHead(t *testing.T) {
 	defer store.Close()
 	process := &durableFakeProcess{failFirstReview: true}
 	controller := newController(t, store, lab, process, gitadapter.Workspace{})
-	run, err := controller.Start(context.Background(), startInput(lab))
+	run, err := controller.Start(context.Background(), startInput(t, lab))
 	if err == nil {
 		t.Fatal("expected transient failed review")
 	}
@@ -848,7 +861,7 @@ func TestNoChangeRepairReusesExactRepairBaseAndExactHeadEvidence(t *testing.T) {
 	defer store.Close()
 	process := &durableFakeProcess{noChangeOnResume: true}
 	controller := newController(t, store, lab, process, gitadapter.Workspace{})
-	input := startInput(lab)
+	input := startInput(t, lab)
 	input.Task.Policy.MaxRepairAttempts = domain.DefaultMaxRepairAttempts
 	input.NormalizedJSON, err = json.Marshal(input.Task)
 	if err != nil {
@@ -891,7 +904,7 @@ func TestLaterRepairUsesFirstRepairDeadlineAndStopsAtManualIntervention(t *testi
 	defer store.Close()
 	process := &durableFakeProcess{}
 	controller := newController(t, store, lab, process, gitadapter.Workspace{})
-	input := startInput(lab)
+	input := startInput(t, lab)
 	input.Task.Policy.MaxRepairAttempts = domain.DefaultMaxRepairAttempts
 	input.NormalizedJSON, err = json.Marshal(input.Task)
 	if err != nil {
@@ -1028,7 +1041,7 @@ func beginInterruptedRepair(t *testing.T) (localLab, *storeadapter.Store, *durab
 	}
 	process := &durableFakeProcess{resumeStarted: make(chan struct{}, 1)}
 	controller := newController(t, store, lab, process, gitadapter.Workspace{})
-	input := startInput(lab)
+	input := startInput(t, lab)
 	input.Task.Policy.MaxRepairAttempts = domain.DefaultMaxRepairAttempts
 	input.NormalizedJSON, err = json.Marshal(input.Task)
 	if err != nil {
@@ -1098,7 +1111,7 @@ func TestFreshReviewFindingsPersistAndResumeBoundedRepairWithSameSession(t *test
 	defer store.Close()
 	process := &durableFakeProcess{reviewFindings: true}
 	controller := newController(t, store, lab, process, gitadapter.Workspace{})
-	input := startInput(lab)
+	input := startInput(t, lab)
 	input.Task.Policy.MaxRepairAttempts = domain.DefaultMaxRepairAttempts
 	input.NormalizedJSON, err = json.Marshal(input.Task)
 	if err != nil {
@@ -1164,7 +1177,7 @@ func TestRepairHumanDecisionResumesInsteadOfReplayingDecisionRequest(t *testing.
 	defer store.Close()
 	process := &durableFakeProcess{reviewFindings: true, reviewFindingCount: 2, decisionOnFirstResume: true}
 	controller := newController(t, store, lab, process, gitadapter.Workspace{})
-	input := startInput(lab)
+	input := startInput(t, lab)
 	input.Task.Policy.MaxRepairAttempts = domain.DefaultMaxRepairAttempts
 	input.NormalizedJSON, err = json.Marshal(input.Task)
 	if err != nil {
@@ -1245,7 +1258,7 @@ func TestFreshReviewHandoffRejectsTamperedOutcomeBeforePersistence(t *testing.T)
 	defer store.Close()
 	process := &durableFakeProcess{reviewFindings: true}
 	controller := newController(t, store, lab, process, gitadapter.Workspace{})
-	run, err := controller.Start(context.Background(), startInput(lab))
+	run, err := controller.Start(context.Background(), startInput(t, lab))
 	if err != nil || run.State != domain.StateFreshReview {
 		t.Fatalf("run=%+v err=%v", run, err)
 	}
@@ -1272,7 +1285,7 @@ func TestFreshReviewHandoffRejectsWorktreeHeadDriftBeforePersistence(t *testing.
 	defer store.Close()
 	process := &durableFakeProcess{reviewFindings: true}
 	controller := newController(t, store, lab, process, gitadapter.Workspace{})
-	run, err := controller.Start(context.Background(), startInput(lab))
+	run, err := controller.Start(context.Background(), startInput(t, lab))
 	if err != nil || run.State != domain.StateFreshReview {
 		t.Fatalf("run=%+v err=%v", run, err)
 	}
@@ -1298,7 +1311,9 @@ func TestProductionDriverRoutesFreshReviewFindingsIntoBoundedSameSessionRepair(t
 	process := &durableFakeProcess{reviewFindings: true}
 	local := newController(t, store, lab, process, gitadapter.Workspace{})
 	reader := &productionLinearReader{source: productionLinearSource()}
-	admission, err := application.NewGatedLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, local, application.AllowNewAdmissionForTest())
+	authority := startInput(t, lab).ConfigurationAuthority
+	gate := application.StaticNewAdmissionGate{Decision: application.NewAdmissionDecision{Allowed: true, Reason: application.ConfigurationReasonReady, Authority: authority}}
+	admission, err := application.NewGatedLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, local, gate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1392,7 +1407,7 @@ func TestRestartRecoversStartedAttemptSessionAndResumesExplicitly(t *testing.T) 
 	defer store.Close()
 	process := &durableFakeProcess{}
 	wrapper := &failAfterTransitionStore{RunStore: store, from: domain.StateProvisioning, to: domain.StateExecuting, remaining: 1}
-	run, err := newController(t, wrapper, lab, process, gitadapter.Workspace{}).Start(context.Background(), startInput(lab))
+	run, err := newController(t, wrapper, lab, process, gitadapter.Workspace{}).Start(context.Background(), startInput(t, lab))
 	if err == nil || run.State != domain.StateExecuting {
 		t.Fatalf("run=%+v err=%v", run, err)
 	}
@@ -1446,7 +1461,7 @@ func TestInterruptedAttemptReconciliationOwnsRunLeaseBeforeStoppingProcess(t *te
 	defer store.Close()
 	process := &durableFakeProcess{}
 	wrapper := &failAfterTransitionStore{RunStore: store, from: domain.StateProvisioning, to: domain.StateExecuting, remaining: 1}
-	run, err := newController(t, wrapper, lab, process, gitadapter.Workspace{}).Start(context.Background(), startInput(lab))
+	run, err := newController(t, wrapper, lab, process, gitadapter.Workspace{}).Start(context.Background(), startInput(t, lab))
 	if err == nil || run.State != domain.StateExecuting {
 		t.Fatalf("run=%+v err=%v", run, err)
 	}
@@ -1509,7 +1524,7 @@ func TestInterruptedAttemptWithoutSessionPersistsManualIntervention(t *testing.T
 	defer store.Close()
 	process := &durableFakeProcess{}
 	wrapper := &failAfterTransitionStore{RunStore: store, from: domain.StateProvisioning, to: domain.StateExecuting, remaining: 1}
-	run, err := newController(t, wrapper, lab, process, gitadapter.Workspace{}).Start(context.Background(), startInput(lab))
+	run, err := newController(t, wrapper, lab, process, gitadapter.Workspace{}).Start(context.Background(), startInput(t, lab))
 	if err == nil || run.State != domain.StateExecuting {
 		t.Fatalf("run=%+v err=%v", run, err)
 	}
@@ -1552,7 +1567,7 @@ func TestRestartClosesPreparedAttemptWithoutProcessStopEvidence(t *testing.T) {
 	defer store.Close()
 	process := &durableFakeProcess{}
 	wrapper := &failAfterTransitionStore{RunStore: store, from: domain.StateProvisioning, to: domain.StateExecuting, remaining: 1}
-	run, err := newController(t, wrapper, lab, process, gitadapter.Workspace{}).Start(context.Background(), startInput(lab))
+	run, err := newController(t, wrapper, lab, process, gitadapter.Workspace{}).Start(context.Background(), startInput(t, lab))
 	if err == nil || run.State != domain.StateExecuting {
 		t.Fatalf("run=%+v err=%v", run, err)
 	}
@@ -1586,9 +1601,9 @@ func TestControllerRefusesCompetingActiveLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	input := startInput(lab)
+	input := startInput(t, lab)
 	repositoryJSON, _ := json.Marshal(input.Repository)
-	_, _, err = store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: input.Task.RunID, IssueID: input.Task.IssueID, IdempotencyKey: input.IdempotencyKey, SourceRevision: input.Task.SourceRevision, RawIssueJSON: string(input.RawIssueJSON), RawIssueHash: input.RawIssueHash, NormalizedTaskJSON: string(input.NormalizedJSON), TaskHash: input.TaskHash, Repository: input.Task.Repository, RepositoryConfigJSON: string(repositoryJSON), BaseBranch: input.Task.BaseBranch, WorkingBranch: input.Task.WorkingBranch, WorktreePath: filepath.Join(lab.worktrees, input.Task.RunID), ArtifactRoot: filepath.Join(lab.runs, input.Task.RunID)}})
+	_, _, err = store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: input.Task.RunID, IssueID: input.Task.IssueID, IdempotencyKey: input.IdempotencyKey, SourceRevision: input.Task.SourceRevision, RawIssueJSON: string(input.RawIssueJSON), RawIssueHash: input.RawIssueHash, NormalizedTaskJSON: string(input.NormalizedJSON), TaskHash: input.TaskHash, Repository: input.Task.Repository, RepositoryConfigJSON: string(repositoryJSON), BaseBranch: input.Task.BaseBranch, WorkingBranch: input.Task.WorkingBranch, WorktreePath: filepath.Join(lab.worktrees, input.Task.RunID), ArtifactRoot: filepath.Join(lab.runs, input.Task.RunID)}, ConfigurationAuthority: input.ConfigurationAuthority})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1623,7 +1638,7 @@ func TestRestartReusesVerificationAndReviewEvidence(t *testing.T) {
 			defer store.Close()
 			process := &durableFakeProcess{}
 			wrapper := &failingTransitionStore{RunStore: store, from: boundary.from, to: boundary.to, remaining: 1}
-			run, err := newController(t, wrapper, lab, process, gitadapter.Workspace{}).Start(context.Background(), startInput(lab))
+			run, err := newController(t, wrapper, lab, process, gitadapter.Workspace{}).Start(context.Background(), startInput(t, lab))
 			if err == nil {
 				t.Fatal("expected boundary crash")
 			}
@@ -1672,7 +1687,7 @@ func TestRestartRecoversControllerCandidateWithoutDuplicateCommit(t *testing.T) 
 	defer store.Close()
 	process := &durableFakeProcess{}
 	crashGit := &crashAfterCommitGit{once: true}
-	run, err := newController(t, store, lab, process, crashGit).Start(context.Background(), startInput(lab))
+	run, err := newController(t, store, lab, process, crashGit).Start(context.Background(), startInput(t, lab))
 	if err == nil {
 		t.Fatal("expected simulated crash")
 	}
@@ -1762,7 +1777,7 @@ func TestApprovalInvalidatesOnWorkspaceAndEvidenceMutation(t *testing.T) {
 			defer store.Close()
 			process := &durableFakeProcess{}
 			controller := newController(t, store, lab, process, gitadapter.Workspace{})
-			run, err := controller.Start(context.Background(), startInput(lab))
+			run, err := controller.Start(context.Background(), startInput(t, lab))
 			if err != nil {
 				t.Fatal(err)
 			}

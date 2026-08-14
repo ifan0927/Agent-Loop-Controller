@@ -16,7 +16,7 @@ import (
 )
 
 func TestAutomaticAdmissionLeaseUsesTTLAndVersionCAS(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func TestAutomaticAdmissionLeaseUsesTTLAndVersionCAS(t *testing.T) {
 }
 
 func TestAutomaticAdmissionLeaseConcurrentAcquireHasOneOwner(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestAutomaticAdmissionLeaseConcurrentAcquireHasOneOwner(t *testing.T) {
 }
 
 func TestReserveAutomaticAdmissionIsAtomicAndAdoptable(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestReserveAutomaticAdmissionIsAtomicAndAdoptable(t *testing.T) {
 }
 
 func TestAutomaticAdmissionFailsClosedForActiveOrCorruptEvidence(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +195,7 @@ func TestAutomaticAdmissionFailsClosedForActiveOrCorruptEvidence(t *testing.T) {
 }
 
 func TestAutomaticAdmissionJournalAllowsOnlySanitizedStateProgress(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +242,7 @@ func TestAutomaticAdmissionJournalAllowsOnlySanitizedStateProgress(t *testing.T)
 }
 
 func TestAutomaticAdmissionReservationRejectsLostLeaseAndMismatchedRestartEvidence(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +282,7 @@ func TestAutomaticAdmissionReservationRejectsLostLeaseAndMismatchedRestartEviden
 }
 
 func TestAutomaticAdmissionConcurrentReserveCreatesAtMostOneRun(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,7 +343,7 @@ func TestAutomaticAdmissionRejectsEveryCorruptUnrelatedJournalRow(t *testing.T) 
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
-			store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+			store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -374,7 +374,7 @@ func TestAutomaticAdmissionRejectsEveryCorruptUnrelatedJournalRow(t *testing.T) 
 }
 
 func TestAutomaticAdmissionLeaseExpiryUsesNumericTimeComparison(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +431,7 @@ func TestMigrationV18BackfillsLegacyAutomaticAdmissionLeaseExpiry(t *testing.T) 
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -454,7 +454,7 @@ func TestAutomaticAdmissionJournalRejectsStatusAndRunStateContradictions(t *test
 		{name: "mutation intent executing", status: "mutation_intent"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+			store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -538,7 +538,7 @@ func TestAutomaticAdmissionAbandonReleasesSlotAndReplaysIdempotently(t *testing.
 
 func TestAutomaticAdmissionAbandonCleanupFailureDetailsSurviveReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -563,7 +563,7 @@ func TestAutomaticAdmissionAbandonCleanupFailureDetailsSurviveReopen(t *testing.
 		t.Fatal(err)
 	}
 
-	reopened, err := Open(path)
+	reopened, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -698,17 +698,17 @@ func TestAutomaticAdmissionAbandonRetainsHumanDecisionEvidence(t *testing.T) {
 func TestAutomaticAdmissionAbandonReplayRetainsNewNonMergeDeliveryEvidence(t *testing.T) {
 	for _, test := range []struct {
 		name string
-		add  func(context.Context, *Store, application.Run) error
+		add  func(context.Context, *admissionTestStore, application.Run) error
 	}{
-		{name: "reply intent", add: func(ctx context.Context, store *Store, run application.Run) error {
+		{name: "reply intent", add: func(ctx context.Context, store *admissionTestStore, run application.Run) error {
 			_, _, err := store.BeginSideEffect(ctx, application.SideEffectRecord{RunID: run.ID, Kind: "reply_to_review_comment", IdempotencyKey: "reply-replay", IntentJSON: `{"pull_request":7}`, Attempt: 1})
 			return err
 		}},
-		{name: "reply evidence", add: func(ctx context.Context, store *Store, run application.Run) error {
+		{name: "reply evidence", add: func(ctx context.Context, store *admissionTestStore, run application.Run) error {
 			_, err := store.db.ExecContext(ctx, `INSERT INTO trusted_review_reply_evidence(run_id,root_comment_node_id,pr_number,root_comment_database_id,repaired_head,marker_digest,reply_database_id,reply_node_id,app_id,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, run.ID, "COMMENT_REPLAY", 7, 70, "head", strings.Repeat("b", 64), 71, "COMMENT_REPLY_REPLAY", 99, formatTime(time.Now().UTC()))
 			return err
 		}},
-		{name: "remote cleanup intent", add: func(ctx context.Context, store *Store, run application.Run) error {
+		{name: "remote cleanup intent", add: func(ctx context.Context, store *admissionTestStore, run application.Run) error {
 			return store.UpsertCleanup(ctx, application.CleanupRecord{RunID: run.ID, Kind: "remote_branch", Name: run.WorkingBranch, Status: "intent"})
 		}},
 	} {
@@ -801,9 +801,9 @@ func TestAutomaticAdmissionAbandonRejectsTakenOverRunLease(t *testing.T) {
 	}
 }
 
-func prepareAutomaticAbandonmentRun(t *testing.T, state domain.State) (*Store, application.Run, application.LinearTodoAdmissionLease) {
+func prepareAutomaticAbandonmentRun(t *testing.T, state domain.State) (*admissionTestStore, application.Run, application.LinearTodoAdmissionLease) {
 	t.Helper()
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -885,7 +885,7 @@ func TestMigratesVersionFifteenDatabaseToAutomaticAdmissionSchema(t *testing.T) 
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}

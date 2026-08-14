@@ -343,26 +343,12 @@ func (s *ConfigurationService) configurationReplay(ctx context.Context, command 
 
 func (s *ConfigurationService) recordNoOp(ctx context.Context, authority ConfigurationAuthority, requester ConfiguredRequester, scopes AuthorizedScopeSet, candidate ValidatedConfigurationCandidate) (ConfigurationApplyResult, error) {
 	receipt := configurationApplyReceipt(authority, requester, scopes, candidate, s.now().UTC())
-	receipts, err := NewOperationReceiptService(s.store)
+	settledAt := s.now().UTC()
+	current, settled, _, err := s.store.RecordConfigurationNoOp(ctx, ConfigurationNoOpSettlement{ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Receipt: receipt, EvidenceDigest: configurationDigest("configuration-noop", authority.Desired.Digest), ResultDigest: configurationDigest("configuration-noop-result", authority.Desired.Digest), SettledAt: settledAt})
 	if err != nil {
-		return ConfigurationApplyResult{}, serviceError(ErrorInternal, "configuration receipt authority is unavailable", nil)
+		return ConfigurationApplyResult{}, classifyConfigurationStoreError(err)
 	}
-	persisted, _, err := receipts.Accept(ctx, OperationReceiptInput{OperationType: receipt.OperationType, Scope: receipt.Scope, TargetID: receipt.TargetID, Requester: receipt.Requester, RequestDigest: receipt.RequestDigest, ExpectedAuthorityDigest: receipt.ExpectedAuthorityDigest, OperationAnchorDigest: receipt.OperationAnchorDigest, TargetBindingDigest: receipt.TargetBindingDigest, AcceptedAt: receipt.AcceptedAt})
-	if err != nil {
-		return ConfigurationApplyResult{}, err
-	}
-	if persisted.Phase == OperationPhaseObserved {
-		return ConfigurationApplyResult{Generation: authority.Desired, Receipt: persisted, NoOp: true}, nil
-	}
-	applied, _, err := receipts.RecordApplied(ctx, OperationReceiptMutation{OperationID: persisted.OperationID, Outcome: OperationOutcomePending, ResultingAuthorityDigest: authority.Desired.Digest, ResultingState: string(authority.Desired.State), ResultingVersion: authority.Desired.GenerationID, EvidenceDigest: configurationDigest("configuration-noop", authority.Desired.Digest), At: s.now().UTC()})
-	if err != nil {
-		return ConfigurationApplyResult{}, err
-	}
-	settled, _, err := receipts.RecordSettled(ctx, OperationReceiptMutation{OperationID: applied.OperationID, ExpectedPhase: OperationPhaseApplied, Phase: OperationPhaseObserved, Outcome: OperationOutcomeSucceeded, ResultingAuthorityDigest: authority.Desired.Digest, ResultingState: string(authority.Desired.State), ResultingVersion: authority.Desired.GenerationID, EvidenceDigest: applied.EvidenceDigest, ResultDigest: configurationDigest("configuration-noop-result", authority.Desired.Digest), At: s.now().UTC()})
-	if err != nil {
-		return ConfigurationApplyResult{}, err
-	}
-	return ConfigurationApplyResult{Generation: authority.Desired, Receipt: settled, NoOp: true}, nil
+	return ConfigurationApplyResult{Generation: current.Desired, Receipt: settled, NoOp: true}, nil
 }
 
 func (s *ConfigurationService) ReconcileRuntime(ctx context.Context, now time.Time) (ConfigurationAuthority, RuntimeObservation, error) {

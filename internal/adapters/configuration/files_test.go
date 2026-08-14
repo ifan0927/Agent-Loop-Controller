@@ -2,6 +2,7 @@ package configuration
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -150,6 +151,42 @@ func TestAtomicReplacementRetainsCapturedParentUntilDirectorySyncIsProven(t *tes
 	}
 	if captured, err := os.ReadFile(stage); err != nil || !bytes.Equal(captured, parent) {
 		t.Fatalf("captured parent=%q err=%v", captured, err)
+	}
+}
+
+func TestReplacementProvesCapturedParentCleanupDirectorySync(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	configPath := filepath.Join(root, "controller.json")
+	parent, target := []byte("parent"), []byte("target")
+	if err := os.WriteFile(configPath, parent, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncCalls := 0
+	files.syncDir = func(string) error {
+		syncCalls++
+		if syncCalls == 2 {
+			return os.ErrInvalid
+		}
+		return nil
+	}
+	operationID := "operation-11223344556677889900aabbccddeeff"
+	if err := files.ReplaceLive(operationID, parent, target); err == nil || syncCalls != 2 {
+		t.Fatalf("replace sync calls=%d err=%v", syncCalls, err)
+	}
+	stage, err := files.replacementStagePath(operationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(stage); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("captured parent stage still exists: %v", err)
+	}
+	_, _, _ = files.ReconcileReplacement(operationID, parent, target)
+	if syncCalls != 3 {
+		t.Fatalf("reconciliation did not prove cleanup durability; sync calls=%d", syncCalls)
 	}
 }
 

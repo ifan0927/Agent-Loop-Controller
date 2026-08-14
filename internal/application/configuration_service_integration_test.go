@@ -251,6 +251,18 @@ type configurationFaultStore struct {
 	failSettle bool
 }
 
+type configurationNoOpRaceStore struct {
+	*sqlitestore.Store
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *configurationNoOpRaceStore) RecordConfigurationNoOp(ctx context.Context, settlement application.ConfigurationNoOpSettlement) (application.ConfigurationAuthority, application.OperationReceipt, bool, error) {
+	close(s.entered)
+	<-s.release
+	return s.Store.RecordConfigurationNoOp(ctx, settlement)
+}
+
 func (s *configurationFaultStore) BeginConfigurationApply(ctx context.Context, input application.ConfigurationApplyAcceptance) (application.ConfigurationGeneration, application.OperationReceipt, bool, error) {
 	if s.failBegin {
 		s.failBegin = false
@@ -442,6 +454,47 @@ func TestConfigurationServiceRawRetentionFailureNeverAcceptsIntent(t *testing.T)
 	}
 }
 
+func TestConfigurationNoOpCannotSettleAfterAuthorityAdvances(t *testing.T) {
+	baseService, store, files, runtime, requester := configurationServiceFixture(t)
+	authority, err := baseService.Initialize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raceStore := &configurationNoOpRaceStore{Store: store, entered: make(chan struct{}), release: make(chan struct{})}
+	raceService, err := application.NewConfigurationService(raceStore, files, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: append([]byte(nil), files.live...)}
+	noOpDone := make(chan error, 1)
+	go func() {
+		_, noOpErr := raceService.Apply(context.Background(), command)
+		noOpDone <- noOpErr
+	}()
+	select {
+	case <-raceStore.entered:
+	case <-time.After(time.Second):
+		t.Fatal("no-op did not reach transactional settlement")
+	}
+	advanced, err := baseService.Apply(context.Background(), application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: []byte("advanced while no-op waits")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(raceStore.release)
+	select {
+	case err := <-noOpDone:
+		if err == nil || !strings.Contains(err.Error(), "authority changed") {
+			t.Fatalf("stale no-op error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stale no-op did not finish")
+	}
+	current, found, err := store.ConfigurationAuthority(context.Background())
+	if err != nil || !found || current.Desired.GenerationID != advanced.Generation.GenerationID || current.Desired.Digest != advanced.Generation.Digest {
+		t.Fatalf("authority=%+v found=%t err=%v", current, found, err)
+	}
+}
+
 func TestConfigurationServiceRetainsCurrentPlusNineSettledRawGenerations(t *testing.T) {
 	service, store, files, _, requester := configurationServiceFixture(t)
 	ctx := context.Background()
@@ -521,16 +574,21 @@ func TestConfigurationServiceRetainsCurrentPlusNineSettledRawGenerations(t *test
 }
 
 func TestConfigurationApplyPreservesExistingRunAndDatabaseAuthority(t *testing.T) {
-	service, store, files, _, requester := configurationServiceFixture(t)
+	service, store, files, runtime, requester := configurationServiceFixture(t)
 	ctx := context.Background()
-	_, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: application.Run{
-		ID: "active-run", IssueID: "IFAN-1", IdempotencyKey: "active-run-key", SourceRevision: "source", TaskHash: "task",
-		Repository: "owner/repo", RepositoryConfigJSON: `{}`, BaseBranch: "main", WorkingBranch: "ifan/active-run",
-	}})
+	authority, err := service.Initialize(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	authority, err := service.Initialize(ctx)
+	runtime.observation = freshConfigurationRuntime(authority.Desired.Digest, time.Now().UTC())
+	decision, err := service.CheckNewAdmission(ctx)
+	if err != nil || !decision.Allowed {
+		t.Fatalf("admission decision=%+v err=%v", decision, err)
+	}
+	_, _, err = store.CreateRun(ctx, application.CreateRunInput{Run: application.Run{
+		ID: "active-run", IssueID: "IFAN-1", IdempotencyKey: "active-run-key", SourceRevision: "source", TaskHash: "task",
+		Repository: "owner/repo", RepositoryConfigJSON: `{}`, BaseBranch: "main", WorkingBranch: "ifan/active-run",
+	}, ConfigurationAuthority: decision.Authority})
 	if err != nil {
 		t.Fatal(err)
 	}

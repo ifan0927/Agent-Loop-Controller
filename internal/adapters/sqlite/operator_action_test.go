@@ -32,7 +32,7 @@ func TestOperatorActionJournalBindsAuthorityReplaysAndSurvivesRestart(t *testing
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +142,7 @@ func TestOperatorActionConcurrentSamePayloadIsOneCreateAndOneReplay(t *testing.T
 	path := filepath.Join(t.TempDir(), "controller.db")
 	firstStore, run, event, sequence := operatorActionFixture(t, path)
 	defer firstStore.Close()
-	secondStore, err := Open(path)
+	secondStore, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,8 +155,8 @@ func TestOperatorActionConcurrentSamePayloadIsOneCreateAndOneReplay(t *testing.T
 	}
 	start := make(chan struct{})
 	results := make(chan outcome, 2)
-	for _, store := range []*Store{firstStore, secondStore} {
-		go func(store *Store) {
+	for _, store := range []*admissionTestStore{firstStore, secondStore} {
+		go func(store *admissionTestStore) {
 			service, _ := application.NewOperatorActionService(store)
 			<-start
 			record, created, err := service.Prepare(context.Background(), input)
@@ -174,7 +174,7 @@ func TestOperatorActionConcurrentContradictoryAnswersFailClosed(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
 	firstStore, run, event, sequence := operatorActionFixture(t, path)
 	defer firstStore.Close()
-	secondStore, err := Open(path)
+	secondStore, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,12 +185,12 @@ func TestOperatorActionConcurrentContradictoryAnswersFailClosed(t *testing.T) {
 	}
 	start := make(chan struct{})
 	results := make(chan outcome, 2)
-	for index, store := range []*Store{firstStore, secondStore} {
+	for index, store := range []*admissionTestStore{firstStore, secondStore} {
 		action := application.OperatorActionRetry
 		if index == 1 {
 			action = application.OperatorActionAbandon
 		}
-		go func(store *Store, action application.OperatorActionType) {
+		go func(store *admissionTestStore, action application.OperatorActionType) {
 			service, _ := application.NewOperatorActionService(store)
 			<-start
 			_, created, err := service.Prepare(context.Background(), operatorActionInput(run, event, sequence, action))
@@ -239,7 +239,7 @@ func TestOperatorActionIntentReplayReturnsPersistedResultAfterRunAdvances(t *tes
 }
 
 func TestCIWaitRecoverySupersedesOnlyExactTerminalScheduleAndReplays(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +311,7 @@ func TestCIWaitRecoverySupersedesOnlyExactTerminalScheduleAndReplays(t *testing.
 
 func TestOperatorActionMigrationFromV23CreatesEmptyJournal(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +332,7 @@ func TestOperatorActionMigrationFromV23CreatesEmptyJournal(t *testing.T) {
 		t.Fatal(err)
 	}
 	store.Close()
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,9 +346,9 @@ func TestOperatorActionMigrationFromV23CreatesEmptyJournal(t *testing.T) {
 	}
 }
 
-func operatorActionFixture(t *testing.T, path string) (*Store, application.Run, application.OperatorAttentionEvent, int64) {
+func operatorActionFixture(t *testing.T, path string) (*admissionTestStore, application.Run, application.OperatorAttentionEvent, int64) {
 	t.Helper()
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}

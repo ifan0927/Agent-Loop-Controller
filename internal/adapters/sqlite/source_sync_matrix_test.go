@@ -271,7 +271,7 @@ type sourceSyncMatrixFixture struct {
 	root      string
 	origin    string
 	source    string
-	store     *Store
+	store     *admissionTestStore
 	base      string
 	candidate string
 	merge     string
@@ -324,7 +324,7 @@ func newSourceSyncMatrixFixture(t *testing.T) *sourceSyncMatrixFixture {
 	later := matrixGitOutput(t, merger, "rev-parse", "HEAD")
 	matrixGit(t, merger, "push", "origin", "main")
 
-	store, err := Open(filepath.Join(root, "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(root, "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -313,7 +313,7 @@ The acceptance matrix requires:
 | Boundary | Required evidence |
 | --- | --- |
 | Automatic admission | Bounded scan, priority selection, atomic run/slot/permit reservation, exact Todo-to-In-Progress mutation, and one nonterminal run per repository |
-| Configuration authority | Same-byte filesystem binding/database-anchor/locator baseline crash matrix, read-only binding proof, v31 migration, CAS/no-op/concurrent replay, intent-before-exchange crash matrix, captured-parent/fsync proof, durable prune claims, legacy non-elevation, manual-supervisor heartbeat, drift/effective convergence, and transactional admission fencing |
+| Configuration authority | Same-byte filesystem binding/database-anchor/locator baseline crash matrix, bounded forward-migration read-only binding proof, v31 migration, atomic no-op authority/receipt CAS, concurrent replay, intent-before-exchange crash matrix, captured-parent/exchange/cleanup fsync proof, durable prune claims, legacy non-elevation, manual-supervisor heartbeat, drift/effective convergence, and fail-closed direct plus automatic admission fencing |
 | Bounded concurrency | Generic capacity above two, same-repository exclusion, drain-on-reduction, sibling failure isolation, and restart reconstruction |
 | Implementation | Owned worktree, resumable session, exact candidate, successful verifier batch |
 | Internal review | Fresh independent read-only review bound to candidate head; after repair, exact expected-finding dispositions cover both repair and full branch deltas |
@@ -341,7 +341,7 @@ controller process. Cover at least:
 - Linear admission mutation intent/observation;
 - configuration raw staging, filesystem baseline binding, database anchor,
   locator publication, prune claim/removal, intent acceptance, captured-parent
-  exchange/fsync/reread,
+  exchange/fsync/reread, staged-leaf cleanup sync, same-digest receipt CAS,
   desired settlement, effective observation, and retention pruning;
 - push, PR create/adopt, review reply, and merge intent/observation;
 - pending CI/approval/thread resolution polling;

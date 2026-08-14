@@ -108,6 +108,55 @@ func TestConcurrentConfigurationBaselineCreatesExactlyOneGeneration(t *testing.T
 	}
 }
 
+func TestConfigurationBindingProofAllowsTrustedForwardMigrationOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "controller.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	configPath := filepath.Join(t.TempDir(), "controller.json")
+	input := application.ConfigurationBaselineInput{Candidate: application.ValidatedConfigurationCandidate{Digest: strings.Repeat("a", 64), Size: 42, SchemaVersion: 5, DatabasePath: path, Operator: domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}}, CanonicalConfigPath: configPath, ObservedAt: now}
+	if err := store.PrepareConfigurationBaseline(context.Background(), input); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if _, _, err := store.AdoptConfigurationBaseline(context.Background(), input); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	boundConfig, boundDatabase, bound, err := inspectConfigurationBindingReadOnly(context.Background(), path, schemaVersion+1)
+	if err != nil || !bound || boundConfig != configPath || boundDatabase != path {
+		t.Fatalf("config=%q database=%q bound=%t err=%v", boundConfig, boundDatabase, bound, err)
+	}
+	if _, _, _, err := inspectConfigurationBindingReadOnly(context.Background(), path, 30); err == nil {
+		t.Fatal("pre-authority schema accepted trusted binding proof")
+	}
+}
+
+func TestSchemaV31WithoutConfigurationAuthorityRejectsDirectAdmission(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	input := application.CreateRunInput{Run: application.Run{ID: "unfenced-run", IssueID: "IFAN-1", IdempotencyKey: "unfenced-run", SourceRevision: "source", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: `{}`, BaseBranch: "main", WorkingBranch: "ifan/unfenced"}}
+	if _, created, err := store.CreateRun(context.Background(), input); !errors.Is(err, application.ErrConfigurationAuthorityConflict) || created {
+		t.Fatalf("created=%t err=%v", created, err)
+	}
+	lease, acquired, err := store.AcquireLinearTodoAdmissionLease(context.Background(), "missing-authority-fixture", time.Minute, time.Now().UTC())
+	if err != nil || !acquired {
+		t.Fatalf("lease=%+v acquired=%t err=%v", lease, acquired, err)
+	}
+	reservation := automaticAdmissionReservation("123e4567-e89b-42d3-a456-426614174031", "unfenced-reservation", "IFAN-31", lease)
+	if _, _, reserved, err := store.ReserveLinearTodoAdmission(context.Background(), reservation); !errors.Is(err, application.ErrConfigurationAuthorityConflict) || reserved {
+		t.Fatalf("reserved=%t err=%v", reserved, err)
+	}
+}
+
 func TestConfigurationDriftEvidenceRecordsTransitionsNotPollingCadence(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {

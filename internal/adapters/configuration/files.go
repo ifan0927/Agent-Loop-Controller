@@ -277,7 +277,9 @@ func (f *Files) ReplaceLive(operationID string, expected, payload []byte) error 
 	if err := os.Remove(stage); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return errors.New("configuration replacement cleanup failed")
 	}
-	_ = f.syncParent()
+	if err := f.syncParent(); err != nil {
+		return errors.New("configuration replacement cleanup synchronization is unproven")
+	}
 	return nil
 }
 
@@ -289,6 +291,9 @@ func (f *Files) ReconcileReplacement(operationID string, expectedParent, target 
 	live, candidate, liveErr := f.ReadLive()
 	staged, stageErr := readPrivateRegular(stage, f.uid, maximumConfigurationBytes, true)
 	if errors.Is(stageErr, os.ErrNotExist) {
+		if f.syncParent() != nil {
+			return nil, application.ValidatedConfigurationCandidate{}, errors.New("configuration replacement cleanup synchronization is unproven")
+		}
 		return live, candidate, liveErr
 	}
 	if liveErr != nil || stageErr != nil {

@@ -156,6 +156,12 @@ anchor, payload, action, or expected-authority drift conflicts, while a later
 Controller-owned occurrence receives a new anchor. Mutually exclusive actions
 share the same authority uniqueness boundary.
 
+Configuration same-digest no-ops are not a weaker receipt path. SQLite
+rechecks the exact desired generation, digest, and absence of an incomplete
+intent, then writes the final observed/succeeded receipt in that same
+transaction. A concurrent authority advance conflicts instead of recording a
+receipt against stale authority.
+
 Receipt phase and outcome are separate. The monotonic phases are `accepted`,
 `applied`, and `observed`; outcomes are `pending`, `succeeded`, `failed`,
 `conflict`, and `ambiguous`. An interrupted caller cannot erase an accepted
@@ -515,8 +521,11 @@ one exact bounded byte payload, the private configuration adapter retains those
 same bytes and exclusively publishes a filesystem baseline-binding intent,
 SQLite durably prepares the matching database anchor, and only then may the
 private locator be published. Startup proves a locator or pre-locator binding
-target in read-only mode against that prepared binding before opening or migrating the
-database; SQLite then atomically assigns one baseline generation without
+target in read-only mode against that prepared binding before opening or
+migrating the database. That proof accepts only the configuration-authority
+schema floor through the binary's supported schema, allowing a trusted older
+store to receive normal forward migrations while rejecting pre-authority and
+newer unsupported stores. SQLite then atomically assigns one baseline generation without
 rewriting the live file. The mode-`0600` locator beside the configuration binds
 the canonical live path to its owning database so a later invalid or
 database-path-drifted file cannot create, redirect, or migrate an attacker-
@@ -537,7 +546,9 @@ the target, and commits one apply intent and operation receipt before a same-
 directory atomic exchange. The exchange captures the exact displaced inode;
 an unexpected concurrent edit is restored instead of overwritten. The
 captured parent remains as private operation evidence until directory sync and
-exact reread prove the target. Startup and pre-apply reconciliation settle an
+exact reread prove the target. Removing the staged leaf also requires a proven
+parent-directory sync; an interrupted or failed cleanup remains an error until
+reconciliation repeats that sync. Startup and pre-apply reconciliation settle an
 interrupted intent from exact parent/target evidence or an ambiguous third or
 unsafe observation; drift is never adopted or overwritten. A matching fresh
 heartbeat durably selects only the current desired generation as effective.
@@ -555,7 +566,9 @@ transaction as the new run or reservation. The token expires with the exact
 heartbeat freshness window, and every durable drift-entered or drift-cleared
 transition advances authority version and invalidates older tokens. Apply
 acceptance uses the same SQLite write authority, so
-admission cannot cross an accepted configuration change. Missing authority,
+admission cannot cross an accepted configuration change. A schema-31-or-newer
+store with no configuration authority rejects direct run creation and automatic
+reservation as well as composed admission. Missing authority,
 pending restart, drift, unresolved apply,
 stale/offline runtime, and unavailable evidence fail closed without releasing
 permits or changing existing runs.

@@ -12,7 +12,7 @@ import (
 )
 
 func TestGenericGitHubEvidenceStoreCannotSerializeInlineReviewBodies(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

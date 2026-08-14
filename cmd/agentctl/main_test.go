@@ -267,7 +267,7 @@ func TestLocalContinueAuthorizesBeforeRegistryRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	authority, _ := json.Marshal(application.LocalRepository{AllowedOperatorLogins: []string{"ifan0927"}})
-	_, _, err = store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: "run-auth-first", IdempotencyKey: "key", Repository: "owner/repo", RepositoryConfigJSON: string(authority)}})
+	_, _, err = store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: "run-auth-first", IdempotencyKey: "key", Repository: "owner/repo", RepositoryConfigJSON: string(authority)}, ConfigurationAuthority: testConfigurationAuthority(t, store, path)})
 	store.Close()
 	if err != nil {
 		t.Fatal(err)
@@ -285,7 +285,7 @@ func TestLocalContinueRejectsCallerRepositoryBeforeRegistryRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	authority, _ := json.Marshal(application.LocalRepository{AllowedOperatorLogins: []string{"ifan0927"}})
-	_, _, err = store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: "run-repository", IdempotencyKey: "key", Repository: "owner/repo", RepositoryConfigJSON: string(authority)}})
+	_, _, err = store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: "run-repository", IdempotencyKey: "key", Repository: "owner/repo", RepositoryConfigJSON: string(authority)}, ConfigurationAuthority: testConfigurationAuthority(t, store, path)})
 	store.Close()
 	if err != nil {
 		t.Fatal(err)
@@ -319,6 +319,7 @@ func TestLocalStatusOutputsDurableInspection(t *testing.T) {
 	}
 	authority, _ := json.Marshal(application.LocalRepository{AllowedOperatorLogins: []string{"ifan0927"}})
 	input := application.CreateRunInput{Run: application.Run{ID: "run-1", IssueID: "ISSUE-1", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw-hash", NormalizedTaskJSON: "{}", TaskHash: "task-hash", Repository: "repo:test-project", RepositoryConfigJSON: string(authority), BaseBranch: "main", WorkingBranch: "ifan/test", ArtifactRoot: "/tmp/run", ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}}
+	input.ConfigurationAuthority = testConfigurationAuthority(t, store, path)
 	if _, _, err := store.CreateRun(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}
@@ -353,13 +354,16 @@ func TestControllerStatusProjectsIdempotencyKeyOnlyToAuthorizedOperator(t *testi
 		t.Fatal(err)
 	}
 	configPath, dbPath := writeControllerStatusConfig(t, root)
+	if _, err := loadManagedConfiguration(configPath); err != nil {
+		t.Fatal(err)
+	}
 	store, err := sqlitestore.Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	authority, _ := json.Marshal(application.LocalRepository{AllowedOperatorLogins: []string{"ifan0927"}, TrustedOperatorActors: []application.TrustedActorIdentity{{DatabaseID: 33, NodeID: "MDQ6VXNlcjMz", Login: "ifan0927", Type: "User"}}})
 	run := application.Run{ID: "run-status", IssueID: "IFAN-18", IdempotencyKey: "resume-key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: string(authority), BaseBranch: "main", WorkingBranch: "ifan/ifan-18"}
-	if _, _, err := store.CreateRun(context.Background(), application.CreateRunInput{Run: run}); err != nil {
+	if _, _, err := store.CreateRun(context.Background(), application.CreateRunInput{Run: run, ConfigurationAuthority: testExistingNewAdmissionGate(t, store).Decision.Authority}); err != nil {
 		store.Close()
 		t.Fatal(err)
 	}
@@ -690,7 +694,7 @@ func TestLocalStatusRejectsUnauthorizedRequester(t *testing.T) {
 		t.Fatal(err)
 	}
 	authority, _ := json.Marshal(application.LocalRepository{AllowedOperatorLogins: []string{"ifan0927"}})
-	_, _, err = store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: "run-auth", IdempotencyKey: "key", Repository: "owner/repo", RepositoryConfigJSON: string(authority)}})
+	_, _, err = store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: "run-auth", IdempotencyKey: "key", Repository: "owner/repo", RepositoryConfigJSON: string(authority)}, ConfigurationAuthority: testConfigurationAuthority(t, store, path)})
 	store.Close()
 	if err != nil {
 		t.Fatal(err)
@@ -714,6 +718,7 @@ func TestLocalInspectSanitizesRepositoryBinding(t *testing.T) {
 		GitHubInstallationID: 22, ExpectedRepositoryID: 33, AllowedOperatorLogins: []string{"ifan0927"}, TrustedOperatorActors: []application.TrustedActorIdentity{{DatabaseID: 33, NodeID: "MDQ6VXNlcjMz", Login: "ifan0927", Type: "User"}}}
 	raw, _ := json.Marshal(binding)
 	input := application.CreateRunInput{Run: application.Run{ID: "run-binding", IssueID: "ISSUE-2", IdempotencyKey: "binding-key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: string(raw), ProfileID: binding.ProfileID, ProfileSnapshotVersion: binding.ProfileSnapshotVersion, ProfileDigest: binding.ProfileDigest, ProfileSnapshotJSON: `{}`, RegistryVersion: 1, RegistryDigest: "registry-digest", RepositoryBindingDigest: "binding-digest", BaseBranch: "main", WorkingBranch: "ifan/test", WorktreePath: "/secret/run-worktree", ArtifactRoot: "/secret/artifact"}}
+	input.ConfigurationAuthority = testConfigurationAuthority(t, store, path)
 	if _, _, err := store.CreateRun(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}

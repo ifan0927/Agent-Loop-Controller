@@ -161,6 +161,54 @@ func (s *Store) AdoptConfigurationBaseline(ctx context.Context, input applicatio
 	return authority, true, nil
 }
 
+func (s *Store) RecordConfigurationNoOp(ctx context.Context, settlement application.ConfigurationNoOpSettlement) (application.ConfigurationAuthority, application.OperationReceipt, bool, error) {
+	if settlement.ExpectedGenerationID <= 0 || !validConfigurationDigest(settlement.ExpectedDigest) || application.ValidateOperationReceipt(settlement.Receipt) != nil || settlement.Receipt.OperationType != application.OperationApplyConfiguration || settlement.Receipt.Scope != application.ScopeController || settlement.Receipt.TargetID != application.ConfigurationTargetID || settlement.Receipt.RequestDigest != settlement.ExpectedDigest || settlement.Receipt.ExpectedAuthorityDigest != settlement.ExpectedDigest || !validConfigurationDigest(settlement.EvidenceDigest) || !validConfigurationDigest(settlement.ResultDigest) || settlement.SettledAt.IsZero() || settlement.SettledAt.Before(settlement.Receipt.AcceptedAt) {
+		return application.ConfigurationAuthority{}, application.OperationReceipt{}, false, errors.New("configuration no-op settlement is invalid")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return application.ConfigurationAuthority{}, application.OperationReceipt{}, false, err
+	}
+	defer tx.Rollback()
+	authority, found, err := configurationAuthorityQuery(ctx, tx)
+	if err != nil || !found {
+		return application.ConfigurationAuthority{}, application.OperationReceipt{}, false, application.ErrConfigurationAuthorityConflict
+	}
+	if authority.Incomplete != nil || authority.Desired.GenerationID != settlement.ExpectedGenerationID || authority.Desired.Digest != settlement.ExpectedDigest {
+		return application.ConfigurationAuthority{}, application.OperationReceipt{}, false, application.ErrConfigurationAuthorityConflict
+	}
+	if existing, found, lookupErr := getOperationReceiptByIDTx(ctx, tx, settlement.Receipt.OperationID); lookupErr != nil {
+		return application.ConfigurationAuthority{}, application.OperationReceipt{}, false, lookupErr
+	} else if found {
+		if !sameAcceptedOperationReceipt(existing, settlement.Receipt) || existing.Phase != application.OperationPhaseObserved || existing.Outcome != application.OperationOutcomeSucceeded || existing.ResultingVersion != authority.Desired.GenerationID || existing.ResultingAuthorityDigest != authority.Desired.Digest {
+			return application.ConfigurationAuthority{}, application.OperationReceipt{}, false, application.ErrOperationReceiptConflict
+		}
+		return authority, existing, false, tx.Commit()
+	}
+	settled := settlement.Receipt
+	settled.Phase = application.OperationPhaseObserved
+	settled.Outcome = application.OperationOutcomeSucceeded
+	settled.ResultingAuthorityDigest = authority.Desired.Digest
+	settled.ResultingState = string(authority.Desired.State)
+	settled.ResultingVersion = authority.Desired.GenerationID
+	settled.EvidenceDigest = settlement.EvidenceDigest
+	settled.ResultDigest = settlement.ResultDigest
+	settled.AppliedAt = settlement.SettledAt
+	settled.SettledAt = settlement.SettledAt
+	if err := insertOperationReceiptTx(ctx, tx, settled, ""); err != nil {
+		if _, found, lookupErr := getOperationReceiptByAuthorityTx(ctx, tx, settled.AuthorityKey); lookupErr != nil {
+			return application.ConfigurationAuthority{}, application.OperationReceipt{}, false, lookupErr
+		} else if found {
+			return application.ConfigurationAuthority{}, application.OperationReceipt{}, false, application.ErrOperationReceiptConflict
+		}
+		return application.ConfigurationAuthority{}, application.OperationReceipt{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return application.ConfigurationAuthority{}, application.OperationReceipt{}, false, err
+	}
+	return authority, settled, true, nil
+}
+
 func (s *Store) BeginConfigurationApply(ctx context.Context, input application.ConfigurationApplyAcceptance) (application.ConfigurationGeneration, application.OperationReceipt, bool, error) {
 	if input.AcceptedAt.IsZero() || input.ExpectedGenerationID <= 0 || !validConfigurationMetadata(input.Candidate.Digest, input.Candidate.Size, input.Candidate.SchemaVersion) || input.Candidate.SchemaVersion != 5 || input.Candidate.Operator.Validate() != nil || input.Requester.Validate() != nil || !input.Receipt.Requester.Equal(input.Requester) || application.ValidateOperationReceipt(input.Receipt) != nil || input.Receipt.OperationType != application.OperationApplyConfiguration || input.Receipt.Scope != application.ScopeController || input.Receipt.TargetID != application.ConfigurationTargetID {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, errors.New("configuration apply acceptance is invalid")
@@ -246,11 +294,8 @@ func requireConfigurationAdmissionAuthorityTx(ctx context.Context, tx *sql.Tx, e
 	if err != nil {
 		return err
 	}
-	// Stores created before configuration authority is established retain their
-	// legacy/test behavior. Every production composition establishes authority
-	// before it can reach a new-admission path.
 	if !found {
-		return nil
+		return application.ErrConfigurationAuthorityConflict
 	}
 	if !expected.Valid() || time.Now().UTC().After(expected.ValidThrough) || authority.Incomplete != nil || authority.Desired.GenerationID != expected.GenerationID || authority.Desired.Digest != expected.Digest || authority.Version != expected.AuthorityVersion || authority.EffectiveID != authority.Desired.GenerationID || authority.Desired.State != application.ConfigurationGenerationEffective {
 		return application.ErrConfigurationAuthorityConflict

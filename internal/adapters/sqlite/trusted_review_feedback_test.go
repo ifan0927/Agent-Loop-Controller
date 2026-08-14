@@ -17,7 +17,7 @@ func feedbackRecord(runID string) application.TrustedReviewFeedbackRecord {
 	return application.TrustedReviewFeedbackRecord{RunID: runID, TrustedReviewFeedback: domain.TrustedReviewFeedback{PRNumber: 1, PRDatabaseID: 2, PRNodeID: "PR_2", ReviewDatabaseID: 3, ReviewNodeID: "REVIEW_3", ThreadNodeID: "THREAD_4", RootCommentDatabaseID: 5, RootCommentNodeID: "COMMENT_5", Author: domain.ActorIdentity{DatabaseID: 6, NodeID: "USER_6", Login: "ifan0927", Type: "User"}, OriginalReviewHeadSHA: strings.Repeat("a", 40), Path: "internal/example.go", Line: &line, Body: "bounded trusted feedback", SourceAt: now, ObservedAt: now}}
 }
 
-func createFeedbackRun(t *testing.T, store *Store, id string) {
+func createFeedbackRun(t *testing.T, store *admissionTestStore, id string) {
 	t.Helper()
 	run := application.Run{ID: id, IssueID: id, IdempotencyKey: id, SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "ifan/test", ArtifactRoot: "/tmp/" + id}
 	if _, _, err := store.CreateRun(context.Background(), application.CreateRunInput{Run: run}); err != nil {
@@ -26,7 +26,7 @@ func createFeedbackRun(t *testing.T, store *Store, id string) {
 }
 
 func TestTrustedReviewFeedbackIsImmutableBoundedAndCASOnly(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func TestTrustedReviewFeedbackIsImmutableBoundedAndCASOnly(t *testing.T) {
 }
 
 func TestTrustedReviewFeedbackInitialSaveRejectsFutureEvidence(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestTrustedReviewFeedbackInitialSaveRejectsFutureEvidence(t *testing.T) {
 }
 
 func TestTrustedFeedbackDriftPersistsConflictAndManualTransitionAtomically(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestTrustedFeedbackDriftPersistsConflictAndManualTransitionAtomically(t *te
 }
 
 func TestTrustedReviewFeedbackAggregateTextBound(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func TestTrustedReviewFeedbackAggregateTextBound(t *testing.T) {
 }
 
 func TestTrustedReviewFeedbackTransitionRequiresStageEvidence(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +264,7 @@ func TestTrustedReviewFeedbackTransitionRequiresStageEvidence(t *testing.T) {
 }
 
 func TestFinalizeReviewReplyIsAtomicAcrossLifecycleEvidenceAndSideEffect(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,7 +385,7 @@ func TestFinalizeReviewReplyIsAtomicAcrossLifecycleEvidenceAndSideEffect(t *test
 
 func TestTrustedReviewFeedbackMigratesExistingRuns(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,7 +406,7 @@ func TestTrustedReviewFeedbackMigratesExistingRuns(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -419,7 +419,7 @@ func TestTrustedReviewFeedbackMigratesExistingRuns(t *testing.T) {
 }
 
 func TestTrustedReviewFeedbackHeadBoundsRejectBeforePersistence(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

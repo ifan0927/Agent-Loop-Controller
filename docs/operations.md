@@ -117,7 +117,10 @@ records the matching anchor in that database, publishes the private locator,
 and finally settles the generation. After a crash, startup accepts either the
 pre-locator intent or locator only after a read-only schema-and-binding proof;
 it never creates or migrates an unproven target or follows a newly edited live
-database path. After baseline, the locator and retained desired bytes bind the
+database path. The proof accepts database schemas from the configuration-
+authority floor through the current binary's supported schema so a trusted
+older store can be migrated normally; it rejects pre-authority and newer
+unsupported schemas. After baseline, the locator and retained desired bytes bind the
 canonical configuration to its existing database. An alternate configuration
 path, database relocation, invalid live file, or out-of-band digest change is a
 conflict; startup never re-baselines, follows an edited database path, adopts
@@ -130,6 +133,12 @@ change requires the existing explicit worker restart procedure because workers
 load configuration only at process startup. Raw generation files, baseline
 binding, and locator contents are private recovery evidence: do not read, copy,
 edit, prune, or use them as an operator API.
+
+The database does not provide a legacy admission fallback once it has schema
+31 or newer. If configuration authority is absent, both manual run creation and
+automatic reservation fail closed. Tests and offline fixtures must establish an
+explicit ready test authority; operators must recover the canonical binding and
+must not insert authority rows or run records manually.
 
 Repository profiles are selectable one at a time per run. They may coexist in
 one configuration, but paths must not overlap and a run freezes the selected

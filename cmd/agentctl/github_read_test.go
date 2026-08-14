@@ -71,26 +71,6 @@ func TestGitHubReadCLIEndToEndPersistsAndRestarts(t *testing.T) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 	dbPath := filepath.Join(dir, "controller.db")
-	store, err := sqlitestore.Open(dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	bindingJSON, _ := json.Marshal(application.LocalRepository{ProfileID: "repository-profile:owner/repo", ProfileSnapshotVersion: 1, ProfileDigest: "profile", RegistryVersion: 1, RegistryDigest: "registry", RepositoryBindingDigest: "binding", CanonicalRepository: "owner/repo", BaseBranch: "main", ExpectedRepositoryID: 99, GitHubAppID: 1, GitHubInstallationID: 2, AllowedOperatorLogins: []string{"ifan0927"}})
-	run := application.Run{ID: "run", IssueID: "IFAN-1", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: string(bindingJSON), ProfileID: "repository-profile:owner/repo", ProfileSnapshotVersion: 1, ProfileDigest: "profile", ProfileSnapshotJSON: `{}`, RegistryVersion: 1, RegistryDigest: "registry", RepositoryBindingDigest: "binding", BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: filepath.Join(dir, "artifacts"), ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}
-	if _, _, err := store.CreateRun(context.Background(), application.CreateRunInput{Run: run}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.SetWorkspace(context.Background(), "run", "base", filepath.Join(dir, "worktree")); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.SetCandidateHead(context.Background(), "run", "head"); err != nil {
-		t.Fatal(err)
-	}
-	pr := domain.PullRequest{Number: 1, URL: "https://example.invalid/pr/1", NodeID: "PR", HeadBranch: "feature", BaseBranch: "main", HeadSHA: "head", BaseSHA: "base", BodyDigest: hex.EncodeToString(bodySum[:]), OwnershipKey: "key", State: "open"}
-	if err := store.SavePullRequest(context.Background(), "run", pr); err != nil {
-		t.Fatal(err)
-	}
-	store.Close()
 	paths := []string{filepath.Join(dir, "origin"), filepath.Join(dir, "source"), filepath.Join(dir, "runs"), filepath.Join(dir, "worktrees")}
 	for _, path := range paths {
 		if err := os.Mkdir(path, 0o700); err != nil {
@@ -110,6 +90,29 @@ func TestGitHubReadCLIEndToEndPersistsAndRestarts(t *testing.T) {
 	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := loadManagedConfiguration(configPath); err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlitestore.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindingJSON, _ := json.Marshal(application.LocalRepository{ProfileID: "repository-profile:owner/repo", ProfileSnapshotVersion: 1, ProfileDigest: "profile", RegistryVersion: 1, RegistryDigest: "registry", RepositoryBindingDigest: "binding", CanonicalRepository: "owner/repo", BaseBranch: "main", ExpectedRepositoryID: 99, GitHubAppID: 1, GitHubInstallationID: 2, AllowedOperatorLogins: []string{"ifan0927"}})
+	run := application.Run{ID: "run", IssueID: "IFAN-1", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: string(bindingJSON), ProfileID: "repository-profile:owner/repo", ProfileSnapshotVersion: 1, ProfileDigest: "profile", ProfileSnapshotJSON: `{}`, RegistryVersion: 1, RegistryDigest: "registry", RepositoryBindingDigest: "binding", BaseBranch: "main", WorkingBranch: "feature", ArtifactRoot: filepath.Join(dir, "artifacts"), ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}
+	if _, _, err := store.CreateRun(context.Background(), application.CreateRunInput{Run: run, ConfigurationAuthority: testExistingNewAdmissionGate(t, store).Decision.Authority}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetWorkspace(context.Background(), "run", "base", filepath.Join(dir, "worktree")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCandidateHead(context.Background(), "run", "head"); err != nil {
+		t.Fatal(err)
+	}
+	pr := domain.PullRequest{Number: 1, URL: "https://example.invalid/pr/1", NodeID: "PR", HeadBranch: "feature", BaseBranch: "main", HeadSHA: "head", BaseSHA: "base", BodyDigest: hex.EncodeToString(bodySum[:]), OwnershipKey: "key", State: "open"}
+	if err := store.SavePullRequest(context.Background(), "run", pr); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
 	read, pipeWrite, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)

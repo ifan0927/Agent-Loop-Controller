@@ -17,7 +17,7 @@ import (
 )
 
 func TestOperationReceiptPersistsScopeNeutralLifecycleReplayAndConflict(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestOperationReceiptPersistsScopeNeutralLifecycleReplayAndConflict(t *testi
 }
 
 func TestOperationReceiptServiceClassifiesAuthorityAndLifecycleDriftAsConflict(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestOperationReceiptServiceClassifiesAuthorityAndLifecycleDriftAsConflict(t
 }
 
 func TestOperationReceiptPersistsPreApplyTerminalOutcomes(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestOperationReceiptPersistsPreApplyTerminalOutcomes(t *testing.T) {
 }
 
 func TestConcurrentOperationReceiptAcceptanceConverges(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestConcurrentOperationReceiptAcceptanceConverges(t *testing.T) {
 }
 
 func TestAuthorizedOperationReceiptQueryIsNonDisclosing(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,16 +221,16 @@ func TestMigrationV30BackfillsLegacyOperatorActionAsReadableReceipt(t *testing.T
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = Open(path)
+	reopened, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
-	inspection, err := store.Inspect(ctx, run.ID)
+	defer reopened.Close()
+	inspection, err := reopened.Inspect(ctx, run.ID)
 	if err != nil || len(inspection.OperatorActions) != 1 || inspection.OperatorActions[0].ActionID != actionID {
 		t.Fatalf("inspection=%+v err=%v", inspection.OperatorActions, err)
 	}
-	service, err := application.NewOperatorActionService(store)
+	service, err := application.NewOperatorActionService(reopened)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +241,7 @@ func TestMigrationV30BackfillsLegacyOperatorActionAsReadableReceipt(t *testing.T
 		t.Fatalf("legacy replay=%+v created=%t err=%v", replayed, created, err)
 	}
 	var operationID string
-	if err := store.db.QueryRowContext(ctx, `SELECT operation_id FROM operation_receipts WHERE source_action_id=?`, actionID).Scan(&operationID); err != nil || !strings.HasPrefix(operationID, "operation-") {
+	if err := reopened.db.QueryRowContext(ctx, `SELECT operation_id FROM operation_receipts WHERE source_action_id=?`, actionID).Scan(&operationID); err != nil || !strings.HasPrefix(operationID, "operation-") {
 		t.Fatalf("operation=%q err=%v", operationID, err)
 	}
 }

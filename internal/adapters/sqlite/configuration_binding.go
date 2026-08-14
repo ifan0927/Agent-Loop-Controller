@@ -12,8 +12,14 @@ import (
 
 // InspectConfigurationBindingReadOnly proves a locator target without
 // creating or migrating it. It accepts either completed authority or the
-// prepared baseline anchor that exists before locator publication.
+// prepared baseline anchor that exists before locator publication. A trusted
+// binding from the configuration-authority schema may be older than this
+// binary so Open can perform the normal forward migration afterwards.
 func InspectConfigurationBindingReadOnly(ctx context.Context, path string) (string, string, bool, error) {
+	return inspectConfigurationBindingReadOnly(ctx, path, schemaVersion)
+}
+
+func inspectConfigurationBindingReadOnly(ctx context.Context, path string, supportedVersion int) (string, string, bool, error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return "", "", false, errors.New("configuration database binding is invalid")
 	}
@@ -33,7 +39,7 @@ func InspectConfigurationBindingReadOnly(ctx context.Context, path string) (stri
 	defer db.Close()
 	db.SetMaxOpenConns(1)
 	var version int
-	if err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil || version != schemaVersion {
+	if err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil || supportedVersion < 31 || version < 31 || version > supportedVersion {
 		return "", "", false, errors.New("configuration database binding is unavailable")
 	}
 	var configPath, databasePath string

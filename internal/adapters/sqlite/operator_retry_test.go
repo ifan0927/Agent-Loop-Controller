@@ -44,7 +44,7 @@ func TestOperatorRetryAtomicallyReschedulesObservesAndReplaysAcrossRestart(t *te
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestOperatorRetryConcurrentIdenticalCommandsShareOneAction(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
 	firstStore, run, _, _ := operatorActionFixture(t, path)
 	defer firstStore.Close()
-	secondStore, err := Open(path)
+	secondStore, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,8 +131,8 @@ func TestOperatorRetryConcurrentIdenticalCommandsShareOneAction(t *testing.T) {
 	results := make(chan outcome, 2)
 	var ready sync.WaitGroup
 	ready.Add(2)
-	for _, store := range []*Store{firstStore, secondStore} {
-		go func(store *Store) {
+	for _, store := range []*admissionTestStore{firstStore, secondStore} {
+		go func(store *admissionTestStore) {
 			service, _ := application.NewOperatorRetryService(store, &operatorRetryRevalidator{run: run})
 			ready.Done()
 			<-start

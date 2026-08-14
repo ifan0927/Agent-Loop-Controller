@@ -14,7 +14,7 @@ import (
 
 func TestRetryScheduleSurvivesRestartAndBoundsAttention(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +33,7 @@ func TestRetryScheduleSurvivesRestartAndBoundsAttention(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func TestRetryScheduleSurvivesRestartAndBoundsAttention(t *testing.T) {
 }
 
 func TestRetryScheduleCASAllowsOneConcurrentFailureAndNoSecondRunAuthority(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestRetryScheduleCASAllowsOneConcurrentFailureAndNoSecondRunAuthority(t *te
 }
 
 func TestRetryScheduleStateDriftBecomesAuthorityAttention(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestRetryScheduleStateDriftBecomesAuthorityAttention(t *testing.T) {
 }
 
 func TestProcessStartRetryBindsCallerSelectedExactPersistedAttempt(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

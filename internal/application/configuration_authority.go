@@ -211,10 +211,20 @@ type ConfigurationDriftObservation struct {
 	ObservedAt           time.Time
 }
 
+type ConfigurationNoOpSettlement struct {
+	ExpectedGenerationID int64
+	ExpectedDigest       string
+	Receipt              OperationReceipt
+	EvidenceDigest       string
+	ResultDigest         string
+	SettledAt            time.Time
+}
+
 type ConfigurationGenerationStore interface {
 	ConfigurationAuthority(context.Context) (ConfigurationAuthority, bool, error)
 	PrepareConfigurationBaseline(context.Context, ConfigurationBaselineInput) error
 	AdoptConfigurationBaseline(context.Context, ConfigurationBaselineInput) (ConfigurationAuthority, bool, error)
+	RecordConfigurationNoOp(context.Context, ConfigurationNoOpSettlement) (ConfigurationAuthority, OperationReceipt, bool, error)
 	BeginConfigurationApply(context.Context, ConfigurationApplyAcceptance) (ConfigurationGeneration, OperationReceipt, bool, error)
 	SettleConfigurationApply(context.Context, ConfigurationApplySettlement) (ConfigurationAuthority, OperationReceipt, bool, error)
 	ObserveConfigurationEffective(context.Context, ConfigurationEffectiveObservation) (ConfigurationAuthority, bool, error)
