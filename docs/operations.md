@@ -120,9 +120,11 @@ and finally settles the generation. After a crash, startup accepts either the
 pre-locator intent or locator only after proving that exact private file
 identity and its schema/binding on one query-only SQLite connection. The
 adapter checks the actual SQLite VFS file descriptor, not another pathname
-lookup, and repeats that check on any pool reconnect. Writes and forward
-migration are enabled only on that same connection without reopening
-the pathname. Every later production store composition re-proves the persisted
+lookup, and repeats the VFS descriptor plus pathname check on every physical
+connection, idle-pool reuse, transaction boundary, direct query or effect, and
+prepared-statement effect. Writes and forward migration are enabled only on
+that same connection without reopening the pathname. Every later production
+store composition re-proves the persisted
 database identity instead of using a path-only open. It never creates or
 migrates an unproven target or follows a newly edited live
 database path. The proof accepts database schemas from the configuration-
@@ -140,7 +142,9 @@ preview, rollback, or drift-repair CLI. A committed future typed configuration
 change requires the existing explicit worker restart procedure because workers
 load configuration only at process startup. Raw generation files, baseline
 binding, and locator contents are private recovery evidence: do not read, copy,
-edit, prune, or use them as an operator API.
+edit, prune, or use them as an operator API. Trusted reads reject either the
+authority or generation ancestor if it is a symlink, has changed ownership, or
+is not mode `0700`, even when the leaf itself still appears private.
 
 Raw retention and pruning are serialized with configuration publication by a
 flock on the stable filesystem-root inode; there is no user-replaceable

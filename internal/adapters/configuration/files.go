@@ -156,6 +156,9 @@ func (f *Files) HasRaw(digest string, size int64) bool {
 	if !validDigest(digest) || size < 0 || size > maximumConfigurationBytes {
 		return false
 	}
+	if f.inspectAuthorityRoots(true) != nil {
+		return false
+	}
 	payload, err := readPrivateRegular(f.rawPath(digest), f.uid, maximumConfigurationBytes, true)
 	return err == nil && int64(len(payload)) == size && configurationDigest(payload) == digest && f.syncAuthorityDirectory(f.rawRoot) == nil
 }
@@ -200,6 +203,9 @@ func (f *Files) PublishBaselineBinding(candidate application.ValidatedConfigurat
 func (f *Files) ReadRaw(digest string, size int64) ([]byte, error) {
 	if !validDigest(digest) || size < 0 || size > maximumConfigurationBytes {
 		return nil, errors.New("configuration raw evidence is invalid")
+	}
+	if err := f.inspectAuthorityRoots(true); err != nil {
+		return nil, errors.New("configuration raw authority is unsafe")
 	}
 	payload, err := readPrivateRegular(f.rawPath(digest), f.uid, maximumConfigurationBytes, true)
 	if err != nil || int64(len(payload)) != size || configurationDigest(payload) != digest {
@@ -374,6 +380,9 @@ func (f *Files) RemoveRaw(digest string) error {
 	if !validDigest(digest) {
 		return errors.New("configuration raw digest is invalid")
 	}
+	if err := f.inspectAuthorityRoots(true); err != nil {
+		return errors.New("configuration raw authority is unsafe")
+	}
 	path := f.rawPath(digest)
 	if _, err := readPrivateRegular(path, f.uid, maximumConfigurationBytes, true); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -455,6 +464,11 @@ func ReadLocator(configPath string) (AuthorityLocator, bool, error) {
 	if err != nil {
 		return AuthorityLocator{}, false, err
 	}
+	if _, err := os.Lstat(files.root); errors.Is(err, os.ErrNotExist) {
+		return AuthorityLocator{}, false, nil
+	} else if err != nil || files.inspectAuthorityRoots(false) != nil {
+		return AuthorityLocator{}, false, errors.New("configuration authority directory is unsafe")
+	}
 	path := filepath.Join(files.root, "locator.json")
 	payload, err := readPrivateRegular(path, files.uid, 4096, true)
 	if errors.Is(err, os.ErrNotExist) {
@@ -477,6 +491,11 @@ func ReadBaselineBinding(configPath string) (BaselineBinding, bool, error) {
 	files, err := NewFiles(configPath)
 	if err != nil {
 		return BaselineBinding{}, false, err
+	}
+	if _, err := os.Lstat(files.root); errors.Is(err, os.ErrNotExist) {
+		return BaselineBinding{}, false, nil
+	} else if err != nil || files.inspectAuthorityRoots(false) != nil {
+		return BaselineBinding{}, false, errors.New("configuration authority directory is unsafe")
 	}
 	payload, err := readPrivateRegular(filepath.Join(files.root, "baseline.json"), files.uid, 4096, true)
 	if errors.Is(err, os.ErrNotExist) {
@@ -528,6 +547,16 @@ func (f *Files) ensureRoots() error {
 	}
 	if err := ensurePrivateDirectory(f.rawRoot, f.uid); err != nil {
 		return errors.New("configuration raw directory is unsafe")
+	}
+	return nil
+}
+
+func (f *Files) inspectAuthorityRoots(includeRaw bool) error {
+	if err := inspectPrivateDirectory(f.root, f.uid, true); err != nil {
+		return err
+	}
+	if includeRaw {
+		return inspectPrivateDirectory(f.rawRoot, f.uid, true)
 	}
 	return nil
 }

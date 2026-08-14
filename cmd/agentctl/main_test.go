@@ -516,6 +516,20 @@ func TestManagedConfigurationRejectsAlternatePathForOwnedStore(t *testing.T) {
 	}
 }
 
+func TestManagedConfigurationRejectsUnsafeAuthorityAncestor(t *testing.T) {
+	root := resolvedTempDir(t)
+	configPath, _ := writeControllerStatusConfig(t, root)
+	if _, err := loadManagedConfiguration(configPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(root, "authority"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadManagedConfiguration(configPath); err == nil {
+		t.Fatal("managed configuration accepted a public authority ancestor")
+	}
+}
+
 func TestManagedStoreReopenRejectsDatabaseReplacementAfterConfigurationLoad(t *testing.T) {
 	root := resolvedTempDir(t)
 	configPath, databasePath := writeControllerStatusConfig(t, root)

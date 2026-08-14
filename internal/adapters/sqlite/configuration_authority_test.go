@@ -277,7 +277,7 @@ func TestConfigurationAuthorityOpenRejectsConnectionInodeABASwap(t *testing.T) {
 	}
 }
 
-func TestPinnedStoreRejectsReplacementOnPoolReconnect(t *testing.T) {
+func TestPinnedStoreRejectsReplacementOnIdleConnectionReuse(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "controller.db")
 	store, err := Open(path)
@@ -285,7 +285,6 @@ func TestPinnedStoreRejectsReplacementOnPoolReconnect(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	store.db.SetMaxIdleConns(0)
 	if err := os.Rename(path, filepath.Join(root, "original.db")); err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +296,47 @@ func TestPinnedStoreRejectsReplacementOnPoolReconnect(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := store.SchemaVersion(context.Background()); err == nil || !strings.Contains(err.Error(), "identity changed") {
-		t.Fatalf("pool reconnect err=%v", err)
+		t.Fatalf("idle connection reuse err=%v", err)
+	}
+}
+
+func TestPinnedTransactionRejectsReplacementBeforeCommit(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "controller.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	tx, err := store.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(context.Background(), `CREATE TABLE replacement_guard_probe (value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	displaced := filepath.Join(root, "original.db")
+	if err := os.Rename(path, displaced); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replacement.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("transaction commit err=%v", err)
+	}
+	db, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: displaced}).String()+"?mode=ro&_pragma=query_only(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='replacement_guard_probe'`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("rolled-back table count=%d err=%v", count, err)
 	}
 }
 

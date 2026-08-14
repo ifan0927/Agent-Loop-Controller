@@ -61,6 +61,58 @@ func TestPrivateRawLocatorAndAtomicLiveReplacement(t *testing.T) {
 	}
 }
 
+func TestTrustedReadsRejectUnsafeAuthorityAncestors(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	configPath := filepath.Join(root, "controller.json")
+	payload := []byte("baseline")
+	if err := os.WriteFile(configPath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(root, "controller.db")
+	bindTestDatabase(t, files, databasePath)
+	candidate := application.ValidatedConfigurationCandidate{Digest: configurationDigest(payload), Size: int64(len(payload)), SchemaVersion: 5, DatabasePath: databasePath}
+	if err := files.RetainRaw(candidate.Digest, payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := files.PublishBaselineBinding(candidate); err != nil {
+		t.Fatal(err)
+	}
+	if err := files.PublishLocator(databasePath); err != nil {
+		t.Fatal(err)
+	}
+	assertRejected := func(label string) {
+		t.Helper()
+		if _, found, err := ReadLocator(configPath); err == nil || found {
+			t.Fatalf("%s locator found=%t err=%v", label, found, err)
+		}
+		if _, found, err := ReadBaselineBinding(configPath); err == nil || found {
+			t.Fatalf("%s baseline found=%t err=%v", label, found, err)
+		}
+		if _, err := files.ReadRaw(candidate.Digest, candidate.Size); err == nil || files.HasRaw(candidate.Digest, candidate.Size) {
+			t.Fatalf("%s raw authority was accepted", label)
+		}
+	}
+	if err := os.Chmod(files.root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	assertRejected("public-mode ancestor")
+	if err := os.Chmod(files.root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	displaced := filepath.Join(root, "displaced-authority")
+	if err := os.Rename(files.root, displaced); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(displaced, files.root); err != nil {
+		t.Fatal(err)
+	}
+	assertRejected("symlink ancestor")
+}
+
 func TestBaselineBindingIsPrivateExclusiveAndIdempotent(t *testing.T) {
 	root := canonicalTempDirectory(t)
 	configPath := filepath.Join(root, "controller.json")

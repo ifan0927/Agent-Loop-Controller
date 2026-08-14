@@ -61,7 +61,10 @@ func loadManagedConfiguration(path string) (bootstrap.Bootstrap, error) {
 		// Reconciliation may deliberately return conflict after durably marking
 		// ambiguous evidence. The retained desired generation still supplies the
 		// only safe composition input, while the gate remains closed.
-		_, _ = service.Initialize(context.Background())
+		initialized, initializeErr := service.Initialize(context.Background())
+		if initializeErr != nil && (initialized.Incomplete == nil || initialized.Incomplete.State != application.ConfigurationApplyAmbiguous) {
+			return bootstrap.Bootstrap{}, errors.New("configuration authority reconciliation failed")
+		}
 		authority, found, err = store.ConfigurationAuthority(context.Background())
 		if err != nil || !found {
 			return bootstrap.Bootstrap{}, errors.New("configuration authority is unavailable")

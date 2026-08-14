@@ -116,7 +116,7 @@ func openPinnedStore(ctx context.Context, path string, supportedVersion int, cre
 			return nil, errors.New("SQLite database path is unsafe")
 		}
 	}
-	connector := &pinnedSQLiteConnector{driver: &moderncsqlite.Driver{}, dsn: pinnedSQLiteDSN(path), expected: identity, beforeIdentityCheck: hooks.afterConnectionOpen}
+	connector := &pinnedSQLiteConnector{driver: &moderncsqlite.Driver{}, dsn: pinnedSQLiteDSN(path), path: path, expected: identity, beforeIdentityCheck: hooks.afterConnectionOpen}
 	db := sql.OpenDB(connector)
 	db.SetMaxOpenConns(1)
 	if hooks.beforeConnectionOpen != nil {
@@ -185,6 +185,7 @@ type moderncConnectionHeader struct {
 type pinnedSQLiteConnector struct {
 	driver              *moderncsqlite.Driver
 	dsn                 string
+	path                string
 	expected            application.DatabaseFileIdentity
 	beforeIdentityCheck func()
 	allowWrites         atomic.Bool
@@ -217,10 +218,192 @@ func (c *pinnedSQLiteConnector) Connect(ctx context.Context) (driver.Conn, error
 			return nil, err
 		}
 	}
-	return connection, nil
+	return &pinnedSQLiteConnection{Conn: connection, path: c.path, expected: c.expected}, nil
 }
 
 func (c *pinnedSQLiteConnector) Driver() driver.Driver { return c.driver }
+
+type pinnedSQLiteConnection struct {
+	driver.Conn
+	path     string
+	expected application.DatabaseFileIdentity
+}
+
+func (c *pinnedSQLiteConnection) validate() error {
+	identity, err := moderncDriverConnectionIdentity(c.Conn)
+	if err != nil || identity != c.expected || !databasePathStillIdentifies(c.path, c.expected) {
+		return errors.New("SQLite database identity changed while open")
+	}
+	return nil
+}
+
+func (c *pinnedSQLiteConnection) Prepare(query string) (driver.Stmt, error) {
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	statement, err := c.Conn.Prepare(query)
+	if err != nil {
+		return nil, err
+	}
+	return &pinnedSQLiteStatement{Stmt: statement, connection: c}, nil
+}
+
+func (c *pinnedSQLiteConnection) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	preparer, ok := c.Conn.(driver.ConnPrepareContext)
+	if !ok {
+		return c.Prepare(query)
+	}
+	statement, err := preparer.PrepareContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	return &pinnedSQLiteStatement{Stmt: statement, connection: c}, nil
+}
+
+func (c *pinnedSQLiteConnection) Begin() (driver.Tx, error) {
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	transaction, err := c.Conn.Begin()
+	if err != nil {
+		return nil, err
+	}
+	return &pinnedSQLiteTransaction{Tx: transaction, connection: c}, nil
+}
+
+func (c *pinnedSQLiteConnection) BeginTx(ctx context.Context, options driver.TxOptions) (driver.Tx, error) {
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	beginner, ok := c.Conn.(driver.ConnBeginTx)
+	if !ok {
+		if options.Isolation != driver.IsolationLevel(sql.LevelDefault) || options.ReadOnly {
+			return nil, errors.New("SQLite transaction options are unsupported")
+		}
+		return c.Begin()
+	}
+	transaction, err := beginner.BeginTx(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	return &pinnedSQLiteTransaction{Tx: transaction, connection: c}, nil
+}
+
+func (c *pinnedSQLiteConnection) ExecContext(ctx context.Context, query string, arguments []driver.NamedValue) (driver.Result, error) {
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	execer, ok := c.Conn.(driver.ExecerContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+	return execer.ExecContext(ctx, query, arguments)
+}
+
+func (c *pinnedSQLiteConnection) QueryContext(ctx context.Context, query string, arguments []driver.NamedValue) (driver.Rows, error) {
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	queryer, ok := c.Conn.(driver.QueryerContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+	return queryer.QueryContext(ctx, query, arguments)
+}
+
+func (c *pinnedSQLiteConnection) Ping(ctx context.Context) error {
+	if err := c.validate(); err != nil {
+		return err
+	}
+	if pinger, ok := c.Conn.(driver.Pinger); ok {
+		return pinger.Ping(ctx)
+	}
+	return nil
+}
+
+func (c *pinnedSQLiteConnection) ResetSession(ctx context.Context) error {
+	if err := c.validate(); err != nil {
+		return err
+	}
+	if resetter, ok := c.Conn.(driver.SessionResetter); ok {
+		return resetter.ResetSession(ctx)
+	}
+	return nil
+}
+
+func (c *pinnedSQLiteConnection) IsValid() bool {
+	if c.validate() != nil {
+		return false
+	}
+	if validator, ok := c.Conn.(driver.Validator); ok {
+		return validator.IsValid()
+	}
+	return true
+}
+
+func (c *pinnedSQLiteConnection) CheckNamedValue(value *driver.NamedValue) error {
+	if checker, ok := c.Conn.(driver.NamedValueChecker); ok {
+		return checker.CheckNamedValue(value)
+	}
+	return driver.ErrSkip
+}
+
+type pinnedSQLiteTransaction struct {
+	driver.Tx
+	connection *pinnedSQLiteConnection
+}
+
+func (t *pinnedSQLiteTransaction) Commit() error {
+	if err := t.connection.validate(); err != nil {
+		_ = t.Tx.Rollback()
+		return err
+	}
+	return t.Tx.Commit()
+}
+
+type pinnedSQLiteStatement struct {
+	driver.Stmt
+	connection *pinnedSQLiteConnection
+}
+
+func (s *pinnedSQLiteStatement) Exec(arguments []driver.Value) (driver.Result, error) {
+	if err := s.connection.validate(); err != nil {
+		return nil, err
+	}
+	return s.Stmt.Exec(arguments)
+}
+
+func (s *pinnedSQLiteStatement) Query(arguments []driver.Value) (driver.Rows, error) {
+	if err := s.connection.validate(); err != nil {
+		return nil, err
+	}
+	return s.Stmt.Query(arguments)
+}
+
+func (s *pinnedSQLiteStatement) ExecContext(ctx context.Context, arguments []driver.NamedValue) (driver.Result, error) {
+	if err := s.connection.validate(); err != nil {
+		return nil, err
+	}
+	execer, ok := s.Stmt.(driver.StmtExecContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+	return execer.ExecContext(ctx, arguments)
+}
+
+func (s *pinnedSQLiteStatement) QueryContext(ctx context.Context, arguments []driver.NamedValue) (driver.Rows, error) {
+	if err := s.connection.validate(); err != nil {
+		return nil, err
+	}
+	queryer, ok := s.Stmt.(driver.StmtQueryContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+	return queryer.QueryContext(ctx, arguments)
+}
 
 func sqliteConnectionFileIdentity(conn *sql.Conn) (application.DatabaseFileIdentity, error) {
 	var identity application.DatabaseFileIdentity
@@ -235,6 +418,9 @@ func sqliteConnectionFileIdentity(conn *sql.Conn) (application.DatabaseFileIdent
 func moderncDriverConnectionIdentity(driverConnection any) (application.DatabaseFileIdentity, error) {
 	var identity application.DatabaseFileIdentity
 	err := func() error {
+		if pinned, ok := driverConnection.(*pinnedSQLiteConnection); ok {
+			driverConnection = pinned.Conn
+		}
 		typeOf := reflect.TypeOf(driverConnection)
 		valueOf := reflect.ValueOf(driverConnection)
 		if typeOf == nil || typeOf.Kind() != reflect.Pointer || typeOf.Elem().PkgPath() != "modernc.org/sqlite" || typeOf.Elem().Name() != "conn" || valueOf.IsNil() {

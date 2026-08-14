@@ -525,10 +525,11 @@ private locator be published. Startup proves a locator or pre-locator binding
 target's persisted device/inode identity and prepared binding on one query-only
 SQLite connection before enabling writes or migrating that same connection.
 The adapter obtains SQLite's actual main-database VFS file descriptor and
-`fstat`s it; every pool reconnect repeats that exact identity check before
-writes are enabled. There is no path-based reopen between proof and effects,
-and every later production composition reopens only with the persisted
-identity constraint.
+`fstat`s it. Every physical connection, idle-pool reuse, transaction boundary,
+direct query or effect, and prepared-statement effect rechecks both that VFS
+descriptor and the persisted pathname identity. There is no path-based reopen
+between proof and effects, and every later production composition reopens only
+with the persisted identity constraint.
 That proof accepts only the configuration-authority
 schema floor through the binary's supported schema, allowing a trusted older
 store to receive normal forward migrations while rejecting pre-authority and
@@ -538,9 +539,11 @@ configuration bind the canonical live path to its owning database path and
 exact private file identity so a later invalid or
 database-path-drifted file cannot create, redirect, or migrate an attacker-
 selected store. Raw
-generation payloads remain mode-`0600` beneath a current-user mode-`0700`
-authority directory; SQLite contains metadata, receipts, and sanitized events
-only. Current plus nine recent settled payloads are retained, while current and
+generation payloads remain mode-`0600` beneath current-user mode-`0700`
+authority and generation directories. Every trusted locator, binding, or raw
+read revalidates those non-symlink private ancestors before accepting a leaf;
+SQLite contains metadata, receipts, and sanitized events only. Current plus
+nine recent settled payloads are retained, while current and
 unresolved evidence are never pruned. Deletion first acquires a durable digest
 claim in SQLite; apply acceptance checks that claim in its transaction, so a
 digest cannot become accepted while its raw leaf is being removed. Raw target
