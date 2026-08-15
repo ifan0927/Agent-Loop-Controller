@@ -546,6 +546,8 @@ selected store. Raw
 generation payloads remain mode-`0600` beneath current-user mode-`0700`
 authority and generation directories. Every trusted locator, binding, or raw
 read revalidates those non-symlink private ancestors before accepting a leaf;
+the bounded leaf read also revalidates the opened inode and current pathname's
+owner, private mode, and single-link identity after reading.
 SQLite contains metadata, receipts, and sanitized events only. Current plus
 nine recent settled payloads are retained, while current and
 unresolved evidence are never pruned. Deletion first acquires a durable digest

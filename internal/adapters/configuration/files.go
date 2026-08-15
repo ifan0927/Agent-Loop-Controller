@@ -646,11 +646,15 @@ func inspectPrivateDirectory(path string, uid int, requirePrivateMode bool) erro
 }
 
 func readPrivateRegular(path string, uid, limit int, privateMode bool) ([]byte, error) {
+	return readPrivateRegularWithHook(path, uid, limit, privateMode, nil)
+}
+
+func readPrivateRegularWithHook(path string, uid, limit int, privateMode bool, afterRead func()) ([]byte, error) {
 	before, err := os.Lstat(path)
 	if err != nil {
 		return nil, err
 	}
-	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() || before.Size() > int64(limit) || !ownedBy(before, uid) || linkCount(before) != 1 || privateMode && before.Mode().Perm() != 0o600 {
+	if !privateRegularInfoSafe(before, uid, privateMode) || before.Size() > int64(limit) {
 		return nil, errors.New("unsafe file")
 	}
 	file, err := os.Open(path)
@@ -659,19 +663,26 @@ func readPrivateRegular(path string, uid, limit int, privateMode bool) ([]byte, 
 	}
 	defer file.Close()
 	opened, err := file.Stat()
-	if err != nil || !os.SameFile(before, opened) {
+	if err != nil || !os.SameFile(before, opened) || !privateRegularInfoSafe(opened, uid, privateMode) {
 		return nil, errors.New("file changed")
 	}
 	payload, err := io.ReadAll(io.LimitReader(file, int64(limit)+1))
 	if err != nil || len(payload) > limit {
 		return nil, errors.New("file is unreadable")
 	}
+	if afterRead != nil {
+		afterRead()
+	}
 	after, statErr := file.Stat()
 	current, currentErr := os.Lstat(path)
-	if statErr != nil || currentErr != nil || !os.SameFile(opened, after) || !os.SameFile(opened, current) || opened.Size() != after.Size() || after.Size() != int64(len(payload)) || !opened.ModTime().Equal(after.ModTime()) || linkCount(after) != 1 {
+	if statErr != nil || currentErr != nil || !os.SameFile(opened, after) || !os.SameFile(opened, current) || !privateRegularInfoSafe(after, uid, privateMode) || !privateRegularInfoSafe(current, uid, privateMode) || opened.Size() != after.Size() || after.Size() != int64(len(payload)) || !opened.ModTime().Equal(after.ModTime()) {
 		return nil, errors.New("file changed")
 	}
 	return payload, nil
+}
+
+func privateRegularInfoSafe(info os.FileInfo, uid int, privateMode bool) bool {
+	return info != nil && info.Mode()&os.ModeSymlink == 0 && info.Mode().IsRegular() && ownedBy(info, uid) && linkCount(info) == 1 && (!privateMode || info.Mode().Perm() == 0o600)
 }
 
 func atomicPrivateWrite(path string, payload []byte, uid int, requireAbsent bool, syncer func(string) error) error {

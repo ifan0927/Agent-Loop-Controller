@@ -61,6 +61,21 @@ func TestPrivateRawLocatorAndAtomicLiveReplacement(t *testing.T) {
 	}
 }
 
+func TestPrivateReadRejectsModeChangeAfterPayloadRead(t *testing.T) {
+	path := filepath.Join(canonicalTempDirectory(t), "private.json")
+	if err := os.WriteFile(path, []byte("private evidence"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := readPrivateRegularWithHook(path, os.Getuid(), maximumConfigurationBytes, true, func() {
+		if chmodErr := os.Chmod(path, 0o666); chmodErr != nil {
+			t.Fatal(chmodErr)
+		}
+	})
+	if err == nil {
+		t.Fatal("private read accepted a mode change after reading")
+	}
+}
+
 func TestTrustedReadsRejectUnsafeAuthorityAncestors(t *testing.T) {
 	root := canonicalTempDirectory(t)
 	configPath := filepath.Join(root, "controller.json")

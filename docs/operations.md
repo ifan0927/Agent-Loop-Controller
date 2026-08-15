@@ -146,7 +146,9 @@ load configuration only at process startup. Raw generation files, baseline
 binding, and locator contents are private recovery evidence: do not read, copy,
 edit, prune, or use them as an operator API. Trusted reads reject either the
 authority or generation ancestor if it is a symlink, has changed ownership, or
-is not mode `0700`, even when the leaf itself still appears private.
+is not mode `0700`, even when the leaf itself still appears private. After each
+bounded private-leaf read, the opened inode and current pathname are rechecked
+for owner, mode `0600`, single-link state, and exact identity.
 
 Raw retention and pruning are serialized with configuration publication by a
 flock on the stable filesystem-root inode; there is no user-replaceable
