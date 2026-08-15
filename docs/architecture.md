@@ -527,7 +527,8 @@ SQLite connection before enabling writes or migrating that same connection.
 The adapter obtains SQLite's actual main-database VFS file descriptor and
 `fstat`s it. Every physical connection and idle-pool reuse, plus both sides of
 each transaction boundary, direct query or effect, and prepared-statement
-effect, rechecks that VFS descriptor and the persisted pathname identity. A
+effect, and each row-consumption step rechecks that VFS descriptor and the
+persisted pathname identity. A
 replacement during an otherwise successful effect is therefore returned as a
 failure before the application may perform its next side effect. There is no
 path-based reopen between proof and effects, and every later production
@@ -567,8 +568,11 @@ authority.
 The presentation-independent apply service authorizes from the committed
 desired generation's configured operator, strictly validates current-schema
 candidate bytes, compares expected generation and digest, protects every
-nonterminal run's frozen repository and configured-operator authority, retains
-the target, and commits one apply intent and operation receipt before a same-
+nonterminal run's frozen repository and configured-operator authority. The
+current request's controller scope is resolved again after reconciliation,
+because reconciliation may commit an already-accepted operator transition.
+Only then does the service retain the target and commit one apply intent and
+operation receipt before a same-
 directory atomic exchange. The file adapter rechecks the bound database path
 after intent persistence and immediately before and after that exchange; a
 database replacement fences or restores the live-file effect. The exchange

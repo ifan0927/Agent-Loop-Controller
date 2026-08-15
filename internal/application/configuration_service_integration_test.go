@@ -815,6 +815,36 @@ func TestConfigurationCandidateOperatorCannotAuthorizeOwnApply(t *testing.T) {
 	}
 }
 
+func TestConfigurationApplyReauthorizesAfterReconcileChangesOperator(t *testing.T) {
+	baseService, store, files, runtime, oldRequester := configurationServiceFixture(t)
+	ctx := context.Background()
+	authority, err := baseService.Initialize(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	faults := &configurationFaultStore{Store: store, failSettle: true}
+	service, err := application.NewConfigurationService(faults, files, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files.operator = domain.GitHubUserIdentity{Login: "future", DatabaseID: 9, NodeID: "USER_9", ActorType: "User"}
+	operatorTransition := []byte("operator transition awaiting settlement")
+	if _, err := service.Apply(ctx, application.ConfigurationApplyCommand{Requester: oldRequester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: operatorTransition}); err == nil {
+		t.Fatal("injected settlement failure unexpectedly succeeded")
+	}
+	secondTarget := []byte("old operator follow-up after reconcile")
+	if _, err := service.Apply(ctx, application.ConfigurationApplyCommand{Requester: oldRequester, ExpectedGenerationID: 2, ExpectedDigest: configurationTestDigest(operatorTransition), Payload: secondTarget}); err == nil {
+		t.Fatal("old operator remained authorized after reconcile committed the new operator")
+	}
+	current, found, err := store.ConfigurationAuthority(ctx)
+	if err != nil || !found || current.Desired.GenerationID != 2 || current.Desired.ConfiguredOperator.Login != "future" || current.Incomplete != nil {
+		t.Fatalf("authority=%+v found=%t err=%v", current, found, err)
+	}
+	if generations, err := store.ListConfigurationGenerations(ctx); err != nil || len(generations) != 2 {
+		t.Fatalf("generations=%+v err=%v", generations, err)
+	}
+}
+
 func TestConfigurationResponseLossReplaySurvivesOperatorChange(t *testing.T) {
 	service, _, files, _, currentRequester := configurationServiceFixture(t)
 	authority, err := service.Initialize(context.Background())

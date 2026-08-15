@@ -203,6 +203,13 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 	if err != nil {
 		return ConfigurationApplyResult{}, err
 	}
+	// Reconciliation can commit an already-accepted generation that changes the
+	// configured operator. Resolve controller scope again from that committed
+	// desired generation before this request may propose another mutation.
+	authority, configured, scopes, err = s.authorize(ctx, command.Requester)
+	if err != nil {
+		return ConfigurationApplyResult{}, err
+	}
 	if authority.Incomplete != nil {
 		return ConfigurationApplyResult{}, serviceError(ErrorConflict, "configuration apply is unresolved", nil)
 	}

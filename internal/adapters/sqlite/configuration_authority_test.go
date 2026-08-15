@@ -300,6 +300,37 @@ func TestPinnedStoreRejectsReplacementOnIdleConnectionReuse(t *testing.T) {
 	}
 }
 
+func TestPinnedRowsRejectReplacementBeforeConsumption(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "controller.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	rows, err := store.db.QueryContext(context.Background(), `SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	if err := os.Rename(path, filepath.Join(root, "original.db")); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replacement.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if rows.Next() {
+		t.Fatal("row consumption crossed database pathname replacement")
+	}
+	if err := rows.Err(); err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("row consumption err=%v", err)
+	}
+}
+
 func TestPinnedTransactionRejectsReplacementBeforeCommit(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "controller.db")

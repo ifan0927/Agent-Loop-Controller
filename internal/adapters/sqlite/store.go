@@ -345,7 +345,7 @@ func (c *pinnedSQLiteConnection) QueryContext(ctx context.Context, query string,
 		_ = rows.Close()
 		return nil, err
 	}
-	return rows, nil
+	return &pinnedSQLiteRows{Rows: rows, connection: c}, nil
 }
 
 func (c *pinnedSQLiteConnection) Ping(ctx context.Context) error {
@@ -439,7 +439,7 @@ func (s *pinnedSQLiteStatement) Query(arguments []driver.Value) (driver.Rows, er
 		_ = rows.Close()
 		return nil, err
 	}
-	return rows, nil
+	return &pinnedSQLiteRows{Rows: rows, connection: s.connection}, nil
 }
 
 func (s *pinnedSQLiteStatement) ExecContext(ctx context.Context, arguments []driver.NamedValue) (driver.Result, error) {
@@ -476,7 +476,32 @@ func (s *pinnedSQLiteStatement) QueryContext(ctx context.Context, arguments []dr
 		_ = rows.Close()
 		return nil, err
 	}
-	return rows, nil
+	return &pinnedSQLiteRows{Rows: rows, connection: s.connection}, nil
+}
+
+type pinnedSQLiteRows struct {
+	driver.Rows
+	connection *pinnedSQLiteConnection
+}
+
+func (r *pinnedSQLiteRows) Next(values []driver.Value) error {
+	if err := r.connection.validate(); err != nil {
+		return err
+	}
+	err := r.Rows.Next(values)
+	if identityErr := r.connection.validate(); identityErr != nil {
+		return identityErr
+	}
+	return err
+}
+
+func (r *pinnedSQLiteRows) Close() error {
+	closeErr := r.Rows.Close()
+	identityErr := r.connection.validate()
+	if closeErr != nil {
+		return closeErr
+	}
+	return identityErr
 }
 
 func sqliteConnectionFileIdentity(conn *sql.Conn) (application.DatabaseFileIdentity, error) {
