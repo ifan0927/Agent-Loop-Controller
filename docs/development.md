@@ -254,6 +254,10 @@ agentctl local start \
 
 All issue/registry/database/repository and complete requester flags are
 required. The caller selection must match the admitted fixture issue.
+`local start` establishes an explicit ready fixture configuration authority in
+that database and refuses to reuse an authority that was not created by this
+development fixture. Use a new disposable lab database; never point this
+development-only command at a production Controller store.
 
 The convenience script creates and retains a lab:
 
@@ -313,7 +317,7 @@ The acceptance matrix requires:
 | Boundary | Required evidence |
 | --- | --- |
 | Automatic admission | Bounded scan, priority selection, atomic run/slot/permit reservation, exact Todo-to-In-Progress mutation, and one nonterminal run per repository |
-| Configuration authority | Same-byte stable-root-flock-serialized filesystem binding/database-anchor/locator baseline crash matrix, trusted-ancestor and descendant-path replacement exclusion, actual-VFS-fd exact-inode proof including ABA replacement, idle reuse, transaction effects, and pool reconnect, no-replace single-link publication, pre-anchor temp/raw recovery, retryable raw/binding/locator/prune directory durability, bounded forward migration, v31 migration, atomic no-op authority/receipt CAS, concurrent replay, intent-before-exchange crash matrix, captured-parent/exchange/cleanup fsync proof, durable prune claims plus serialized same-digest restaging, legacy non-elevation, manual-supervisor heartbeat, drift/effective convergence, and fail-closed direct plus automatic admission fencing |
+| Configuration authority | Same-byte stable-root-flock-serialized filesystem binding/database-anchor/locator baseline crash matrix, trusted-ancestor and descendant-path replacement exclusion, actual-VFS-fd exact-inode proof including ABA replacement, idle reuse, pre/post transaction effects, and pool reconnect, no-replace single-link publication, pre-anchor temp/raw recovery, retryable raw/binding/locator/prune directory durability, bounded forward migration, v31 migration, atomic no-op authority/receipt CAS, concurrent replay, intent-before-exchange crash matrix, captured-parent/exchange/cleanup fsync proof, durable prune claims plus serialized same-digest restaging, legacy non-elevation, manual-supervisor heartbeat, drift/effective convergence, development-fixture authority, and fail-closed direct plus automatic admission fencing |
 | Bounded concurrency | Generic capacity above two, same-repository exclusion, drain-on-reduction, sibling failure isolation, and restart reconstruction |
 | Implementation | Owned worktree, resumable session, exact candidate, successful verifier batch |
 | Internal review | Fresh independent read-only review bound to candidate head; after repair, exact expected-finding dispositions cover both repair and full branch deltas |

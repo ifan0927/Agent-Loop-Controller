@@ -121,10 +121,10 @@ pre-locator intent or locator only after proving that exact private file
 identity and its schema/binding on one query-only SQLite connection. The
 adapter checks the actual SQLite VFS file descriptor, not another pathname
 lookup, and repeats the VFS descriptor plus pathname check on every physical
-connection, idle-pool reuse, transaction boundary, direct query or effect, and
-prepared-statement effect. Writes and forward migration are enabled only on
-that same connection without reopening the pathname. Every later production
-store composition re-proves the persisted
+connection and idle-pool reuse, and before plus after each transaction
+boundary, direct query or effect, and prepared-statement effect. Writes and
+forward migration are enabled only on that same connection without reopening
+the pathname. Every later production store composition re-proves the persisted
 database identity instead of using a path-only open. It never creates or
 migrates an unproven target or follows a newly edited live
 database path. The proof accepts database schemas from the configuration-

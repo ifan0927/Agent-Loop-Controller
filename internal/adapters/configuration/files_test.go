@@ -196,6 +196,7 @@ func TestAtomicReplacementRestoresConcurrentExternalDrift(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	bindTestDatabase(t, files, filepath.Join(root, "controller.db"))
 	files.beforeSwap = func() {
 		if err := os.WriteFile(configPath, drift, 0o600); err != nil {
 			t.Error(err)
@@ -211,6 +212,36 @@ func TestAtomicReplacementRestoresConcurrentExternalDrift(t *testing.T) {
 	}
 }
 
+func TestAtomicReplacementRejectsDatabasePathReplacementBeforeLiveEffect(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	configPath := filepath.Join(root, "controller.json")
+	parent, target := []byte("parent"), []byte("target")
+	if err := os.WriteFile(configPath, parent, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(root, "controller.db")
+	bindTestDatabase(t, files, databasePath)
+	files.beforeSwap = func() {
+		if err := os.Rename(databasePath, filepath.Join(root, "original.db")); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.WriteFile(databasePath, []byte("replacement database"), 0o600); err != nil {
+			t.Error(err)
+		}
+	}
+	if err := files.ReplaceLive("operation-cdef0123456789abcdef0123456789ab", parent, target); err == nil {
+		t.Fatal("database replacement did not fence live configuration effect")
+	}
+	if live, err := os.ReadFile(configPath); err != nil || !bytes.Equal(live, parent) {
+		t.Fatalf("live=%q err=%v", live, err)
+	}
+}
+
 func TestAtomicReplacementRetainsCapturedParentUntilDirectorySyncIsProven(t *testing.T) {
 	root := canonicalTempDirectory(t)
 	configPath := filepath.Join(root, "controller.json")
@@ -222,6 +253,7 @@ func TestAtomicReplacementRetainsCapturedParentUntilDirectorySyncIsProven(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
+	bindTestDatabase(t, files, filepath.Join(root, "controller.db"))
 	files.syncDir = func(string) error { return os.ErrInvalid }
 	operationID := "operation-00112233445566778899aabbccddeeff"
 	if err := files.ReplaceLive(operationID, parent, target); err == nil {
@@ -250,6 +282,7 @@ func TestReplacementProvesCapturedParentCleanupDirectorySync(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	bindTestDatabase(t, files, filepath.Join(root, "controller.db"))
 	syncCalls := 0
 	files.syncDir = func(string) error {
 		syncCalls++

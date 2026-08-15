@@ -525,11 +525,13 @@ private locator be published. Startup proves a locator or pre-locator binding
 target's persisted device/inode identity and prepared binding on one query-only
 SQLite connection before enabling writes or migrating that same connection.
 The adapter obtains SQLite's actual main-database VFS file descriptor and
-`fstat`s it. Every physical connection, idle-pool reuse, transaction boundary,
-direct query or effect, and prepared-statement effect rechecks both that VFS
-descriptor and the persisted pathname identity. There is no path-based reopen
-between proof and effects, and every later production composition reopens only
-with the persisted identity constraint.
+`fstat`s it. Every physical connection and idle-pool reuse, plus both sides of
+each transaction boundary, direct query or effect, and prepared-statement
+effect, rechecks that VFS descriptor and the persisted pathname identity. A
+replacement during an otherwise successful effect is therefore returned as a
+failure before the application may perform its next side effect. There is no
+path-based reopen between proof and effects, and every later production
+composition reopens only with the persisted identity constraint.
 That proof accepts only the configuration-authority
 schema floor through the binary's supported schema, allowing a trusted older
 store to receive normal forward migrations while rejecting pre-authority and
@@ -567,7 +569,10 @@ desired generation's configured operator, strictly validates current-schema
 candidate bytes, compares expected generation and digest, protects every
 nonterminal run's frozen repository and configured-operator authority, retains
 the target, and commits one apply intent and operation receipt before a same-
-directory atomic exchange. The exchange captures the exact displaced inode;
+directory atomic exchange. The file adapter rechecks the bound database path
+after intent persistence and immediately before and after that exchange; a
+database replacement fences or restores the live-file effect. The exchange
+captures the exact displaced inode;
 an unexpected concurrent edit is restored instead of overwritten. The
 captured parent remains as private operation evidence until directory sync and
 exact reread prove the target. Removing the staged leaf also requires a proven

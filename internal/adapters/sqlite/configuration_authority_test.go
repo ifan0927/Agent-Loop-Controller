@@ -340,6 +340,57 @@ func TestPinnedTransactionRejectsReplacementBeforeCommit(t *testing.T) {
 	}
 }
 
+func TestPinnedTransactionRejectsReplacementBeforeCommitReturns(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "controller.db")
+	displaced := filepath.Join(root, "original.db")
+	replacementPath := filepath.Join(root, "replacement.db")
+	armed := false
+	store, err := openPinnedStore(context.Background(), path, schemaVersion, true, application.DatabaseFileIdentity{}, nil, openPinnedStoreHooks{afterTransactionCommit: func() {
+		if !armed {
+			return
+		}
+		armed = false
+		if err := os.Rename(path, displaced); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(replacementPath, path); err != nil {
+			t.Fatal(err)
+		}
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	replacement, err := Open(replacementPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replacement.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := store.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(context.Background(), `CREATE TABLE post_commit_guard_probe (value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	armed = true
+	if err := tx.Commit(); err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("post-commit identity err=%v", err)
+	}
+	db, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: path}).String()+"?mode=ro&_pragma=query_only(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='post_commit_guard_probe'`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("replacement table count=%d err=%v", count, err)
+	}
+}
+
 func TestSchemaV31WithoutConfigurationAuthorityRejectsDirectAdmission(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {

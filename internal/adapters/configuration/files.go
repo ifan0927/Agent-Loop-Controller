@@ -267,6 +267,9 @@ func (f *Files) ReplaceLive(operationID string, expected, payload []byte) error 
 	if len(payload) > maximumConfigurationBytes || len(expected) > maximumConfigurationBytes {
 		return errors.New("configuration payload is too large")
 	}
+	if !pathHasDatabaseIdentity(f.databasePath, f.databaseIdentity, f.uid) {
+		return errors.New("configuration database authority is unsafe")
+	}
 	live, err := readPrivateRegular(f.configPath, f.uid, maximumConfigurationBytes, false)
 	if err != nil || !bytes.Equal(live, expected) {
 		return errors.New("live configuration replacement is unsafe")
@@ -281,11 +284,24 @@ func (f *Files) ReplaceLive(operationID string, expected, payload []byte) error 
 	if f.beforeSwap != nil {
 		f.beforeSwap()
 	}
+	if !pathHasDatabaseIdentity(f.databasePath, f.databaseIdentity, f.uid) {
+		_ = os.Remove(stage)
+		_ = f.syncParent()
+		return errors.New("configuration database authority changed before replacement")
+	}
 	// The exchange atomically captures the exact inode being replaced. A
 	// concurrent third-party edit becomes the private stage and is restored.
 	if err := atomicSwap(stage, f.configPath); err != nil {
 		_ = os.Remove(stage)
 		return errors.New("configuration atomic exchange failed")
+	}
+	if !pathHasDatabaseIdentity(f.databasePath, f.databaseIdentity, f.uid) {
+		if swapErr := atomicSwap(stage, f.configPath); swapErr != nil || f.syncParent() != nil {
+			return errors.New("configuration replacement conflict is ambiguous")
+		}
+		_ = os.Remove(stage)
+		_ = f.syncParent()
+		return errors.New("configuration database authority changed during replacement")
 	}
 	replaced, readErr := readPrivateRegular(stage, f.uid, maximumConfigurationBytes, true)
 	if readErr != nil || !bytes.Equal(replaced, expected) {
@@ -314,6 +330,9 @@ func (f *Files) ReplaceLive(operationID string, expected, payload []byte) error 
 }
 
 func (f *Files) ReconcileReplacement(operationID string, expectedParent, target []byte) ([]byte, application.ValidatedConfigurationCandidate, error) {
+	if !pathHasDatabaseIdentity(f.databasePath, f.databaseIdentity, f.uid) {
+		return nil, application.ValidatedConfigurationCandidate{}, errors.New("configuration database authority is unsafe")
+	}
 	stage, err := f.replacementStagePath(operationID)
 	if err != nil {
 		return nil, application.ValidatedConfigurationCandidate{}, err

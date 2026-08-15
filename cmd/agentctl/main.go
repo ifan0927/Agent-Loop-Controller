@@ -26,6 +26,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/localregistry"
 	processadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/process"
 	sqlitestore "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite"
+	sqlitefixture "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite/sqlitetest"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/verifier"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
@@ -1239,13 +1240,17 @@ func localStart(args []string) error {
 	if err := store.AuthorizeHeavyPermitAdoption(permitOwner); err != nil {
 		return errors.New("local supervisor fencing is unavailable")
 	}
+	configurationAuthority, err := sqlitefixture.EstablishReadyFixtureConfigurationAuthority(context.Background(), store, normalizedDBPath)
+	if err != nil {
+		return errors.New("local fixture configuration authority is unavailable")
+	}
 	controller := newLocalController(store, *codexBinary, repo.WorktreeRoot)
 	ctx, cancel := localContext(*timeout)
 	defer cancel()
 	ctx = application.WithManualHeavyPermitOwner(ctx, permitOwner)
 	input := application.LocalStartInput{Task: snapshot.Task, RawIssueJSON: snapshot.RawJSON, RawIssueHash: snapshot.RawHash,
 		NormalizedJSON: snapshot.NormalizedJSON, TaskHash: snapshot.TaskHash, IdempotencyKey: snapshot.IdempotencyKey,
-		Repository: localRepository(repo), RunRoot: repo.RunRoot, WorktreeRoot: repo.WorktreeRoot}
+		Repository: localRepository(repo), RunRoot: repo.RunRoot, WorktreeRoot: repo.WorktreeRoot, ConfigurationAuthority: configurationAuthority}
 	result, err := application.NewCommandService(controller, store).Start(ctx, application.StartCommand{Requester: requesterIdentity.value(), RepositorySelection: snapshot.Task.Repository, IdempotencyKey: snapshot.IdempotencyKey, Input: input})
 	if err != nil {
 		return err

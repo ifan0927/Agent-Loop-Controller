@@ -79,9 +79,10 @@ func openConfigurationAuthority(ctx context.Context, path, configPath string, ex
 }
 
 type openPinnedStoreHooks struct {
-	beforeConnectionOpen func()
-	afterConnectionOpen  func()
-	beforeEffects        func()
+	beforeConnectionOpen   func()
+	afterConnectionOpen    func()
+	beforeEffects          func()
+	afterTransactionCommit func()
 }
 
 func openPinnedStore(ctx context.Context, path string, supportedVersion int, create bool, expected application.DatabaseFileIdentity, verify func(*sql.Conn) error, hooks openPinnedStoreHooks) (*Store, error) {
@@ -116,7 +117,7 @@ func openPinnedStore(ctx context.Context, path string, supportedVersion int, cre
 			return nil, errors.New("SQLite database path is unsafe")
 		}
 	}
-	connector := &pinnedSQLiteConnector{driver: &moderncsqlite.Driver{}, dsn: pinnedSQLiteDSN(path), path: path, expected: identity, beforeIdentityCheck: hooks.afterConnectionOpen}
+	connector := &pinnedSQLiteConnector{driver: &moderncsqlite.Driver{}, dsn: pinnedSQLiteDSN(path), path: path, expected: identity, beforeIdentityCheck: hooks.afterConnectionOpen, afterTransactionCommit: hooks.afterTransactionCommit}
 	db := sql.OpenDB(connector)
 	db.SetMaxOpenConns(1)
 	if hooks.beforeConnectionOpen != nil {
@@ -183,12 +184,13 @@ type moderncConnectionHeader struct {
 }
 
 type pinnedSQLiteConnector struct {
-	driver              *moderncsqlite.Driver
-	dsn                 string
-	path                string
-	expected            application.DatabaseFileIdentity
-	beforeIdentityCheck func()
-	allowWrites         atomic.Bool
+	driver                 *moderncsqlite.Driver
+	dsn                    string
+	path                   string
+	expected               application.DatabaseFileIdentity
+	beforeIdentityCheck    func()
+	afterTransactionCommit func()
+	allowWrites            atomic.Bool
 }
 
 func (c *pinnedSQLiteConnector) Connect(ctx context.Context) (driver.Conn, error) {
@@ -218,15 +220,16 @@ func (c *pinnedSQLiteConnector) Connect(ctx context.Context) (driver.Conn, error
 			return nil, err
 		}
 	}
-	return &pinnedSQLiteConnection{Conn: connection, path: c.path, expected: c.expected}, nil
+	return &pinnedSQLiteConnection{Conn: connection, path: c.path, expected: c.expected, afterTransactionCommit: c.afterTransactionCommit}, nil
 }
 
 func (c *pinnedSQLiteConnector) Driver() driver.Driver { return c.driver }
 
 type pinnedSQLiteConnection struct {
 	driver.Conn
-	path     string
-	expected application.DatabaseFileIdentity
+	path                   string
+	expected               application.DatabaseFileIdentity
+	afterTransactionCommit func()
 }
 
 func (c *pinnedSQLiteConnection) validate() error {
@@ -245,6 +248,10 @@ func (c *pinnedSQLiteConnection) Prepare(query string) (driver.Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := c.validate(); err != nil {
+		_ = statement.Close()
+		return nil, err
+	}
 	return &pinnedSQLiteStatement{Stmt: statement, connection: c}, nil
 }
 
@@ -260,6 +267,10 @@ func (c *pinnedSQLiteConnection) PrepareContext(ctx context.Context, query strin
 	if err != nil {
 		return nil, err
 	}
+	if err := c.validate(); err != nil {
+		_ = statement.Close()
+		return nil, err
+	}
 	return &pinnedSQLiteStatement{Stmt: statement, connection: c}, nil
 }
 
@@ -269,6 +280,10 @@ func (c *pinnedSQLiteConnection) Begin() (driver.Tx, error) {
 	}
 	transaction, err := c.Conn.Begin()
 	if err != nil {
+		return nil, err
+	}
+	if err := c.validate(); err != nil {
+		_ = transaction.Rollback()
 		return nil, err
 	}
 	return &pinnedSQLiteTransaction{Tx: transaction, connection: c}, nil
@@ -289,6 +304,10 @@ func (c *pinnedSQLiteConnection) BeginTx(ctx context.Context, options driver.TxO
 	if err != nil {
 		return nil, err
 	}
+	if err := c.validate(); err != nil {
+		_ = transaction.Rollback()
+		return nil, err
+	}
 	return &pinnedSQLiteTransaction{Tx: transaction, connection: c}, nil
 }
 
@@ -300,7 +319,14 @@ func (c *pinnedSQLiteConnection) ExecContext(ctx context.Context, query string, 
 	if !ok {
 		return nil, driver.ErrSkip
 	}
-	return execer.ExecContext(ctx, query, arguments)
+	result, err := execer.ExecContext(ctx, query, arguments)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (c *pinnedSQLiteConnection) QueryContext(ctx context.Context, query string, arguments []driver.NamedValue) (driver.Rows, error) {
@@ -311,7 +337,15 @@ func (c *pinnedSQLiteConnection) QueryContext(ctx context.Context, query string,
 	if !ok {
 		return nil, driver.ErrSkip
 	}
-	return queryer.QueryContext(ctx, query, arguments)
+	rows, err := queryer.QueryContext(ctx, query, arguments)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.validate(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	return rows, nil
 }
 
 func (c *pinnedSQLiteConnection) Ping(ctx context.Context) error {
@@ -319,9 +353,11 @@ func (c *pinnedSQLiteConnection) Ping(ctx context.Context) error {
 		return err
 	}
 	if pinger, ok := c.Conn.(driver.Pinger); ok {
-		return pinger.Ping(ctx)
+		if err := pinger.Ping(ctx); err != nil {
+			return err
+		}
 	}
-	return nil
+	return c.validate()
 }
 
 func (c *pinnedSQLiteConnection) ResetSession(ctx context.Context) error {
@@ -329,9 +365,11 @@ func (c *pinnedSQLiteConnection) ResetSession(ctx context.Context) error {
 		return err
 	}
 	if resetter, ok := c.Conn.(driver.SessionResetter); ok {
-		return resetter.ResetSession(ctx)
+		if err := resetter.ResetSession(ctx); err != nil {
+			return err
+		}
 	}
-	return nil
+	return c.validate()
 }
 
 func (c *pinnedSQLiteConnection) IsValid() bool {
@@ -361,7 +399,13 @@ func (t *pinnedSQLiteTransaction) Commit() error {
 		_ = t.Tx.Rollback()
 		return err
 	}
-	return t.Tx.Commit()
+	if err := t.Tx.Commit(); err != nil {
+		return err
+	}
+	if t.connection.afterTransactionCommit != nil {
+		t.connection.afterTransactionCommit()
+	}
+	return t.connection.validate()
 }
 
 type pinnedSQLiteStatement struct {
@@ -373,14 +417,29 @@ func (s *pinnedSQLiteStatement) Exec(arguments []driver.Value) (driver.Result, e
 	if err := s.connection.validate(); err != nil {
 		return nil, err
 	}
-	return s.Stmt.Exec(arguments)
+	result, err := s.Stmt.Exec(arguments)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.connection.validate(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (s *pinnedSQLiteStatement) Query(arguments []driver.Value) (driver.Rows, error) {
 	if err := s.connection.validate(); err != nil {
 		return nil, err
 	}
-	return s.Stmt.Query(arguments)
+	rows, err := s.Stmt.Query(arguments)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.connection.validate(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	return rows, nil
 }
 
 func (s *pinnedSQLiteStatement) ExecContext(ctx context.Context, arguments []driver.NamedValue) (driver.Result, error) {
@@ -391,7 +450,14 @@ func (s *pinnedSQLiteStatement) ExecContext(ctx context.Context, arguments []dri
 	if !ok {
 		return nil, driver.ErrSkip
 	}
-	return execer.ExecContext(ctx, arguments)
+	result, err := execer.ExecContext(ctx, arguments)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.connection.validate(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (s *pinnedSQLiteStatement) QueryContext(ctx context.Context, arguments []driver.NamedValue) (driver.Rows, error) {
@@ -402,7 +468,15 @@ func (s *pinnedSQLiteStatement) QueryContext(ctx context.Context, arguments []dr
 	if !ok {
 		return nil, driver.ErrSkip
 	}
-	return queryer.QueryContext(ctx, arguments)
+	rows, err := queryer.QueryContext(ctx, arguments)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.connection.validate(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	return rows, nil
 }
 
 func sqliteConnectionFileIdentity(conn *sql.Conn) (application.DatabaseFileIdentity, error) {

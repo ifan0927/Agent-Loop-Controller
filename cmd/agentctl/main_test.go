@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -176,6 +177,45 @@ func TestLocalCommandsAcceptDocumentedLeadingRunID(t *testing.T) {
 	runID, args := splitLeadingRunID([]string{"run-123", "--db", "/tmp/controller.db"})
 	if runID != "run-123" || len(args) != 2 || args[0] != "--db" {
 		t.Fatalf("runID=%q args=%v", runID, args)
+	}
+}
+
+func TestLocalStartInjectsDevelopmentFixtureConfigurationAuthority(t *testing.T) {
+	falseBinary, err := exec.LookPath("false")
+	if err != nil {
+		t.Skip("false executable is unavailable")
+	}
+	lab := resolvedTempDir(t)
+	command := exec.Command(filepath.Join("..", "..", "scripts", "create-local-lab.sh"), lab)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("create local lab: %v: %s", err, output)
+	}
+	err = localStart([]string{
+		"--issue", filepath.Join(lab, "simulated-issue.json"),
+		"--registry", filepath.Join(lab, "repository-registry.json"),
+		"--db", filepath.Join(lab, "controller.db"),
+		"--repository", "fixture-owner/test-project",
+		"--requester", "fixture-operator",
+		"--requester-database-id", "1",
+		"--requester-node-id", "MDQ6VXNlcjE=",
+		"--requester-type", "User",
+		"--codex-binary", falseBinary,
+	})
+	if err == nil {
+		t.Fatal("false Codex fixture unexpectedly completed")
+	}
+	store, openErr := sqlitestore.Open(filepath.Join(lab, "controller.db"))
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	defer store.Close()
+	authority, found, authorityErr := store.ConfigurationAuthority(context.Background())
+	if authorityErr != nil || !found || authority.CanonicalConfigPath != filepath.Join(lab, "controller.db.test-controller.json") {
+		t.Fatalf("authority=%+v found=%t err=%v", authority, found, authorityErr)
+	}
+	runs, listErr := store.ListNonterminalRuns(context.Background())
+	if listErr != nil || len(runs) != 1 {
+		t.Fatalf("runs=%+v err=%v local start err=%v", runs, listErr, err)
 	}
 }
 
