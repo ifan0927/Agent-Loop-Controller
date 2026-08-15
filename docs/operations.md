@@ -148,7 +148,8 @@ edit, prune, or use them as an operator API. Trusted reads reject either the
 authority or generation ancestor if it is a symlink, has changed ownership, or
 is not mode `0700`, even when the leaf itself still appears private. After each
 bounded private-leaf read, the opened inode and current pathname are rechecked
-for owner, mode `0600`, single-link state, and exact identity.
+for owner, mode `0600`, single-link state, and exact identity after the final
+authority-directory sync. The leaf descriptor stays open across that sync.
 
 Raw retention and pruning are serialized with configuration publication by a
 flock on the stable filesystem-root inode; there is no user-replaceable
@@ -156,8 +157,10 @@ lock-file, configuration-parent, or authority-subtree lock pathname. Existing
 identical publications and already-absent prune retries must re-sync their
 parent directory before they can report durable success. That sync pins the
 opened authority directory and revalidates its current pathname, owner, mode
-`0700`, and inode after the exact leaf use before returning. Raw reads preserve
-the same proof for both the outer authority and nested generation directory.
+`0700`, and inode before the still-open leaf or expected absence receives its
+final pathname proof. First creation and every retry also fsync each authority
+directory's parent entry while pinning both directory identities. Raw reads
+preserve the same proof for both the outer authority and nested generation directory.
 Exclusive raw,
 binding, and locator publication uses the platform's atomic no-replace rename,
 so a crash cannot leave the final leaf hard-linked to a temporary alias.
@@ -166,6 +169,10 @@ that never acquired a retained SQLite generation anchor. A competing apply
 returns a safe conflict, while deferred pruning is retried by normal startup or
 later apply reconciliation. Operators must not recreate or remove private
 configuration evidence while a mutation may be active.
+
+When an apply returns to a digest already reported by the current fresh worker,
+the new generation can be recorded effective in that same response. No worker
+restart is required merely because the digest appeared in an older generation.
 
 The database does not provide a legacy admission fallback once it has schema
 31 or newer. If configuration authority is absent, both manual run creation and

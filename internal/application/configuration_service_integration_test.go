@@ -432,6 +432,44 @@ func TestConfigurationServiceBaselineApplyReplayConvergenceAndDrift(t *testing.T
 	}
 }
 
+func TestConfigurationApplyImmediatelyObservesAlreadyLoadedHistoricalDigest(t *testing.T) {
+	service, _, _, runtime, requester := configurationServiceFixture(t)
+	ctx := context.Background()
+	authority, err := service.Initialize(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := []byte("baseline configuration")
+	now := time.Now().UTC()
+	runtime.observation = freshConfigurationRuntime(authority.Desired.Digest, now)
+	if projection, err := service.Projection(ctx, requester, now); err != nil || projection.State != application.ConfigurationReady {
+		t.Fatalf("baseline projection=%+v err=%v", projection, err)
+	}
+
+	intermediate, err := service.Apply(ctx, application.ConfigurationApplyCommand{
+		Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID,
+		ExpectedDigest: authority.Desired.Digest, Payload: []byte("intermediate configuration"),
+	})
+	if err != nil || intermediate.Generation.State != application.ConfigurationGenerationPendingRestart {
+		t.Fatalf("intermediate=%+v err=%v", intermediate, err)
+	}
+
+	returned, err := service.Apply(ctx, application.ConfigurationApplyCommand{
+		Requester: requester, ExpectedGenerationID: intermediate.Generation.GenerationID,
+		ExpectedDigest: intermediate.Generation.Digest, Payload: baseline,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if returned.Generation.GenerationID == authority.Desired.GenerationID || returned.Generation.State != application.ConfigurationGenerationEffective {
+		t.Fatalf("returned generation=%+v", returned.Generation)
+	}
+	projection, err := service.Projection(ctx, requester, now)
+	if err != nil || projection.State != application.ConfigurationReady || projection.EffectiveGenerationID != returned.Generation.GenerationID {
+		t.Fatalf("returned projection=%+v err=%v", projection, err)
+	}
+}
+
 func TestConfigurationHistoricalNoOpReplaysAfterAuthorityAdvances(t *testing.T) {
 	service, _, _, _, requester := configurationServiceFixture(t)
 	ctx := context.Background()

@@ -548,7 +548,9 @@ generation payloads remain mode-`0600` beneath current-user mode-`0700`
 authority and generation directories. Every trusted locator, binding, or raw
 read revalidates those non-symlink private ancestors before accepting a leaf;
 the bounded leaf read also revalidates the opened inode and current pathname's
-owner, private mode, and single-link identity after reading.
+owner, private mode, and single-link identity after reading. First creation and
+every retry fsync the parent entry for each private authority directory while
+pinning and revalidating both the child and parent directory identities.
 SQLite contains metadata, receipts, and sanitized events only. Current plus
 nine recent settled payloads are retained, while current and
 unresolved evidence are never pruned. Deletion first acquires a durable digest
@@ -565,8 +567,10 @@ generation anchor. Existing identical raw, baseline, and locator publications
 re-sync their parent directory before success; an already-absent prune retry
 does the same before settling metadata. Authority-directory sync pins an opened
 directory descriptor and revalidates its current pathname, owner, mode `0700`,
-and inode after the exact leaf use and sync. Nested raw reads pin and revalidate
-both the authority and generation directories. Exclusive publications use an OS
+and inode while the exact leaf descriptor remains open; the leaf descriptor and
+pathname are revalidated only after that sync. Removal similarly proves the leaf
+is still absent after sync. Nested raw reads pin and revalidate both the
+authority and generation directories. Exclusive publications use an OS
 no-replace rename, so the fully synced temporary inode becomes the single-link
 final inode without a temp/final hard-link crash window. Restart cleanup
 removes interrupted pre-publication temporary leaves while holding mutation
@@ -596,6 +600,9 @@ reconciliation repeats that sync. Startup and pre-apply reconciliation settle an
 interrupted intent from exact parent/target evidence or an ambiguous third or
 unsafe observation; drift is never adopted or overwritten. A matching fresh
 heartbeat durably selects only the current desired generation as effective.
+If a new generation returns to a digest already loaded by the fresh worker,
+the apply response performs that correlation immediately instead of requiring
+another projection poll or restart.
 The resulting finite projection is
 `ready`, `restart_required`, `starting`, `stale`, `offline`, `unknown`, or
 `conflict`, separate from worker activity and capacity.

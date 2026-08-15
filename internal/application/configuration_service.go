@@ -212,6 +212,7 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 		}
 		return ConfigurationApplyResult{}, err
 	}
+	authority = s.reconcileRuntimeBestEffort(ctx, authority)
 	if replay, ok := s.settledConfigurationReplay(ctx, command, replayCandidate); ok {
 		return replay, nil
 	}
@@ -306,6 +307,7 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 			return ConfigurationApplyResult{}, reconcileErr
 		}
 		if settled.Desired.OperationID == generation.OperationID && settled.Desired.GenerationID == generation.GenerationID {
+			settled = s.reconcileRuntimeBestEffort(ctx, settled)
 			replayed, _ := s.store.GetAuthorizedOperationReceipt(ctx, generation.OperationID, scopes)
 			return ConfigurationApplyResult{Generation: settled.Desired, Receipt: replayed}, nil
 		}
@@ -320,6 +322,7 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 			return ConfigurationApplyResult{}, reconcileErr
 		}
 		if settled.Desired.OperationID == generation.OperationID && settled.Desired.GenerationID == generation.GenerationID {
+			settled = s.reconcileRuntimeBestEffort(ctx, settled)
 			replayed, _ := s.store.GetAuthorizedOperationReceipt(ctx, generation.OperationID, scopes)
 			return ConfigurationApplyResult{Generation: settled.Desired, Receipt: replayed}, nil
 		}
@@ -330,8 +333,20 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 	if err != nil {
 		return ConfigurationApplyResult{}, serviceError(ErrorConflict, "configuration settlement requires reconciliation", nil)
 	}
+	settled = s.reconcileRuntimeBestEffort(ctx, settled)
 	s.pruneLocked(ctx)
 	return ConfigurationApplyResult{Generation: settled.Desired, Receipt: settledReceipt}, nil
+}
+
+func (s *ConfigurationService) reconcileRuntimeBestEffort(ctx context.Context, authority ConfigurationAuthority) ConfigurationAuthority {
+	if s.runtime == nil || authority.Incomplete != nil {
+		return authority
+	}
+	reconciled, _, err := s.ReconcileRuntime(ctx, s.now().UTC())
+	if err == nil && reconciled.Desired.GenerationID == authority.Desired.GenerationID {
+		return reconciled
+	}
+	return authority
 }
 
 func (s *ConfigurationService) removeUnreferencedRaw(ctx context.Context, digest string) {

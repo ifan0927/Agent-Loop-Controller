@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -66,10 +67,11 @@ func TestPrivateReadRejectsModeChangeAfterPayloadRead(t *testing.T) {
 	if err := os.WriteFile(path, []byte("private evidence"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := readPrivateRegularWithHook(path, os.Getuid(), maximumConfigurationBytes, true, func() {
+	_, err := readPrivateRegularWithHook(path, os.Getuid(), maximumConfigurationBytes, true, func() error {
 		if chmodErr := os.Chmod(path, 0o666); chmodErr != nil {
 			t.Fatal(chmodErr)
 		}
+		return nil
 	})
 	if err == nil {
 		t.Fatal("private read accepted a mode change after reading")
@@ -96,6 +98,33 @@ func TestAuthorityPublicationRejectsDirectoryModeChangeDuringSync(t *testing.T) 
 	}
 	if err := files.PublishLocator(databasePath); err == nil {
 		t.Fatal("authority publication accepted a directory mode change")
+	}
+}
+
+func TestAuthorityPublicationRejectsLeafReplacementDuringFinalSync(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	configPath := filepath.Join(root, "controller.json")
+	if err := os.WriteFile(configPath, []byte("baseline"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("trusted raw evidence")
+	digest := configurationDigest(payload)
+	replacement := filepath.Join(root, "replacement.json")
+	files.syncAuthority = func(path string) error {
+		if err := os.WriteFile(replacement, []byte("attacker replacement"), 0o600); err != nil {
+			return err
+		}
+		if err := os.Rename(replacement, files.rawPath(digest)); err != nil {
+			return err
+		}
+		return syncDirectory(path)
+	}
+	if err := files.RetainRaw(digest, payload); err == nil {
+		t.Fatal("authority publication accepted a leaf replacement during final sync")
 	}
 }
 
@@ -630,6 +659,64 @@ func TestRawRemovalRetrySyncsAlreadyAbsentDirectoryEntry(t *testing.T) {
 	}
 	if err := files.RemoveRaw(digest); err != nil {
 		t.Fatalf("absent raw retry did not sync directory: %v", err)
+	}
+}
+
+func TestRawRemovalRejectsLeafRecreationDuringFinalSync(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	configPath := filepath.Join(root, "controller.json")
+	if err := os.WriteFile(configPath, []byte("parent"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("retained")
+	digest := configurationDigest(payload)
+	if err := files.RetainRaw(digest, payload); err != nil {
+		t.Fatal(err)
+	}
+	files.syncAuthority = func(path string) error {
+		if err := os.WriteFile(files.rawPath(digest), []byte("recreated"), 0o600); err != nil {
+			return err
+		}
+		return syncDirectory(path)
+	}
+	if err := files.RemoveRaw(digest); err == nil {
+		t.Fatal("raw removal accepted a recreated leaf during final sync")
+	}
+}
+
+func TestAuthorityRootCreationRetryReprovesParentEntries(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	configPath := filepath.Join(root, "controller.json")
+	if err := os.WriteFile(configPath, []byte("parent"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed := false
+	var synced []string
+	files.syncRootEntry = func(path string) error {
+		synced = append(synced, path)
+		if !failed {
+			failed = true
+			return errors.New("injected parent directory sync failure")
+		}
+		return syncPrivateDirectoryEntry(path, files.uid)
+	}
+	if err := files.ensureRoots(); err == nil {
+		t.Fatal("authority root creation did not surface parent sync failure")
+	}
+	if err := files.ensureRoots(); err != nil {
+		t.Fatalf("authority root retry did not re-prove directory entries: %v", err)
+	}
+	want := []string{files.root, files.root, files.rawRoot}
+	if !slices.Equal(synced, want) {
+		t.Fatalf("synced entries=%v want=%v", synced, want)
 	}
 }
 

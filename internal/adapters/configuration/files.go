@@ -34,6 +34,7 @@ type Files struct {
 	beforeSwap       func()
 	syncDir          func(string) error
 	syncAuthority    func(string) error
+	syncRootEntry    func(string) error
 }
 
 type AuthorityLocator struct {
@@ -136,9 +137,9 @@ func (f *Files) RetainRaw(digest string, payload []byte) error {
 	}
 	syncAuthority := func(string) error { return f.syncAuthorityDirectories(directories) }
 	path := f.rawPath(digest)
-	if existing, err := readRetainedAfterPublication(path, f.uid); err == nil {
+	if existing, err := f.readAuthorityLeaf(path, maximumConfigurationBytes, directories); err == nil {
 		if bytes.Equal(existing, payload) {
-			return syncAuthority("")
+			return nil
 		}
 		return errors.New("configuration raw evidence conflicts")
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -146,20 +147,18 @@ func (f *Files) RetainRaw(digest string, payload []byte) error {
 	}
 	err = atomicPrivateWrite(path, payload, f.uid, true, syncAuthority)
 	if errors.Is(err, os.ErrExist) {
-		existing, readErr := readRetainedAfterPublication(path, f.uid)
+		existing, readErr := f.readAuthorityLeaf(path, maximumConfigurationBytes, directories)
 		if readErr == nil && bytes.Equal(existing, payload) {
-			return syncAuthority("")
+			return nil
 		}
 	}
 	return err
 }
 
-func readRetainedAfterPublication(path string, uid int) ([]byte, error) {
-	return readPrivateRegular(path, uid, maximumConfigurationBytes, true)
-}
-
-func readAfterExclusivePublication(path string, uid, limit int) ([]byte, error) {
-	return readPrivateRegular(path, uid, limit, true)
+func (f *Files) readAuthorityLeaf(path string, limit int, directories []privateDirectorySnapshot) ([]byte, error) {
+	return readPrivateRegularWithHook(path, f.uid, limit, true, func() error {
+		return f.syncAuthorityDirectories(directories)
+	})
 }
 
 func (f *Files) HasRaw(digest string, size int64) bool {
@@ -170,8 +169,8 @@ func (f *Files) HasRaw(digest string, size int64) bool {
 	if err != nil {
 		return false
 	}
-	payload, err := readPrivateRegular(f.rawPath(digest), f.uid, maximumConfigurationBytes, true)
-	return err == nil && int64(len(payload)) == size && configurationDigest(payload) == digest && f.syncAuthorityDirectories(directories) == nil
+	payload, err := f.readAuthorityLeaf(f.rawPath(digest), maximumConfigurationBytes, directories)
+	return err == nil && int64(len(payload)) == size && configurationDigest(payload) == digest
 }
 
 func (f *Files) PublishBaselineBinding(candidate application.ValidatedConfigurationCandidate) error {
@@ -196,24 +195,24 @@ func (f *Files) PublishBaselineBinding(candidate application.ValidatedConfigurat
 	}
 	payload = append(payload, '\n')
 	path := filepath.Join(f.root, "baseline.json")
-	if existing, err := readAfterExclusivePublication(path, f.uid, 4096); err == nil {
+	if existing, err := f.readAuthorityLeaf(path, 4096, directories); err == nil {
 		current, decodeErr := decodeBaselineBinding(existing)
 		if decodeErr != nil || current != value {
 			return errors.New("configuration baseline binding conflicts")
 		}
-		return syncAuthority("")
+		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return errors.New("configuration baseline binding is unsafe")
 	}
 	if err := atomicPrivateWrite(path, payload, f.uid, true, syncAuthority); !errors.Is(err, os.ErrExist) {
 		return err
 	}
-	existing, readErr := readAfterExclusivePublication(path, f.uid, 4096)
+	existing, readErr := f.readAuthorityLeaf(path, 4096, directories)
 	current, decodeErr := decodeBaselineBinding(existing)
 	if readErr != nil || decodeErr != nil || current != value {
 		return errors.New("configuration baseline binding conflicts")
 	}
-	return syncAuthority("")
+	return nil
 }
 
 func (f *Files) ReadRaw(digest string, size int64) ([]byte, error) {
@@ -224,12 +223,9 @@ func (f *Files) ReadRaw(digest string, size int64) ([]byte, error) {
 	if err != nil {
 		return nil, errors.New("configuration raw authority is unsafe")
 	}
-	payload, err := readPrivateRegular(f.rawPath(digest), f.uid, maximumConfigurationBytes, true)
+	payload, err := f.readAuthorityLeaf(f.rawPath(digest), maximumConfigurationBytes, directories)
 	if err != nil || int64(len(payload)) != size || configurationDigest(payload) != digest {
 		return nil, errors.New("configuration raw evidence is unavailable")
-	}
-	if err := f.syncAuthorityDirectories(directories); err != nil {
-		return nil, errors.New("configuration raw evidence durability is unavailable")
 	}
 	return payload, nil
 }
@@ -421,16 +417,20 @@ func (f *Files) RemoveRaw(digest string) error {
 		return errors.New("configuration raw authority is unsafe")
 	}
 	path := f.rawPath(digest)
-	if _, err := readPrivateRegular(path, f.uid, maximumConfigurationBytes, true); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return f.syncAuthorityDirectories(directories)
-		}
+	if _, err := readPrivateRegular(path, f.uid, maximumConfigurationBytes, true); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return errors.New("configuration raw evidence is unsafe")
+	} else if err == nil {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return errors.New("configuration raw evidence could not be pruned")
+		}
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return errors.New("configuration raw evidence could not be pruned")
+	if err := f.syncAuthorityDirectories(directories); err != nil {
+		return err
 	}
-	return f.syncAuthorityDirectories(directories)
+	if _, err := os.Lstat(path); err == nil || !errors.Is(err, os.ErrNotExist) {
+		return errors.New("configuration raw evidence removal is unproven")
+	}
+	return nil
 }
 
 func (f *Files) ListRawDigests() ([]string, error) {
@@ -452,14 +452,11 @@ func (f *Files) ListRawDigests() ([]string, error) {
 		if !found || !validDigest(digest) {
 			return nil, errors.New("configuration raw directory is unsafe")
 		}
-		payload, err := readPrivateRegular(filepath.Join(f.rawRoot, name), f.uid, maximumConfigurationBytes, true)
+		payload, err := f.readAuthorityLeaf(filepath.Join(f.rawRoot, name), maximumConfigurationBytes, directories)
 		if err != nil || configurationDigest(payload) != digest {
 			return nil, errors.New("configuration raw evidence is unsafe")
 		}
 		digests = append(digests, digest)
-	}
-	if err := f.syncAuthorityDirectories(directories); err != nil {
-		return nil, errors.New("configuration raw evidence durability is unavailable")
 	}
 	return digests, nil
 }
@@ -483,24 +480,24 @@ func (f *Files) PublishLocator(databasePath string) error {
 	}
 	payload = append(payload, '\n')
 	path := filepath.Join(f.root, "locator.json")
-	if existing, err := readAfterExclusivePublication(path, f.uid, 4096); err == nil {
+	if existing, err := f.readAuthorityLeaf(path, 4096, directories); err == nil {
 		current, decodeErr := decodeLocator(existing)
 		if decodeErr != nil || current != value {
 			return errors.New("configuration authority locator conflicts")
 		}
-		return syncAuthority("")
+		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return errors.New("configuration authority locator is unsafe")
 	}
 	if err := atomicPrivateWrite(path, payload, f.uid, true, syncAuthority); !errors.Is(err, os.ErrExist) {
 		return err
 	}
-	existing, readErr := readAfterExclusivePublication(path, f.uid, 4096)
+	existing, readErr := f.readAuthorityLeaf(path, 4096, directories)
 	current, decodeErr := decodeLocator(existing)
 	if readErr != nil || decodeErr != nil || current != value {
 		return errors.New("configuration authority locator conflicts")
 	}
-	return syncAuthority("")
+	return nil
 }
 
 // ReadLocator resolves only the fixed locator beside the requested canonical
@@ -520,7 +517,7 @@ func ReadLocator(configPath string) (AuthorityLocator, bool, error) {
 		return AuthorityLocator{}, false, errors.New("configuration authority directory is unsafe")
 	}
 	path := filepath.Join(files.root, "locator.json")
-	payload, err := readPrivateRegular(path, files.uid, 4096, true)
+	payload, err := files.readAuthorityLeaf(path, 4096, directories)
 	if errors.Is(err, os.ErrNotExist) {
 		return AuthorityLocator{}, false, nil
 	}
@@ -530,9 +527,6 @@ func ReadLocator(configPath string) (AuthorityLocator, bool, error) {
 	value, err := decodeLocator(payload)
 	if err != nil || value.ConfigPath != configPath {
 		return AuthorityLocator{}, false, errors.New("configuration authority locator conflicts")
-	}
-	if err := files.syncAuthorityDirectories(directories); err != nil {
-		return AuthorityLocator{}, false, errors.New("configuration authority locator durability is unavailable")
 	}
 	return value, true, nil
 }
@@ -551,7 +545,7 @@ func ReadBaselineBinding(configPath string) (BaselineBinding, bool, error) {
 	if err != nil {
 		return BaselineBinding{}, false, errors.New("configuration authority directory is unsafe")
 	}
-	payload, err := readPrivateRegular(filepath.Join(files.root, "baseline.json"), files.uid, 4096, true)
+	payload, err := files.readAuthorityLeaf(filepath.Join(files.root, "baseline.json"), 4096, directories)
 	if errors.Is(err, os.ErrNotExist) {
 		return BaselineBinding{}, false, nil
 	}
@@ -561,9 +555,6 @@ func ReadBaselineBinding(configPath string) (BaselineBinding, bool, error) {
 	value, err := decodeBaselineBinding(payload)
 	if err != nil || value.ConfigPath != configPath {
 		return BaselineBinding{}, false, errors.New("configuration baseline binding conflicts")
-	}
-	if err := files.syncAuthorityDirectories(directories); err != nil {
-		return BaselineBinding{}, false, errors.New("configuration baseline binding durability is unavailable")
 	}
 	return value, true, nil
 }
@@ -599,10 +590,23 @@ func (f *Files) ensureRoots() error {
 	if err := ensurePrivateDirectory(f.root, f.uid); err != nil {
 		return errors.New("configuration authority directory is unsafe")
 	}
+	if err := f.syncCreatedDirectoryEntry(f.root); err != nil {
+		return errors.New("configuration authority directory durability is unavailable")
+	}
 	if err := ensurePrivateDirectory(f.rawRoot, f.uid); err != nil {
 		return errors.New("configuration raw directory is unsafe")
 	}
+	if err := f.syncCreatedDirectoryEntry(f.rawRoot); err != nil {
+		return errors.New("configuration raw directory durability is unavailable")
+	}
 	return nil
+}
+
+func (f *Files) syncCreatedDirectoryEntry(path string) error {
+	if f.syncRootEntry != nil {
+		return f.syncRootEntry(path)
+	}
+	return syncPrivateDirectoryEntry(path, f.uid)
 }
 
 func (f *Files) inspectAuthorityRoots(includeRaw bool) error {
@@ -684,7 +688,7 @@ func readPrivateRegular(path string, uid, limit int, privateMode bool) ([]byte, 
 	return readPrivateRegularWithHook(path, uid, limit, privateMode, nil)
 }
 
-func readPrivateRegularWithHook(path string, uid, limit int, privateMode bool, afterRead func()) ([]byte, error) {
+func readPrivateRegularWithHook(path string, uid, limit int, privateMode bool, afterRead func() error) ([]byte, error) {
 	before, err := os.Lstat(path)
 	if err != nil {
 		return nil, err
@@ -706,7 +710,9 @@ func readPrivateRegularWithHook(path string, uid, limit int, privateMode bool, a
 		return nil, errors.New("file is unreadable")
 	}
 	if afterRead != nil {
-		afterRead()
+		if err := afterRead(); err != nil {
+			return nil, err
+		}
 	}
 	after, statErr := file.Stat()
 	current, currentErr := os.Lstat(path)
@@ -758,12 +764,9 @@ func atomicPrivateWrite(path string, payload []byte, uid int, requireAbsent bool
 	if syncer == nil {
 		syncer = syncDirectory
 	}
-	verified, err := readPrivateRegular(path, uid, len(payload), true)
+	verified, err := readPrivateRegularWithHook(path, uid, len(payload), true, func() error { return syncer(parent) })
 	if err != nil || !bytes.Equal(verified, payload) {
 		return errors.New("configuration replacement verification failed")
-	}
-	if err := syncer(parent); err != nil {
-		return errors.New("configuration directory synchronization failed")
 	}
 	return nil
 }
@@ -869,6 +872,53 @@ func (f *Files) syncAuthorityDirectories(snapshots []privateDirectorySnapshot) e
 
 func privateDirectoryInfoSafe(info os.FileInfo, uid int) bool {
 	return info != nil && info.Mode()&os.ModeSymlink == 0 && info.IsDir() && info.Mode().Perm() == 0o700 && ownedBy(info, uid)
+}
+
+func syncPrivateDirectoryEntry(path string, uid int) error {
+	parent := filepath.Dir(path)
+	childBefore, err := os.Lstat(path)
+	if err != nil || !privateDirectoryInfoSafe(childBefore, uid) {
+		return errors.New("configuration directory entry is unsafe")
+	}
+	child, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return errors.New("configuration directory entry is unsafe")
+	}
+	defer child.Close()
+	childOpened, err := child.Stat()
+	if err != nil || !os.SameFile(childBefore, childOpened) || !privateDirectoryInfoSafe(childOpened, uid) {
+		return errors.New("configuration directory entry changed")
+	}
+	parentBefore, err := os.Lstat(parent)
+	if err != nil || !ownedDirectoryInfoSafe(parentBefore, uid) {
+		return errors.New("configuration directory parent is unsafe")
+	}
+	parentDirectory, err := os.OpenFile(parent, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return errors.New("configuration directory parent is unsafe")
+	}
+	defer parentDirectory.Close()
+	parentOpened, err := parentDirectory.Stat()
+	if err != nil || !os.SameFile(parentBefore, parentOpened) || !ownedDirectoryInfoSafe(parentOpened, uid) {
+		return errors.New("configuration directory parent changed")
+	}
+	if err := parentDirectory.Sync(); err != nil {
+		return err
+	}
+	childAfter, childStatErr := child.Stat()
+	childCurrent, childPathErr := os.Lstat(path)
+	parentAfter, parentStatErr := parentDirectory.Stat()
+	parentCurrent, parentPathErr := os.Lstat(parent)
+	if childStatErr != nil || childPathErr != nil || parentStatErr != nil || parentPathErr != nil ||
+		!os.SameFile(childOpened, childAfter) || !os.SameFile(childOpened, childCurrent) || !privateDirectoryInfoSafe(childAfter, uid) || !privateDirectoryInfoSafe(childCurrent, uid) ||
+		!os.SameFile(parentOpened, parentAfter) || !os.SameFile(parentOpened, parentCurrent) || !ownedDirectoryInfoSafe(parentAfter, uid) || !ownedDirectoryInfoSafe(parentCurrent, uid) {
+		return errors.New("configuration directory entry changed")
+	}
+	return nil
+}
+
+func ownedDirectoryInfoSafe(info os.FileInfo, uid int) bool {
+	return info != nil && info.Mode()&os.ModeSymlink == 0 && info.IsDir() && ownedBy(info, uid)
 }
 
 func syncDirectory(path string) error {
