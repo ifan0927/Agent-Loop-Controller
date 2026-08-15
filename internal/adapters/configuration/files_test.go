@@ -706,7 +706,7 @@ func TestAuthorityRootCreationRetryReprovesParentEntries(t *testing.T) {
 			failed = true
 			return errors.New("injected parent directory sync failure")
 		}
-		return syncPrivateDirectoryEntry(path, files.uid)
+		return nil
 	}
 	if err := files.ensureRoots(); err == nil {
 		t.Fatal("authority root creation did not surface parent sync failure")
@@ -717,6 +717,31 @@ func TestAuthorityRootCreationRetryReprovesParentEntries(t *testing.T) {
 	want := []string{files.root, files.root, files.rawRoot}
 	if !slices.Equal(synced, want) {
 		t.Fatalf("synced entries=%v want=%v", synced, want)
+	}
+}
+
+func TestAuthorityRootCreationRejectsParentReplacementBeforeRawRootCreation(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	configPath := filepath.Join(root, "controller.json")
+	if err := os.WriteFile(configPath, []byte("parent"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacedRoot := files.root + "-replaced"
+	files.syncRootEntry = func(path string) error {
+		if path != files.root {
+			return nil
+		}
+		if err := os.Rename(files.root, replacedRoot); err != nil {
+			return err
+		}
+		return os.Mkdir(files.root, 0o700)
+	}
+	if err := files.ensureRoots(); err == nil {
+		t.Fatal("authority root creation accepted a replaced parent for the raw directory")
 	}
 }
 

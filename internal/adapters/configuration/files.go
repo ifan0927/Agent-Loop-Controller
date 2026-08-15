@@ -590,23 +590,30 @@ func (f *Files) ensureRoots() error {
 	if err := ensurePrivateDirectory(f.root, f.uid); err != nil {
 		return errors.New("configuration authority directory is unsafe")
 	}
-	if err := f.syncCreatedDirectoryEntry(f.root); err != nil {
+	rootIdentity, err := f.syncCreatedDirectoryEntry(f.root, nil)
+	if err != nil {
 		return errors.New("configuration authority directory durability is unavailable")
 	}
 	if err := ensurePrivateDirectory(f.rawRoot, f.uid); err != nil {
 		return errors.New("configuration raw directory is unsafe")
 	}
-	if err := f.syncCreatedDirectoryEntry(f.rawRoot); err != nil {
+	if _, err := f.syncCreatedDirectoryEntry(f.rawRoot, rootIdentity); err != nil {
 		return errors.New("configuration raw directory durability is unavailable")
 	}
 	return nil
 }
 
-func (f *Files) syncCreatedDirectoryEntry(path string) error {
-	if f.syncRootEntry != nil {
-		return f.syncRootEntry(path)
+func (f *Files) syncCreatedDirectoryEntry(path string, expectedParent os.FileInfo) (os.FileInfo, error) {
+	identity, err := syncPrivateDirectoryEntry(path, f.uid, expectedParent)
+	if err != nil {
+		return nil, err
 	}
-	return syncPrivateDirectoryEntry(path, f.uid)
+	if f.syncRootEntry != nil {
+		if err := f.syncRootEntry(path); err != nil {
+			return nil, err
+		}
+	}
+	return identity, nil
 }
 
 func (f *Files) inspectAuthorityRoots(includeRaw bool) error {
@@ -874,36 +881,36 @@ func privateDirectoryInfoSafe(info os.FileInfo, uid int) bool {
 	return info != nil && info.Mode()&os.ModeSymlink == 0 && info.IsDir() && info.Mode().Perm() == 0o700 && ownedBy(info, uid)
 }
 
-func syncPrivateDirectoryEntry(path string, uid int) error {
+func syncPrivateDirectoryEntry(path string, uid int, expectedParent os.FileInfo) (os.FileInfo, error) {
 	parent := filepath.Dir(path)
 	childBefore, err := os.Lstat(path)
 	if err != nil || !privateDirectoryInfoSafe(childBefore, uid) {
-		return errors.New("configuration directory entry is unsafe")
+		return nil, errors.New("configuration directory entry is unsafe")
 	}
 	child, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
 	if err != nil {
-		return errors.New("configuration directory entry is unsafe")
+		return nil, errors.New("configuration directory entry is unsafe")
 	}
 	defer child.Close()
 	childOpened, err := child.Stat()
 	if err != nil || !os.SameFile(childBefore, childOpened) || !privateDirectoryInfoSafe(childOpened, uid) {
-		return errors.New("configuration directory entry changed")
+		return nil, errors.New("configuration directory entry changed")
 	}
 	parentBefore, err := os.Lstat(parent)
-	if err != nil || !ownedDirectoryInfoSafe(parentBefore, uid) {
-		return errors.New("configuration directory parent is unsafe")
+	if err != nil || !ownedDirectoryInfoSafe(parentBefore, uid) || expectedParent != nil && !os.SameFile(expectedParent, parentBefore) {
+		return nil, errors.New("configuration directory parent is unsafe")
 	}
 	parentDirectory, err := os.OpenFile(parent, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
 	if err != nil {
-		return errors.New("configuration directory parent is unsafe")
+		return nil, errors.New("configuration directory parent is unsafe")
 	}
 	defer parentDirectory.Close()
 	parentOpened, err := parentDirectory.Stat()
 	if err != nil || !os.SameFile(parentBefore, parentOpened) || !ownedDirectoryInfoSafe(parentOpened, uid) {
-		return errors.New("configuration directory parent changed")
+		return nil, errors.New("configuration directory parent changed")
 	}
 	if err := parentDirectory.Sync(); err != nil {
-		return err
+		return nil, err
 	}
 	childAfter, childStatErr := child.Stat()
 	childCurrent, childPathErr := os.Lstat(path)
@@ -912,9 +919,9 @@ func syncPrivateDirectoryEntry(path string, uid int) error {
 	if childStatErr != nil || childPathErr != nil || parentStatErr != nil || parentPathErr != nil ||
 		!os.SameFile(childOpened, childAfter) || !os.SameFile(childOpened, childCurrent) || !privateDirectoryInfoSafe(childAfter, uid) || !privateDirectoryInfoSafe(childCurrent, uid) ||
 		!os.SameFile(parentOpened, parentAfter) || !os.SameFile(parentOpened, parentCurrent) || !ownedDirectoryInfoSafe(parentAfter, uid) || !ownedDirectoryInfoSafe(parentCurrent, uid) {
-		return errors.New("configuration directory entry changed")
+		return nil, errors.New("configuration directory entry changed")
 	}
-	return nil
+	return childOpened, nil
 }
 
 func ownedDirectoryInfoSafe(info os.FileInfo, uid int) bool {
