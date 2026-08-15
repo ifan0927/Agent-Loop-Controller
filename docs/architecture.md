@@ -528,7 +528,8 @@ The adapter obtains SQLite's actual main-database VFS file descriptor and
 `fstat`s it. Every physical connection and idle-pool reuse, plus both sides of
 each transaction boundary, direct query or effect, and prepared-statement
 effect, and each row-consumption step rechecks that VFS descriptor and the
-persisted pathname identity. A
+persisted pathname identity, current-user ownership, single-link state, and
+private mode. A
 replacement during an otherwise successful effect is therefore returned as a
 failure before the application may perform its next side effect. There is no
 path-based reopen between proof and effects, and every later production
@@ -571,6 +572,9 @@ candidate bytes, compares expected generation and digest, protects every
 nonterminal run's frozen repository and configured-operator authority. The
 current request's controller scope is resolved again after reconciliation,
 because reconciliation may commit an already-accepted operator transition.
+An accepted receipt is not a settled replay: an exact retry first reconciles
+the durable intent and then returns the observed result, including when that
+generation changed the configured operator.
 Only then does the service retain the target and commit one apply intent and
 operation receipt before a same-
 directory atomic exchange. The file adapter rechecks the bound database path

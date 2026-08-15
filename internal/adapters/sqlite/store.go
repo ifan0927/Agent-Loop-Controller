@@ -117,6 +117,9 @@ func openPinnedStore(ctx context.Context, path string, supportedVersion int, cre
 			return nil, errors.New("SQLite database path is unsafe")
 		}
 	}
+	if err := file.Chmod(0o600); err != nil {
+		return nil, err
+	}
 	connector := &pinnedSQLiteConnector{driver: &moderncsqlite.Driver{}, dsn: pinnedSQLiteDSN(path), path: path, expected: identity, beforeIdentityCheck: hooks.afterConnectionOpen, afterTransactionCommit: hooks.afterTransactionCommit}
 	db := sql.OpenDB(connector)
 	db.SetMaxOpenConns(1)
@@ -160,9 +163,6 @@ func openPinnedStore(ctx context.Context, path string, supportedVersion int, cre
 	connector.allowWrites.Store(true)
 	if !databasePathStillIdentifies(path, identity) {
 		return nil, errors.New("SQLite database identity changed while opening")
-	}
-	if err := file.Chmod(0o600); err != nil {
-		return nil, err
 	}
 	if err := conn.Close(); err != nil {
 		return nil, err
@@ -547,7 +547,7 @@ func moderncDriverConnectionIdentity(driverConnection any) (application.Database
 		}
 		fileDescriptor := libc.AtomicLoadNInt32(mainFile+unsafe.Offsetof(sqlite3.TunixFile{}.Fh), 0)
 		var stat syscall.Stat_t
-		if fileDescriptor < 0 || syscall.Fstat(int(fileDescriptor), &stat) != nil || int(stat.Uid) != os.Getuid() || stat.Nlink != 1 {
+		if fileDescriptor < 0 || syscall.Fstat(int(fileDescriptor), &stat) != nil || int(stat.Uid) != os.Getuid() || stat.Nlink != 1 || stat.Mode&0o777 != 0o600 {
 			return errors.New("SQLite driver connection identity is unavailable")
 		}
 		identity = application.DatabaseFileIdentity{Device: uint64(stat.Dev), Inode: uint64(stat.Ino)}
@@ -585,11 +585,11 @@ func safeDatabaseFileIdentity(file *os.File) (application.DatabaseFileIdentity, 
 
 func databasePathStillIdentifies(path string, expected application.DatabaseFileIdentity) bool {
 	info, err := os.Lstat(path)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
 		return false
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
+	if !ok || int(stat.Uid) != os.Getuid() || stat.Nlink != 1 {
 		return false
 	}
 	current := application.DatabaseFileIdentity{Device: uint64(stat.Dev), Inode: uint64(stat.Ino)}

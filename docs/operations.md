@@ -123,7 +123,8 @@ adapter checks the actual SQLite VFS file descriptor, not another pathname
 lookup, and repeats the VFS descriptor plus pathname check on every physical
 connection and idle-pool reuse, and before plus after each transaction
 boundary, direct query or effect, prepared-statement effect, and row-consumption
-step. Writes and
+step. The check also revalidates current-user ownership, single-link state, and
+mode `0600`. Writes and
 forward migration are enabled only on that same connection without reopening
 the pathname. Every later production store composition re-proves the persisted
 database identity instead of using a path-only open. It never creates or

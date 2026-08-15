@@ -535,6 +535,33 @@ func TestConfigurationServiceCleansFailedPreIntentStagingAndReconcilesSettlement
 	}
 }
 
+func TestConfigurationExactAcceptedReplayReconcilesLostSettlementResponse(t *testing.T) {
+	baseService, store, files, runtime, requester := configurationServiceFixture(t)
+	ctx := context.Background()
+	authority, err := baseService.Initialize(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	faults := &configurationFaultStore{Store: store, failSettle: true}
+	service, err := application.NewConfigurationService(faults, files, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := []byte("lost settlement response target")
+	command := application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: target}
+	if _, err := service.Apply(ctx, command); err == nil {
+		t.Fatal("injected settlement response loss unexpectedly succeeded")
+	}
+	replayed, err := service.Apply(ctx, command)
+	if err != nil || replayed.Generation.GenerationID != 2 || replayed.Generation.Digest != configurationTestDigest(target) || replayed.Receipt.Phase != application.OperationPhaseObserved {
+		t.Fatalf("replayed=%+v err=%v", replayed, err)
+	}
+	current, found, err := store.ConfigurationAuthority(ctx)
+	if err != nil || !found || current.Desired.GenerationID != 2 || current.Incomplete != nil {
+		t.Fatalf("authority=%+v found=%t err=%v", current, found, err)
+	}
+}
+
 func TestConfigurationServiceRawRetentionFailureNeverAcceptsIntent(t *testing.T) {
 	service, store, files, _, requester := configurationServiceFixture(t)
 	authority, err := service.Initialize(context.Background())

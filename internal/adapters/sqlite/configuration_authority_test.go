@@ -300,6 +300,21 @@ func TestPinnedStoreRejectsReplacementOnIdleConnectionReuse(t *testing.T) {
 	}
 }
 
+func TestPinnedStoreRejectsModeChangeOnIdleConnectionReuse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "controller.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := os.Chmod(path, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SchemaVersion(context.Background()); err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("mode-change reuse err=%v", err)
+	}
+}
+
 func TestPinnedRowsRejectReplacementBeforeConsumption(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "controller.db")

@@ -192,16 +192,28 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 	// when the effect was accepted. This read-only path preserves response-loss
 	// replay even when that effect changed the configured operator.
 	payloadDigest := sha256.Sum256(command.Payload)
-	if replay, ok := s.configurationReplay(ctx, command, ValidatedConfigurationCandidate{Digest: hex.EncodeToString(payloadDigest[:])}); ok {
+	replayCandidate := ValidatedConfigurationCandidate{Digest: hex.EncodeToString(payloadDigest[:])}
+	replay, replayFound := s.configurationReplay(ctx, command, replayCandidate)
+	if replayFound && replay.Receipt.Phase == OperationPhaseObserved {
 		return replay, nil
 	}
 	authority, configured, scopes, err := s.authorize(ctx, command.Requester)
 	if err != nil {
+		if replay, ok := s.settledConfigurationReplay(ctx, command, replayCandidate); ok {
+			return replay, nil
+		}
 		return ConfigurationApplyResult{}, err
 	}
 	authority, err = s.Reconcile(ctx)
 	if err != nil {
+		var conflict *ServiceError
+		if replayFound && replay.Receipt.Phase == OperationPhaseAccepted && errors.As(err, &conflict) && conflict.Category == ErrorConflict && conflict.Message == "configuration apply is still active" {
+			return replay, nil
+		}
 		return ConfigurationApplyResult{}, err
+	}
+	if replay, ok := s.settledConfigurationReplay(ctx, command, replayCandidate); ok {
+		return replay, nil
 	}
 	// Reconciliation can commit an already-accepted generation that changes the
 	// configured operator. Resolve controller scope again from that committed
