@@ -726,7 +726,8 @@ func atomicPrivateWrite(path string, payload []byte, uid int, requireAbsent bool
 	if err := syncer(parent); err != nil {
 		return errors.New("configuration directory synchronization failed")
 	}
-	if _, err := readPrivateRegular(path, uid, len(payload), true); err != nil {
+	verified, err := readPrivateRegular(path, uid, len(payload), true)
+	if err != nil || !bytes.Equal(verified, payload) {
 		return errors.New("configuration replacement verification failed")
 	}
 	return nil
@@ -766,10 +767,37 @@ func (f *Files) cleanupPublicationTemps() error {
 }
 
 func (f *Files) syncAuthorityDirectory(path string) error {
-	if f.syncAuthority != nil {
-		return f.syncAuthority(path)
+	before, err := os.Lstat(path)
+	if err != nil || !privateDirectoryInfoSafe(before, f.uid) {
+		return errors.New("configuration authority directory is unsafe")
 	}
-	return syncDirectory(path)
+	directory, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return errors.New("configuration authority directory is unsafe")
+	}
+	defer directory.Close()
+	opened, err := directory.Stat()
+	if err != nil || !os.SameFile(before, opened) || !privateDirectoryInfoSafe(opened, f.uid) {
+		return errors.New("configuration authority directory changed")
+	}
+	if f.syncAuthority != nil {
+		err = f.syncAuthority(path)
+	} else {
+		err = directory.Sync()
+	}
+	if err != nil {
+		return err
+	}
+	after, statErr := directory.Stat()
+	current, currentErr := os.Lstat(path)
+	if statErr != nil || currentErr != nil || !os.SameFile(opened, after) || !os.SameFile(opened, current) || !privateDirectoryInfoSafe(after, f.uid) || !privateDirectoryInfoSafe(current, f.uid) {
+		return errors.New("configuration authority directory changed")
+	}
+	return nil
+}
+
+func privateDirectoryInfoSafe(info os.FileInfo, uid int) bool {
+	return info != nil && info.Mode()&os.ModeSymlink == 0 && info.IsDir() && info.Mode().Perm() == 0o700 && ownedBy(info, uid)
 }
 
 func syncDirectory(path string) error {

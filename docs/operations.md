@@ -154,7 +154,9 @@ Raw retention and pruning are serialized with configuration publication by a
 flock on the stable filesystem-root inode; there is no user-replaceable
 lock-file, configuration-parent, or authority-subtree lock pathname. Existing
 identical publications and already-absent prune retries must re-sync their
-parent directory before they can report durable success. Exclusive raw,
+parent directory before they can report durable success. That sync pins the
+opened authority directory and revalidates its current pathname, owner, mode
+`0700`, and inode before returning. Exclusive raw,
 binding, and locator publication uses the platform's atomic no-replace rename,
 so a crash cannot leave the final leaf hard-linked to a temporary alias.
 Restart cleanup removes interrupted temporary leaves and raw digest leaves

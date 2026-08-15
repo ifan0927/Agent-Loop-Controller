@@ -160,7 +160,8 @@ Configuration same-digest no-ops are not a weaker receipt path. SQLite
 rechecks the exact desired generation, digest, and absence of an incomplete
 intent, then writes the final observed/succeeded receipt in that same
 transaction. A concurrent authority advance conflicts instead of recording a
-receipt against stale authority.
+receipt against stale authority. Once recorded, exact replay resolves the
+receipt's permanent resulting generation even after desired authority advances.
 
 Receipt phase and outcome are separate. The monotonic phases are `accepted`,
 `applied`, and `observed`; outcomes are `pending`, `succeeded`, `failed`,
@@ -562,7 +563,9 @@ leaf between deletion and metadata settlement. Startup finishes interrupted
 claims idempotently and removes raw digest leaves that have no retained SQLite
 generation anchor. Existing identical raw, baseline, and locator publications
 re-sync their parent directory before success; an already-absent prune retry
-does the same before settling metadata. Exclusive publications use an OS
+does the same before settling metadata. Authority-directory sync pins an opened
+directory descriptor and revalidates its current pathname, owner, mode `0700`,
+and inode after sync. Exclusive publications use an OS
 no-replace rename, so the fully synced temporary inode becomes the single-link
 final inode without a temp/final hard-link crash window. Restart cleanup
 removes interrupted pre-publication temporary leaves while holding mutation

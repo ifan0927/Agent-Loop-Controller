@@ -235,13 +235,8 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 		if listErr != nil {
 			return ConfigurationApplyResult{}, serviceError(ErrorInternal, "configuration replay evidence is unavailable", nil)
 		}
-		for _, generation := range generations {
-			if generation.OperationID == replay.OperationID {
-				return ConfigurationApplyResult{Generation: generation, Receipt: replay}, nil
-			}
-		}
-		if replay.Outcome == OperationOutcomeSucceeded && replay.ResultingVersion == authority.Desired.GenerationID {
-			return ConfigurationApplyResult{Generation: authority.Desired, Receipt: replay, NoOp: true}, nil
+		if result, ok := configurationReceiptReplay(replay, generations); ok {
+			return result, nil
 		}
 		return ConfigurationApplyResult{}, serviceError(ErrorConflict, "configuration replay evidence conflicts", nil)
 	}
@@ -402,14 +397,22 @@ func (s *ConfigurationService) configurationReplay(ctx context.Context, command 
 	if err != nil {
 		return ConfigurationApplyResult{}, false
 	}
+	return configurationReceiptReplay(receipt, generations)
+}
+
+func configurationReceiptReplay(receipt OperationReceipt, generations []ConfigurationGeneration) (ConfigurationApplyResult, bool) {
 	for _, generation := range generations {
 		if generation.OperationID == receipt.OperationID {
 			return ConfigurationApplyResult{Generation: generation, Receipt: receipt}, true
 		}
 	}
-	authority, found, err := s.store.ConfigurationAuthority(ctx)
-	if err == nil && found && receipt.Outcome == OperationOutcomeSucceeded && receipt.ResultingVersion == authority.Desired.GenerationID && receipt.RequestDigest == authority.Desired.Digest {
-		return ConfigurationApplyResult{Generation: authority.Desired, Receipt: receipt, NoOp: true}, true
+	if receipt.Phase != OperationPhaseObserved || receipt.Outcome != OperationOutcomeSucceeded || receipt.ResultingVersion <= 0 || receipt.RequestDigest != receipt.ResultingAuthorityDigest {
+		return ConfigurationApplyResult{}, false
+	}
+	for _, generation := range generations {
+		if generation.GenerationID == receipt.ResultingVersion && generation.Digest == receipt.RequestDigest {
+			return ConfigurationApplyResult{Generation: generation, Receipt: receipt, NoOp: true}, true
+		}
 	}
 	return ConfigurationApplyResult{}, false
 }

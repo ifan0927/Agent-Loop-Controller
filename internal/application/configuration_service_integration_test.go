@@ -432,6 +432,29 @@ func TestConfigurationServiceBaselineApplyReplayConvergenceAndDrift(t *testing.T
 	}
 }
 
+func TestConfigurationHistoricalNoOpReplaysAfterAuthorityAdvances(t *testing.T) {
+	service, _, _, _, requester := configurationServiceFixture(t)
+	ctx := context.Background()
+	authority, err := service.Initialize(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := []byte("baseline configuration")
+	command := application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: baseline}
+	noOp, err := service.Apply(ctx, command)
+	if err != nil || !noOp.NoOp || noOp.Generation.GenerationID != 1 {
+		t.Fatalf("no-op=%+v err=%v", noOp, err)
+	}
+	advanced, err := service.Apply(ctx, application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: []byte("next generation")})
+	if err != nil || advanced.Generation.GenerationID != 2 {
+		t.Fatalf("advanced=%+v err=%v", advanced, err)
+	}
+	replayed, err := service.Apply(ctx, command)
+	if err != nil || !replayed.NoOp || replayed.Generation.GenerationID != 1 || replayed.Receipt.OperationID != noOp.Receipt.OperationID {
+		t.Fatalf("replayed=%+v err=%v", replayed, err)
+	}
+}
+
 func TestConfigurationServiceReconcilesEveryReplacementCrashBoundary(t *testing.T) {
 	for _, test := range []struct {
 		name        string

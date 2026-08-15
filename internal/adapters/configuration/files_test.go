@@ -76,6 +76,29 @@ func TestPrivateReadRejectsModeChangeAfterPayloadRead(t *testing.T) {
 	}
 }
 
+func TestAuthorityPublicationRejectsDirectoryModeChangeDuringSync(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	configPath := filepath.Join(root, "controller.json")
+	if err := os.WriteFile(configPath, []byte("baseline"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(root, "controller.db")
+	bindTestDatabase(t, files, databasePath)
+	files.syncAuthority = func(path string) error {
+		if err := os.Chmod(path, 0o777); err != nil {
+			return err
+		}
+		return syncDirectory(path)
+	}
+	if err := files.PublishLocator(databasePath); err == nil {
+		t.Fatal("authority publication accepted a directory mode change")
+	}
+}
+
 func TestTrustedReadsRejectUnsafeAuthorityAncestors(t *testing.T) {
 	root := canonicalTempDirectory(t)
 	configPath := filepath.Join(root, "controller.json")
