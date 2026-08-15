@@ -156,7 +156,9 @@ lock-file, configuration-parent, or authority-subtree lock pathname. Existing
 identical publications and already-absent prune retries must re-sync their
 parent directory before they can report durable success. That sync pins the
 opened authority directory and revalidates its current pathname, owner, mode
-`0700`, and inode before returning. Exclusive raw,
+`0700`, and inode after the exact leaf use before returning. Raw reads preserve
+the same proof for both the outer authority and nested generation directory.
+Exclusive raw,
 binding, and locator publication uses the platform's atomic no-replace rename,
 so a crash cannot leave the final leaf hard-linked to a temporary alias.
 Restart cleanup removes interrupted temporary leaves and raw digest leaves

@@ -99,6 +99,32 @@ func TestAuthorityPublicationRejectsDirectoryModeChangeDuringSync(t *testing.T) 
 	}
 }
 
+func TestRawReadRejectsOuterAuthorityModeChangeAtFinalProof(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	configPath := filepath.Join(root, "controller.json")
+	if err := os.WriteFile(configPath, []byte("baseline"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("raw evidence")
+	digest := configurationDigest(payload)
+	if err := files.RetainRaw(digest, payload); err != nil {
+		t.Fatal(err)
+	}
+	files.syncAuthority = func(path string) error {
+		if err := os.Chmod(files.root, 0o777); err != nil {
+			return err
+		}
+		return syncDirectory(path)
+	}
+	if files.HasRaw(digest, int64(len(payload))) {
+		t.Fatal("raw read accepted an unsafe outer authority directory")
+	}
+}
+
 func TestTrustedReadsRejectUnsafeAuthorityAncestors(t *testing.T) {
 	root := canonicalTempDirectory(t)
 	configPath := filepath.Join(root, "controller.json")

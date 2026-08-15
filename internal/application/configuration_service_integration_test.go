@@ -333,7 +333,7 @@ func (f *configurationFilesFixture) PublishBaselineBinding(application.Validated
 	return nil
 }
 func (f *configurationFilesFixture) candidate(payload []byte, schema int) application.ValidatedConfigurationCandidate {
-	return application.ValidatedConfigurationCandidate{Digest: configurationTestDigest(payload), Size: int64(len(payload)), SchemaVersion: schema, DatabasePath: f.database, Operator: f.operator, Repositories: map[string]application.ConfigurationRepositoryAuthority{}}
+	return application.ValidatedConfigurationCandidate{Digest: configurationTestDigest(payload), Size: int64(len(payload)), SchemaVersion: schema, DatabasePath: f.database, LinearTeamKey: "IFAN", Operator: f.operator, Repositories: map[string]application.ConfigurationRepositoryAuthority{}}
 }
 
 type configurationRuntimeFixture struct {
@@ -845,6 +845,30 @@ func TestConfigurationApplyPreservesExistingRunAndDatabaseAuthority(t *testing.T
 	}
 	if generations, listErr := store.ListConfigurationGenerations(ctx); listErr != nil || len(generations) != 1 {
 		t.Fatalf("rejected generations=%+v err=%v", generations, listErr)
+	}
+}
+
+func TestConfigurationCompatibilityPreservesActiveRunLinearAuthority(t *testing.T) {
+	operator := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
+	repository := application.LocalRepository{CanonicalRepository: "owner/repo", BaseBranch: "main"}
+	repositoryJSON, err := json.Marshal(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceJSON, err := json.Marshal(application.LinearTaskSource{Provider: "linear", Identifier: "IFAN-1", Team: application.LinearTeam{ID: "team", Key: "IFAN"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := application.Run{Repository: repository.CanonicalRepository, BaseBranch: repository.BaseBranch, RepositoryConfigJSON: string(repositoryJSON), RawIssueJSON: string(sourceJSON)}
+	candidate := application.ValidatedConfigurationCandidate{LinearTeamKey: "IFAN", Operator: operator, Repositories: map[string]application.ConfigurationRepositoryAuthority{
+		"owner/repo": {CanonicalRepository: repository.CanonicalRepository, BaseBranch: repository.BaseBranch},
+	}}
+	if err := application.ConfigurationCompatibleWithActiveRuns(operator, candidate, []application.Run{run}); err != nil {
+		t.Fatalf("matching Linear authority was rejected: %v", err)
+	}
+	candidate.LinearTeamKey = "OTHER"
+	if err := application.ConfigurationCompatibleWithActiveRuns(operator, candidate, []application.Run{run}); err == nil || !strings.Contains(err.Error(), "Linear authority") {
+		t.Fatalf("retargeted Linear authority err=%v", err)
 	}
 }
 

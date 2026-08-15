@@ -164,6 +164,7 @@ type ValidatedConfigurationCandidate struct {
 	Size          int64
 	SchemaVersion int
 	DatabasePath  string
+	LinearTeamKey string
 	Operator      domain.GitHubUserIdentity
 	Repositories  map[string]ConfigurationRepositoryAuthority
 }
@@ -376,6 +377,13 @@ func ConfigurationCompatibleWithActiveRuns(currentOperator domain.GitHubUserIden
 			frozen.ExpectedRepositoryID != configured.ExpectedRepositoryID || !slices.Equal(frozen.VerifierIDs, configured.VerifierIDs) ||
 			!slices.Equal(frozen.AllowedOperatorLogins, configured.AllowedOperatorLogins) || !slices.Equal(frozen.TrustedOperatorActors, configured.TrustedOperatorActors) {
 			return errors.New("configuration changes authority required by an active run")
+		}
+		var source LinearTaskSource
+		if strings.TrimSpace(run.RawIssueJSON) == "" || decodeStrictJSON([]byte(run.RawIssueJSON), &source) != nil || strings.TrimSpace(source.Provider) == "" || source.Provider == "linear" && strings.TrimSpace(source.Team.Key) == "" {
+			return errors.New("active run task-source authority is unavailable")
+		}
+		if source.Provider == "linear" && candidate.LinearTeamKey != source.Team.Key {
+			return errors.New("configuration changes Linear authority required by an active run")
 		}
 	}
 	return nil

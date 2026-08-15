@@ -565,7 +565,8 @@ generation anchor. Existing identical raw, baseline, and locator publications
 re-sync their parent directory before success; an already-absent prune retry
 does the same before settling metadata. Authority-directory sync pins an opened
 directory descriptor and revalidates its current pathname, owner, mode `0700`,
-and inode after sync. Exclusive publications use an OS
+and inode after the exact leaf use and sync. Nested raw reads pin and revalidate
+both the authority and generation directories. Exclusive publications use an OS
 no-replace rename, so the fully synced temporary inode becomes the single-link
 final inode without a temp/final hard-link crash window. Restart cleanup
 removes interrupted pre-publication temporary leaves while holding mutation
@@ -574,7 +575,8 @@ authority.
 The presentation-independent apply service authorizes from the committed
 desired generation's configured operator, strictly validates current-schema
 candidate bytes, compares expected generation and digest, protects every
-nonterminal run's frozen repository and configured-operator authority. The
+nonterminal run's frozen repository, Linear task-source, and configured-
+operator authority. The
 current request's controller scope is resolved again after reconciliation,
 because reconciliation may commit an already-accepted operator transition.
 An accepted receipt is not a settled replay: an exact retry first reconciles
