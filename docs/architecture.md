@@ -156,6 +156,13 @@ anchor, payload, action, or expected-authority drift conflicts, while a later
 Controller-owned occurrence receives a new anchor. Mutually exclusive actions
 share the same authority uniqueness boundary.
 
+Configuration same-digest no-ops are not a weaker receipt path. SQLite
+rechecks the exact desired generation, digest, and absence of an incomplete
+intent, then writes the final observed/succeeded receipt in that same
+transaction. A concurrent authority advance conflicts instead of recording a
+receipt against stale authority. Once recorded, exact replay resolves the
+receipt's permanent resulting generation even after desired authority advances.
+
 Receipt phase and outcome are separate. The monotonic phases are `accepted`,
 `applied`, and `observed`; outcomes are `pending`, `succeeded`, `failed`,
 `conflict`, and `ambiguous`. An interrupted caller cannot erase an accepted
@@ -484,8 +491,11 @@ Worker runtime liveness is a separate application contract from workload
 activity and configuration convergence. After strict configuration, process
 lock, credential topology, SQLite compatibility, supervisor fencing,
 scheduling reconciliation, and production dispatcher construction succeed,
-the worker publishes schema-v2 private heartbeat evidence immediately and on a
-fixed 15-second cadence. Activity transitions may publish immediately but do
+the active supervisor publishes schema-v2 private heartbeat evidence
+immediately and on a fixed 15-second cadence. This is normally the automatic
+worker; the mutually exclusive manual `linear start` and `controller run`
+supervisors publish the same process-bound evidence for their own lifetime.
+Activity transitions may publish immediately but do
 not reset that cadence. The single supervisor heartbeat covers all bounded
 repository dispatches; there is no per-run heartbeat. Publication failure
 cancels and joins dispatch and fails the worker nonzero, while SQLite workflow
@@ -501,8 +511,118 @@ time plus a narrow process-identity observer to return `fresh`, `stale`,
 `offline`, `unknown`, or `conflict`; only age at or below 45 seconds with an
 exact live process match is fresh. Its sanitized projection omits PID,
 process-start identity, UID, local paths, launchd output, raw errors, logs, and
-credentials. Loaded digest evidence deliberately has no generation ID: fresh
-runtime liveness does not yet mean aggregate `ready` or `restart_required`.
+credentials. Loaded digest evidence deliberately has no generation ID. The
+configuration convergence service correlates only a fresh, identity-verified
+loaded digest to the current desired generation under SQLite CAS; the worker
+never invents generation identity.
+
+Controller-owned configuration authority is established on the first
+production configuration/store composition. The bootstrap adapter validates
+one exact bounded byte payload, then holds the private filesystem mutation
+authority while the configuration adapter retains those same bytes and
+exclusively publishes a baseline-binding intent,
+SQLite durably prepares the matching database anchor, and only then may the
+private locator be published. Startup proves a locator or pre-locator binding
+target's persisted device/inode identity and prepared binding on one query-only
+SQLite connection before enabling writes or migrating that same connection.
+The adapter obtains SQLite's actual main-database VFS file descriptor and
+`fstat`s it. Every physical connection and idle-pool reuse, plus both sides of
+each transaction boundary, direct query or effect, and prepared-statement
+effect, and each row-consumption step rechecks that VFS descriptor and the
+persisted pathname identity, current-user ownership, single-link state, and
+private mode. A
+replacement during an otherwise successful effect is therefore returned as a
+failure before the application may perform its next side effect. There is no
+path-based reopen between proof and effects, and every later production
+composition reopens only with the persisted identity constraint.
+That proof accepts only the configuration-authority
+schema floor through the binary's supported schema, allowing a trusted older
+store to receive normal forward migrations while rejecting pre-authority and
+newer unsupported stores. SQLite then atomically assigns one baseline generation without
+rewriting the live file. The mode-`0600` baseline binding and locator beside the
+configuration bind the canonical live path to its owning database path and
+exact private file identity so a later invalid or
+database-path-drifted file cannot create, redirect, or migrate an attacker-
+selected store. Raw
+generation payloads remain mode-`0600` beneath current-user mode-`0700`
+authority and generation directories. Every trusted locator, binding, or raw
+read revalidates those non-symlink private ancestors before accepting a leaf;
+the bounded leaf read also revalidates the opened inode and current pathname's
+owner, private mode, and single-link identity after reading. First creation and
+every retry fsync the parent entry for each private authority directory while
+pinning and revalidating both the child and parent directory identities.
+SQLite contains metadata, receipts, and sanitized events only. Current plus
+nine recent settled payloads are retained, while current and
+unresolved evidence are never pruned. Deletion first acquires a durable digest
+claim in SQLite; apply acceptance checks that claim in its transaction, so a
+digest cannot become accepted while its raw leaf is being removed. Raw target
+publication, prune deletion/metadata completion, and live replacement also
+flock the stable filesystem-root inode. The authority does not depend on any
+user-replaceable lock-file, configuration-parent, or authority-subtree
+pathname, so replacing a descendant cannot give a second Controller process a
+parallel mutation authority. An apply therefore cannot recreate a claimed raw
+leaf between deletion and metadata settlement. Startup finishes interrupted
+claims idempotently and removes raw digest leaves that have no retained SQLite
+generation anchor. Existing identical raw, baseline, and locator publications
+re-sync their parent directory before success; an already-absent prune retry
+does the same before settling metadata. Authority-directory sync pins an opened
+directory descriptor and revalidates its current pathname, owner, mode `0700`,
+and inode while the exact leaf descriptor remains open; the leaf descriptor and
+pathname are revalidated only after that sync. Removal similarly proves the leaf
+is still absent after sync. Nested raw reads pin and revalidate both the
+authority and generation directories. Exclusive publications use an OS
+no-replace rename, so the fully synced temporary inode becomes the single-link
+final inode without a temp/final hard-link crash window. Restart cleanup
+removes interrupted pre-publication temporary leaves while holding mutation
+authority.
+
+The presentation-independent apply service authorizes from the committed
+desired generation's configured operator, strictly validates current-schema
+candidate bytes, compares expected generation and digest, protects every
+nonterminal run's frozen repository, Linear task-source, and configured-
+operator authority. The
+current request's controller scope is resolved again after reconciliation,
+because reconciliation may commit an already-accepted operator transition.
+An accepted receipt is not a settled replay: an exact retry first reconciles
+the durable intent and then returns the observed result, including when that
+generation changed the configured operator.
+Only then does the service retain the target and commit one apply intent and
+operation receipt before a same-
+directory atomic exchange. The file adapter rechecks the bound database path
+after intent persistence and immediately before and after that exchange; a
+database replacement fences or restores the live-file effect. The exchange
+captures the exact displaced inode;
+an unexpected concurrent edit is restored instead of overwritten. The
+captured parent remains as private operation evidence until directory sync and
+exact reread prove the target. Removing the staged leaf also requires a proven
+parent-directory sync; an interrupted or failed cleanup remains an error until
+reconciliation repeats that sync. Startup and pre-apply reconciliation settle an
+interrupted intent from exact parent/target evidence or an ambiguous third or
+unsafe observation; drift is never adopted or overwritten. A matching fresh
+heartbeat durably selects only the current desired generation as effective.
+If a new generation returns to a digest already loaded by the fresh worker,
+the apply response performs that correlation immediately instead of requiring
+another projection poll or restart.
+The resulting finite projection is
+`ready`, `restart_required`, `starting`, `stale`, `offline`, `unknown`, or
+`conflict`, separate from worker activity and capacity.
+
+Every production new-admission path uses this application-owned convergence
+gate. Automatic dispatch may continue driving an already-admitted run, but it
+checks the gate before candidate scan or Linear mutation and again immediately
+before reservation. Manual Linear admission checks before issue collection and
+again immediately before run creation. The second decision carries a
+generation/digest/authority-version token that SQLite validates in the same
+transaction as the new run or reservation. The token expires with the exact
+heartbeat freshness window, and every durable drift-entered or drift-cleared
+transition advances authority version and invalidates older tokens. Apply
+acceptance uses the same SQLite write authority, so
+admission cannot cross an accepted configuration change. A schema-31-or-newer
+store with no configuration authority rejects direct run creation and automatic
+reservation as well as composed admission. Missing authority,
+pending restart, drift, unresolved apply,
+stale/offline runtime, and unavailable evidence fail closed without releasing
+permits or changing existing runs.
 
 An authenticated `retry` action is deliberately narrower than general recovery:
 it accepts only a current `retry_budget_exhausted` attention whose retained
@@ -910,7 +1030,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 30; migration history is code, not a
+inspection. The current schema is version 31; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees
@@ -973,7 +1093,17 @@ switches enable PR create, review reply, and squash merge writes.
 canonicalizes and cross-checks repositories and GitHub profiles, validates path
 isolation, derives stable digests, and produces a credential-safe readiness
 projection. Version 5 is current; older versions are compatibility inputs, not
-recommended templates.
+recommended templates. For a legacy baseline it derives a migration-only
+controller operator only when the same immutable actor is already trusted by
+every repository profile. A disjoint legacy policy remains readable and can
+converge through the Controller's internal admission gate, but it supplies no
+controller-scope apply/history authority; a repository-only actor is never
+elevated. Existing legacy run/query authorization is unchanged. Its same-byte
+validation seam is reused by baseline,
+live reread, retained desired evidence, and current-schema apply validation.
+`internal/adapters/configuration` owns the baseline-binding intent, trusted
+locator, immutable raw generation files, retention, captured-parent exchange
+evidence, and atomic live replacement; it does not expose a raw history API.
 
 ### Filesystem and artifact handling
 
@@ -1222,6 +1352,7 @@ around it. The principal table groups are:
 | `automatic_retry_schedules`, `operator_attention_outbox` | Restart-stable retry policy and immutable versioned operator-attention events; legacy delivery fields are storage-only evidence |
 | `operator_actions` | Action-specific authenticated recovery intent and legacy validated/applied/observed provenance, separate from automatic workflow evidence |
 | `operation_receipts` | Scope-neutral accepted/applied/observed operation identity, outcome, and sanitized result evidence; legacy operator actions are backfilled and mirrored here |
+| configuration generation, authority, apply-intent, and convergence tables | Immutable desired/effective metadata, one Controller-wide CAS transaction, reconciliation state, and meaningful sanitized transitions; raw bytes remain outside SQLite |
 
 ### Current state versus evidence
 
@@ -1330,10 +1461,10 @@ resolution is not approval, and an approval for an old head is stale.
 - Linear admission and completion observation are implemented, but completion
   remains external automation/human authority.
 - GitHub writes require a narrowly permissioned selected-repository App.
-- Transactional repository onboarding, typed configuration mutation services,
-  the local TUI, optional HTTP/Web adapters, notification transport, Hermes
-  runtime integration, public API, webhooks, and multi-tenant authorization are
-  not implemented.
+- Typed drafts/semantic preview/rollback and drift recovery, transactional
+  repository onboarding, the local TUI, optional HTTP/Web adapters,
+  notification transport, Hermes runtime integration, public API, webhooks,
+  and multi-tenant authorization are not implemented.
 - External live E2E acceptance remains restricted to isolated fixture
   repositories. The automatic-delivery acceptance and repair-aware independent
   review are complete; future live gates must follow the staged Controller and

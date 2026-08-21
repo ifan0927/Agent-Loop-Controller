@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,21 +13,33 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
+	"unsafe"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/libc"
+	moderncsqlite "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 30
+const schemaVersion = 31
+
+const (
+	sqliteMigrationRetryDelay  = 10 * time.Millisecond
+	sqliteMigrationRetryWindow = 5 * time.Second
+)
 
 type Store struct {
 	db                   *sql.DB
+	databaseIdentity     application.DatabaseFileIdentity
 	heavySupervisorMu    sync.RWMutex
 	heavySupervisorOwner string
 }
@@ -36,6 +49,48 @@ func Open(path string) (*Store, error) {
 }
 
 func openWithSupportedSchema(path string, supportedVersion int) (*Store, error) {
+	return openPinnedStore(context.Background(), path, supportedVersion, true, application.DatabaseFileIdentity{}, nil, openPinnedStoreHooks{})
+}
+
+// OpenConfigurationAuthority proves the exact private database inode and its
+// configuration binding on one query-only SQLite connection, then migrates
+// that same connection. No pathname reopen occurs between proof and effects.
+func OpenConfigurationAuthority(ctx context.Context, path, configPath string, expected application.DatabaseFileIdentity, allowUnbound bool) (*Store, error) {
+	return openConfigurationAuthority(ctx, path, configPath, expected, allowUnbound, openPinnedStoreHooks{})
+}
+
+func openConfigurationAuthority(ctx context.Context, path, configPath string, expected application.DatabaseFileIdentity, allowUnbound bool, hooks openPinnedStoreHooks) (*Store, error) {
+	verify := func(db *sql.Conn) error {
+		var version int
+		if err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil || version < 31 || version > schemaVersion {
+			return errors.New("configuration database binding is unavailable")
+		}
+		boundConfig, boundDatabase, found, err := configurationBindingQuery(ctx, db)
+		if err != nil {
+			return err
+		}
+		if found {
+			if boundConfig != configPath || boundDatabase != path {
+				return errors.New("configuration database binding conflicts")
+			}
+			return nil
+		}
+		if !allowUnbound {
+			return errors.New("configuration database binding is unavailable")
+		}
+		return nil
+	}
+	return openPinnedStore(ctx, path, schemaVersion, false, expected, verify, hooks)
+}
+
+type openPinnedStoreHooks struct {
+	beforeConnectionOpen   func()
+	afterConnectionOpen    func()
+	beforeEffects          func()
+	afterTransactionCommit func()
+}
+
+func openPinnedStore(ctx context.Context, path string, supportedVersion int, create bool, expected application.DatabaseFileIdentity, verify func(*sql.Conn) error, hooks openPinnedStoreHooks) (*Store, error) {
 	if supportedVersion < 1 || supportedVersion > schemaVersion {
 		return nil, errors.New("supported SQLite schema version is invalid")
 	}
@@ -44,33 +99,511 @@ func openWithSupportedSchema(path string, supportedVersion int) (*Store, error) 
 		return nil, err
 	}
 	path = absolute
-	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return nil, errors.New("SQLite database path must not be a symlink")
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+	flags := os.O_RDWR | syscall.O_NOFOLLOW
+	if create {
+		flags |= os.O_CREATE
+	}
+	file, err := os.OpenFile(path, flags, 0o600)
+	if err != nil {
+		return nil, errors.New("SQLite database path is unavailable")
+	}
+	closeFile := true
+	defer func() {
+		if closeFile {
+			_ = file.Close()
+		}
+	}()
+	identity, err := safeDatabaseFileIdentity(file)
+	if err != nil || expected.Valid() && identity != expected {
+		return nil, errors.New("SQLite database path is unsafe")
+	}
+	if expected.Valid() {
+		if info, statErr := file.Stat(); statErr != nil || info.Mode().Perm() != 0o600 {
+			return nil, errors.New("SQLite database path is unsafe")
+		}
+	}
+	if err := file.Chmod(0o600); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", sqliteDSN(path))
+	connector := &pinnedSQLiteConnector{driver: &moderncsqlite.Driver{}, dsn: pinnedSQLiteDSN(path), path: path, expected: identity, beforeIdentityCheck: hooks.afterConnectionOpen, afterTransactionCommit: hooks.afterTransactionCommit}
+	db := sql.OpenDB(connector)
+	db.SetMaxOpenConns(1)
+	if hooks.beforeConnectionOpen != nil {
+		hooks.beforeConnectionOpen()
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	closeDatabase := true
+	defer func() {
+		if closeDatabase {
+			_ = conn.Close()
+			_ = db.Close()
+		}
+	}()
+	if err := conn.QueryRowContext(ctx, `SELECT 1`).Scan(new(int)); err != nil {
+		return nil, errors.New("SQLite database identity changed while opening")
+	}
+	connectionIdentity, err := sqliteConnectionFileIdentity(conn)
+	if err != nil || connectionIdentity != identity || !databasePathStillIdentifies(path, identity) {
+		return nil, errors.New("SQLite database identity changed while opening")
+	}
+	if verify != nil {
+		if err := verify(conn); err != nil {
+			return nil, err
+		}
+	}
+	if hooks.beforeEffects != nil {
+		hooks.beforeEffects()
+	}
+	if _, err := conn.ExecContext(ctx, `PRAGMA query_only = OFF`); err != nil {
+		return nil, err
+	}
+	if err := migrateSQLiteWithRetry(ctx, conn, supportedVersion); err != nil {
+		db.Close()
+		return nil, err
+	}
+	connector.allowWrites.Store(true)
+	if !databasePathStillIdentifies(path, identity) {
+		return nil, errors.New("SQLite database identity changed while opening")
+	}
+	if err := conn.Close(); err != nil {
+		return nil, err
+	}
+	if err := file.Close(); err != nil {
+		return nil, err
+	}
+	closeFile, closeDatabase = false, false
+	return &Store{db: db, databaseIdentity: identity}, nil
+}
+
+// moderncConnectionHeader mirrors the first two fields of the connection in
+// the exact pinned modernc.org/sqlite version. SQLite's public file-control
+// API then exposes the real VFS handle, allowing fstat of the connection's
+// actual main database rather than another pathname open.
+type moderncConnectionHeader struct {
+	database uintptr
+	tls      *libc.TLS
+}
+
+type pinnedSQLiteConnector struct {
+	driver                 *moderncsqlite.Driver
+	dsn                    string
+	path                   string
+	expected               application.DatabaseFileIdentity
+	beforeIdentityCheck    func()
+	afterTransactionCommit func()
+	allowWrites            atomic.Bool
+}
+
+func (c *pinnedSQLiteConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	connection, err := c.driver.Open(c.dsn)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
-	store := &Store{db: db}
-	if err := store.migrate(context.Background(), supportedVersion); err != nil {
-		db.Close()
+	if c.beforeIdentityCheck != nil {
+		c.beforeIdentityCheck()
+	}
+	identity, err := moderncDriverConnectionIdentity(connection)
+	if err != nil || identity != c.expected {
+		_ = connection.Close()
+		return nil, errors.New("SQLite database identity changed while opening")
+	}
+	if c.allowWrites.Load() {
+		execer, ok := connection.(driver.ExecerContext)
+		if !ok {
+			_ = connection.Close()
+			return nil, errors.New("SQLite driver connection is unavailable")
+		}
+		if _, err := execer.ExecContext(ctx, `PRAGMA query_only = OFF`, nil); err != nil {
+			_ = connection.Close()
+			return nil, err
+		}
+	}
+	return &pinnedSQLiteConnection{Conn: connection, path: c.path, expected: c.expected, afterTransactionCommit: c.afterTransactionCommit}, nil
+}
+
+func (c *pinnedSQLiteConnector) Driver() driver.Driver { return c.driver }
+
+type pinnedSQLiteConnection struct {
+	driver.Conn
+	path                   string
+	expected               application.DatabaseFileIdentity
+	afterTransactionCommit func()
+}
+
+func (c *pinnedSQLiteConnection) validate() error {
+	identity, err := moderncDriverConnectionIdentity(c.Conn)
+	if err != nil || identity != c.expected || !databasePathStillIdentifies(c.path, c.expected) {
+		return errors.New("SQLite database identity changed while open")
+	}
+	return nil
+}
+
+func (c *pinnedSQLiteConnection) Prepare(query string) (driver.Stmt, error) {
+	if err := c.validate(); err != nil {
 		return nil, err
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		db.Close()
+	statement, err := c.Conn.Prepare(query)
+	if err != nil {
 		return nil, err
 	}
-	return store, nil
+	if err := c.validate(); err != nil {
+		_ = statement.Close()
+		return nil, err
+	}
+	return &pinnedSQLiteStatement{Stmt: statement, connection: c}, nil
+}
+
+func (c *pinnedSQLiteConnection) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	preparer, ok := c.Conn.(driver.ConnPrepareContext)
+	if !ok {
+		return c.Prepare(query)
+	}
+	statement, err := preparer.PrepareContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.validate(); err != nil {
+		_ = statement.Close()
+		return nil, err
+	}
+	return &pinnedSQLiteStatement{Stmt: statement, connection: c}, nil
+}
+
+func (c *pinnedSQLiteConnection) Begin() (driver.Tx, error) {
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	transaction, err := c.Conn.Begin()
+	if err != nil {
+		return nil, err
+	}
+	if err := c.validate(); err != nil {
+		_ = transaction.Rollback()
+		return nil, err
+	}
+	return &pinnedSQLiteTransaction{Tx: transaction, connection: c}, nil
+}
+
+func (c *pinnedSQLiteConnection) BeginTx(ctx context.Context, options driver.TxOptions) (driver.Tx, error) {
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	beginner, ok := c.Conn.(driver.ConnBeginTx)
+	if !ok {
+		if options.Isolation != driver.IsolationLevel(sql.LevelDefault) || options.ReadOnly {
+			return nil, errors.New("SQLite transaction options are unsupported")
+		}
+		return c.Begin()
+	}
+	transaction, err := beginner.BeginTx(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.validate(); err != nil {
+		_ = transaction.Rollback()
+		return nil, err
+	}
+	return &pinnedSQLiteTransaction{Tx: transaction, connection: c}, nil
+}
+
+func (c *pinnedSQLiteConnection) ExecContext(ctx context.Context, query string, arguments []driver.NamedValue) (driver.Result, error) {
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	execer, ok := c.Conn.(driver.ExecerContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+	result, err := execer.ExecContext(ctx, query, arguments)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (c *pinnedSQLiteConnection) QueryContext(ctx context.Context, query string, arguments []driver.NamedValue) (driver.Rows, error) {
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	queryer, ok := c.Conn.(driver.QueryerContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+	rows, err := queryer.QueryContext(ctx, query, arguments)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.validate(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	return &pinnedSQLiteRows{Rows: rows, connection: c}, nil
+}
+
+func (c *pinnedSQLiteConnection) Ping(ctx context.Context) error {
+	if err := c.validate(); err != nil {
+		return err
+	}
+	if pinger, ok := c.Conn.(driver.Pinger); ok {
+		if err := pinger.Ping(ctx); err != nil {
+			return err
+		}
+	}
+	return c.validate()
+}
+
+func (c *pinnedSQLiteConnection) ResetSession(ctx context.Context) error {
+	if err := c.validate(); err != nil {
+		return err
+	}
+	if resetter, ok := c.Conn.(driver.SessionResetter); ok {
+		if err := resetter.ResetSession(ctx); err != nil {
+			return err
+		}
+	}
+	return c.validate()
+}
+
+func (c *pinnedSQLiteConnection) IsValid() bool {
+	if c.validate() != nil {
+		return false
+	}
+	if validator, ok := c.Conn.(driver.Validator); ok {
+		return validator.IsValid()
+	}
+	return true
+}
+
+func (c *pinnedSQLiteConnection) CheckNamedValue(value *driver.NamedValue) error {
+	if checker, ok := c.Conn.(driver.NamedValueChecker); ok {
+		return checker.CheckNamedValue(value)
+	}
+	return driver.ErrSkip
+}
+
+type pinnedSQLiteTransaction struct {
+	driver.Tx
+	connection *pinnedSQLiteConnection
+}
+
+func (t *pinnedSQLiteTransaction) Commit() error {
+	if err := t.connection.validate(); err != nil {
+		_ = t.Tx.Rollback()
+		return err
+	}
+	if err := t.Tx.Commit(); err != nil {
+		return err
+	}
+	if t.connection.afterTransactionCommit != nil {
+		t.connection.afterTransactionCommit()
+	}
+	return t.connection.validate()
+}
+
+type pinnedSQLiteStatement struct {
+	driver.Stmt
+	connection *pinnedSQLiteConnection
+}
+
+func (s *pinnedSQLiteStatement) Exec(arguments []driver.Value) (driver.Result, error) {
+	if err := s.connection.validate(); err != nil {
+		return nil, err
+	}
+	result, err := s.Stmt.Exec(arguments)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.connection.validate(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (s *pinnedSQLiteStatement) Query(arguments []driver.Value) (driver.Rows, error) {
+	if err := s.connection.validate(); err != nil {
+		return nil, err
+	}
+	rows, err := s.Stmt.Query(arguments)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.connection.validate(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	return &pinnedSQLiteRows{Rows: rows, connection: s.connection}, nil
+}
+
+func (s *pinnedSQLiteStatement) ExecContext(ctx context.Context, arguments []driver.NamedValue) (driver.Result, error) {
+	if err := s.connection.validate(); err != nil {
+		return nil, err
+	}
+	execer, ok := s.Stmt.(driver.StmtExecContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+	result, err := execer.ExecContext(ctx, arguments)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.connection.validate(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (s *pinnedSQLiteStatement) QueryContext(ctx context.Context, arguments []driver.NamedValue) (driver.Rows, error) {
+	if err := s.connection.validate(); err != nil {
+		return nil, err
+	}
+	queryer, ok := s.Stmt.(driver.StmtQueryContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+	rows, err := queryer.QueryContext(ctx, arguments)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.connection.validate(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	return &pinnedSQLiteRows{Rows: rows, connection: s.connection}, nil
+}
+
+type pinnedSQLiteRows struct {
+	driver.Rows
+	connection *pinnedSQLiteConnection
+}
+
+func (r *pinnedSQLiteRows) Next(values []driver.Value) error {
+	if err := r.connection.validate(); err != nil {
+		return err
+	}
+	err := r.Rows.Next(values)
+	if identityErr := r.connection.validate(); identityErr != nil {
+		return identityErr
+	}
+	return err
+}
+
+func (r *pinnedSQLiteRows) Close() error {
+	closeErr := r.Rows.Close()
+	identityErr := r.connection.validate()
+	if closeErr != nil {
+		return closeErr
+	}
+	return identityErr
+}
+
+func sqliteConnectionFileIdentity(conn *sql.Conn) (application.DatabaseFileIdentity, error) {
+	var identity application.DatabaseFileIdentity
+	err := conn.Raw(func(driverConnection any) error {
+		var err error
+		identity, err = moderncDriverConnectionIdentity(driverConnection)
+		return err
+	})
+	return identity, err
+}
+
+func moderncDriverConnectionIdentity(driverConnection any) (application.DatabaseFileIdentity, error) {
+	var identity application.DatabaseFileIdentity
+	err := func() error {
+		if pinned, ok := driverConnection.(*pinnedSQLiteConnection); ok {
+			driverConnection = pinned.Conn
+		}
+		typeOf := reflect.TypeOf(driverConnection)
+		valueOf := reflect.ValueOf(driverConnection)
+		if typeOf == nil || typeOf.Kind() != reflect.Pointer || typeOf.Elem().PkgPath() != "modernc.org/sqlite" || typeOf.Elem().Name() != "conn" || valueOf.IsNil() {
+			return errors.New("SQLite driver connection identity is unavailable")
+		}
+		header := (*moderncConnectionHeader)(unsafe.Pointer(valueOf.Pointer()))
+		if header.database == 0 || header.tls == nil {
+			return errors.New("SQLite driver connection identity is unavailable")
+		}
+		databaseName, err := libc.CString("main")
+		if err != nil {
+			return errors.New("SQLite driver connection identity is unavailable")
+		}
+		defer libc.Xfree(header.tls, databaseName)
+		allocationSize := int(unsafe.Sizeof(uintptr(0)))
+		filePointer := header.tls.Alloc(allocationSize)
+		defer header.tls.Free(allocationSize)
+		libc.AssignPtrUintptr(filePointer, 0)
+		if result := sqlite3.Xsqlite3_file_control(header.tls, header.database, databaseName, int32(sqlite3.SQLITE_FCNTL_FILE_POINTER), filePointer); result != sqlite3.SQLITE_OK {
+			return errors.New("SQLite driver connection identity is unavailable")
+		}
+		mainFile := libc.AtomicLoadNUintptr(filePointer, 0)
+		if mainFile == 0 {
+			return errors.New("SQLite driver connection identity is unavailable")
+		}
+		fileDescriptor := libc.AtomicLoadNInt32(mainFile+unsafe.Offsetof(sqlite3.TunixFile{}.Fh), 0)
+		var stat syscall.Stat_t
+		if fileDescriptor < 0 || syscall.Fstat(int(fileDescriptor), &stat) != nil || int(stat.Uid) != os.Getuid() || stat.Nlink != 1 || stat.Mode&0o777 != 0o600 {
+			return errors.New("SQLite driver connection identity is unavailable")
+		}
+		identity = application.DatabaseFileIdentity{Device: uint64(stat.Dev), Inode: uint64(stat.Ino)}
+		if !identity.Valid() {
+			return errors.New("SQLite driver connection identity is unavailable")
+		}
+		return nil
+	}()
+	return identity, err
 }
 
 func sqliteDSN(path string) string {
 	return (&url.URL{Scheme: "file", Path: path}).String() + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
 }
 
+func pinnedSQLiteDSN(path string) string {
+	return (&url.URL{Scheme: "file", Path: path}).String() + "?mode=rw&_pragma=query_only(1)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+}
+
+func safeDatabaseFileIdentity(file *os.File) (application.DatabaseFileIdentity, error) {
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return application.DatabaseFileIdentity{}, errors.New("SQLite database path is unsafe")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || int(stat.Uid) != os.Getuid() || stat.Nlink != 1 {
+		return application.DatabaseFileIdentity{}, errors.New("SQLite database path is unsafe")
+	}
+	identity := application.DatabaseFileIdentity{Device: uint64(stat.Dev), Inode: uint64(stat.Ino)}
+	if !identity.Valid() {
+		return application.DatabaseFileIdentity{}, errors.New("SQLite database path is unsafe")
+	}
+	return identity, nil
+}
+
+func databasePathStillIdentifies(path string, expected application.DatabaseFileIdentity) bool {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || int(stat.Uid) != os.Getuid() || stat.Nlink != 1 {
+		return false
+	}
+	current := application.DatabaseFileIdentity{Device: uint64(stat.Dev), Inode: uint64(stat.Ino)}
+	return current == expected
+}
+
 func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) DatabaseIdentity() application.DatabaseFileIdentity { return s.databaseIdentity }
 
 func (s *Store) SchemaVersion(ctx context.Context) (int, error) {
 	var version int
@@ -78,11 +611,16 @@ func (s *Store) SchemaVersion(ctx context.Context) (int, error) {
 	return version, err
 }
 
-func (s *Store) migrate(ctx context.Context, supportedVersion int) error {
-	if _, err := s.db.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
+type sqliteTransactioner interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
+}
+
+func migrateSQLite(ctx context.Context, db sqliteTransactioner, supportedVersion int) error {
+	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
 		return err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -163,6 +701,8 @@ func (s *Store) migrate(ctx context.Context, supportedVersion int) error {
 			statements = migrationV29
 		case 30:
 			statements = migrationV30
+		case 31:
+			statements = migrationV31
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -201,6 +741,32 @@ func (s *Store) migrate(ctx context.Context, supportedVersion int) error {
 		}
 	}
 	return tx.Commit()
+}
+
+func migrateSQLiteWithRetry(ctx context.Context, db sqliteTransactioner, supportedVersion int) error {
+	retryCtx, cancel := context.WithTimeout(ctx, sqliteMigrationRetryWindow)
+	defer cancel()
+	for {
+		err := migrateSQLite(retryCtx, db, supportedVersion)
+		if err == nil || !sqliteBusy(err) {
+			return err
+		}
+		timer := time.NewTimer(sqliteMigrationRetryDelay)
+		select {
+		case <-retryCtx.Done():
+			timer.Stop()
+			return retryCtx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func sqliteBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "database is locked") || strings.Contains(message, "sqlite_busy")
 }
 
 var migrationV1 = []string{
@@ -431,6 +997,124 @@ var migrationV30 = []string{
 	)`,
 	`CREATE INDEX operation_receipts_target ON operation_receipts(scope_kind,target_id,accepted_at,operation_id)`,
 	`CREATE UNIQUE INDEX operation_receipts_source_action ON operation_receipts(source_action_id) WHERE source_action_id<>''`,
+}
+
+// migrationV31 establishes one Controller-wide configuration generation
+// authority. Raw configuration bytes remain in the private file adapter; only
+// immutable metadata, transaction state, and sanitized convergence evidence
+// are stored in SQLite.
+var migrationV31 = []string{
+	`DROP INDEX operation_receipts_target`,
+	`DROP INDEX operation_receipts_source_action`,
+	`ALTER TABLE operation_receipts RENAME TO operation_receipts_v30`,
+	`CREATE TABLE operation_receipts (
+		operation_id TEXT PRIMARY KEY,
+		authority_key TEXT NOT NULL UNIQUE,
+		operation_anchor_digest TEXT NOT NULL,
+		operation_type TEXT NOT NULL CHECK(operation_type IN ('decide','retry','abandon','recover_ci_wait','recover_owned_push','accept_external_merge','apply_configuration')),
+		scope_kind TEXT NOT NULL CHECK(scope_kind IN ('controller','repository','run','onboarding')),
+		target_id TEXT NOT NULL,
+		requester_login TEXT NOT NULL,
+		requester_database_id INTEGER NOT NULL,
+		requester_node_id TEXT NOT NULL,
+		requester_actor_type TEXT NOT NULL,
+		request_digest TEXT NOT NULL,
+		expected_authority_digest TEXT NOT NULL,
+		target_binding_digest TEXT NOT NULL,
+		phase TEXT NOT NULL CHECK(phase IN ('accepted','applied','observed')),
+		outcome TEXT NOT NULL CHECK(outcome IN ('pending','succeeded','failed','conflict','ambiguous')),
+		resulting_authority_digest TEXT NOT NULL DEFAULT '',
+		resulting_state TEXT NOT NULL DEFAULT '',
+		resulting_version INTEGER NOT NULL DEFAULT 0 CHECK(resulting_version >= 0),
+		evidence_digest TEXT NOT NULL DEFAULT '',
+		result_digest TEXT NOT NULL DEFAULT '',
+		accepted_at TEXT NOT NULL,
+		applied_at TEXT NOT NULL DEFAULT '',
+		settled_at TEXT NOT NULL DEFAULT '',
+		source_action_id TEXT NOT NULL DEFAULT ''
+	)`,
+	`INSERT INTO operation_receipts SELECT * FROM operation_receipts_v30`,
+	`DROP TABLE operation_receipts_v30`,
+	`CREATE INDEX operation_receipts_target ON operation_receipts(scope_kind,target_id,accepted_at,operation_id)`,
+	`CREATE UNIQUE INDEX operation_receipts_source_action ON operation_receipts(source_action_id) WHERE source_action_id<>''`,
+	`CREATE TABLE configuration_generations (
+		generation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+		parent_generation_id INTEGER REFERENCES configuration_generations(generation_id),
+		digest TEXT NOT NULL,
+		target_size INTEGER NOT NULL CHECK(target_size BETWEEN 0 AND 262144),
+		schema_version INTEGER NOT NULL CHECK(schema_version BETWEEN 1 AND 5),
+		origin TEXT NOT NULL CHECK(origin IN ('baseline','apply')),
+		requester_login TEXT NOT NULL DEFAULT '',
+		requester_database_id INTEGER NOT NULL DEFAULT 0,
+		requester_node_id TEXT NOT NULL DEFAULT '',
+		requester_actor_type TEXT NOT NULL DEFAULT '',
+		configured_operator_login TEXT NOT NULL DEFAULT '',
+		configured_operator_database_id INTEGER NOT NULL DEFAULT 0,
+		configured_operator_node_id TEXT NOT NULL DEFAULT '',
+		configured_operator_actor_type TEXT NOT NULL DEFAULT '',
+		operation_id TEXT REFERENCES operation_receipts(operation_id),
+		lifecycle TEXT NOT NULL CHECK(lifecycle IN ('accepted','pending_restart','effective','superseded','failed','ambiguous')),
+		raw_retained INTEGER NOT NULL CHECK(raw_retained IN (0,1)),
+		created_at TEXT NOT NULL,
+		committed_at TEXT NOT NULL DEFAULT '',
+		effective_at TEXT NOT NULL DEFAULT '',
+		superseded_at TEXT NOT NULL DEFAULT '',
+		settled_at TEXT NOT NULL DEFAULT '',
+		reason_code TEXT NOT NULL DEFAULT '',
+		CHECK((origin='baseline' AND parent_generation_id IS NULL AND operation_id IS NULL AND requester_login='' AND requester_database_id=0 AND requester_node_id='' AND requester_actor_type='') OR (origin='apply' AND parent_generation_id IS NOT NULL AND operation_id IS NOT NULL))
+	)`,
+	`CREATE TABLE configuration_baseline_anchor (
+		authority_id INTEGER PRIMARY KEY CHECK(authority_id=1),
+		canonical_config_path TEXT NOT NULL,
+		database_path TEXT NOT NULL,
+		digest TEXT NOT NULL,
+		target_size INTEGER NOT NULL CHECK(target_size BETWEEN 0 AND 262144),
+		schema_version INTEGER NOT NULL CHECK(schema_version BETWEEN 1 AND 5),
+		prepared_at TEXT NOT NULL
+	)`,
+	`CREATE INDEX configuration_generations_created ON configuration_generations(created_at,generation_id)`,
+	`CREATE TRIGGER configuration_generation_identity_immutable BEFORE UPDATE ON configuration_generations
+		WHEN NEW.parent_generation_id IS NOT OLD.parent_generation_id OR NEW.digest<>OLD.digest OR NEW.target_size<>OLD.target_size OR NEW.schema_version<>OLD.schema_version OR NEW.origin<>OLD.origin OR NEW.requester_login<>OLD.requester_login OR NEW.requester_database_id<>OLD.requester_database_id OR NEW.requester_node_id<>OLD.requester_node_id OR NEW.requester_actor_type<>OLD.requester_actor_type OR NEW.configured_operator_login<>OLD.configured_operator_login OR NEW.configured_operator_database_id<>OLD.configured_operator_database_id OR NEW.configured_operator_node_id<>OLD.configured_operator_node_id OR NEW.configured_operator_actor_type<>OLD.configured_operator_actor_type OR NEW.operation_id IS NOT OLD.operation_id OR NEW.created_at<>OLD.created_at
+		BEGIN SELECT RAISE(ABORT,'configuration generation identity is immutable'); END`,
+	`CREATE TABLE configuration_authority (
+		authority_id INTEGER PRIMARY KEY CHECK(authority_id=1),
+		canonical_config_path TEXT NOT NULL,
+		database_path TEXT NOT NULL,
+		desired_generation_id INTEGER NOT NULL REFERENCES configuration_generations(generation_id),
+		effective_generation_id INTEGER REFERENCES configuration_generations(generation_id),
+		authority_version INTEGER NOT NULL CHECK(authority_version > 0),
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	)`,
+	`CREATE TABLE configuration_apply_intents (
+		generation_id INTEGER PRIMARY KEY REFERENCES configuration_generations(generation_id),
+		parent_generation_id INTEGER NOT NULL REFERENCES configuration_generations(generation_id),
+		parent_digest TEXT NOT NULL,
+		target_digest TEXT NOT NULL,
+		operation_id TEXT NOT NULL UNIQUE REFERENCES operation_receipts(operation_id),
+		status TEXT NOT NULL CHECK(status IN ('accepted','committed','failed','ambiguous')),
+		accepted_at TEXT NOT NULL,
+		settled_at TEXT NOT NULL DEFAULT '',
+		reason_code TEXT NOT NULL DEFAULT ''
+	)`,
+	`CREATE UNIQUE INDEX configuration_one_incomplete_apply ON configuration_apply_intents((1)) WHERE status IN ('accepted','ambiguous')`,
+	`CREATE TABLE configuration_convergence_events (
+		event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+		event_type TEXT NOT NULL CHECK(event_type IN ('baseline_established','apply_accepted','apply_committed','apply_failed','apply_ambiguous','desired_changed','effective_observed','drift_entered','drift_cleared','convergence_conflict')),
+		generation_id INTEGER REFERENCES configuration_generations(generation_id),
+		operation_id TEXT NOT NULL DEFAULT '',
+		digest TEXT NOT NULL DEFAULT '',
+		worker_instance_id TEXT NOT NULL DEFAULT '',
+		build_identity TEXT NOT NULL DEFAULT '',
+		reason_code TEXT NOT NULL,
+		evidence_digest TEXT NOT NULL,
+		observed_at TEXT NOT NULL,
+		UNIQUE(event_type,generation_id,operation_id,digest,evidence_digest)
+	)`,
+	`CREATE TABLE configuration_raw_prune_claims (
+		digest TEXT PRIMARY KEY,
+		claimed_at TEXT NOT NULL
+	)`,
 }
 
 func backfillOperationReceiptsV30Tx(ctx context.Context, tx *sql.Tx) error {
@@ -807,6 +1491,9 @@ func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput)
 		return application.Run{}, false, err
 	}
 	defer tx.Rollback()
+	if err := requireConfigurationAdmissionAuthorityTx(ctx, tx, input.ConfigurationAuthority); err != nil {
+		return application.Run{}, false, err
+	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO runs(run_id,issue_id,idempotency_key,source_revision,raw_issue_json,raw_issue_hash,
 		normalized_task_json,task_hash,repository,repository_config_json,profile_id,profile_snapshot_version,profile_digest,profile_snapshot_json,registry_version,registry_digest,repository_binding_digest,base_branch,working_branch,worktree_path,artifact_root,current_state,implementation_model,review_model,created_at,updated_at)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, run.ID, run.IssueID, run.IdempotencyKey, run.SourceRevision, run.RawIssueJSON,

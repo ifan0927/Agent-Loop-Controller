@@ -17,6 +17,7 @@ import (
 	gitadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/git"
 	processadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/process"
 	storeadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite/sqlitetest"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/verifier"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
@@ -30,7 +31,7 @@ func TestOfflineAcceptanceMissingVerifierCannotAuthorizeCandidateWithDurableEvid
 		t.Fatal(err)
 	}
 
-	input := startInput(lab)
+	input := startInput(t, lab)
 	input.Task.VerifierIDs = []string{"missing-verifier"}
 	input.Repository.VerifierIDs = []string{"missing-verifier"}
 	input.NormalizedJSON, err = json.Marshal(input.Task)
@@ -132,7 +133,7 @@ func TestOfflineAcceptanceSparseEnvironmentUsesManagedVerifierAndGitPaths(t *tes
 		"fixture-go-test": {Program: goPath, Args: []string{"test", "./..."}},
 	}, processadapter.OSRunner{}, workspace)
 	controller := application.NewLocalController(store, testWorktrees{}, codex.NewExecutor(process, "codex"), registry, workspace, "codex", lab.worktrees)
-	run, err := controller.Start(context.Background(), startInput(lab))
+	run, err := controller.Start(context.Background(), startInput(t, lab))
 	if err != nil || run.State != domain.StateApprovalReady {
 		t.Fatalf("run=%+v err=%v", run, err)
 	}
@@ -193,7 +194,8 @@ func TestOfflineAcceptanceProductionAbandonTerminalizesWithResidueAndReplaysClea
 	source.Identifier = "IFAN-ABANDON"
 	reader := &productionLinearReader{source: source}
 	controller := &acceptancePersistingController{store: store, persist: false}
-	admission, err := application.NewLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, controller)
+	gate := acceptanceAdmissionGate(t, store, lab.db)
+	admission, err := application.NewGatedLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, controller, gate)
 	if err != nil {
 		store.Close()
 		t.Fatal(err)
@@ -214,7 +216,7 @@ func TestOfflineAcceptanceProductionAbandonTerminalizesWithResidueAndReplaysClea
 		store.Close()
 		t.Fatalf("admission lease=%+v acquired=%t err=%v", lease, acquired, err)
 	}
-	run, _, reserved, err := store.ReserveLinearTodoAdmission(context.Background(), application.LinearTodoAdmissionReservation{Lease: lease, ScanDigest: acceptanceDigest([]byte("abandon-scan")), IssueUUID: source.IssueID, Input: controller.input})
+	run, _, reserved, err := store.ReserveLinearTodoAdmission(context.Background(), application.LinearTodoAdmissionReservation{Lease: lease, ScanDigest: acceptanceDigest([]byte("abandon-scan")), IssueUUID: source.IssueID, Input: controller.input, ConfigurationAuthority: gate.Decision.Authority})
 	if err != nil || !reserved || run.State != domain.StateReceived {
 		store.Close()
 		t.Fatalf("received reservation run=%+v reserved=%t err=%v", run, reserved, err)
@@ -268,7 +270,8 @@ func TestOfflineAcceptanceProductionAbandonTerminalizesWithResidueAndReplaysClea
 		t.Fatal(err)
 	}
 	controller = &acceptancePersistingController{store: store, persist: false}
-	admission, err = application.NewLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, controller)
+	gate = acceptanceAdmissionGate(t, store, lab.db)
+	admission, err = application.NewGatedLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, controller, gate)
 	if err != nil {
 		store.Close()
 		t.Fatal(err)
@@ -356,7 +359,8 @@ func TestOfflineAcceptanceProductionAbandonCompletesOwnedCleanup(t *testing.T) {
 	source.Identifier = "IFAN-ABANDON-COMPLETE"
 	reader := &productionLinearReader{source: source}
 	controller := &acceptancePersistingController{store: store, persist: false}
-	admission, err := application.NewLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, controller)
+	gate := acceptanceAdmissionGate(t, store, lab.db)
+	admission, err := application.NewGatedLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, controller, gate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -372,7 +376,7 @@ func TestOfflineAcceptanceProductionAbandonCompletesOwnedCleanup(t *testing.T) {
 	if err != nil || !acquired {
 		t.Fatalf("admission lease=%+v acquired=%t err=%v", lease, acquired, err)
 	}
-	run, _, reserved, err := store.ReserveLinearTodoAdmission(context.Background(), application.LinearTodoAdmissionReservation{Lease: lease, ScanDigest: acceptanceDigest([]byte("abandon-complete-scan")), IssueUUID: source.IssueID, Input: controller.input})
+	run, _, reserved, err := store.ReserveLinearTodoAdmission(context.Background(), application.LinearTodoAdmissionReservation{Lease: lease, ScanDigest: acceptanceDigest([]byte("abandon-complete-scan")), IssueUUID: source.IssueID, Input: controller.input, ConfigurationAuthority: gate.Decision.Authority})
 	if err != nil || !reserved || run.State != domain.StateReceived {
 		t.Fatalf("received reservation run=%+v reserved=%t err=%v", run, reserved, err)
 	}
@@ -535,7 +539,7 @@ func TestOfflineAcceptanceRepairDeadlineAnchorsAndCancellationDoesNotExpirePolic
 			t.Fatalf("reopened repair anchor=%v want=%v err=%v", acceptanceRepairAnchorFromTimeline(persisted.Timeline), anchor, err)
 		}
 		controller := newControllerWithRepairClock(t, reopened, stack.lab, stack.process, gitadapter.Workspace{}, func() time.Time { return anchor.Add(31 * time.Minute) })
-		admission, err := application.NewLinearAdmissionService(stack.reader, productionLinearResolver{repository: stack.repository}, reopened, controller)
+		admission, err := application.NewGatedLinearAdmissionService(stack.reader, productionLinearResolver{repository: stack.repository}, reopened, controller, acceptanceAdmissionGate(t, reopened, stack.lab.db))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -576,7 +580,7 @@ func TestOfflineAcceptanceRepairDeadlineAnchorsAndCancellationDoesNotExpirePolic
 			t.Fatalf("reopened repair anchor=%v want=%v err=%v", acceptanceRepairAnchorFromTimeline(persisted.Timeline), anchor, err)
 		}
 		controller := newControllerWithRepairClock(t, reopened, stack.lab, stack.process, gitadapter.Workspace{}, func() time.Time { return anchor.Add(time.Minute) })
-		admission, err := application.NewLinearAdmissionService(stack.reader, productionLinearResolver{repository: stack.repository}, reopened, controller)
+		admission, err := application.NewGatedLinearAdmissionService(stack.reader, productionLinearResolver{repository: stack.repository}, reopened, controller, acceptanceAdmissionGate(t, reopened, stack.lab.db))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -624,7 +628,7 @@ func newAcceptanceProductionStack(t *testing.T, reviewFindings bool) acceptanceP
 	local := newController(t, store, lab, process, gitadapter.Workspace{})
 	source := productionLinearSource()
 	reader := &productionLinearReader{source: source}
-	admission, err := application.NewLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, local)
+	admission, err := application.NewGatedLinearAdmissionService(reader, productionLinearResolver{repository: repository}, store, local, acceptanceAdmissionGate(t, store, lab.db))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -755,8 +759,17 @@ func (c *acceptancePersistingController) StartAuthorized(ctx context.Context, in
 	if !c.persist {
 		return run, nil
 	}
-	created, _, err := c.store.CreateRun(ctx, application.CreateRunInput{Run: run})
+	created, _, err := c.store.CreateRun(ctx, application.CreateRunInput{Run: run, ConfigurationAuthority: input.ConfigurationAuthority})
 	return created, err
+}
+
+func acceptanceAdmissionGate(t *testing.T, store *storeadapter.Store, databasePath string) application.StaticNewAdmissionGate {
+	t.Helper()
+	authority, err := sqlitetest.EstablishReadyConfigurationAuthority(context.Background(), store, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return application.StaticNewAdmissionGate{Decision: application.NewAdmissionDecision{Allowed: true, Reason: application.ConfigurationReasonReady, Authority: authority}}
 }
 
 func (c *acceptancePersistingController) ContinueExpected(ctx context.Context, runID string, _ domain.State, _ string, _ *application.Decision) (application.Run, error) {

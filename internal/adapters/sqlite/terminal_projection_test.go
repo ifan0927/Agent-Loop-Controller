@@ -19,7 +19,7 @@ import (
 func TestTerminalProjectionSurvivesSQLiteRestart(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestTerminalProjectionSurvivesSQLiteRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestTerminalProjectionSurvivesSQLiteRestart(t *testing.T) {
 func TestCompletedMergeWithoutPullRequestAggregateProjectsUnknownAfterRestart(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +163,7 @@ func TestCompletedMergeWithoutPullRequestAggregateProjectsUnknownAfterRestart(t 
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +197,7 @@ func TestResolvedFeedbackProjectionOrdersGitHubEvidenceAcrossSQLiteRestart(t *te
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
 			path := filepath.Join(t.TempDir(), "controller.db")
-			store, err := Open(path)
+			store, err := openAdmissionTestStore(path)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -267,7 +267,7 @@ func TestResolvedFeedbackProjectionOrdersGitHubEvidenceAcrossSQLiteRestart(t *te
 				t.Fatal(err)
 			}
 
-			store, err = Open(path)
+			store, err = openAdmissionTestStore(path)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -300,7 +300,7 @@ func TestCorruptPullRequestAggregateFailsClosedAcrossSQLiteRestart(t *testing.T)
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
 			path := filepath.Join(t.TempDir(), "controller.db")
-			store, err := Open(path)
+			store, err := openAdmissionTestStore(path)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -340,7 +340,7 @@ func TestCorruptPullRequestAggregateFailsClosedAcrossSQLiteRestart(t *testing.T)
 				t.Fatal(err)
 			}
 
-			store, err = Open(path)
+			store, err = openAdmissionTestStore(path)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -362,7 +362,7 @@ func TestCorruptPullRequestAggregateFailsClosedAcrossSQLiteRestart(t *testing.T)
 func TestZeroTimeGitHubObservationFailsClosedAcrossSQLiteRestart(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -419,7 +419,7 @@ func TestZeroTimeGitHubObservationFailsClosedAcrossSQLiteRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -448,7 +448,7 @@ func TestGitHubEvidenceSQLAuthorityColumnsFailClosedAcrossSQLiteRestart(t *testi
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
 			path := filepath.Join(t.TempDir(), "controller.db")
-			store, err := Open(path)
+			store, err := openAdmissionTestStore(path)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -478,7 +478,7 @@ func TestGitHubEvidenceSQLAuthorityColumnsFailClosedAcrossSQLiteRestart(t *testi
 			if err := store.Close(); err != nil {
 				t.Fatal(err)
 			}
-			store, err = Open(path)
+			store, err = openAdmissionTestStore(path)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -493,7 +493,7 @@ func TestGitHubEvidenceSQLAuthorityColumnsFailClosedAcrossSQLiteRestart(t *testi
 func TestGitHubEvidenceEqualTimesUseEvidenceIDOrderAcrossSQLiteRestart(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -521,7 +521,7 @@ func TestGitHubEvidenceEqualTimesUseEvidenceIDOrderAcrossSQLiteRestart(t *testin
 		t.Fatal(err)
 	}
 
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -541,7 +541,7 @@ func TestGitHubEvidenceEqualTimesUseEvidenceIDOrderAcrossSQLiteRestart(t *testin
 func TestGitHubEvidenceLegacyOffsetTimeMatchesCanonicalSQLAcrossRestart(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -570,7 +570,7 @@ func TestGitHubEvidenceLegacyOffsetTimeMatchesCanonicalSQLAcrossRestart(t *testi
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -600,7 +600,7 @@ func TestCorruptMergeSHAFailsClosedAcrossSQLiteRestart(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
 			path := filepath.Join(t.TempDir(), "controller.db")
-			store, err := Open(path)
+			store, err := openAdmissionTestStore(path)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -624,7 +624,7 @@ func TestCorruptMergeSHAFailsClosedAcrossSQLiteRestart(t *testing.T) {
 			if err := store.Close(); err != nil {
 				t.Fatal(err)
 			}
-			store, err = Open(path)
+			store, err = openAdmissionTestStore(path)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -639,7 +639,7 @@ func TestCorruptMergeSHAFailsClosedAcrossSQLiteRestart(t *testing.T) {
 func TestLargeGitHubHistoryUsesBoundedProjectionAndFeedbackSelectionAcrossRestart(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -709,7 +709,7 @@ func TestLargeGitHubHistoryUsesBoundedProjectionAndFeedbackSelectionAcrossRestar
 		t.Fatal(err)
 	}
 
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}

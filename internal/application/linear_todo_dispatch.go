@@ -40,6 +40,7 @@ const (
 	LinearTodoQueueDecisionCapacityFull        = "capacity_full"
 	LinearTodoQueueDecisionAdmissionBusy       = "admission_busy"
 	LinearTodoQueueDecisionNoEligibleCandidate = "no_eligible_candidate"
+	LinearTodoQueueDecisionConfigurationFenced = "configuration_fenced"
 )
 
 // LinearTodoQueueDecision is sanitized, bounded evidence for one admission
@@ -64,7 +65,7 @@ func (d LinearTodoQueueDecision) Validate() error {
 	case LinearTodoQueueDecisionNoCandidate, LinearTodoQueueDecisionActiveRun,
 		LinearTodoQueueDecisionIncompleteScan, LinearTodoQueueDecisionSelectedPriority, LinearTodoQueueDecisionSchedulerAttention,
 		LinearTodoQueueDecisionRetryAttention, LinearTodoQueueDecisionCapacityFull, LinearTodoQueueDecisionAdmissionBusy,
-		LinearTodoQueueDecisionNoEligibleCandidate:
+		LinearTodoQueueDecisionNoEligibleCandidate, LinearTodoQueueDecisionConfigurationFenced:
 	default:
 		return errors.New("queue decision reason is invalid")
 	}
@@ -132,6 +133,7 @@ type LinearTodoDispatchPolicy struct {
 	AttentionProfile     OperatorAttentionProfile
 	Retry                AutomaticRetryPolicy
 	ExternalPollInterval time.Duration
+	AdmissionGate        NewAdmissionGate
 }
 
 // LinearTodoDispatchResult contains sanitized control-flow evidence. The
@@ -181,7 +183,7 @@ type LinearTodoDispatcher struct {
 }
 
 func NewLinearTodoDispatcher(scanner LinearTodoCandidateScanner, reader LinearIssueReader, resolver LinearAdmissionRepositoryResolver, starter LinearReservedIssueStarter, store linearTodoDispatchStore, controller LocalRunController, driver LinearTodoDispatchDriver, policy LinearTodoDispatchPolicy) (*LinearTodoDispatcher, error) {
-	if scanner == nil || reader == nil || resolver == nil || starter == nil || store == nil || controller == nil || driver == nil {
+	if scanner == nil || reader == nil || resolver == nil || starter == nil || store == nil || controller == nil || driver == nil || policy.AdmissionGate == nil {
 		return nil, errors.New("Linear Todo dispatcher dependencies are required")
 	}
 	if err := validateLinearTodoDispatchPolicy(policy); err != nil {
@@ -221,6 +223,10 @@ func validateLinearTodoDispatchPolicy(policy LinearTodoDispatchPolicy) error {
 // conflict.
 func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatchResult, error) {
 	now := d.clock()
+	// Observe configuration convergence before selecting existing work. A
+	// conflict fences only new authority below; compatible persisted runs must
+	// still be allowed to progress under their frozen authority.
+	admission, gateErr := d.policy.AdmissionGate.CheckNewAdmission(ctx)
 	// The in-process claim is checked before the short persisted admission
 	// lease so sibling per-run supervisors can make progress concurrently.
 	if _, concurrencyEnabled := schedulingStore(d.store); concurrencyEnabled && len(d.activeRunIDs()) > 0 {
@@ -372,6 +378,10 @@ func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatch
 		result := LinearTodoDispatchResult{Outcome: LinearTodoDispatchWaiting, NextRunnableAt: persistedNextRunnableAt}
 		return withQueueDecision(result, queueDecision(LinearTodoQueueDecisionCapacityFull, 0, false)), nil
 	}
+	if gateErr != nil || !admission.Allowed {
+		result := LinearTodoDispatchResult{Outcome: LinearTodoDispatchWaiting, NextRunnableAt: persistedNextRunnableAt}
+		return withQueueDecision(result, queueDecision(LinearTodoQueueDecisionConfigurationFenced, 0, false)), nil
+	}
 
 	if !d.renewLease(ctx, &lease) {
 		result, attentionErr := d.schedulerAttention(ctx, d.policy.AttentionProfile, "lease_lost", dispatchEvidence("lease_lost_before_scan"))
@@ -414,7 +424,12 @@ func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatch
 		}
 		return d.scanAttentionWithDecision(ctx, "incomplete_authority", dispatchEvidence("no_authoritatively_valid_candidate", scan.Digest), queueDecision(LinearTodoQueueDecisionIncompleteScan, len(scan.Candidates), false))
 	}
-	result, driveErr := d.reserveStartAndDrive(ctx, &lease, selected, scan.Digest)
+	admission, gateErr = d.policy.AdmissionGate.CheckNewAdmission(ctx)
+	if gateErr != nil || !admission.Allowed || !admission.Authority.Valid() {
+		result := LinearTodoDispatchResult{Outcome: LinearTodoDispatchWaiting, NextRunnableAt: persistedNextRunnableAt}
+		return withQueueDecision(result, queueDecision(LinearTodoQueueDecisionConfigurationFenced, 0, false)), nil
+	}
+	result, driveErr := d.reserveStartAndDrive(ctx, &lease, selected, scan.Digest, admission.Authority)
 	if driveErr != nil {
 		run, runErr := d.currentRetryRun(ctx, mustReservedRun(selected.snapshot, selected.repository))
 		if runErr != nil {
@@ -915,7 +930,7 @@ func linearTodoPriorityRank(priority int) int {
 	return priority
 }
 
-func (d *LinearTodoDispatcher) reserveStartAndDrive(ctx context.Context, lease *LinearTodoAdmissionLease, candidate linearTodoDispatchCandidate, scanDigest string) (LinearTodoDispatchResult, error) {
+func (d *LinearTodoDispatcher) reserveStartAndDrive(ctx context.Context, lease *LinearTodoAdmissionLease, candidate linearTodoDispatchCandidate, scanDigest string, configurationAuthority ConfigurationAdmissionAuthority) (LinearTodoDispatchResult, error) {
 	if !d.claimRun(candidate.snapshot.Task.RunID) {
 		return LinearTodoDispatchResult{Outcome: LinearTodoDispatchWaiting}, nil
 	}
@@ -930,7 +945,7 @@ func (d *LinearTodoDispatcher) reserveStartAndDrive(ctx context.Context, lease *
 	}
 	decisionID := digestLinear([]byte(strings.Join([]string{scanDigest, candidate.candidate.IssueID, candidate.repository.RepositoryBindingDigest, strconv.FormatInt(lease.Version, 10)}, ":")))
 	scheduling := SchedulingReservation{OwnerNonce: d.policy.OwnerNonce, CapacityIdentity: capacity.EffectiveIdentity, Capacity: capacity.EffectiveCapacity, RunnableSince: d.clock(), DecisionID: decisionID, IssueSequence: candidate.candidate.IssueSequence, Priority: candidate.candidate.Priority, RepositoryProfileID: candidate.repository.ProfileID}
-	reserved, journal, created, err := d.store.ReserveLinearTodoAdmission(ctx, LinearTodoAdmissionReservation{Lease: *lease, ScanDigest: scanDigest, IssueUUID: candidate.candidate.IssueID, Input: input, Scheduling: scheduling})
+	reserved, journal, created, err := d.store.ReserveLinearTodoAdmission(ctx, LinearTodoAdmissionReservation{Lease: *lease, ScanDigest: scanDigest, IssueUUID: candidate.candidate.IssueID, Input: input, Scheduling: scheduling, ConfigurationAuthority: configurationAuthority})
 	if err != nil {
 		if leaseErr := d.requireLease(ctx, *lease); leaseErr != nil {
 			return d.schedulerAttention(ctx, dispatcherProfile(candidate.repository, d.policy.AttentionProfile), "lease_lost", dispatchEvidence("lease_lost_during_reservation", scanDigest))

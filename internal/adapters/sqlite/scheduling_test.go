@@ -15,7 +15,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-func controllerSchedulingRunScopes(t *testing.T, store *Store) application.AuthorizedScopeSet {
+func controllerSchedulingRunScopes(t *testing.T, store *admissionTestStore) application.AuthorizedScopeSet {
 	t.Helper()
 	user := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "U_7", ActorType: "User"}
 	authorizer, err := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: user})
@@ -42,7 +42,7 @@ func controllerSchedulingRunScopes(t *testing.T, store *Store) application.Autho
 }
 
 func TestSchedulingReservesDifferentRepositoriesUpToGenericCapacity(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ func TestSchedulingReservesDifferentRepositoriesUpToGenericCapacity(t *testing.T
 }
 
 func TestSchedulingProjectionQueriesAreReadOnlyBoundedAndOrdered(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestSchedulingProjectionQueriesAreReadOnlyBoundedAndOrdered(t *testing.T) {
 }
 
 func TestRepositorySchedulingScopeDoesNotDiscloseSiblingRunsOrDecisions(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +182,7 @@ func TestRepositorySchedulingScopeDoesNotDiscloseSiblingRunsOrDecisions(t *testi
 }
 
 func TestSchedulingProjectionQueriesFailClosedForMissingOrCorruptEvidence(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +211,7 @@ func TestSchedulingProjectionQueriesFailClosedForMissingOrCorruptEvidence(t *tes
 }
 
 func TestSchedulingConcurrentSameRepositoryReservationHasOneWinner(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +257,7 @@ func TestSchedulingConcurrentSameRepositoryReservationHasOneWinner(t *testing.T)
 }
 
 func TestManualCreateRunCannotBypassRepositoryOrCapacityAuthority(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,7 +286,7 @@ func TestManualCreateRunCannotBypassRepositoryOrCapacityAuthority(t *testing.T) 
 }
 
 func TestSchedulingCapacityReductionDrainsWithoutCancellation(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +316,7 @@ func TestSchedulingCapacityReductionDrainsWithoutCancellation(t *testing.T) {
 }
 
 func TestSchedulingFutureRetryDoesNotBlockAvailableCapacity(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,7 +361,7 @@ func TestSchedulingFutureRetryDoesNotBlockAvailableCapacity(t *testing.T) {
 }
 
 func TestSchedulingHumanWaitRequiresLatestTransitionAttention(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -411,7 +411,7 @@ func TestSchedulingHumanWaitRequiresLatestTransitionAttention(t *testing.T) {
 
 func TestSchedulingRestartReconcilesSlotsAndReleasesSafeExternalWaitPermit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -429,7 +429,7 @@ func TestSchedulingRestartReconcilesSlotsAndReleasesSafeExternalWaitPermit(t *te
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path)
+	reopened, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,7 +445,7 @@ func TestSchedulingRestartReconcilesSlotsAndReleasesSafeExternalWaitPermit(t *te
 }
 
 func TestSchedulingKeepsGitHubApprovalAsRunnableExternalWait(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -468,7 +468,7 @@ func TestSchedulingKeepsGitHubApprovalAsRunnableExternalWait(t *testing.T) {
 }
 
 func TestSchedulingCancellationIsolationReleasesOnlyTerminalSibling(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -509,7 +509,7 @@ func TestSchedulingCancellationIsolationReleasesOnlyTerminalSibling(t *testing.T
 }
 
 func TestHeavyPermitOwnerMismatchRequiresExclusiveSupervisorFencing(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -537,7 +537,7 @@ func TestHeavyPermitOwnerMismatchRequiresExclusiveSupervisorFencing(t *testing.T
 }
 
 func TestHeavyPermitAdoptionWaitsForLiveManualRunLease(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -564,7 +564,7 @@ func TestHeavyPermitAdoptionWaitsForLiveManualRunLease(t *testing.T) {
 }
 
 func TestHeavyPermitFirstCreationRequiresStartedAttemptReconciliation(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -597,7 +597,7 @@ func TestHeavyPermitFirstCreationRequiresStartedAttemptReconciliation(t *testing
 }
 
 func TestSchedulingProjectsLiveRunLeaseExpiryAsRestartWake(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -622,7 +622,7 @@ func TestSchedulingProjectsLiveRunLeaseExpiryAsRestartWake(t *testing.T) {
 }
 
 func TestQuarantinedRunRetainsFailClosedSchedulingAuthority(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -671,7 +671,7 @@ func TestQuarantinedRunRetainsFailClosedSchedulingAuthority(t *testing.T) {
 }
 
 func TestAutomaticRunMissingSchedulingRowFailsClosed(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -695,7 +695,7 @@ func TestAutomaticRunMissingSchedulingRowFailsClosed(t *testing.T) {
 
 func TestPreConcurrencySchemaRefusesConcurrencyDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -717,7 +717,7 @@ func TestPreConcurrencySchemaRefusesConcurrencyDatabase(t *testing.T) {
 	if legacy, err := openWithSupportedSchema(path, 28); err == nil {
 		legacy.Close()
 		t.Fatal("pre-concurrency schema reader accepted concurrency database")
-	} else if !strings.Contains(err.Error(), "database schema version 30 is newer than supported 28") {
+	} else if !strings.Contains(err.Error(), "database schema version 31 is newer than supported 28") {
 		t.Fatalf("compatibility error=%v", err)
 	}
 	db, err := sql.Open("sqlite", sqliteDSN(path))
@@ -726,7 +726,7 @@ func TestPreConcurrencySchemaRefusesConcurrencyDatabase(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 30 {
+	if err := db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 31 {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	if version <= 28 {

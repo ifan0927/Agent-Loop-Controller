@@ -12,7 +12,7 @@ import (
 
 func TestCIWaitPersistsFirstObservationWarnsOnceAndSeparatesHeads(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func TestCIWaitPersistsFirstObservationWarnsOnceAndSeparatesHeads(t *testing.T) 
 		t.Fatal(err)
 	}
 	store.Close()
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -49,6 +49,7 @@ type LinearAdmissionService struct {
 	resolver LinearAdmissionRepositoryResolver
 	store    LinearAdmissionStore
 	commands CommandService
+	gate     NewAdmissionGate
 }
 
 func NewLinearAdmissionService(reader LinearIssueReader, resolver LinearAdmissionRepositoryResolver, store LinearAdmissionStore, controller LocalRunController) (*LinearAdmissionService, error) {
@@ -58,9 +59,28 @@ func NewLinearAdmissionService(reader LinearIssueReader, resolver LinearAdmissio
 	return &LinearAdmissionService{reader: reader, resolver: resolver, store: store, commands: NewCommandService(controller, store)}, nil
 }
 
+func NewGatedLinearAdmissionService(reader LinearIssueReader, resolver LinearAdmissionRepositoryResolver, store LinearAdmissionStore, controller LocalRunController, gate NewAdmissionGate) (*LinearAdmissionService, error) {
+	service, err := NewLinearAdmissionService(reader, resolver, store, controller)
+	if err != nil {
+		return nil, err
+	}
+	if gate == nil {
+		return nil, errors.New("new-admission convergence gate is required")
+	}
+	service.gate = gate
+	return service, nil
+}
+
 func (s *LinearAdmissionService) Start(ctx context.Context, command LinearStartCommand) (CommandResult, []LinearRequestObservation, error) {
 	if strings.TrimSpace(command.Identifier) == "" {
 		return CommandResult{}, nil, serviceError(ErrorInvalidInput, "Linear issue identifier is required", nil)
+	}
+	if s.gate == nil {
+		return CommandResult{}, nil, serviceError(ErrorConflict, "new admission is fenced", nil)
+	}
+	decision, err := s.gate.CheckNewAdmission(ctx)
+	if err != nil || !decision.Allowed {
+		return CommandResult{}, nil, serviceError(ErrorConflict, "new admission is fenced", nil)
 	}
 	source, observations, err := s.reader.ReadIssue(ctx, command.Identifier)
 	if err != nil {
@@ -83,10 +103,14 @@ func (s *LinearAdmissionService) Start(ctx context.Context, command LinearStartC
 			return CommandResult{}, observations, err
 		}
 	}
+	decision, err = s.gate.CheckNewAdmission(ctx)
+	if err != nil || !decision.Allowed || !decision.Authority.Valid() {
+		return CommandResult{}, observations, serviceError(ErrorConflict, "new admission is fenced", nil)
+	}
 
 	input := LocalStartInput{Task: snapshot.Task, RawIssueJSON: snapshot.RawJSON, RawIssueHash: snapshot.RawHash,
 		NormalizedJSON: snapshot.NormalizedJSON, TaskHash: snapshot.TaskHash, IdempotencyKey: snapshot.IdempotencyKey,
-		Repository: repository, RunRoot: repository.RunRoot, WorktreeRoot: repository.WorktreeRoot}
+		Repository: repository, RunRoot: repository.RunRoot, WorktreeRoot: repository.WorktreeRoot, ConfigurationAuthority: decision.Authority}
 	result, err := s.commands.Start(ctx, StartCommand{Requester: command.Requester, RepositorySelection: repository.CanonicalRepository, IdempotencyKey: snapshot.IdempotencyKey, Input: input})
 	if err != nil {
 		// A concurrent trigger can create the run after the preflight above. Read

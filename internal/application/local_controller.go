@@ -59,15 +59,16 @@ type TrustedActorIdentity struct {
 }
 
 type LocalStartInput struct {
-	Task           domain.CodingTask
-	RawIssueJSON   []byte
-	RawIssueHash   string
-	NormalizedJSON []byte
-	TaskHash       string
-	IdempotencyKey string
-	Repository     LocalRepository
-	RunRoot        string
-	WorktreeRoot   string
+	Task                   domain.CodingTask
+	RawIssueJSON           []byte
+	RawIssueHash           string
+	NormalizedJSON         []byte
+	TaskHash               string
+	IdempotencyKey         string
+	Repository             LocalRepository
+	RunRoot                string
+	WorktreeRoot           string
+	ConfigurationAuthority ConfigurationAdmissionAuthority
 }
 
 type Decision struct {
@@ -315,7 +316,7 @@ func (c *LocalController) StartAuthorized(ctx context.Context, input LocalStartI
 	if err != nil {
 		return Run{}, err
 	}
-	run, created, err := c.store.CreateRun(ctx, CreateRunInput{Run: runInput})
+	run, created, err := c.store.CreateRun(ctx, CreateRunInput{Run: runInput, ConfigurationAuthority: input.ConfigurationAuthority})
 	if err != nil {
 		return Run{}, err
 	}

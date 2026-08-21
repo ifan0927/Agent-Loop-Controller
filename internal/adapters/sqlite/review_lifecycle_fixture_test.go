@@ -11,6 +11,7 @@ import (
 	"time"
 
 	sqlitestore "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite/sqlitetest"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
@@ -149,21 +150,28 @@ type lifecycleFixture struct {
 	validator   fixtureValidator
 	operator    application.Requester
 	repository  application.LocalRepository
+	authority   application.ConfigurationAdmissionAuthority
 }
 
 func newLifecycleFixture(t *testing.T, roots int) *lifecycleFixture {
 	t.Helper()
 	ctx := context.Background()
-	store, err := sqlitestore.Open(filepath.Join(t.TempDir(), "controller.db"))
+	databasePath := filepath.Join(t.TempDir(), "controller.db")
+	store, err := sqlitestore.Open(databasePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
+	authority, err := sqlitetest.EstablishReadyConfigurationAuthority(ctx, store, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	repo := fixtureRepository()
 	controller := &fixtureController{store: store, repairedHead: fixtureSHA('b')}
 	source := fixtureLinearSource()
 	reader := &fixtureLinearReader{source: source}
-	admission, err := application.NewLinearAdmissionService(reader, fixtureResolver{repository: repo}, store, controller)
+	gate := application.StaticNewAdmissionGate{Decision: application.NewAdmissionDecision{Allowed: true, Reason: application.ConfigurationReasonReady, Authority: authority}}
+	admission, err := application.NewGatedLinearAdmissionService(reader, fixtureResolver{repository: repo}, store, controller, gate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,12 +212,13 @@ func newLifecycleFixture(t *testing.T, roots int) *lifecycleFixture {
 	gh.runID = run.ID
 	replies := &fixtureReplies{reader: gh}
 	merger := &fixtureMerger{reader: gh}
-	return &lifecycleFixture{store: store, controller: controller, coordinator: coordinator, run: run, reader: gh, replies: replies, merger: merger, validator: fixtureValidator{}, operator: operator, repository: repo}
+	return &lifecycleFixture{store: store, controller: controller, coordinator: coordinator, run: run, reader: gh, replies: replies, merger: merger, validator: fixtureValidator{}, operator: operator, repository: repo, authority: authority}
 }
 
 func (f *lifecycleFixture) restart(t *testing.T) {
 	t.Helper()
-	admission, err := application.NewLinearAdmissionService(&fixtureLinearReader{source: fixtureLinearSource()}, fixtureResolver{repository: f.repository}, f.store, f.controller)
+	gate := application.StaticNewAdmissionGate{Decision: application.NewAdmissionDecision{Allowed: true, Reason: application.ConfigurationReasonReady, Authority: f.authority}}
+	admission, err := application.NewGatedLinearAdmissionService(&fixtureLinearReader{source: fixtureLinearSource()}, fixtureResolver{repository: f.repository}, f.store, f.controller, gate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +302,7 @@ func (c *fixtureController) StartAuthorized(ctx context.Context, input applicati
 	if err != nil {
 		return application.Run{}, err
 	}
-	returned, _, err := c.store.CreateRun(ctx, application.CreateRunInput{Run: application.Run{ID: input.Task.RunID, IssueID: input.Task.IssueID, IdempotencyKey: input.IdempotencyKey, SourceRevision: input.Task.SourceRevision, RawIssueJSON: string(input.RawIssueJSON), RawIssueHash: input.RawIssueHash, NormalizedTaskJSON: string(input.NormalizedJSON), TaskHash: input.TaskHash, Repository: input.Task.Repository, RepositoryConfigJSON: string(config), ProfileID: input.Repository.ProfileID, ProfileSnapshotVersion: input.Repository.ProfileSnapshotVersion, ProfileDigest: input.Repository.ProfileDigest, ProfileSnapshotJSON: input.Repository.ProfileSnapshotJSON, RegistryVersion: input.Repository.RegistryVersion, RegistryDigest: input.Repository.RegistryDigest, RepositoryBindingDigest: input.Repository.RepositoryBindingDigest, BaseBranch: input.Task.BaseBranch, WorkingBranch: input.Task.WorkingBranch, WorktreePath: filepath.Join(input.WorktreeRoot, input.Task.RunID), ArtifactRoot: filepath.Join(input.RunRoot, input.Task.RunID)}})
+	returned, _, err := c.store.CreateRun(ctx, application.CreateRunInput{Run: application.Run{ID: input.Task.RunID, IssueID: input.Task.IssueID, IdempotencyKey: input.IdempotencyKey, SourceRevision: input.Task.SourceRevision, RawIssueJSON: string(input.RawIssueJSON), RawIssueHash: input.RawIssueHash, NormalizedTaskJSON: string(input.NormalizedJSON), TaskHash: input.TaskHash, Repository: input.Task.Repository, RepositoryConfigJSON: string(config), ProfileID: input.Repository.ProfileID, ProfileSnapshotVersion: input.Repository.ProfileSnapshotVersion, ProfileDigest: input.Repository.ProfileDigest, ProfileSnapshotJSON: input.Repository.ProfileSnapshotJSON, RegistryVersion: input.Repository.RegistryVersion, RegistryDigest: input.Repository.RegistryDigest, RepositoryBindingDigest: input.Repository.RepositoryBindingDigest, BaseBranch: input.Task.BaseBranch, WorkingBranch: input.Task.WorkingBranch, WorktreePath: filepath.Join(input.WorktreeRoot, input.Task.RunID), ArtifactRoot: filepath.Join(input.RunRoot, input.Task.RunID)}, ConfigurationAuthority: input.ConfigurationAuthority})
 	return returned, err
 }
 func (c *fixtureController) ContinueExpected(ctx context.Context, runID string, _ domain.State, _ string, _ *application.Decision) (application.Run, error) {

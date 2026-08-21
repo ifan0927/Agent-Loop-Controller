@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/bootstrap"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/codex"
 	processadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/process"
 	storeadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite"
@@ -28,7 +27,7 @@ import (
 // composition to recover. The Linear ports and driver are controlled offline
 // adapters; no external service is contacted.
 func TestOfflineAcceptanceWorkerRestartPreservesRetryAndParksAtDurableAttention(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	root := resolvedTempDir(t)
@@ -41,7 +40,7 @@ func TestOfflineAcceptanceWorkerRestartPreservesRetryAndParksAtDurableAttention(
 	defer linearServer.Close()
 	rewriteRetryFixtureLinearURL(t, configPath, linearServer.URL+"/graphql")
 	t.Setenv("IFAN_LOOP_LINEAR_TOKEN", "fixture-credential")
-	loaded, err := bootstrap.Load(configPath)
+	loaded, err := loadManagedConfiguration(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +284,7 @@ func newAcceptanceRetryWorkerFixture(t *testing.T, store *storeadapter.Store, re
 	verification := acceptanceRetryVerifier{git: gitFixture}
 	controller := application.NewLocalController(store, worktrees, codexFixture, verification, gitFixture, "fixture-codex", repository.WorktreeRoot)
 	driver := &acceptanceRetryDriver{store: store, controller: controller, codex: codexFixture}
-	dispatcher, err := newAcceptanceRetryDispatcher(scanner, reader, starter, store, controller, driver, repository, owner)
+	dispatcher, err := newAcceptanceRetryDispatcher(t, scanner, reader, starter, store, controller, driver, repository, owner)
 	if err != nil {
 		return acceptanceRetryWorkerFixture{}, err
 	}
@@ -490,7 +489,7 @@ func (v acceptanceRetryVerifier) Run(_ context.Context, ids []string, _ string, 
 	return evidence, nil
 }
 
-func newAcceptanceRetryDispatcher(scanner application.LinearTodoCandidateScanner, reader application.LinearIssueReader, starter application.LinearReservedIssueStarter, store *storeadapter.Store, controller application.LocalRunController, driver application.LinearTodoDispatchDriver, repository application.LocalRepository, owner string) (*application.LinearTodoDispatcher, error) {
+func newAcceptanceRetryDispatcher(t *testing.T, scanner application.LinearTodoCandidateScanner, reader application.LinearIssueReader, starter application.LinearReservedIssueStarter, store *storeadapter.Store, controller application.LocalRunController, driver application.LinearTodoDispatchDriver, repository application.LocalRepository, owner string) (*application.LinearTodoDispatcher, error) {
 	requester := application.Requester{ID: "operator", Kind: "github_login"}
 	if len(repository.AllowedOperatorLogins) > 0 {
 		requester.ID = repository.AllowedOperatorLogins[0]
@@ -508,5 +507,6 @@ func newAcceptanceRetryDispatcher(scanner application.LinearTodoCandidateScanner
 		Requester:          requester,
 		AttentionProfile:   application.OperatorAttentionProfile{ID: "offline", Name: "offline-retry-fixture"},
 		Retry:              application.AutomaticRetryPolicy{MaxAttempts: 1, InitialDelay: time.Second, MaximumDelay: time.Second},
+		AdmissionGate:      testExistingNewAdmissionGate(t, store),
 	})
 }

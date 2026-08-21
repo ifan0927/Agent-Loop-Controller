@@ -5,15 +5,19 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/bootstrap"
+	configurationadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/configuration"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/localissue"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/localregistry"
 	sqlitestore "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite"
@@ -176,6 +180,45 @@ func TestLocalCommandsAcceptDocumentedLeadingRunID(t *testing.T) {
 	}
 }
 
+func TestLocalStartInjectsDevelopmentFixtureConfigurationAuthority(t *testing.T) {
+	falseBinary, err := exec.LookPath("false")
+	if err != nil {
+		t.Skip("false executable is unavailable")
+	}
+	lab := resolvedTempDir(t)
+	command := exec.Command(filepath.Join("..", "..", "scripts", "create-local-lab.sh"), lab)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("create local lab: %v: %s", err, output)
+	}
+	err = localStart([]string{
+		"--issue", filepath.Join(lab, "simulated-issue.json"),
+		"--registry", filepath.Join(lab, "repository-registry.json"),
+		"--db", filepath.Join(lab, "controller.db"),
+		"--repository", "fixture-owner/test-project",
+		"--requester", "fixture-operator",
+		"--requester-database-id", "1",
+		"--requester-node-id", "MDQ6VXNlcjE=",
+		"--requester-type", "User",
+		"--codex-binary", falseBinary,
+	})
+	if err == nil {
+		t.Fatal("false Codex fixture unexpectedly completed")
+	}
+	store, openErr := sqlitestore.Open(filepath.Join(lab, "controller.db"))
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	defer store.Close()
+	authority, found, authorityErr := store.ConfigurationAuthority(context.Background())
+	if authorityErr != nil || !found || authority.CanonicalConfigPath != filepath.Join(lab, "controller.db.test-controller.json") {
+		t.Fatalf("authority=%+v found=%t err=%v", authority, found, authorityErr)
+	}
+	runs, listErr := store.ListNonterminalRuns(context.Background())
+	if listErr != nil || len(runs) != 1 {
+		t.Fatalf("runs=%+v err=%v local start err=%v", runs, listErr, err)
+	}
+}
+
 func TestNormalizeControllerDatabasePathAcceptsRelativeCLIPath(t *testing.T) {
 	path, err := normalizeControllerDatabasePath("./controller.db")
 	if err != nil {
@@ -264,7 +307,7 @@ func TestLocalContinueAuthorizesBeforeRegistryRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	authority, _ := json.Marshal(application.LocalRepository{AllowedOperatorLogins: []string{"ifan0927"}})
-	_, _, err = store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: "run-auth-first", IdempotencyKey: "key", Repository: "owner/repo", RepositoryConfigJSON: string(authority)}})
+	_, _, err = store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: "run-auth-first", IdempotencyKey: "key", Repository: "owner/repo", RepositoryConfigJSON: string(authority)}, ConfigurationAuthority: testConfigurationAuthority(t, store, path)})
 	store.Close()
 	if err != nil {
 		t.Fatal(err)
@@ -282,7 +325,7 @@ func TestLocalContinueRejectsCallerRepositoryBeforeRegistryRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	authority, _ := json.Marshal(application.LocalRepository{AllowedOperatorLogins: []string{"ifan0927"}})
-	_, _, err = store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: "run-repository", IdempotencyKey: "key", Repository: "owner/repo", RepositoryConfigJSON: string(authority)}})
+	_, _, err = store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: "run-repository", IdempotencyKey: "key", Repository: "owner/repo", RepositoryConfigJSON: string(authority)}, ConfigurationAuthority: testConfigurationAuthority(t, store, path)})
 	store.Close()
 	if err != nil {
 		t.Fatal(err)
@@ -316,6 +359,7 @@ func TestLocalStatusOutputsDurableInspection(t *testing.T) {
 	}
 	authority, _ := json.Marshal(application.LocalRepository{AllowedOperatorLogins: []string{"ifan0927"}})
 	input := application.CreateRunInput{Run: application.Run{ID: "run-1", IssueID: "ISSUE-1", IdempotencyKey: "key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw-hash", NormalizedTaskJSON: "{}", TaskHash: "task-hash", Repository: "repo:test-project", RepositoryConfigJSON: string(authority), BaseBranch: "main", WorkingBranch: "ifan/test", ArtifactRoot: "/tmp/run", ImplementationModel: "gpt-5.6-terra", ReviewModel: "gpt-5.6-sol"}}
+	input.ConfigurationAuthority = testConfigurationAuthority(t, store, path)
 	if _, _, err := store.CreateRun(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}
@@ -350,13 +394,16 @@ func TestControllerStatusProjectsIdempotencyKeyOnlyToAuthorizedOperator(t *testi
 		t.Fatal(err)
 	}
 	configPath, dbPath := writeControllerStatusConfig(t, root)
+	if _, err := loadManagedConfiguration(configPath); err != nil {
+		t.Fatal(err)
+	}
 	store, err := sqlitestore.Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	authority, _ := json.Marshal(application.LocalRepository{AllowedOperatorLogins: []string{"ifan0927"}, TrustedOperatorActors: []application.TrustedActorIdentity{{DatabaseID: 33, NodeID: "MDQ6VXNlcjMz", Login: "ifan0927", Type: "User"}}})
 	run := application.Run{ID: "run-status", IssueID: "IFAN-18", IdempotencyKey: "resume-key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: string(authority), BaseBranch: "main", WorkingBranch: "ifan/ifan-18"}
-	if _, _, err := store.CreateRun(context.Background(), application.CreateRunInput{Run: run}); err != nil {
+	if _, _, err := store.CreateRun(context.Background(), application.CreateRunInput{Run: run, ConfigurationAuthority: testExistingNewAdmissionGate(t, store).Decision.Authority}); err != nil {
 		store.Close()
 		t.Fatal(err)
 	}
@@ -430,6 +477,314 @@ func writeControllerStatusConfig(t *testing.T, root string) (configPath, dbPath 
 	return configPath, dbPath
 }
 
+func TestManagedConfigurationUsesTrustedLocatorAfterLiveDrift(t *testing.T) {
+	root := resolvedTempDir(t)
+	configPath, databasePath := writeControllerStatusConfig(t, root)
+	baseline, err := loadManagedConfiguration(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baseline.Controller.DatabasePath != databasePath {
+		t.Fatalf("baseline database=%q", baseline.Controller.DatabasePath)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":99,"controller":{"database_path":"/tmp/attacker.db"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	retained, err := loadManagedConfiguration(configPath)
+	if err != nil || retained.Digest != baseline.Digest || retained.Controller.DatabasePath != databasePath {
+		t.Fatalf("retained=%+v err=%v", retained, err)
+	}
+	store, err := sqlitestore.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	authority, found, err := store.ConfigurationAuthority(context.Background())
+	if err != nil || !found || authority.Desired.Digest != baseline.Digest || authority.CanonicalConfigPath != configPath {
+		t.Fatalf("authority=%+v found=%t err=%v", authority, found, err)
+	}
+}
+
+func TestManualSupervisorHeartbeatMakesAdmissionReadyWhileHoldingWorkerLock(t *testing.T) {
+	root := resolvedTempDir(t)
+	configPath, databasePath := writeControllerStatusConfig(t, root)
+	loaded, err := loadManagedConfiguration(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := acquireWorkerProcessLock(filepath.Dir(databasePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	_, heartbeat, err := startManualControllerHeartbeat(context.Background(), loaded.Path, loaded.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer heartbeat.Stop()
+	store, err := sqlitestore.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	convergence, err := configuredConvergenceService(store, loaded, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := convergence.CheckNewAdmission(context.Background())
+	if err != nil || !decision.Allowed || decision.Reason != application.ConfigurationReasonReady || decision.Authority.Digest != loaded.Digest {
+		t.Fatalf("decision=%+v err=%v", decision, err)
+	}
+}
+
+func TestManagedConfigurationRejectsAlternatePathForOwnedStore(t *testing.T) {
+	root := resolvedTempDir(t)
+	configPath, _ := writeControllerStatusConfig(t, root)
+	if _, err := loadManagedConfiguration(configPath); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alternate := filepath.Join(root, "alternate.json")
+	if err := os.WriteFile(alternate, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadManagedConfiguration(alternate); err == nil || !strings.Contains(err.Error(), "locator conflicts") {
+		t.Fatalf("alternate path error=%v", err)
+	}
+}
+
+func TestManagedConfigurationRejectsUnsafeAuthorityAncestor(t *testing.T) {
+	root := resolvedTempDir(t)
+	configPath, _ := writeControllerStatusConfig(t, root)
+	if _, err := loadManagedConfiguration(configPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(root, "authority"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadManagedConfiguration(configPath); err == nil {
+		t.Fatal("managed configuration accepted a public authority ancestor")
+	}
+}
+
+func TestManagedStoreReopenRejectsDatabaseReplacementAfterConfigurationLoad(t *testing.T) {
+	root := resolvedTempDir(t)
+	configPath, databasePath := writeControllerStatusConfig(t, root)
+	loaded, err := loadManagedConfiguration(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(databasePath, filepath.Join(root, "proved.db")); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := sqlitestore.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replacement.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := openManagedConfigurationStore(loaded)
+	if store != nil {
+		store.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "store is unavailable") {
+		t.Fatalf("replacement reopen err=%v", err)
+	}
+	if _, _, bound, inspectErr := sqlitestore.InspectConfigurationBindingReadOnly(context.Background(), databasePath); inspectErr != nil || bound {
+		t.Fatalf("replacement binding accepted=%t err=%v", bound, inspectErr)
+	}
+}
+
+func TestManagedConfigurationFinishesBaselineAfterLocatorPublicationCrash(t *testing.T) {
+	root := resolvedTempDir(t)
+	configPath, databasePath := writeControllerStatusConfig(t, root)
+	loadedBeforeCrash, err := bootstrap.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := configurationadapter.NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := files.ValidateBaseline(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlitestore.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := files.BindDatabaseIdentity(databasePath, store.DatabaseIdentity()); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := files.RetainRaw(candidate.Digest, payload); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := files.PublishBaselineBinding(candidate); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.PrepareConfigurationBaseline(context.Background(), application.ConfigurationBaselineInput{Candidate: candidate, CanonicalConfigPath: configPath, ObservedAt: time.Now().UTC()}); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := files.PublishLocator(databasePath); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadManagedConfiguration(configPath)
+	if err != nil || loaded.Controller.DatabasePath != databasePath || loaded.Digest != loadedBeforeCrash.Digest {
+		t.Fatalf("loaded=%+v err=%v", loaded, err)
+	}
+	store, err = sqlitestore.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if authority, found, err := store.ConfigurationAuthority(context.Background()); err != nil || !found || authority.Desired.Digest != loaded.Digest {
+		t.Fatalf("authority=%+v found=%t err=%v", authority, found, err)
+	}
+}
+
+func TestManagedConfigurationResumesBaselineBindingBeforeDatabaseAnchor(t *testing.T) {
+	root := resolvedTempDir(t)
+	configPath, databasePath := writeControllerStatusConfig(t, root)
+	payload, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := configurationadapter.NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := files.ValidateBaseline(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlitestore.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := files.BindDatabaseIdentity(databasePath, store.DatabaseIdentity()); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := files.RetainRaw(candidate.Digest, payload); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := files.PublishBaselineBinding(candidate); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadManagedConfiguration(configPath)
+	if err != nil || loaded.Digest != candidate.Digest || loaded.Controller.DatabasePath != databasePath {
+		t.Fatalf("loaded=%+v err=%v", loaded, err)
+	}
+	store, err = sqlitestore.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if authority, found, err := store.ConfigurationAuthority(context.Background()); err != nil || !found || authority.Desired.Digest != candidate.Digest {
+		t.Fatalf("authority=%+v found=%t err=%v", authority, found, err)
+	}
+}
+
+func TestManagedConfigurationRejectsLiveRelocationAfterPreparedBaseline(t *testing.T) {
+	root := resolvedTempDir(t)
+	configPath, databasePath := writeControllerStatusConfig(t, root)
+	payload, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := configurationadapter.NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := files.ValidateBaseline(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlitestore.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := files.BindDatabaseIdentity(databasePath, store.DatabaseIdentity()); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := files.RetainRaw(candidate.Digest, payload); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := files.PublishBaselineBinding(candidate); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.PrepareConfigurationBaseline(context.Background(), application.ConfigurationBaselineInput{Candidate: candidate, CanonicalConfigPath: configPath, ObservedAt: time.Now().UTC()}); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var changed map[string]any
+	if err := json.Unmarshal(payload, &changed); err != nil {
+		t.Fatal(err)
+	}
+	attackerDatabase := filepath.Join(root, "attacker.db")
+	changed["controller"].(map[string]any)["database_path"] = attackerDatabase
+	changedPayload, err := json.Marshal(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, changedPayload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadManagedConfiguration(configPath); err == nil || !strings.Contains(err.Error(), "baseline binding conflicts") {
+		t.Fatalf("baseline relocation error=%v", err)
+	}
+	if _, err := os.Lstat(attackerDatabase); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("alternate database was created: %v", err)
+	}
+	boundConfig, boundDatabase, bound, err := sqlitestore.InspectConfigurationBindingReadOnly(context.Background(), databasePath)
+	if err != nil || !bound || boundConfig != configPath || boundDatabase != databasePath {
+		t.Fatalf("bound config=%q database=%q bound=%t err=%v", boundConfig, boundDatabase, bound, err)
+	}
+}
+
+func TestManagedConfigurationRejectsUnboundLocatorTarget(t *testing.T) {
+	root := resolvedTempDir(t)
+	configPath, _ := writeControllerStatusConfig(t, root)
+	attackerDatabase := filepath.Join(root, "attacker.db")
+	files, err := configurationadapter.NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := files.PublishLocator(attackerDatabase); err == nil {
+		t.Fatal("unbound locator target was published")
+	}
+	if _, err := os.Lstat(attackerDatabase); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("locator target was created: %v", err)
+	}
+}
+
 func TestLocalStatusRejectsUnauthorizedRequester(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
 	store, err := sqlitestore.Open(path)
@@ -437,7 +792,7 @@ func TestLocalStatusRejectsUnauthorizedRequester(t *testing.T) {
 		t.Fatal(err)
 	}
 	authority, _ := json.Marshal(application.LocalRepository{AllowedOperatorLogins: []string{"ifan0927"}})
-	_, _, err = store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: "run-auth", IdempotencyKey: "key", Repository: "owner/repo", RepositoryConfigJSON: string(authority)}})
+	_, _, err = store.CreateRun(context.Background(), application.CreateRunInput{Run: application.Run{ID: "run-auth", IdempotencyKey: "key", Repository: "owner/repo", RepositoryConfigJSON: string(authority)}, ConfigurationAuthority: testConfigurationAuthority(t, store, path)})
 	store.Close()
 	if err != nil {
 		t.Fatal(err)
@@ -461,6 +816,7 @@ func TestLocalInspectSanitizesRepositoryBinding(t *testing.T) {
 		GitHubInstallationID: 22, ExpectedRepositoryID: 33, AllowedOperatorLogins: []string{"ifan0927"}, TrustedOperatorActors: []application.TrustedActorIdentity{{DatabaseID: 33, NodeID: "MDQ6VXNlcjMz", Login: "ifan0927", Type: "User"}}}
 	raw, _ := json.Marshal(binding)
 	input := application.CreateRunInput{Run: application.Run{ID: "run-binding", IssueID: "ISSUE-2", IdempotencyKey: "binding-key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: string(raw), ProfileID: binding.ProfileID, ProfileSnapshotVersion: binding.ProfileSnapshotVersion, ProfileDigest: binding.ProfileDigest, ProfileSnapshotJSON: `{}`, RegistryVersion: 1, RegistryDigest: "registry-digest", RepositoryBindingDigest: "binding-digest", BaseBranch: "main", WorkingBranch: "ifan/test", WorktreePath: "/secret/run-worktree", ArtifactRoot: "/secret/artifact"}}
+	input.ConfigurationAuthority = testConfigurationAuthority(t, store, path)
 	if _, _, err := store.CreateRun(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}

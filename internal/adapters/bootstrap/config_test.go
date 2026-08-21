@@ -227,19 +227,65 @@ func TestLoadVersionFiveRequiresDistinctConfiguredOperatorAuthority(t *testing.T
 	}
 }
 
-func TestLoadVersionFourRemainsReadableWithoutControllerOperator(t *testing.T) {
+func TestLoadVersionFourDerivesDeterministicMigrationOperator(t *testing.T) {
 	root := canonicalTempDir(t)
 	configPath, _ := writeV2Fixture(t, root, "github-app-profile:fixture", 7)
 	config := readJSONFixture(t, configPath)
 	config["version"] = VersionFour
+	repository := config["repositories"].([]any)[0].(map[string]any)
+	policy := repository["operator_identity_policy"].(map[string]any)
+	policy["allowed_logins"] = []any{"zeta", "ifan0927"}
+	policy["trusted_actors"] = []any{
+		map[string]any{"database_id": 9, "node_id": "zeta-node", "login": "zeta", "type": "User"},
+		map[string]any{"database_id": 1, "node_id": "node", "login": "ifan0927", "type": "User"},
+	}
 	writeJSONFixture(t, configPath, config)
 
 	loaded, err := Load(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Version != VersionFour || loaded.Controller.Operator.Validate() == nil {
+	if loaded.Version != VersionFour || loaded.Controller.Operator.Validate() != nil || loaded.Controller.Operator.Login != "ifan0927" {
 		t.Fatalf("version=%d legacy operator=%+v", loaded.Version, loaded.Controller.Operator)
+	}
+}
+
+func TestLegacyMigrationOperatorNeverElevatesRepositoryOnlyActor(t *testing.T) {
+	root := canonicalTempDir(t)
+	repository := func(name, login string, databaseID int64) localregistry.Repository {
+		base := filepath.Join(root, name)
+		paths := []string{filepath.Join(base, "origin"), filepath.Join(base, "source"), filepath.Join(base, "runs"), filepath.Join(base, "worktrees")}
+		for _, path := range paths {
+			if err := os.MkdirAll(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return localregistry.Repository{Owner: "owner", Name: name, LinearLabel: name, OriginPath: paths[0], SourcePath: paths[1], RunRoot: paths[2], WorktreeRoot: paths[3], BaseBranch: "main", VerifierRegistryRef: "builtin:v1", VerifierIDs: []string{"fixture-go-test"}, GitHubAppProfileRef: "github-app-profile:fixture", GitHubAppID: 7, GitHubInstallationID: 8, ExpectedRepositoryID: databaseID + 100, OperatorIdentityPolicy: localregistry.OperatorIdentityPolicy{AllowedLogins: []string{login}, TrustedActors: []localregistry.TrustedActorIdentity{{DatabaseID: databaseID, NodeID: login + "-node", Login: login, Type: "User"}}}}
+	}
+	registry, err := localregistry.New([]localregistry.Repository{repository("repo-z", "zeta", 9), repository("repo-a", "alpha", 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operator, err := deriveLegacyConfiguredOperator(registry)
+	if err != nil || operator.Validate() == nil {
+		t.Fatalf("operator=%+v err=%v", operator, err)
+	}
+}
+
+func TestValidateCurrentBytesRejectsLegacyReadableSchema(t *testing.T) {
+	root := canonicalTempDir(t)
+	configPath, _ := writeV2Fixture(t, root, "github-app-profile:fixture", 7)
+	config := readJSONFixture(t, configPath)
+	config["version"] = VersionFour
+	payload, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateBytes(configPath, payload); err != nil {
+		t.Fatalf("legacy load validation failed: %v", err)
+	}
+	if _, err := ValidateCurrentBytes(configPath, payload); err == nil || !strings.Contains(err.Error(), "current schema") {
+		t.Fatalf("current apply validation error=%v", err)
 	}
 }
 

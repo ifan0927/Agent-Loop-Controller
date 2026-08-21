@@ -17,7 +17,7 @@ import (
 )
 
 func TestOperatorAttentionOutboxIsAppendOnlyIdempotentAndBounded(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestOperatorAttentionOutboxIsAppendOnlyIdempotentAndBounded(t *testing.T) {
 
 func TestOperatorAttentionOutboxConcurrentInsertAndSanitizedProjectionParity(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestOperatorAttentionOutboxConcurrentInsertAndSanitizedProjectionParity(t *
 
 func TestOperatorAttentionMigrationPreservesLegacyEvidenceAndNormalizesEnvelope(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,6 +127,7 @@ func TestOperatorAttentionMigrationPreservesLegacyEvidenceAndNormalizesEnvelope(
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE operator_attention_outbox`); err != nil {
 		t.Fatal(err)
 	}
+	removeConfigurationV31(t, store.db)
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE operator_actions`); err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +145,7 @@ func TestOperatorAttentionMigrationPreservesLegacyEvidenceAndNormalizesEnvelope(
 			t.Fatal(err)
 		}
 	}
-	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (23,24,25,26,27,28,29,30)`); err != nil {
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (23,24,25,26,27,28,29,30,31)`); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 7, 15, 4, 0, 0, 0, time.UTC)
@@ -159,7 +160,7 @@ func TestOperatorAttentionMigrationPreservesLegacyEvidenceAndNormalizesEnvelope(
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +199,7 @@ func TestOperatorAttentionMigrationPreservesLegacyEvidenceAndNormalizesEnvelope(
 
 func TestOperatorAttentionMigrationAcceptsFrozenLegacyProfileContract(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +224,8 @@ func TestOperatorAttentionMigrationAcceptsFrozenLegacyProfileContract(t *testing
 			t.Fatal(err)
 		}
 	}
-	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (23,24,25,26,27,28,29,30)`); err != nil {
+	removeConfigurationV31(t, store.db)
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (23,24,25,26,27,28,29,30,31)`); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 7, 15, 5, 0, 0, 0, time.UTC)
@@ -237,7 +239,7 @@ func TestOperatorAttentionMigrationAcceptsFrozenLegacyProfileContract(t *testing
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,7 +251,7 @@ func TestOperatorAttentionMigrationAcceptsFrozenLegacyProfileContract(t *testing
 }
 
 func TestManualInterventionReplayBindsTransitionInsteadOfMutableRunTimestamp(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

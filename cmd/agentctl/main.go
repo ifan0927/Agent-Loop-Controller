@@ -26,6 +26,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/localregistry"
 	processadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/process"
 	sqlitestore "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite"
+	sqlitefixture "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite/sqlitetest"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/verifier"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
@@ -149,7 +150,7 @@ func linearStart(args []string) error {
 	if err != nil {
 		return err
 	}
-	loaded, err := bootstrap.Load(path)
+	loaded, err := loadManagedConfiguration(path)
 	if err != nil {
 		return err
 	}
@@ -159,7 +160,7 @@ func linearStart(args []string) error {
 	}
 	defer supervisorLock.Close()
 	permitOwner := "direct:" + uuid.NewString()
-	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
+	store, err := openManagedConfigurationStore(loaded)
 	if err != nil {
 		return err
 	}
@@ -178,19 +179,34 @@ func linearStart(args []string) error {
 	if err != nil {
 		return err
 	}
-	service, err := application.NewLinearAdmissionService(reader, linearRegistryResolver{registry: loaded.Registry}, store, newLocalController(store, loaded.Controller.CodexBinary, ""))
+	heartbeatCtx, heartbeat, err := startManualControllerHeartbeat(context.Background(), loaded.Path, loaded.Digest)
 	if err != nil {
 		return err
 	}
-	ctx, cancel := localContext(loaded.Controller.RunTimeout)
+	defer heartbeat.Stop()
+	convergence, err := configuredConvergenceService(store, loaded, 0, false)
+	if err != nil {
+		return errors.New("configuration convergence authority is unavailable")
+	}
+	service, err := application.NewGatedLinearAdmissionService(reader, linearRegistryResolver{registry: loaded.Registry}, store, newLocalController(store, loaded.Controller.CodexBinary, ""), convergence)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(heartbeatCtx, loaded.Controller.RunTimeout)
 	defer cancel()
 	ctx = application.WithHeavyPermitOwner(ctx, permitOwner)
 	result, _, err := service.Start(ctx, application.LinearStartCommand{Requester: requesterIdentity.value(), Identifier: identifier})
 	if err != nil {
+		if heartbeatErr := heartbeat.Stop(); heartbeatErr != nil {
+			return heartbeatErr
+		}
 		return err
 	}
 	if _, err := store.ReconcileSchedulingAuthorities(context.Background(), time.Now().UTC()); err != nil {
 		return errors.New("controller scheduling authority could not be settled")
+	}
+	if err := heartbeat.Stop(); err != nil {
+		return err
 	}
 	return printJSON(result.Run)
 }
@@ -224,7 +240,7 @@ func controllerRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	loaded, err := bootstrap.Load(path)
+	loaded, err := loadManagedConfiguration(path)
 	if err != nil {
 		return err
 	}
@@ -234,7 +250,7 @@ func controllerRun(args []string) error {
 	}
 	defer supervisorLock.Close()
 	policy.HeavyPermitOwner = "direct:" + uuid.NewString()
-	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
+	store, err := openManagedConfigurationStore(loaded)
 	if err != nil {
 		return err
 	}
@@ -253,15 +269,27 @@ func controllerRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	admission, err := application.NewLinearAdmissionService(reader, linearRegistryResolver{registry: loaded.Registry}, store, newLocalController(store, loaded.Controller.CodexBinary, ""))
+	heartbeatCtx, heartbeat, err := startManualControllerHeartbeat(context.Background(), loaded.Path, loaded.Digest)
 	if err != nil {
 		return err
 	}
-	startCtx, cancelStart := localContext(loaded.Controller.RunTimeout)
+	defer heartbeat.Stop()
+	convergence, err := configuredConvergenceService(store, loaded, 0, false)
+	if err != nil {
+		return errors.New("configuration convergence authority is unavailable")
+	}
+	admission, err := application.NewGatedLinearAdmissionService(reader, linearRegistryResolver{registry: loaded.Registry}, store, newLocalController(store, loaded.Controller.CodexBinary, ""), convergence)
+	if err != nil {
+		return err
+	}
+	startCtx, cancelStart := context.WithTimeout(heartbeatCtx, loaded.Controller.RunTimeout)
 	startCtx = application.WithHeavyPermitOwner(startCtx, policy.HeavyPermitOwner)
 	started, _, err := admission.Start(startCtx, application.LinearStartCommand{Requester: requester.value(), Identifier: identifier})
 	cancelStart()
 	if err != nil {
+		if heartbeatErr := heartbeat.Stop(); heartbeatErr != nil {
+			return heartbeatErr
+		}
 		return err
 	}
 	if _, err := store.ReconcileSchedulingAuthorities(context.Background(), time.Now().UTC()); err != nil {
@@ -271,12 +299,18 @@ func controllerRun(args []string) error {
 	// result, but make the restart-safe run ID available while it waits for
 	// external checks or the configured human operator's approval.
 	fmt.Fprintf(os.Stderr, "automatic delivery driver started for run %s\n", started.Run.RunID)
-	driveCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	driveCtx, stop := signal.NotifyContext(heartbeatCtx, os.Interrupt)
 	defer stop()
 	driveCtx, cancelDrive := context.WithTimeout(driveCtx, *maxRuntime)
 	defer cancelDrive()
 	result, err := driveProductionRun(driveCtx, loaded, store, requester.value(), started.Run.RunID, policy)
 	if err != nil {
+		if heartbeatErr := heartbeat.Stop(); heartbeatErr != nil {
+			return heartbeatErr
+		}
+		return err
+	}
+	if err := heartbeat.Stop(); err != nil {
 		return err
 	}
 	return printJSON(result)
@@ -310,7 +344,7 @@ func controllerDrive(args []string) error {
 	if err != nil {
 		return err
 	}
-	loaded, err := bootstrap.Load(path)
+	loaded, err := loadManagedConfiguration(path)
 	if err != nil {
 		return err
 	}
@@ -320,7 +354,7 @@ func controllerDrive(args []string) error {
 	}
 	defer supervisorLock.Close()
 	policy.HeavyPermitOwner = "direct:" + uuid.NewString()
-	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
+	store, err := openManagedConfigurationStore(loaded)
 	if err != nil {
 		return err
 	}
@@ -461,11 +495,11 @@ func controllerInspect(command string, args []string) error {
 	if err != nil {
 		return err
 	}
-	loaded, err := bootstrap.Load(path)
+	loaded, err := loadManagedConfiguration(path)
 	if err != nil {
 		return err
 	}
-	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
+	store, err := openManagedConfigurationStore(loaded)
 	if err != nil {
 		return err
 	}
@@ -482,9 +516,10 @@ func controllerInspect(command string, args []string) error {
 }
 
 func configuredQueryService(loaded bootstrap.Bootstrap, store application.QueryStore) (application.QueryService, error) {
-	if loaded.Controller.Operator.Validate() != nil {
+	if loaded.Version != bootstrap.CurrentVersion || loaded.Controller.Operator.Validate() != nil {
 		// Versions 1 through 4 remain readable through the legacy CLI boundary.
-		// They do not grant the version-5 controller scope.
+		// Their derived migration operator authorizes configuration transition
+		// only; it does not retroactively change historical query authority.
 		return application.NewQueryService(store), nil
 	}
 	authorizer, err := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: loaded.Controller.Operator})
@@ -654,11 +689,11 @@ func controllerAbandon(args []string) error {
 	if err != nil {
 		return err
 	}
-	loaded, err := bootstrap.Load(path)
+	loaded, err := loadManagedConfiguration(path)
 	if err != nil {
 		return err
 	}
-	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
+	store, err := openManagedConfigurationStore(loaded)
 	if err != nil {
 		return err
 	}
@@ -918,11 +953,11 @@ func productionCommandWithDecision(args []string, name string, allowDecision boo
 	if err != nil {
 		return productionCLICommand{}, bootstrap.Bootstrap{}, nil, err
 	}
-	loaded, err := bootstrap.Load(path)
+	loaded, err := loadManagedConfiguration(path)
 	if err != nil {
 		return productionCLICommand{}, bootstrap.Bootstrap{}, nil, err
 	}
-	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
+	store, err := openManagedConfigurationStore(loaded)
 	if err != nil {
 		return productionCLICommand{}, bootstrap.Bootstrap{}, nil, err
 	}
@@ -1015,11 +1050,11 @@ func githubRead(args []string) error {
 	if err != nil {
 		return err
 	}
-	loaded, err := bootstrap.Load(path)
+	loaded, err := loadManagedConfiguration(path)
 	if err != nil {
 		return err
 	}
-	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
+	store, err := openManagedConfigurationStore(loaded)
 	if err != nil {
 		return err
 	}
@@ -1205,13 +1240,17 @@ func localStart(args []string) error {
 	if err := store.AuthorizeHeavyPermitAdoption(permitOwner); err != nil {
 		return errors.New("local supervisor fencing is unavailable")
 	}
+	configurationAuthority, err := sqlitefixture.EstablishReadyFixtureConfigurationAuthority(context.Background(), store, normalizedDBPath)
+	if err != nil {
+		return errors.New("local fixture configuration authority is unavailable")
+	}
 	controller := newLocalController(store, *codexBinary, repo.WorktreeRoot)
 	ctx, cancel := localContext(*timeout)
 	defer cancel()
 	ctx = application.WithManualHeavyPermitOwner(ctx, permitOwner)
 	input := application.LocalStartInput{Task: snapshot.Task, RawIssueJSON: snapshot.RawJSON, RawIssueHash: snapshot.RawHash,
 		NormalizedJSON: snapshot.NormalizedJSON, TaskHash: snapshot.TaskHash, IdempotencyKey: snapshot.IdempotencyKey,
-		Repository: localRepository(repo), RunRoot: repo.RunRoot, WorktreeRoot: repo.WorktreeRoot}
+		Repository: localRepository(repo), RunRoot: repo.RunRoot, WorktreeRoot: repo.WorktreeRoot, ConfigurationAuthority: configurationAuthority}
 	result, err := application.NewCommandService(controller, store).Start(ctx, application.StartCommand{Requester: requesterIdentity.value(), RepositorySelection: snapshot.Task.Repository, IdempotencyKey: snapshot.IdempotencyKey, Input: input})
 	if err != nil {
 		return err

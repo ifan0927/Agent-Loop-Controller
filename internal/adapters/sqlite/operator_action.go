@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
@@ -412,11 +411,7 @@ func validOperatorActionDigest(value string) bool {
 }
 
 func operatorActionSQLiteBusy(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "database is locked") || strings.Contains(message, "sqlite_busy")
+	return sqliteBusy(err)
 }
 
 func waitOperatorActionRetry(ctx context.Context, attempt int) error {

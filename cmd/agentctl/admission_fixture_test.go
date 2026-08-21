@@ -15,6 +15,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/codex"
 	processadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/process"
 	sqlitestore "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite/sqlitetest"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/verifier"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
@@ -29,11 +30,15 @@ func TestOfflineWorkerOnceConcurrencyHasOneSQLiteAdmission(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	store, err := sqlitestore.Open(t.TempDir() + "/controller.db")
+	databasePath := t.TempDir() + "/controller.db"
+	store, err := sqlitestore.Open(databasePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
+	if _, err := sqlitetest.EstablishReadyConfigurationAuthority(ctx, store, databasePath); err != nil {
+		t.Fatal(err)
+	}
 
 	repository := offlineAdmissionRepository(t)
 	candidate := offlineAdmissionCandidate()
@@ -154,11 +159,15 @@ waitForDriver:
 func TestOfflineBoundedWorkerDrivesTwoTemporaryRepositoriesAtCapacityTwo(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	store, err := sqlitestore.Open(filepath.Join(t.TempDir(), "controller.db"))
+	databasePath := filepath.Join(t.TempDir(), "controller.db")
+	store, err := sqlitestore.Open(databasePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
+	if _, err := sqlitetest.EstablishReadyConfigurationAuthority(ctx, store, databasePath); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := store.ConfigureHeavyCapacity(ctx, 2, offlineAdmissionDigest("capacity-two"), time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
@@ -275,11 +284,15 @@ func TestOfflineBoundedWorkerDrivesTwoTemporaryRepositoriesAtCapacityTwo(t *test
 
 func TestOfflineSQLiteAdmissionSelectsTotalOrderFromThreeCandidates(t *testing.T) {
 	ctx := context.Background()
-	store, err := sqlitestore.Open(t.TempDir() + "/controller.db")
+	databasePath := t.TempDir() + "/controller.db"
+	store, err := sqlitestore.Open(databasePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
+	if _, err := sqlitetest.EstablishReadyConfigurationAuthority(ctx, store, databasePath); err != nil {
+		t.Fatal(err)
+	}
 
 	first := offlineAdmissionCandidate()
 	first.Identifier, first.IssueSequence = "IFAN-41", 41
@@ -682,6 +695,19 @@ func newOfflineAdmissionDispatcher(scanner application.LinearTodoCandidateScanne
 }
 
 func newOfflineAdmissionDispatcherWithResolver(scanner application.LinearTodoCandidateScanner, reader application.LinearIssueReader, starter application.LinearReservedIssueStarter, store *sqlitestore.Store, controller application.LocalRunController, driver application.LinearTodoDispatchDriver, resolver application.LinearAdmissionRepositoryResolver, owner string) (*application.LinearTodoDispatcher, error) {
+	var gate application.NewAdmissionGate = application.AllowNewAdmissionForTest()
+	if authority, found, err := store.ConfigurationAuthority(context.Background()); err != nil {
+		return nil, err
+	} else if found {
+		if authority.EffectiveID != authority.Desired.GenerationID {
+			observed := time.Now().UTC()
+			authority, _, err = store.ObserveConfigurationEffective(context.Background(), application.ConfigurationEffectiveObservation{ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, WorkerInstanceID: "offline-fixture", BuildIdentity: "offline-fixture", ObservedAt: observed, EvidenceDigest: offlineAdmissionDigest("configuration-effective")})
+			if err != nil {
+				return nil, err
+			}
+		}
+		gate = application.StaticNewAdmissionGate{Decision: application.NewAdmissionDecision{Allowed: true, Reason: application.ConfigurationReasonReady, Authority: application.ConfigurationAdmissionAuthority{GenerationID: authority.Desired.GenerationID, Digest: authority.Desired.Digest, AuthorityVersion: authority.Version, ValidThrough: time.Now().UTC().Add(time.Hour)}}}
+	}
 	return application.NewLinearTodoDispatcher(scanner, reader, resolver, starter, store, controller, driver, application.LinearTodoDispatchPolicy{
 		CandidateAuthority: application.LinearTodoCandidateAuthority{TeamID: "123e4567-e89b-42d3-a456-426614174100", TeamKey: "IFAN", TodoState: offlineAdmissionTodoState, InProgressState: offlineAdmissionInProgressState, MaxCandidates: 10, MaxPages: 1},
 		StartAuthority:     application.LinearIssueStartAuthority{TeamID: "123e4567-e89b-42d3-a456-426614174100", TeamKey: "IFAN", TodoState: offlineAdmissionTodoState, InProgressState: offlineAdmissionInProgressState},
@@ -690,6 +716,7 @@ func newOfflineAdmissionDispatcherWithResolver(scanner application.LinearTodoCan
 		OwnerNonce:         owner,
 		Requester:          application.Requester{ID: "operator", Kind: "github_login"},
 		AttentionProfile:   application.OperatorAttentionProfile{ID: "offline", Name: "offline-fixture"},
+		AdmissionGate:      gate,
 	})
 }
 

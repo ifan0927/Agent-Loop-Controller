@@ -254,6 +254,10 @@ agentctl local start \
 
 All issue/registry/database/repository and complete requester flags are
 required. The caller selection must match the admitted fixture issue.
+`local start` establishes an explicit ready fixture configuration authority in
+that database and refuses to reuse an authority that was not created by this
+development fixture. Use a new disposable lab database; never point this
+development-only command at a production Controller store.
 
 The convenience script creates and retains a lab:
 
@@ -313,6 +317,7 @@ The acceptance matrix requires:
 | Boundary | Required evidence |
 | --- | --- |
 | Automatic admission | Bounded scan, priority selection, atomic run/slot/permit reservation, exact Todo-to-In-Progress mutation, and one nonterminal run per repository |
+| Configuration authority | Same-byte stable-root-flock-serialized filesystem binding/database-anchor/locator baseline crash matrix, trusted-ancestor and descendant-path replacement exclusion, private-leaf descriptor pinning across final directory sync plus post-sync owner/mode/link/path proof, initial private-directory parent-entry fsync and full-chain directory inode/mode proof, actual-VFS-fd exact-inode/private-mode proof including ABA replacement, idle reuse, pre/post transaction and row-consumption effects, and pool reconnect, post-reconcile operator reauthorization, accepted-receipt reconciliation, historical same-digest no-op replay and immediate effective correlation for an already-loaded historical digest, active-run Linear task-source compatibility, no-replace single-link publication, pre-anchor temp/raw recovery, retryable raw/binding/locator/prune directory durability, bounded forward migration, v31 migration, atomic no-op authority/receipt CAS, concurrent replay, intent-before-exchange crash matrix, captured-parent/exchange/cleanup fsync proof, durable prune claims plus serialized same-digest restaging, legacy non-elevation, manual-supervisor heartbeat, drift/effective convergence, development-fixture authority, and fail-closed direct plus automatic admission fencing |
 | Bounded concurrency | Generic capacity above two, same-repository exclusion, drain-on-reduction, sibling failure isolation, and restart reconstruction |
 | Implementation | Owned worktree, resumable session, exact candidate, successful verifier batch |
 | Internal review | Fresh independent read-only review bound to candidate head; after repair, exact expected-finding dispositions cover both repair and full branch deltas |
@@ -338,6 +343,10 @@ controller process. Cover at least:
 - verifier start/interruption and full batch recording;
 - fresh-review findings atomic handoff;
 - Linear admission mutation intent/observation;
+- configuration raw staging, filesystem baseline binding, database anchor,
+  locator publication, prune claim/removal, intent acceptance, captured-parent
+  exchange/fsync/reread, staged-leaf cleanup sync, same-digest receipt CAS,
+  desired settlement, effective observation, and retention pruning;
 - push, PR create/adopt, review reply, and merge intent/observation;
 - pending CI/approval/thread resolution polling;
 - Linear completion observation;
@@ -350,7 +359,7 @@ that bypass safety solely to make fault injection easier.
 ## Database Migrations
 
 SQLite migrations are ordered in `internal/adapters/sqlite/store.go`; the current
-schema version is 30. Opening a database applies missing forward migrations in a
+schema version is 31. Opening a database applies missing forward migrations in a
 transaction. A database newer than the binary fails closed.
 
 When adding a migration:

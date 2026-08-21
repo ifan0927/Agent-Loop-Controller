@@ -89,7 +89,8 @@ func TestFixtureLinearCompletionGateRejectsMissingOrMismatchedEvidence(t *testin
 
 func fixtureRunAwaitingLinearCompletion(t *testing.T) (*sqlitestore.Store, application.Run, application.MergeRecord) {
 	t.Helper()
-	store, err := sqlitestore.Open(filepath.Join(t.TempDir(), "controller.db"))
+	databasePath := filepath.Join(t.TempDir(), "controller.db")
+	store, err := sqlitestore.Open(databasePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,6 +111,7 @@ func fixtureRunAwaitingLinearCompletion(t *testing.T) (*sqlitestore.Store, appli
 		BaseSHA:              strings.Repeat("b", 40),
 		ArtifactRoot:         filepath.Join(t.TempDir(), "artifacts"),
 	}}
+	input.ConfigurationAuthority = testConfigurationAuthority(t, store, databasePath)
 	if _, _, err := store.CreateRun(ctx, input); err != nil {
 		store.Close()
 		t.Fatal(err)

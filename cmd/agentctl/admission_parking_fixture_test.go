@@ -24,6 +24,7 @@ func TestOfflineParkedDecisionSurvivesRestartAndAutomaticallyReturnsToDriver(t *
 	if err != nil {
 		t.Fatal(err)
 	}
+	testConfigurationAuthority(t, store, dbPath)
 	firstDriver := newOfflineAdmissionDriver()
 	firstDriver.release()
 	first := parkingDispatcher(t, store, repository, candidate, process, firstDriver, "parking-owner-one")

@@ -21,7 +21,7 @@ import (
 
 func TestGitHubV6EvidencePersistsMetadataWithoutSecrets(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestGitHubV6EvidencePersistsMetadataWithoutSecrets(t *testing.T) {
 }
 
 func TestRetryMergeSideEffectClaimsOnePolicyRetry(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestRetryMergeSideEffectClaimsOnePolicyRetry(t *testing.T) {
 }
 
 func TestRetryLinearIssueStartSideEffectClaimsOnlySecondAttempt(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestRetryLinearIssueStartSideEffectClaimsOnlySecondAttempt(t *testing.T) {
 }
 
 func TestLinearIssueStartExecutionClaimIsSingleOwner(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +191,7 @@ func TestLinearIssueStartExecutionClaimIsSingleOwner(t *testing.T) {
 }
 
 func TestRetryLinearIssueStartSideEffectHasOneWinner(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +237,7 @@ func TestRetryLinearIssueStartSideEffectHasOneWinner(t *testing.T) {
 }
 
 func TestRetryLinearIssueStartSideEffectRequiresExactConclusiveTodoResult(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,7 +265,7 @@ func TestRetryLinearIssueStartSideEffectRequiresExactConclusiveTodoResult(t *tes
 }
 
 func TestRecordMergePolicyPendingAtomicallyPersistsWaitAndTopology(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,7 +313,7 @@ func TestRecordMergePolicyPendingAtomicallyPersistsWaitAndTopology(t *testing.T)
 }
 
 func TestGitHubReadSuccessPersistsEvidenceAndGateTransitionAtomically(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -367,7 +367,7 @@ func TestGitHubReadSuccessPersistsEvidenceAndGateTransitionAtomically(t *testing
 
 func TestManualPRTargetDriftPersistsSanitizedConflictWithoutRewritingBinding(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -470,7 +470,7 @@ func TestManualPRTargetDriftPersistsSanitizedConflictWithoutRewritingBinding(t *
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -483,7 +483,7 @@ func TestManualPRTargetDriftPersistsSanitizedConflictWithoutRewritingBinding(t *
 
 type githubReadRows struct{ requests, installations, evidence, transitions int }
 
-func githubReadRowCounts(t *testing.T, store *Store, ctx context.Context, runID string) githubReadRows {
+func githubReadRowCounts(t *testing.T, store *admissionTestStore, ctx context.Context, runID string) githubReadRows {
 	t.Helper()
 	var counts githubReadRows
 	for _, query := range []struct {
@@ -503,7 +503,7 @@ func githubReadRowCounts(t *testing.T, store *Store, ctx context.Context, runID 
 }
 
 func TestGitHubReadSuccessRejectsTargetMismatchWithoutPartialWrites(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -554,7 +554,7 @@ func TestGitHubReadSuccessRejectsTargetMismatchWithoutPartialWrites(t *testing.T
 }
 
 func TestGitHubReadFailureRejectsMismatchedAuthorityWithoutWrites(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -595,7 +595,7 @@ func TestGitHubReadFailureRejectsMismatchedAuthorityWithoutWrites(t *testing.T) 
 }
 
 func TestGitHubReadAtomicallySelectsTrustedFeedbackWithRepairTransition(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -637,7 +637,7 @@ func TestGitHubReadAtomicallySelectsTrustedFeedbackWithRepairTransition(t *testi
 }
 
 func TestMigrationAndRunIdempotency(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -670,7 +670,7 @@ func TestMigrationAndRunIdempotency(t *testing.T) {
 }
 
 func TestListRunsUsesRepositoryScopedDeterministicCursor(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -703,7 +703,7 @@ func TestListRunsUsesRepositoryScopedDeterministicCursor(t *testing.T) {
 }
 
 func TestAuthorizedRunPaginationIgnoresHiddenSentinels(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -756,7 +756,7 @@ func TestAuthorizedRunPaginationIgnoresHiddenSentinels(t *testing.T) {
 }
 
 func TestAuthorizedRunLookupBindsFrozenRunIDAndAuthorityDigest(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -836,7 +836,7 @@ func frozenRunScopes(t *testing.T, runID, repository, bindingDigest string) appl
 }
 
 func TestLinearSourceDriftHaltsTheExactActiveRun(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -859,7 +859,7 @@ func TestLinearSourceDriftHaltsTheExactActiveRun(t *testing.T) {
 }
 
 func TestRunIdempotencyRejectsLocalOwnershipPathDrift(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -880,7 +880,7 @@ func TestRunIdempotencyRejectsLocalOwnershipPathDrift(t *testing.T) {
 
 func TestDatabaseIsPrivateAndMigrationIsIdempotent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -892,7 +892,7 @@ func TestDatabaseIsPrivateAndMigrationIsIdempotent(t *testing.T) {
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("database mode=%o", info.Mode().Perm())
 	}
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -905,7 +905,7 @@ func TestDatabaseIsPrivateAndMigrationIsIdempotent(t *testing.T) {
 
 func TestMigratesLegacyCodeRabbitApprovalColumnWithoutLosingApproval(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -940,13 +940,14 @@ func TestMigratesLegacyCodeRabbitApprovalColumnWithoutLosingApproval(t *testing.
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE operator_attention_outbox`); err != nil {
 		t.Fatal(err)
 	}
+	removeConfigurationV31(t, store.db)
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE operator_actions`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE operation_receipts`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30)`); err != nil {
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE trusted_review_feedback_conflicts`); err != nil {
@@ -964,7 +965,7 @@ func TestMigratesLegacyCodeRabbitApprovalColumnWithoutLosingApproval(t *testing.
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -982,7 +983,7 @@ func TestMigratesLegacyCodeRabbitApprovalColumnWithoutLosingApproval(t *testing.
 }
 
 func TestMergeMethodMigrationAcceptsOnlySquashAndExternal(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1041,7 +1042,7 @@ func TestMigratesVersionOneDatabaseToVersionTwo(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.Close()
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1082,7 +1083,7 @@ func TestMigratesVersionFourDatabaseToCurrentVersion(t *testing.T) {
 		}
 	}
 	db.Close()
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1099,7 +1100,7 @@ func TestMigratesVersionFourDatabaseToCurrentVersion(t *testing.T) {
 
 func TestSideEffectIntentSurvivesRestartWithoutDuplicate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1113,7 +1114,7 @@ func TestSideEffectIntentSurvivesRestartWithoutDuplicate(t *testing.T) {
 		t.Fatalf("created=%v err=%v", created, err)
 	}
 	store.Close()
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1125,7 +1126,7 @@ func TestSideEffectIntentSurvivesRestartWithoutDuplicate(t *testing.T) {
 }
 
 func TestApprovalAndMergeEvidenceAreImmutable(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1176,7 +1177,7 @@ func TestApprovalAndMergeEvidenceAreImmutable(t *testing.T) {
 }
 
 func TestHumanApprovalAcceptsOnlyNewerCompatibleObservation(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1242,7 +1243,7 @@ func TestHumanApprovalAcceptsOnlyNewerCompatibleObservation(t *testing.T) {
 
 func TestLinearCompletionEvidenceSurvivesRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1260,7 +1261,7 @@ func TestLinearCompletionEvidenceSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	store.Close()
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1276,7 +1277,7 @@ func TestLinearCompletionEvidenceSurvivesRestart(t *testing.T) {
 
 func TestGitHubApprovalObservationSurvivesRestartWithSourceAndObservationTimes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1312,7 +1313,7 @@ func TestGitHubApprovalObservationSurvivesRestartWithSourceAndObservationTimes(t
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1325,7 +1326,7 @@ func TestGitHubApprovalObservationSurvivesRestartWithSourceAndObservationTimes(t
 
 func TestResolvedAdvancedApprovalObservationSurvivesSQLiteRestartAndClaimsOneGuardedRetry(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
-	store, err := Open(path)
+	store, err := openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1361,7 +1362,7 @@ func TestResolvedAdvancedApprovalObservationSurvivesSQLiteRestartAndClaimsOneGua
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = Open(path)
+	store, err = openAdmissionTestStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1394,7 +1395,7 @@ func TestResolvedAdvancedApprovalObservationSurvivesSQLiteRestartAndClaimsOneGua
 }
 
 func TestSideEffectAndPullRequestConflictsFailClosed(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1435,7 +1436,7 @@ func TestSideEffectAndPullRequestConflictsFailClosed(t *testing.T) {
 }
 
 func TestForeignKeysRemainEnabledAfterConnectionRecreation(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1451,7 +1452,7 @@ func TestForeignKeysRemainEnabledAfterConnectionRecreation(t *testing.T) {
 }
 
 func TestRunLeaseUsesOwnerCASAndExpiry(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1482,7 +1483,7 @@ func TestRunLeaseUsesOwnerCASAndExpiry(t *testing.T) {
 }
 
 func TestGitHubFailureAuditUsesLeaseCAS(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1508,7 +1509,7 @@ func TestGitHubFailureAuditUsesLeaseCAS(t *testing.T) {
 }
 
 func TestTransitionUsesExpectedStateCompare(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1535,7 +1536,7 @@ func TestTransitionUsesExpectedStateCompare(t *testing.T) {
 }
 
 func TestAttemptArtifactDirectoryCannotBeReused(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1574,7 +1575,7 @@ func TestAttemptArtifactDirectoryCannotBeReused(t *testing.T) {
 }
 
 func TestOwnedResourceCannotBeClaimedByAnotherRun(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1597,7 +1598,7 @@ func TestOwnedResourceCannotBeClaimedByAnotherRun(t *testing.T) {
 }
 
 func TestBeginRepairAtomicallyRollsCandidateIntoTransition(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

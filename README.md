@@ -63,6 +63,10 @@ the state machine.
   and narrow GitHub App authorities, including one complete immutable
   controller-operator identity distinct from automatic admission.
 - Manual Linear admission and disabled-by-default automatic Todo admission.
+- Controller-owned immutable configuration generations with one-time baseline
+  adoption, private bounded raw evidence, generation/digest CAS transactions,
+  crash reconciliation, desired/effective runtime convergence, and fail-closed
+  new-admission fencing.
 - Deterministically ordered bounded worker scheduling with one nonterminal run
   per repository, a configurable local-heavy-work capacity, durable leases and
   permits, restart-stable parked states, retry schedules, local
@@ -165,10 +169,10 @@ remaining Controller operator foundations followed by a local TUI operator
 console in this repository under
 [roadmap #99](https://github.com/ifan0927/Agent-Loop-Controller/issues/99).
 Local operator identity, application authorization, operation receipts, and
-legal-action offers are implemented. Activity-independent worker heartbeat and
-controller-authorized runtime observation are also implemented; configuration
-generation and desired/effective convergence are the next dependency-ready
-foundation.
+legal-action offers are implemented. Activity-independent worker heartbeat,
+controller-authorized runtime observation, configuration generation/CAS, and
+desired/effective convergence fencing are also implemented; the typed
+configuration lifecycle is the next dependency-ready foundation.
 The TUI and `agentctl operator` are planned, not current behavior. HTTP, a Web
 UI, outbound notifications, Hermes runtime integration, public API/webhook
 admission, and cross-repository transactions remain deferred or exploratory.

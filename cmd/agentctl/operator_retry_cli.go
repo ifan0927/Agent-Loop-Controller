@@ -5,9 +5,7 @@ import (
 	"errors"
 	"flag"
 
-	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/bootstrap"
 	linearadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/linear"
-	sqlitestore "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 )
 
@@ -29,11 +27,11 @@ func controllerRetry(args []string) error {
 	if err != nil {
 		return err
 	}
-	loaded, err := bootstrap.Load(path)
+	loaded, err := loadManagedConfiguration(path)
 	if err != nil {
 		return err
 	}
-	store, err := sqlitestore.Open(loaded.Controller.DatabasePath)
+	store, err := openManagedConfigurationStore(loaded)
 	if err != nil {
 		return err
 	}
