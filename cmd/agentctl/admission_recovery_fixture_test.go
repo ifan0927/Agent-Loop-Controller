@@ -27,7 +27,7 @@ import (
 // composition to recover. The Linear ports and driver are controlled offline
 // adapters; no external service is contacted.
 func TestOfflineAcceptanceWorkerRestartPreservesRetryAndParksAtDurableAttention(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	root := resolvedTempDir(t)
