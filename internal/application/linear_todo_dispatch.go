@@ -223,6 +223,10 @@ func validateLinearTodoDispatchPolicy(policy LinearTodoDispatchPolicy) error {
 // conflict.
 func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatchResult, error) {
 	now := d.clock()
+	// Observe configuration convergence before selecting existing work. A
+	// conflict fences only new authority below; compatible persisted runs must
+	// still be allowed to progress under their frozen authority.
+	admission, gateErr := d.policy.AdmissionGate.CheckNewAdmission(ctx)
 	// The in-process claim is checked before the short persisted admission
 	// lease so sibling per-run supervisors can make progress concurrently.
 	if _, concurrencyEnabled := schedulingStore(d.store); concurrencyEnabled && len(d.activeRunIDs()) > 0 {
@@ -374,7 +378,6 @@ func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatch
 		result := LinearTodoDispatchResult{Outcome: LinearTodoDispatchWaiting, NextRunnableAt: persistedNextRunnableAt}
 		return withQueueDecision(result, queueDecision(LinearTodoQueueDecisionCapacityFull, 0, false)), nil
 	}
-	admission, gateErr := d.policy.AdmissionGate.CheckNewAdmission(ctx)
 	if gateErr != nil || !admission.Allowed {
 		result := LinearTodoDispatchResult{Outcome: LinearTodoDispatchWaiting, NextRunnableAt: persistedNextRunnableAt}
 		return withQueueDecision(result, queueDecision(LinearTodoQueueDecisionConfigurationFenced, 0, false)), nil

@@ -1015,12 +1015,13 @@ func TestLinearTodoDispatcherRechecksConfigurationBeforeReservation(t *testing.T
 func TestLinearTodoDispatcherConfigurationFenceDoesNotInterruptExistingRun(t *testing.T) {
 	candidate := dispatchCandidate("fenced-existing", "IFAN-143", 1)
 	dispatcher, store, scanner, _, _, driver := newDispatchLab(t, candidate)
-	dispatcher.policy.AdmissionGate = StaticNewAdmissionGate{Decision: NewAdmissionDecision{Allowed: false, Reason: ConfigurationReasonExternalDrift}}
+	gate := &admissionDecisionSequence{decisions: []NewAdmissionDecision{{Allowed: false, Reason: ConfigurationReasonExternalDrift}}}
+	dispatcher.policy.AdmissionGate = gate
 	store.run = authorizeDispatchRun(Run{ID: "run-fenced-existing", IssueID: "IFAN-199", IdempotencyKey: "existing-key", Repository: "owner/repo", State: domain.StateExecuting})
 
 	result, err := dispatcher.Dispatch(context.Background())
-	if err != nil || result.Outcome != LinearTodoDispatchDriven || scanner.calls != 0 || len(driver.calls) != 1 || store.run.IssueID != "IFAN-199" {
-		t.Fatalf("result=%+v scans=%d driver=%+v run=%+v err=%v", result, scanner.calls, driver.calls, store.run, err)
+	if err != nil || result.Outcome != LinearTodoDispatchDriven || scanner.calls != 0 || len(driver.calls) != 1 || store.run.IssueID != "IFAN-199" || gate.calls != 1 {
+		t.Fatalf("result=%+v scans=%d driver=%+v run=%+v gate=%d err=%v", result, scanner.calls, driver.calls, store.run, gate.calls, err)
 	}
 }
 
