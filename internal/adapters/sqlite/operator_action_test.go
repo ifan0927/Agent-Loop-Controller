@@ -328,7 +328,7 @@ func TestOperatorActionMigrationFromV23CreatesEmptyJournal(t *testing.T) {
 	if _, err := store.db.Exec(`ALTER TABLE attempts DROP COLUMN process_control_key`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.Exec(`DELETE FROM schema_migrations WHERE version IN (24,25,26,27,28,29,30,31)`); err != nil {
+	if _, err := store.db.Exec(`DELETE FROM schema_migrations WHERE version IN (24,25,26,27,28,29,30,31,32)`); err != nil {
 		t.Fatal(err)
 	}
 	store.Close()

@@ -67,6 +67,10 @@ the state machine.
   adoption, private bounded raw evidence, generation/digest CAS transactions,
   crash reconciliation, desired/effective runtime convergence, and fail-closed
   new-admission fencing.
+- One Controller-wide durable typed configuration draft for routine timeout and
+  automatic-admission settings, with revision CAS, sanitized validation,
+  semantic preview, replayable apply through the generation service, and
+  explicit discard.
 - Deterministically ordered bounded worker scheduling with one nonterminal run
   per repository, a configurable local-heavy-work capacity, durable leases and
   permits, restart-stable parked states, retry schedules, local
@@ -171,8 +175,10 @@ console in this repository under
 Local operator identity, application authorization, operation receipts, and
 legal-action offers are implemented. Activity-independent worker heartbeat,
 controller-authorized runtime observation, configuration generation/CAS, and
-desired/effective convergence fencing are also implemented; the typed
-configuration lifecycle is the next dependency-ready foundation.
+desired/effective convergence fencing are also implemented, together with the
+first normal typed-change draft/preview/apply slice. Forward rollback and
+explicit drift recovery remain later configuration lifecycle work; repository
+lifecycle is the next separate operator foundation.
 The TUI and `agentctl operator` are planned, not current behavior. HTTP, a Web
 UI, outbound notifications, Hermes runtime integration, public API/webhook
 admission, and cross-repository transactions remain deferred or exploratory.

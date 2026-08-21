@@ -607,6 +607,29 @@ The resulting finite projection is
 `ready`, `restart_required`, `starting`, `stale`, `offline`, `unknown`, or
 `conflict`, separate from worker activity and capacity.
 
+The normal-change adapter adds one Controller-wide durable typed draft without
+adding another configuration transaction. Controller authorization happens
+before every draft lookup. Revision compare-and-swap plus the last closed edit
+digest provides exact lost-response replay, while a different edit at the same
+revision conflicts. SQLite stores only the nine allowlisted timeout/admission
+scalars, their integrity digest, finite lifecycle, sanitized validation and
+preview metadata, and the resulting generation/receipt binding. Candidate
+bytes are never stored with the draft: validation, preview, and apply reread the
+exact retained base-generation raw bytes and deterministically materialize a
+schema-v5 candidate in memory. An unchanged projection returns the exact base
+bytes and reaches the generation service's same-digest no-op path.
+
+Validation returns only closed field IDs, finite reason codes, and severity.
+Semantic preview returns allowlisted boolean, duration, and bounded-integer
+before/after values plus finite restart, convergence-fence, frozen-run, and
+capacity-drain impacts. Its digest binds draft/revision, base and candidate
+digests, semantic changes, impacts, and current configuration authority. Apply
+reauthorizes and recomputes all of that evidence, marks the draft applying, and
+delegates to the existing configuration apply service. The existing
+`apply_configuration` receipt remains the sole apply operation identity;
+response-loss and restart replay reconcile the same generation rather than
+creating another. Apply never starts, stops, or restarts a worker.
+
 Every production new-admission path uses this application-owned convergence
 gate. Automatic dispatch may continue driving an already-admitted run, but it
 checks the gate before candidate scan or Linear mutation and again immediately
@@ -1030,7 +1053,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 31; migration history is code, not a
+inspection. The current schema is version 32; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees
@@ -1353,6 +1376,7 @@ around it. The principal table groups are:
 | `operator_actions` | Action-specific authenticated recovery intent and legacy validated/applied/observed provenance, separate from automatic workflow evidence |
 | `operation_receipts` | Scope-neutral accepted/applied/observed operation identity, outcome, and sanitized result evidence; legacy operator actions are backfilled and mirrored here |
 | configuration generation, authority, apply-intent, and convergence tables | Immutable desired/effective metadata, one Controller-wide CAS transaction, reconciliation state, and meaningful sanitized transitions; raw bytes remain outside SQLite |
+| `configuration_drafts` | At most one active Controller-wide typed draft, revision/edit replay authority, sanitized validation/preview evidence, and generation/receipt settlement; no raw candidate, path, identity, or credential authority |
 
 ### Current state versus evidence
 
@@ -1461,7 +1485,7 @@ resolution is not approval, and an approval for an old head is stale.
 - Linear admission and completion observation are implemented, but completion
   remains external automation/human authority.
 - GitHub writes require a narrowly permissioned selected-repository App.
-- Typed drafts/semantic preview/rollback and drift recovery, transactional
+- Forward rollback and explicit drift recovery, transactional
   repository onboarding, the local TUI, optional HTTP/Web adapters,
   notification transport, Hermes runtime integration, public API, webhooks,
   and multi-tenant authorization are not implemented.

@@ -14,6 +14,22 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 )
 
+func TestEditableAuthorityProofIgnoresOnlyClosedTypedLeaves(t *testing.T) {
+	base := []byte(`{"version":5,"controller":{"database_path":"/private/controller.db","run_timeout":"30m"},"automation":{"linear_todo_admission":{"enabled":false,"heavy_capacity":2,"credential_source_ref":"secret://file/token"}}}`)
+	typedChange := []byte(`{"automation":{"linear_todo_admission":{"credential_source_ref":"secret://file/token","heavy_capacity":3,"enabled":false}},"controller":{"run_timeout":"45m","database_path":"/private/controller.db"},"version":5}`)
+	if !editableAuthorityEqual(base, typedChange) {
+		t.Fatal("closed typed change was rejected by non-editable authority proof")
+	}
+	authorityChange := []byte(`{"version":5,"controller":{"database_path":"/private/other.db","run_timeout":"45m"},"automation":{"linear_todo_admission":{"enabled":false,"heavy_capacity":3,"credential_source_ref":"secret://file/token"}}}`)
+	if editableAuthorityEqual(base, authorityChange) {
+		t.Fatal("non-editable database authority change was accepted")
+	}
+	credentialChange := []byte(`{"version":5,"controller":{"database_path":"/private/controller.db","run_timeout":"45m"},"automation":{"linear_todo_admission":{"enabled":false,"heavy_capacity":3,"credential_source_ref":"secret://file/other"}}}`)
+	if editableAuthorityEqual(base, credentialChange) {
+		t.Fatal("non-editable credential authority change was accepted")
+	}
+}
+
 func TestPrivateRawLocatorAndAtomicLiveReplacement(t *testing.T) {
 	root := canonicalTempDirectory(t)
 	configPath := filepath.Join(root, "controller.json")

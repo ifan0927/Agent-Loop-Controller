@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -104,6 +105,21 @@ type WorkflowState struct {
 	ID   string
 	Name string
 	Type string
+}
+
+// EditableSettings is the closed, secret-free projection used by the managed
+// configuration draft adapter. It deliberately excludes every authority,
+// identity, credential reference, executable, and path.
+type EditableSettings struct {
+	RunTimeout                    time.Duration
+	AdmissionEnabled              bool
+	AdmissionPollInterval         time.Duration
+	DeliveryPollInterval          time.Duration
+	SchedulerLeaseTTL             time.Duration
+	SchedulerLeaseRenewalInterval time.Duration
+	AdmissionMaxCandidates        int
+	AdmissionMaxPages             int
+	AdmissionHeavyCapacity        int
 }
 
 type readinessFile struct {
@@ -364,6 +380,223 @@ func ValidateCurrentBytes(canonicalPath string, data []byte) (Bootstrap, error) 
 		return Bootstrap{}, invalid("configuration apply requires the current schema version")
 	}
 	return loaded, nil
+}
+
+// ProjectEditableSettings validates the exact current-schema payload before
+// projecting only the closed routine settings surface.
+func ProjectEditableSettings(canonicalPath string, data []byte) (EditableSettings, error) {
+	if _, err := ValidateCurrentBytes(canonicalPath, data); err != nil {
+		return EditableSettings{}, err
+	}
+	raw, admission, err := decodeEditableDocument(data)
+	if err != nil || raw.Version != CurrentVersion {
+		return EditableSettings{}, invalid("configuration editable settings are invalid")
+	}
+	settings := EditableSettings{
+		AdmissionEnabled: false, AdmissionPollInterval: 5 * time.Minute,
+		DeliveryPollInterval: 30 * time.Second, SchedulerLeaseTTL: time.Minute,
+		SchedulerLeaseRenewalInterval: 20 * time.Second, AdmissionMaxCandidates: 20,
+		AdmissionMaxPages: 5, AdmissionHeavyCapacity: 2,
+	}
+	if admission.Enabled != nil {
+		settings.AdmissionEnabled = *admission.Enabled
+	}
+	settings.RunTimeout, _ = time.ParseDuration(raw.Controller.RunTimeout)
+	if admission.PollInterval != "" {
+		settings.AdmissionPollInterval, _ = time.ParseDuration(admission.PollInterval)
+	}
+	if len(admission.DeliveryPollInterval) != 0 {
+		var value string
+		if json.Unmarshal(admission.DeliveryPollInterval, &value) == nil {
+			settings.DeliveryPollInterval, _ = time.ParseDuration(value)
+		}
+	}
+	if admission.SchedulerLeaseTTL != "" {
+		settings.SchedulerLeaseTTL, _ = time.ParseDuration(admission.SchedulerLeaseTTL)
+	}
+	if admission.SchedulerLeaseRenewalInterval != "" {
+		settings.SchedulerLeaseRenewalInterval, _ = time.ParseDuration(admission.SchedulerLeaseRenewalInterval)
+	}
+	if admission.MaxCandidates != 0 {
+		settings.AdmissionMaxCandidates = admission.MaxCandidates
+	}
+	if admission.MaxPages != 0 {
+		settings.AdmissionMaxPages = admission.MaxPages
+	}
+	if len(admission.HeavyCapacity) != 0 {
+		_ = json.Unmarshal(admission.HeavyCapacity, &settings.AdmissionHeavyCapacity)
+	}
+	return settings, nil
+}
+
+// MaterializeEditableSettings rewrites only the allowlisted leaves in memory.
+// If the projection is unchanged it returns the exact retained bytes so the
+// generation service preserves its same-digest no-op contract.
+func MaterializeEditableSettings(canonicalPath string, base []byte, settings EditableSettings) ([]byte, error) {
+	current, err := ProjectEditableSettings(canonicalPath, base)
+	if err != nil {
+		return nil, err
+	}
+	if current == settings {
+		return append([]byte(nil), base...), nil
+	}
+	var document map[string]json.RawMessage
+	if err := decodeStrictObject(base, &document); err != nil {
+		return nil, invalid("configuration editable settings are invalid")
+	}
+	var controller map[string]json.RawMessage
+	var automation map[string]json.RawMessage
+	var admission map[string]json.RawMessage
+	if decodeStrictObject(document["controller"], &controller) != nil {
+		return nil, invalid("configuration editable settings are invalid")
+	}
+	hadAutomation := len(document["automation"]) != 0
+	if hadAutomation && decodeStrictObject(document["automation"], &automation) != nil {
+		return nil, invalid("configuration editable settings are invalid")
+	}
+	if automation == nil {
+		automation = make(map[string]json.RawMessage)
+	}
+	hadAdmission := len(automation["linear_todo_admission"]) != 0
+	if hadAdmission && decodeStrictObject(automation["linear_todo_admission"], &admission) != nil {
+		return nil, invalid("configuration editable settings are invalid")
+	}
+	if admission == nil {
+		admission = make(map[string]json.RawMessage)
+	}
+	set := func(target map[string]json.RawMessage, key string, value any) error {
+		encoded, marshalErr := json.Marshal(value)
+		if marshalErr == nil {
+			target[key] = encoded
+		}
+		return marshalErr
+	}
+	if current.RunTimeout != settings.RunTimeout {
+		if err := set(controller, "run_timeout", settings.RunTimeout.String()); err != nil {
+			return nil, err
+		}
+	}
+	admissionChanged := current.AdmissionEnabled != settings.AdmissionEnabled ||
+		current.AdmissionPollInterval != settings.AdmissionPollInterval ||
+		current.DeliveryPollInterval != settings.DeliveryPollInterval ||
+		current.SchedulerLeaseTTL != settings.SchedulerLeaseTTL ||
+		current.SchedulerLeaseRenewalInterval != settings.SchedulerLeaseRenewalInterval ||
+		current.AdmissionMaxCandidates != settings.AdmissionMaxCandidates ||
+		current.AdmissionMaxPages != settings.AdmissionMaxPages ||
+		current.AdmissionHeavyCapacity != settings.AdmissionHeavyCapacity
+	if !hadAdmission && admissionChanged {
+		for key, value := range map[string]any{
+			"enabled": settings.AdmissionEnabled, "poll_interval": settings.AdmissionPollInterval.String(),
+			"delivery_poll_interval": settings.DeliveryPollInterval.String(), "scheduler_lease_ttl": settings.SchedulerLeaseTTL.String(),
+			"scheduler_lease_renewal_interval": settings.SchedulerLeaseRenewalInterval.String(), "max_candidates": settings.AdmissionMaxCandidates,
+			"max_pages": settings.AdmissionMaxPages, "heavy_capacity": settings.AdmissionHeavyCapacity,
+		} {
+			if err := set(admission, key, value); err != nil {
+				return nil, err
+			}
+		}
+	} else if current.AdmissionEnabled != settings.AdmissionEnabled {
+		if err := set(admission, "enabled", settings.AdmissionEnabled); err != nil {
+			return nil, err
+		}
+	}
+	if current.AdmissionPollInterval != settings.AdmissionPollInterval {
+		if err := set(admission, "poll_interval", settings.AdmissionPollInterval.String()); err != nil {
+			return nil, err
+		}
+	}
+	if current.DeliveryPollInterval != settings.DeliveryPollInterval {
+		if err := set(admission, "delivery_poll_interval", settings.DeliveryPollInterval.String()); err != nil {
+			return nil, err
+		}
+	}
+	if current.SchedulerLeaseTTL != settings.SchedulerLeaseTTL {
+		if err := set(admission, "scheduler_lease_ttl", settings.SchedulerLeaseTTL.String()); err != nil {
+			return nil, err
+		}
+	}
+	if current.SchedulerLeaseRenewalInterval != settings.SchedulerLeaseRenewalInterval {
+		if err := set(admission, "scheduler_lease_renewal_interval", settings.SchedulerLeaseRenewalInterval.String()); err != nil {
+			return nil, err
+		}
+	}
+	if current.AdmissionMaxCandidates != settings.AdmissionMaxCandidates {
+		if err := set(admission, "max_candidates", settings.AdmissionMaxCandidates); err != nil {
+			return nil, err
+		}
+	}
+	if current.AdmissionMaxPages != settings.AdmissionMaxPages {
+		if err := set(admission, "max_pages", settings.AdmissionMaxPages); err != nil {
+			return nil, err
+		}
+	}
+	if current.AdmissionHeavyCapacity != settings.AdmissionHeavyCapacity {
+		if err := set(admission, "heavy_capacity", settings.AdmissionHeavyCapacity); err != nil {
+			return nil, err
+		}
+	}
+	controllerJSON, err := json.Marshal(controller)
+	if err != nil {
+		return nil, err
+	}
+	document["controller"] = controllerJSON
+	if hadAutomation || admissionChanged {
+		admissionJSON, err := json.Marshal(admission)
+		if err != nil {
+			return nil, err
+		}
+		automation["linear_todo_admission"] = admissionJSON
+		automationJSON, err := json.Marshal(automation)
+		if err != nil {
+			return nil, err
+		}
+		document["automation"] = automationJSON
+	}
+	candidate, err := json.MarshalIndent(document, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	candidate = append(candidate, '\n')
+	if len(candidate) > 256<<10 {
+		return nil, invalid("controller configuration is too large")
+	}
+	return candidate, nil
+}
+
+func decodeEditableDocument(data []byte) (configFile, linearTodoAdmissionFile, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var raw configFile
+	if err := decoder.Decode(&raw); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return configFile{}, linearTodoAdmissionFile{}, invalid("configuration editable settings are invalid")
+	}
+	if len(raw.Automation) == 0 {
+		return raw, linearTodoAdmissionFile{}, nil
+	}
+	var automation automationFile
+	if decodeStrictObject(raw.Automation, &automation) != nil {
+		return configFile{}, linearTodoAdmissionFile{}, invalid("configuration editable settings are invalid")
+	}
+	var admission linearTodoAdmissionFile
+	if len(automation.LinearTodoAdmission) == 0 {
+		return raw, admission, nil
+	}
+	if decodeStrictObject(automation.LinearTodoAdmission, &admission) != nil {
+		return configFile{}, linearTodoAdmissionFile{}, invalid("configuration editable settings are invalid")
+	}
+	return raw, admission, nil
+}
+
+func decodeStrictObject(data []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return errors.New("JSON contains trailing values")
+	}
+	return nil
 }
 
 func decodeRegistry(raw configFile) (localregistry.Registry, string, error) {

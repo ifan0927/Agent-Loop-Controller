@@ -717,7 +717,7 @@ func TestPreConcurrencySchemaRefusesConcurrencyDatabase(t *testing.T) {
 	if legacy, err := openWithSupportedSchema(path, 28); err == nil {
 		legacy.Close()
 		t.Fatal("pre-concurrency schema reader accepted concurrency database")
-	} else if !strings.Contains(err.Error(), "database schema version 31 is newer than supported 28") {
+	} else if !strings.Contains(err.Error(), "database schema version 32 is newer than supported 28") {
 		t.Fatalf("compatibility error=%v", err)
 	}
 	db, err := sql.Open("sqlite", sqliteDSN(path))
@@ -726,7 +726,7 @@ func TestPreConcurrencySchemaRefusesConcurrencyDatabase(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 31 {
+	if err := db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != schemaVersion {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	if version <= 28 {
