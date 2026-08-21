@@ -138,11 +138,22 @@ path, database relocation, invalid live file, or out-of-band digest change is a
 conflict; startup never re-baselines, follows an edited database path, adopts
 drift, or rewrites the file.
 
-The Controller now owns internal generation/CAS apply and convergence
-contracts, but this milestone intentionally exposes no raw apply, draft,
-preview, rollback, or drift-repair CLI. A committed future typed configuration
-change requires the existing explicit worker restart procedure because workers
-load configuration only at process startup. Raw generation files, baseline
+The Controller exposes a normal typed-change path for `controller.run_timeout`
+and the eight bounded `automation.linear_todo_admission` policy fields. Use
+`config draft open|show|set|validate|preview|apply|discard`; no command accepts
+raw JSON, a candidate file, a generic key, a path, an identity, or a credential
+reference. The single active draft is revision-CAS protected and bound to the
+exact desired generation. Preview and apply expose only sanitized allowlisted
+values and finite impacts. Apply delegates to the existing generation/CAS
+service and never restarts the worker. Forward rollback and explicit drift
+repair remain unavailable.
+
+A committed typed configuration change normally reports `restart_required`
+because workers load configuration only at process startup. Use the existing
+explicit supervised restart procedure, then `config status` until the desired,
+effective, and live digests converge. Existing compatible runs continue under
+their frozen authority and capacity reductions drain rather than revoke held
+work. Raw generation files, baseline
 binding, and locator contents are private recovery evidence: do not read, copy,
 edit, prune, or use them as an operator API. Trusted reads reject either the
 authority or generation ancestor if it is a symlink, has changed ownership, or
@@ -610,6 +621,70 @@ A ready result does not validate token scope or GitHub App access.
 **Related commands**
 
 `config validate`, `controller launchagent doctor`.
+
+### `config status` and `config draft`
+
+**Purpose**
+
+Observe managed configuration convergence and safely change routine typed
+settings without editing or submitting raw `controller.json`.
+
+**Syntax**
+
+```sh
+agentctl config status --requester <login> --requester-database-id <id> \
+  --requester-node-id <node> --requester-type User
+agentctl config draft open <complete-requester-flags>
+agentctl config draft show --draft-id <id> --revision <n> <complete-requester-flags>
+agentctl config draft set --draft-id <id> --revision <n> \
+  --heavy-capacity 3 <complete-requester-flags>
+agentctl config draft validate --draft-id <id> --revision <n> <complete-requester-flags>
+agentctl config draft preview --draft-id <id> --revision <n> <complete-requester-flags>
+agentctl config draft apply --draft-id <id> --revision <n> \
+  --preview-digest <digest> --expected-generation-id <id> \
+  --expected-digest <digest> <complete-requester-flags>
+agentctl config draft discard --draft-id <id> --revision <n> <complete-requester-flags>
+```
+
+`draft set` accepts exactly one of `--run-timeout`,
+`--automatic-admission-enabled`, `--admission-poll-interval`,
+`--delivery-poll-interval`, `--scheduler-lease-ttl`,
+`--scheduler-lease-renewal-interval`, `--max-candidates`, `--max-pages`, or
+`--heavy-capacity`. Every managed query and mutation requires the complete
+configured GitHub User requester tuple. `--config` may select the canonical
+configuration path.
+
+Open resumes an existing active draft rather than rebasing or replacing it.
+Each edit increments the revision and invalidates prior validation/preview.
+Validation and preview are local and create no generation or receipt. Apply
+recomputes validation and preview from retained base bytes, checks exact
+generation/digest/preview authority, and returns the existing apply receipt plus
+convergence projection. Exact retries return the same edit revision or apply
+generation/receipt. Discard changes neither generation nor runtime state.
+
+If the desired baseline is older than schema 5, upgrade it through the bounded
+legacy-to-current transition before opening a draft. Preserve an applying or
+ambiguous draft and the private `authority/` tree; do not edit SQLite or force a
+second apply. `config validate` and `config inspect` remain separate SQLite-free
+offline commands.
+
+**Possible durable stop states**
+
+An open draft may remain until explicitly applied or discarded. An accepted
+ambiguous apply remains non-editable and requires the future recovery
+capability. `restart_required` is resolved only by the existing operator-owned
+worker restart and subsequent matching heartbeat.
+
+**Safety notes**
+
+Draft IDs, revisions, digests, and receipts are compare-and-swap evidence, not
+bearer authorization. Never share private configuration paths or authority
+files to troubleshoot a sanitized conflict.
+
+**Related commands**
+
+`config validate`, `config inspect`, `controller launchagent status`,
+`controller launchdaemon status`.
 
 ### `controller worker`
 

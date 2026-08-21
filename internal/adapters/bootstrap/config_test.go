@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -286,6 +287,67 @@ func TestValidateCurrentBytesRejectsLegacyReadableSchema(t *testing.T) {
 	}
 	if _, err := ValidateCurrentBytes(configPath, payload); err == nil || !strings.Contains(err.Error(), "current schema") {
 		t.Fatalf("current apply validation error=%v", err)
+	}
+}
+
+func TestEditableSettingsMaterializationPreservesExactNoOpAndClosedAuthority(t *testing.T) {
+	configPath, config := enabledAutomationConfig(t)
+	writeJSONFixture(t, configPath, config)
+	base, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings, err := ProjectEditableSettings(configPath, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unchanged, err := MaterializeEditableSettings(configPath, base, settings)
+	if err != nil || !bytes.Equal(unchanged, base) {
+		t.Fatalf("unchanged candidate did not preserve exact bytes: err=%v", err)
+	}
+	settings.AdmissionHeavyCapacity = 3
+	candidate, err := MaterializeEditableSettings(configPath, base, settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := ValidateCurrentBytes(configPath, candidate)
+	if err != nil || loaded.Automation.LinearTodoAdmission.HeavyCapacity != 3 {
+		t.Fatalf("candidate=%+v err=%v", loaded.Automation.LinearTodoAdmission, err)
+	}
+	projected, err := ProjectEditableSettings(configPath, candidate)
+	if err != nil || projected != settings {
+		t.Fatalf("projected=%+v want=%+v err=%v", projected, settings, err)
+	}
+	for _, marker := range []string{"secret://env/IFAN_LOOP_LINEAR_TOKEN", "github-app-profile:fixture", "owner", "repo"} {
+		if !bytes.Contains(candidate, []byte(marker)) {
+			t.Fatalf("non-editable authority marker %q was not preserved", marker)
+		}
+	}
+}
+
+func TestEditableSettingsProjectsDisabledDefaultsWithoutAutomationBlock(t *testing.T) {
+	configPath, config := enabledAutomationConfig(t)
+	delete(config, "automation")
+	writeJSONFixture(t, configPath, config)
+	base, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings, err := ProjectEditableSettings(configPath, base)
+	if err != nil || settings.AdmissionEnabled || settings.AdmissionHeavyCapacity != 2 || settings.AdmissionPollInterval != 5*time.Minute {
+		t.Fatalf("settings=%+v err=%v", settings, err)
+	}
+	settings.AdmissionHeavyCapacity = 3
+	candidate, err := MaterializeEditableSettings(configPath, base, settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateCurrentBytes(configPath, candidate); err != nil {
+		t.Fatalf("disabled candidate invalid: %v", err)
+	}
+	projected, err := ProjectEditableSettings(configPath, candidate)
+	if err != nil || projected.AdmissionHeavyCapacity != 3 || projected.AdmissionEnabled {
+		t.Fatalf("projected=%+v err=%v", projected, err)
 	}
 }
 

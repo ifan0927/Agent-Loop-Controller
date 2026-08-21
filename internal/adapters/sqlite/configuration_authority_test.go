@@ -19,6 +19,7 @@ import (
 func removeConfigurationV31(t *testing.T, db *sql.DB) {
 	t.Helper()
 	for _, statement := range []string{
+		`DROP TABLE IF EXISTS configuration_drafts`,
 		`DROP TABLE IF EXISTS configuration_raw_prune_claims`,
 		`DROP TABLE IF EXISTS configuration_convergence_events`,
 		`DROP TABLE IF EXISTS configuration_apply_intents`,
@@ -52,7 +53,7 @@ func TestConfigurationV31MigratesV30AndPreservesReceipts(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if version, err := store.SchemaVersion(context.Background()); err != nil || version != 31 {
+	if version, err := store.SchemaVersion(context.Background()); err != nil || version != schemaVersion {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	if target, err := store.GetOperationReceiptTarget(context.Background(), receipt.OperationID); err != nil || target.TargetID != receipt.TargetID {

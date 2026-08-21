@@ -93,6 +93,9 @@ This milestone is recorded by the closed
   evidence, generation/digest CAS apply, crash reconciliation, desired/effective
   heartbeat correlation, finite convergence projection, and new-admission
   fencing without interrupting existing runs.
+- The first normal typed-change slice: one durable Controller-wide draft,
+  revision/edit replay, sanitized validation and semantic preview, typed CLI,
+  and replayable delegation to the existing generation apply receipt.
 
 The implementation child work under the
 [automatic-admission roadmap](https://github.com/ifan0927/Agent-Loop-Controller/issues/21)
@@ -136,9 +139,10 @@ runtime path.
 Implementation work is created one dependency-ready issue at a time. Local
 operator identity, application authorization, operation receipts, and
 legal-action offers are complete. Activity-independent worker heartbeat,
-controller-authorized runtime observation, configuration generations/CAS, and
-desired/effective convergence fencing are complete. The next foundation is the
-typed configuration lifecycle. Do not create
+controller-authorized runtime observation, configuration generations/CAS,
+desired/effective convergence fencing, and the first normal typed-change slice
+are complete. Forward rollback and drift recovery remain later typed-lifecycle
+work. Do not create
 speculative TUI, HTTP, or frontend slices before their Controller contracts
 exist.
 
@@ -146,10 +150,11 @@ exist.
 
 Bounded multi-repository concurrency, local operator authorization, operation
 receipts, legal-action offers, worker runtime observation, and configuration
-transaction/convergence authority are complete. The remaining
+transaction/convergence authority and the normal typed-change draft path are
+complete. The remaining
 presentation-independent sequence is:
 
-1. typed configuration lifecycle;
+1. remaining typed configuration lifecycle where dependency-ready;
 2. repository lifecycle and readiness;
 3. restart-safe onboarding saga;
 4. existing-checkout adoption;

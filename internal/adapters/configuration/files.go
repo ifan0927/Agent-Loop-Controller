@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 
@@ -110,6 +111,87 @@ func (f *Files) ValidateCurrent(payload []byte) (application.ValidatedConfigurat
 		return application.ValidatedConfigurationCandidate{}, err
 	}
 	return candidateFromBootstrap(loaded, len(payload)), nil
+}
+
+func (f *Files) ProjectEditable(payload []byte) (application.ConfigurationEditableSettings, error) {
+	settings, err := bootstrap.ProjectEditableSettings(f.configPath, payload)
+	if err != nil {
+		return application.ConfigurationEditableSettings{}, err
+	}
+	return application.ConfigurationEditableSettings{
+		RunTimeout: application.ConfigurationDuration(settings.RunTimeout),
+		Admission: application.ConfigurationEditableAdmissionSettings{
+			Enabled:                       settings.AdmissionEnabled,
+			PollInterval:                  application.ConfigurationDuration(settings.AdmissionPollInterval),
+			DeliveryPollInterval:          application.ConfigurationDuration(settings.DeliveryPollInterval),
+			SchedulerLeaseTTL:             application.ConfigurationDuration(settings.SchedulerLeaseTTL),
+			SchedulerLeaseRenewalInterval: application.ConfigurationDuration(settings.SchedulerLeaseRenewalInterval),
+			MaxCandidates:                 settings.AdmissionMaxCandidates,
+			MaxPages:                      settings.AdmissionMaxPages,
+			HeavyCapacity:                 settings.AdmissionHeavyCapacity,
+		},
+	}, nil
+}
+
+func (f *Files) MaterializeEditable(base []byte, settings application.ConfigurationEditableSettings) ([]byte, error) {
+	return bootstrap.MaterializeEditableSettings(f.configPath, base, bootstrap.EditableSettings{
+		RunTimeout:                    settings.RunTimeout.Duration(),
+		AdmissionEnabled:              settings.Admission.Enabled,
+		AdmissionPollInterval:         settings.Admission.PollInterval.Duration(),
+		DeliveryPollInterval:          settings.Admission.DeliveryPollInterval.Duration(),
+		SchedulerLeaseTTL:             settings.Admission.SchedulerLeaseTTL.Duration(),
+		SchedulerLeaseRenewalInterval: settings.Admission.SchedulerLeaseRenewalInterval.Duration(),
+		AdmissionMaxCandidates:        settings.Admission.MaxCandidates,
+		AdmissionMaxPages:             settings.Admission.MaxPages,
+		AdmissionHeavyCapacity:        settings.Admission.HeavyCapacity,
+	})
+}
+
+func (f *Files) ValidateEditableCandidate(base, candidate []byte) (application.ValidatedConfigurationCandidate, error) {
+	baseAuthority, err := f.ValidateCurrent(base)
+	if err != nil {
+		return application.ValidatedConfigurationCandidate{}, err
+	}
+	target, err := f.ValidateCurrent(candidate)
+	if err != nil {
+		return application.ValidatedConfigurationCandidate{}, err
+	}
+	if !editableAuthorityEqual(base, candidate) || baseAuthority.DatabasePath != target.DatabasePath || baseAuthority.LinearTeamKey != target.LinearTeamKey || !baseAuthority.Operator.Equal(target.Operator) || !reflect.DeepEqual(baseAuthority.Repositories, target.Repositories) {
+		return application.ValidatedConfigurationCandidate{}, errors.New("configuration candidate changes non-editable authority")
+	}
+	return target, nil
+}
+
+func editableAuthorityEqual(base, candidate []byte) bool {
+	normalize := func(payload []byte) ([]byte, bool) {
+		decoder := json.NewDecoder(bytes.NewReader(payload))
+		decoder.UseNumber()
+		var document map[string]any
+		if err := decoder.Decode(&document); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+			return nil, false
+		}
+		if controller, ok := document["controller"].(map[string]any); ok {
+			delete(controller, "run_timeout")
+		}
+		if automation, ok := document["automation"].(map[string]any); ok {
+			if admission, ok := automation["linear_todo_admission"].(map[string]any); ok {
+				for _, field := range []string{"enabled", "poll_interval", "delivery_poll_interval", "scheduler_lease_ttl", "scheduler_lease_renewal_interval", "max_candidates", "max_pages", "heavy_capacity"} {
+					delete(admission, field)
+				}
+				if len(admission) == 0 {
+					delete(automation, "linear_todo_admission")
+				}
+			}
+			if len(automation) == 0 {
+				delete(document, "automation")
+			}
+		}
+		normalized, err := json.Marshal(document)
+		return normalized, err == nil
+	}
+	baseNormalized, baseOK := normalize(base)
+	candidateNormalized, candidateOK := normalize(candidate)
+	return baseOK && candidateOK && bytes.Equal(baseNormalized, candidateNormalized)
 }
 
 func (f *Files) ReadLive() ([]byte, application.ValidatedConfigurationCandidate, error) {

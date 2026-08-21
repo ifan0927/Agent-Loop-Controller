@@ -30,7 +30,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 31
+const schemaVersion = 32
 
 const (
 	sqliteMigrationRetryDelay  = 10 * time.Millisecond
@@ -703,6 +703,8 @@ func migrateSQLite(ctx context.Context, db sqliteTransactioner, supportedVersion
 			statements = migrationV30
 		case 31:
 			statements = migrationV31
+		case 32:
+			statements = migrationV32
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -1115,6 +1117,53 @@ var migrationV31 = []string{
 		digest TEXT PRIMARY KEY,
 		claimed_at TEXT NOT NULL
 	)`,
+}
+
+// migrationV32 adds the single Controller-wide typed draft record. It stores
+// only allowlisted scalar settings and sanitized derived metadata; raw
+// candidate configuration remains exclusively in memory.
+var migrationV32 = []string{
+	`CREATE TABLE configuration_drafts (
+		draft_id TEXT PRIMARY KEY,
+		base_generation_id INTEGER NOT NULL REFERENCES configuration_generations(generation_id),
+		base_digest TEXT NOT NULL,
+		revision INTEGER NOT NULL CHECK(revision > 0),
+		lifecycle TEXT NOT NULL CHECK(lifecycle IN ('open','applying','applied','discarded','ambiguous')),
+		run_timeout_ns INTEGER NOT NULL,
+		admission_enabled INTEGER NOT NULL CHECK(admission_enabled IN (0,1)),
+		admission_poll_interval_ns INTEGER NOT NULL,
+		delivery_poll_interval_ns INTEGER NOT NULL,
+		scheduler_lease_ttl_ns INTEGER NOT NULL,
+		scheduler_lease_renewal_interval_ns INTEGER NOT NULL,
+		max_candidates INTEGER NOT NULL,
+		max_pages INTEGER NOT NULL,
+		heavy_capacity INTEGER NOT NULL,
+		settings_digest TEXT NOT NULL,
+		last_edit_field TEXT NOT NULL DEFAULT '',
+		last_edit_base_revision INTEGER NOT NULL DEFAULT 0,
+		last_edit_digest TEXT NOT NULL DEFAULT '',
+		validation_revision INTEGER NOT NULL DEFAULT 0,
+		validation_candidate_digest TEXT NOT NULL DEFAULT '',
+		validation_digest TEXT NOT NULL DEFAULT '',
+		validation_valid INTEGER NOT NULL DEFAULT 0 CHECK(validation_valid IN (0,1)),
+		validation_findings_json TEXT NOT NULL DEFAULT '',
+		validated_at TEXT NOT NULL DEFAULT '',
+		preview_revision INTEGER NOT NULL DEFAULT 0,
+		preview_candidate_digest TEXT NOT NULL DEFAULT '',
+		preview_digest TEXT NOT NULL DEFAULT '',
+		preview_changes_json TEXT NOT NULL DEFAULT '',
+		preview_impacts_json TEXT NOT NULL DEFAULT '',
+		previewed_at TEXT NOT NULL DEFAULT '',
+		result_operation_id TEXT NOT NULL DEFAULT '',
+		result_generation_id INTEGER REFERENCES configuration_generations(generation_id),
+		result_no_op INTEGER NOT NULL DEFAULT 0 CHECK(result_no_op IN (0,1)),
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		settled_at TEXT NOT NULL DEFAULT '',
+		reason_code TEXT NOT NULL DEFAULT ''
+	)`,
+	`CREATE UNIQUE INDEX configuration_one_active_draft ON configuration_drafts((1)) WHERE lifecycle IN ('open','applying','ambiguous')`,
+	`CREATE INDEX configuration_drafts_updated ON configuration_drafts(updated_at,draft_id)`,
 }
 
 func backfillOperationReceiptsV30Tx(ctx context.Context, tx *sql.Tx) error {
