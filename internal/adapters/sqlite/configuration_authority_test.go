@@ -66,6 +66,50 @@ func TestConfigurationV31MigratesV30AndPreservesReceipts(t *testing.T) {
 	}
 }
 
+func TestConcurrentConfigurationV31MigrationFromV30(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "controller.db")
+	legacy, err := openWithSupportedSchema(path, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ready := make(chan struct{}, 2)
+	release := make(chan struct{})
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			store, openErr := openPinnedStore(context.Background(), path, schemaVersion, true, application.DatabaseFileIdentity{}, nil, openPinnedStoreHooks{beforeEffects: func() {
+				ready <- struct{}{}
+				<-release
+			}})
+			if openErr == nil {
+				openErr = store.Close()
+			}
+			results <- openErr
+		}()
+	}
+	<-ready
+	<-ready
+	close(release)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if version, err := store.SchemaVersion(context.Background()); err != nil || version != schemaVersion {
+		t.Fatalf("version=%d err=%v", version, err)
+	}
+}
+
 func TestConcurrentConfigurationBaselineCreatesExactlyOneGeneration(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {

@@ -32,6 +32,11 @@ import (
 
 const schemaVersion = 31
 
+const (
+	sqliteMigrationRetryDelay  = 10 * time.Millisecond
+	sqliteMigrationRetryWindow = 5 * time.Second
+)
+
 type Store struct {
 	db                   *sql.DB
 	databaseIdentity     application.DatabaseFileIdentity
@@ -156,7 +161,7 @@ func openPinnedStore(ctx context.Context, path string, supportedVersion int, cre
 	if _, err := conn.ExecContext(ctx, `PRAGMA query_only = OFF`); err != nil {
 		return nil, err
 	}
-	if err := migrateSQLite(ctx, conn, supportedVersion); err != nil {
+	if err := migrateSQLiteWithRetry(ctx, conn, supportedVersion); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -736,6 +741,36 @@ func migrateSQLite(ctx context.Context, db sqliteTransactioner, supportedVersion
 		}
 	}
 	return tx.Commit()
+}
+
+func migrateSQLiteWithRetry(ctx context.Context, db sqliteTransactioner, supportedVersion int) error {
+	deadline := time.Now().Add(sqliteMigrationRetryWindow)
+	for {
+		err := migrateSQLite(ctx, db, supportedVersion)
+		if err == nil || !sqliteBusy(err) {
+			return err
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return err
+		}
+		delay := min(sqliteMigrationRetryDelay, remaining)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func sqliteBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "database is locked") || strings.Contains(message, "sqlite_busy")
 }
 
 var migrationV1 = []string{
