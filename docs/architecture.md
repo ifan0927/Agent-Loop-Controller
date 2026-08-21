@@ -18,6 +18,22 @@ an autonomous policy-improvement loop.
 
 ## 2. System Context
 
+### Product runtime and repository development
+
+ALC can manage Codex executions for configured target-repository workloads.
+Development of the ALC repository itself is deliberately outside that runtime:
+work is captured in a GitHub issue and the user manually launches Codex to
+design or implement it. ALC never invokes, supervises, verifies, approves,
+publishes, or merges changes into itself. This prevents a self-hosted or
+recursive development authority.
+
+Issue Spec Studio may guide a manually launched ALC design session when the
+root router selects design mode. `ISSUE_SPEC_STUDIO_PATH`, the Project Profile,
+and an optional active design checkpoint are development context only. They are
+not Controller configuration, process inputs, prompt payloads, scheduler stages,
+verification stages, or automatically loaded runtime context. Production ALC
+does not require or read the variable and behaves identically when it is unset.
+
 ```text
 Current CLI / automatic worker / future local TUI or adapter
                            |
@@ -1061,6 +1077,13 @@ the local macOS MVP. Only the controller retains the separate lock descriptor; a
 restart may claim its authenticated inode after the prior controller releases
 it. This lets graceful abandon interrupt the exact surviving process group and
 prove it exited without trusting a reusable PID alone.
+
+Controller-managed Codex commands never use
+`--dangerously-bypass-approvals-and-sandbox`, `--ignore-rules`,
+`--skip-git-repo-check`, `resume --last`, or `--strict-config`. They pass prompts
+through stdin, keep JSONL stdout separate from stderr, validate versioned final
+messages, and preserve unknown JSONL event types as telemetry. Repository design
+profiles and checkpoints are not injected into these commands or prompts.
 
 Managed launches created inside a generated Go test binary add a separate
 test-parent lifetime pipe after the durable launch gate. Abrupt loss of that
