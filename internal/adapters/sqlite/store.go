@@ -744,22 +744,18 @@ func migrateSQLite(ctx context.Context, db sqliteTransactioner, supportedVersion
 }
 
 func migrateSQLiteWithRetry(ctx context.Context, db sqliteTransactioner, supportedVersion int) error {
-	deadline := time.Now().Add(sqliteMigrationRetryWindow)
+	retryCtx, cancel := context.WithTimeout(ctx, sqliteMigrationRetryWindow)
+	defer cancel()
 	for {
-		err := migrateSQLite(ctx, db, supportedVersion)
+		err := migrateSQLite(retryCtx, db, supportedVersion)
 		if err == nil || !sqliteBusy(err) {
 			return err
 		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return err
-		}
-		delay := min(sqliteMigrationRetryDelay, remaining)
-		timer := time.NewTimer(delay)
+		timer := time.NewTimer(sqliteMigrationRetryDelay)
 		select {
-		case <-ctx.Done():
+		case <-retryCtx.Done():
 			timer.Stop()
-			return ctx.Err()
+			return retryCtx.Err()
 		case <-timer.C:
 		}
 	}
