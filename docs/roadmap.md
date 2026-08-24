@@ -147,8 +147,9 @@ operator identity, application authorization, operation receipts, and
 legal-action offers are complete. Activity-independent worker heartbeat,
 controller-authorized runtime observation, configuration generations/CAS,
 desired/effective convergence fencing, the first normal typed-change slice, and
-forward rollback and exact safe external-drift recovery are complete. Unsafe or
-ambiguous configuration repair remains deliberately out of scope. Do not create
+forward rollback, exact safe external-drift recovery, and repository lifecycle,
+readiness, and admission fencing are complete. Unsafe or ambiguous configuration
+repair remains deliberately out of scope. Do not create
 speculative TUI, HTTP, or frontend slices before their Controller contracts
 exist.
 
@@ -156,16 +157,16 @@ exist.
 
 Bounded multi-repository concurrency, local operator authorization, operation
 receipts, legal-action offers, worker runtime observation, and configuration
-transaction/convergence authority, normal typed-change drafts, and forward
-rollback plus exact safe external-drift recovery are complete. The remaining
+transaction/convergence authority, normal typed-change drafts, forward rollback,
+exact safe external-drift recovery, and repository lifecycle/readiness are
+complete. The remaining
 presentation-independent sequence is:
 
-1. repository lifecycle and readiness;
-2. restart-safe onboarding saga;
-3. existing-checkout adoption;
-4. empty-repository initialization;
-5. routine Controller projections;
-6. activity and audit integrity.
+1. restart-safe onboarding saga;
+2. existing-checkout adoption;
+3. empty-repository initialization;
+4. routine Controller projections;
+5. activity and audit integrity.
 
 These services own policy, authorization, idempotency, reconciliation, and
 sanitized evidence independently of presentation. GitHub repository creation,
@@ -225,13 +226,13 @@ queries for conversation, trigger, status, and notification workflows. It must
 not execute Mac shell commands, read worktrees, approve GitHub reviews, resolve
 human threads, or own controller state.
 
-### Planned: multi-repository lifecycle and visibility
+### Current: multi-repository lifecycle and visibility
 
-Bounded multi-repository scheduling is implemented while each run still selects
-exactly one repository. The remaining operator foundations and TUI should make
-repository onboarding, readiness, lifecycle, capacity, and active-run state
-visible without introducing cross-repository transactions or one issue spanning
-multiple PRs.
+Bounded multi-repository scheduling, durable lifecycle intent, readiness
+snapshots, and admission fencing are implemented while each run still selects
+exactly one repository. The remaining operator foundations and TUI should add
+onboarding and routine capacity/activity visibility without introducing
+cross-repository transactions or one issue spanning multiple PRs.
 
 ## Longer-Term Direction
 

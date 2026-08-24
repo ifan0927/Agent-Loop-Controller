@@ -535,7 +535,50 @@ func (r Registry) RepositoryAuthority(_ context.Context, name string) (applicati
 		trusted = append(trusted, domain.GitHubUserIdentity{Login: actor.Login, DatabaseID: actor.DatabaseID, NodeID: actor.NodeID, ActorType: actor.Type})
 	}
 	return application.RepositoryAuthority{Repository: binding.CanonicalRepository, ProfileID: binding.ProfileID, BindingDigest: binding.RepositoryBindingDigest,
-		AllowedLogins: append([]string(nil), binding.OperatorIdentityPolicy.AllowedLogins...), TrustedOperators: trusted, Enabled: true}, true, nil
+		AllowedLogins: append([]string(nil), binding.OperatorIdentityPolicy.AllowedLogins...), TrustedOperators: trusted}, true, nil
+}
+
+// RepositoryProfile exposes the current validated profile to the application
+// composition boundary. Query projections never receive this private path and
+// adapter authority.
+func (r Registry) RepositoryProfile(ctx context.Context, name string) (application.RepositoryProfileAuthority, bool, error) {
+	authority, found, err := r.RepositoryAuthority(ctx, name)
+	if err != nil || !found {
+		return application.RepositoryProfileAuthority{}, found, err
+	}
+	binding, err := r.Resolve(name)
+	if err != nil {
+		return application.RepositoryProfileAuthority{}, false, nil
+	}
+	return application.RepositoryProfileAuthority{Authority: authority, Profile: binding.applicationProfile()}, true, nil
+}
+
+func (r Registry) ListRepositoryProfiles(ctx context.Context) ([]application.RepositoryProfileAuthority, error) {
+	bindings := r.Bindings()
+	result := make([]application.RepositoryProfileAuthority, 0, len(bindings))
+	for _, binding := range bindings {
+		authority, found, err := r.RepositoryAuthority(ctx, binding.CanonicalRepository)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			result = append(result, application.RepositoryProfileAuthority{Authority: authority, Profile: binding.applicationProfile()})
+		}
+	}
+	return result, nil
+}
+
+func (b Binding) applicationProfile() application.LocalRepository {
+	actors := make([]application.TrustedActorIdentity, len(b.OperatorIdentityPolicy.TrustedActors))
+	for index, actor := range b.OperatorIdentityPolicy.TrustedActors {
+		actors[index] = application.TrustedActorIdentity{DatabaseID: actor.DatabaseID, NodeID: actor.NodeID, Login: actor.Login, Type: actor.Type}
+	}
+	return application.LocalRepository{ProfileID: b.ProfileID, ProfileSnapshotVersion: b.ProfileSnapshotVersion, ProfileDigest: b.ProfileDigest, ProfileSnapshotJSON: b.ProfileSnapshotJSON,
+		RegistryVersion: b.RegistryVersion, RegistryDigest: b.RegistryDigest, RepositoryBindingDigest: b.RepositoryBindingDigest, CanonicalRepository: b.CanonicalRepository,
+		LinearLabel: b.LinearLabel, OriginPath: b.OriginPath, SourcePath: b.SourcePath, RunRoot: b.RunRoot, WorktreeRoot: b.WorktreeRoot, BaseBranch: b.BaseBranch,
+		VerifierRegistryRef: b.VerifierRegistryRef, VerifierIDs: append([]string(nil), b.VerifierIDs...), GitHubAppProfileRef: b.GitHubAppProfileRef,
+		GitHubAppID: b.GitHubAppID, GitHubInstallationID: b.GitHubInstallationID, ExpectedRepositoryID: b.ExpectedRepositoryID, CISlowThreshold: b.CISlowThreshold,
+		AllowedOperatorLogins: append([]string(nil), b.OperatorIdentityPolicy.AllowedLogins...), TrustedOperatorActors: actors}
 }
 
 // ResolveLinearLabel resolves the controller-configured short label from a

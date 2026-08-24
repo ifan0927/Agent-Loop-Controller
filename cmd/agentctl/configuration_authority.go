@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/bootstrap"
 	configurationadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/configuration"
@@ -145,6 +146,19 @@ func openManagedConfigurationStore(loaded bootstrap.Bootstrap) (*sqlitestore.Sto
 	store, err := sqlitestore.OpenConfigurationAuthority(context.Background(), locator.DatabasePath, loaded.Path, locator.DatabaseIdentity, false)
 	if err != nil {
 		return nil, errors.New("configuration authority store is unavailable")
+	}
+	profiles, err := loaded.Registry.ListRepositoryProfiles(context.Background())
+	if err != nil {
+		store.Close()
+		return nil, errors.New("repository profile authority is unavailable")
+	}
+	if err := store.AdoptRepositoryLifecycleBaseline(context.Background(), application.RepositoryBaselineInput{Profiles: profiles, AdoptedAt: time.Now().UTC()}); err != nil {
+		store.Close()
+		return nil, errors.New("repository lifecycle baseline conflicts")
+	}
+	if err := store.ReconcileRepositoryRechecks(context.Background(), time.Now().UTC()); err != nil {
+		store.Close()
+		return nil, errors.New("repository recheck reconciliation failed")
 	}
 	return store, nil
 }

@@ -307,6 +307,9 @@ agentctl config init
 agentctl config validate
 agentctl config inspect
 agentctl config doctor
+agentctl repository list <requester flags>
+agentctl repository recheck owner/repository --request-id initial-readiness <requester flags>
+agentctl repository enable owner/repository --request-id enable-after-readiness <requester flags>
 ```
 
 Before enabling a live target, verify the selected repository identity, clean
@@ -376,6 +379,51 @@ All examples omit `--config` when using the default path. Durations use Go
 duration syntax such as `30s`, `15m`, and `24h`.
 
 ### Normal operator commands
+
+### `repository list`, `inspect`, `recheck`, `enable`, and `disable`
+
+**Purpose**
+
+Inspect durable repository lifecycle/readiness and perform receipt-backed
+readiness or lifecycle operations.
+
+**Syntax**
+
+```sh
+agentctl repository list [--limit 50] [--cursor '<opaque>'] <requester flags>
+agentctl repository inspect owner/repository <requester flags>
+agentctl repository recheck owner/repository \
+  --request-id '<stable-id>' <requester flags>
+agentctl repository enable owner/repository \
+  --request-id '<stable-id>' <requester flags>
+agentctl repository disable owner/repository \
+  --request-id '<stable-id>' <requester flags>
+```
+
+All commands accept `--config`. Requester flags must contain the complete
+configured GitHub `User` identity. Mutations also require a caller-stable
+`--request-id`; reuse the same value only to replay the same intended operation.
+Output is JSON. Collection pagination is applied only after authorization, and
+missing and unauthorized detail targets are indistinguishable.
+
+`list` and `inspect` read only persisted projections and never contact Git,
+GitHub, or Linear. `recheck` performs the eight configured read-only
+observations and publishes only a complete authority-matched snapshot. It does
+not fetch, checkout, create a branch, install an App, create a Linear label, or
+run a verifier. After an upgrade, every adopted repository remains enabled for
+compatibility but is `unknown` until its first successful recheck, so recheck
+before expecting new admission. Enable only after the projection is `ready`;
+disable remains legal while work is active and blocks only new
+admission. Readiness remains separate from enabled/disabled intent, while any
+profile or configuration authority change requires a fresh recheck.
+
+If a recheck is interrupted, restart any managed command once to reconcile it
+to `ambiguous`, then use a new request ID for a deliberate fresh observation.
+Exact replay of a settled request returns its persisted receipt.
+
+**Related commands**
+
+`config status`, `controller worker`, `controller run`.
 
 ### `version`
 

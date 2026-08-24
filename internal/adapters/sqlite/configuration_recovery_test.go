@@ -32,7 +32,7 @@ func TestConfigurationRecoveryV34MigratesV33AndPreservesReceipts(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if version, err := store.SchemaVersion(context.Background()); err != nil || version != 34 {
+	if version, err := store.SchemaVersion(context.Background()); err != nil || version != schemaVersion {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	if target, err := store.GetOperationReceiptTarget(context.Background(), receipt.OperationID); err != nil || target.TargetID != receipt.TargetID {
@@ -81,7 +81,7 @@ func TestConcurrentConfigurationRecoveryV34MigrationFromV33(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if version, err := store.SchemaVersion(context.Background()); err != nil || version != 34 {
+	if version, err := store.SchemaVersion(context.Background()); err != nil || version != schemaVersion {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 }
@@ -104,7 +104,7 @@ func TestConfigurationRecoveryV34ReceiptConstraintAcrossOpenPaths(t *testing.T) 
 				t.Fatal(err)
 			}
 			defer store.Close()
-			if version, err := store.SchemaVersion(context.Background()); err != nil || version != 34 {
+			if version, err := store.SchemaVersion(context.Background()); err != nil || version != schemaVersion {
 				t.Fatalf("version=%d err=%v", version, err)
 			}
 			receipt := application.NewOperationReceipt(application.OperationReceiptInput{OperationType: application.OperationRestoreConfiguration, Scope: application.ScopeController, TargetID: application.ConfigurationTargetID, Requester: recoveryTestRequester(), RequestDigest: strings.Repeat("a", 64), ExpectedAuthorityDigest: strings.Repeat("b", 64), OperationAnchorDigest: strings.Repeat("c", 64), TargetBindingDigest: strings.Repeat("d", 64), AcceptedAt: time.Now().UTC()})

@@ -134,6 +134,7 @@ type LinearTodoDispatchPolicy struct {
 	Retry                AutomaticRetryPolicy
 	ExternalPollInterval time.Duration
 	AdmissionGate        NewAdmissionGate
+	RepositoryGate       RepositoryAdmissionGate
 }
 
 // LinearTodoDispatchResult contains sanitized control-flow evidence. The
@@ -800,6 +801,20 @@ func (d *LinearTodoDispatcher) readAndSelect(ctx context.Context, lease *LinearT
 					continue
 				}
 			}
+			if d.policy.RepositoryGate != nil {
+				repositoryDecision, repositoryErr := d.policy.RepositoryGate.CheckRepositoryAdmission(ctx, repository)
+				if repositoryErr != nil {
+					projection.Classification, projection.ReasonCode = QueueCandidateAmbiguous, "repository_eligibility_ambiguous"
+					projections = append(projections, projection)
+					stopSelection = true
+					break
+				}
+				if !repositoryDecision.Allowed {
+					projection.Classification, projection.ReasonCode = QueueCandidateRepositoryIneligible, repositoryDecision.Reason
+					projections = append(projections, projection)
+					continue
+				}
+			}
 		} else {
 			projection.Classification, projection.ReasonCode = QueueCandidateInvalid, "repository_binding_invalid"
 			projections = append(projections, projection)
@@ -939,6 +954,16 @@ func (d *LinearTodoDispatcher) reserveStartAndDrive(ctx context.Context, lease *
 		return d.schedulerAttention(ctx, dispatcherProfile(candidate.repository, d.policy.AttentionProfile), "lease_lost", dispatchEvidence("lease_lost", scanDigest))
 	}
 	input := linearTodoDispatchInput(candidate.snapshot, candidate.repository)
+	if d.policy.RepositoryGate != nil {
+		repositoryDecision, repositoryErr := d.policy.RepositoryGate.CheckRepositoryAdmission(ctx, candidate.repository)
+		if repositoryErr != nil {
+			return LinearTodoDispatchResult{}, classifyServiceError(repositoryErr)
+		}
+		if !repositoryDecision.Allowed || !repositoryDecision.Token.Valid() {
+			return withQueueDecision(LinearTodoDispatchResult{Outcome: LinearTodoDispatchWaiting, ScanDigest: scanDigest}, queueDecision(QueueCandidateRepositoryIneligible, 0, false)), nil
+		}
+		input.RepositoryAuthority = repositoryDecision.Token
+	}
 	capacity, capacityErr := d.capacity(ctx)
 	if capacityErr != nil {
 		return LinearTodoDispatchResult{}, capacityErr
@@ -947,6 +972,9 @@ func (d *LinearTodoDispatcher) reserveStartAndDrive(ctx context.Context, lease *
 	scheduling := SchedulingReservation{OwnerNonce: d.policy.OwnerNonce, CapacityIdentity: capacity.EffectiveIdentity, Capacity: capacity.EffectiveCapacity, RunnableSince: d.clock(), DecisionID: decisionID, IssueSequence: candidate.candidate.IssueSequence, Priority: candidate.candidate.Priority, RepositoryProfileID: candidate.repository.ProfileID}
 	reserved, journal, created, err := d.store.ReserveLinearTodoAdmission(ctx, LinearTodoAdmissionReservation{Lease: *lease, ScanDigest: scanDigest, IssueUUID: candidate.candidate.IssueID, Input: input, Scheduling: scheduling, ConfigurationAuthority: configurationAuthority})
 	if err != nil {
+		if errors.Is(err, ErrRepositoryAdmissionConflict) {
+			return withQueueDecision(LinearTodoDispatchResult{Outcome: LinearTodoDispatchWaiting, ScanDigest: scanDigest}, queueDecision(QueueCandidateRepositoryIneligible, 0, false)), nil
+		}
 		if leaseErr := d.requireLease(ctx, *lease); leaseErr != nil {
 			return d.schedulerAttention(ctx, dispatcherProfile(candidate.repository, d.policy.AttentionProfile), "lease_lost", dispatchEvidence("lease_lost_during_reservation", scanDigest))
 		}

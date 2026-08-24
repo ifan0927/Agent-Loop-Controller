@@ -45,11 +45,12 @@ type LinearRevalidateCommand struct {
 // LinearAdmissionService composes an authoritative read-only Linear adapter
 // with the controller-owned admission and durable-run boundaries.
 type LinearAdmissionService struct {
-	reader   LinearIssueReader
-	resolver LinearAdmissionRepositoryResolver
-	store    LinearAdmissionStore
-	commands CommandService
-	gate     NewAdmissionGate
+	reader         LinearIssueReader
+	resolver       LinearAdmissionRepositoryResolver
+	store          LinearAdmissionStore
+	commands       CommandService
+	gate           NewAdmissionGate
+	repositoryGate RepositoryAdmissionGate
 }
 
 func NewLinearAdmissionService(reader LinearIssueReader, resolver LinearAdmissionRepositoryResolver, store LinearAdmissionStore, controller LocalRunController) (*LinearAdmissionService, error) {
@@ -68,6 +69,18 @@ func NewGatedLinearAdmissionService(reader LinearIssueReader, resolver LinearAdm
 		return nil, errors.New("new-admission convergence gate is required")
 	}
 	service.gate = gate
+	return service, nil
+}
+
+func NewRepositoryGatedLinearAdmissionService(reader LinearIssueReader, resolver LinearAdmissionRepositoryResolver, store LinearAdmissionStore, controller LocalRunController, gate NewAdmissionGate, repositoryGate RepositoryAdmissionGate) (*LinearAdmissionService, error) {
+	service, err := NewGatedLinearAdmissionService(reader, resolver, store, controller, gate)
+	if err != nil {
+		return nil, err
+	}
+	if repositoryGate == nil {
+		return nil, errors.New("repository admission gate is required")
+	}
+	service.repositoryGate = repositoryGate
 	return service, nil
 }
 
@@ -107,10 +120,20 @@ func (s *LinearAdmissionService) Start(ctx context.Context, command LinearStartC
 	if err != nil || !decision.Allowed || !decision.Authority.Valid() {
 		return CommandResult{}, observations, serviceError(ErrorConflict, "new admission is fenced", nil)
 	}
+	var repositoryAuthority RepositoryEligibilityToken
+	if !found {
+		if s.repositoryGate != nil {
+			repositoryDecision, repositoryErr := s.repositoryGate.CheckRepositoryAdmission(ctx, repository)
+			if repositoryErr != nil || !repositoryDecision.Allowed || !repositoryDecision.Token.Valid() {
+				return CommandResult{}, observations, serviceError(ErrorConflict, "repository admission is fenced", repositoryErr)
+			}
+			repositoryAuthority = repositoryDecision.Token
+		}
+	}
 
 	input := LocalStartInput{Task: snapshot.Task, RawIssueJSON: snapshot.RawJSON, RawIssueHash: snapshot.RawHash,
 		NormalizedJSON: snapshot.NormalizedJSON, TaskHash: snapshot.TaskHash, IdempotencyKey: snapshot.IdempotencyKey,
-		Repository: repository, RunRoot: repository.RunRoot, WorktreeRoot: repository.WorktreeRoot, ConfigurationAuthority: decision.Authority}
+		Repository: repository, RunRoot: repository.RunRoot, WorktreeRoot: repository.WorktreeRoot, ConfigurationAuthority: decision.Authority, RepositoryAuthority: repositoryAuthority}
 	result, err := s.commands.Start(ctx, StartCommand{Requester: command.Requester, RepositorySelection: repository.CanonicalRepository, IdempotencyKey: snapshot.IdempotencyKey, Input: input})
 	if err != nil {
 		// A concurrent trigger can create the run after the preflight above. Read

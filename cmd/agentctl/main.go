@@ -56,6 +56,8 @@ func main() {
 		err = controller(os.Args[2:])
 	case "config":
 		err = config(os.Args[2:])
+	case "repository":
+		err = repositoryCommand(os.Args[2:])
 	case "github-read":
 		err = githubRead(os.Args[2:])
 	default:
@@ -188,7 +190,7 @@ func linearStart(args []string) error {
 	if err != nil {
 		return errors.New("configuration convergence authority is unavailable")
 	}
-	service, err := application.NewGatedLinearAdmissionService(reader, linearRegistryResolver{registry: loaded.Registry}, store, newLocalController(store, loaded.Controller.CodexBinary, ""), convergence)
+	service, err := application.NewRepositoryGatedLinearAdmissionService(reader, linearRegistryResolver{registry: loaded.Registry}, store, newLocalController(store, loaded.Controller.CodexBinary, ""), convergence, store)
 	if err != nil {
 		return err
 	}
@@ -278,7 +280,7 @@ func controllerRun(args []string) error {
 	if err != nil {
 		return errors.New("configuration convergence authority is unavailable")
 	}
-	admission, err := application.NewGatedLinearAdmissionService(reader, linearRegistryResolver{registry: loaded.Registry}, store, newLocalController(store, loaded.Controller.CodexBinary, ""), convergence)
+	admission, err := application.NewRepositoryGatedLinearAdmissionService(reader, linearRegistryResolver{registry: loaded.Registry}, store, newLocalController(store, loaded.Controller.CodexBinary, ""), convergence, store)
 	if err != nil {
 		return err
 	}
@@ -1683,5 +1685,5 @@ func decodeTask(reader io.Reader) (domain.CodingTask, error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: agentctl <version|plan|spike|local|linear|controller|config|github-read> [options]")
+	fmt.Fprintln(os.Stderr, "usage: agentctl <version|plan|spike|local|linear|controller|config|repository|github-read> [options]")
 }

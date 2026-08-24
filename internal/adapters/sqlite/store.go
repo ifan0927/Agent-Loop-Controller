@@ -30,7 +30,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 34
+const schemaVersion = 35
 
 const (
 	sqliteMigrationRetryDelay  = 10 * time.Millisecond
@@ -628,7 +628,13 @@ func migrateSQLite(ctx context.Context, db sqliteTransactioner, supportedVersion
 			if err := migrateSQLiteGeneric(ctx, db, 33); err != nil {
 				return err
 			}
-			return migrateSQLiteV34Upgrade(ctx, db)
+			if err := migrateSQLiteV34Upgrade(ctx, db); err != nil {
+				return err
+			}
+			existingVersion = 34
+		}
+		if supportedVersion >= 35 && existingVersion < 35 {
+			return migrateSQLiteV35Upgrade(ctx, db)
 		}
 	}
 	return migrateSQLiteGeneric(ctx, db, supportedVersion)
@@ -724,6 +730,8 @@ func migrateSQLiteGeneric(ctx context.Context, db sqliteTransactioner, supported
 			statements = migrationV33
 		case 34:
 			statements = migrationV34
+		case 35:
+			statements = migrationV35
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -1284,6 +1292,170 @@ var migrationV34ReceiptRebuild = []string{
 	`PRAGMA legacy_alter_table = OFF`,
 }
 
+// migrationV35 establishes durable repository lifecycle intent, exactly-once
+// baseline adoption, restart-safe recheck attempts, complete readiness
+// snapshots, and the receipt operations that mutate this authority.
+var migrationV35 = []string{
+	`CREATE TABLE repository_lifecycle_baseline (
+		authority_id INTEGER PRIMARY KEY CHECK(authority_id=1),
+		configuration_generation_id INTEGER NOT NULL,
+		configuration_digest TEXT NOT NULL,
+		configuration_authority_version INTEGER NOT NULL CHECK(configuration_authority_version > 0),
+		repository_count INTEGER NOT NULL CHECK(repository_count > 0),
+		profiles_digest TEXT NOT NULL,
+		adopted_at TEXT NOT NULL
+	)`,
+	`CREATE TABLE repository_lifecycles (
+		repository TEXT PRIMARY KEY,
+		profile_id TEXT NOT NULL UNIQUE,
+		profile_digest TEXT NOT NULL,
+		repository_binding_digest TEXT NOT NULL UNIQUE,
+		intent TEXT NOT NULL CHECK(intent IN ('enabled','disabled')),
+		lifecycle_version INTEGER NOT NULL CHECK(lifecycle_version > 0),
+		current_snapshot_id TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL
+	)`,
+	`CREATE TABLE repository_readiness_snapshots (
+		snapshot_id TEXT PRIMARY KEY,
+		repository TEXT NOT NULL REFERENCES repository_lifecycles(repository),
+		profile_id TEXT NOT NULL,
+		profile_digest TEXT NOT NULL,
+		repository_binding_digest TEXT NOT NULL,
+		lifecycle_version INTEGER NOT NULL CHECK(lifecycle_version > 0),
+		configuration_generation_id INTEGER NOT NULL,
+		configuration_digest TEXT NOT NULL,
+		configuration_authority_version INTEGER NOT NULL CHECK(configuration_authority_version > 0),
+		overall_status TEXT NOT NULL CHECK(overall_status IN ('ready','not_ready','unknown','conflict')),
+		reason_code TEXT NOT NULL,
+		snapshot_digest TEXT NOT NULL,
+		observed_at TEXT NOT NULL,
+		published_at TEXT NOT NULL
+	)`,
+	`CREATE TABLE repository_readiness_dimensions (
+		snapshot_id TEXT NOT NULL REFERENCES repository_readiness_snapshots(snapshot_id) ON DELETE CASCADE,
+		dimension TEXT NOT NULL CHECK(dimension IN ('profile_configuration','configuration_convergence','local_checkout','base_branch','github_repository','github_app','linear_label','verifier_policy')),
+		status TEXT NOT NULL CHECK(status IN ('ready','not_ready','unknown','conflict','not_applicable')),
+		reason_code TEXT NOT NULL,
+		identity_id TEXT NOT NULL DEFAULT '',
+		evidence_digest TEXT NOT NULL,
+		observed_at TEXT NOT NULL,
+		PRIMARY KEY(snapshot_id,dimension)
+	)`,
+	`CREATE TABLE repository_recheck_attempts (
+		attempt_id TEXT PRIMARY KEY,
+		operation_id TEXT NOT NULL UNIQUE REFERENCES operation_receipts(operation_id),
+		repository TEXT NOT NULL REFERENCES repository_lifecycles(repository),
+		expected_profile_digest TEXT NOT NULL,
+		expected_repository_binding_digest TEXT NOT NULL,
+		expected_lifecycle_version INTEGER NOT NULL CHECK(expected_lifecycle_version > 0),
+		expected_configuration_generation_id INTEGER NOT NULL,
+		expected_configuration_digest TEXT NOT NULL,
+		expected_configuration_authority_version INTEGER NOT NULL CHECK(expected_configuration_authority_version > 0),
+		status TEXT NOT NULL CHECK(status IN ('in_progress','published','failed','conflict','ambiguous')),
+		result_snapshot_id TEXT NOT NULL DEFAULT '',
+		started_at TEXT NOT NULL,
+		settled_at TEXT NOT NULL DEFAULT '',
+		reason_code TEXT NOT NULL DEFAULT ''
+	)`,
+	`CREATE UNIQUE INDEX repository_one_active_recheck ON repository_recheck_attempts(repository) WHERE status='in_progress'`,
+	`CREATE TABLE repository_recheck_observations (
+		attempt_id TEXT NOT NULL REFERENCES repository_recheck_attempts(attempt_id) ON DELETE CASCADE,
+		dimension TEXT NOT NULL CHECK(dimension IN ('profile_configuration','configuration_convergence','local_checkout','base_branch','github_repository','github_app','linear_label','verifier_policy')),
+		status TEXT NOT NULL CHECK(status IN ('ready','not_ready','unknown','conflict','not_applicable')),
+		reason_code TEXT NOT NULL,
+		identity_id TEXT NOT NULL DEFAULT '',
+		evidence_digest TEXT NOT NULL,
+		observed_at TEXT NOT NULL,
+		PRIMARY KEY(attempt_id,dimension)
+	)`,
+	`CREATE INDEX repository_snapshot_history ON repository_readiness_snapshots(repository,published_at,snapshot_id)`,
+	`CREATE TRIGGER repository_lifecycle_identity_immutable BEFORE UPDATE ON repository_lifecycles
+		WHEN NEW.repository<>OLD.repository OR NEW.profile_id<>OLD.profile_id
+		BEGIN SELECT RAISE(ABORT,'repository lifecycle identity is immutable'); END`,
+}
+
+var migrationV35ReceiptRebuild = []string{
+	`PRAGMA legacy_alter_table = ON`,
+	`DROP INDEX operation_receipts_target`,
+	`DROP INDEX operation_receipts_source_action`,
+	`ALTER TABLE operation_receipts RENAME TO operation_receipts_v34`,
+	`CREATE TABLE operation_receipts (
+		operation_id TEXT PRIMARY KEY,
+		authority_key TEXT NOT NULL UNIQUE,
+		operation_anchor_digest TEXT NOT NULL,
+		operation_type TEXT NOT NULL CHECK(operation_type IN ('decide','retry','abandon','recover_ci_wait','recover_owned_push','accept_external_merge','apply_configuration','restore_configuration','recheck_repository','enable_repository','disable_repository')),
+		scope_kind TEXT NOT NULL CHECK(scope_kind IN ('controller','repository','run','onboarding')),
+		target_id TEXT NOT NULL,
+		requester_login TEXT NOT NULL,
+		requester_database_id INTEGER NOT NULL,
+		requester_node_id TEXT NOT NULL,
+		requester_actor_type TEXT NOT NULL,
+		request_digest TEXT NOT NULL,
+		expected_authority_digest TEXT NOT NULL,
+		target_binding_digest TEXT NOT NULL,
+		phase TEXT NOT NULL CHECK(phase IN ('accepted','applied','observed')),
+		outcome TEXT NOT NULL CHECK(outcome IN ('pending','succeeded','failed','conflict','ambiguous')),
+		resulting_authority_digest TEXT NOT NULL DEFAULT '',
+		resulting_state TEXT NOT NULL DEFAULT '',
+		resulting_version INTEGER NOT NULL DEFAULT 0 CHECK(resulting_version >= 0),
+		evidence_digest TEXT NOT NULL DEFAULT '',
+		result_digest TEXT NOT NULL DEFAULT '',
+		accepted_at TEXT NOT NULL,
+		applied_at TEXT NOT NULL DEFAULT '',
+		settled_at TEXT NOT NULL DEFAULT '',
+		source_action_id TEXT NOT NULL DEFAULT ''
+	)`,
+	`INSERT INTO operation_receipts SELECT * FROM operation_receipts_v34`,
+	`DROP TABLE operation_receipts_v34`,
+	`CREATE INDEX operation_receipts_target ON operation_receipts(scope_kind,target_id,accepted_at,operation_id)`,
+	`CREATE UNIQUE INDEX operation_receipts_source_action ON operation_receipts(source_action_id) WHERE source_action_id<>''`,
+	`PRAGMA legacy_alter_table = OFF`,
+}
+
+func migrateSQLiteV35Upgrade(ctx context.Context, db sqliteTransactioner) error {
+	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		return err
+	}
+	defer db.ExecContext(ctx, `PRAGMA foreign_keys = ON`)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var current int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&current); err != nil {
+		return err
+	}
+	if current >= 35 {
+		return tx.Commit()
+	}
+	if current != 34 {
+		return fmt.Errorf("repository lifecycle migration requires schema 34, found %d", current)
+	}
+	for _, statement := range append(append([]string(nil), migrationV35ReceiptRebuild...), migrationV35...) {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("migrate schema to version 35: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES(35,?)`, nowText()); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA legacy_alter_table = OFF`); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
+		return err
+	}
+	var violations int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_foreign_key_check`).Scan(&violations); err != nil || violations != 0 {
+		return errors.New("schema 35 foreign key validation failed")
+	}
+	return nil
+}
+
 func migrateSQLiteV34Upgrade(ctx context.Context, db sqliteTransactioner) error {
 	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
 		return err
@@ -1704,6 +1876,10 @@ func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput)
 	defer tx.Rollback()
 	if err := requireConfigurationAdmissionAuthorityTx(ctx, tx, input.ConfigurationAuthority); err != nil {
 		return application.Run{}, false, err
+	}
+	var repository application.LocalRepository
+	if err := json.Unmarshal([]byte(run.RepositoryConfigJSON), &repository); err != nil || requireRepositoryAdmissionAuthorityTx(ctx, tx, repository, input.RepositoryAuthority) != nil {
+		return application.Run{}, false, application.ErrRepositoryAdmissionConflict
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO runs(run_id,issue_id,idempotency_key,source_revision,raw_issue_json,raw_issue_hash,
 		normalized_task_json,task_hash,repository,repository_config_json,profile_id,profile_snapshot_version,profile_digest,profile_snapshot_json,registry_version,registry_digest,repository_binding_digest,base_branch,working_branch,worktree_path,artifact_root,current_state,implementation_model,review_model,created_at,updated_at)

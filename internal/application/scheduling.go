@@ -21,6 +21,7 @@ const (
 	QueueCandidateWaiting                   = "waiting"
 	QueueCandidateBlockedByActiveRepository = "blocked_by_active_repository"
 	QueueCandidateRepositoryDisabled        = "repository_disabled"
+	QueueCandidateRepositoryIneligible      = "repository_ineligible"
 	QueueCandidateInvalid                   = "invalid"
 	QueueCandidateDrift                     = "source_drift"
 	QueueCandidateAmbiguous                 = "ambiguous"
@@ -203,7 +204,7 @@ func validSchedulingProfileID(value string) bool {
 func validQueueCandidateClassification(value string) bool {
 	switch value {
 	case QueueCandidateSelected, QueueCandidateWaiting, QueueCandidateBlockedByActiveRepository,
-		QueueCandidateRepositoryDisabled, QueueCandidateInvalid, QueueCandidateDrift,
+		QueueCandidateRepositoryDisabled, QueueCandidateRepositoryIneligible, QueueCandidateInvalid, QueueCandidateDrift,
 		QueueCandidateAmbiguous:
 		return true
 	default:

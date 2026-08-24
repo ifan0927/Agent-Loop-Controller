@@ -25,7 +25,7 @@ func TestConfigurationDraftV33MigratesV31WithoutSyntheticDraft(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if version, err := store.SchemaVersion(context.Background()); err != nil || version != 34 {
+	if version, err := store.SchemaVersion(context.Background()); err != nil || version != schemaVersion {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	if _, found, err := store.ActiveConfigurationDraft(context.Background()); err != nil || found {
@@ -71,7 +71,7 @@ func TestConcurrentConfigurationDraftV33MigrationFromV31(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if version, err := store.SchemaVersion(context.Background()); err != nil || version != 34 {
+	if version, err := store.SchemaVersion(context.Background()); err != nil || version != schemaVersion {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 }
