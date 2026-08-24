@@ -50,6 +50,16 @@ func configurationAuthorityQuery(ctx context.Context, query queryRower) (applica
 	if found {
 		authority.Incomplete = &intent
 	}
+	recovery, recoveryFound, err := configurationIncompleteRecovery(ctx, query)
+	if err != nil {
+		return application.ConfigurationAuthority{}, false, err
+	}
+	if recoveryFound {
+		if authority.Incomplete != nil {
+			return application.ConfigurationAuthority{}, false, errors.New("configuration mutation authority is corrupt")
+		}
+		authority.IncompleteRecovery = &recovery
+	}
 	return authority, true, nil
 }
 
@@ -179,7 +189,7 @@ func (s *Store) RecordConfigurationNoOp(ctx context.Context, settlement applicat
 	if err != nil || !found {
 		return application.ConfigurationAuthority{}, application.OperationReceipt{}, false, application.ErrConfigurationAuthorityConflict
 	}
-	if authority.Incomplete != nil || authority.Desired.GenerationID != settlement.ExpectedGenerationID || authority.Desired.Digest != settlement.ExpectedDigest {
+	if authority.Incomplete != nil || authority.IncompleteRecovery != nil || authority.Desired.GenerationID != settlement.ExpectedGenerationID || authority.Desired.Digest != settlement.ExpectedDigest {
 		return application.ConfigurationAuthority{}, application.OperationReceipt{}, false, application.ErrConfigurationAuthorityConflict
 	}
 	if existing, found, lookupErr := getOperationReceiptByIDTx(ctx, tx, settlement.Receipt.OperationID); lookupErr != nil {
@@ -242,7 +252,7 @@ func (s *Store) BeginConfigurationApply(ctx context.Context, input application.C
 	if err != nil || !found {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, application.ErrConfigurationAuthorityConflict
 	}
-	if authority.Incomplete != nil {
+	if authority.Incomplete != nil || authority.IncompleteRecovery != nil {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, application.ErrConfigurationApplyInProgress
 	}
 	if authority.Desired.GenerationID != input.ExpectedGenerationID || authority.Desired.Digest != input.ExpectedDigest || authority.DatabasePath != input.Candidate.DatabasePath {
@@ -311,7 +321,7 @@ func requireConfigurationAdmissionAuthorityTx(ctx context.Context, tx *sql.Tx, e
 	if !found {
 		return application.ErrConfigurationAuthorityConflict
 	}
-	if !expected.Valid() || time.Now().UTC().After(expected.ValidThrough) || authority.Incomplete != nil || authority.Desired.GenerationID != expected.GenerationID || authority.Desired.Digest != expected.Digest || authority.Version != expected.AuthorityVersion || authority.EffectiveID != authority.Desired.GenerationID || authority.Desired.State != application.ConfigurationGenerationEffective {
+	if !expected.Valid() || time.Now().UTC().After(expected.ValidThrough) || authority.Incomplete != nil || authority.IncompleteRecovery != nil || authority.Desired.GenerationID != expected.GenerationID || authority.Desired.Digest != expected.Digest || authority.Version != expected.AuthorityVersion || authority.EffectiveID != authority.Desired.GenerationID || authority.Desired.State != application.ConfigurationGenerationEffective {
 		return application.ErrConfigurationAuthorityConflict
 	}
 	var lastDrift string
@@ -445,7 +455,7 @@ func (s *Store) ObserveConfigurationEffective(ctx context.Context, observation a
 	}
 	defer tx.Rollback()
 	authority, found, err := configurationAuthorityQuery(ctx, tx)
-	if err != nil || !found || authority.Incomplete != nil || authority.Desired.GenerationID != observation.ExpectedGenerationID || authority.Desired.Digest != observation.ExpectedDigest {
+	if err != nil || !found || authority.Incomplete != nil || authority.IncompleteRecovery != nil || authority.Desired.GenerationID != observation.ExpectedGenerationID || authority.Desired.Digest != observation.ExpectedDigest {
 		return application.ConfigurationAuthority{}, false, application.ErrConfigurationAuthorityConflict
 	}
 	if authority.EffectiveID == observation.ExpectedGenerationID && !authority.Desired.EffectiveAt.IsZero() {

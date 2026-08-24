@@ -390,7 +390,7 @@ The acceptance matrix requires:
 | Boundary | Required evidence |
 | --- | --- |
 | Automatic admission | Bounded scan, priority selection, atomic run/slot/permit reservation, exact Todo-to-In-Progress mutation, and one nonterminal run per repository |
-| Configuration authority | Same-byte stable-root-flock-serialized filesystem binding/database-anchor/locator baseline crash matrix, trusted-ancestor and descendant-path replacement exclusion, private-leaf descriptor pinning across final directory sync plus post-sync owner/mode/link/path proof, initial private-directory parent-entry fsync and full-chain directory inode/mode proof, actual-VFS-fd exact-inode/private-mode proof including ABA replacement, idle reuse, pre/post transaction and row-consumption effects, and pool reconnect, post-reconcile operator reauthorization, accepted-receipt reconciliation, historical same-digest no-op replay and immediate effective correlation for an already-loaded historical digest, active-run Linear task-source compatibility, no-replace single-link publication, pre-anchor temp/raw recovery, retryable raw/binding/locator/prune directory durability, bounded forward migration through v33, atomic no-op authority/receipt CAS, concurrent replay, intent-before-exchange crash matrix, captured-parent/exchange/cleanup fsync proof, durable prune claims plus serialized same-digest restaging, legacy non-elevation, manual-supervisor heartbeat, drift/effective convergence, development-fixture authority, and fail-closed direct plus automatic admission fencing |
+| Configuration authority | Same-byte stable-root-flock-serialized filesystem binding/database-anchor/locator baseline crash matrix, trusted-ancestor and descendant-path replacement exclusion, private-leaf descriptor pinning across final directory sync plus post-sync owner/mode/link/path proof, initial private-directory parent-entry fsync and full-chain directory inode/mode proof, actual-VFS-fd exact-inode/private-mode proof including ABA replacement, idle reuse, pre/post transaction and row-consumption effects, and pool reconnect, post-reconcile operator reauthorization, accepted apply/recovery receipt reconciliation, historical same-digest no-op replay and immediate effective correlation for an already-loaded historical digest, safe-drift offer/CAS authorization, apply/recovery durable exclusion, no-generation exact desired restore, response-loss and same-digest-recurrence replay, third-digest preservation and fenced ambiguity, active-run Linear task-source compatibility, no-replace single-link publication, pre-anchor temp/raw recovery, retryable raw/binding/locator/prune directory durability, bounded forward migration through v34, atomic no-op authority/receipt CAS, concurrent replay, intent-before-exchange crash matrix, captured-parent/exchange/cleanup fsync proof, durable prune claims plus serialized same-digest restaging, legacy non-elevation, manual-supervisor heartbeat, drift/effective convergence, development-fixture authority, and fail-closed direct plus automatic admission fencing |
 | Typed configuration drafts | One active normal or rollback-origin draft under concurrent open, authorization-before-lookup and hidden targets, every allowlisted field and input bound, edit/discard replay, validation and preview invalidation, v32-compatible normal identity plus deterministic source-bound rollback identity, schema-1-through-5 scalar projection, source-prune/open exclusion plus exact post-open replay after pruning, committed intent/receipt source evidence, immutable generation provenance, unchanged-byte no-op, real apply, response-loss/restart replay, capacity drain impact, sanitized output, and isolated CLI restart/convergence acceptance |
 | Bounded concurrency | Generic capacity above two, same-repository exclusion, drain-on-reduction, sibling failure isolation, and restart reconstruction |
 | Implementation | Owned worktree, resumable session, exact candidate, successful verifier batch |
@@ -420,7 +420,8 @@ controller process. Cover at least:
 - configuration raw staging, filesystem baseline binding, database anchor,
   locator publication, prune claim/removal, intent acceptance, captured-parent
   exchange/fsync/reread, staged-leaf cleanup sync, same-digest receipt CAS,
-  desired settlement, effective observation, and retention pruning;
+  desired settlement, safe-drift recovery intent/exchange/replay/ambiguity,
+  effective observation, and retention pruning;
 - push, PR create/adopt, review reply, and merge intent/observation;
 - pending CI/approval/thread resolution polling;
 - Linear completion observation;
@@ -433,7 +434,7 @@ that bypass safety solely to make fault injection easier.
 ## Database Migrations
 
 SQLite migrations are ordered in `internal/adapters/sqlite/store.go`; the current
-schema version is 33. Opening a database applies missing forward migrations in a
+schema version is 34. Opening a database applies missing forward migrations in a
 transaction. A database newer than the binary fails closed.
 
 When adding a migration:

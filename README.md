@@ -179,8 +179,9 @@ legal-action offers are implemented. Activity-independent worker heartbeat,
 controller-authorized runtime observation, configuration generation/CAS, and
 desired/effective convergence fencing are also implemented, together with the
 normal typed-change draft/preview/apply slice and Controller-owned forward
-rollback. Explicit external-drift recovery remains later configuration
-lifecycle work; repository lifecycle is the next separate operator foundation.
+rollback, plus exact safe external-drift recovery with durable receipt replay
+and no new generation. Unsafe or ambiguous configuration repair remains out of
+scope; repository lifecycle is the next separate operator foundation.
 The TUI and `agentctl operator` are planned, not current behavior. HTTP, a Web
 UI, outbound notifications, Hermes runtime integration, public API/webhook
 admission, and cross-repository transactions remain deferred or exploratory.

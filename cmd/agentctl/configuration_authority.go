@@ -62,7 +62,7 @@ func loadManagedConfiguration(path string) (bootstrap.Bootstrap, error) {
 		// ambiguous evidence. The retained desired generation still supplies the
 		// only safe composition input, while the gate remains closed.
 		initialized, initializeErr := service.Initialize(context.Background())
-		if initializeErr != nil && (initialized.Incomplete == nil || initialized.Incomplete.State != application.ConfigurationApplyAmbiguous) {
+		if initializeErr != nil && (initialized.Incomplete == nil || initialized.Incomplete.State != application.ConfigurationApplyAmbiguous) && (initialized.IncompleteRecovery == nil || initialized.IncompleteRecovery.State != application.ConfigurationRecoveryAmbiguous) {
 			return bootstrap.Bootstrap{}, errors.New("configuration authority reconciliation failed")
 		}
 		authority, found, err = store.ConfigurationAuthority(context.Background())

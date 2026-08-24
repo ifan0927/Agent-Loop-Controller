@@ -19,8 +19,9 @@ const (
 )
 
 var (
-	ErrConfigurationAuthorityConflict = errors.New("configuration authority conflicts")
-	ErrConfigurationApplyInProgress   = errors.New("configuration apply is unresolved")
+	ErrConfigurationAuthorityConflict  = errors.New("configuration authority conflicts")
+	ErrConfigurationApplyInProgress    = errors.New("configuration apply is unresolved")
+	ErrConfigurationRecoveryInProgress = errors.New("configuration recovery is unresolved")
 )
 
 type ConfigurationGenerationState string
@@ -50,6 +51,14 @@ const (
 	ConfigurationApplyAmbiguous ConfigurationApplyState = "ambiguous"
 )
 
+type ConfigurationRecoveryState string
+
+const (
+	ConfigurationRecoveryAccepted  ConfigurationRecoveryState = "accepted"
+	ConfigurationRecoveryCommitted ConfigurationRecoveryState = "committed"
+	ConfigurationRecoveryAmbiguous ConfigurationRecoveryState = "ambiguous"
+)
+
 type ConfigurationReason string
 
 const (
@@ -66,6 +75,8 @@ const (
 	ConfigurationReasonAuthorityMissing   ConfigurationReason = "configuration_authority_missing"
 	ConfigurationReasonApplyIncomplete    ConfigurationReason = "configuration_apply_incomplete"
 	ConfigurationReasonApplyAmbiguous     ConfigurationReason = "configuration_apply_ambiguous"
+	ConfigurationReasonRecoveryIncomplete ConfigurationReason = "configuration_recovery_incomplete"
+	ConfigurationReasonRecoveryAmbiguous  ConfigurationReason = "configuration_recovery_ambiguous"
 	ConfigurationReasonAuthorityConflict  ConfigurationReason = "configuration_authority_conflict"
 	ConfigurationReasonEffectiveUnsettled ConfigurationReason = "effective_observation_pending"
 )
@@ -150,17 +161,32 @@ type ConfigurationApplyIntent struct {
 	Reason       ConfigurationReason     `json:"reason,omitempty"`
 }
 
+type ConfigurationRecoveryIntent struct {
+	DesiredGenerationID int64                      `json:"desired_generation_id"`
+	DesiredDigest       string                     `json:"desired_digest"`
+	AuthorityVersion    int64                      `json:"authority_version"`
+	ObservedDigest      string                     `json:"observed_digest"`
+	OperationID         string                     `json:"operation_id"`
+	Requester           domain.GitHubUserIdentity  `json:"requester"`
+	State               ConfigurationRecoveryState `json:"state"`
+	AcceptedAt          time.Time                  `json:"accepted_at"`
+	SettledAt           time.Time                  `json:"settled_at,omitempty"`
+	Reason              ConfigurationReason        `json:"reason,omitempty"`
+	EvidenceDigest      string                     `json:"evidence_digest,omitempty"`
+}
+
 // ConfigurationAuthority contains public generation identity plus the private
 // binding needed only by Controller composition. Private paths are never
 // serialized or copied into audit/projection records.
 type ConfigurationAuthority struct {
-	Desired             ConfigurationGeneration   `json:"desired"`
-	EffectiveID         int64                     `json:"effective_generation_id,omitempty"`
-	Incomplete          *ConfigurationApplyIntent `json:"incomplete_apply,omitempty"`
-	Version             int64                     `json:"authority_version"`
-	UpdatedAt           time.Time                 `json:"updated_at"`
-	CanonicalConfigPath string                    `json:"-"`
-	DatabasePath        string                    `json:"-"`
+	Desired             ConfigurationGeneration      `json:"desired"`
+	EffectiveID         int64                        `json:"effective_generation_id,omitempty"`
+	Incomplete          *ConfigurationApplyIntent    `json:"incomplete_apply,omitempty"`
+	IncompleteRecovery  *ConfigurationRecoveryIntent `json:"incomplete_recovery,omitempty"`
+	Version             int64                        `json:"authority_version"`
+	UpdatedAt           time.Time                    `json:"updated_at"`
+	CanonicalConfigPath string                       `json:"-"`
+	DatabasePath        string                       `json:"-"`
 }
 
 type ConfigurationRepositoryAuthority struct {
@@ -258,6 +284,31 @@ type ConfigurationNoOpSettlement struct {
 	SettledAt            time.Time
 }
 
+type ConfigurationRecoveryAcceptance struct {
+	DesiredGenerationID int64
+	DesiredDigest       string
+	AuthorityVersion    int64
+	ObservedDigest      string
+	Requester           domain.GitHubUserIdentity
+	Receipt             OperationReceipt
+	AcceptedAt          time.Time
+}
+
+type ConfigurationRecoverySettlement struct {
+	OperationID    string
+	Outcome        ConfigurationRecoveryState
+	Reason         ConfigurationReason
+	EvidenceDigest string
+	SettledAt      time.Time
+}
+
+type ConfigurationRecoveryStore interface {
+	ConfigurationRecoveryIntent(context.Context, string) (ConfigurationRecoveryIntent, bool, error)
+	ConfigurationRecoveryIsLatest(context.Context, string, int64) (bool, error)
+	BeginConfigurationRecovery(context.Context, ConfigurationRecoveryAcceptance) (ConfigurationRecoveryIntent, OperationReceipt, bool, error)
+	SettleConfigurationRecovery(context.Context, ConfigurationRecoverySettlement) (ConfigurationAuthority, ConfigurationRecoveryIntent, OperationReceipt, bool, error)
+}
+
 type ConfigurationGenerationStore interface {
 	ConfigurationAuthority(context.Context) (ConfigurationAuthority, bool, error)
 	PrepareConfigurationBaseline(context.Context, ConfigurationBaselineInput) error
@@ -288,9 +339,23 @@ type ConfigurationFileAuthority interface {
 	AcquireReplacement(string) (ConfigurationReplacementLock, bool, error)
 	ReplaceLive(string, []byte, []byte) error
 	ReconcileReplacement(string, []byte, []byte) ([]byte, ValidatedConfigurationCandidate, error)
+	ReconcileRestore(string, string, []byte) (ConfigurationRestoreFileObservation, error)
 	RemoveRaw(string) error
 	ListRawDigests() ([]string, error)
 	PublishLocator(string) error
+}
+
+type ConfigurationRestoreFileState string
+
+const (
+	ConfigurationRestoreFileDesired ConfigurationRestoreFileState = "desired"
+	ConfigurationRestoreFileThird   ConfigurationRestoreFileState = "third_digest"
+	ConfigurationRestoreFileUnsafe  ConfigurationRestoreFileState = "unsafe"
+)
+
+type ConfigurationRestoreFileObservation struct {
+	State  ConfigurationRestoreFileState
+	Digest string
 }
 
 type ConfigurationReplacementLock interface {
@@ -313,6 +378,35 @@ type ConfigurationApplyResult struct {
 	Generation ConfigurationGeneration `json:"generation"`
 	Receipt    OperationReceipt        `json:"receipt"`
 	NoOp       bool                    `json:"no_op"`
+}
+
+type ConfigurationRecoveryAction string
+
+const ConfigurationRecoveryActionRestore ConfigurationRecoveryAction = "restore"
+
+type ConfigurationRecoveryOffer struct {
+	State                    string                      `json:"state"`
+	Reason                   ConfigurationReason         `json:"reason"`
+	Action                   ConfigurationRecoveryAction `json:"action"`
+	ExpectedGenerationID     int64                       `json:"expected_generation_id"`
+	ExpectedDigest           string                      `json:"expected_digest"`
+	ExpectedAuthorityVersion int64                       `json:"expected_authority_version"`
+	ObservedDigest           string                      `json:"observed_digest"`
+	ObservedAt               time.Time                   `json:"observed_at"`
+}
+
+type ConfigurationRecoveryCommand struct {
+	Requester                Requester
+	ExpectedGenerationID     int64
+	ExpectedDigest           string
+	ExpectedAuthorityVersion int64
+	ObservedDigest           string
+}
+
+type ConfigurationRecoveryResult struct {
+	Recovery    ConfigurationRecoveryIntent        `json:"recovery"`
+	Receipt     OperationReceipt                   `json:"receipt"`
+	Convergence ConfigurationConvergenceProjection `json:"convergence"`
 }
 
 type ConfigurationConvergenceProjection struct {

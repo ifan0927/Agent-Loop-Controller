@@ -22,6 +22,8 @@ import (
 func removeConfigurationV31(t *testing.T, db *sql.DB) {
 	t.Helper()
 	for _, statement := range []string{
+		`DROP TRIGGER IF EXISTS configuration_apply_excludes_recovery`,
+		`DROP TABLE IF EXISTS configuration_recovery_intents`,
 		`DROP TABLE IF EXISTS configuration_drafts`,
 		`DROP TABLE IF EXISTS configuration_raw_prune_claims`,
 		`DROP TABLE IF EXISTS configuration_convergence_events`,

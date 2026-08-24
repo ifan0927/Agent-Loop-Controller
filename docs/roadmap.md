@@ -99,6 +99,9 @@ This milestone is recorded by the closed
 - Controller-owned forward rollback with bounded eligible-source discovery,
   schema-1-through-5 typed projection, source-bound draft/preview/apply identity,
   immutable resulting-generation provenance, and no parallel mutation path.
+- Exact safe external-drift recovery with authorized bounded offers, durable
+  intent/receipt replay, no-generation desired-byte restoration, atomic
+  concurrent-edit preservation, and admission fencing for ambiguity.
 
 The implementation child work under the
 [automatic-admission roadmap](https://github.com/ifan0927/Agent-Loop-Controller/issues/21)
@@ -144,8 +147,8 @@ operator identity, application authorization, operation receipts, and
 legal-action offers are complete. Activity-independent worker heartbeat,
 controller-authorized runtime observation, configuration generations/CAS,
 desired/effective convergence fencing, the first normal typed-change slice, and
-forward rollback are complete. External-drift recovery remains later
-typed-lifecycle work. Do not create
+forward rollback and exact safe external-drift recovery are complete. Unsafe or
+ambiguous configuration repair remains deliberately out of scope. Do not create
 speculative TUI, HTTP, or frontend slices before their Controller contracts
 exist.
 
@@ -154,16 +157,15 @@ exist.
 Bounded multi-repository concurrency, local operator authorization, operation
 receipts, legal-action offers, worker runtime observation, and configuration
 transaction/convergence authority, normal typed-change drafts, and forward
-rollback are complete. The remaining
+rollback plus exact safe external-drift recovery are complete. The remaining
 presentation-independent sequence is:
 
-1. explicit typed external-drift recovery where dependency-ready;
-2. repository lifecycle and readiness;
-3. restart-safe onboarding saga;
-4. existing-checkout adoption;
-5. empty-repository initialization;
-6. routine Controller projections;
-7. activity and audit integrity.
+1. repository lifecycle and readiness;
+2. restart-safe onboarding saga;
+3. existing-checkout adoption;
+4. empty-repository initialization;
+5. routine Controller projections;
+6. activity and audit integrity.
 
 These services own policy, authorization, idempotency, reconciliation, and
 sanitized evidence independently of presentation. GitHub repository creation,
