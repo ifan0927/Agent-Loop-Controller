@@ -40,7 +40,7 @@ func (s *Store) OpenConfigurationDraft(ctx context.Context, input application.Co
 	if activeErr == nil {
 		if input.DraftOrigin == application.ConfigurationDraftOriginRollback {
 			authority, found, authorityErr := configurationAuthorityQuery(ctx, tx)
-			if authorityErr != nil || !found || authority.Incomplete != nil || authority.Desired.GenerationID != input.BaseGenerationID || authority.Desired.Digest != input.BaseDigest || authority.Desired.SchemaVersion != 5 || active.DraftOrigin != input.DraftOrigin || active.BaseGenerationID != input.BaseGenerationID || active.BaseDigest != input.BaseDigest || active.RollbackSourceGenerationID != input.RollbackSourceGenerationID || active.RollbackSourceDigest != input.RollbackSourceDigest {
+			if authorityErr != nil || !found || authority.Incomplete != nil || authority.IncompleteRecovery != nil || authority.Desired.GenerationID != input.BaseGenerationID || authority.Desired.Digest != input.BaseDigest || authority.Desired.SchemaVersion != 5 || active.DraftOrigin != input.DraftOrigin || active.BaseGenerationID != input.BaseGenerationID || active.BaseDigest != input.BaseDigest || active.RollbackSourceGenerationID != input.RollbackSourceGenerationID || active.RollbackSourceDigest != input.RollbackSourceDigest {
 				return application.ConfigurationDraft{}, false, errors.New("configuration rollback draft conflicts")
 			}
 		}
@@ -54,7 +54,7 @@ func (s *Store) OpenConfigurationDraft(ctx context.Context, input application.Co
 		return application.ConfigurationDraft{}, false, application.ErrConfigurationAuthorityConflict
 	}
 	if input.DraftOrigin == application.ConfigurationDraftOriginRollback {
-		if authority.Incomplete != nil {
+		if authority.Incomplete != nil || authority.IncompleteRecovery != nil {
 			return application.ConfigurationDraft{}, false, application.ErrConfigurationAuthorityConflict
 		}
 		var eligible int

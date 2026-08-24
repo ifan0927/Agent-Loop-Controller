@@ -75,6 +75,57 @@ func managedConfigRollback(args []string) error {
 	}
 }
 
+func managedConfigRecover(args []string) error {
+	if len(args) == 0 || args[0] != "restore" {
+		return errors.New("usage: agentctl config recover restore [options]")
+	}
+	return managedConfigRecoverRestore(args[1:])
+}
+
+func managedConfigRecoverRestore(args []string) error {
+	flags := flag.NewFlagSet("config recover restore", flag.ContinueOnError)
+	pathFlag := configPathFlag(flags)
+	requester := addRequesterFlags(flags)
+	expectedGeneration := flags.Int64("expected-generation-id", 0, "expected desired configuration generation")
+	expectedDigest := flags.String("expected-digest", "", "expected desired configuration digest")
+	expectedAuthorityVersion := flags.Int64("expected-authority-version", 0, "expected configuration authority version")
+	observedDigest := flags.String("observed-digest", "", "exact safely observed live configuration digest")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("config recover restore does not accept positional arguments")
+	}
+	if !requester.complete() {
+		return errors.New("complete requester identity is required")
+	}
+	if *expectedGeneration < 1 || *expectedAuthorityVersion < 1 || len(*expectedDigest) != 64 || len(*observedDigest) != 64 || *expectedDigest == *observedDigest {
+		return errors.New("complete configuration recovery authority is required")
+	}
+	path, err := resolveConfigPath(*pathFlag)
+	if err != nil {
+		return err
+	}
+	loaded, err := loadManagedConfiguration(path)
+	if err != nil {
+		return err
+	}
+	store, err := openManagedConfigurationStore(loaded)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	service, err := configuredConvergenceService(store, loaded, 0, false)
+	if err != nil {
+		return err
+	}
+	result, err := service.RecoverRestore(context.Background(), application.ConfigurationRecoveryCommand{Requester: requester.value(), ExpectedGenerationID: *expectedGeneration, ExpectedDigest: *expectedDigest, ExpectedAuthorityVersion: *expectedAuthorityVersion, ObservedDigest: *observedDigest})
+	if err != nil {
+		return err
+	}
+	return printJSON(result)
+}
+
 func managedConfigRollbackSources(args []string) error {
 	flags := flag.NewFlagSet("config rollback sources", flag.ContinueOnError)
 	common := addManagedDraftCommonFlags(flags, false)

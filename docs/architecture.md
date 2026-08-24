@@ -623,6 +623,24 @@ The resulting finite projection is
 `ready`, `restart_required`, `starting`, `stale`, `offline`, `unknown`, or
 `conflict`, separate from worker activity and capacity.
 
+Safely readable external drift has one narrower recovery action. After
+Controller authorization, status may expose only the current desired
+generation/digest, configuration authority version, and exact observed live
+digest needed for `restore_configuration` compare-and-swap. The command
+reauthorizes and recomputes that evidence immediately before atomically
+persisting one recovery intent and generic Controller-scope receipt. Apply and
+restore acceptance are mutually exclusive in SQLite and share the stable
+filesystem-root mutation lock. Restore exchanges the exact accepted observed
+file for the retained exact desired bytes; it neither creates a generation nor
+adopts or retains external bytes. Startup and every pre-mutation reconciliation
+resume only an already-accepted observed digest under the same operation ID.
+Exact desired evidence settles success; a third digest or unsafe or
+contradictory stage settles ambiguous, preserves the required private evidence,
+and keeps admission fenced. Successful settlement records one
+`drift_cleared` transition, advances configuration authority version, and then
+reuses the ordinary runtime convergence projection. A later recurrence must
+first establish newer drift authority and cannot replay the earlier receipt.
+
 The typed lifecycle adapter adds one Controller-wide durable normal or
 rollback-origin draft without
 adding another configuration transaction. Controller authorization happens
@@ -1092,7 +1110,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 33; migration history is code, not a
+inspection. The current schema is version 34; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees
@@ -1423,7 +1441,7 @@ around it. The principal table groups are:
 | `automatic_retry_schedules`, `operator_attention_outbox` | Restart-stable retry policy and immutable versioned operator-attention events; legacy delivery fields are storage-only evidence |
 | `operator_actions` | Action-specific authenticated recovery intent and legacy validated/applied/observed provenance, separate from automatic workflow evidence |
 | `operation_receipts` | Scope-neutral accepted/applied/observed operation identity, outcome, and sanitized result evidence; legacy operator actions are backfilled and mirrored here |
-| configuration generation, authority, apply-intent, and convergence tables | Immutable desired/effective metadata, one Controller-wide CAS transaction, reconciliation state, optional immutable rollback-source identity, and meaningful sanitized transitions; raw bytes remain outside SQLite |
+| configuration generation, authority, apply/recovery-intent, and convergence tables | Immutable desired/effective metadata, one Controller-wide CAS mutation authority, crash reconciliation state, optional immutable rollback-source identity, and meaningful sanitized transitions; raw desired bytes remain outside SQLite and external bytes are never stored |
 | `configuration_drafts` | At most one active Controller-wide normal or rollback-origin typed draft, revision/edit replay authority, immutable rollback source when applicable, sanitized validation/preview evidence, and generation/receipt settlement; no raw candidate, path, identity, or credential authority |
 
 ### Current state versus evidence
@@ -1533,8 +1551,8 @@ resolution is not approval, and an approval for an old head is stale.
 - Linear admission and completion observation are implemented, but completion
   remains external automation/human authority.
 - GitHub writes require a narrowly permissioned selected-repository App.
-- Explicit external-drift recovery, transactional repository onboarding, the
-  local TUI, optional HTTP/Web adapters,
+- Unsafe or ambiguous configuration recovery, transactional repository
+  onboarding, the local TUI, optional HTTP/Web adapters,
   notification transport, Hermes runtime integration, public API, webhooks,
   and multi-tenant authorization are not implemented.
 - External live E2E acceptance remains restricted to isolated fixture

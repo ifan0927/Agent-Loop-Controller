@@ -18,17 +18,19 @@ type configurationPersistence interface {
 }
 
 type ConfigurationService struct {
-	store   configurationPersistence
-	files   ConfigurationFileAuthority
-	runtime ConfigurationRuntimeObserver
-	now     func() time.Time
+	store         configurationPersistence
+	recoveryStore ConfigurationRecoveryStore
+	files         ConfigurationFileAuthority
+	runtime       ConfigurationRuntimeObserver
+	now           func() time.Time
 }
 
 func NewConfigurationService(store configurationPersistence, files ConfigurationFileAuthority, runtime ConfigurationRuntimeObserver) (*ConfigurationService, error) {
 	if store == nil || files == nil {
 		return nil, errors.New("configuration authority dependencies are required")
 	}
-	return &ConfigurationService{store: store, files: files, runtime: runtime, now: func() time.Time { return time.Now().UTC() }}, nil
+	recoveryStore, _ := store.(ConfigurationRecoveryStore)
+	return &ConfigurationService{store: store, recoveryStore: recoveryStore, files: files, runtime: runtime, now: func() time.Time { return time.Now().UTC() }}, nil
 }
 
 // Initialize adopts one valid unmanaged live configuration or reconciles the
@@ -120,8 +122,11 @@ func (s *ConfigurationService) Reconcile(ctx context.Context) (ConfigurationAuth
 	if authority.CanonicalConfigPath != s.files.CanonicalConfigPath() || !s.files.HasRaw(authority.Desired.Digest, authority.Desired.Size) {
 		return ConfigurationAuthority{}, serviceError(ErrorConflict, "configuration authority conflicts", nil)
 	}
-	if authority.Incomplete == nil {
+	if authority.Incomplete == nil && authority.IncompleteRecovery == nil {
 		return authority, nil
+	}
+	if authority.IncompleteRecovery != nil {
+		return s.reconcileRecovery(ctx, authority, *authority.IncompleteRecovery)
 	}
 	intent := *authority.Incomplete
 	if intent.State == ConfigurationApplyAmbiguous {
@@ -344,7 +349,7 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 }
 
 func (s *ConfigurationService) reconcileRuntimeBestEffort(ctx context.Context, authority ConfigurationAuthority) ConfigurationAuthority {
-	if s.runtime == nil || authority.Incomplete != nil {
+	if s.runtime == nil || authority.Incomplete != nil || authority.IncompleteRecovery != nil {
 		return authority
 	}
 	reconciled, _, err := s.ReconcileRuntime(ctx, s.now().UTC())
@@ -456,7 +461,7 @@ func (s *ConfigurationService) ReconcileRuntime(ctx context.Context, now time.Ti
 	if err != nil || !found {
 		return ConfigurationAuthority{}, RuntimeObservation{}, serviceError(ErrorConflict, "configuration authority is not initialized", nil)
 	}
-	if authority.Incomplete == nil {
+	if authority.Incomplete == nil && authority.IncompleteRecovery == nil {
 		if err := s.observeDriftTransition(ctx, authority, now.UTC()); err != nil {
 			if !errors.Is(err, ErrConfigurationAuthorityConflict) {
 				return authority, RuntimeObservation{}, serviceError(ErrorInternal, "configuration drift evidence could not be persisted", nil)
@@ -478,7 +483,7 @@ func (s *ConfigurationService) ReconcileRuntime(ctx context.Context, now time.Ti
 	if err != nil {
 		return authority, RuntimeObservation{}, err
 	}
-	if authority.Incomplete != nil || runtime.Liveness != RuntimeLivenessFresh || runtime.LoadedConfigurationDigest != authority.Desired.Digest || runtime.LastObservedAt == nil {
+	if authority.Incomplete != nil || authority.IncompleteRecovery != nil || runtime.Liveness != RuntimeLivenessFresh || runtime.LoadedConfigurationDigest != authority.Desired.Digest || runtime.LastObservedAt == nil {
 		return authority, runtime, nil
 	}
 	live, liveCandidate, err := s.files.ReadLive()
@@ -561,6 +566,15 @@ func (s *ConfigurationService) History(ctx context.Context, requester Requester)
 
 func (s *ConfigurationService) project(authority ConfigurationAuthority, runtime RuntimeObservation) ConfigurationConvergenceProjection {
 	projection := ConfigurationConvergenceProjection{DesiredGenerationID: authority.Desired.GenerationID, DesiredDigest: authority.Desired.Digest, EffectiveGenerationID: authority.EffectiveID, LoadedConfigurationDigest: runtime.LoadedConfigurationDigest, LastMeaningfulObservation: runtime.LastObservedAt}
+	if authority.IncompleteRecovery != nil {
+		projection.State, projection.NextAction = ConfigurationConflict, ConfigurationActionRecoverAuthority
+		if authority.IncompleteRecovery.State == ConfigurationRecoveryAmbiguous {
+			projection.Reason = ConfigurationReasonRecoveryAmbiguous
+		} else {
+			projection.Reason = ConfigurationReasonRecoveryIncomplete
+		}
+		return projection
+	}
 	if authority.Incomplete != nil {
 		projection.State, projection.NextAction = ConfigurationConflict, ConfigurationActionRecoverAuthority
 		if authority.Incomplete.State == ConfigurationApplyAmbiguous {
@@ -704,7 +718,7 @@ func normalizedConfigurationApplyProvenance(value ConfigurationApplyProvenance) 
 
 func classifyConfigurationStoreError(err error) error {
 	switch {
-	case errors.Is(err, ErrConfigurationAuthorityConflict), errors.Is(err, ErrConfigurationApplyInProgress), errors.Is(err, ErrOperationReceiptConflict):
+	case errors.Is(err, ErrConfigurationAuthorityConflict), errors.Is(err, ErrConfigurationApplyInProgress), errors.Is(err, ErrConfigurationRecoveryInProgress), errors.Is(err, ErrOperationReceiptConflict):
 		return serviceError(ErrorConflict, "configuration apply authority changed", nil)
 	default:
 		return serviceError(ErrorInternal, "configuration apply could not be persisted", nil)

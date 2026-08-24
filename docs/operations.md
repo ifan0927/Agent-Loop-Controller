@@ -136,7 +136,7 @@ unsupported schemas. After baseline, the locator and retained desired bytes bind
 canonical configuration to its existing database. An alternate configuration
 path, database relocation, invalid live file, or out-of-band digest change is a
 conflict; startup never re-baselines, follows an edited database path, adopts
-drift, or rewrites the file.
+drift, or rewrites the file before an explicit authorized recovery intent.
 
 The Controller exposes normal typed-change and forward-rollback paths for
 `controller.run_timeout` and the eight bounded
@@ -151,8 +151,19 @@ superseded, safely committed schema-1-through-5 generations whose nine settings
 project under current policy. Opening a rollback draft binds the exact source
 and current desired authority, then materializes against current schema-5 base
 bytes so every non-editable current authority remains unchanged. Apply delegates
-to the existing generation/CAS service and never restarts the worker. Explicit
-external-drift repair remains unavailable.
+to the existing generation/CAS service and never restarts the worker.
+
+For one safely readable external edit, authorized `config status` includes a
+bounded `recovery` offer containing the exact desired generation/digest,
+authority version, and observed live digest. Pass those values unchanged to
+`config recover restore`. The command durably accepts that exact occurrence,
+restores only the retained current desired bytes, and returns the settled
+receipt plus convergence. It creates no generation, preserves existing runs,
+and never restarts the worker. Missing, unreadable, invalid, relocated, or
+otherwise unsafe live files, missing desired raw evidence, changed authority or
+live digest, and incomplete or ambiguous apply/recovery evidence remain
+fail-closed. There is no force, adopt, import, merge, historical-restore, or raw
+file recovery command.
 
 A committed typed configuration change normally reports `restart_required`
 because workers load configuration only at process startup. Use the existing
@@ -628,7 +639,7 @@ A ready result does not validate token scope or GitHub App access.
 
 `config validate`, `controller launchagent doctor`.
 
-### `config status`, `config draft`, and `config rollback`
+### `config status`, `config draft`, `config rollback`, and `config recover`
 
 **Purpose**
 
@@ -654,6 +665,9 @@ agentctl config rollback sources <complete-requester-flags>
 agentctl config rollback open --source-generation-id <id> \
   --source-digest <digest> --expected-generation-id <id> \
   --expected-digest <digest> <complete-requester-flags>
+agentctl config recover restore --expected-generation-id <id> \
+  --expected-digest <digest> --expected-authority-version <version> \
+  --observed-digest <digest> <complete-requester-flags>
 ```
 
 `draft set` accepts exactly one of `--run-timeout`,
@@ -689,6 +703,14 @@ successful receipt and settled draft but creates no generation or restart need.
 The historical raw snapshot may be pruned after draft creation because the
 draft retains only typed scalar settings and sanitized source identity.
 
+`config recover restore` accepts only the complete authority projected by the
+current safe `config status` recovery offer. It reauthorizes and rechecks the
+live digest under the same Controller-wide mutation authority as apply, then
+restores the exact retained desired bytes. Exact response-loss retries return
+the same recovery intent and receipt. A concurrent third edit is restored when
+safe and leaves an ambiguous fenced recovery; do not retry with substituted
+digests or edit the private stage.
+
 If the desired baseline is older than schema 5, upgrade it through the bounded
 legacy-to-current transition before opening a draft. Preserve an applying or
 ambiguous draft and the private `authority/` tree; do not edit SQLite or force a
@@ -697,10 +719,11 @@ offline commands.
 
 **Possible durable stop states**
 
-An open draft may remain until explicitly applied or discarded. An accepted
-ambiguous apply remains non-editable and requires the future recovery
-capability. `restart_required` is resolved only by the existing operator-owned
-worker restart and subsequent matching heartbeat.
+An open draft may remain until explicitly applied or discarded. An ambiguous
+apply or recovery remains non-editable and requires a later dedicated recovery
+capability; safe-drift restore does not settle either ambiguity.
+`restart_required` is resolved only by the existing operator-owned worker
+restart and subsequent matching heartbeat.
 
 **Safety notes**
 
@@ -710,7 +733,7 @@ files to troubleshoot a sanitized conflict.
 
 **Related commands**
 
-`config validate`, `config inspect`, `config rollback sources`,
+`config validate`, `config inspect`, `config rollback sources`, `config recover restore`,
 `controller launchagent status`,
 `controller launchdaemon status`.
 
@@ -2599,7 +2622,8 @@ There is no automatic backup command or migration rollback command.
 | --- | --- |
 | Configuration invalid | Run `config validate`; correct the strict JSON/reference/path error. Do not weaken validators or insert placeholder identities. |
 | Configuration restart required | Use the existing supervised worker restart procedure, then wait for a fresh matching heartbeat and durable effective observation. Do not edit SQLite or the private locator. |
-| Configuration drift or ambiguous apply | Stop new admission and preserve `authority/` evidence. Do not rebaseline, copy a raw generation over the live file, change the locator, or force overwrite; typed recovery is intentionally deferred. |
+| Safely readable configuration drift | Use the exact authorized `recovery` offer from `config status` with `config recover restore`. Do not substitute a digest, copy raw evidence manually, adopt the external bytes, or request a worker restart as part of recovery. |
+| Unsafe configuration drift or ambiguous apply/recovery | Stop new admission and preserve `authority/` evidence. Do not rebaseline, edit SQLite, change the locator, remove a private stage, or force overwrite; this recovery slice intentionally remains fail-closed. |
 | Unauthorized requester | Use the immutable GitHub `User` identity configured and frozen for the run. A matching login alone is insufficient. |
 | Linear source drift | Inspect the source revision and changed task/branch/repository facts. Resolve the human/manual gate; do not overwrite the snapshot. |
 | Repository/profile drift | Restore the exact frozen authority or deliberately terminate/recover through supported policy. Unrelated config edits must not retarget the run. |

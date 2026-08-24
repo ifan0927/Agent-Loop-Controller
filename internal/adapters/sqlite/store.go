@@ -30,7 +30,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 33
+const schemaVersion = 34
 
 const (
 	sqliteMigrationRetryDelay  = 10 * time.Millisecond
@@ -613,6 +613,7 @@ func (s *Store) SchemaVersion(ctx context.Context) (int, error) {
 
 type sqliteTransactioner interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
 	BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
 }
 
@@ -620,6 +621,20 @@ func migrateSQLite(ctx context.Context, db sqliteTransactioner, supportedVersion
 	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
 		return err
 	}
+	if supportedVersion >= 34 {
+		var existingVersion int
+		err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&existingVersion)
+		if err != nil || existingVersion < 34 {
+			if err := migrateSQLiteGeneric(ctx, db, 33); err != nil {
+				return err
+			}
+			return migrateSQLiteV34Upgrade(ctx, db)
+		}
+	}
+	return migrateSQLiteGeneric(ctx, db, supportedVersion)
+}
+
+func migrateSQLiteGeneric(ctx context.Context, db sqliteTransactioner, supportedVersion int) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -707,6 +722,8 @@ func migrateSQLite(ctx context.Context, db sqliteTransactioner, supportedVersion
 			statements = migrationV32
 		case 33:
 			statements = migrationV33
+		case 34:
+			statements = migrationV34
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -1192,6 +1209,123 @@ var migrationV33 = []string{
 	`CREATE TRIGGER configuration_draft_provenance_immutable BEFORE UPDATE ON configuration_drafts
 		WHEN NEW.draft_origin<>OLD.draft_origin OR NEW.rollback_source_generation_id<>OLD.rollback_source_generation_id OR NEW.rollback_source_digest<>OLD.rollback_source_digest
 		BEGIN SELECT RAISE(ABORT,'configuration draft provenance is immutable'); END`,
+}
+
+// migrationV34 adds one Controller-wide configuration drift recovery intent.
+// Cross-table triggers keep apply and recovery under one durable mutation lane.
+var migrationV34 = []string{
+	`CREATE TABLE configuration_recovery_intents (
+		operation_id TEXT PRIMARY KEY REFERENCES operation_receipts(operation_id),
+		desired_generation_id INTEGER NOT NULL REFERENCES configuration_generations(generation_id),
+		desired_digest TEXT NOT NULL,
+		authority_version INTEGER NOT NULL CHECK(authority_version > 0),
+		observed_digest TEXT NOT NULL,
+		requester_login TEXT NOT NULL,
+		requester_database_id INTEGER NOT NULL,
+		requester_node_id TEXT NOT NULL,
+		requester_actor_type TEXT NOT NULL,
+		status TEXT NOT NULL CHECK(status IN ('accepted','committed','ambiguous')),
+		accepted_at TEXT NOT NULL,
+		settled_at TEXT NOT NULL DEFAULT '',
+		reason_code TEXT NOT NULL DEFAULT '',
+		evidence_digest TEXT NOT NULL DEFAULT '',
+		CHECK(desired_digest<>observed_digest)
+	)`,
+	`CREATE UNIQUE INDEX configuration_one_incomplete_recovery ON configuration_recovery_intents((1)) WHERE status IN ('accepted','ambiguous')`,
+	`CREATE TRIGGER configuration_recovery_identity_immutable BEFORE UPDATE ON configuration_recovery_intents
+		WHEN NEW.operation_id<>OLD.operation_id OR NEW.desired_generation_id<>OLD.desired_generation_id OR NEW.desired_digest<>OLD.desired_digest OR NEW.authority_version<>OLD.authority_version OR NEW.observed_digest<>OLD.observed_digest OR NEW.requester_login<>OLD.requester_login OR NEW.requester_database_id<>OLD.requester_database_id OR NEW.requester_node_id<>OLD.requester_node_id OR NEW.requester_actor_type<>OLD.requester_actor_type OR NEW.accepted_at<>OLD.accepted_at
+		BEGIN SELECT RAISE(ABORT,'configuration recovery identity is immutable'); END`,
+	`CREATE TRIGGER configuration_recovery_settlement_once BEFORE UPDATE ON configuration_recovery_intents
+		WHEN OLD.status<>'accepted' OR NEW.status NOT IN ('committed','ambiguous')
+		BEGIN SELECT RAISE(ABORT,'configuration recovery settlement is immutable'); END`,
+	`CREATE TRIGGER configuration_recovery_excludes_apply BEFORE INSERT ON configuration_recovery_intents
+		WHEN NEW.status IN ('accepted','ambiguous') AND EXISTS(SELECT 1 FROM configuration_apply_intents WHERE status IN ('accepted','ambiguous'))
+		BEGIN SELECT RAISE(ABORT,'configuration mutation is already active'); END`,
+	`CREATE TRIGGER configuration_apply_excludes_recovery BEFORE INSERT ON configuration_apply_intents
+		WHEN NEW.status IN ('accepted','ambiguous') AND EXISTS(SELECT 1 FROM configuration_recovery_intents WHERE status IN ('accepted','ambiguous'))
+		BEGIN SELECT RAISE(ABORT,'configuration mutation is already active'); END`,
+}
+
+var migrationV34ReceiptRebuild = []string{
+	`PRAGMA legacy_alter_table = ON`,
+	`DROP INDEX operation_receipts_target`,
+	`DROP INDEX operation_receipts_source_action`,
+	`ALTER TABLE operation_receipts RENAME TO operation_receipts_v33`,
+	`CREATE TABLE operation_receipts (
+		operation_id TEXT PRIMARY KEY,
+		authority_key TEXT NOT NULL UNIQUE,
+		operation_anchor_digest TEXT NOT NULL,
+		operation_type TEXT NOT NULL CHECK(operation_type IN ('decide','retry','abandon','recover_ci_wait','recover_owned_push','accept_external_merge','apply_configuration','restore_configuration')),
+		scope_kind TEXT NOT NULL CHECK(scope_kind IN ('controller','repository','run','onboarding')),
+		target_id TEXT NOT NULL,
+		requester_login TEXT NOT NULL,
+		requester_database_id INTEGER NOT NULL,
+		requester_node_id TEXT NOT NULL,
+		requester_actor_type TEXT NOT NULL,
+		request_digest TEXT NOT NULL,
+		expected_authority_digest TEXT NOT NULL,
+		target_binding_digest TEXT NOT NULL,
+		phase TEXT NOT NULL CHECK(phase IN ('accepted','applied','observed')),
+		outcome TEXT NOT NULL CHECK(outcome IN ('pending','succeeded','failed','conflict','ambiguous')),
+		resulting_authority_digest TEXT NOT NULL DEFAULT '',
+		resulting_state TEXT NOT NULL DEFAULT '',
+		resulting_version INTEGER NOT NULL DEFAULT 0 CHECK(resulting_version >= 0),
+		evidence_digest TEXT NOT NULL DEFAULT '',
+		result_digest TEXT NOT NULL DEFAULT '',
+		accepted_at TEXT NOT NULL,
+		applied_at TEXT NOT NULL DEFAULT '',
+		settled_at TEXT NOT NULL DEFAULT '',
+		source_action_id TEXT NOT NULL DEFAULT ''
+	)`,
+	`INSERT INTO operation_receipts SELECT * FROM operation_receipts_v33`,
+	`DROP TABLE operation_receipts_v33`,
+	`CREATE INDEX operation_receipts_target ON operation_receipts(scope_kind,target_id,accepted_at,operation_id)`,
+	`CREATE UNIQUE INDEX operation_receipts_source_action ON operation_receipts(source_action_id) WHERE source_action_id<>''`,
+	`PRAGMA legacy_alter_table = OFF`,
+}
+
+func migrateSQLiteV34Upgrade(ctx context.Context, db sqliteTransactioner) error {
+	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		return err
+	}
+	defer db.ExecContext(ctx, `PRAGMA foreign_keys = ON`)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var current int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&current); err != nil {
+		return err
+	}
+	if current >= 34 {
+		return tx.Commit()
+	}
+	if current != 33 {
+		return fmt.Errorf("configuration recovery migration requires schema 33, found %d", current)
+	}
+	for _, statement := range append(append([]string(nil), migrationV34ReceiptRebuild...), migrationV34...) {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("migrate schema to version 34: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES(34,?)`, nowText()); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA legacy_alter_table = OFF`); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
+		return err
+	}
+	var violations int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_foreign_key_check`).Scan(&violations); err != nil || violations != 0 {
+		return errors.New("schema 34 foreign key validation failed")
+	}
+	return nil
 }
 
 func backfillOperationReceiptsV30Tx(ctx context.Context, tx *sql.Tx) error {

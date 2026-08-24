@@ -18,13 +18,14 @@ var (
 type OperationType string
 
 const (
-	OperationDecide              OperationType = "decide"
-	OperationRetry               OperationType = "retry"
-	OperationAbandon             OperationType = "abandon"
-	OperationRecoverCIWait       OperationType = "recover_ci_wait"
-	OperationRecoverOwnedPush    OperationType = "recover_owned_push"
-	OperationAcceptExternalMerge OperationType = "accept_external_merge"
-	OperationApplyConfiguration  OperationType = "apply_configuration"
+	OperationDecide               OperationType = "decide"
+	OperationRetry                OperationType = "retry"
+	OperationAbandon              OperationType = "abandon"
+	OperationRecoverCIWait        OperationType = "recover_ci_wait"
+	OperationRecoverOwnedPush     OperationType = "recover_owned_push"
+	OperationAcceptExternalMerge  OperationType = "accept_external_merge"
+	OperationApplyConfiguration   OperationType = "apply_configuration"
+	OperationRestoreConfiguration OperationType = "restore_configuration"
 )
 
 type OperationPhase string
@@ -349,7 +350,7 @@ func ValidateOperationReceiptMutation(mutation OperationReceiptMutation) error {
 
 func validOperationType(value OperationType) bool {
 	switch value {
-	case OperationDecide, OperationRetry, OperationAbandon, OperationRecoverCIWait, OperationRecoverOwnedPush, OperationAcceptExternalMerge, OperationApplyConfiguration:
+	case OperationDecide, OperationRetry, OperationAbandon, OperationRecoverCIWait, OperationRecoverOwnedPush, OperationAcceptExternalMerge, OperationApplyConfiguration, OperationRestoreConfiguration:
 		return true
 	default:
 		return false
