@@ -13,7 +13,12 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const configurationGenerationSelect = `SELECT generation_id,COALESCE(parent_generation_id,0),digest,target_size,schema_version,origin,requester_login,requester_database_id,requester_node_id,requester_actor_type,configured_operator_login,configured_operator_database_id,configured_operator_node_id,configured_operator_actor_type,COALESCE(operation_id,''),lifecycle,raw_retained,created_at,committed_at,effective_at,superseded_at,settled_at,reason_code FROM configuration_generations`
+const configurationRollbackSettlementPredicate = `g.lifecycle='superseded' AND g.committed_at<>'' AND g.superseded_at<>'' AND g.settled_at=g.superseded_at AND g.created_at<=g.committed_at AND g.committed_at<=g.superseded_at AND (g.effective_at='' OR (g.committed_at<=g.effective_at AND g.effective_at<=g.superseded_at)) AND (
+	(g.origin='baseline' AND g.parent_generation_id IS NULL AND g.operation_id IS NULL AND g.requester_login='' AND g.requester_database_id=0 AND g.requester_node_id='' AND g.requester_actor_type='' AND g.created_at=g.committed_at AND NOT EXISTS(SELECT 1 FROM configuration_apply_intents bi WHERE bi.generation_id=g.generation_id) AND EXISTS(SELECT 1 FROM configuration_baseline_anchor b WHERE b.digest=g.digest AND b.target_size=g.target_size AND b.schema_version=g.schema_version AND b.prepared_at=g.created_at)) OR
+	(g.origin='apply' AND EXISTS(SELECT 1 FROM configuration_generations p JOIN configuration_apply_intents i ON i.generation_id=g.generation_id JOIN operation_receipts r ON r.operation_id=g.operation_id WHERE p.generation_id=g.parent_generation_id AND i.parent_generation_id=p.generation_id AND i.parent_digest=p.digest AND i.target_digest=g.digest AND i.operation_id=g.operation_id AND i.status='committed' AND i.accepted_at=g.created_at AND i.settled_at=g.committed_at AND r.operation_type='apply_configuration' AND r.scope_kind='controller' AND r.target_id='controller-configuration' AND r.request_digest=g.digest AND r.expected_authority_digest=p.digest AND r.phase='observed' AND r.outcome='succeeded' AND r.resulting_authority_digest=g.digest AND r.resulting_version=g.generation_id AND r.accepted_at=g.created_at AND r.applied_at=g.committed_at AND r.settled_at=g.committed_at))
+)`
+
+const configurationGenerationSelect = `SELECT generation_id,COALESCE(parent_generation_id,0),digest,target_size,schema_version,origin,requester_login,requester_database_id,requester_node_id,requester_actor_type,configured_operator_login,configured_operator_database_id,configured_operator_node_id,configured_operator_actor_type,COALESCE(operation_id,''),lifecycle,raw_retained,created_at,committed_at,effective_at,superseded_at,settled_at,reason_code,rollback_source_generation_id,rollback_source_digest,CASE WHEN ` + configurationRollbackSettlementPredicate + ` THEN 1 ELSE 0 END FROM configuration_generations AS g`
 
 func (s *Store) ConfigurationAuthority(ctx context.Context) (application.ConfigurationAuthority, bool, error) {
 	return configurationAuthorityQuery(ctx, s.db)
@@ -210,7 +215,7 @@ func (s *Store) RecordConfigurationNoOp(ctx context.Context, settlement applicat
 }
 
 func (s *Store) BeginConfigurationApply(ctx context.Context, input application.ConfigurationApplyAcceptance) (application.ConfigurationGeneration, application.OperationReceipt, bool, error) {
-	if input.AcceptedAt.IsZero() || input.ExpectedGenerationID <= 0 || !validConfigurationMetadata(input.Candidate.Digest, input.Candidate.Size, input.Candidate.SchemaVersion) || input.Candidate.SchemaVersion != 5 || input.Candidate.Operator.Validate() != nil || input.Requester.Validate() != nil || !input.Receipt.Requester.Equal(input.Requester) || application.ValidateOperationReceipt(input.Receipt) != nil || input.Receipt.OperationType != application.OperationApplyConfiguration || input.Receipt.Scope != application.ScopeController || input.Receipt.TargetID != application.ConfigurationTargetID {
+	if input.AcceptedAt.IsZero() || input.ExpectedGenerationID <= 0 || !validConfigurationMetadata(input.Candidate.Digest, input.Candidate.Size, input.Candidate.SchemaVersion) || input.Candidate.SchemaVersion != 5 || input.Candidate.Operator.Validate() != nil || input.Requester.Validate() != nil || !input.Receipt.Requester.Equal(input.Requester) || application.ValidateOperationReceipt(input.Receipt) != nil || input.Receipt.OperationType != application.OperationApplyConfiguration || input.Receipt.Scope != application.ScopeController || input.Receipt.TargetID != application.ConfigurationTargetID || !input.Provenance.Valid() {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, errors.New("configuration apply acceptance is invalid")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -228,6 +233,9 @@ func (s *Store) BeginConfigurationApply(ctx context.Context, input application.C
 		if generationErr != nil {
 			return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, application.ErrConfigurationAuthorityConflict
 		}
+		if !configurationGenerationMatchesProvenance(generation, input.Provenance) {
+			return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, application.ErrConfigurationAuthorityConflict
+		}
 		return generation, existing, false, tx.Commit()
 	}
 	authority, found, err := configurationAuthorityQuery(ctx, tx)
@@ -239,6 +247,12 @@ func (s *Store) BeginConfigurationApply(ctx context.Context, input application.C
 	}
 	if authority.Desired.GenerationID != input.ExpectedGenerationID || authority.Desired.Digest != input.ExpectedDigest || authority.DatabasePath != input.Candidate.DatabasePath {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, application.ErrConfigurationAuthorityConflict
+	}
+	if input.Provenance.Kind == application.ConfigurationApplyRollback {
+		var sourceDigest, sourceOrigin, sourceLifecycle string
+		if err := tx.QueryRowContext(ctx, `SELECT digest,origin,lifecycle FROM configuration_generations WHERE generation_id=?`, input.Provenance.RollbackSourceGenerationID).Scan(&sourceDigest, &sourceOrigin, &sourceLifecycle); err != nil || sourceDigest != input.Provenance.RollbackSourceDigest || sourceLifecycle != string(application.ConfigurationGenerationSuperseded) || sourceOrigin != string(application.ConfigurationOriginBaseline) && sourceOrigin != string(application.ConfigurationOriginApply) || input.Provenance.RollbackSourceGenerationID == authority.Desired.GenerationID {
+			return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, application.ErrConfigurationAuthorityConflict
+		}
 	}
 	var pruneClaim int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM configuration_raw_prune_claims WHERE digest=?`, input.Candidate.Digest).Scan(&pruneClaim); err != nil {
@@ -257,7 +271,7 @@ func (s *Store) BeginConfigurationApply(ctx context.Context, input application.C
 	if err := insertOperationReceiptTx(ctx, tx, input.Receipt, ""); err != nil {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, err
 	}
-	result, err := tx.ExecContext(ctx, `INSERT INTO configuration_generations(parent_generation_id,digest,target_size,schema_version,origin,requester_login,requester_database_id,requester_node_id,requester_actor_type,configured_operator_login,configured_operator_database_id,configured_operator_node_id,configured_operator_actor_type,operation_id,lifecycle,raw_retained,created_at,reason_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'accepted',1,?,'')`, authority.Desired.GenerationID, input.Candidate.Digest, input.Candidate.Size, input.Candidate.SchemaVersion, string(application.ConfigurationOriginApply), input.Requester.Login, input.Requester.DatabaseID, input.Requester.NodeID, input.Requester.ActorType, input.Candidate.Operator.Login, input.Candidate.Operator.DatabaseID, input.Candidate.Operator.NodeID, input.Candidate.Operator.ActorType, input.Receipt.OperationID, formatTime(input.AcceptedAt))
+	result, err := tx.ExecContext(ctx, `INSERT INTO configuration_generations(parent_generation_id,digest,target_size,schema_version,origin,requester_login,requester_database_id,requester_node_id,requester_actor_type,configured_operator_login,configured_operator_database_id,configured_operator_node_id,configured_operator_actor_type,operation_id,lifecycle,raw_retained,created_at,reason_code,rollback_source_generation_id,rollback_source_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'accepted',1,?,'',?,?)`, authority.Desired.GenerationID, input.Candidate.Digest, input.Candidate.Size, input.Candidate.SchemaVersion, string(application.ConfigurationOriginApply), input.Requester.Login, input.Requester.DatabaseID, input.Requester.NodeID, input.Requester.ActorType, input.Candidate.Operator.Login, input.Candidate.Operator.DatabaseID, input.Candidate.Operator.NodeID, input.Candidate.Operator.ActorType, input.Receipt.OperationID, formatTime(input.AcceptedAt), input.Provenance.RollbackSourceGenerationID, input.Provenance.RollbackSourceDigest)
 	if err != nil {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, err
 	}
@@ -268,7 +282,7 @@ func (s *Store) BeginConfigurationApply(ctx context.Context, input application.C
 	if _, err := tx.ExecContext(ctx, `INSERT INTO configuration_apply_intents(generation_id,parent_generation_id,parent_digest,target_digest,operation_id,status,accepted_at) VALUES(?,?,?,?,?,'accepted',?)`, generationID, authority.Desired.GenerationID, authority.Desired.Digest, input.Candidate.Digest, input.Receipt.OperationID, formatTime(input.AcceptedAt)); err != nil {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, err
 	}
-	evidence := configurationEvidence("apply-accepted", generationID, input.Candidate.Digest, input.Receipt.OperationID)
+	evidence := configurationEvidence("apply-accepted", generationID, input.Candidate.Digest, input.Receipt.OperationID, input.Provenance.RollbackSourceGenerationID, input.Provenance.RollbackSourceDigest)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO configuration_convergence_events(event_type,generation_id,operation_id,digest,reason_code,evidence_digest,observed_at) VALUES('apply_accepted',?,?,?,?,?,?)`, generationID, input.Receipt.OperationID, input.Candidate.Digest, string(application.ConfigurationReasonApplyIncomplete), evidence, formatTime(input.AcceptedAt)); err != nil {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, err
 	}
@@ -525,7 +539,33 @@ func (s *Store) ListConfigurationGenerations(ctx context.Context) ([]application
 		}
 		result = append(result, generation)
 	}
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for index := range result {
+		if result[index].SettlementEvidenceValid {
+			result[index].SettlementEvidenceValid = result[index].RawRetained && configurationRollbackSettlementEvidence(ctx, s.db, result[index])
+		}
+	}
+	return result, nil
+}
+
+func configurationRollbackSettlementEvidence(ctx context.Context, query queryRower, generation application.ConfigurationGeneration) bool {
+	if !generation.SettlementEvidenceValid {
+		return false
+	}
+	if generation.Origin == application.ConfigurationOriginBaseline {
+		return true
+	}
+	parent, err := scanConfigurationGeneration(query.QueryRowContext(ctx, configurationGenerationSelect+` WHERE generation_id=?`, generation.ParentID))
+	if err != nil {
+		return false
+	}
+	receipt, err := scanOperationReceipt(query.QueryRowContext(ctx, operationReceiptSelect+` WHERE operation_id=?`, generation.OperationID))
+	return err == nil && application.ConfigurationApplyReceiptSettlesGeneration(receipt, generation, parent)
 }
 
 func (s *Store) ConfigurationRawPruneCandidates(ctx context.Context, keep int) ([]string, error) {
@@ -668,20 +708,39 @@ func configurationRawProtectedTx(ctx context.Context, tx *sql.Tx, digest string)
 func scanConfigurationGeneration(row rowScanner) (application.ConfigurationGeneration, error) {
 	var generation application.ConfigurationGeneration
 	var origin, lifecycle, created, committed, effective, superseded, settled, reason string
-	var raw int
-	if err := row.Scan(&generation.GenerationID, &generation.ParentID, &generation.Digest, &generation.Size, &generation.SchemaVersion, &origin, &generation.Requester.Login, &generation.Requester.DatabaseID, &generation.Requester.NodeID, &generation.Requester.ActorType, &generation.ConfiguredOperator.Login, &generation.ConfiguredOperator.DatabaseID, &generation.ConfiguredOperator.NodeID, &generation.ConfiguredOperator.ActorType, &generation.OperationID, &lifecycle, &raw, &created, &committed, &effective, &superseded, &settled, &reason); err != nil {
+	var raw, settlementEvidence int
+	if err := row.Scan(&generation.GenerationID, &generation.ParentID, &generation.Digest, &generation.Size, &generation.SchemaVersion, &origin, &generation.Requester.Login, &generation.Requester.DatabaseID, &generation.Requester.NodeID, &generation.Requester.ActorType, &generation.ConfiguredOperator.Login, &generation.ConfiguredOperator.DatabaseID, &generation.ConfiguredOperator.NodeID, &generation.ConfiguredOperator.ActorType, &generation.OperationID, &lifecycle, &raw, &created, &committed, &effective, &superseded, &settled, &reason, &generation.RollbackSourceGenerationID, &generation.RollbackSourceDigest, &settlementEvidence); err != nil {
 		return application.ConfigurationGeneration{}, err
 	}
 	generation.Origin = application.ConfigurationGenerationOrigin(origin)
 	generation.State = application.ConfigurationGenerationState(lifecycle)
 	generation.RawRetained = raw == 1
+	generation.SettlementEvidenceValid = settlementEvidence == 1
 	generation.CreatedAt, generation.CommittedAt, generation.EffectiveAt = parseTime(created), parseTime(committed), parseTime(effective)
 	generation.SupersededAt, generation.SettledAt = parseTime(superseded), parseTime(settled)
 	generation.Reason = application.ConfigurationReason(reason)
-	if !validConfigurationMetadata(generation.Digest, generation.Size, generation.SchemaVersion) || generation.GenerationID <= 0 || generation.CreatedAt.IsZero() {
+	if !validConfigurationMetadata(generation.Digest, generation.Size, generation.SchemaVersion) || generation.GenerationID <= 0 || generation.CreatedAt.IsZero() || generation.Origin != application.ConfigurationOriginBaseline && generation.Origin != application.ConfigurationOriginApply || generation.Origin == application.ConfigurationOriginBaseline && (generation.RollbackSourceGenerationID != 0 || generation.RollbackSourceDigest != "") || !configurationGenerationMatchesProvenance(generation, application.ConfigurationApplyProvenance{Kind: func() application.ConfigurationApplyKind {
+		if generation.RollbackSourceGenerationID > 0 || generation.RollbackSourceDigest != "" {
+			return application.ConfigurationApplyRollback
+		}
+		return application.ConfigurationApplyNormal
+	}(), RollbackSourceGenerationID: generation.RollbackSourceGenerationID, RollbackSourceDigest: generation.RollbackSourceDigest}) {
 		return application.ConfigurationGeneration{}, errors.New("configuration generation is corrupt")
 	}
 	return generation, nil
+}
+
+func configurationGenerationMatchesProvenance(generation application.ConfigurationGeneration, provenance application.ConfigurationApplyProvenance) bool {
+	if provenance.Kind == "" {
+		provenance.Kind = application.ConfigurationApplyNormal
+	}
+	if !provenance.Valid() {
+		return false
+	}
+	if provenance.Kind == application.ConfigurationApplyNormal {
+		return generation.RollbackSourceGenerationID == 0 && generation.RollbackSourceDigest == ""
+	}
+	return generation.RollbackSourceGenerationID == provenance.RollbackSourceGenerationID && generation.RollbackSourceDigest == provenance.RollbackSourceDigest
 }
 
 func validConfigurationMetadata(digest string, size int64, schema int) bool {

@@ -93,23 +93,49 @@ const (
 )
 
 type ConfigurationGeneration struct {
-	GenerationID       int64                         `json:"generation_id"`
-	ParentID           int64                         `json:"parent_generation_id,omitempty"`
-	Digest             string                        `json:"digest"`
-	Size               int64                         `json:"size"`
-	SchemaVersion      int                           `json:"schema_version"`
-	Origin             ConfigurationGenerationOrigin `json:"origin"`
-	Requester          domain.GitHubUserIdentity     `json:"requester,omitempty"`
-	ConfiguredOperator domain.GitHubUserIdentity     `json:"configured_operator,omitempty"`
-	OperationID        string                        `json:"operation_id,omitempty"`
-	State              ConfigurationGenerationState  `json:"state"`
-	RawRetained        bool                          `json:"raw_retained"`
-	CreatedAt          time.Time                     `json:"created_at"`
-	CommittedAt        time.Time                     `json:"committed_at,omitempty"`
-	EffectiveAt        time.Time                     `json:"effective_at,omitempty"`
-	SupersededAt       time.Time                     `json:"superseded_at,omitempty"`
-	SettledAt          time.Time                     `json:"settled_at,omitempty"`
-	Reason             ConfigurationReason           `json:"reason,omitempty"`
+	GenerationID               int64                         `json:"generation_id"`
+	ParentID                   int64                         `json:"parent_generation_id,omitempty"`
+	Digest                     string                        `json:"digest"`
+	Size                       int64                         `json:"size"`
+	SchemaVersion              int                           `json:"schema_version"`
+	Origin                     ConfigurationGenerationOrigin `json:"origin"`
+	Requester                  domain.GitHubUserIdentity     `json:"requester,omitempty"`
+	ConfiguredOperator         domain.GitHubUserIdentity     `json:"configured_operator,omitempty"`
+	OperationID                string                        `json:"operation_id,omitempty"`
+	RollbackSourceGenerationID int64                         `json:"rollback_source_generation_id,omitempty"`
+	RollbackSourceDigest       string                        `json:"rollback_source_digest,omitempty"`
+	SettlementEvidenceValid    bool                          `json:"-"`
+	State                      ConfigurationGenerationState  `json:"state"`
+	RawRetained                bool                          `json:"raw_retained"`
+	CreatedAt                  time.Time                     `json:"created_at"`
+	CommittedAt                time.Time                     `json:"committed_at,omitempty"`
+	EffectiveAt                time.Time                     `json:"effective_at,omitempty"`
+	SupersededAt               time.Time                     `json:"superseded_at,omitempty"`
+	SettledAt                  time.Time                     `json:"settled_at,omitempty"`
+	Reason                     ConfigurationReason           `json:"reason,omitempty"`
+}
+
+type ConfigurationApplyKind string
+
+const (
+	ConfigurationApplyNormal   ConfigurationApplyKind = "normal"
+	ConfigurationApplyRollback ConfigurationApplyKind = "rollback"
+)
+
+// ConfigurationApplyProvenance is Controller-derived intent evidence. The
+// presentation layer cannot supply it; typed draft orchestration derives it
+// from the persisted draft before invoking the generation service.
+type ConfigurationApplyProvenance struct {
+	Kind                       ConfigurationApplyKind
+	RollbackSourceGenerationID int64
+	RollbackSourceDigest       string
+}
+
+func (p ConfigurationApplyProvenance) Valid() bool {
+	if p.Kind == "" || p.Kind == ConfigurationApplyNormal {
+		return p.RollbackSourceGenerationID == 0 && p.RollbackSourceDigest == ""
+	}
+	return p.Kind == ConfigurationApplyRollback && p.RollbackSourceGenerationID > 0 && validAuthorityDigest(p.RollbackSourceDigest)
 }
 
 type ConfigurationApplyIntent struct {
@@ -191,6 +217,7 @@ type ConfigurationApplyAcceptance struct {
 	Candidate            ValidatedConfigurationCandidate
 	Requester            domain.GitHubUserIdentity
 	Receipt              OperationReceipt
+	Provenance           ConfigurationApplyProvenance
 	AcceptedAt           time.Time
 }
 
@@ -279,6 +306,7 @@ type ConfigurationApplyCommand struct {
 	ExpectedGenerationID int64
 	ExpectedDigest       string
 	Payload              []byte
+	Provenance           ConfigurationApplyProvenance
 }
 
 type ConfigurationApplyResult struct {

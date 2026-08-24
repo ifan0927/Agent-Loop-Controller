@@ -602,6 +602,95 @@ func validAdmissionFixture() map[string]any {
 	}
 }
 
+func TestProjectHistoricalEditableSettingsVersionsAndCompatibility(t *testing.T) {
+	base := func(version int) map[string]any {
+		return map[string]any{"version": version, "controller": map[string]any{"run_timeout": "30m"}}
+	}
+	admission := func() map[string]any {
+		return map[string]any{"enabled": true, "poll_interval": "5m", "delivery_poll_interval": "30s", "scheduler_lease_ttl": "1m", "scheduler_lease_renewal_interval": "20s", "max_candidates": 20, "max_pages": 5}
+	}
+	fixtures := []struct {
+		version  int
+		document map[string]any
+		enabled  bool
+		capacity int
+	}{
+		{LegacyVersion, base(LegacyVersion), false, 2},
+		{VersionTwo, base(VersionTwo), false, 2},
+		{VersionThree, func() map[string]any {
+			value := base(VersionThree)
+			item := admission()
+			item["max_active_runs"] = 1
+			value["automation"] = map[string]any{"linear_todo_admission": item}
+			return value
+		}(), true, 1},
+		{VersionFour, func() map[string]any {
+			value := base(VersionFour)
+			item := admission()
+			value["automation"] = map[string]any{"linear_todo_admission": item}
+			return value
+		}(), true, 2},
+		{CurrentVersion, func() map[string]any {
+			value := base(CurrentVersion)
+			item := admission()
+			item["heavy_capacity"] = 3
+			value["automation"] = map[string]any{"linear_todo_admission": item}
+			return value
+		}(), true, 3},
+	}
+	for _, fixture := range fixtures {
+		raw, err := json.Marshal(fixture.document)
+		if err != nil {
+			t.Fatal(err)
+		}
+		settings, err := ProjectHistoricalEditableSettings(raw, fixture.version)
+		if err != nil || settings.AdmissionEnabled != fixture.enabled || settings.AdmissionHeavyCapacity != fixture.capacity || settings.RunTimeout != 30*time.Minute || settings.DeliveryPollInterval != 30*time.Second {
+			t.Fatalf("version=%d settings=%+v err=%v", fixture.version, settings, err)
+		}
+	}
+}
+
+func TestProjectHistoricalEditableSettingsRejectsMismatchAndMalformedShapesWithoutLegacyIO(t *testing.T) {
+	legacy := map[string]any{"version": LegacyVersion, "controller": map[string]any{"run_timeout": "30m"}, "repository_registry_file": "/definitely/not/read/by/projection.json"}
+	raw, _ := json.Marshal(legacy)
+	if _, err := ProjectHistoricalEditableSettings(raw, LegacyVersion); err != nil {
+		t.Fatalf("legacy scalar projection performed external path validation: %v", err)
+	}
+	if _, err := ProjectHistoricalEditableSettings(raw, VersionTwo); err == nil {
+		t.Fatal("schema metadata mismatch was accepted")
+	}
+	legacy["unexpected"] = true
+	raw, _ = json.Marshal(legacy)
+	if _, err := ProjectHistoricalEditableSettings(raw, LegacyVersion); err == nil {
+		t.Fatal("unknown historical field was accepted")
+	}
+	duplicate := []byte(`{"version":5,"version":4,"controller":{"run_timeout":"30m"}}`)
+	if _, err := ProjectHistoricalEditableSettings(duplicate, CurrentVersion); err == nil {
+		t.Fatal("ambiguous duplicate historical field was accepted")
+	}
+	versionThree := map[string]any{"version": VersionThree, "controller": map[string]any{"run_timeout": "30m"}, "automation": map[string]any{"linear_todo_admission": map[string]any{"enabled": true, "poll_interval": "5m", "delivery_poll_interval": "30s", "scheduler_lease_ttl": "1m", "scheduler_lease_renewal_interval": "20s", "max_candidates": 20, "max_pages": 5, "max_active_runs": 2}}}
+	raw, _ = json.Marshal(versionThree)
+	if _, err := ProjectHistoricalEditableSettings(raw, VersionThree); err == nil {
+		t.Fatal("incompatible version-3 singleton semantics were accepted")
+	}
+	for _, missing := range []string{"poll_interval", "scheduler_lease_ttl", "scheduler_lease_renewal_interval", "max_candidates", "max_pages"} {
+		document := map[string]any{"version": CurrentVersion, "controller": map[string]any{"run_timeout": "30m"}}
+		item := validAdmissionFixture()
+		delete(item, missing)
+		document["automation"] = map[string]any{"linear_todo_admission": item}
+		raw, _ := json.Marshal(document)
+		if _, err := ProjectHistoricalEditableSettings(raw, CurrentVersion); err == nil {
+			t.Fatalf("enabled historical automation accepted missing %s", missing)
+		}
+	}
+	disabled := map[string]any{"version": VersionThree, "controller": map[string]any{"run_timeout": "30m"}, "automation": map[string]any{"linear_todo_admission": map[string]any{"enabled": false, "max_candidates": 0}}}
+	raw, _ = json.Marshal(disabled)
+	settings, err := ProjectHistoricalEditableSettings(raw, VersionThree)
+	if err != nil || settings.AdmissionEnabled || settings.AdmissionHeavyCapacity != 2 || settings.AdmissionMaxCandidates != 20 {
+		t.Fatalf("disabled historical defaults=%+v err=%v", settings, err)
+	}
+}
+
 func upgradeCurrentFixture(config map[string]any) {
 	config["version"] = CurrentVersion
 	config["controller"].(map[string]any)["operator"] = map[string]any{"database_id": 1, "node_id": "node", "login": "ifan0927", "type": "User"}

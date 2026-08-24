@@ -61,6 +61,75 @@ func managedConfigDraft(args []string) error {
 	}
 }
 
+func managedConfigRollback(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: agentctl config rollback <sources|open> [options]")
+	}
+	switch args[0] {
+	case "sources":
+		return managedConfigRollbackSources(args[1:])
+	case "open":
+		return managedConfigRollbackOpen(args[1:])
+	default:
+		return errors.New("usage: agentctl config rollback <sources|open> [options]")
+	}
+}
+
+func managedConfigRollbackSources(args []string) error {
+	flags := flag.NewFlagSet("config rollback sources", flag.ContinueOnError)
+	common := addManagedDraftCommonFlags(flags, false)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("config rollback sources does not accept positional arguments")
+	}
+	if err := common.validate(false); err != nil {
+		return err
+	}
+	service, closeStore, err := openManagedDraftService(*common.path)
+	if err != nil {
+		return err
+	}
+	defer closeStore()
+	result, err := service.RollbackSources(context.Background(), common.requester.value())
+	if err != nil {
+		return err
+	}
+	return printJSON(result)
+}
+
+func managedConfigRollbackOpen(args []string) error {
+	flags := flag.NewFlagSet("config rollback open", flag.ContinueOnError)
+	common := addManagedDraftCommonFlags(flags, false)
+	sourceGeneration := flags.Int64("source-generation-id", 0, "retained rollback source generation")
+	sourceDigest := flags.String("source-digest", "", "exact retained rollback source digest")
+	expectedGeneration := flags.Int64("expected-generation-id", 0, "expected desired configuration generation")
+	expectedDigest := flags.String("expected-digest", "", "expected desired configuration digest")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("config rollback open does not accept positional arguments")
+	}
+	if err := common.validate(false); err != nil {
+		return err
+	}
+	if *sourceGeneration < 1 || *expectedGeneration < 1 || len(*sourceDigest) != 64 || len(*expectedDigest) != 64 {
+		return errors.New("source and desired generation authority are required")
+	}
+	service, closeStore, err := openManagedDraftService(*common.path)
+	if err != nil {
+		return err
+	}
+	defer closeStore()
+	draft, err := service.OpenRollback(context.Background(), application.ConfigurationRollbackOpenCommand{Requester: common.requester.value(), SourceGenerationID: *sourceGeneration, SourceDigest: *sourceDigest, ExpectedGenerationID: *expectedGeneration, ExpectedDigest: *expectedDigest})
+	if err != nil {
+		return err
+	}
+	return printJSON(draft)
+}
+
 type managedDraftCommonFlags struct {
 	path      *string
 	requester requesterFlags

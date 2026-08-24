@@ -44,6 +44,10 @@ func (f *configurationDraftDocumentFixture) ProjectEditable(payload []byte) (app
 	return f.base, nil
 }
 
+func (f *configurationDraftDocumentFixture) ProjectHistoricalEditable(payload []byte, _ int) (application.ConfigurationEditableSettings, error) {
+	return f.ProjectEditable(payload)
+}
+
 func (f *configurationDraftDocumentFixture) MaterializeEditable(base []byte, settings application.ConfigurationEditableSettings) ([]byte, error) {
 	current, _ := f.ProjectEditable(base)
 	if current == settings {
@@ -130,6 +134,203 @@ func TestConfigurationDraftLifecyclePreviewApplyAndReplay(t *testing.T) {
 	}
 	if generations, err := store.ListConfigurationGenerations(ctx); err != nil || len(generations) != 2 {
 		t.Fatalf("generations=%+v err=%v", generations, err)
+	}
+}
+
+func TestConfigurationForwardRollbackLifecycleProvenanceAndNoOpIdentity(t *testing.T) {
+	configuration, store, files, runtime, requester := configurationServiceFixture(t)
+	ctx := context.Background()
+	authority, err := configuration.Initialize(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.observation = freshConfigurationRuntime(authority.Desired.Digest, time.Now().UTC())
+	document := newConfigurationDraftDocumentFixture(files)
+	service, err := application.NewConfigurationDraftService(configuration, store, document)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	normal, err := service.Open(ctx, requester)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capacity := 3
+	normal, err = service.Edit(ctx, application.ConfigurationDraftEditCommand{Requester: requester, DraftID: normal.DraftID, Revision: normal.Revision, Edit: application.ConfigurationEdit{Field: application.ConfigurationFieldAdmissionHeavyCapacity, Integer: &capacity}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalPreview, err := service.Preview(ctx, application.ConfigurationDraftCommand{Requester: requester, DraftID: normal.DraftID, Revision: normal.Revision})
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalApplied, err := service.Apply(ctx, application.ConfigurationDraftApplyCommand{Requester: requester, DraftID: normal.DraftID, Revision: normal.Revision, PreviewDigest: normalPreview.PreviewDigest, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest})
+	if err != nil || normalApplied.Apply.Generation.GenerationID != 2 {
+		t.Fatalf("normal apply=%+v err=%v", normalApplied, err)
+	}
+
+	sources, err := service.RollbackSources(ctx, requester)
+	if err != nil || sources.DesiredGenerationID != 2 || len(sources.Sources) != 1 || sources.Sources[0].GenerationID != 1 || sources.Sources[0].Origin != application.ConfigurationOriginBaseline {
+		t.Fatalf("sources=%+v err=%v", sources, err)
+	}
+	source := sources.Sources[0]
+	rollbackCommand := application.ConfigurationRollbackOpenCommand{Requester: requester, SourceGenerationID: source.GenerationID, SourceDigest: source.Digest, ExpectedGenerationID: sources.DesiredGenerationID, ExpectedDigest: sources.DesiredDigest}
+	stale := rollbackCommand
+	stale.ExpectedGenerationID = 1
+	stale.ExpectedDigest = source.Digest
+	if _, err := service.OpenRollback(ctx, stale); err == nil || !strings.Contains(err.Error(), "conflict") {
+		t.Fatalf("stale rollback open err=%v", err)
+	}
+	blockingNormal, err := service.Open(ctx, requester)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.OpenRollback(ctx, rollbackCommand); err == nil || !strings.Contains(err.Error(), "conflict") {
+		t.Fatalf("active normal draft did not conflict: %v", err)
+	}
+	if _, err := service.Discard(ctx, application.ConfigurationDraftCommand{Requester: requester, DraftID: blockingNormal.DraftID, Revision: blockingNormal.Revision}); err != nil {
+		t.Fatal(err)
+	}
+	rollback, err := service.OpenRollback(ctx, rollbackCommand)
+	if err != nil || rollback.DraftOrigin != application.ConfigurationDraftOriginRollback || rollback.Revision != 1 || rollback.BaseGenerationID != 2 || rollback.Settings.Admission.HeavyCapacity != 2 || rollback.RollbackSourceGenerationID != 1 || rollback.RollbackSourceDigest != source.Digest {
+		t.Fatalf("rollback=%+v err=%v", rollback, err)
+	}
+	replayedOpen, err := service.OpenRollback(ctx, rollbackCommand)
+	if err != nil || replayedOpen.DraftID != rollback.DraftID {
+		t.Fatalf("open replay=%+v err=%v", replayedOpen, err)
+	}
+	claimed, err := store.ClaimConfigurationRawPrune(ctx, source.Digest)
+	if err != nil || !claimed {
+		t.Fatalf("source prune claim=%t err=%v", claimed, err)
+	}
+	if err := files.RemoveRaw(source.Digest); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteConfigurationRawPrune(ctx, source.Digest, true); err != nil {
+		t.Fatal(err)
+	}
+	replayedAfterPrune, err := service.OpenRollback(ctx, rollbackCommand)
+	if err != nil || replayedAfterPrune.DraftID != rollback.DraftID {
+		t.Fatalf("pruned-source open replay=%+v err=%v", replayedAfterPrune, err)
+	}
+	resumedNormal, err := service.Open(ctx, requester)
+	if err != nil || resumedNormal.DraftID != rollback.DraftID || resumedNormal.DraftOrigin != application.ConfigurationDraftOriginRollback {
+		t.Fatalf("normal resume=%+v err=%v", resumedNormal, err)
+	}
+
+	preview, err := service.Preview(ctx, application.ConfigurationDraftCommand{Requester: requester, DraftID: rollback.DraftID, Revision: rollback.Revision})
+	if err != nil || preview.DraftOrigin != application.ConfigurationDraftOriginRollback || preview.RollbackSourceGenerationID != 1 || preview.RollbackSourceDigest != source.Digest || len(preview.Changes) != 1 || preview.Changes[0].Category != application.ConfigurationPreviewHeavyCapacityDecreased {
+		t.Fatalf("rollback preview=%+v err=%v", preview, err)
+	}
+	rolledBack, err := service.Apply(ctx, application.ConfigurationDraftApplyCommand{Requester: requester, DraftID: rollback.DraftID, Revision: rollback.Revision, PreviewDigest: preview.PreviewDigest, ExpectedGenerationID: 2, ExpectedDigest: sources.DesiredDigest})
+	if err != nil || rolledBack.Apply.NoOp || rolledBack.Apply.Generation.GenerationID != 3 || rolledBack.Apply.Generation.ParentID != 2 || rolledBack.Apply.Generation.RollbackSourceGenerationID != 1 || rolledBack.Apply.Generation.RollbackSourceDigest != source.Digest {
+		t.Fatalf("rollback apply=%+v err=%v", rolledBack, err)
+	}
+	replayedApply, err := service.Apply(ctx, application.ConfigurationDraftApplyCommand{Requester: requester, DraftID: rollback.DraftID, Revision: rollback.Revision, PreviewDigest: preview.PreviewDigest, ExpectedGenerationID: 2, ExpectedDigest: sources.DesiredDigest})
+	if err != nil || replayedApply.Apply.Receipt.OperationID != rolledBack.Apply.Receipt.OperationID || replayedApply.Apply.Generation.GenerationID != 3 {
+		t.Fatalf("rollback replay=%+v err=%v", replayedApply, err)
+	}
+
+	current, found, err := store.ConfigurationAuthority(ctx)
+	if err != nil || !found || current.Desired.GenerationID != 3 {
+		t.Fatalf("authority=%+v found=%t err=%v", current, found, err)
+	}
+	remainingSources, err := service.RollbackSources(ctx, requester)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var noOpSource application.ConfigurationRollbackSource
+	for _, candidate := range remainingSources.Sources {
+		if candidate.GenerationID == 2 {
+			noOpSource = candidate
+		}
+	}
+	if noOpSource.GenerationID == 0 || noOpSource.EffectiveAt != nil {
+		t.Fatalf("superseded source without effective observation was unavailable: %+v", remainingSources)
+	}
+	noOpRollbackCommand := application.ConfigurationRollbackOpenCommand{Requester: requester, SourceGenerationID: noOpSource.GenerationID, SourceDigest: noOpSource.Digest, ExpectedGenerationID: current.Desired.GenerationID, ExpectedDigest: current.Desired.Digest}
+	noOpRollback, err := service.OpenRollback(ctx, noOpRollbackCommand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capacity = 2
+	noOpRollback, err = service.Edit(ctx, application.ConfigurationDraftEditCommand{Requester: requester, DraftID: noOpRollback.DraftID, Revision: 1, Edit: application.ConfigurationEdit{Field: application.ConfigurationFieldAdmissionHeavyCapacity, Integer: &capacity}})
+	if err != nil || noOpRollback.RollbackSourceGenerationID != noOpSource.GenerationID || noOpRollback.RollbackSourceDigest != noOpSource.Digest {
+		t.Fatalf("no-op rollback edit=%+v err=%v", noOpRollback, err)
+	}
+	noOpRollbackPreview, err := service.Preview(ctx, application.ConfigurationDraftCommand{Requester: requester, DraftID: noOpRollback.DraftID, Revision: noOpRollback.Revision})
+	if err != nil || len(noOpRollbackPreview.Changes) != 0 {
+		t.Fatalf("no-op rollback preview=%+v err=%v", noOpRollbackPreview, err)
+	}
+	noOpRollbackResult, err := service.Apply(ctx, application.ConfigurationDraftApplyCommand{Requester: requester, DraftID: noOpRollback.DraftID, Revision: noOpRollback.Revision, PreviewDigest: noOpRollbackPreview.PreviewDigest, ExpectedGenerationID: current.Desired.GenerationID, ExpectedDigest: current.Desired.Digest})
+	if err != nil || !noOpRollbackResult.Apply.NoOp || noOpRollbackResult.Apply.Generation.GenerationID != 3 {
+		t.Fatalf("no-op rollback=%+v err=%v", noOpRollbackResult, err)
+	}
+
+	normalNoOp, err := service.Open(ctx, requester)
+	if err != nil || normalNoOp.DraftOrigin != application.ConfigurationDraftOriginNormal {
+		t.Fatalf("normal no-op draft=%+v err=%v", normalNoOp, err)
+	}
+	normalNoOpPreview, err := service.Preview(ctx, application.ConfigurationDraftCommand{Requester: requester, DraftID: normalNoOp.DraftID, Revision: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalNoOpResult, err := service.Apply(ctx, application.ConfigurationDraftApplyCommand{Requester: requester, DraftID: normalNoOp.DraftID, Revision: 1, PreviewDigest: normalNoOpPreview.PreviewDigest, ExpectedGenerationID: 3, ExpectedDigest: current.Desired.Digest})
+	if err != nil || !normalNoOpResult.Apply.NoOp || normalNoOpResult.Apply.Receipt.OperationID == noOpRollbackResult.Apply.Receipt.OperationID {
+		t.Fatalf("normal no-op=%+v rollback operation=%s err=%v", normalNoOpResult, noOpRollbackResult.Apply.Receipt.OperationID, err)
+	}
+	if generations, err := store.ListConfigurationGenerations(ctx); err != nil || len(generations) != 3 {
+		t.Fatalf("generations=%+v err=%v", generations, err)
+	}
+}
+
+func TestConfigurationRollbackSourcesExcludeCorruptAndPrunedEvidence(t *testing.T) {
+	configuration, store, files, runtime, requester := configurationServiceFixture(t)
+	ctx := context.Background()
+	authority, err := configuration.Initialize(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.observation = freshConfigurationRuntime(authority.Desired.Digest, time.Now().UTC())
+	document := newConfigurationDraftDocumentFixture(files)
+	service, err := application.NewConfigurationDraftService(configuration, store, document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	draft, err := service.Open(ctx, requester)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capacity := 3
+	draft, _ = service.Edit(ctx, application.ConfigurationDraftEditCommand{Requester: requester, DraftID: draft.DraftID, Revision: 1, Edit: application.ConfigurationEdit{Field: application.ConfigurationFieldAdmissionHeavyCapacity, Integer: &capacity}})
+	preview, _ := service.Preview(ctx, application.ConfigurationDraftCommand{Requester: requester, DraftID: draft.DraftID, Revision: 2})
+	if _, err := service.Apply(ctx, application.ConfigurationDraftApplyCommand{Requester: requester, DraftID: draft.DraftID, Revision: 2, PreviewDigest: preview.PreviewDigest, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest}); err != nil {
+		t.Fatal(err)
+	}
+	baselinePayload := append([]byte(nil), files.raw[authority.Desired.Digest]...)
+	files.raw[authority.Desired.Digest] = []byte("corrupt retained evidence")
+	sources, err := service.RollbackSources(ctx, requester)
+	if err != nil || len(sources.Sources) != 0 {
+		t.Fatalf("corrupt sources=%+v err=%v", sources, err)
+	}
+	files.raw[authority.Desired.Digest] = baselinePayload
+	sources, err = service.RollbackSources(ctx, requester)
+	if err != nil || len(sources.Sources) != 1 {
+		t.Fatalf("restored sources=%+v err=%v", sources, err)
+	}
+	claimed, err := store.ClaimConfigurationRawPrune(ctx, authority.Desired.Digest)
+	if err != nil || !claimed {
+		t.Fatalf("claimed=%t err=%v", claimed, err)
+	}
+	if err := files.RemoveRaw(authority.Desired.Digest); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteConfigurationRawPrune(ctx, authority.Desired.Digest, true); err != nil {
+		t.Fatal(err)
+	}
+	sources, err = service.RollbackSources(ctx, requester)
+	if err != nil || len(sources.Sources) != 0 {
+		t.Fatalf("pruned sources=%+v err=%v", sources, err)
 	}
 }
 
@@ -400,6 +601,9 @@ func TestConfigurationDraftAmbiguousApplyPreservesOperationBinding(t *testing.T)
 	}
 	if _, err := service.Edit(ctx, application.ConfigurationDraftEditCommand{Requester: requester, DraftID: draft.DraftID, Revision: draft.Revision, Edit: application.ConfigurationEdit{Field: application.ConfigurationFieldAdmissionHeavyCapacity, Integer: &capacity}}); err == nil {
 		t.Fatal("ambiguous draft remained editable")
+	}
+	if sources, err := service.RollbackSources(ctx, requester); err != nil || len(sources.Sources) != 0 {
+		t.Fatalf("ambiguous generation became rollback source: %+v err=%v", sources, err)
 	}
 	resumed, err := service.Open(ctx, requester)
 	if err != nil || resumed.DraftID != draft.DraftID || resumed.State != application.ConfigurationDraftAmbiguous {

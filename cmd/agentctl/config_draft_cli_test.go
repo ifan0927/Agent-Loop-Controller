@@ -116,15 +116,111 @@ func TestManagedConfigDraftCLIIsolatedTypedApplyAndConvergence(t *testing.T) {
 		t.Fatalf("status=%+v output=%s err=%v", status, statusOutput, err)
 	}
 
+	sourcesOutput, err := captureConfigOutput(func() error { return configCommand(append([]string{"rollback", "sources"}, requester...)) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sources application.ConfigurationRollbackSources
+	if err := json.Unmarshal([]byte(sourcesOutput), &sources); err != nil || sources.DesiredGenerationID != 2 || len(sources.Sources) != 1 || sources.Sources[0].GenerationID != 1 || sources.Sources[0].Digest != baseline.Digest {
+		t.Fatalf("sources=%+v output=%s err=%v", sources, sourcesOutput, err)
+	}
+	rollbackOpenArgs := append([]string{"rollback", "open"}, requester...)
+	rollbackOpenArgs = append(rollbackOpenArgs, "--source-generation-id", "1", "--source-digest", baseline.Digest, "--expected-generation-id", "2", "--expected-digest", applied.Apply.Generation.Digest)
+	rollbackOpenOutput, err := captureConfigOutput(func() error { return configCommand(rollbackOpenArgs) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rollbackDraft application.ConfigurationDraft
+	if err := json.Unmarshal([]byte(rollbackOpenOutput), &rollbackDraft); err != nil || rollbackDraft.DraftOrigin != application.ConfigurationDraftOriginRollback || rollbackDraft.BaseGenerationID != 2 || rollbackDraft.RollbackSourceGenerationID != 1 || rollbackDraft.Settings.Admission.HeavyCapacity != 2 {
+		t.Fatalf("rollback draft=%+v output=%s err=%v", rollbackDraft, rollbackOpenOutput, err)
+	}
+	rollbackPreviewArgs := append([]string{"draft", "preview"}, requester...)
+	rollbackPreviewArgs = append(rollbackPreviewArgs, "--draft-id", rollbackDraft.DraftID, "--revision", "1")
+	rollbackPreviewOutput, err := captureConfigOutput(func() error { return configCommand(rollbackPreviewArgs) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rollbackPreview application.ConfigurationPreview
+	if err := json.Unmarshal([]byte(rollbackPreviewOutput), &rollbackPreview); err != nil || rollbackPreview.RollbackSourceGenerationID != 1 || rollbackPreview.RollbackSourceDigest != baseline.Digest || len(rollbackPreview.Changes) != 1 || rollbackPreview.Changes[0].Category != application.ConfigurationPreviewHeavyCapacityDecreased {
+		t.Fatalf("rollback preview=%+v output=%s err=%v", rollbackPreview, rollbackPreviewOutput, err)
+	}
+	rollbackApplyArgs := append([]string{"draft", "apply"}, requester...)
+	rollbackApplyArgs = append(rollbackApplyArgs, "--draft-id", rollbackDraft.DraftID, "--revision", "1", "--preview-digest", rollbackPreview.PreviewDigest, "--expected-generation-id", "2", "--expected-digest", applied.Apply.Generation.Digest)
+	rollbackApplyOutput, err := captureConfigOutput(func() error { return configCommand(rollbackApplyArgs) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rollbackApplied application.ConfigurationDraftApplyResult
+	if err := json.Unmarshal([]byte(rollbackApplyOutput), &rollbackApplied); err != nil || rollbackApplied.Apply.Generation.GenerationID != 3 || rollbackApplied.Apply.Generation.ParentID != 2 || rollbackApplied.Apply.Generation.RollbackSourceGenerationID != 1 || rollbackApplied.Apply.Generation.RollbackSourceDigest != baseline.Digest {
+		t.Fatalf("rollback applied=%+v output=%s err=%v", rollbackApplied, rollbackApplyOutput, err)
+	}
+	rollbackReplayOutput, err := captureConfigOutput(func() error { return configCommand(rollbackApplyArgs) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rollbackReplay application.ConfigurationDraftApplyResult
+	if err := json.Unmarshal([]byte(rollbackReplayOutput), &rollbackReplay); err != nil || rollbackReplay.Apply.Generation.GenerationID != rollbackApplied.Apply.Generation.GenerationID || rollbackReplay.Apply.Receipt.OperationID != rollbackApplied.Apply.Receipt.OperationID {
+		t.Fatalf("rollback replay=%+v output=%s err=%v", rollbackReplay, rollbackReplayOutput, err)
+	}
+
+	convergedHeartbeat.Stop()
+	rollbackCurrent, err := loadManagedConfiguration(configPath)
+	if err != nil || rollbackCurrent.Digest != rollbackApplied.Apply.Generation.Digest {
+		t.Fatalf("rollback current=%+v err=%v", rollbackCurrent, err)
+	}
+	_, rollbackHeartbeat, err := startManualControllerHeartbeat(context.Background(), rollbackCurrent.Path, rollbackCurrent.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rollbackHeartbeat.Stop()
+	rollbackStatusOutput, err := captureConfigOutput(func() error { return configCommand(append([]string{"status"}, requester...)) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(rollbackStatusOutput), &status); err != nil || status.Convergence.State != application.ConfigurationReady || status.Convergence.DesiredGenerationID != 3 || status.Convergence.EffectiveGenerationID != 3 {
+		t.Fatalf("rollback status=%+v output=%s err=%v", status, rollbackStatusOutput, err)
+	}
+
+	noOpOpenArgs := append([]string{"rollback", "open"}, requester...)
+	noOpOpenArgs = append(noOpOpenArgs, "--source-generation-id", "1", "--source-digest", baseline.Digest, "--expected-generation-id", "3", "--expected-digest", rollbackApplied.Apply.Generation.Digest)
+	noOpOpenOutput, err := captureConfigOutput(func() error { return configCommand(noOpOpenArgs) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var noOpDraft application.ConfigurationDraft
+	if err := json.Unmarshal([]byte(noOpOpenOutput), &noOpDraft); err != nil || noOpDraft.Settings.Admission.HeavyCapacity != 2 || noOpDraft.BaseGenerationID != 3 {
+		t.Fatalf("no-op draft=%+v output=%s err=%v", noOpDraft, noOpOpenOutput, err)
+	}
+	noOpPreviewArgs := append([]string{"draft", "preview"}, requester...)
+	noOpPreviewArgs = append(noOpPreviewArgs, "--draft-id", noOpDraft.DraftID, "--revision", "1")
+	noOpPreviewOutput, err := captureConfigOutput(func() error { return configCommand(noOpPreviewArgs) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var noOpPreview application.ConfigurationPreview
+	if err := json.Unmarshal([]byte(noOpPreviewOutput), &noOpPreview); err != nil || len(noOpPreview.Changes) != 0 {
+		t.Fatalf("no-op preview=%+v output=%s err=%v", noOpPreview, noOpPreviewOutput, err)
+	}
+	noOpApplyArgs := append([]string{"draft", "apply"}, requester...)
+	noOpApplyArgs = append(noOpApplyArgs, "--draft-id", noOpDraft.DraftID, "--revision", "1", "--preview-digest", noOpPreview.PreviewDigest, "--expected-generation-id", "3", "--expected-digest", rollbackApplied.Apply.Generation.Digest)
+	noOpApplyOutput, err := captureConfigOutput(func() error { return configCommand(noOpApplyArgs) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var noOpApplied application.ConfigurationDraftApplyResult
+	if err := json.Unmarshal([]byte(noOpApplyOutput), &noOpApplied); err != nil || !noOpApplied.Apply.NoOp || noOpApplied.Apply.Generation.GenerationID != 3 {
+		t.Fatalf("no-op applied=%+v output=%s err=%v", noOpApplied, noOpApplyOutput, err)
+	}
+
 	store, err := sqlitestore.Open(databasePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if generations, err := store.ListConfigurationGenerations(context.Background()); err != nil || len(generations) != 2 {
+	if generations, err := store.ListConfigurationGenerations(context.Background()); err != nil || len(generations) != 3 {
 		t.Fatalf("generations=%+v err=%v", generations, err)
 	}
-	for _, output := range []string{openOutput, setOutput, validationOutput, previewOutput, applyOutput, replayOutput, statusOutput} {
+	for _, output := range []string{openOutput, setOutput, validationOutput, previewOutput, applyOutput, replayOutput, statusOutput, sourcesOutput, rollbackOpenOutput, rollbackPreviewOutput, rollbackApplyOutput, rollbackReplayOutput, rollbackStatusOutput, noOpOpenOutput, noOpPreviewOutput, noOpApplyOutput} {
 		for _, sensitive := range []string{root, databasePath, filepath.Join(root, "app.pem"), "private-key-material", "secret://", "IFAN_LOOP_LINEAR_TOKEN"} {
 			if strings.Contains(output, sensitive) {
 				t.Fatalf("managed config output leaked %q: %s", sensitive, output)
@@ -134,9 +230,19 @@ func TestManagedConfigDraftCLIIsolatedTypedApplyAndConvergence(t *testing.T) {
 }
 
 func TestManagedConfigDraftCLIRequiresCompleteRequesterForEveryOperation(t *testing.T) {
-	for _, args := range [][]string{{"status"}, {"draft", "open"}, {"draft", "show", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1"}, {"draft", "set", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1", "--heavy-capacity", "2"}, {"draft", "validate", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1"}, {"draft", "preview", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1"}, {"draft", "apply", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1"}, {"draft", "discard", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1"}} {
+	for _, args := range [][]string{{"status"}, {"rollback", "sources"}, {"rollback", "open", "--source-generation-id", "1", "--source-digest", strings.Repeat("a", 64), "--expected-generation-id", "2", "--expected-digest", strings.Repeat("b", 64)}, {"draft", "open"}, {"draft", "show", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1"}, {"draft", "set", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1", "--heavy-capacity", "2"}, {"draft", "validate", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1"}, {"draft", "preview", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1"}, {"draft", "apply", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1"}, {"draft", "discard", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1"}} {
 		if err := configCommand(args); err == nil || !strings.Contains(err.Error(), "complete requester") {
 			t.Fatalf("args=%v err=%v", args, err)
+		}
+	}
+	requester := []string{"--requester", "ifan0927", "--requester-database-id", "33", "--requester-node-id", "MDQ6VXNlcjMz", "--requester-type", "User"}
+	for _, forbidden := range [][]string{
+		append(append([]string{"rollback", "sources"}, requester...), "--repository", "owner/repo"),
+		append(append([]string{"rollback", "open"}, requester...), "--raw-json", `{}`),
+		append(append([]string{"rollback", "open"}, requester...), "--candidate-file", "/tmp/candidate.json"),
+	} {
+		if err := configCommand(forbidden); err == nil {
+			t.Fatalf("forbidden rollback input accepted: %v", forbidden)
 		}
 	}
 }

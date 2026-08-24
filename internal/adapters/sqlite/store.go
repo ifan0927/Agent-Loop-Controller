@@ -30,7 +30,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 32
+const schemaVersion = 33
 
 const (
 	sqliteMigrationRetryDelay  = 10 * time.Millisecond
@@ -705,6 +705,8 @@ func migrateSQLite(ctx context.Context, db sqliteTransactioner, supportedVersion
 			statements = migrationV31
 		case 32:
 			statements = migrationV32
+		case 33:
+			statements = migrationV33
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -1164,6 +1166,32 @@ var migrationV32 = []string{
 	)`,
 	`CREATE UNIQUE INDEX configuration_one_active_draft ON configuration_drafts((1)) WHERE lifecycle IN ('open','applying','ambiguous')`,
 	`CREATE INDEX configuration_drafts_updated ON configuration_drafts(updated_at,draft_id)`,
+}
+
+// migrationV33 binds forward-rollback provenance to drafts and resulting
+// generations. Existing drafts are classified as normal and no historical
+// generation receives synthetic rollback provenance.
+var migrationV33 = []string{
+	`ALTER TABLE configuration_drafts ADD COLUMN draft_origin TEXT NOT NULL DEFAULT 'normal' CHECK(draft_origin IN ('normal','rollback'))`,
+	`ALTER TABLE configuration_drafts ADD COLUMN rollback_source_generation_id INTEGER NOT NULL DEFAULT 0 CHECK(rollback_source_generation_id >= 0)`,
+	`ALTER TABLE configuration_drafts ADD COLUMN rollback_source_digest TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE configuration_generations ADD COLUMN rollback_source_generation_id INTEGER NOT NULL DEFAULT 0 CHECK(rollback_source_generation_id >= 0)`,
+	`ALTER TABLE configuration_generations ADD COLUMN rollback_source_digest TEXT NOT NULL DEFAULT ''`,
+	`DROP TRIGGER configuration_generation_identity_immutable`,
+	`CREATE TRIGGER configuration_generation_rollback_provenance BEFORE INSERT ON configuration_generations
+		WHEN (NEW.origin='baseline' AND (NEW.rollback_source_generation_id<>0 OR NEW.rollback_source_digest<>'')) OR
+			(NEW.origin='apply' AND NOT ((NEW.rollback_source_generation_id=0 AND NEW.rollback_source_digest='') OR (NEW.rollback_source_generation_id>0 AND length(NEW.rollback_source_digest)=64)))
+		BEGIN SELECT RAISE(ABORT,'configuration generation rollback provenance is invalid'); END`,
+	`CREATE TRIGGER configuration_generation_identity_immutable BEFORE UPDATE ON configuration_generations
+		WHEN NEW.parent_generation_id IS NOT OLD.parent_generation_id OR NEW.digest<>OLD.digest OR NEW.target_size<>OLD.target_size OR NEW.schema_version<>OLD.schema_version OR NEW.origin<>OLD.origin OR NEW.requester_login<>OLD.requester_login OR NEW.requester_database_id<>OLD.requester_database_id OR NEW.requester_node_id<>OLD.requester_node_id OR NEW.requester_actor_type<>OLD.requester_actor_type OR NEW.configured_operator_login<>OLD.configured_operator_login OR NEW.configured_operator_database_id<>OLD.configured_operator_database_id OR NEW.configured_operator_node_id<>OLD.configured_operator_node_id OR NEW.configured_operator_actor_type<>OLD.configured_operator_actor_type OR NEW.operation_id IS NOT OLD.operation_id OR NEW.created_at<>OLD.created_at OR NEW.rollback_source_generation_id<>OLD.rollback_source_generation_id OR NEW.rollback_source_digest<>OLD.rollback_source_digest
+		BEGIN SELECT RAISE(ABORT,'configuration generation identity is immutable'); END`,
+	`CREATE TRIGGER configuration_draft_rollback_provenance BEFORE INSERT ON configuration_drafts
+		WHEN (NEW.draft_origin='normal' AND (NEW.rollback_source_generation_id<>0 OR NEW.rollback_source_digest<>'')) OR
+			(NEW.draft_origin='rollback' AND (NEW.rollback_source_generation_id<=0 OR length(NEW.rollback_source_digest)<>64))
+		BEGIN SELECT RAISE(ABORT,'configuration draft rollback provenance is invalid'); END`,
+	`CREATE TRIGGER configuration_draft_provenance_immutable BEFORE UPDATE ON configuration_drafts
+		WHEN NEW.draft_origin<>OLD.draft_origin OR NEW.rollback_source_generation_id<>OLD.rollback_source_generation_id OR NEW.rollback_source_digest<>OLD.rollback_source_digest
+		BEGIN SELECT RAISE(ABORT,'configuration draft provenance is immutable'); END`,
 }
 
 func backfillOperationReceiptsV30Tx(ctx context.Context, tx *sql.Tx) error {
