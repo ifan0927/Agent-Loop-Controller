@@ -228,6 +228,23 @@ func TestLoadVersionFiveRequiresDistinctConfiguredOperatorAuthority(t *testing.T
 	}
 }
 
+func TestLoadVersionFiveAllowsZeroRepositoriesOnlyWithAutomaticAdmissionDisabled(t *testing.T) {
+	configPath, config := enabledAutomationConfig(t)
+	config["repositories"] = []any{}
+	config["automation"].(map[string]any)["linear_todo_admission"].(map[string]any)["enabled"] = false
+	writeJSONFixture(t, configPath, config)
+	loaded, err := Load(configPath)
+	if err != nil || len(loaded.Registry.Bindings()) != 0 || len(loaded.GitHubProfiles) != 1 {
+		t.Fatalf("loaded=%+v err=%v", loaded, err)
+	}
+
+	config["automation"].(map[string]any)["linear_todo_admission"].(map[string]any)["enabled"] = true
+	writeJSONFixture(t, configPath, config)
+	if _, err := Load(configPath); err == nil || !strings.Contains(err.Error(), "requires at least one repository profile") {
+		t.Fatalf("enabled zero-repository configuration err=%v", err)
+	}
+}
+
 func TestLoadVersionFourDerivesDeterministicMigrationOperator(t *testing.T) {
 	root := canonicalTempDir(t)
 	configPath, _ := writeV2Fixture(t, root, "github-app-profile:fixture", 7)

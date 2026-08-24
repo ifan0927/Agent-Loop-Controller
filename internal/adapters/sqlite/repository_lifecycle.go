@@ -19,7 +19,7 @@ import (
 )
 
 func (s *Store) AdoptRepositoryLifecycleBaseline(ctx context.Context, input application.RepositoryBaselineInput) error {
-	if len(input.Profiles) == 0 || len(input.Profiles) > 256 {
+	if len(input.Profiles) > 256 {
 		return errors.New("repository lifecycle baseline profiles are invalid")
 	}
 	profiles := append([]application.RepositoryProfileAuthority(nil), input.Profiles...)
@@ -52,34 +52,51 @@ func (s *Store) AdoptRepositoryLifecycleBaseline(ctx context.Context, input appl
 	var persistedDigest string
 	err = tx.QueryRowContext(ctx, `SELECT repository_count,profiles_digest FROM repository_lifecycle_baseline WHERE authority_id=1`).Scan(&count, &persistedDigest)
 	if err == nil {
-		if count != len(profiles) || persistedDigest != profilesDigest {
-			return application.ErrRepositoryLifecycleConflict
-		}
+		_ = count
+		_ = persistedDigest
 		for _, profile := range profiles {
 			var profileID, profileDigest, bindingDigest string
-			if err := tx.QueryRowContext(ctx, `SELECT profile_id,profile_digest,repository_binding_digest FROM repository_lifecycles WHERE repository=?`, profile.Authority.Repository).Scan(&profileID, &profileDigest, &bindingDigest); err != nil || profileID != profile.Authority.ProfileID || profileDigest != profile.Profile.ProfileDigest || bindingDigest != profile.Authority.BindingDigest {
+			lookupErr := tx.QueryRowContext(ctx, `SELECT profile_id,profile_digest,repository_binding_digest FROM repository_lifecycles WHERE repository=? AND retired_at=''`, profile.Authority.Repository).Scan(&profileID, &profileDigest, &bindingDigest)
+			if errors.Is(lookupErr, sql.ErrNoRows) {
+				incarnationID, idErr := nextRepositoryIncarnationIDTx(ctx, tx, profile.Authority.Repository, profile.Authority.BindingDigest, input.AdoptedAt)
+				if idErr != nil {
+					return idErr
+				}
+				lifecycle := application.RepositoryLifecycle{IncarnationID: incarnationID, Repository: profile.Authority.Repository, ProfileID: profile.Authority.ProfileID, ProfileDigest: profile.Profile.ProfileDigest, RepositoryBindingDigest: profile.Authority.BindingDigest, Intent: application.RepositoryEnabled, Version: 1, UpdatedAt: input.AdoptedAt}
+				if err := insertInitialRepositoryLifecycleTx(ctx, tx, lifecycle, configuration, input.AdoptedAt); err != nil {
+					return err
+				}
+				continue
+			}
+			if lookupErr != nil {
 				return application.ErrRepositoryLifecycleMissing
 			}
+			if profileID != profile.Authority.ProfileID || profileDigest != profile.Profile.ProfileDigest || bindingDigest != profile.Authority.BindingDigest {
+				return application.ErrRepositoryLifecycleConflict
+			}
+		}
+		var unmatched int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_lifecycles WHERE retired_at='' AND removal_state='' AND repository NOT IN (`+repositoryPlaceholders(len(profiles))+`)`, repositoryNames(profiles)...).Scan(&unmatched); err != nil {
+			return err
+		}
+		if unmatched != 0 {
+			return application.ErrRepositoryLifecycleConflict
 		}
 		return tx.Commit()
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
+	if len(profiles) == 0 {
+		return errors.New("repository lifecycle baseline profiles are invalid")
+	}
 	for _, profile := range profiles {
-		lifecycle := application.RepositoryLifecycle{Repository: profile.Authority.Repository, ProfileID: profile.Authority.ProfileID, ProfileDigest: profile.Profile.ProfileDigest, RepositoryBindingDigest: profile.Authority.BindingDigest, Intent: application.RepositoryEnabled, Version: 1, UpdatedAt: input.AdoptedAt}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO repository_lifecycles(repository,profile_id,profile_digest,repository_binding_digest,intent,lifecycle_version,current_snapshot_id,updated_at) VALUES(?,?,?,?,?,?,?,?)`, lifecycle.Repository, lifecycle.ProfileID, lifecycle.ProfileDigest, lifecycle.RepositoryBindingDigest, string(lifecycle.Intent), lifecycle.Version, "", formatTime(lifecycle.UpdatedAt)); err != nil {
-			return err
-		}
-		results := initialRepositoryReadiness(input.AdoptedAt, lifecycle)
-		snapshot, err := buildRepositorySnapshot(lifecycle, configuration, results, input.AdoptedAt, "initial_recheck_required")
+		incarnationID, err := nextRepositoryIncarnationIDTx(ctx, tx, profile.Authority.Repository, profile.Authority.BindingDigest, input.AdoptedAt)
 		if err != nil {
 			return err
 		}
-		if err := insertRepositorySnapshotTx(ctx, tx, snapshot); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE repository_lifecycles SET current_snapshot_id=? WHERE repository=? AND current_snapshot_id=''`, snapshot.SnapshotID, lifecycle.Repository); err != nil {
+		lifecycle := application.RepositoryLifecycle{IncarnationID: incarnationID, Repository: profile.Authority.Repository, ProfileID: profile.Authority.ProfileID, ProfileDigest: profile.Profile.ProfileDigest, RepositoryBindingDigest: profile.Authority.BindingDigest, Intent: application.RepositoryEnabled, Version: 1, UpdatedAt: input.AdoptedAt}
+		if err := insertInitialRepositoryLifecycleTx(ctx, tx, lifecycle, configuration, input.AdoptedAt); err != nil {
 			return err
 		}
 	}
@@ -128,7 +145,7 @@ func (s *Store) ListAuthorizedRepositories(ctx context.Context, scopes applicati
 		return application.RepositoryListPage{}, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT repository,repository_binding_digest FROM repository_lifecycles ORDER BY repository`)
+	rows, err := tx.QueryContext(ctx, `SELECT repository,repository_binding_digest FROM repository_lifecycles WHERE retired_at='' ORDER BY repository`)
 	if err != nil {
 		return application.RepositoryListPage{}, err
 	}
@@ -211,7 +228,7 @@ func (s *Store) BeginRepositoryRecheck(ctx context.Context, input application.Re
 	if !errors.Is(err, sql.ErrNoRows) {
 		return application.RepositoryRecheckState{}, false, err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO repository_recheck_attempts(attempt_id,operation_id,repository,expected_profile_digest,expected_repository_binding_digest,expected_lifecycle_version,expected_configuration_generation_id,expected_configuration_digest,expected_configuration_authority_version,status,started_at) VALUES(?,?,?,?,?,?,?,?,?,'in_progress',?)`, input.AttemptID, input.OperationID, current.Lifecycle.Repository, current.Lifecycle.ProfileDigest, current.Lifecycle.RepositoryBindingDigest, current.Lifecycle.Version, current.ConfigurationAuthority.GenerationID, current.ConfigurationAuthority.Digest, current.ConfigurationAuthority.AuthorityVersion, formatTime(input.StartedAt))
+	_, err = tx.ExecContext(ctx, `INSERT INTO repository_recheck_attempts(attempt_id,operation_id,incarnation_id,repository,expected_profile_digest,expected_repository_binding_digest,expected_lifecycle_version,expected_configuration_generation_id,expected_configuration_digest,expected_configuration_authority_version,status,started_at) VALUES(?,?,?,?,?,?,?,?,?,?,'in_progress',?)`, input.AttemptID, input.OperationID, current.Lifecycle.IncarnationID, current.Lifecycle.Repository, current.Lifecycle.ProfileDigest, current.Lifecycle.RepositoryBindingDigest, current.Lifecycle.Version, current.ConfigurationAuthority.GenerationID, current.ConfigurationAuthority.Digest, current.ConfigurationAuthority.AuthorityVersion, formatTime(input.StartedAt))
 	if err != nil {
 		return application.RepositoryRecheckState{}, false, application.ErrRepositoryLifecycleConflict
 	}
@@ -289,7 +306,7 @@ func (s *Store) PublishRepositoryRecheck(ctx context.Context, input application.
 	if err := insertRepositorySnapshotTx(ctx, tx, snapshot); err != nil {
 		return application.RepositoryProjection{}, application.OperationReceipt{}, err
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE repository_lifecycles SET current_snapshot_id=?,updated_at=? WHERE repository=? AND lifecycle_version=? AND profile_digest=? AND repository_binding_digest=?`, snapshot.SnapshotID, formatTime(input.PublishedAt), current.Lifecycle.Repository, current.Lifecycle.Version, current.Lifecycle.ProfileDigest, current.Lifecycle.RepositoryBindingDigest)
+	result, err := tx.ExecContext(ctx, `UPDATE repository_lifecycles SET current_snapshot_id=?,updated_at=? WHERE incarnation_id=? AND retired_at='' AND removal_state='' AND lifecycle_version=? AND profile_digest=? AND repository_binding_digest=?`, snapshot.SnapshotID, formatTime(input.PublishedAt), current.Lifecycle.IncarnationID, current.Lifecycle.Version, current.Lifecycle.ProfileDigest, current.Lifecycle.RepositoryBindingDigest)
 	if err != nil {
 		return application.RepositoryProjection{}, application.OperationReceipt{}, err
 	}
@@ -383,7 +400,7 @@ func (s *Store) ChangeRepositoryLifecycle(ctx context.Context, input application
 	version := current.Lifecycle.Version
 	if current.Lifecycle.Intent != input.Intent {
 		version++
-		result, err := tx.ExecContext(ctx, `UPDATE repository_lifecycles SET intent=?,lifecycle_version=?,updated_at=? WHERE repository=? AND lifecycle_version=? AND intent=?`, string(input.Intent), version, formatTime(input.ChangedAt), current.Lifecycle.Repository, current.Lifecycle.Version, string(current.Lifecycle.Intent))
+		result, err := tx.ExecContext(ctx, `UPDATE repository_lifecycles SET intent=?,lifecycle_version=?,updated_at=? WHERE incarnation_id=? AND retired_at='' AND removal_state='' AND lifecycle_version=? AND intent=?`, string(input.Intent), version, formatTime(input.ChangedAt), current.Lifecycle.IncarnationID, current.Lifecycle.Version, string(current.Lifecycle.Intent))
 		if err != nil {
 			return application.RepositoryProjection{}, application.OperationReceipt{}, err
 		}
@@ -541,6 +558,9 @@ func repositoryAdmissionDecisionTx(ctx context.Context, tx *sql.Tx, profile appl
 	if authority.Lifecycle.Intent != application.RepositoryEnabled {
 		return application.RepositoryAdmissionDecision{Reason: "repository_disabled"}, nil
 	}
+	if authority.Removal != nil {
+		return application.RepositoryAdmissionDecision{Reason: authority.Removal.State}, nil
+	}
 	if authority.Recheck != nil {
 		return application.RepositoryAdmissionDecision{Reason: "readiness_recheck_in_progress"}, nil
 	}
@@ -565,7 +585,7 @@ func repositoryOperationAuthorityTx(ctx context.Context, tx *sql.Tx, repository 
 		return application.RepositoryOperationAuthority{}, err
 	}
 	var snapshotID string
-	if err := tx.QueryRowContext(ctx, `SELECT current_snapshot_id FROM repository_lifecycles WHERE repository=?`, repository).Scan(&snapshotID); err != nil || snapshotID == "" {
+	if err := tx.QueryRowContext(ctx, `SELECT current_snapshot_id FROM repository_lifecycles WHERE repository=? AND retired_at=''`, repository).Scan(&snapshotID); err != nil || snapshotID == "" {
 		return application.RepositoryOperationAuthority{}, application.ErrRepositoryLifecycleMissing
 	}
 	snapshot, err := repositorySnapshotTx(ctx, tx, snapshotID)
@@ -580,20 +600,24 @@ func repositoryOperationAuthorityTx(ctx context.Context, tx *sql.Tx, repository 
 	if err != nil {
 		return application.RepositoryOperationAuthority{}, err
 	}
-	return application.RepositoryOperationAuthority{Lifecycle: lifecycle, Snapshot: snapshot, Recheck: recheck, ConfigurationAuthority: configuration}, nil
+	removal, err := repositoryRemovalProjectionTx(ctx, tx, lifecycle.IncarnationID)
+	if err != nil {
+		return application.RepositoryOperationAuthority{}, err
+	}
+	return application.RepositoryOperationAuthority{Lifecycle: lifecycle, Snapshot: snapshot, Recheck: recheck, ConfigurationAuthority: configuration, Removal: removal}, nil
 }
 
 func repositoryLifecycleTx(ctx context.Context, tx *sql.Tx, repository string) (application.RepositoryLifecycle, error) {
 	var lifecycle application.RepositoryLifecycle
-	var intent, updated string
-	err := tx.QueryRowContext(ctx, `SELECT repository,profile_id,profile_digest,repository_binding_digest,intent,lifecycle_version,updated_at FROM repository_lifecycles WHERE repository=?`, repository).Scan(&lifecycle.Repository, &lifecycle.ProfileID, &lifecycle.ProfileDigest, &lifecycle.RepositoryBindingDigest, &intent, &lifecycle.Version, &updated)
+	var intent, updated, retired string
+	err := tx.QueryRowContext(ctx, `SELECT incarnation_id,repository,profile_id,profile_digest,repository_binding_digest,intent,lifecycle_version,updated_at,retired_at,retirement_evidence_digest FROM repository_lifecycles WHERE repository=? AND retired_at=''`, repository).Scan(&lifecycle.IncarnationID, &lifecycle.Repository, &lifecycle.ProfileID, &lifecycle.ProfileDigest, &lifecycle.RepositoryBindingDigest, &intent, &lifecycle.Version, &updated, &retired, &lifecycle.RetirementEvidenceDigest)
 	if errors.Is(err, sql.ErrNoRows) {
 		return application.RepositoryLifecycle{}, application.ErrRepositoryLifecycleMissing
 	}
 	if err != nil {
 		return application.RepositoryLifecycle{}, err
 	}
-	lifecycle.Intent, lifecycle.UpdatedAt = application.RepositoryLifecycleIntent(intent), parseTime(updated)
+	lifecycle.Intent, lifecycle.UpdatedAt, lifecycle.RetiredAt = application.RepositoryLifecycleIntent(intent), parseTime(updated), parseTime(retired)
 	if lifecycle.Validate() != nil {
 		return application.RepositoryLifecycle{}, errors.New("repository lifecycle evidence is corrupt")
 	}
@@ -603,7 +627,7 @@ func repositoryLifecycleTx(ctx context.Context, tx *sql.Tx, repository string) (
 func repositorySnapshotTx(ctx context.Context, tx *sql.Tx, snapshotID string) (application.RepositoryReadinessSnapshot, error) {
 	var snapshot application.RepositoryReadinessSnapshot
 	var status, observed, published string
-	err := tx.QueryRowContext(ctx, `SELECT snapshot_id,repository,profile_id,profile_digest,repository_binding_digest,lifecycle_version,configuration_generation_id,configuration_digest,configuration_authority_version,overall_status,reason_code,snapshot_digest,observed_at,published_at FROM repository_readiness_snapshots WHERE snapshot_id=?`, snapshotID).Scan(&snapshot.SnapshotID, &snapshot.Repository, &snapshot.ProfileID, &snapshot.ProfileDigest, &snapshot.RepositoryBindingDigest, &snapshot.LifecycleVersion, &snapshot.ConfigurationGenerationID, &snapshot.ConfigurationDigest, &snapshot.ConfigurationAuthorityVersion, &status, &snapshot.ReasonCode, &snapshot.SnapshotDigest, &observed, &published)
+	err := tx.QueryRowContext(ctx, `SELECT snapshot_id,incarnation_id,repository,profile_id,profile_digest,repository_binding_digest,lifecycle_version,configuration_generation_id,configuration_digest,configuration_authority_version,overall_status,reason_code,snapshot_digest,observed_at,published_at FROM repository_readiness_snapshots WHERE snapshot_id=?`, snapshotID).Scan(&snapshot.SnapshotID, &snapshot.IncarnationID, &snapshot.Repository, &snapshot.ProfileID, &snapshot.ProfileDigest, &snapshot.RepositoryBindingDigest, &snapshot.LifecycleVersion, &snapshot.ConfigurationGenerationID, &snapshot.ConfigurationDigest, &snapshot.ConfigurationAuthorityVersion, &status, &snapshot.ReasonCode, &snapshot.SnapshotDigest, &observed, &published)
 	if err != nil {
 		return application.RepositoryReadinessSnapshot{}, err
 	}
@@ -661,9 +685,11 @@ func repositoryProjectionTx(ctx context.Context, tx *sql.Tx, repository string) 
 	if err != nil {
 		return application.RepositoryProjection{}, err
 	}
-	projection := application.RepositoryProjection{Lifecycle: authority.Lifecycle, Readiness: effectiveRepositorySnapshot(authority.Lifecycle, authority.Snapshot, authority.ConfigurationAuthority), Recheck: authority.Recheck}
+	projection := application.RepositoryProjection{Lifecycle: authority.Lifecycle, Readiness: effectiveRepositorySnapshot(authority.Lifecycle, authority.Snapshot, authority.ConfigurationAuthority), Recheck: authority.Recheck, Removal: authority.Removal}
 	projection.Availability = application.RepositoryAvailability{Available: true, ReasonCode: "available"}
-	if authority.Recheck != nil {
+	if authority.Removal != nil {
+		projection.Availability.Available, projection.Availability.ReasonCode = false, authority.Removal.State
+	} else if authority.Recheck != nil {
 		projection.Availability.Available, projection.Availability.ReasonCode = false, "readiness_recheck_in_progress"
 	} else if authority.Lifecycle.Intent == application.RepositoryDisabled {
 		projection.Availability.Available, projection.Availability.ReasonCode = false, "repository_disabled"
@@ -712,8 +738,8 @@ func buildRepositorySnapshot(lifecycle application.RepositoryLifecycle, configur
 		}
 	}
 	dimensionsDigest, _ := domain.RepositoryReadinessDigest(results)
-	digest := repositoryDigest("repository-snapshot-v1", lifecycle.Repository, lifecycle.ProfileID, lifecycle.ProfileDigest, lifecycle.RepositoryBindingDigest, fmt.Sprint(lifecycle.Version), fmt.Sprint(configuration.GenerationID), configuration.Digest, fmt.Sprint(configuration.AuthorityVersion), string(overall), reason, dimensionsDigest, formatTime(observedAt), formatTime(publishedAt))
-	snapshot := application.RepositoryReadinessSnapshot{SnapshotID: "repository-snapshot-" + digest[:24], Repository: lifecycle.Repository, ProfileID: lifecycle.ProfileID, ProfileDigest: lifecycle.ProfileDigest, RepositoryBindingDigest: lifecycle.RepositoryBindingDigest, LifecycleVersion: lifecycle.Version, ConfigurationGenerationID: configuration.GenerationID, ConfigurationDigest: configuration.Digest, ConfigurationAuthorityVersion: configuration.AuthorityVersion, Status: overall, ReasonCode: reason, SnapshotDigest: digest, Dimensions: append([]domain.RepositoryDimensionResult(nil), results...), ObservedAt: observedAt, PublishedAt: publishedAt.UTC()}
+	digest := repositoryDigest("repository-snapshot-v2", lifecycle.IncarnationID, lifecycle.Repository, lifecycle.ProfileID, lifecycle.ProfileDigest, lifecycle.RepositoryBindingDigest, fmt.Sprint(lifecycle.Version), fmt.Sprint(configuration.GenerationID), configuration.Digest, fmt.Sprint(configuration.AuthorityVersion), string(overall), reason, dimensionsDigest, formatTime(observedAt), formatTime(publishedAt))
+	snapshot := application.RepositoryReadinessSnapshot{SnapshotID: "repository-snapshot-" + digest[:24], IncarnationID: lifecycle.IncarnationID, Repository: lifecycle.Repository, ProfileID: lifecycle.ProfileID, ProfileDigest: lifecycle.ProfileDigest, RepositoryBindingDigest: lifecycle.RepositoryBindingDigest, LifecycleVersion: lifecycle.Version, ConfigurationGenerationID: configuration.GenerationID, ConfigurationDigest: configuration.Digest, ConfigurationAuthorityVersion: configuration.AuthorityVersion, Status: overall, ReasonCode: reason, SnapshotDigest: digest, Dimensions: append([]domain.RepositoryDimensionResult(nil), results...), ObservedAt: observedAt, PublishedAt: publishedAt.UTC()}
 	return snapshot, snapshot.Validate()
 }
 
@@ -721,7 +747,7 @@ func insertRepositorySnapshotTx(ctx context.Context, tx *sql.Tx, snapshot applic
 	if snapshot.Validate() != nil {
 		return errors.New("repository snapshot publication is invalid")
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO repository_readiness_snapshots(snapshot_id,repository,profile_id,profile_digest,repository_binding_digest,lifecycle_version,configuration_generation_id,configuration_digest,configuration_authority_version,overall_status,reason_code,snapshot_digest,observed_at,published_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, snapshot.SnapshotID, snapshot.Repository, snapshot.ProfileID, snapshot.ProfileDigest, snapshot.RepositoryBindingDigest, snapshot.LifecycleVersion, snapshot.ConfigurationGenerationID, snapshot.ConfigurationDigest, snapshot.ConfigurationAuthorityVersion, string(snapshot.Status), snapshot.ReasonCode, snapshot.SnapshotDigest, formatTime(snapshot.ObservedAt), formatTime(snapshot.PublishedAt)); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO repository_readiness_snapshots(snapshot_id,incarnation_id,repository,profile_id,profile_digest,repository_binding_digest,lifecycle_version,configuration_generation_id,configuration_digest,configuration_authority_version,overall_status,reason_code,snapshot_digest,observed_at,published_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, snapshot.SnapshotID, snapshot.IncarnationID, snapshot.Repository, snapshot.ProfileID, snapshot.ProfileDigest, snapshot.RepositoryBindingDigest, snapshot.LifecycleVersion, snapshot.ConfigurationGenerationID, snapshot.ConfigurationDigest, snapshot.ConfigurationAuthorityVersion, string(snapshot.Status), snapshot.ReasonCode, snapshot.SnapshotDigest, formatTime(snapshot.ObservedAt), formatTime(snapshot.PublishedAt)); err != nil {
 		return err
 	}
 	for _, result := range snapshot.Dimensions {
@@ -781,12 +807,31 @@ func initialRepositoryReadiness(at time.Time, lifecycle application.RepositoryLi
 	return results
 }
 
+func insertInitialRepositoryLifecycleTx(ctx context.Context, tx *sql.Tx, lifecycle application.RepositoryLifecycle, configuration application.ConfigurationAdmissionAuthority, at time.Time) error {
+	if lifecycle.Validate() != nil {
+		return errors.New("repository lifecycle baseline is invalid")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO repository_lifecycles(incarnation_id,repository,profile_id,profile_digest,repository_binding_digest,intent,lifecycle_version,current_snapshot_id,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`, lifecycle.IncarnationID, lifecycle.Repository, lifecycle.ProfileID, lifecycle.ProfileDigest, lifecycle.RepositoryBindingDigest, string(lifecycle.Intent), lifecycle.Version, "", formatTime(lifecycle.UpdatedAt)); err != nil {
+		return err
+	}
+	results := initialRepositoryReadiness(at, lifecycle)
+	snapshot, err := buildRepositorySnapshot(lifecycle, configuration, results, at, "initial_recheck_required")
+	if err != nil {
+		return err
+	}
+	if err := insertRepositorySnapshotTx(ctx, tx, snapshot); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE repository_lifecycles SET current_snapshot_id=? WHERE incarnation_id=? AND current_snapshot_id=''`, snapshot.SnapshotID, lifecycle.IncarnationID)
+	return err
+}
+
 func sameRepositoryOperationAuthority(left, right application.RepositoryOperationAuthority) bool {
-	return sameRepositoryBaseAuthority(left, right) && (left.Recheck == nil) == (right.Recheck == nil) && (left.Recheck == nil || left.Recheck.AttemptID == right.Recheck.AttemptID)
+	return sameRepositoryBaseAuthority(left, right) && (left.Recheck == nil) == (right.Recheck == nil) && (left.Recheck == nil || left.Recheck.AttemptID == right.Recheck.AttemptID) && (left.Removal == nil) == (right.Removal == nil) && (left.Removal == nil || left.Removal.OperationID == right.Removal.OperationID && left.Removal.State == right.Removal.State)
 }
 
 func sameRepositoryBaseAuthority(left, right application.RepositoryOperationAuthority) bool {
-	return left.Lifecycle.Repository == right.Lifecycle.Repository && left.Lifecycle.ProfileID == right.Lifecycle.ProfileID && left.Lifecycle.ProfileDigest == right.Lifecycle.ProfileDigest && left.Lifecycle.RepositoryBindingDigest == right.Lifecycle.RepositoryBindingDigest && left.Lifecycle.Intent == right.Lifecycle.Intent && left.Lifecycle.Version == right.Lifecycle.Version && left.Snapshot.SnapshotID == right.Snapshot.SnapshotID && left.Snapshot.SnapshotDigest == right.Snapshot.SnapshotDigest && left.ConfigurationAuthority.GenerationID == right.ConfigurationAuthority.GenerationID && left.ConfigurationAuthority.Digest == right.ConfigurationAuthority.Digest && left.ConfigurationAuthority.AuthorityVersion == right.ConfigurationAuthority.AuthorityVersion
+	return left.Lifecycle.IncarnationID == right.Lifecycle.IncarnationID && left.Lifecycle.Repository == right.Lifecycle.Repository && left.Lifecycle.ProfileID == right.Lifecycle.ProfileID && left.Lifecycle.ProfileDigest == right.Lifecycle.ProfileDigest && left.Lifecycle.RepositoryBindingDigest == right.Lifecycle.RepositoryBindingDigest && left.Lifecycle.Intent == right.Lifecycle.Intent && left.Lifecycle.Version == right.Lifecycle.Version && left.Snapshot.SnapshotID == right.Snapshot.SnapshotID && left.Snapshot.SnapshotDigest == right.Snapshot.SnapshotDigest && left.ConfigurationAuthority.GenerationID == right.ConfigurationAuthority.GenerationID && left.ConfigurationAuthority.Digest == right.ConfigurationAuthority.Digest && left.ConfigurationAuthority.AuthorityVersion == right.ConfigurationAuthority.AuthorityVersion
 }
 
 func sameDimensionResults(left, right []domain.RepositoryDimensionResult) bool {
@@ -835,6 +880,34 @@ func repositoryProfilesDigest(profiles []application.RepositoryProfileAuthority)
 		parts = append(parts, profile.Authority.Repository, profile.Authority.ProfileID, profile.Profile.ProfileDigest, profile.Authority.BindingDigest)
 	}
 	return repositoryDigest("repository-baseline-profiles-v1", parts...)
+}
+
+func repositoryIncarnationID(repository, binding string, adoptedAt time.Time) string {
+	digest := repositoryDigest("repository-incarnation-v1", repository, binding, formatTime(adoptedAt))
+	return "repository-incarnation-" + digest[:32]
+}
+
+func nextRepositoryIncarnationIDTx(ctx context.Context, tx *sql.Tx, repository, binding string, adoptedAt time.Time) (string, error) {
+	var count int64
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_lifecycles WHERE repository=?`, repository).Scan(&count); err != nil {
+		return "", err
+	}
+	return repositoryIncarnationID(repository, binding, adoptedAt.Add(time.Duration(count))), nil
+}
+
+func repositoryPlaceholders(count int) string {
+	if count == 0 {
+		return "NULL"
+	}
+	return strings.TrimSuffix(strings.Repeat("?,", count), ",")
+}
+
+func repositoryNames(profiles []application.RepositoryProfileAuthority) []any {
+	values := make([]any, 0, len(profiles))
+	for _, profile := range profiles {
+		values = append(values, profile.Authority.Repository)
+	}
+	return values
 }
 
 func repositorySnapshotReason(results []domain.RepositoryDimensionResult, overall domain.RepositoryReadinessStatus) string {

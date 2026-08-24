@@ -22,6 +22,11 @@ import (
 func removeConfigurationV31(t *testing.T, db *sql.DB) {
 	t.Helper()
 	for _, statement := range []string{
+		`DROP TRIGGER IF EXISTS configuration_recovery_excludes_repository_removal`,
+		`DROP TRIGGER IF EXISTS configuration_draft_excludes_repository_removal`,
+		`DROP TRIGGER IF EXISTS repository_removal_draft_excludes_configuration`,
+		`DROP TABLE IF EXISTS repository_removal_intents`,
+		`DROP TABLE IF EXISTS repository_removal_drafts`,
 		`DROP TRIGGER IF EXISTS configuration_apply_excludes_recovery`,
 		`DROP TABLE IF EXISTS configuration_recovery_intents`,
 		`DROP TABLE IF EXISTS configuration_drafts`,
@@ -42,6 +47,8 @@ func removeConfigurationV31(t *testing.T, db *sql.DB) {
 func removeRepositoryLifecycleV35(t *testing.T, db *sql.DB) {
 	t.Helper()
 	for _, statement := range []string{
+		`DROP TABLE IF EXISTS repository_removal_intents`,
+		`DROP TABLE IF EXISTS repository_removal_drafts`,
 		`DROP TABLE IF EXISTS repository_recheck_observations`,
 		`DROP TABLE IF EXISTS repository_recheck_attempts`,
 		`DROP TABLE IF EXISTS repository_readiness_dimensions`,

@@ -24,24 +24,31 @@ const (
 )
 
 type RepositoryLifecycle struct {
-	Repository              string                    `json:"repository"`
-	ProfileID               string                    `json:"profile_id"`
-	ProfileDigest           string                    `json:"profile_digest"`
-	RepositoryBindingDigest string                    `json:"repository_binding_digest"`
-	Intent                  RepositoryLifecycleIntent `json:"intent"`
-	Version                 int64                     `json:"version"`
-	UpdatedAt               time.Time                 `json:"updated_at"`
+	IncarnationID            string                    `json:"incarnation_id"`
+	Repository               string                    `json:"repository"`
+	ProfileID                string                    `json:"profile_id"`
+	ProfileDigest            string                    `json:"profile_digest"`
+	RepositoryBindingDigest  string                    `json:"repository_binding_digest"`
+	Intent                   RepositoryLifecycleIntent `json:"intent"`
+	Version                  int64                     `json:"version"`
+	UpdatedAt                time.Time                 `json:"updated_at"`
+	RetiredAt                time.Time                 `json:"retired_at,omitempty"`
+	RetirementEvidenceDigest string                    `json:"retirement_evidence_digest,omitempty"`
 }
 
 func (l RepositoryLifecycle) Validate() error {
-	if strings.TrimSpace(l.Repository) == "" || strings.TrimSpace(l.ProfileID) == "" || !validAuthorityDigest(l.ProfileDigest) || !validAuthorityDigest(l.RepositoryBindingDigest) || l.Intent != RepositoryEnabled && l.Intent != RepositoryDisabled || l.Version < 1 || l.UpdatedAt.IsZero() {
+	if !validRepositoryIncarnationID(l.IncarnationID) || strings.TrimSpace(l.Repository) == "" || strings.TrimSpace(l.ProfileID) == "" || !validAuthorityDigest(l.ProfileDigest) || !validAuthorityDigest(l.RepositoryBindingDigest) || l.Intent != RepositoryEnabled && l.Intent != RepositoryDisabled || l.Version < 1 || l.UpdatedAt.IsZero() {
 		return errors.New("repository lifecycle is invalid")
+	}
+	if l.RetiredAt.IsZero() != (l.RetirementEvidenceDigest == "") || !l.RetiredAt.IsZero() && (!validAuthorityDigest(l.RetirementEvidenceDigest) || l.RetiredAt.Before(l.UpdatedAt)) {
+		return errors.New("repository retirement evidence is invalid")
 	}
 	return nil
 }
 
 type RepositoryReadinessSnapshot struct {
 	SnapshotID                    string                             `json:"snapshot_id"`
+	IncarnationID                 string                             `json:"incarnation_id"`
 	Repository                    string                             `json:"repository"`
 	ProfileID                     string                             `json:"profile_id"`
 	ProfileDigest                 string                             `json:"profile_digest"`
@@ -60,7 +67,7 @@ type RepositoryReadinessSnapshot struct {
 
 func (s RepositoryReadinessSnapshot) Validate() error {
 	status, err := domain.AggregateRepositoryReadiness(s.Dimensions)
-	if err != nil || status != s.Status || strings.TrimSpace(s.SnapshotID) == "" || strings.TrimSpace(s.Repository) == "" || strings.TrimSpace(s.ProfileID) == "" || !validAuthorityDigest(s.ProfileDigest) || !validAuthorityDigest(s.RepositoryBindingDigest) || s.LifecycleVersion < 1 || s.ConfigurationGenerationID < 1 || s.ConfigurationAuthorityVersion < 1 || !validAuthorityDigest(s.ConfigurationDigest) || !validAuthorityDigest(s.SnapshotDigest) || strings.TrimSpace(s.ReasonCode) == "" || s.ObservedAt.IsZero() || s.PublishedAt.IsZero() || s.PublishedAt.Before(s.ObservedAt) {
+	if err != nil || status != s.Status || strings.TrimSpace(s.SnapshotID) == "" || !validRepositoryIncarnationID(s.IncarnationID) || strings.TrimSpace(s.Repository) == "" || strings.TrimSpace(s.ProfileID) == "" || !validAuthorityDigest(s.ProfileDigest) || !validAuthorityDigest(s.RepositoryBindingDigest) || s.LifecycleVersion < 1 || s.ConfigurationGenerationID < 1 || s.ConfigurationAuthorityVersion < 1 || !validAuthorityDigest(s.ConfigurationDigest) || !validAuthorityDigest(s.SnapshotDigest) || strings.TrimSpace(s.ReasonCode) == "" || s.ObservedAt.IsZero() || s.PublishedAt.IsZero() || s.PublishedAt.Before(s.ObservedAt) {
 		return errors.New("repository readiness snapshot is invalid")
 	}
 	return nil
@@ -73,6 +80,15 @@ type RepositoryRecheckState struct {
 	StartedAt   time.Time `json:"started_at"`
 }
 
+type RepositoryRemovalProjection struct {
+	OperationID        string    `json:"operation_id"`
+	ResultGenerationID int64     `json:"result_generation_id,omitempty"`
+	ResultDigest       string    `json:"result_digest,omitempty"`
+	State              string    `json:"state"`
+	NextAction         string    `json:"next_action"`
+	UpdatedAt          time.Time `json:"updated_at"`
+}
+
 type RepositoryAvailability struct {
 	Available  bool   `json:"available"`
 	ReasonCode string `json:"reason_code"`
@@ -80,10 +96,11 @@ type RepositoryAvailability struct {
 }
 
 type RepositoryProjection struct {
-	Lifecycle    RepositoryLifecycle         `json:"lifecycle"`
-	Readiness    RepositoryReadinessSnapshot `json:"readiness"`
-	Availability RepositoryAvailability      `json:"availability"`
-	Recheck      *RepositoryRecheckState     `json:"recheck,omitempty"`
+	Lifecycle    RepositoryLifecycle          `json:"lifecycle"`
+	Readiness    RepositoryReadinessSnapshot  `json:"readiness"`
+	Availability RepositoryAvailability       `json:"availability"`
+	Recheck      *RepositoryRecheckState      `json:"recheck,omitempty"`
+	Removal      *RepositoryRemovalProjection `json:"removal,omitempty"`
 }
 
 type RepositoryListPage struct {
@@ -113,6 +130,7 @@ type RepositoryOperationAuthority struct {
 	Snapshot               RepositoryReadinessSnapshot
 	Recheck                *RepositoryRecheckState
 	ConfigurationAuthority ConfigurationAdmissionAuthority
+	Removal                *RepositoryRemovalProjection
 }
 
 type RepositoryEligibilityToken struct {
@@ -246,6 +264,9 @@ func (s *RepositoryService) List(ctx context.Context, requester Requester, limit
 	profiles, err := s.profiles.ListRepositoryProfiles(ctx)
 	if err != nil {
 		return RepositoryListPage{}, classifyServiceError(err)
+	}
+	if len(profiles) == 0 {
+		return RepositoryListPage{Repositories: []RepositoryProjection{}}, nil
 	}
 	scopes := AuthorizedScopeSet{}
 	for _, profile := range profiles {
@@ -455,10 +476,22 @@ func (c RepositoryMutationCommand) RequesterIdentity() domain.GitHubUserIdentity
 
 func repositoryOperationAuthorityDigest(authority RepositoryOperationAuthority) string {
 	payload, _ := json.Marshal(struct {
-		Repository, ProfileDigest, BindingDigest, Intent, SnapshotID, SnapshotDigest, ConfigurationDigest string
-		LifecycleVersion, ConfigurationGenerationID, ConfigurationAuthorityVersion                        int64
-	}{authority.Lifecycle.Repository, authority.Lifecycle.ProfileDigest, authority.Lifecycle.RepositoryBindingDigest, string(authority.Lifecycle.Intent), authority.Snapshot.SnapshotID, authority.Snapshot.SnapshotDigest, authority.ConfigurationAuthority.Digest, authority.Lifecycle.Version, authority.ConfigurationAuthority.GenerationID, authority.ConfigurationAuthority.AuthorityVersion})
+		IncarnationID, Repository, ProfileDigest, BindingDigest, Intent, SnapshotID, SnapshotDigest, ConfigurationDigest string
+		LifecycleVersion, ConfigurationGenerationID, ConfigurationAuthorityVersion                                       int64
+	}{IncarnationID: authority.Lifecycle.IncarnationID, Repository: authority.Lifecycle.Repository, ProfileDigest: authority.Lifecycle.ProfileDigest, BindingDigest: authority.Lifecycle.RepositoryBindingDigest, Intent: string(authority.Lifecycle.Intent), SnapshotID: authority.Snapshot.SnapshotID, SnapshotDigest: authority.Snapshot.SnapshotDigest, ConfigurationDigest: authority.ConfigurationAuthority.Digest, LifecycleVersion: authority.Lifecycle.Version, ConfigurationGenerationID: authority.ConfigurationAuthority.GenerationID, ConfigurationAuthorityVersion: authority.ConfigurationAuthority.AuthorityVersion})
 	return digestText("repository-operation-authority-v1\x00" + string(payload))
+}
+
+func validRepositoryIncarnationID(value string) bool {
+	if !strings.HasPrefix(value, "repository-incarnation-") || len(value) != len("repository-incarnation-")+32 {
+		return false
+	}
+	for _, char := range value[len("repository-incarnation-"):] {
+		if !strings.ContainsRune("0123456789abcdef", char) {
+			return false
+		}
+	}
+	return true
 }
 
 func classifyRepositoryError(err error) error {

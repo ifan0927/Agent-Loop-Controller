@@ -73,10 +73,13 @@ the state machine.
   explicit discard. Eligible retained generations can be projected into a
   source-bound forward-rollback draft without restoring historical private
   authority or creating another apply path.
-- Durable per-repository `enabled`/`disabled` lifecycle authority with one-time
-  compatibility-preserving baseline adoption, eight-dimension read-only
-  readiness snapshots, restart-safe recheck receipts, and transaction-time
-  admission fencing for both manual and automatic starts.
+- Durable per-repository `enabled`/`disabled` lifecycle authority with immutable
+  incarnation identity, one-time compatibility-preserving baseline adoption,
+  eight-dimension read-only readiness snapshots, restart-safe recheck receipts,
+  guarded draft/preview/apply retirement, and transaction-time admission
+  fencing for both manual and automatic starts. Retirement removes only the
+  exact configuration profile after fresh worker convergence and preserves run,
+  receipt, audit, local, GitHub, and Linear history.
 - Deterministically ordered bounded worker scheduling with one nonterminal run
   per repository, a configurable local-heavy-work capacity, durable leases and
   permits, restart-stable parked states, retry schedules, local
@@ -184,9 +187,10 @@ controller-authorized runtime observation, configuration generation/CAS, and
 desired/effective convergence fencing are also implemented, together with the
 normal typed-change draft/preview/apply slice and Controller-owned forward
 rollback, plus exact safe external-drift recovery with durable receipt replay
-and no new generation. Repository lifecycle, readiness, and admission fencing
-are also implemented. Unsafe or ambiguous configuration repair remains out of
-scope; restart-safe onboarding is the next separate operator foundation.
+and no new generation. Repository lifecycle, readiness, guarded retirement,
+zero-repository disabled-admission operation, and admission fencing are also
+implemented. Unsafe or ambiguous configuration repair remains out of scope;
+restart-safe onboarding is the next separate operator foundation.
 The TUI and `agentctl operator` are planned, not current behavior. HTTP, a Web
 UI, outbound notifications, Hermes runtime integration, public API/webhook
 admission, and cross-repository transactions remain deferred or exploratory.

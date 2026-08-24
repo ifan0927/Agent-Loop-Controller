@@ -178,6 +178,119 @@ func (f *Files) ValidateEditableCandidate(base, candidate []byte) (application.V
 	return target, nil
 }
 
+// MaterializeRepositoryRemoval removes one exact validated inline repository
+// profile while preserving every unrelated top-level field and repository
+// entry. Raw profile bytes never leave this private configuration adapter.
+func (f *Files) MaterializeRepositoryRemoval(base []byte, target application.LocalRepository) ([]byte, int, int, error) {
+	loaded, err := bootstrap.ValidateCurrentBytes(f.configPath, base)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	binding, err := loaded.Registry.Resolve(target.CanonicalRepository)
+	if err != nil || binding.ProfileID != target.ProfileID || binding.ProfileDigest != target.ProfileDigest || binding.RepositoryBindingDigest != target.RepositoryBindingDigest {
+		return nil, 0, 0, errors.New("repository removal target authority conflicts")
+	}
+	var document map[string]json.RawMessage
+	if err := decodeStrictRawDocument(base, &document); err != nil {
+		return nil, 0, 0, err
+	}
+	var repositories []json.RawMessage
+	if err := json.Unmarshal(document["repositories"], &repositories); err != nil {
+		return nil, 0, 0, errors.New("repository collection is invalid")
+	}
+	before := len(repositories)
+	filtered := make([]json.RawMessage, 0, max(0, before-1))
+	removed := false
+	for _, raw := range repositories {
+		var identity struct {
+			Owner string `json:"owner"`
+			Name  string `json:"name"`
+		}
+		if err := json.Unmarshal(raw, &identity); err != nil {
+			return nil, 0, 0, errors.New("repository identity is invalid")
+		}
+		canonical := strings.ToLower(strings.TrimSpace(identity.Owner)) + "/" + strings.ToLower(strings.TrimSpace(identity.Name))
+		if canonical == target.CanonicalRepository {
+			if removed {
+				return nil, 0, 0, errors.New("repository removal target is ambiguous")
+			}
+			removed = true
+			continue
+		}
+		filtered = append(filtered, append(json.RawMessage(nil), raw...))
+	}
+	if !removed || len(filtered) != before-1 {
+		return nil, 0, 0, errors.New("repository removal target is unavailable")
+	}
+	repositoriesJSON, err := json.Marshal(filtered)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	document["repositories"] = repositoriesJSON
+	candidate, err := json.MarshalIndent(document, "", "  ")
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	candidate = append(candidate, '\n')
+	return candidate, before, len(filtered), nil
+}
+
+func (f *Files) ValidateRepositoryRemovalCandidate(base, candidate []byte, target application.LocalRepository) (application.ValidatedConfigurationCandidate, error) {
+	baseLoaded, err := bootstrap.ValidateCurrentBytes(f.configPath, base)
+	if err != nil {
+		return application.ValidatedConfigurationCandidate{}, err
+	}
+	targetLoaded, err := bootstrap.ValidateCurrentBytes(f.configPath, candidate)
+	if err != nil {
+		return application.ValidatedConfigurationCandidate{}, err
+	}
+	baseBinding, err := baseLoaded.Registry.Resolve(target.CanonicalRepository)
+	if err != nil || baseBinding.ProfileID != target.ProfileID || baseBinding.ProfileDigest != target.ProfileDigest || baseBinding.RepositoryBindingDigest != target.RepositoryBindingDigest {
+		return application.ValidatedConfigurationCandidate{}, errors.New("repository removal target authority conflicts")
+	}
+	if targetLoaded.Registry.HasRepository(target.CanonicalRepository) || len(baseLoaded.Registry.Bindings()) != len(targetLoaded.Registry.Bindings())+1 {
+		return application.ValidatedConfigurationCandidate{}, errors.New("repository removal candidate has an invalid collection delta")
+	}
+	baseRepositories := candidateFromBootstrap(baseLoaded, len(base)).Repositories
+	targetRepositories := candidateFromBootstrap(targetLoaded, len(candidate)).Repositories
+	for repository, binding := range targetRepositories {
+		baseCurrent, found := baseRepositories[repository]
+		if !found || !reflect.DeepEqual(baseCurrent, binding) {
+			return application.ValidatedConfigurationCandidate{}, errors.New("repository removal candidate changes unrelated repository authority")
+		}
+	}
+	baseProtected, err := protectedConfigurationDocument(base)
+	if err != nil {
+		return application.ValidatedConfigurationCandidate{}, err
+	}
+	targetProtected, err := protectedConfigurationDocument(candidate)
+	if err != nil || !bytes.Equal(baseProtected, targetProtected) {
+		return application.ValidatedConfigurationCandidate{}, errors.New("repository removal candidate changes protected configuration authority")
+	}
+	return candidateFromBootstrap(targetLoaded, len(candidate)), nil
+}
+
+func decodeStrictRawDocument(payload []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return errors.New("configuration document contains trailing values")
+	}
+	return nil
+}
+
+func protectedConfigurationDocument(payload []byte) ([]byte, error) {
+	var document map[string]json.RawMessage
+	if err := decodeStrictRawDocument(payload, &document); err != nil {
+		return nil, err
+	}
+	delete(document, "repositories")
+	return json.Marshal(document)
+}
+
 func editableAuthorityEqual(base, candidate []byte) bool {
 	normalize := func(payload []byte) ([]byte, bool) {
 		decoder := json.NewDecoder(bytes.NewReader(payload))

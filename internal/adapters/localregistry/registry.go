@@ -199,9 +199,6 @@ func build(file File) (Registry, error) {
 	if file.Version != CurrentVersion {
 		return Registry{}, fmt.Errorf("unsupported repository registry version %d", file.Version)
 	}
-	if len(file.Repositories) == 0 {
-		return Registry{}, errors.New("repository registry must not be empty")
-	}
 	canonical, err := json.Marshal(file)
 	if err != nil {
 		return Registry{}, err

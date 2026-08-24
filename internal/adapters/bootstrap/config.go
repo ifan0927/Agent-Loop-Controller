@@ -340,7 +340,7 @@ func ValidateBytes(canonicalPath string, data []byte) (Bootstrap, error) {
 	if err != nil {
 		return Bootstrap{}, err
 	}
-	if err := crossCheck(registry, profiles); err != nil {
+	if err := crossCheck(registry, profiles, raw.Version); err != nil {
 		return Bootstrap{}, err
 	}
 	operator, err := decodeConfiguredOperator(raw.Controller.Operator, raw.Version)
@@ -795,7 +795,7 @@ func decodeRegistry(raw configFile) (localregistry.Registry, string, error) {
 		if err := decoder.Decode(&repositories); err != nil {
 			return localregistry.Registry{}, "", invalid("inline repositories are invalid")
 		}
-		if err := decoder.Decode(&struct{}{}); err != io.EOF || len(repositories) == 0 {
+		if err := decoder.Decode(&struct{}{}); err != io.EOF || len(repositories) == 0 && raw.Version != CurrentVersion {
 			return localregistry.Registry{}, "", invalid("inline repositories are invalid")
 		}
 		registry, err := localregistry.New(repositories)
@@ -846,6 +846,9 @@ func decodeAutomation(raw configFile, registry localregistry.Registry) (Automati
 }
 
 func validateLinearTodoAdmission(raw linearTodoAdmissionFile, registry localregistry.Registry, version int) (Automation, error) {
+	if len(registry.Bindings()) == 0 {
+		return Automation{}, conflict("automatic admission requires at least one repository profile")
+	}
 	if !validUUID(raw.TeamID) || raw.TeamKey != "IFAN" ||
 		!validWorkflowState(raw.TodoState, "Todo", "unstarted") ||
 		!validWorkflowState(raw.InProgressState, "In Progress", "started") ||
@@ -1061,7 +1064,7 @@ func decodeProfiles(raw []profileFile) (map[string]GitHubProfile, error) {
 	return profiles, nil
 }
 
-func crossCheck(registry localregistry.Registry, profiles map[string]GitHubProfile) error {
+func crossCheck(registry localregistry.Registry, profiles map[string]GitHubProfile, version int) error {
 	used := make(map[string]struct{})
 	for _, binding := range registry.Bindings() {
 		profile, ok := profiles[binding.GitHubAppProfileRef]
@@ -1074,7 +1077,10 @@ func crossCheck(registry localregistry.Registry, profiles map[string]GitHubProfi
 			return conflict("GitHub App profile does not match repository authority")
 		}
 	}
-	if len(used) != len(profiles) {
+	// Current-schema repository removal deliberately preserves GitHub App
+	// profiles. They can therefore be temporarily unreferenced, including when
+	// the last managed repository is retired.
+	if version != CurrentVersion && len(used) != len(profiles) {
 		return missing("GitHub App profile is not referenced by a repository")
 	}
 	return nil
