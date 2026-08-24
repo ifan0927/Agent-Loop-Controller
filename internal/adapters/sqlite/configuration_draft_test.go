@@ -11,7 +11,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 )
 
-func TestConfigurationDraftV32MigratesV31WithoutSyntheticDraft(t *testing.T) {
+func TestConfigurationDraftV33MigratesV31WithoutSyntheticDraft(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
 	legacy, err := openWithSupportedSchema(path, 31)
 	if err != nil {
@@ -25,7 +25,7 @@ func TestConfigurationDraftV32MigratesV31WithoutSyntheticDraft(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if version, err := store.SchemaVersion(context.Background()); err != nil || version != 32 {
+	if version, err := store.SchemaVersion(context.Background()); err != nil || version != 33 {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	if _, found, err := store.ActiveConfigurationDraft(context.Background()); err != nil || found {
@@ -37,7 +37,7 @@ func TestConfigurationDraftV32MigratesV31WithoutSyntheticDraft(t *testing.T) {
 	}
 }
 
-func TestConcurrentConfigurationDraftV32MigrationFromV31(t *testing.T) {
+func TestConcurrentConfigurationDraftV33MigrationFromV31(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
 	legacy, err := openWithSupportedSchema(path, 31)
 	if err != nil {
@@ -71,8 +71,49 @@ func TestConcurrentConfigurationDraftV32MigrationFromV31(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if version, err := store.SchemaVersion(context.Background()); err != nil || version != 32 {
+	if version, err := store.SchemaVersion(context.Background()); err != nil || version != 33 {
 		t.Fatalf("version=%d err=%v", version, err)
+	}
+}
+
+func TestConfigurationRollbackV33MigratesV32DraftAsNormalAndPreservesGenerations(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "controller.db")
+	legacy, err := openWithSupportedSchema(path, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := formatTime(time.Date(2026, 8, 24, 1, 0, 0, 0, time.UTC))
+	digest := strings.Repeat("a", 64)
+	result, err := legacy.db.Exec(`INSERT INTO configuration_generations(digest,target_size,schema_version,origin,configured_operator_login,configured_operator_database_id,configured_operator_node_id,configured_operator_actor_type,lifecycle,raw_retained,created_at,committed_at,effective_at,settled_at,reason_code) VALUES(?,1,5,'baseline','operator',1,'USER_1','User','effective',1,?,?,?,?,?)`, digest, now, now, now, now, string(application.ConfigurationReasonReady))
+	if err != nil {
+		t.Fatal(err)
+	}
+	generationID, _ := result.LastInsertId()
+	if _, err := legacy.db.Exec(`INSERT INTO configuration_authority(authority_id,canonical_config_path,database_path,desired_generation_id,effective_generation_id,authority_version,created_at,updated_at) VALUES(1,'/tmp/controller.json',?,?,?,1,?,?)`, path, generationID, generationID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	settings := configurationDraftSettings()
+	if _, err := legacy.db.Exec(`INSERT INTO configuration_drafts(draft_id,base_generation_id,base_digest,revision,lifecycle,run_timeout_ns,admission_enabled,admission_poll_interval_ns,delivery_poll_interval_ns,scheduler_lease_ttl_ns,scheduler_lease_renewal_interval_ns,max_candidates,max_pages,heavy_capacity,settings_digest,created_at,updated_at) VALUES(?,?,?,1,'open',?,?,?,?,?,?,?,?,?,?,?,?)`, "configuration-draft-00000000000000000000000000000001", generationID, digest, int64(settings.RunTimeout), boolInt(settings.Admission.Enabled), int64(settings.Admission.PollInterval), int64(settings.Admission.DeliveryPollInterval), int64(settings.Admission.SchedulerLeaseTTL), int64(settings.Admission.SchedulerLeaseRenewalInterval), settings.Admission.MaxCandidates, settings.Admission.MaxPages, settings.Admission.HeavyCapacity, application.ConfigurationSettingsDigest(settings), now, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	draft, found, err := store.ConfigurationDraft(context.Background(), "configuration-draft-00000000000000000000000000000001")
+	if err != nil || !found || draft.DraftOrigin != application.ConfigurationDraftOriginNormal || draft.RollbackSourceGenerationID != 0 || draft.RollbackSourceDigest != "" {
+		t.Fatalf("draft=%+v found=%t err=%v", draft, found, err)
+	}
+	generations, err := store.ListConfigurationGenerations(context.Background())
+	if err != nil || len(generations) != 1 || generations[0].RollbackSourceGenerationID != 0 || generations[0].RollbackSourceDigest != "" {
+		t.Fatalf("generations=%+v err=%v", generations, err)
+	}
+	if _, err := store.db.Exec(`UPDATE configuration_drafts SET draft_origin='rollback',rollback_source_generation_id=1,rollback_source_digest=? WHERE draft_id=?`, digest, draft.DraftID); err == nil {
+		t.Fatal("draft rollback provenance remained mutable")
 	}
 }
 
@@ -137,6 +178,45 @@ func TestConfigurationDraftOpenEditReplayDiscardAndIntegrity(t *testing.T) {
 	}
 	if _, found, err := store.ConfigurationDraft(ctx, draft.DraftID); err == nil || found {
 		t.Fatalf("malformed draft found=%t err=%v", found, err)
+	}
+}
+
+func TestConfigurationRollbackDraftReplayRejectsStaleCurrentAuthority(t *testing.T) {
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	authority, found, err := store.ConfigurationAuthority(ctx)
+	if err != nil || !found {
+		t.Fatalf("authority=%+v found=%t err=%v", authority, found, err)
+	}
+	now := time.Now().UTC()
+	sourceID, sourceDigest := authority.Desired.GenerationID, authority.Desired.Digest
+	if _, err := store.db.Exec(`UPDATE configuration_generations SET lifecycle='superseded',superseded_at=?,settled_at=? WHERE generation_id=?`, formatTime(now), formatTime(now), sourceID); err != nil {
+		t.Fatal(err)
+	}
+	currentDigest := strings.Repeat("b", 64)
+	result, err := store.db.Exec(`INSERT INTO configuration_generations(digest,target_size,schema_version,origin,configured_operator_login,configured_operator_database_id,configured_operator_node_id,configured_operator_actor_type,lifecycle,raw_retained,created_at,committed_at,effective_at,settled_at,reason_code) VALUES(?,1,5,'baseline',?,?,?,?,'effective',1,?,?,?,?,?)`, currentDigest, authority.Desired.ConfiguredOperator.Login, authority.Desired.ConfiguredOperator.DatabaseID, authority.Desired.ConfiguredOperator.NodeID, authority.Desired.ConfiguredOperator.ActorType, formatTime(now), formatTime(now), formatTime(now), formatTime(now), string(application.ConfigurationReasonReady))
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentID, _ := result.LastInsertId()
+	if _, err := store.db.Exec(`UPDATE configuration_authority SET desired_generation_id=?,effective_generation_id=? WHERE authority_id=1`, currentID, currentID); err != nil {
+		t.Fatal(err)
+	}
+	settings := configurationDraftSettings()
+	input := application.ConfigurationDraftOpenInput{DraftID: "configuration-draft-00000000000000000000000000000021", BaseGenerationID: currentID, BaseDigest: currentDigest, Settings: settings, SettingsDigest: application.ConfigurationSettingsDigest(settings), DraftOrigin: application.ConfigurationDraftOriginRollback, RollbackSourceGenerationID: sourceID, RollbackSourceDigest: sourceDigest, OpenedAt: now}
+	draft, created, err := store.OpenConfigurationDraft(ctx, input)
+	if err != nil || !created || draft.DraftOrigin != application.ConfigurationDraftOriginRollback {
+		t.Fatalf("draft=%+v created=%t err=%v", draft, created, err)
+	}
+	if _, err := store.db.Exec(`UPDATE configuration_authority SET desired_generation_id=? WHERE authority_id=1`, sourceID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.OpenConfigurationDraft(ctx, input); err == nil {
+		t.Fatal("rollback draft replay accepted stale current authority")
 	}
 }
 

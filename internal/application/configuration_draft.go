@@ -1,6 +1,7 @@
 package application
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -10,6 +11,8 @@ import (
 	"slices"
 	"strconv"
 	"time"
+
+	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
 type ConfigurationFieldID string
@@ -86,6 +89,13 @@ const (
 	ConfigurationDraftAmbiguous ConfigurationDraftState = "ambiguous"
 )
 
+type ConfigurationDraftOrigin string
+
+const (
+	ConfigurationDraftOriginNormal   ConfigurationDraftOrigin = "normal"
+	ConfigurationDraftOriginRollback ConfigurationDraftOrigin = "rollback"
+)
+
 type ConfigurationValidationSeverity string
 
 const ConfigurationValidationError ConfigurationValidationSeverity = "error"
@@ -155,37 +165,43 @@ type ConfigurationPreviewChange struct {
 }
 
 type ConfigurationPreview struct {
-	DraftID          string                       `json:"draft_id"`
-	Revision         int64                        `json:"revision"`
-	BaseGenerationID int64                        `json:"base_generation_id"`
-	BaseDigest       string                       `json:"base_digest"`
-	CandidateDigest  string                       `json:"candidate_digest"`
-	PreviewDigest    string                       `json:"preview_digest"`
-	Changes          []ConfigurationPreviewChange `json:"changes"`
-	Impacts          []ConfigurationPreviewImpact `json:"impacts"`
-	PreviewedAt      time.Time                    `json:"previewed_at"`
+	DraftID                    string                       `json:"draft_id"`
+	Revision                   int64                        `json:"revision"`
+	BaseGenerationID           int64                        `json:"base_generation_id"`
+	BaseDigest                 string                       `json:"base_digest"`
+	CandidateDigest            string                       `json:"candidate_digest"`
+	DraftOrigin                ConfigurationDraftOrigin     `json:"draft_origin"`
+	RollbackSourceGenerationID int64                        `json:"rollback_source_generation_id,omitempty"`
+	RollbackSourceDigest       string                       `json:"rollback_source_digest,omitempty"`
+	PreviewDigest              string                       `json:"preview_digest"`
+	Changes                    []ConfigurationPreviewChange `json:"changes"`
+	Impacts                    []ConfigurationPreviewImpact `json:"impacts"`
+	PreviewedAt                time.Time                    `json:"previewed_at"`
 }
 
 type ConfigurationDraft struct {
-	DraftID              string                         `json:"draft_id"`
-	BaseGenerationID     int64                          `json:"base_generation_id"`
-	BaseDigest           string                         `json:"base_digest"`
-	Revision             int64                          `json:"revision"`
-	State                ConfigurationDraftState        `json:"state"`
-	Settings             ConfigurationEditableSettings  `json:"settings"`
-	SettingsDigest       string                         `json:"settings_digest"`
-	LastEditField        ConfigurationFieldID           `json:"last_edit_field,omitempty"`
-	LastEditBaseRevision int64                          `json:"-"`
-	LastEditDigest       string                         `json:"-"`
-	Validation           *ConfigurationValidationResult `json:"validation,omitempty"`
-	Preview              *ConfigurationPreview          `json:"preview,omitempty"`
-	ResultOperationID    string                         `json:"result_operation_id,omitempty"`
-	ResultGenerationID   int64                          `json:"result_generation_id,omitempty"`
-	ResultNoOp           bool                           `json:"result_no_op,omitempty"`
-	CreatedAt            time.Time                      `json:"created_at"`
-	UpdatedAt            time.Time                      `json:"updated_at"`
-	SettledAt            time.Time                      `json:"settled_at,omitempty"`
-	Reason               string                         `json:"reason_code,omitempty"`
+	DraftID                    string                         `json:"draft_id"`
+	BaseGenerationID           int64                          `json:"base_generation_id"`
+	BaseDigest                 string                         `json:"base_digest"`
+	Revision                   int64                          `json:"revision"`
+	State                      ConfigurationDraftState        `json:"state"`
+	DraftOrigin                ConfigurationDraftOrigin       `json:"draft_origin"`
+	RollbackSourceGenerationID int64                          `json:"rollback_source_generation_id,omitempty"`
+	RollbackSourceDigest       string                         `json:"rollback_source_digest,omitempty"`
+	Settings                   ConfigurationEditableSettings  `json:"settings"`
+	SettingsDigest             string                         `json:"settings_digest"`
+	LastEditField              ConfigurationFieldID           `json:"last_edit_field,omitempty"`
+	LastEditBaseRevision       int64                          `json:"-"`
+	LastEditDigest             string                         `json:"-"`
+	Validation                 *ConfigurationValidationResult `json:"validation,omitempty"`
+	Preview                    *ConfigurationPreview          `json:"preview,omitempty"`
+	ResultOperationID          string                         `json:"result_operation_id,omitempty"`
+	ResultGenerationID         int64                          `json:"result_generation_id,omitempty"`
+	ResultNoOp                 bool                           `json:"result_no_op,omitempty"`
+	CreatedAt                  time.Time                      `json:"created_at"`
+	UpdatedAt                  time.Time                      `json:"updated_at"`
+	SettledAt                  time.Time                      `json:"settled_at,omitempty"`
+	Reason                     string                         `json:"reason_code,omitempty"`
 }
 
 type ConfigurationEdit struct {
@@ -196,12 +212,15 @@ type ConfigurationEdit struct {
 }
 
 type ConfigurationDraftOpenInput struct {
-	DraftID          string
-	BaseGenerationID int64
-	BaseDigest       string
-	Settings         ConfigurationEditableSettings
-	SettingsDigest   string
-	OpenedAt         time.Time
+	DraftID                    string
+	BaseGenerationID           int64
+	BaseDigest                 string
+	Settings                   ConfigurationEditableSettings
+	SettingsDigest             string
+	DraftOrigin                ConfigurationDraftOrigin
+	RollbackSourceGenerationID int64
+	RollbackSourceDigest       string
+	OpenedAt                   time.Time
 }
 
 type ConfigurationDraftEditInput struct {
@@ -215,11 +234,14 @@ type ConfigurationDraftEditInput struct {
 }
 
 type ConfigurationDraftMetadataInput struct {
-	DraftID          string
-	ExpectedRevision int64
-	Validation       *ConfigurationValidationResult
-	Preview          *ConfigurationPreview
-	UpdatedAt        time.Time
+	DraftID                    string
+	ExpectedRevision           int64
+	Validation                 *ConfigurationValidationResult
+	Preview                    *ConfigurationPreview
+	DraftOrigin                ConfigurationDraftOrigin
+	RollbackSourceGenerationID int64
+	RollbackSourceDigest       string
+	UpdatedAt                  time.Time
 }
 
 type ConfigurationDraftApplyBinding struct {
@@ -252,8 +274,33 @@ type ConfigurationDraftStore interface {
 
 type ConfigurationDraftDocument interface {
 	ProjectEditable([]byte) (ConfigurationEditableSettings, error)
+	ProjectHistoricalEditable([]byte, int) (ConfigurationEditableSettings, error)
 	MaterializeEditable([]byte, ConfigurationEditableSettings) ([]byte, error)
 	ValidateEditableCandidate([]byte, []byte) (ValidatedConfigurationCandidate, error)
+}
+
+type ConfigurationRollbackSource struct {
+	GenerationID  int64                         `json:"generation_id"`
+	Digest        string                        `json:"digest"`
+	SchemaVersion int                           `json:"schema_version"`
+	Origin        ConfigurationGenerationOrigin `json:"origin"`
+	CommittedAt   time.Time                     `json:"committed_at"`
+	EffectiveAt   *time.Time                    `json:"effective_at,omitempty"`
+	SupersededAt  time.Time                     `json:"superseded_at"`
+}
+
+type ConfigurationRollbackSources struct {
+	DesiredGenerationID int64                         `json:"desired_generation_id"`
+	DesiredDigest       string                        `json:"desired_digest"`
+	Sources             []ConfigurationRollbackSource `json:"sources"`
+}
+
+type ConfigurationRollbackOpenCommand struct {
+	Requester            Requester
+	SourceGenerationID   int64
+	SourceDigest         string
+	ExpectedGenerationID int64
+	ExpectedDigest       string
 }
 
 type ConfigurationDraftService struct {
@@ -322,11 +369,125 @@ func (s *ConfigurationDraftService) Open(ctx context.Context, requester Requeste
 	if err != nil {
 		return ConfigurationDraft{}, serviceError(ErrorInternal, "configuration draft identity is unavailable", nil)
 	}
-	draft, _, err := s.store.OpenConfigurationDraft(ctx, ConfigurationDraftOpenInput{DraftID: draftID, BaseGenerationID: authority.Desired.GenerationID, BaseDigest: authority.Desired.Digest, Settings: settings, SettingsDigest: ConfigurationSettingsDigest(settings), OpenedAt: s.now().UTC()})
+	draft, _, err := s.store.OpenConfigurationDraft(ctx, ConfigurationDraftOpenInput{DraftID: draftID, BaseGenerationID: authority.Desired.GenerationID, BaseDigest: authority.Desired.Digest, Settings: settings, SettingsDigest: ConfigurationSettingsDigest(settings), DraftOrigin: ConfigurationDraftOriginNormal, OpenedAt: s.now().UTC()})
 	if err != nil {
 		return ConfigurationDraft{}, serviceError(ErrorInternal, "configuration draft could not be opened", nil)
 	}
 	return draft, nil
+}
+
+func (s *ConfigurationDraftService) RollbackSources(ctx context.Context, requester Requester) (ConfigurationRollbackSources, error) {
+	authority, _, _, err := s.configuration.authorize(ctx, requester)
+	if err != nil {
+		return ConfigurationRollbackSources{}, err
+	}
+	generations, err := s.configuration.store.ListConfigurationGenerations(ctx)
+	if err != nil {
+		return ConfigurationRollbackSources{}, serviceError(ErrorInternal, "configuration rollback sources are unavailable", nil)
+	}
+	result := ConfigurationRollbackSources{DesiredGenerationID: authority.Desired.GenerationID, DesiredDigest: authority.Desired.Digest, Sources: []ConfigurationRollbackSource{}}
+	for _, generation := range generations {
+		if len(result.Sources) >= ConfigurationRawRetainCount {
+			break
+		}
+		if !eligibleRollbackGeneration(generation, authority.Desired.GenerationID) {
+			continue
+		}
+		payload, readErr := s.configuration.files.ReadRaw(generation.Digest, generation.Size)
+		if readErr != nil {
+			continue
+		}
+		settings, projectionErr := s.document.ProjectHistoricalEditable(payload, generation.SchemaVersion)
+		if projectionErr != nil || len(configurationSettingsFindings(settings)) != 0 {
+			continue
+		}
+		var effectiveAt *time.Time
+		if !generation.EffectiveAt.IsZero() {
+			value := generation.EffectiveAt
+			effectiveAt = &value
+		}
+		result.Sources = append(result.Sources, ConfigurationRollbackSource{GenerationID: generation.GenerationID, Digest: generation.Digest, SchemaVersion: generation.SchemaVersion, Origin: generation.Origin, CommittedAt: generation.CommittedAt, EffectiveAt: effectiveAt, SupersededAt: generation.SupersededAt})
+	}
+	return result, nil
+}
+
+func (s *ConfigurationDraftService) OpenRollback(ctx context.Context, command ConfigurationRollbackOpenCommand) (ConfigurationDraft, error) {
+	if command.SourceGenerationID <= 0 || command.ExpectedGenerationID <= 0 || !validAuthorityDigest(command.SourceDigest) || !validAuthorityDigest(command.ExpectedDigest) {
+		return ConfigurationDraft{}, serviceError(ErrorInvalidInput, "configuration rollback authority is invalid", nil)
+	}
+	if _, _, _, err := s.configuration.authorize(ctx, command.Requester); err != nil {
+		return ConfigurationDraft{}, err
+	}
+	authority, err := s.configuration.Reconcile(ctx)
+	if err != nil {
+		return ConfigurationDraft{}, err
+	}
+	// Reconciliation may settle an apply that changes configured authority.
+	authority, _, _, err = s.configuration.authorize(ctx, command.Requester)
+	if err != nil {
+		return ConfigurationDraft{}, err
+	}
+	if authority.Incomplete != nil || authority.Desired.GenerationID != command.ExpectedGenerationID || authority.Desired.Digest != command.ExpectedDigest || authority.Desired.SchemaVersion != 5 {
+		return ConfigurationDraft{}, serviceError(ErrorConflict, "configuration rollback authority changed", nil)
+	}
+	livePayload, live, liveErr := s.configuration.files.ReadLive()
+	desiredPayload, desiredErr := s.configuration.files.ReadRaw(authority.Desired.Digest, authority.Desired.Size)
+	if liveErr != nil || desiredErr != nil || live.Digest != authority.Desired.Digest || !bytes.Equal(livePayload, desiredPayload) {
+		return ConfigurationDraft{}, serviceError(ErrorConflict, "live configuration conflicts with desired authority", nil)
+	}
+	if active, found, activeErr := s.store.ActiveConfigurationDraft(ctx); activeErr != nil {
+		return ConfigurationDraft{}, serviceError(ErrorInternal, "configuration draft authority is unavailable", nil)
+	} else if found {
+		if active.DraftOrigin == ConfigurationDraftOriginRollback && active.BaseGenerationID == command.ExpectedGenerationID && active.BaseDigest == command.ExpectedDigest && active.RollbackSourceGenerationID == command.SourceGenerationID && active.RollbackSourceDigest == command.SourceDigest {
+			return active, nil
+		}
+		return ConfigurationDraft{}, serviceError(ErrorConflict, "configuration rollback draft conflicts", nil)
+	}
+	generations, err := s.configuration.store.ListConfigurationGenerations(ctx)
+	if err != nil {
+		return ConfigurationDraft{}, serviceError(ErrorInternal, "configuration rollback source is unavailable", nil)
+	}
+	source, found := generationByID(generations, command.SourceGenerationID)
+	if !found || source.Digest != command.SourceDigest || !eligibleRollbackGeneration(source, authority.Desired.GenerationID) {
+		return ConfigurationDraft{}, serviceError(ErrorConflict, "configuration rollback source is ineligible", nil)
+	}
+	payload, err := s.configuration.files.ReadRaw(source.Digest, source.Size)
+	if err != nil {
+		return ConfigurationDraft{}, serviceError(ErrorConflict, "configuration rollback source is unavailable", nil)
+	}
+	settings, err := s.document.ProjectHistoricalEditable(payload, source.SchemaVersion)
+	if err != nil || len(configurationSettingsFindings(settings)) != 0 {
+		return ConfigurationDraft{}, serviceError(ErrorConflict, "configuration rollback source is incompatible", nil)
+	}
+	draftID, err := newConfigurationDraftID()
+	if err != nil {
+		return ConfigurationDraft{}, serviceError(ErrorInternal, "configuration draft identity is unavailable", nil)
+	}
+	input := ConfigurationDraftOpenInput{DraftID: draftID, BaseGenerationID: authority.Desired.GenerationID, BaseDigest: authority.Desired.Digest, Settings: settings, SettingsDigest: ConfigurationSettingsDigest(settings), DraftOrigin: ConfigurationDraftOriginRollback, RollbackSourceGenerationID: source.GenerationID, RollbackSourceDigest: source.Digest, OpenedAt: s.now().UTC()}
+	draft, _, err := s.store.OpenConfigurationDraft(ctx, input)
+	if err != nil {
+		return ConfigurationDraft{}, serviceError(ErrorConflict, "configuration rollback draft conflicts", nil)
+	}
+	if draft.DraftOrigin != ConfigurationDraftOriginRollback || draft.BaseGenerationID != input.BaseGenerationID || draft.BaseDigest != input.BaseDigest || draft.RollbackSourceGenerationID != input.RollbackSourceGenerationID || draft.RollbackSourceDigest != input.RollbackSourceDigest {
+		return ConfigurationDraft{}, serviceError(ErrorConflict, "configuration rollback draft conflicts", nil)
+	}
+	return draft, nil
+}
+
+func eligibleRollbackGeneration(generation ConfigurationGeneration, desiredID int64) bool {
+	if generation.GenerationID <= 0 || generation.GenerationID == desiredID || generation.State != ConfigurationGenerationSuperseded || !generation.RawRetained || !generation.SettlementEvidenceValid || generation.SchemaVersion < 1 || generation.SchemaVersion > 5 || !validAuthorityDigest(generation.Digest) {
+		return false
+	}
+	if generation.Origin != ConfigurationOriginBaseline && generation.Origin != ConfigurationOriginApply {
+		return false
+	}
+	if generation.CommittedAt.IsZero() || generation.SupersededAt.IsZero() || generation.SettledAt.IsZero() || generation.CommittedAt.Before(generation.CreatedAt) || generation.SupersededAt.Before(generation.CommittedAt) || generation.SettledAt != generation.SupersededAt || !generation.EffectiveAt.IsZero() && (generation.EffectiveAt.Before(generation.CommittedAt) || generation.SupersededAt.Before(generation.EffectiveAt)) {
+		return false
+	}
+	if generation.Origin == ConfigurationOriginBaseline {
+		return generation.ParentID == 0 && generation.OperationID == "" && generation.Requester == (domain.GitHubUserIdentity{})
+	}
+	return generation.ParentID > 0 && generation.OperationID != "" && generation.Requester.Validate() == nil
 }
 
 func (s *ConfigurationDraftService) Show(ctx context.Context, command ConfigurationDraftCommand) (ConfigurationDraft, error) {
@@ -378,7 +539,7 @@ func (s *ConfigurationDraftService) Validate(ctx context.Context, command Config
 	}
 	result, _ := s.computeValidation(draft, base)
 	result.ValidatedAt = s.now().UTC()
-	stored, err := s.store.RecordConfigurationDraftMetadata(ctx, ConfigurationDraftMetadataInput{DraftID: draft.DraftID, ExpectedRevision: draft.Revision, Validation: &result, UpdatedAt: result.ValidatedAt})
+	stored, err := s.store.RecordConfigurationDraftMetadata(ctx, ConfigurationDraftMetadataInput{DraftID: draft.DraftID, ExpectedRevision: draft.Revision, Validation: &result, DraftOrigin: draft.DraftOrigin, RollbackSourceGenerationID: draft.RollbackSourceGenerationID, RollbackSourceDigest: draft.RollbackSourceDigest, UpdatedAt: result.ValidatedAt})
 	if err != nil || stored.Validation == nil {
 		return ConfigurationValidationResult{}, serviceError(ErrorConflict, "configuration draft revision changed", nil)
 	}
@@ -404,7 +565,7 @@ func (s *ConfigurationDraftService) Preview(ctx context.Context, command Configu
 	}
 	preview.PreviewedAt = s.now().UTC()
 	validation.ValidatedAt = preview.PreviewedAt
-	stored, err := s.store.RecordConfigurationDraftMetadata(ctx, ConfigurationDraftMetadataInput{DraftID: draft.DraftID, ExpectedRevision: draft.Revision, Validation: &validation, Preview: &preview, UpdatedAt: preview.PreviewedAt})
+	stored, err := s.store.RecordConfigurationDraftMetadata(ctx, ConfigurationDraftMetadataInput{DraftID: draft.DraftID, ExpectedRevision: draft.Revision, Validation: &validation, Preview: &preview, DraftOrigin: draft.DraftOrigin, RollbackSourceGenerationID: draft.RollbackSourceGenerationID, RollbackSourceDigest: draft.RollbackSourceDigest, UpdatedAt: preview.PreviewedAt})
 	if err != nil || stored.Preview == nil {
 		return ConfigurationPreview{}, serviceError(ErrorConflict, "configuration draft revision changed", nil)
 	}
@@ -456,8 +617,14 @@ func (s *ConfigurationDraftService) Apply(ctx context.Context, command Configura
 		return ConfigurationDraftApplyResult{}, serviceError(ErrorConflict, "configuration draft apply authority changed", nil)
 	}
 	preview, err := s.computePreview(draft, base, candidate, authority)
-	acceptedReplay := draft.State == ConfigurationDraftApplying && draft.Preview != nil && draft.Preview.PreviewDigest == command.PreviewDigest &&
-		(authority.Desired.Digest == candidateDigest || authority.Incomplete != nil && authority.Incomplete.ParentID == draft.BaseGenerationID && authority.Incomplete.ParentDigest == draft.BaseDigest && authority.Incomplete.TargetDigest == candidateDigest)
+	desiredReplay := authority.Desired.Digest == candidateDigest && (candidateDigest == draft.BaseDigest || generationProvenanceMatchesDraft(authority.Desired, draft))
+	incompleteReplay := false
+	if authority.Incomplete != nil && authority.Incomplete.ParentID == draft.BaseGenerationID && authority.Incomplete.ParentDigest == draft.BaseDigest && authority.Incomplete.TargetDigest == candidateDigest {
+		if generation, exists := generationByID(generations, authority.Incomplete.GenerationID); exists {
+			incompleteReplay = generationProvenanceMatchesDraft(generation, draft)
+		}
+	}
+	acceptedReplay := draft.State == ConfigurationDraftApplying && draft.Preview != nil && draft.Preview.PreviewDigest == command.PreviewDigest && (desiredReplay || incompleteReplay)
 	if err != nil || preview.PreviewDigest != command.PreviewDigest && !acceptedReplay {
 		return ConfigurationDraftApplyResult{}, serviceError(ErrorConflict, "configuration preview authority changed", nil)
 	}
@@ -469,7 +636,7 @@ func (s *ConfigurationDraftService) Apply(ctx context.Context, command Configura
 		}
 		draft = bound
 	}
-	result, applyErr := s.configuration.Apply(ctx, ConfigurationApplyCommand{Requester: command.Requester, ExpectedGenerationID: command.ExpectedGenerationID, ExpectedDigest: command.ExpectedDigest, Payload: candidate})
+	result, applyErr := s.configuration.Apply(ctx, ConfigurationApplyCommand{Requester: command.Requester, ExpectedGenerationID: command.ExpectedGenerationID, ExpectedDigest: command.ExpectedDigest, Payload: candidate, Provenance: draftApplyProvenance(draft)})
 	if applyErr != nil {
 		if !s.bindIncompleteApply(ctx, draft, candidate, preview.PreviewDigest) {
 			_, _, _ = s.store.BindConfigurationDraftApply(ctx, ConfigurationDraftApplyBinding{DraftID: draft.DraftID, ExpectedRevision: draft.Revision, PreviewDigest: preview.PreviewDigest, State: ConfigurationDraftOpen, Reason: "apply_rejected", UpdatedAt: s.now().UTC()})
@@ -566,7 +733,10 @@ func (s *ConfigurationDraftService) computePreview(draft ConfigurationDraft, bas
 	impactsJSON, _ := json.Marshal(impacts)
 	candidateDigest := digestBytes(candidate)
 	previewDigest := configurationDigest("configuration-preview-v1", draft.DraftID, strconv.FormatInt(draft.Revision, 10), strconv.FormatInt(draft.BaseGenerationID, 10), draft.BaseDigest, candidateDigest, string(changesJSON), string(impactsJSON), strconv.FormatInt(authority.Desired.GenerationID, 10), authority.Desired.Digest, strconv.FormatInt(authority.Version, 10))
-	return ConfigurationPreview{DraftID: draft.DraftID, Revision: draft.Revision, BaseGenerationID: draft.BaseGenerationID, BaseDigest: draft.BaseDigest, CandidateDigest: candidateDigest, PreviewDigest: previewDigest, Changes: changes, Impacts: impacts}, nil
+	if draft.DraftOrigin == ConfigurationDraftOriginRollback {
+		previewDigest = configurationDigest("configuration-preview-v2", draft.DraftID, strconv.FormatInt(draft.Revision, 10), strconv.FormatInt(draft.BaseGenerationID, 10), draft.BaseDigest, string(draft.DraftOrigin), strconv.FormatInt(draft.RollbackSourceGenerationID, 10), draft.RollbackSourceDigest, candidateDigest, string(changesJSON), string(impactsJSON), strconv.FormatInt(authority.Desired.GenerationID, 10), authority.Desired.Digest, strconv.FormatInt(authority.Version, 10))
+	}
+	return ConfigurationPreview{DraftID: draft.DraftID, Revision: draft.Revision, BaseGenerationID: draft.BaseGenerationID, BaseDigest: draft.BaseDigest, CandidateDigest: candidateDigest, DraftOrigin: draft.DraftOrigin, RollbackSourceGenerationID: draft.RollbackSourceGenerationID, RollbackSourceDigest: draft.RollbackSourceDigest, PreviewDigest: previewDigest, Changes: changes, Impacts: impacts}, nil
 }
 
 func (s *ConfigurationDraftService) bindIncompleteApply(ctx context.Context, draft ConfigurationDraft, candidate []byte, previewDigest string) bool {
@@ -575,7 +745,15 @@ func (s *ConfigurationDraftService) bindIncompleteApply(ctx context.Context, dra
 		return false
 	}
 	candidateDigest := digestBytes(candidate)
+	generations, err := s.configuration.store.ListConfigurationGenerations(ctx)
+	if err != nil {
+		return false
+	}
 	if authority.Incomplete != nil && authority.Incomplete.TargetDigest == candidateDigest {
+		generation, found := generationByID(generations, authority.Incomplete.GenerationID)
+		if !found || !generationProvenanceMatchesDraft(generation, draft) {
+			return false
+		}
 		state := ConfigurationDraftApplying
 		if authority.Incomplete.State == ConfigurationApplyAmbiguous {
 			state = ConfigurationDraftAmbiguous
@@ -583,7 +761,7 @@ func (s *ConfigurationDraftService) bindIncompleteApply(ctx context.Context, dra
 		_, _, _ = s.store.BindConfigurationDraftApply(ctx, ConfigurationDraftApplyBinding{DraftID: draft.DraftID, ExpectedRevision: draft.Revision, PreviewDigest: previewDigest, State: state, OperationID: authority.Incomplete.OperationID, GenerationID: authority.Incomplete.GenerationID, Reason: string(authority.Incomplete.Reason), UpdatedAt: s.now().UTC()})
 		return true
 	}
-	if authority.Desired.ParentID == draft.BaseGenerationID && authority.Desired.Digest == candidateDigest && authority.Desired.OperationID != "" {
+	if authority.Desired.ParentID == draft.BaseGenerationID && authority.Desired.Digest == candidateDigest && authority.Desired.OperationID != "" && generationProvenanceMatchesDraft(authority.Desired, draft) {
 		_, _, _ = s.store.BindConfigurationDraftApply(ctx, ConfigurationDraftApplyBinding{DraftID: draft.DraftID, ExpectedRevision: draft.Revision, PreviewDigest: previewDigest, State: ConfigurationDraftApplying, OperationID: authority.Desired.OperationID, GenerationID: authority.Desired.GenerationID, Reason: string(authority.Desired.Reason), UpdatedAt: s.now().UTC()})
 		return true
 	}
@@ -604,7 +782,7 @@ func (s *ConfigurationDraftService) appliedReplay(ctx context.Context, command C
 		return ConfigurationDraftApplyResult{}, serviceError(ErrorInternal, "configuration generation evidence is unavailable", nil)
 	}
 	generation, found := generationByID(generations, draft.ResultGenerationID)
-	if !found {
+	if !found || !draft.ResultNoOp && !generationProvenanceMatchesDraft(generation, draft) {
 		return ConfigurationDraftApplyResult{}, serviceError(ErrorConflict, "configuration draft replay evidence conflicts", nil)
 	}
 	projection, err := s.configuration.Projection(ctx, command.Requester, s.now().UTC())
@@ -612,6 +790,20 @@ func (s *ConfigurationDraftService) appliedReplay(ctx context.Context, command C
 		return ConfigurationDraftApplyResult{}, err
 	}
 	return ConfigurationDraftApplyResult{Apply: ConfigurationApplyResult{Generation: generation, Receipt: receipt, NoOp: draft.ResultNoOp}, Convergence: projection}, nil
+}
+
+func draftApplyProvenance(draft ConfigurationDraft) ConfigurationApplyProvenance {
+	if draft.DraftOrigin == ConfigurationDraftOriginRollback {
+		return ConfigurationApplyProvenance{Kind: ConfigurationApplyRollback, RollbackSourceGenerationID: draft.RollbackSourceGenerationID, RollbackSourceDigest: draft.RollbackSourceDigest}
+	}
+	return ConfigurationApplyProvenance{Kind: ConfigurationApplyNormal}
+}
+
+func generationProvenanceMatchesDraft(generation ConfigurationGeneration, draft ConfigurationDraft) bool {
+	if draft.DraftOrigin == ConfigurationDraftOriginRollback {
+		return generation.RollbackSourceGenerationID == draft.RollbackSourceGenerationID && generation.RollbackSourceDigest == draft.RollbackSourceDigest
+	}
+	return generation.RollbackSourceGenerationID == 0 && generation.RollbackSourceDigest == ""
 }
 
 func ConfigurationSettingsDigest(settings ConfigurationEditableSettings) string {

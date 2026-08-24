@@ -604,6 +604,44 @@ func TestConfigurationReceiptSettlementFailureRollsBackDesiredAtomically(t *test
 	if err != nil || !changed || settled.Desired.GenerationID != generation.GenerationID || settledReceipt.Phase != application.OperationPhaseObserved {
 		t.Fatalf("settled=%+v receipt=%+v changed=%t err=%v", settled, settledReceipt, changed, err)
 	}
+	nextReceipt := application.NewOperationReceipt(application.OperationReceiptInput{
+		OperationType: application.OperationApplyConfiguration, Scope: application.ScopeController, TargetID: application.ConfigurationTargetID,
+		Requester: operator, RequestDigest: strings.Repeat("f", 64), ExpectedAuthorityDigest: settled.Desired.Digest,
+		OperationAnchorDigest: strings.Repeat("1", 64), TargetBindingDigest: strings.Repeat("d", 64), AcceptedAt: now.Add(3 * time.Second),
+	})
+	next, _, _, err := store.BeginConfigurationApply(ctx, application.ConfigurationApplyAcceptance{
+		ExpectedGenerationID: settled.Desired.GenerationID, ExpectedDigest: settled.Desired.Digest,
+		Candidate: application.ValidatedConfigurationCandidate{Digest: strings.Repeat("f", 64), Size: 44, SchemaVersion: 5, DatabasePath: databasePath, Operator: operator},
+		Requester: operator, Receipt: nextReceipt, AcceptedAt: nextReceipt.AcceptedAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := store.SettleConfigurationApply(ctx, application.ConfigurationApplySettlement{GenerationID: next.GenerationID, ParentID: next.ParentID, OperationID: next.OperationID, Outcome: application.ConfigurationApplyCommitted, Reason: application.ConfigurationReasonRestartRequired, EvidenceDigest: strings.Repeat("2", 64), SettledAt: now.Add(4 * time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	findGeneration := func() application.ConfigurationGeneration {
+		generations, listErr := store.ListConfigurationGenerations(ctx)
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		for _, item := range generations {
+			if item.GenerationID == generation.GenerationID {
+				return item
+			}
+		}
+		t.Fatal("superseded generation is missing")
+		return application.ConfigurationGeneration{}
+	}
+	if source := findGeneration(); !source.SettlementEvidenceValid || !source.EffectiveAt.IsZero() {
+		t.Fatalf("source settlement evidence=%+v", source)
+	}
+	if _, err := store.db.Exec(`UPDATE configuration_apply_intents SET target_digest=? WHERE generation_id=?`, strings.Repeat("0", 64), generation.GenerationID); err != nil {
+		t.Fatal(err)
+	}
+	if source := findGeneration(); source.SettlementEvidenceValid {
+		t.Fatalf("contradictory intent remained valid: %+v", source)
+	}
 }
 
 func TestConfigurationRawPruneClaimAndApplyAcceptanceAreMutuallyExclusive(t *testing.T) {

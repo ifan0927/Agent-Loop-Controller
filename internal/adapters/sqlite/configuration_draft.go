@@ -16,28 +16,70 @@ const configurationDraftSelect = `SELECT draft_id,base_generation_id,base_digest
 	last_edit_field,last_edit_base_revision,last_edit_digest,
 	validation_revision,validation_candidate_digest,validation_digest,validation_valid,validation_findings_json,validated_at,
 	preview_revision,preview_candidate_digest,preview_digest,preview_changes_json,preview_impacts_json,previewed_at,
-	result_operation_id,COALESCE(result_generation_id,0),result_no_op,created_at,updated_at,settled_at,reason_code
+	result_operation_id,COALESCE(result_generation_id,0),result_no_op,created_at,updated_at,settled_at,reason_code,draft_origin,rollback_source_generation_id,rollback_source_digest
 	FROM configuration_drafts`
 
 func (s *Store) OpenConfigurationDraft(ctx context.Context, input application.ConfigurationDraftOpenInput) (application.ConfigurationDraft, bool, error) {
-	if !validDraftID(input.DraftID) || input.BaseGenerationID <= 0 || !validConfigurationDigest(input.BaseDigest) || input.SettingsDigest != application.ConfigurationSettingsDigest(input.Settings) || input.OpenedAt.IsZero() {
+	if input.DraftOrigin == "" {
+		input.DraftOrigin = application.ConfigurationDraftOriginNormal
+	}
+	if !validDraftID(input.DraftID) || input.BaseGenerationID <= 0 || !validConfigurationDigest(input.BaseDigest) || input.SettingsDigest != application.ConfigurationSettingsDigest(input.Settings) || input.OpenedAt.IsZero() || !validDraftProvenance(input.DraftOrigin, input.RollbackSourceGenerationID, input.RollbackSourceDigest) {
 		return application.ConfigurationDraft{}, false, errors.New("configuration draft input is invalid")
 	}
-	settings := input.Settings
-	_, err := s.db.ExecContext(ctx, `INSERT INTO configuration_drafts(
-		draft_id,base_generation_id,base_digest,revision,lifecycle,run_timeout_ns,admission_enabled,admission_poll_interval_ns,delivery_poll_interval_ns,scheduler_lease_ttl_ns,scheduler_lease_renewal_interval_ns,max_candidates,max_pages,heavy_capacity,settings_digest,created_at,updated_at
-	) VALUES(?,?,?,1,'open',?,?,?,?,?,?,?,?,?,?,?,?)`,
-		input.DraftID, input.BaseGenerationID, input.BaseDigest,
-		int64(settings.RunTimeout), boolInt(settings.Admission.Enabled), int64(settings.Admission.PollInterval), int64(settings.Admission.DeliveryPollInterval), int64(settings.Admission.SchedulerLeaseTTL), int64(settings.Admission.SchedulerLeaseRenewalInterval), settings.Admission.MaxCandidates, settings.Admission.MaxPages, settings.Admission.HeavyCapacity, input.SettingsDigest, formatTime(input.OpenedAt), formatTime(input.OpenedAt))
-	if err == nil {
-		draft, found, readErr := s.ConfigurationDraft(ctx, input.DraftID)
-		return draft, true, readErrIfMissing(readErr, found)
-	}
-	draft, found, readErr := s.ActiveConfigurationDraft(ctx)
-	if readErr != nil || !found {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
 		return application.ConfigurationDraft{}, false, err
 	}
-	return draft, false, nil
+	defer tx.Rollback()
+	// Acquire the write reservation before any read. This avoids SQLite's
+	// deferred read-to-write lock upgrade race during concurrent first open.
+	if _, err := tx.ExecContext(ctx, `UPDATE configuration_authority SET authority_version=authority_version WHERE authority_id=1`); err != nil {
+		return application.ConfigurationDraft{}, false, err
+	}
+	active, activeErr := scanConfigurationDraft(tx.QueryRowContext(ctx, configurationDraftSelect+` WHERE lifecycle IN ('open','applying','ambiguous') ORDER BY updated_at DESC,draft_id LIMIT 1`))
+	if activeErr == nil {
+		if input.DraftOrigin == application.ConfigurationDraftOriginRollback {
+			authority, found, authorityErr := configurationAuthorityQuery(ctx, tx)
+			if authorityErr != nil || !found || authority.Incomplete != nil || authority.Desired.GenerationID != input.BaseGenerationID || authority.Desired.Digest != input.BaseDigest || authority.Desired.SchemaVersion != 5 || active.DraftOrigin != input.DraftOrigin || active.BaseGenerationID != input.BaseGenerationID || active.BaseDigest != input.BaseDigest || active.RollbackSourceGenerationID != input.RollbackSourceGenerationID || active.RollbackSourceDigest != input.RollbackSourceDigest {
+				return application.ConfigurationDraft{}, false, errors.New("configuration rollback draft conflicts")
+			}
+		}
+		return active, false, tx.Commit()
+	}
+	if !errors.Is(activeErr, sql.ErrNoRows) {
+		return application.ConfigurationDraft{}, false, activeErr
+	}
+	authority, found, err := configurationAuthorityQuery(ctx, tx)
+	if err != nil || !found || authority.Desired.GenerationID != input.BaseGenerationID || authority.Desired.Digest != input.BaseDigest || authority.Desired.SchemaVersion != 5 {
+		return application.ConfigurationDraft{}, false, application.ErrConfigurationAuthorityConflict
+	}
+	if input.DraftOrigin == application.ConfigurationDraftOriginRollback {
+		if authority.Incomplete != nil {
+			return application.ConfigurationDraft{}, false, application.ErrConfigurationAuthorityConflict
+		}
+		var eligible int
+		err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM configuration_generations g WHERE g.generation_id=? AND g.generation_id<>? AND g.digest=? AND g.raw_retained=1 AND g.schema_version BETWEEN 1 AND 5 AND `+configurationRollbackSettlementPredicate+` AND NOT EXISTS(SELECT 1 FROM configuration_raw_prune_claims p WHERE p.digest=g.digest)`, input.RollbackSourceGenerationID, input.BaseGenerationID, input.RollbackSourceDigest).Scan(&eligible)
+		if err != nil || eligible != 1 {
+			return application.ConfigurationDraft{}, false, application.ErrConfigurationAuthorityConflict
+		}
+	}
+	settings := input.Settings
+	_, err = tx.ExecContext(ctx, `INSERT INTO configuration_drafts(
+		draft_id,base_generation_id,base_digest,revision,lifecycle,run_timeout_ns,admission_enabled,admission_poll_interval_ns,delivery_poll_interval_ns,scheduler_lease_ttl_ns,scheduler_lease_renewal_interval_ns,max_candidates,max_pages,heavy_capacity,settings_digest,created_at,updated_at,draft_origin,rollback_source_generation_id,rollback_source_digest
+	) VALUES(?,?,?,1,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		input.DraftID, input.BaseGenerationID, input.BaseDigest,
+		int64(settings.RunTimeout), boolInt(settings.Admission.Enabled), int64(settings.Admission.PollInterval), int64(settings.Admission.DeliveryPollInterval), int64(settings.Admission.SchedulerLeaseTTL), int64(settings.Admission.SchedulerLeaseRenewalInterval), settings.Admission.MaxCandidates, settings.Admission.MaxPages, settings.Admission.HeavyCapacity, input.SettingsDigest, formatTime(input.OpenedAt), formatTime(input.OpenedAt), string(input.DraftOrigin), input.RollbackSourceGenerationID, input.RollbackSourceDigest)
+	if err != nil {
+		return application.ConfigurationDraft{}, false, err
+	}
+	draft, err := scanConfigurationDraft(tx.QueryRowContext(ctx, configurationDraftSelect+` WHERE draft_id=?`, input.DraftID))
+	if err != nil {
+		return application.ConfigurationDraft{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return application.ConfigurationDraft{}, false, err
+	}
+	return draft, true, nil
 }
 
 func (s *Store) ConfigurationDraft(ctx context.Context, draftID string) (application.ConfigurationDraft, bool, error) {
@@ -90,7 +132,10 @@ func (s *Store) EditConfigurationDraft(ctx context.Context, input application.Co
 }
 
 func (s *Store) RecordConfigurationDraftMetadata(ctx context.Context, input application.ConfigurationDraftMetadataInput) (application.ConfigurationDraft, error) {
-	if !validDraftID(input.DraftID) || input.ExpectedRevision < 1 || input.UpdatedAt.IsZero() || input.Validation == nil {
+	if input.DraftOrigin == "" {
+		input.DraftOrigin = application.ConfigurationDraftOriginNormal
+	}
+	if !validDraftID(input.DraftID) || input.ExpectedRevision < 1 || input.UpdatedAt.IsZero() || input.Validation == nil || !validDraftProvenance(input.DraftOrigin, input.RollbackSourceGenerationID, input.RollbackSourceDigest) {
 		return application.ConfigurationDraft{}, errors.New("configuration draft metadata is invalid")
 	}
 	validation := input.Validation
@@ -104,7 +149,11 @@ func (s *Store) RecordConfigurationDraftMetadata(ctx context.Context, input appl
 	previewRevision, previewCandidate, previewDigest, changesJSON, impactsJSON, previewedAt := int64(0), "", "", "", "", ""
 	if input.Preview != nil {
 		preview := input.Preview
-		if preview.DraftID != input.DraftID || preview.Revision != input.ExpectedRevision || preview.CandidateDigest != validation.CandidateDigest || !validConfigurationDigest(preview.PreviewDigest) || preview.PreviewedAt.IsZero() {
+		previewOrigin := preview.DraftOrigin
+		if previewOrigin == "" {
+			previewOrigin = application.ConfigurationDraftOriginNormal
+		}
+		if preview.DraftID != input.DraftID || preview.Revision != input.ExpectedRevision || preview.CandidateDigest != validation.CandidateDigest || !validConfigurationDigest(preview.PreviewDigest) || preview.PreviewedAt.IsZero() || !validDraftProvenance(previewOrigin, preview.RollbackSourceGenerationID, preview.RollbackSourceDigest) || previewOrigin != input.DraftOrigin || preview.RollbackSourceGenerationID != input.RollbackSourceGenerationID || preview.RollbackSourceDigest != input.RollbackSourceDigest {
 			return application.ConfigurationDraft{}, errors.New("configuration preview metadata is invalid")
 		}
 		changes, marshalErr := json.Marshal(preview.Changes)
@@ -120,9 +169,9 @@ func (s *Store) RecordConfigurationDraftMetadata(ctx context.Context, input appl
 	result, err := s.db.ExecContext(ctx, `UPDATE configuration_drafts SET
 		validation_revision=?,validation_candidate_digest=?,validation_digest=?,validation_valid=?,validation_findings_json=?,validated_at=?,
 		preview_revision=?,preview_candidate_digest=?,preview_digest=?,preview_changes_json=?,preview_impacts_json=?,previewed_at=?,updated_at=?
-		WHERE draft_id=? AND lifecycle='open' AND revision=?`,
+		WHERE draft_id=? AND lifecycle='open' AND revision=? AND draft_origin=? AND rollback_source_generation_id=? AND rollback_source_digest=?`,
 		validation.Revision, validation.CandidateDigest, validation.ValidationDigest, boolInt(validation.Valid), string(findings), formatTime(validation.ValidatedAt),
-		previewRevision, previewCandidate, previewDigest, changesJSON, impactsJSON, previewedAt, formatTime(input.UpdatedAt), input.DraftID, input.ExpectedRevision)
+		previewRevision, previewCandidate, previewDigest, changesJSON, impactsJSON, previewedAt, formatTime(input.UpdatedAt), input.DraftID, input.ExpectedRevision, string(input.DraftOrigin), input.RollbackSourceGenerationID, input.RollbackSourceDigest)
 	if err != nil {
 		return application.ConfigurationDraft{}, err
 	}
@@ -228,16 +277,18 @@ func scanConfigurationDraft(row configurationDraftScanner) (application.Configur
 	var previewRevision int64
 	var previewCandidate, previewDigest, changesJSON, impactsJSON, previewedAt string
 	var createdAt, updatedAt, settledAt string
+	var draftOrigin string
 	err := row.Scan(&draft.DraftID, &draft.BaseGenerationID, &draft.BaseDigest, &draft.Revision, &lifecycle,
 		&runTimeout, &enabled, &poll, &delivery, &ttl, &renewal, &draft.Settings.Admission.MaxCandidates, &draft.Settings.Admission.MaxPages, &draft.Settings.Admission.HeavyCapacity, &draft.SettingsDigest,
 		&lastField, &draft.LastEditBaseRevision, &draft.LastEditDigest,
 		&validationRevision, &validationCandidate, &validationDigest, &validationValid, &findingsJSON, &validatedAt,
 		&previewRevision, &previewCandidate, &previewDigest, &changesJSON, &impactsJSON, &previewedAt,
-		&draft.ResultOperationID, &draft.ResultGenerationID, &resultNoOp, &createdAt, &updatedAt, &settledAt, &draft.Reason)
+		&draft.ResultOperationID, &draft.ResultGenerationID, &resultNoOp, &createdAt, &updatedAt, &settledAt, &draft.Reason, &draftOrigin, &draft.RollbackSourceGenerationID, &draft.RollbackSourceDigest)
 	if err != nil {
 		return application.ConfigurationDraft{}, err
 	}
 	draft.State = application.ConfigurationDraftState(lifecycle)
+	draft.DraftOrigin = application.ConfigurationDraftOrigin(draftOrigin)
 	draft.Settings.RunTimeout = application.ConfigurationDuration(runTimeout)
 	draft.Settings.Admission.Enabled = enabled == 1
 	draft.Settings.Admission.PollInterval = application.ConfigurationDuration(poll)
@@ -260,7 +311,7 @@ func scanConfigurationDraft(row configurationDraftScanner) (application.Configur
 		if json.Unmarshal([]byte(changesJSON), &changes) != nil || json.Unmarshal([]byte(impactsJSON), &impacts) != nil {
 			return application.ConfigurationDraft{}, errors.New("configuration preview evidence is malformed")
 		}
-		draft.Preview = &application.ConfigurationPreview{DraftID: draft.DraftID, Revision: previewRevision, BaseGenerationID: draft.BaseGenerationID, BaseDigest: draft.BaseDigest, CandidateDigest: previewCandidate, PreviewDigest: previewDigest, Changes: changes, Impacts: impacts, PreviewedAt: parseTime(previewedAt)}
+		draft.Preview = &application.ConfigurationPreview{DraftID: draft.DraftID, Revision: previewRevision, BaseGenerationID: draft.BaseGenerationID, BaseDigest: draft.BaseDigest, CandidateDigest: previewCandidate, DraftOrigin: draft.DraftOrigin, RollbackSourceGenerationID: draft.RollbackSourceGenerationID, RollbackSourceDigest: draft.RollbackSourceDigest, PreviewDigest: previewDigest, Changes: changes, Impacts: impacts, PreviewedAt: parseTime(previewedAt)}
 	}
 	if err := validatePersistedDraft(draft); err != nil {
 		return application.ConfigurationDraft{}, err
@@ -278,7 +329,7 @@ func validatePersistedDraft(draft application.ConfigurationDraft) error {
 		settings.Admission.SchedulerLeaseRenewalInterval.Duration() >= 5*time.Second && settings.Admission.SchedulerLeaseRenewalInterval.Duration() <= 5*time.Minute &&
 		settings.Admission.MaxCandidates >= 1 && settings.Admission.MaxCandidates <= 100 && settings.Admission.MaxPages >= 1 && settings.Admission.MaxPages <= 20 && settings.Admission.HeavyCapacity >= 1 && settings.Admission.HeavyCapacity <= application.MaxHeavyCapacity
 	validEditReplay := draft.Revision == 1 && draft.LastEditField == "" && draft.LastEditBaseRevision == 0 && draft.LastEditDigest == "" || draft.Revision > 1 && validConfigurationField(draft.LastEditField) && draft.LastEditBaseRevision == draft.Revision-1 && validConfigurationDigest(draft.LastEditDigest)
-	if !validDraftID(draft.DraftID) || draft.BaseGenerationID <= 0 || !validConfigurationDigest(draft.BaseDigest) || draft.Revision < 1 || !validState || !validSettings || !validEditReplay || draft.SettingsDigest != application.ConfigurationSettingsDigest(draft.Settings) || draft.CreatedAt.IsZero() || draft.UpdatedAt.IsZero() {
+	if !validDraftID(draft.DraftID) || draft.BaseGenerationID <= 0 || !validConfigurationDigest(draft.BaseDigest) || draft.Revision < 1 || !validState || !validSettings || !validEditReplay || !validDraftProvenance(draft.DraftOrigin, draft.RollbackSourceGenerationID, draft.RollbackSourceDigest) || draft.SettingsDigest != application.ConfigurationSettingsDigest(draft.Settings) || draft.CreatedAt.IsZero() || draft.UpdatedAt.IsZero() {
 		return errors.New("configuration draft evidence is malformed")
 	}
 	if draft.Validation != nil && (draft.Validation.Revision != draft.Revision || !validConfigurationDigest(draft.Validation.CandidateDigest) || !validConfigurationDigest(draft.Validation.ValidationDigest) || draft.Validation.ValidatedAt.IsZero()) {
@@ -294,6 +345,13 @@ func validatePersistedDraft(draft application.ConfigurationDraft) error {
 		return errors.New("configuration draft ambiguity evidence is malformed")
 	}
 	return nil
+}
+
+func validDraftProvenance(origin application.ConfigurationDraftOrigin, generationID int64, digest string) bool {
+	if origin == "" || origin == application.ConfigurationDraftOriginNormal {
+		return generationID == 0 && digest == ""
+	}
+	return origin == application.ConfigurationDraftOriginRollback && generationID > 0 && validConfigurationDigest(digest)
 }
 
 func validDraftID(value string) bool {

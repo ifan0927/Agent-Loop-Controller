@@ -138,15 +138,21 @@ path, database relocation, invalid live file, or out-of-band digest change is a
 conflict; startup never re-baselines, follows an edited database path, adopts
 drift, or rewrites the file.
 
-The Controller exposes a normal typed-change path for `controller.run_timeout`
-and the eight bounded `automation.linear_todo_admission` policy fields. Use
-`config draft open|show|set|validate|preview|apply|discard`; no command accepts
+The Controller exposes normal typed-change and forward-rollback paths for
+`controller.run_timeout` and the eight bounded
+`automation.linear_todo_admission` policy fields. Use
+`config draft open|show|set|validate|preview|apply|discard` and
+`config rollback sources|open`; no command accepts
 raw JSON, a candidate file, a generic key, a path, an identity, or a credential
 reference. The single active draft is revision-CAS protected and bound to the
 exact desired generation. Preview and apply expose only sanitized allowlisted
-values and finite impacts. Apply delegates to the existing generation/CAS
-service and never restarts the worker. Forward rollback and explicit drift
-repair remain unavailable.
+values and finite impacts. Rollback source discovery lists only retained,
+superseded, safely committed schema-1-through-5 generations whose nine settings
+project under current policy. Opening a rollback draft binds the exact source
+and current desired authority, then materializes against current schema-5 base
+bytes so every non-editable current authority remains unchanged. Apply delegates
+to the existing generation/CAS service and never restarts the worker. Explicit
+external-drift repair remains unavailable.
 
 A committed typed configuration change normally reports `restart_required`
 because workers load configuration only at process startup. Use the existing
@@ -622,7 +628,7 @@ A ready result does not validate token scope or GitHub App access.
 
 `config validate`, `controller launchagent doctor`.
 
-### `config status` and `config draft`
+### `config status`, `config draft`, and `config rollback`
 
 **Purpose**
 
@@ -644,6 +650,10 @@ agentctl config draft apply --draft-id <id> --revision <n> \
   --preview-digest <digest> --expected-generation-id <id> \
   --expected-digest <digest> <complete-requester-flags>
 agentctl config draft discard --draft-id <id> --revision <n> <complete-requester-flags>
+agentctl config rollback sources <complete-requester-flags>
+agentctl config rollback open --source-generation-id <id> \
+  --source-digest <digest> --expected-generation-id <id> \
+  --expected-digest <digest> <complete-requester-flags>
 ```
 
 `draft set` accepts exactly one of `--run-timeout`,
@@ -661,6 +671,23 @@ recomputes validation and preview from retained base bytes, checks exact
 generation/digest/preview authority, and returns the existing apply receipt plus
 convergence projection. Exact retries return the same edit revision or apply
 generation/receipt. Discard changes neither generation nor runtime state.
+
+`rollback sources` returns the exact current desired generation authority and a
+bounded sanitized eligible-source list. `rollback open` first reconciles any
+incomplete apply, proves the live file still matches desired authority, verifies
+the exact retained source, and opens revision 1 with source settings against the
+current desired base. An exact retry returns the same rollback draft; an active
+normal draft, another rollback source, stale source/base evidence, first-open
+pruning, malformed history, unsupported policy, unresolved apply, or external
+drift conflicts without replacement. Once creation has durably bound the typed
+settings, an exact retry still returns that active draft even if the source raw
+snapshot was pruned afterward. After open, use the ordinary `draft` commands.
+Editing preserves immutable source identity. A real apply creates one new
+current-schema generation whose parent is current desired and whose metadata
+records the rollback source. A same-digest rollback records a source-bound
+successful receipt and settled draft but creates no generation or restart need.
+The historical raw snapshot may be pruned after draft creation because the
+draft retains only typed scalar settings and sanitized source identity.
 
 If the desired baseline is older than schema 5, upgrade it through the bounded
 legacy-to-current transition before opening a draft. Preserve an applying or
@@ -683,7 +710,8 @@ files to troubleshoot a sanitized conflict.
 
 **Related commands**
 
-`config validate`, `config inspect`, `controller launchagent status`,
+`config validate`, `config inspect`, `config rollback sources`,
+`controller launchagent status`,
 `controller launchdaemon status`.
 
 ### `controller worker`

@@ -623,7 +623,8 @@ The resulting finite projection is
 `ready`, `restart_required`, `starting`, `stale`, `offline`, `unknown`, or
 `conflict`, separate from worker activity and capacity.
 
-The normal-change adapter adds one Controller-wide durable typed draft without
+The typed lifecycle adapter adds one Controller-wide durable normal or
+rollback-origin draft without
 adding another configuration transaction. Controller authorization happens
 before every draft lookup. Revision compare-and-swap plus the last closed edit
 digest provides exact lost-response replay, while a different edit at the same
@@ -635,15 +636,37 @@ exact retained base-generation raw bytes and deterministically materialize a
 schema-v5 candidate in memory. An unchanged projection returns the exact base
 bytes and reaches the generation service's same-digest no-op path.
 
+Rollback discovery authorizes before generation-history or raw-evidence reads
+and returns only the exact current desired authority plus bounded sanitized
+superseded sources. A safely committed source does not require an effective
+worker observation before a later apply supersedes it; when present, the
+effective observation must fall between commit and supersession. Apply-origin
+sources also require matching committed intent and successful receipt evidence,
+while a baseline source requires its matching adoption anchor. The configuration
+adapter strictly projects the nine scalar settings from retained schema versions
+1 through 5, including version-3
+singleton-to-heavy-capacity semantics, without resolving a historical external
+registry, reading credentials, or performing network or supervisor work. Draft
+creation rechecks source retention and current desired CAS in the same SQLite
+write transaction; a concurrent prune claim conflicts, while pruning may resume
+normally after the source identity and typed settings are durably bound.
+
 Validation returns only closed field IDs, finite reason codes, and severity.
 Semantic preview returns allowlisted boolean, duration, and bounded-integer
 before/after values plus finite restart, convergence-fence, frozen-run, and
 capacity-drain impacts. Its digest binds draft/revision, base and candidate
-digests, semantic changes, impacts, and current configuration authority. Apply
+digests, immutable rollback source when present, semantic changes, impacts, and
+current configuration authority. Apply
 reauthorizes and recomputes all of that evidence, marks the draft applying, and
 delegates to the existing configuration apply service. The existing
-`apply_configuration` receipt remains the sole apply operation identity;
-response-loss and restart replay reconcile the same generation rather than
+`apply_configuration` receipt remains the sole apply operation identity. Normal
+apply retains its pre-v33 private identity for migration replay, while a
+rollback anchor distinguishes every exact rollback source
+while its request digest remains the candidate digest. A real rollback records
+the immutable source on the new applied generation before live replacement; a
+same-digest rollback creates no generation but retains source-bound draft and
+receipt evidence. Historical non-editable authority is never materialized.
+Response-loss and restart replay reconcile the same generation rather than
 creating another. Apply never starts, stops, or restarts a worker.
 
 Every production new-admission path uses this application-owned convergence
@@ -1069,7 +1092,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 32; migration history is code, not a
+inspection. The current schema is version 33; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees
@@ -1147,6 +1170,8 @@ controller-scope apply/history authority; a repository-only actor is never
 elevated. Existing legacy run/query authorization is unchanged. Its same-byte
 validation seam is reused by baseline,
 live reread, retained desired evidence, and current-schema apply validation.
+Its separate historical scalar projection reads only the strict in-memory
+document shape needed for rollback and never traverses legacy authority paths.
 `internal/adapters/configuration` owns the baseline-binding intent, trusted
 locator, immutable raw generation files, retention, captured-parent exchange
 evidence, and atomic live replacement; it does not expose a raw history API.
@@ -1398,8 +1423,8 @@ around it. The principal table groups are:
 | `automatic_retry_schedules`, `operator_attention_outbox` | Restart-stable retry policy and immutable versioned operator-attention events; legacy delivery fields are storage-only evidence |
 | `operator_actions` | Action-specific authenticated recovery intent and legacy validated/applied/observed provenance, separate from automatic workflow evidence |
 | `operation_receipts` | Scope-neutral accepted/applied/observed operation identity, outcome, and sanitized result evidence; legacy operator actions are backfilled and mirrored here |
-| configuration generation, authority, apply-intent, and convergence tables | Immutable desired/effective metadata, one Controller-wide CAS transaction, reconciliation state, and meaningful sanitized transitions; raw bytes remain outside SQLite |
-| `configuration_drafts` | At most one active Controller-wide typed draft, revision/edit replay authority, sanitized validation/preview evidence, and generation/receipt settlement; no raw candidate, path, identity, or credential authority |
+| configuration generation, authority, apply-intent, and convergence tables | Immutable desired/effective metadata, one Controller-wide CAS transaction, reconciliation state, optional immutable rollback-source identity, and meaningful sanitized transitions; raw bytes remain outside SQLite |
+| `configuration_drafts` | At most one active Controller-wide normal or rollback-origin typed draft, revision/edit replay authority, immutable rollback source when applicable, sanitized validation/preview evidence, and generation/receipt settlement; no raw candidate, path, identity, or credential authority |
 
 ### Current state versus evidence
 
@@ -1508,8 +1533,8 @@ resolution is not approval, and an approval for an old head is stale.
 - Linear admission and completion observation are implemented, but completion
   remains external automation/human authority.
 - GitHub writes require a narrowly permissioned selected-repository App.
-- Forward rollback and explicit drift recovery, transactional
-  repository onboarding, the local TUI, optional HTTP/Web adapters,
+- Explicit external-drift recovery, transactional repository onboarding, the
+  local TUI, optional HTTP/Web adapters,
   notification transport, Hermes runtime integration, public API, webhooks,
   and multi-tenant authorization are not implemented.
 - External live E2E acceptance remains restricted to isolated fixture

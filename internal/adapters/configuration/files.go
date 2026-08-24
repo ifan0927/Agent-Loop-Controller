@@ -133,6 +133,22 @@ func (f *Files) ProjectEditable(payload []byte) (application.ConfigurationEditab
 	}, nil
 }
 
+func (f *Files) ProjectHistoricalEditable(payload []byte, schemaVersion int) (application.ConfigurationEditableSettings, error) {
+	settings, err := bootstrap.ProjectHistoricalEditableSettings(payload, schemaVersion)
+	if err != nil {
+		return application.ConfigurationEditableSettings{}, err
+	}
+	return application.ConfigurationEditableSettings{
+		RunTimeout: application.ConfigurationDuration(settings.RunTimeout),
+		Admission: application.ConfigurationEditableAdmissionSettings{
+			Enabled: settings.AdmissionEnabled, PollInterval: application.ConfigurationDuration(settings.AdmissionPollInterval),
+			DeliveryPollInterval: application.ConfigurationDuration(settings.DeliveryPollInterval), SchedulerLeaseTTL: application.ConfigurationDuration(settings.SchedulerLeaseTTL),
+			SchedulerLeaseRenewalInterval: application.ConfigurationDuration(settings.SchedulerLeaseRenewalInterval), MaxCandidates: settings.AdmissionMaxCandidates,
+			MaxPages: settings.AdmissionMaxPages, HeavyCapacity: settings.AdmissionHeavyCapacity,
+		},
+	}, nil
+}
+
 func (f *Files) MaterializeEditable(base []byte, settings application.ConfigurationEditableSettings) ([]byte, error) {
 	return bootstrap.MaterializeEditableSettings(f.configPath, base, bootstrap.EditableSettings{
 		RunTimeout:                    settings.RunTimeout.Duration(),

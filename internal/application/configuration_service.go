@@ -188,6 +188,11 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 	if len(command.Payload) > 256<<10 {
 		return ConfigurationApplyResult{}, serviceError(ErrorInvalidInput, "configuration candidate is too large", nil)
 	}
+	provenance, ok := normalizedConfigurationApplyProvenance(command.Provenance)
+	if !ok {
+		return ConfigurationApplyResult{}, serviceError(ErrorInvalidInput, "configuration apply provenance is invalid", nil)
+	}
+	command.Provenance = provenance
 	// An exact settled receipt is evidence that this requester was authorized
 	// when the effect was accepted. This read-only path preserves response-loss
 	// replay even when that effect changed the configured operator.
@@ -230,7 +235,7 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 	if err != nil {
 		return ConfigurationApplyResult{}, serviceError(ErrorInvalidInput, "configuration candidate is invalid", nil)
 	}
-	proposedReceipt := configurationApplyReceiptFor(command.ExpectedGenerationID, command.ExpectedDigest, configured, scopes, candidate, s.now().UTC())
+	proposedReceipt := configurationApplyReceiptFor(command.ExpectedGenerationID, command.ExpectedDigest, configured, scopes, candidate, provenance, s.now().UTC())
 	if replay, replayErr := s.store.GetAuthorizedOperationReceipt(ctx, proposedReceipt.OperationID, scopes); replayErr == nil {
 		generations, listErr := s.store.ListConfigurationGenerations(ctx)
 		if listErr != nil {
@@ -256,7 +261,7 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 		if !bytes.Equal(command.Payload, livePayload) {
 			return ConfigurationApplyResult{}, serviceError(ErrorConflict, "configuration digest evidence conflicts", nil)
 		}
-		return s.recordNoOp(ctx, authority, configured, scopes, candidate)
+		return s.recordNoOp(ctx, authority, configured, scopes, candidate, provenance)
 	}
 	runs, err := s.store.ListNonterminalRuns(ctx)
 	if err != nil {
@@ -285,7 +290,7 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 	if err := s.files.RetainRaw(candidate.Digest, command.Payload); err != nil {
 		return ConfigurationApplyResult{}, serviceError(ErrorInternal, "configuration target evidence could not be retained", nil)
 	}
-	generation, acceptedReceipt, created, err := s.store.BeginConfigurationApply(ctx, ConfigurationApplyAcceptance{ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Candidate: candidate, Requester: configured.identity, Receipt: receipt, AcceptedAt: receipt.AcceptedAt})
+	generation, acceptedReceipt, created, err := s.store.BeginConfigurationApply(ctx, ConfigurationApplyAcceptance{ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Candidate: candidate, Requester: configured.identity, Receipt: receipt, Provenance: provenance, AcceptedAt: receipt.AcceptedAt})
 	if err != nil {
 		s.removeUnreferencedRaw(ctx, candidate.Digest)
 		return ConfigurationApplyResult{}, classifyConfigurationStoreError(err)
@@ -403,7 +408,11 @@ func (s *ConfigurationService) configurationReplay(ctx context.Context, command 
 	if err != nil {
 		return ConfigurationApplyResult{}, false
 	}
-	proposed := configurationApplyReceiptFor(command.ExpectedGenerationID, command.ExpectedDigest, configured, scopes, candidate, s.now().UTC())
+	provenance, ok := normalizedConfigurationApplyProvenance(command.Provenance)
+	if !ok {
+		return ConfigurationApplyResult{}, false
+	}
+	proposed := configurationApplyReceiptFor(command.ExpectedGenerationID, command.ExpectedDigest, configured, scopes, candidate, provenance, s.now().UTC())
 	receipt, err := s.store.GetAuthorizedOperationReceipt(ctx, proposed.OperationID, scopes)
 	if err != nil {
 		return ConfigurationApplyResult{}, false
@@ -432,8 +441,8 @@ func configurationReceiptReplay(receipt OperationReceipt, generations []Configur
 	return ConfigurationApplyResult{}, false
 }
 
-func (s *ConfigurationService) recordNoOp(ctx context.Context, authority ConfigurationAuthority, requester ConfiguredRequester, scopes AuthorizedScopeSet, candidate ValidatedConfigurationCandidate) (ConfigurationApplyResult, error) {
-	receipt := configurationApplyReceipt(authority, requester, scopes, candidate, s.now().UTC())
+func (s *ConfigurationService) recordNoOp(ctx context.Context, authority ConfigurationAuthority, requester ConfiguredRequester, scopes AuthorizedScopeSet, candidate ValidatedConfigurationCandidate, provenance ConfigurationApplyProvenance) (ConfigurationApplyResult, error) {
+	receipt := configurationApplyReceipt(authority, requester, scopes, candidate, provenance, s.now().UTC())
 	settledAt := s.now().UTC()
 	current, settled, _, err := s.store.RecordConfigurationNoOp(ctx, ConfigurationNoOpSettlement{ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Receipt: receipt, EvidenceDigest: configurationDigest("configuration-noop", authority.Desired.Digest), ResultDigest: configurationDigest("configuration-noop-result", authority.Desired.Digest), SettledAt: settledAt})
 	if err != nil {
@@ -622,14 +631,32 @@ func configurationGenerationOperator(generation ConfigurationGeneration) (domain
 	return domain.GitHubUserIdentity{}, false
 }
 
-func configurationApplyReceipt(authority ConfigurationAuthority, requester ConfiguredRequester, scopes AuthorizedScopeSet, candidate ValidatedConfigurationCandidate, at time.Time) OperationReceipt {
-	return configurationApplyReceiptFor(authority.Desired.GenerationID, authority.Desired.Digest, requester, scopes, candidate, at)
+func configurationApplyReceipt(authority ConfigurationAuthority, requester ConfiguredRequester, scopes AuthorizedScopeSet, candidate ValidatedConfigurationCandidate, provenance ConfigurationApplyProvenance, at time.Time) OperationReceipt {
+	return configurationApplyReceiptFor(authority.Desired.GenerationID, authority.Desired.Digest, requester, scopes, candidate, provenance, at)
 }
 
-func configurationApplyReceiptFor(expectedGenerationID int64, expectedDigest string, requester ConfiguredRequester, scopes AuthorizedScopeSet, candidate ValidatedConfigurationCandidate, at time.Time) OperationReceipt {
+func configurationApplyReceiptFor(expectedGenerationID int64, expectedDigest string, requester ConfiguredRequester, scopes AuthorizedScopeSet, candidate ValidatedConfigurationCandidate, provenance ConfigurationApplyProvenance, at time.Time) OperationReceipt {
 	target, _ := scopes.ControllerOperationTarget()
+	provenance, _ = normalizedConfigurationApplyProvenance(provenance)
 	anchor := configurationDigest("configuration-apply", strconv.FormatInt(expectedGenerationID, 10), expectedDigest, candidate.Digest)
+	if provenance.Kind == ConfigurationApplyRollback {
+		anchor = configurationDigest("configuration-apply-v2", strconv.FormatInt(expectedGenerationID, 10), expectedDigest, candidate.Digest, string(provenance.Kind), strconv.FormatInt(provenance.RollbackSourceGenerationID, 10), provenance.RollbackSourceDigest)
+	}
 	return NewOperationReceipt(OperationReceiptInput{OperationType: OperationApplyConfiguration, Scope: ScopeController, TargetID: target.TargetID, Requester: requester.identity, RequestDigest: candidate.Digest, ExpectedAuthorityDigest: expectedDigest, OperationAnchorDigest: anchor, TargetBindingDigest: target.TargetBindingDigest, AcceptedAt: at})
+}
+
+func normalizedConfigurationApplyProvenance(value ConfigurationApplyProvenance) (ConfigurationApplyProvenance, bool) {
+	if value.Kind == "" {
+		value.Kind = ConfigurationApplyNormal
+	}
+	switch value.Kind {
+	case ConfigurationApplyNormal:
+		return value, value.RollbackSourceGenerationID == 0 && value.RollbackSourceDigest == ""
+	case ConfigurationApplyRollback:
+		return value, value.RollbackSourceGenerationID > 0 && validAuthorityDigest(value.RollbackSourceDigest)
+	default:
+		return ConfigurationApplyProvenance{}, false
+	}
 }
 
 func classifyConfigurationStoreError(err error) error {

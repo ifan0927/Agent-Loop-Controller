@@ -429,6 +429,167 @@ func ProjectEditableSettings(canonicalPath string, data []byte) (EditableSetting
 	return settings, nil
 }
 
+// ProjectHistoricalEditableSettings strictly extracts only the nine managed
+// scalar settings from a retained schema-version 1 through 5 document. It does
+// not resolve legacy registries, inspect credential paths, or validate any
+// external authority.
+func ProjectHistoricalEditableSettings(data []byte, expectedVersion int) (EditableSettings, error) {
+	if len(data) == 0 || len(data) > 256<<10 || expectedVersion < LegacyVersion || expectedVersion > CurrentVersion {
+		return EditableSettings{}, invalid("historical configuration settings are invalid")
+	}
+	if rejectDuplicateJSONKeys(data) != nil {
+		return EditableSettings{}, invalid("historical configuration settings are invalid")
+	}
+	raw, admission, err := decodeEditableDocument(data)
+	if err != nil || raw.Version != expectedVersion {
+		return EditableSettings{}, invalid("historical configuration settings are invalid")
+	}
+	settings := EditableSettings{
+		AdmissionEnabled: false, AdmissionPollInterval: 5 * time.Minute,
+		DeliveryPollInterval: minimumDeliveryPollInterval, SchedulerLeaseTTL: time.Minute,
+		SchedulerLeaseRenewalInterval: 20 * time.Second, AdmissionMaxCandidates: 20,
+		AdmissionMaxPages: 5, AdmissionHeavyCapacity: 2,
+	}
+	settings.RunTimeout, err = time.ParseDuration(raw.Controller.RunTimeout)
+	if err != nil || settings.RunTimeout <= 0 || settings.RunTimeout > 2*time.Hour {
+		return EditableSettings{}, invalid("historical configuration settings are invalid")
+	}
+	if expectedVersion == LegacyVersion || expectedVersion == VersionTwo {
+		if len(raw.Automation) != 0 {
+			return EditableSettings{}, invalid("historical configuration settings are invalid")
+		}
+		return settings, nil
+	}
+	if len(raw.Automation) == 0 {
+		return settings, nil
+	}
+	var automation automationFile
+	if decodeStrictObject(raw.Automation, &automation) != nil || len(automation.LinearTodoAdmission) == 0 || admission.Enabled == nil {
+		return EditableSettings{}, invalid("historical configuration settings are invalid")
+	}
+	settings.AdmissionEnabled = *admission.Enabled
+	if !settings.AdmissionEnabled {
+		return settings, nil
+	}
+	if admission.PollInterval == "" || admission.SchedulerLeaseTTL == "" || admission.SchedulerLeaseRenewalInterval == "" || admission.MaxCandidates == 0 || admission.MaxPages == 0 {
+		return EditableSettings{}, invalid("historical configuration settings are invalid")
+	}
+	if expectedVersion == VersionThree {
+		settings.AdmissionHeavyCapacity = 1
+	}
+	if admission.PollInterval != "" {
+		settings.AdmissionPollInterval, err = time.ParseDuration(admission.PollInterval)
+		if err != nil || settings.AdmissionPollInterval < time.Minute || settings.AdmissionPollInterval > time.Hour {
+			return EditableSettings{}, invalid("historical configuration settings are invalid")
+		}
+	}
+	if len(admission.DeliveryPollInterval) != 0 {
+		var value string
+		if json.Unmarshal(admission.DeliveryPollInterval, &value) != nil {
+			return EditableSettings{}, invalid("historical configuration settings are invalid")
+		}
+		settings.DeliveryPollInterval, err = time.ParseDuration(value)
+		if err != nil || settings.DeliveryPollInterval < minimumDeliveryPollInterval || settings.DeliveryPollInterval > maximumDeliveryPollInterval {
+			return EditableSettings{}, invalid("historical configuration settings are invalid")
+		}
+	}
+	if admission.SchedulerLeaseTTL != "" {
+		settings.SchedulerLeaseTTL, err = time.ParseDuration(admission.SchedulerLeaseTTL)
+		if err != nil || settings.SchedulerLeaseTTL < 30*time.Second || settings.SchedulerLeaseTTL > 10*time.Minute {
+			return EditableSettings{}, invalid("historical configuration settings are invalid")
+		}
+	}
+	if admission.SchedulerLeaseRenewalInterval != "" {
+		settings.SchedulerLeaseRenewalInterval, err = time.ParseDuration(admission.SchedulerLeaseRenewalInterval)
+		if err != nil || settings.SchedulerLeaseRenewalInterval < 5*time.Second || settings.SchedulerLeaseRenewalInterval > settings.SchedulerLeaseTTL/2 {
+			return EditableSettings{}, invalid("historical configuration settings are invalid")
+		}
+	}
+	if admission.MaxCandidates != 0 {
+		settings.AdmissionMaxCandidates = admission.MaxCandidates
+	}
+	if admission.MaxPages != 0 {
+		settings.AdmissionMaxPages = admission.MaxPages
+	}
+	if settings.AdmissionMaxCandidates < 1 || settings.AdmissionMaxCandidates > 100 || settings.AdmissionMaxPages < 1 || settings.AdmissionMaxPages > 20 {
+		return EditableSettings{}, invalid("historical configuration settings are invalid")
+	}
+	if expectedVersion == VersionThree {
+		var maxActiveRuns int
+		if len(admission.HeavyCapacity) != 0 || len(admission.MaxActiveRuns) != 0 && (string(admission.MaxActiveRuns) == "null" || json.Unmarshal(admission.MaxActiveRuns, &maxActiveRuns) != nil || maxActiveRuns != 1) {
+			return EditableSettings{}, invalid("historical configuration settings are invalid")
+		}
+		if settings.AdmissionEnabled && len(admission.MaxActiveRuns) == 0 {
+			return EditableSettings{}, invalid("historical configuration settings are invalid")
+		}
+	} else {
+		if len(admission.MaxActiveRuns) != 0 {
+			return EditableSettings{}, invalid("historical configuration settings are invalid")
+		}
+		if len(admission.HeavyCapacity) != 0 {
+			if string(admission.HeavyCapacity) == "null" || json.Unmarshal(admission.HeavyCapacity, &settings.AdmissionHeavyCapacity) != nil || settings.AdmissionHeavyCapacity < 1 || settings.AdmissionHeavyCapacity > 32 {
+				return EditableSettings{}, invalid("historical configuration settings are invalid")
+			}
+		}
+	}
+	return settings, nil
+}
+
+func rejectDuplicateJSONKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	var readValue func() error
+	readValue = func() error {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		delimiter, ok := token.(json.Delim)
+		if !ok {
+			return nil
+		}
+		switch delimiter {
+		case '{':
+			seen := map[string]struct{}{}
+			for decoder.More() {
+				keyToken, err := decoder.Token()
+				if err != nil {
+					return err
+				}
+				key, ok := keyToken.(string)
+				if !ok {
+					return errors.New("JSON object key is invalid")
+				}
+				if _, exists := seen[key]; exists {
+					return errors.New("JSON object key is duplicated")
+				}
+				seen[key] = struct{}{}
+				if err := readValue(); err != nil {
+					return err
+				}
+			}
+			_, err = decoder.Token()
+			return err
+		case '[':
+			for decoder.More() {
+				if err := readValue(); err != nil {
+					return err
+				}
+			}
+			_, err = decoder.Token()
+			return err
+		default:
+			return errors.New("JSON delimiter is invalid")
+		}
+	}
+	if err := readValue(); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return errors.New("JSON contains trailing values")
+	}
+	return nil
+}
+
 // MaterializeEditableSettings rewrites only the allowlisted leaves in memory.
 // If the projection is unchanged it returns the exact retained bytes so the
 // generation service preserves its same-digest no-op contract.
