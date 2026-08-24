@@ -49,6 +49,59 @@ func New(cfg Config, clock Clock, observer Observer) (*Client, error) {
 	}
 	return &Client{cfg: cfg, http: &http.Client{Timeout: cfg.HTTPTimeout}, clock: clock, observe: observer, repo: domain.RepositoryIdentity{ID: cfg.RepositoryID, Owner: cfg.RepositoryOwner, Name: cfg.RepositoryName}}, nil
 }
+
+// ObserveRepositoryGitHub performs only bounded authentication and repository
+// reads. It never creates or changes repository resources, labels, branches,
+// pull requests, reviews, or permissions.
+func (c *Client) ObserveRepositoryGitHub(ctx context.Context, profile application.LocalRepository) ([2]domain.RepositoryDimensionResult, error) {
+	c.opMu.Lock()
+	defer c.opMu.Unlock()
+	c.budgetMu.Lock()
+	c.requestCount = 0
+	c.budgetMu.Unlock()
+	now := c.clock.Now().UTC()
+	repository := c.repositoryReadinessResult(domain.RepositoryReady, "github_repository_ready", "", profile, now)
+	app := c.githubAppReadinessResult(domain.RepositoryReady, "github_app_ready", profile, now)
+	if profile.GitHubAppID != c.cfg.AppID || profile.GitHubInstallationID != c.cfg.InstallationID || profile.ExpectedRepositoryID != c.cfg.RepositoryID || !strings.EqualFold(profile.CanonicalRepository, c.cfg.RepositoryOwner+"/"+c.cfg.RepositoryName) {
+		repository = c.repositoryReadinessResult(domain.RepositoryConflict, "github_repository_authority_conflict", "", profile, now)
+		app = c.githubAppReadinessResult(domain.RepositoryConflict, "github_app_authority_conflict", profile, now)
+		return [2]domain.RepositoryDimensionResult{repository, app}, nil
+	}
+	if err := c.ensureToken(ctx, false); err != nil {
+		repository = c.repositoryReadinessResult(domain.RepositoryUnknown, "github_observation_unavailable", "", profile, now)
+		app = c.githubAppReadinessResult(domain.RepositoryUnknown, "github_app_observation_unavailable", profile, now)
+		return [2]domain.RepositoryDimensionResult{repository, app}, nil
+	}
+	var raw struct {
+		ID     int64  `json:"id"`
+		NodeID string `json:"node_id"`
+		Name   string `json:"name"`
+		Owner  struct {
+			Login string `json:"login"`
+		} `json:"owner"`
+	}
+	path := fmt.Sprintf("/repos/%s/%s", url.PathEscape(c.cfg.RepositoryOwner), url.PathEscape(c.cfg.RepositoryName))
+	if err := c.rest(ctx, "repository_readiness", "GET", path, nil, &raw, true); err != nil {
+		repository = c.repositoryReadinessResult(domain.RepositoryUnknown, "github_observation_unavailable", "", profile, now)
+		return [2]domain.RepositoryDimensionResult{repository, app}, nil
+	}
+	identity := fmt.Sprintf("%d:%s", raw.ID, raw.NodeID)
+	if raw.ID != c.cfg.RepositoryID || raw.NodeID == "" || !strings.EqualFold(raw.Owner.Login, c.cfg.RepositoryOwner) || raw.Name != c.cfg.RepositoryName {
+		repository = c.repositoryReadinessResult(domain.RepositoryConflict, "github_repository_identity_conflict", identity, profile, now)
+	} else {
+		repository = c.repositoryReadinessResult(domain.RepositoryReady, "github_repository_ready", identity, profile, now)
+	}
+	return [2]domain.RepositoryDimensionResult{repository, app}, nil
+}
+
+func (c *Client) repositoryReadinessResult(status domain.RepositoryReadinessStatus, reason, identity string, profile application.LocalRepository, at time.Time) domain.RepositoryDimensionResult {
+	return domain.RepositoryDimensionResult{Dimension: domain.ReadinessGitHubRepository, Status: status, ReasonCode: reason, Identity: identity, EvidenceDigest: application.ConfigurationEvidenceDigest("repository-github-readiness-v1", profile.ProfileDigest, profile.RepositoryBindingDigest, string(status), reason, identity), ObservedAt: at}
+}
+
+func (c *Client) githubAppReadinessResult(status domain.RepositoryReadinessStatus, reason string, profile application.LocalRepository, at time.Time) domain.RepositoryDimensionResult {
+	identity := fmt.Sprintf("%d:%d", c.cfg.AppID, c.cfg.InstallationID)
+	return domain.RepositoryDimensionResult{Dimension: domain.ReadinessGitHubApp, Status: status, ReasonCode: reason, Identity: identity, EvidenceDigest: application.ConfigurationEvidenceDigest("repository-github-app-readiness-v1", profile.ProfileDigest, profile.RepositoryBindingDigest, string(status), reason, identity, c.permissionsDigest), ObservedAt: at}
+}
 func (c *Client) Read(ctx context.Context, pr int64, expectedHead string) (domain.GitHubReadEvidence, error) {
 	return c.read(ctx, pr, expectedHead, nil)
 }

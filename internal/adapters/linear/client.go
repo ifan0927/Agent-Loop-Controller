@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
 const issueQuery = `query ControllerIssue($identifier: String!, $after: String, $first: Int!) {
@@ -28,6 +29,13 @@ const issueQuery = `query ControllerIssue($identifier: String!, $after: String, 
       nodes { id name }
       pageInfo { hasNextPage endCursor }
     }
+  }
+}`
+
+const repositoryLabelQuery = `query ControllerRepositoryLabel($teamKey: String!, $label: String!, $after: String, $first: Int!) {
+  issueLabels(filter: { team: { key: { eq: $teamKey } }, name: { eq: $label } }, first: $first, after: $after) {
+    nodes { id name team { key } }
+    pageInfo { hasNextPage endCursor }
   }
 }`
 
@@ -58,6 +66,100 @@ func New(cfg Config, credentials CredentialSource, clock Clock) (*Client, error)
 		clock = RealClock{}
 	}
 	return &Client{cfg: cfg, credentials: credentials, http: &http.Client{Timeout: cfg.HTTPTimeout}, clock: clock}, nil
+}
+
+func (c *Client) ObserveRepositoryLinear(ctx context.Context, profile application.LocalRepository) (applicationResult domain.RepositoryDimensionResult, err error) {
+	now := c.clock.Now().UTC()
+	result := func(status domain.RepositoryReadinessStatus, reason, identity string) domain.RepositoryDimensionResult {
+		return domain.RepositoryDimensionResult{Dimension: domain.ReadinessLinearLabel, Status: status, ReasonCode: reason, Identity: identity, EvidenceDigest: application.ConfigurationEvidenceDigest("repository-linear-readiness-v1", profile.ProfileDigest, profile.RepositoryBindingDigest, string(status), reason, identity), ObservedAt: now}
+	}
+	if strings.TrimSpace(profile.LinearLabel) == "" {
+		return result(domain.RepositoryNotReady, "linear_label_missing", ""), nil
+	}
+	token, resolveErr := c.credentials.Resolve(ctx, c.cfg.CredentialSourceRef)
+	if resolveErr != nil || strings.TrimSpace(token) == "" {
+		return result(domain.RepositoryUnknown, "linear_observation_unavailable", ""), nil
+	}
+	defer clearString(&token)
+	var after *string
+	identities := map[string]struct{}{}
+	for page := 0; page < c.cfg.MaxLabelPages; page++ {
+		payload, encodeErr := json.Marshal(struct {
+			Query     string `json:"query"`
+			Variables struct {
+				TeamKey string  `json:"teamKey"`
+				Label   string  `json:"label"`
+				After   *string `json:"after"`
+				First   int     `json:"first"`
+			} `json:"variables"`
+		}{Query: repositoryLabelQuery, Variables: struct {
+			TeamKey string  `json:"teamKey"`
+			Label   string  `json:"label"`
+			After   *string `json:"after"`
+			First   int     `json:"first"`
+		}{c.cfg.TeamKey, profile.LinearLabel, after, c.cfg.LabelPageSize}})
+		if encodeErr != nil {
+			return result(domain.RepositoryUnknown, "linear_observation_unavailable", ""), nil
+		}
+		request, requestErr := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.APIURL, bytes.NewReader(payload))
+		if requestErr != nil {
+			return result(domain.RepositoryUnknown, "linear_observation_unavailable", ""), nil
+		}
+		request.Header.Set("Accept", "application/json")
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", c.authorizationValue(token))
+		response, requestErr := c.http.Do(request)
+		if requestErr != nil {
+			return result(domain.RepositoryUnknown, "linear_observation_unavailable", ""), nil
+		}
+		body, readErr := io.ReadAll(io.LimitReader(response.Body, c.cfg.MaxResponseBytes+1))
+		response.Body.Close()
+		if readErr != nil || response.StatusCode < 200 || response.StatusCode >= 300 || int64(len(body)) > c.cfg.MaxResponseBytes {
+			return result(domain.RepositoryUnknown, "linear_observation_unavailable", ""), nil
+		}
+		var decoded struct {
+			Data struct {
+				IssueLabels struct {
+					Nodes []struct {
+						ID, Name string
+						Team     struct{ Key string } `json:"team"`
+					} `json:"nodes"`
+					PageInfo struct {
+						HasNextPage bool   `json:"hasNextPage"`
+						EndCursor   string `json:"endCursor"`
+					} `json:"pageInfo"`
+				} `json:"issueLabels"`
+			} `json:"data"`
+			Errors []json.RawMessage `json:"errors"`
+		}
+		if json.Unmarshal(body, &decoded) != nil || len(decoded.Errors) != 0 {
+			return result(domain.RepositoryUnknown, "linear_observation_unavailable", ""), nil
+		}
+		for _, label := range decoded.Data.IssueLabels.Nodes {
+			if label.ID == "" || label.Name != profile.LinearLabel || label.Team.Key != c.cfg.TeamKey {
+				return result(domain.RepositoryConflict, "linear_label_identity_conflict", label.ID), nil
+			}
+			identities[label.ID] = struct{}{}
+		}
+		if !decoded.Data.IssueLabels.PageInfo.HasNextPage {
+			break
+		}
+		if page+1 == c.cfg.MaxLabelPages || decoded.Data.IssueLabels.PageInfo.EndCursor == "" {
+			return result(domain.RepositoryUnknown, "linear_label_pagination_incomplete", ""), nil
+		}
+		cursor := decoded.Data.IssueLabels.PageInfo.EndCursor
+		after = &cursor
+	}
+	if len(identities) == 0 {
+		return result(domain.RepositoryNotReady, "linear_label_not_found", ""), nil
+	}
+	if len(identities) != 1 {
+		return result(domain.RepositoryConflict, "linear_label_identity_conflict", ""), nil
+	}
+	for identity := range identities {
+		return result(domain.RepositoryReady, "linear_label_ready", identity), nil
+	}
+	return result(domain.RepositoryUnknown, "linear_observation_unavailable", ""), nil
 }
 
 func (c *Client) ReadIssue(ctx context.Context, identifier string) (application.LinearTaskSource, []application.LinearRequestObservation, error) {

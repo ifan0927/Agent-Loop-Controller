@@ -159,6 +159,9 @@ func (s *Store) ReserveLinearTodoAdmission(ctx context.Context, reservation appl
 	if err := requireConfigurationAdmissionAuthorityTx(ctx, tx, reservation.ConfigurationAuthority); err != nil {
 		return application.Run{}, application.LinearTodoAdmissionJournal{}, false, err
 	}
+	if err := requireRepositoryAdmissionAuthorityTx(ctx, tx, reservation.Input.Repository, reservation.Input.RepositoryAuthority); err != nil {
+		return application.Run{}, application.LinearTodoAdmissionJournal{}, false, err
+	}
 	if err := requireNoAdmissionJournalCorruption(ctx, tx); err != nil {
 		return application.Run{}, application.LinearTodoAdmissionJournal{}, false, err
 	}

@@ -39,6 +39,22 @@ func removeConfigurationV31(t *testing.T, db *sql.DB) {
 	}
 }
 
+func removeRepositoryLifecycleV35(t *testing.T, db *sql.DB) {
+	t.Helper()
+	for _, statement := range []string{
+		`DROP TABLE IF EXISTS repository_recheck_observations`,
+		`DROP TABLE IF EXISTS repository_recheck_attempts`,
+		`DROP TABLE IF EXISTS repository_readiness_dimensions`,
+		`DROP TABLE IF EXISTS repository_readiness_snapshots`,
+		`DROP TABLE IF EXISTS repository_lifecycles`,
+		`DROP TABLE IF EXISTS repository_lifecycle_baseline`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestConfigurationV31MigratesV30AndPreservesReceipts(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
 	legacy, err := openWithSupportedSchema(path, 30)

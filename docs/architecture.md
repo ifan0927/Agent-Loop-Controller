@@ -187,6 +187,41 @@ to complete or classify it without repeating a proven mutation. The authorized
 single-receipt query returns the same sanitized `not_found` result for missing
 and unauthorized targets and reads only persisted Controller state.
 
+### Repository lifecycle and readiness
+
+Every configured repository has Controller-owned lifecycle intent independent
+of profile configuration: `enabled` or `disabled`. The first schema-35 managed
+open adopts exactly one durable baseline and preserves configured repositories
+as enabled. It does not infer operational readiness from historical runs, so
+new admission remains fenced; each initial snapshot exposes all dimensions as
+`unknown` with `initial_recheck_required`.
+
+A recheck is a receipt-backed read-only observation operation. It records the
+exact profile, lifecycle version, configuration generation/digest/version, and
+one result for each closed dimension: profile configuration, configuration
+convergence, local checkout, base branch, GitHub repository, GitHub App, Linear
+label, and verifier policy. Statuses are `ready`, `not_ready`, `unknown`,
+`conflict`, and `not_applicable`; aggregate precedence is `conflict`,
+`unknown`, `not_ready`, then `ready`. Git checks use read-only argv and external
+observers persist normalized reason codes, stable identities where required,
+and digests rather than raw errors, paths, URLs, or credentials.
+
+Publication is one SQLite transaction that compares all frozen authority,
+publishes the complete snapshot, advances the lifecycle pointer, settles the
+attempt, and observes the operation receipt. Authority drift settles a
+conflict without partial publication. Restart reconciliation classifies an
+interrupted in-progress attempt as ambiguous; exact request replay returns its
+durable receipt instead of repeating an unproven observation.
+
+Enabling requires the latest complete effective snapshot to be ready and no
+recheck to be active. Disabling is always legal and does not alter existing run
+authority. Manual and automatic admission first receive a bounded eligibility
+token, then SQLite revalidates the lifecycle version, snapshot identity and
+digest, profile/binding identity, and configuration authority in the same
+transaction that creates or reserves the run. Any lifecycle, profile,
+configuration, readiness, or recheck change therefore fences new admission;
+already admitted runs continue under their frozen authority.
+
 ## 5. End-to-End Data Flow
 
 1. Admission reads Linear by identifier or scans a bounded eligible Todo set.

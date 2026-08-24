@@ -303,6 +303,7 @@ func newAutomaticWorkerRuntime(loaded bootstrap.Bootstrap, instanceID string) (a
 		AttentionProfile:     application.OperatorAttentionProfile{ID: "automation", Name: "linear-todo-admission"},
 		ExternalPollInterval: configured.DeliveryPollInterval,
 		AdmissionGate:        convergence,
+		RepositoryGate:       store,
 	})
 	if err != nil {
 		_ = store.Close()

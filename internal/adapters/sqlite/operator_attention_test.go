@@ -128,6 +128,7 @@ func TestOperatorAttentionMigrationPreservesLegacyEvidenceAndNormalizesEnvelope(
 		t.Fatal(err)
 	}
 	removeConfigurationV31(t, store.db)
+	removeRepositoryLifecycleV35(t, store.db)
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE operator_actions`); err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +146,7 @@ func TestOperatorAttentionMigrationPreservesLegacyEvidenceAndNormalizesEnvelope(
 			t.Fatal(err)
 		}
 	}
-	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (23,24,25,26,27,28,29,30,31,32,33,34)`); err != nil {
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (23,24,25,26,27,28,29,30,31,32,33,34,35)`); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 7, 15, 4, 0, 0, 0, time.UTC)
@@ -225,7 +226,8 @@ func TestOperatorAttentionMigrationAcceptsFrozenLegacyProfileContract(t *testing
 		}
 	}
 	removeConfigurationV31(t, store.db)
-	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (23,24,25,26,27,28,29,30,31,32,33,34)`); err != nil {
+	removeRepositoryLifecycleV35(t, store.db)
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (23,24,25,26,27,28,29,30,31,32,33,34,35)`); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 7, 15, 5, 0, 0, 0, time.UTC)

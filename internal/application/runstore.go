@@ -52,6 +52,7 @@ type Run struct {
 type CreateRunInput struct {
 	Run
 	ConfigurationAuthority ConfigurationAdmissionAuthority
+	RepositoryAuthority    RepositoryEligibilityToken
 }
 
 type Transition struct {

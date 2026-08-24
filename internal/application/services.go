@@ -1501,6 +1501,9 @@ func classifyServiceError(err error) error {
 	if errors.Is(err, ErrRunNotFound) {
 		return serviceError(ErrorNotFound, "run was not found", err)
 	}
+	if errors.Is(err, ErrRepositoryAdmissionConflict) {
+		return serviceError(ErrorConflict, "repository admission is fenced", err)
+	}
 	message := "application operation failed"
 	category := ErrorInternal
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

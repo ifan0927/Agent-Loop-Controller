@@ -69,6 +69,7 @@ type LocalStartInput struct {
 	RunRoot                string
 	WorktreeRoot           string
 	ConfigurationAuthority ConfigurationAdmissionAuthority
+	RepositoryAuthority    RepositoryEligibilityToken
 }
 
 type Decision struct {
@@ -316,7 +317,7 @@ func (c *LocalController) StartAuthorized(ctx context.Context, input LocalStartI
 	if err != nil {
 		return Run{}, err
 	}
-	run, created, err := c.store.CreateRun(ctx, CreateRunInput{Run: runInput, ConfigurationAuthority: input.ConfigurationAuthority})
+	run, created, err := c.store.CreateRun(ctx, CreateRunInput{Run: runInput, ConfigurationAuthority: input.ConfigurationAuthority, RepositoryAuthority: input.RepositoryAuthority})
 	if err != nil {
 		return Run{}, err
 	}
