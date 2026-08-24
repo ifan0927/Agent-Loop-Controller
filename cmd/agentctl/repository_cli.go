@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/bootstrap"
+	configurationadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/configuration"
 	gitadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/git"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/githubapp"
 	linearadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/linear"
@@ -17,7 +18,7 @@ import (
 
 func repositoryCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: agentctl repository <list|inspect|recheck|enable|disable> [options]")
+		return errors.New("usage: agentctl repository <list|inspect|recheck|enable|disable|remove> [options]")
 	}
 	switch args[0] {
 	case "list":
@@ -26,9 +27,160 @@ func repositoryCommand(args []string) error {
 		return repositoryInspect(args[1:])
 	case "recheck", "enable", "disable":
 		return repositoryMutate(args[0], args[1:])
+	case "remove":
+		return repositoryRemove(args[1:])
 	default:
-		return errors.New("usage: agentctl repository <list|inspect|recheck|enable|disable> [options]")
+		return errors.New("usage: agentctl repository <list|inspect|recheck|enable|disable|remove> [options]")
 	}
+}
+
+func repositoryRemove(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: agentctl repository remove <open|show|validate|preview|apply|discard> [options]")
+	}
+	switch args[0] {
+	case "open":
+		return repositoryRemoveOpen(args[1:])
+	case "show", "validate", "preview", "discard":
+		return repositoryRemoveRead(args[0], args[1:])
+	case "apply":
+		return repositoryRemoveApply(args[1:])
+	default:
+		return errors.New("usage: agentctl repository remove <open|show|validate|preview|apply|discard> [options]")
+	}
+}
+
+func repositoryRemoveOpen(args []string) error {
+	repository, remaining := splitLeadingRunID(args)
+	flags := flag.NewFlagSet("repository remove open", flag.ContinueOnError)
+	requester := addRequesterFlags(flags)
+	configPath := configPathFlag(flags)
+	if err := flags.Parse(remaining); err != nil {
+		return err
+	}
+	if repository == "" && flags.NArg() == 1 {
+		repository = flags.Arg(0)
+	}
+	if repository == "" || flags.NArg() != 0 || !requester.complete() {
+		return errors.New("one repository and complete requester identity are required")
+	}
+	service, store, err := composeRepositoryRemovalService(*configPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	draft, err := service.Open(context.Background(), application.RepositoryRemovalOpenCommand{Requester: requester.value(), Repository: repository})
+	if err != nil {
+		return err
+	}
+	return printJSON(draft)
+}
+
+func repositoryRemoveRead(command string, args []string) error {
+	flags := flag.NewFlagSet("repository remove "+command, flag.ContinueOnError)
+	requester := addRequesterFlags(flags)
+	configPath := configPathFlag(flags)
+	draftID := flags.String("draft-id", "", "repository removal draft ID")
+	revision := flags.Int64("revision", 0, "exact immutable removal draft revision")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || !requester.complete() || strings.TrimSpace(*draftID) == "" || *revision != 1 {
+		return errors.New("draft ID, revision 1, and complete requester identity are required")
+	}
+	service, store, err := composeRepositoryRemovalService(*configPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	ctx := context.Background()
+	common := application.RepositoryRemovalCommand{Requester: requester.value(), DraftID: *draftID, Revision: *revision}
+	var result any
+	switch command {
+	case "show":
+		result, err = service.Show(ctx, common)
+	case "validate":
+		result, err = service.Validate(ctx, common)
+	case "preview":
+		result, err = service.Preview(ctx, common)
+	case "discard":
+		result, err = service.Discard(ctx, common)
+	}
+	if err != nil {
+		return err
+	}
+	return printJSON(result)
+}
+
+func repositoryRemoveApply(args []string) error {
+	flags := flag.NewFlagSet("repository remove apply", flag.ContinueOnError)
+	requester := addRequesterFlags(flags)
+	configPath := configPathFlag(flags)
+	draftID := flags.String("draft-id", "", "repository removal draft ID")
+	revision := flags.Int64("revision", 0, "exact immutable removal draft revision")
+	previewDigest := flags.String("preview-digest", "", "exact semantic preview digest")
+	incarnationID := flags.String("incarnation-id", "", "exact repository incarnation identity")
+	lifecycleVersion := flags.Int64("lifecycle-version", 0, "exact repository lifecycle version")
+	profileID := flags.String("profile-id", "", "exact repository profile identity")
+	bindingDigest := flags.String("repository-binding-digest", "", "exact repository profile binding digest")
+	expectedGeneration := flags.Int64("expected-generation-id", 0, "expected desired configuration generation")
+	expectedDigest := flags.String("expected-digest", "", "expected desired configuration digest")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || !requester.complete() || strings.TrimSpace(*draftID) == "" || *revision != 1 || len(*previewDigest) != 64 || strings.TrimSpace(*incarnationID) == "" || *lifecycleVersion < 1 || strings.TrimSpace(*profileID) == "" || len(*bindingDigest) != 64 || *expectedGeneration < 1 || len(*expectedDigest) != 64 {
+		return errors.New("complete removal draft, preview, repository, lifecycle, profile, binding, generation, and requester authority are required")
+	}
+	service, store, err := composeRepositoryRemovalService(*configPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	result, err := service.Apply(context.Background(), application.RepositoryRemovalApplyCommand{Requester: requester.value(), DraftID: *draftID, Revision: *revision, PreviewDigest: *previewDigest, IncarnationID: *incarnationID, LifecycleVersion: *lifecycleVersion, ProfileID: *profileID, RepositoryBindingDigest: *bindingDigest, ExpectedGenerationID: *expectedGeneration, ExpectedDigest: *expectedDigest})
+	if err != nil {
+		return err
+	}
+	return printJSON(result)
+}
+
+func composeRepositoryRemovalService(configOverride string) (*application.RepositoryRemovalService, managedStore, error) {
+	path, err := resolveConfigPath(configOverride)
+	if err != nil {
+		return nil, nil, err
+	}
+	loaded, err := loadManagedConfiguration(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	store, err := openManagedConfigurationStore(loaded)
+	if err != nil {
+		return nil, nil, err
+	}
+	closeWith := func(err error) (*application.RepositoryRemovalService, managedStore, error) {
+		store.Close()
+		return nil, nil, err
+	}
+	authorizer, err := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: loaded.Controller.Operator})
+	if err != nil {
+		return closeWith(err)
+	}
+	repositories, err := application.NewRepositoryService(store, authorizer, loaded.Registry, application.RepositoryObservers{})
+	if err != nil {
+		return closeWith(err)
+	}
+	configuration, err := configuredConvergenceService(store, loaded, 0, false)
+	if err != nil {
+		return closeWith(err)
+	}
+	document, err := configurationadapter.NewFiles(loaded.Path)
+	if err != nil {
+		return closeWith(err)
+	}
+	service, err := application.NewRepositoryRemovalService(configuration, repositories, store, document)
+	if err != nil {
+		return closeWith(err)
+	}
+	return service, store, nil
 }
 
 func repositoryList(args []string) error {

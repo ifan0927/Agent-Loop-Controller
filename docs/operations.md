@@ -380,7 +380,7 @@ duration syntax such as `30s`, `15m`, and `24h`.
 
 ### Normal operator commands
 
-### `repository list`, `inspect`, `recheck`, `enable`, and `disable`
+### `repository list`, `inspect`, `recheck`, `enable`, `disable`, and `remove`
 
 **Purpose**
 
@@ -420,6 +420,42 @@ profile or configuration authority change requires a fresh recheck.
 If a recheck is interrupted, restart any managed command once to reconcile it
 to `ambiguous`, then use a new request ID for a deliberate fresh observation.
 Exact replay of a settled request returns its persisted receipt.
+
+Repository retirement uses an explicit immutable draft workflow:
+
+```sh
+agentctl repository remove open owner/repository <requester flags>
+agentctl repository remove show --draft-id <id> --revision 1 <requester flags>
+agentctl repository remove validate --draft-id <id> --revision 1 <requester flags>
+agentctl repository remove preview --draft-id <id> --revision 1 <requester flags>
+agentctl repository remove apply --draft-id <id> --revision 1 \
+  --preview-digest <digest> --incarnation-id <id> \
+  --lifecycle-version <version> --profile-id <id> \
+  --repository-binding-digest <digest> \
+  --expected-generation-id <generation> --expected-digest <digest> \
+  <requester flags>
+agentctl repository remove discard --draft-id <id> --revision 1 <requester flags>
+```
+
+Disable the repository first. `validate` returns typed guard results and next
+actions; `preview` is semantic and sanitized, names every preserved resource
+category, and never exposes raw configuration, paths, URLs, credential
+references, or secrets. Apply requires the exact preview, incarnation,
+lifecycle, profile/binding, and desired-generation authorities. There is no
+one-shot, force, raw-edit, or external-deletion form.
+
+After apply, restart or reload the worker and use `show` until its receipt is
+`observed`/`succeeded` with reason `retired`. The repository remains fenced and
+visible as removal-pending until that worker reports the exact new
+generation/digest. Current `list` and `inspect` then hide the retired target,
+while its operation receipt and all historical run/audit evidence remain.
+Local checkouts and managed directories, GitHub repositories/branches/PRs/App
+profiles, Linear labels/issues, credentials/references, and artifacts are not
+deleted. Removing the last repository is permitted only with automatic
+admission disabled; the worker then has no repository admission source. A
+configuration rollback does not restore the retired incarnation. Re-onboard
+the same canonical name through the future onboarding workflow to create a new
+incarnation; never edit SQLite or configuration files to revive the tombstone.
 
 **Related commands**
 

@@ -190,11 +190,12 @@ and unauthorized targets and reads only persisted Controller state.
 ### Repository lifecycle and readiness
 
 Every configured repository has Controller-owned lifecycle intent independent
-of profile configuration: `enabled` or `disabled`. The first schema-35 managed
-open adopts exactly one durable baseline and preserves configured repositories
-as enabled. It does not infer operational readiness from historical runs, so
-new admission remains fenced; each initial snapshot exposes all dimensions as
-`unknown` with `initial_recheck_required`.
+of profile configuration: `enabled` or `disabled`. A lifecycle row represents
+one immutable repository incarnation rather than the reusable canonical name.
+The first managed open adopts exactly one durable baseline and preserves
+configured repositories as enabled. It does not infer operational readiness
+from historical runs, so new admission remains fenced; each initial snapshot
+exposes all dimensions as `unknown` with `initial_recheck_required`.
 
 A recheck is a receipt-backed read-only observation operation. It records the
 exact profile, lifecycle version, configuration generation/digest/version, and
@@ -221,6 +222,29 @@ digest, profile/binding identity, and configuration authority in the same
 transaction that creates or reserves the run. Any lifecycle, profile,
 configuration, readiness, or recheck change therefore fences new admission;
 already admitted runs continue under their frozen authority.
+
+Removing a repository is a separate Controller-wide mutation lane, not a
+lifecycle toggle or a generic configuration edit. An immutable removal draft
+binds the exact disabled incarnation, profile/binding digests, lifecycle
+version, desired generation/digest, and configuration authority version.
+Validation fails closed while any run, onboarding or repository operation,
+slot, execution lease, heavy permit, scheduling ownership, cleanup/source-sync
+residue, configuration mutation/recovery, drift, or desired/effective/live
+convergence conflict remains. Removing the final profile additionally requires
+automatic admission to be disabled.
+
+Apply atomically persists a `remove_repository` accepted receipt and removal
+intent before delegating the exact one-profile candidate to the existing
+configuration generation service. The incarnation remains current but fenced
+in `removal_pending_convergence` after file publication. Only a fresh worker
+observation of the exact resulting generation/digest atomically marks the
+intent observed, settles the receipt, and tombstones that incarnation. Current
+repository collections hide tombstones; historical runs, snapshots, attempts,
+receipts, configuration generations, audit evidence, local paths, credentials,
+and external GitHub/Linear resources are never deleted by retirement. A later
+configuration rollback cannot clear a tombstone. Reintroducing the same
+canonical repository through onboarding creates a new enabled incarnation with
+initial unknown readiness and inherits no prior readiness or lifecycle intent.
 
 ## 5. End-to-End Data Flow
 
@@ -677,8 +701,9 @@ reuses the ordinary runtime convergence projection. A later recurrence must
 first establish newer drift authority and cannot replay the earlier receipt.
 
 The typed lifecycle adapter adds one Controller-wide durable normal or
-rollback-origin draft without
-adding another configuration transaction. Controller authorization happens
+rollback-origin scalar draft without adding another configuration transaction.
+Repository removal uses an exclusive source-bound draft lane and cannot overlap
+that scalar draft, apply, or recovery authority. Controller authorization happens
 before every draft lookup. Revision compare-and-swap plus the last closed edit
 digest provides exact lost-response replay, while a different edit at the same
 revision conflicts. SQLite stores only the nine allowlisted timeout/admission
@@ -1145,7 +1170,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 34; migration history is code, not a
+inspection. The current schema is version 36; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees
@@ -1478,6 +1503,7 @@ around it. The principal table groups are:
 | `operation_receipts` | Scope-neutral accepted/applied/observed operation identity, outcome, and sanitized result evidence; legacy operator actions are backfilled and mirrored here |
 | configuration generation, authority, apply/recovery-intent, and convergence tables | Immutable desired/effective metadata, one Controller-wide CAS mutation authority, crash reconciliation state, optional immutable rollback-source identity, and meaningful sanitized transitions; raw desired bytes remain outside SQLite and external bytes are never stored |
 | `configuration_drafts` | At most one active Controller-wide normal or rollback-origin typed draft, revision/edit replay authority, immutable rollback source when applicable, sanitized validation/preview evidence, and generation/receipt settlement; no raw candidate, path, identity, or credential authority |
+| repository lifecycle, readiness, recheck, and removal tables | Immutable incarnation history, one current canonical/profile/binding authority, complete readiness evidence, exclusive source-bound removal draft and accepted/applied/observed settlement, and tombstone evidence; no external-resource deletion authority |
 
 ### Current state versus evidence
 

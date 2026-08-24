@@ -478,6 +478,9 @@ func (s *Store) ObserveConfigurationEffective(ctx context.Context, observation a
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO configuration_convergence_events(event_type,generation_id,digest,worker_instance_id,build_identity,reason_code,evidence_digest,observed_at) VALUES('effective_observed',?,?,?,?,?,?,?)`, observation.ExpectedGenerationID, observation.ExpectedDigest, observation.WorkerInstanceID, observation.BuildIdentity, string(application.ConfigurationReasonReady), observation.EvidenceDigest, formatTime(observation.ObservedAt)); err != nil {
 		return application.ConfigurationAuthority{}, false, err
 	}
+	if err := settleRepositoryRemovalForEffectiveTx(ctx, tx, observation); err != nil {
+		return application.ConfigurationAuthority{}, false, err
+	}
 	authority, _, err = configurationAuthorityQuery(ctx, tx)
 	if err != nil {
 		return application.ConfigurationAuthority{}, false, err

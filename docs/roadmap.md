@@ -147,8 +147,9 @@ operator identity, application authorization, operation receipts, and
 legal-action offers are complete. Activity-independent worker heartbeat,
 controller-authorized runtime observation, configuration generations/CAS,
 desired/effective convergence fencing, the first normal typed-change slice, and
-forward rollback, exact safe external-drift recovery, and repository lifecycle,
-readiness, and admission fencing are complete. Unsafe or ambiguous configuration
+forward rollback, exact safe external-drift recovery, repository lifecycle,
+readiness, guarded retirement, zero-repository disabled-admission operation,
+and admission fencing are complete. Unsafe or ambiguous configuration
 repair remains deliberately out of scope. Do not create
 speculative TUI, HTTP, or frontend slices before their Controller contracts
 exist.
@@ -158,8 +159,8 @@ exist.
 Bounded multi-repository concurrency, local operator authorization, operation
 receipts, legal-action offers, worker runtime observation, and configuration
 transaction/convergence authority, normal typed-change drafts, forward rollback,
-exact safe external-drift recovery, and repository lifecycle/readiness are
-complete. The remaining
+exact safe external-drift recovery, repository lifecycle/readiness, guarded
+retirement, and zero-repository disabled-admission operation are complete. The remaining
 presentation-independent sequence is:
 
 1. restart-safe onboarding saga;

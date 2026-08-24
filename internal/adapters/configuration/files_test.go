@@ -32,6 +32,86 @@ func TestEditableAuthorityProofIgnoresOnlyClosedTypedLeaves(t *testing.T) {
 	}
 }
 
+func TestRepositoryRemovalCandidatePreservesUnrelatedAuthorityAndSupportsZeroRepositories(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	configPath := filepath.Join(root, "controller.json")
+	keyPath := filepath.Join(root, "app.pem")
+	if err := os.WriteFile(keyPath, []byte("private fixture key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	repository := func(owner, name, profile string, appID, installationID, repositoryID int64) localregistry.Repository {
+		prefix := filepath.Join(root, name)
+		paths := []string{prefix + "-origin", prefix + "-source", prefix + "-runs", prefix + "-worktrees"}
+		for _, path := range paths {
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return localregistry.Repository{Owner: owner, Name: name, OriginPath: paths[0], SourcePath: paths[1], RunRoot: paths[2], WorktreeRoot: paths[3], BaseBranch: "main", VerifierRegistryRef: "builtin:v1", VerifierIDs: []string{"fixture-go-test"}, GitHubAppProfileRef: profile, GitHubAppID: appID, GitHubInstallationID: installationID, ExpectedRepositoryID: repositoryID, OperatorIdentityPolicy: localregistry.OperatorIdentityPolicy{AllowedLogins: []string{"operator"}, TrustedActors: []localregistry.TrustedActorIdentity{{DatabaseID: 7, NodeID: "USER_7", Login: "operator", Type: "User"}}}}
+	}
+	repositories := []localregistry.Repository{
+		repository("owner", "one", "github-app-profile:one", 11, 12, 13),
+		repository("owner", "two", "github-app-profile:two", 21, 22, 23),
+	}
+	profile := func(id, name string, appID, installationID, repositoryID int64) map[string]any {
+		return map[string]any{"id": id, "config": map[string]any{"api_base_url": "https://api.github.com", "graphql_url": "https://api.github.com/graphql", "app_id": appID, "installation_id": installationID, "repository_owner": "owner", "repository_name": name, "repository_id": repositoryID, "private_key_file": keyPath, "http_timeout": "2s", "token_refresh_skew": "5m", "api_version": "2022-11-28"}}
+	}
+	document := map[string]any{
+		"version":             5,
+		"controller":          map[string]any{"database_path": filepath.Join(root, "controller.db"), "codex_binary": "codex", "run_timeout": "30m", "operator": map[string]any{"database_id": 7, "node_id": "USER_7", "login": "operator", "type": "User"}},
+		"linear":              map[string]any{"api_url": "https://api.linear.app/graphql", "credential_source_ref": "secret://env/IFAN_LOOP_LINEAR_TOKEN", "authorization_scheme": "bearer", "team_key": "IFAN", "http_timeout": "2s", "max_response_bytes": 4096, "label_page_size": 10, "max_label_pages": 1},
+		"repositories":        repositories,
+		"github_app_profiles": []map[string]any{profile("github-app-profile:one", "one", 11, 12, 13), profile("github-app-profile:two", "two", 21, 22, 23)},
+		"automation":          map[string]any{"linear_todo_admission": map[string]any{"enabled": false, "credential_source_ref": "secret://env/IFAN_LOOP_LINEAR_TOKEN"}},
+	}
+	base, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, base, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validated, err := files.ValidateCurrent(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := func(repository string) application.LocalRepository {
+		value := validated.Repositories[repository]
+		return application.LocalRepository{CanonicalRepository: repository, ProfileID: value.ProfileID, ProfileDigest: value.ProfileDigest, RepositoryBindingDigest: value.RepositoryBindingDigest}
+	}
+	oneRemoved, before, after, err := files.MaterializeRepositoryRemoval(base, target("owner/one"))
+	if err != nil || before != 2 || after != 1 {
+		t.Fatalf("before=%d after=%d err=%v", before, after, err)
+	}
+	oneCandidate, err := files.ValidateRepositoryRemovalCandidate(base, oneRemoved, target("owner/one"))
+	if err != nil || len(oneCandidate.Repositories) != 1 || len(oneCandidate.Repositories["owner/two"].VerifierIDs) != 1 {
+		t.Fatalf("candidate=%+v err=%v", oneCandidate, err)
+	}
+	var preserved map[string]json.RawMessage
+	if err := json.Unmarshal(oneRemoved, &preserved); err != nil {
+		t.Fatal(err)
+	}
+	var profiles []json.RawMessage
+	if err := json.Unmarshal(preserved["github_app_profiles"], &profiles); err != nil || len(profiles) != 2 || !bytes.Contains(preserved["linear"], []byte("IFAN_LOOP_LINEAR_TOKEN")) {
+		t.Fatalf("profiles=%d linear=%s err=%v", len(profiles), preserved["linear"], err)
+	}
+
+	remaining := oneCandidate.Repositories["owner/two"]
+	secondTarget := application.LocalRepository{CanonicalRepository: "owner/two", ProfileID: remaining.ProfileID, ProfileDigest: remaining.ProfileDigest, RepositoryBindingDigest: remaining.RepositoryBindingDigest}
+	zero, before, after, err := files.MaterializeRepositoryRemoval(oneRemoved, secondTarget)
+	if err != nil || before != 1 || after != 0 {
+		t.Fatalf("before=%d after=%d err=%v", before, after, err)
+	}
+	zeroCandidate, err := files.ValidateRepositoryRemovalCandidate(oneRemoved, zero, secondTarget)
+	if err != nil || len(zeroCandidate.Repositories) != 0 {
+		t.Fatalf("zero candidate=%+v err=%v", zeroCandidate, err)
+	}
+}
+
 func TestPrivateRawLocatorAndAtomicLiveReplacement(t *testing.T) {
 	root := canonicalTempDirectory(t)
 	configPath := filepath.Join(root, "controller.json")

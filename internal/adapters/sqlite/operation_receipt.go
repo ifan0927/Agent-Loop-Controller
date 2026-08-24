@@ -135,7 +135,13 @@ func (s *Store) GetAuthorizedOperationReceipt(ctx context.Context, operationID s
 }
 
 func getOperationReceiptByIDTx(ctx context.Context, tx *sql.Tx, operationID string) (application.OperationReceipt, bool, error) {
-	receipt, err := scanOperationReceipt(tx.QueryRowContext(ctx, operationReceiptSelect+` WHERE operation_id=?`, operationID))
+	return getOperationReceiptByIDQuery(ctx, tx, operationID)
+}
+
+func getOperationReceiptByIDQuery(ctx context.Context, query interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, operationID string) (application.OperationReceipt, bool, error) {
+	receipt, err := scanOperationReceipt(query.QueryRowContext(ctx, operationReceiptSelect+` WHERE operation_id=?`, operationID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return application.OperationReceipt{}, false, nil
 	}
