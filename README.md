@@ -178,7 +178,7 @@ Local operator identity, application authorization, operation receipts, and
 legal-action offers are implemented. Activity-independent worker heartbeat,
 controller-authorized runtime observation, configuration generation/CAS, and
 desired/effective convergence fencing are also implemented, together with the
-the normal typed-change draft/preview/apply slice and Controller-owned forward
+normal typed-change draft/preview/apply slice and Controller-owned forward
 rollback. Explicit external-drift recovery remains later configuration
 lifecycle work; repository lifecycle is the next separate operator foundation.
 The TUI and `agentctl operator` are planned, not current behavior. HTTP, a Web

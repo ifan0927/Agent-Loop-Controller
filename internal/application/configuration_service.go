@@ -645,6 +645,49 @@ func configurationApplyReceiptFor(expectedGenerationID int64, expectedDigest str
 	return NewOperationReceipt(OperationReceiptInput{OperationType: OperationApplyConfiguration, Scope: ScopeController, TargetID: target.TargetID, Requester: requester.identity, RequestDigest: candidate.Digest, ExpectedAuthorityDigest: expectedDigest, OperationAnchorDigest: anchor, TargetBindingDigest: target.TargetBindingDigest, AcceptedAt: at})
 }
 
+// ConfigurationApplyReceiptSettlesGeneration proves that a persisted receipt
+// is the complete identity and successful settlement evidence for one applied
+// generation. Adapters use this when historical metadata would otherwise grant
+// rollback authority.
+func ConfigurationApplyReceiptSettlesGeneration(receipt OperationReceipt, generation, parent ConfigurationGeneration) bool {
+	if ValidateOperationReceipt(receipt) != nil || generation.Origin != ConfigurationOriginApply || generation.ParentID != parent.GenerationID || generation.Requester.Validate() != nil || generation.CreatedAt.IsZero() || generation.CommittedAt.IsZero() {
+		return false
+	}
+	provenance := ConfigurationApplyProvenance{Kind: ConfigurationApplyNormal}
+	if generation.RollbackSourceGenerationID > 0 || generation.RollbackSourceDigest != "" {
+		provenance = ConfigurationApplyProvenance{Kind: ConfigurationApplyRollback, RollbackSourceGenerationID: generation.RollbackSourceGenerationID, RollbackSourceDigest: generation.RollbackSourceDigest}
+	}
+	if !provenance.Valid() {
+		return false
+	}
+	configured := ConfiguredRequester{identity: generation.Requester}
+	scopes, err := newAuthorizedScopeSet(generation.Requester, AuthorityScope{Kind: ScopeController, ID: controllerScopeID, AuthorityDigest: identityDigest(generation.Requester)})
+	if err != nil {
+		return false
+	}
+	expected := configurationApplyReceiptFor(parent.GenerationID, parent.Digest, configured, scopes, ValidatedConfigurationCandidate{Digest: generation.Digest}, provenance, receipt.AcceptedAt)
+	return receipt.OperationID == expected.OperationID &&
+		receipt.AuthorityKey == expected.AuthorityKey &&
+		receipt.OperationAnchorDigest == expected.OperationAnchorDigest &&
+		receipt.OperationType == expected.OperationType &&
+		receipt.Scope == expected.Scope &&
+		receipt.TargetID == expected.TargetID &&
+		receipt.Requester.Equal(generation.Requester) &&
+		receipt.RequestDigest == generation.Digest &&
+		receipt.ExpectedAuthorityDigest == parent.Digest &&
+		receipt.TargetBindingDigest == expected.TargetBindingDigest &&
+		receipt.Phase == OperationPhaseObserved &&
+		receipt.Outcome == OperationOutcomeSucceeded &&
+		receipt.ResultingAuthorityDigest == generation.Digest &&
+		receipt.ResultingState == string(ConfigurationGenerationPendingRestart) &&
+		receipt.ResultingVersion == generation.GenerationID &&
+		validAuthorityDigest(receipt.EvidenceDigest) &&
+		validAuthorityDigest(receipt.ResultDigest) &&
+		receipt.AcceptedAt.Equal(generation.CreatedAt) &&
+		receipt.AppliedAt.Equal(generation.CommittedAt) &&
+		receipt.SettledAt.Equal(generation.CommittedAt)
+}
+
 func normalizedConfigurationApplyProvenance(value ConfigurationApplyProvenance) (ConfigurationApplyProvenance, bool) {
 	if value.Kind == "" {
 		value.Kind = ConfigurationApplyNormal

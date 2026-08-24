@@ -539,7 +539,33 @@ func (s *Store) ListConfigurationGenerations(ctx context.Context) ([]application
 		}
 		result = append(result, generation)
 	}
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for index := range result {
+		if result[index].SettlementEvidenceValid {
+			result[index].SettlementEvidenceValid = result[index].RawRetained && configurationRollbackSettlementEvidence(ctx, s.db, result[index])
+		}
+	}
+	return result, nil
+}
+
+func configurationRollbackSettlementEvidence(ctx context.Context, query queryRower, generation application.ConfigurationGeneration) bool {
+	if !generation.SettlementEvidenceValid {
+		return false
+	}
+	if generation.Origin == application.ConfigurationOriginBaseline {
+		return true
+	}
+	parent, err := scanConfigurationGeneration(query.QueryRowContext(ctx, configurationGenerationSelect+` WHERE generation_id=?`, generation.ParentID))
+	if err != nil {
+		return false
+	}
+	receipt, err := scanOperationReceipt(query.QueryRowContext(ctx, operationReceiptSelect+` WHERE operation_id=?`, generation.OperationID))
+	return err == nil && application.ConfigurationApplyReceiptSettlesGeneration(receipt, generation, parent)
 }
 
 func (s *Store) ConfigurationRawPruneCandidates(ctx context.Context, keep int) ([]string, error) {

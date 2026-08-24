@@ -62,6 +62,10 @@ func (s *Store) OpenConfigurationDraft(ctx context.Context, input application.Co
 		if err != nil || eligible != 1 {
 			return application.ConfigurationDraft{}, false, application.ErrConfigurationAuthorityConflict
 		}
+		source, sourceErr := scanConfigurationGeneration(tx.QueryRowContext(ctx, configurationGenerationSelect+` WHERE generation_id=?`, input.RollbackSourceGenerationID))
+		if sourceErr != nil || !configurationRollbackSettlementEvidence(ctx, tx, source) {
+			return application.ConfigurationDraft{}, false, application.ErrConfigurationAuthorityConflict
+		}
 	}
 	settings := input.Settings
 	_, err = tx.ExecContext(ctx, `INSERT INTO configuration_drafts(

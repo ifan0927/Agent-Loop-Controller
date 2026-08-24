@@ -2,11 +2,14 @@ package sqlite
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -569,14 +572,17 @@ func TestConfigurationReceiptSettlementFailureRollsBackDesiredAtomically(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
+	identitySum := sha256.Sum256([]byte(strings.ToLower(operator.Login) + "\x00" + hex.EncodeToString([]byte(operator.NodeID)) + "\x00" + operator.ActorType + "\x00" + strconv.FormatInt(operator.DatabaseID, 10)))
+	targetBinding := hex.EncodeToString(identitySum[:])
+	candidateDigest := strings.Repeat("b", 64)
 	receipt := application.NewOperationReceipt(application.OperationReceiptInput{
 		OperationType: application.OperationApplyConfiguration, Scope: application.ScopeController, TargetID: application.ConfigurationTargetID,
-		Requester: operator, RequestDigest: strings.Repeat("b", 64), ExpectedAuthorityDigest: baseline.Desired.Digest,
-		OperationAnchorDigest: strings.Repeat("c", 64), TargetBindingDigest: strings.Repeat("d", 64), AcceptedAt: now.Add(time.Second),
+		Requester: operator, RequestDigest: candidateDigest, ExpectedAuthorityDigest: baseline.Desired.Digest,
+		OperationAnchorDigest: application.ConfigurationEvidenceDigest("configuration-apply", strconv.FormatInt(baseline.Desired.GenerationID, 10), baseline.Desired.Digest, candidateDigest), TargetBindingDigest: targetBinding, AcceptedAt: now.Add(time.Second),
 	})
 	generation, _, _, err := store.BeginConfigurationApply(ctx, application.ConfigurationApplyAcceptance{
 		ExpectedGenerationID: baseline.Desired.GenerationID, ExpectedDigest: baseline.Desired.Digest,
-		Candidate: application.ValidatedConfigurationCandidate{Digest: strings.Repeat("b", 64), Size: 43, SchemaVersion: 5, DatabasePath: databasePath, Operator: operator},
+		Candidate: application.ValidatedConfigurationCandidate{Digest: candidateDigest, Size: 43, SchemaVersion: 5, DatabasePath: databasePath, Operator: operator},
 		Requester: operator, Receipt: receipt, AcceptedAt: receipt.AcceptedAt,
 	})
 	if err != nil {
@@ -635,6 +641,38 @@ func TestConfigurationReceiptSettlementFailureRollsBackDesiredAtomically(t *test
 	}
 	if source := findGeneration(); !source.SettlementEvidenceValid || !source.EffectiveAt.IsZero() {
 		t.Fatalf("source settlement evidence=%+v", source)
+	}
+	if _, err := store.db.Exec(`UPDATE operation_receipts SET requester_login='contradictory-operator' WHERE operation_id=?`, generation.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	if source := findGeneration(); source.SettlementEvidenceValid {
+		t.Fatalf("contradictory receipt requester remained valid: %+v", source)
+	}
+	currentAuthority, found, authorityErr := store.ConfigurationAuthority(ctx)
+	if authorityErr != nil || !found {
+		t.Fatalf("current authority found=%t err=%v", found, authorityErr)
+	}
+	settings := configurationDraftSettings()
+	if _, _, openErr := store.OpenConfigurationDraft(ctx, application.ConfigurationDraftOpenInput{DraftID: "configuration-draft-00000000000000000000000000000031", BaseGenerationID: currentAuthority.Desired.GenerationID, BaseDigest: currentAuthority.Desired.Digest, Settings: settings, SettingsDigest: application.ConfigurationSettingsDigest(settings), DraftOrigin: application.ConfigurationDraftOriginRollback, RollbackSourceGenerationID: generation.GenerationID, RollbackSourceDigest: generation.Digest, OpenedAt: now.Add(5 * time.Second)}); !errors.Is(openErr, application.ErrConfigurationAuthorityConflict) {
+		t.Fatalf("rollback draft accepted contradictory receipt requester: %v", openErr)
+	}
+	if _, err := store.db.Exec(`UPDATE operation_receipts SET requester_login=? WHERE operation_id=?`, operator.Login, generation.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	if source := findGeneration(); !source.SettlementEvidenceValid {
+		t.Fatalf("restored receipt evidence remained invalid: %+v", source)
+	}
+	if _, err := store.db.Exec(`UPDATE operation_receipts SET operation_anchor_digest=? WHERE operation_id=?`, strings.Repeat("0", 64), generation.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	if source := findGeneration(); source.SettlementEvidenceValid {
+		t.Fatalf("contradictory receipt identity remained valid: %+v", source)
+	}
+	if _, err := store.db.Exec(`UPDATE operation_receipts SET operation_anchor_digest=? WHERE operation_id=?`, receipt.OperationAnchorDigest, generation.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	if source := findGeneration(); !source.SettlementEvidenceValid {
+		t.Fatalf("restored receipt identity remained invalid: %+v", source)
 	}
 	if _, err := store.db.Exec(`UPDATE configuration_apply_intents SET target_digest=? WHERE generation_id=?`, strings.Repeat("0", 64), generation.GenerationID); err != nil {
 		t.Fatal(err)
