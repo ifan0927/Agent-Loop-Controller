@@ -58,14 +58,13 @@ func (s *Store) AdoptRepositoryLifecycleBaseline(ctx context.Context, input appl
 			var profileID, profileDigest, bindingDigest string
 			lookupErr := tx.QueryRowContext(ctx, `SELECT profile_id,profile_digest,repository_binding_digest FROM repository_lifecycles WHERE repository=? AND retired_at=''`, profile.Authority.Repository).Scan(&profileID, &profileDigest, &bindingDigest)
 			if errors.Is(lookupErr, sql.ErrNoRows) {
-				incarnationID, idErr := nextRepositoryIncarnationIDTx(ctx, tx, profile.Authority.Repository, profile.Authority.BindingDigest, input.AdoptedAt)
-				if idErr != nil {
-					return idErr
+				var onboardingCount int
+				if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_onboardings o JOIN repository_onboarding_steps s ON s.onboarding_id=o.onboarding_id WHERE o.canonical_repository=? AND o.status IN ('accepted','running','waiting_for_operator') AND s.step_name='configuration_applied' AND s.status IN ('intended','observed')`, profile.Authority.Repository).Scan(&onboardingCount); err != nil || onboardingCount != 1 {
+					return application.ErrRepositoryLifecycleConflict
 				}
-				lifecycle := application.RepositoryLifecycle{IncarnationID: incarnationID, Repository: profile.Authority.Repository, ProfileID: profile.Authority.ProfileID, ProfileDigest: profile.Profile.ProfileDigest, RepositoryBindingDigest: profile.Authority.BindingDigest, Intent: application.RepositoryEnabled, Version: 1, UpdatedAt: input.AdoptedAt}
-				if err := insertInitialRepositoryLifecycleTx(ctx, tx, lifecycle, configuration, input.AdoptedAt); err != nil {
-					return err
-				}
+				// Post-baseline profiles are fenced until the accepted onboarding
+				// observes exact worker convergence and creates a disabled
+				// incarnation through CreateOnboardingRepositoryLifecycle.
 				continue
 			}
 			if lookupErr != nil {
@@ -117,6 +116,55 @@ func (s *Store) RepositoryOperationAuthority(ctx context.Context, repository str
 		return application.RepositoryOperationAuthority{}, err
 	}
 	return authority, tx.Commit()
+}
+
+func (s *Store) CreateOnboardingRepositoryLifecycle(ctx context.Context, onboardingID string, profile application.LocalRepository, at time.Time) (application.RepositoryProjection, bool, error) {
+	if onboardingID == "" || !validRepositoryProfile(profile) || at.IsZero() {
+		return application.RepositoryProjection{}, false, errors.New("onboarding lifecycle input is invalid")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return application.RepositoryProjection{}, false, err
+	}
+	defer tx.Rollback()
+	var repository, profileID, profileDigest, bindingDigest, status string
+	var stepIndex, generationID int64
+	if err := tx.QueryRowContext(ctx, `SELECT canonical_repository,profile_id,profile_digest,repository_binding_digest,status,step_index,configuration_generation_id FROM repository_onboardings WHERE onboarding_id=?`, onboardingID).Scan(&repository, &profileID, &profileDigest, &bindingDigest, &status, &stepIndex, &generationID); err != nil {
+		return application.RepositoryProjection{}, false, application.ErrOnboardingNotFound
+	}
+	if repository != profile.CanonicalRepository || profileID != profile.ProfileID || profileDigest != profile.ProfileDigest || bindingDigest != profile.RepositoryBindingDigest || status != string(domain.OnboardingRunning) || stepIndex < 4 || generationID < 1 {
+		return application.RepositoryProjection{}, false, application.ErrRepositoryLifecycleConflict
+	}
+	var lifecycleIntent int
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM repository_onboarding_steps WHERE onboarding_id=? AND step_name='lifecycle_created' AND status='intended' AND outcome='pending')`, onboardingID).Scan(&lifecycleIntent); err != nil || lifecycleIntent != 1 {
+		return application.RepositoryProjection{}, false, application.ErrRepositoryLifecycleConflict
+	}
+	configurationAuthority, found, err := configurationAuthorityQuery(ctx, tx)
+	if err != nil || !found || configurationAuthority.Incomplete != nil || configurationAuthority.IncompleteRecovery != nil || configurationAuthority.Desired.GenerationID != generationID || configurationAuthority.EffectiveID != generationID || configurationAuthority.Desired.State != application.ConfigurationGenerationEffective {
+		return application.RepositoryProjection{}, false, application.ErrConfigurationAuthorityConflict
+	}
+	if projection, err := repositoryProjectionTx(ctx, tx, repository); err == nil {
+		if !profileMatchesLifecycle(profile, projection.Lifecycle) || projection.Lifecycle.Intent != application.RepositoryDisabled {
+			return application.RepositoryProjection{}, false, application.ErrRepositoryLifecycleConflict
+		}
+		return projection, false, tx.Commit()
+	} else if !errors.Is(err, application.ErrRepositoryLifecycleMissing) {
+		return application.RepositoryProjection{}, false, err
+	}
+	incarnationID, err := nextRepositoryIncarnationIDTx(ctx, tx, repository, bindingDigest, at.UTC())
+	if err != nil {
+		return application.RepositoryProjection{}, false, err
+	}
+	lifecycle := application.RepositoryLifecycle{IncarnationID: incarnationID, Repository: repository, ProfileID: profileID, ProfileDigest: profileDigest, RepositoryBindingDigest: bindingDigest, Intent: application.RepositoryDisabled, Version: 1, UpdatedAt: at.UTC()}
+	configuration := application.ConfigurationAdmissionAuthority{GenerationID: configurationAuthority.Desired.GenerationID, Digest: configurationAuthority.Desired.Digest, AuthorityVersion: configurationAuthority.Version, ValidThrough: time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)}
+	if err := insertInitialRepositoryLifecycleTx(ctx, tx, lifecycle, configuration, at.UTC()); err != nil {
+		return application.RepositoryProjection{}, false, err
+	}
+	projection, err := repositoryProjectionTx(ctx, tx, repository)
+	if err != nil {
+		return application.RepositoryProjection{}, false, err
+	}
+	return projection, true, tx.Commit()
 }
 
 func (s *Store) RepositoryConfigurationAuthority(ctx context.Context) (application.ConfigurationAdmissionAuthority, error) {

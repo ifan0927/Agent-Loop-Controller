@@ -30,11 +30,13 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 36
+const schemaVersion = 37
 
 const (
-	sqliteMigrationRetryDelay  = 10 * time.Millisecond
-	sqliteMigrationRetryWindow = 5 * time.Second
+	sqliteMigrationRetryDelay = 10 * time.Millisecond
+	// The window bounds both schema work and lock retries. Receipt-table
+	// rebuilds under the race detector can exceed five seconds on hosted CI.
+	sqliteMigrationRetryWindow = 30 * time.Second
 )
 
 type Store struct {
@@ -626,12 +628,18 @@ func migrateSQLite(ctx context.Context, db sqliteTransactioner, supportedVersion
 		err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&existingVersion)
 		if err != nil || existingVersion < 34 {
 			if err := migrateSQLiteGeneric(ctx, db, 33); err != nil {
-				return err
+				if currentErr := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&existingVersion); currentErr != nil || existingVersion < 34 {
+					return err
+				}
+			} else {
+				existingVersion = 33
 			}
-			if err := migrateSQLiteV34Upgrade(ctx, db); err != nil {
-				return err
+			if existingVersion < 34 {
+				if err := migrateSQLiteV34Upgrade(ctx, db); err != nil {
+					return err
+				}
+				existingVersion = 34
 			}
-			existingVersion = 34
 		}
 		if supportedVersion >= 35 && existingVersion < 35 {
 			if err := migrateSQLiteV35Upgrade(ctx, db); err != nil {
@@ -640,7 +648,13 @@ func migrateSQLite(ctx context.Context, db sqliteTransactioner, supportedVersion
 			existingVersion = 35
 		}
 		if supportedVersion >= 36 && existingVersion < 36 {
-			return migrateSQLiteV36Upgrade(ctx, db)
+			if err := migrateSQLiteV36Upgrade(ctx, db); err != nil {
+				return err
+			}
+			existingVersion = 36
+		}
+		if supportedVersion >= 37 && existingVersion < 37 {
+			return migrateSQLiteV37Upgrade(ctx, db)
 		}
 	}
 	return migrateSQLiteGeneric(ctx, db, supportedVersion)
@@ -740,6 +754,8 @@ func migrateSQLiteGeneric(ctx context.Context, db sqliteTransactioner, supported
 			statements = migrationV35
 		case 36:
 			statements = migrationV36
+		case 37:
+			statements = migrationV37
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -1601,6 +1617,142 @@ func migrateSQLiteV36Upgrade(ctx context.Context, db sqliteTransactioner) error 
 	var violations int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_foreign_key_check`).Scan(&violations); err != nil || violations != 0 {
 		return errors.New("schema 36 foreign key validation failed")
+	}
+	return nil
+}
+
+var migrationV37 = []string{
+	`CREATE TABLE repository_onboardings (
+		onboarding_id TEXT PRIMARY KEY,
+		onboarding_kind TEXT NOT NULL CHECK(onboarding_kind IN ('existing_checkout')),
+		canonical_repository TEXT NOT NULL,
+		private_input_digest TEXT NOT NULL,
+		source_path_digest TEXT NOT NULL,
+		request_digest TEXT NOT NULL UNIQUE,
+		requester_login TEXT NOT NULL,
+		requester_database_id INTEGER NOT NULL,
+		requester_node_id TEXT NOT NULL,
+		requester_actor_type TEXT NOT NULL,
+		base_generation_id INTEGER NOT NULL,
+		base_digest TEXT NOT NULL,
+		configuration_authority_version INTEGER NOT NULL,
+		status TEXT NOT NULL CHECK(status IN ('opened','preflight_ready','cancelled','accepted','running','waiting_for_operator','conflict','ready_disabled')),
+		step_index INTEGER NOT NULL DEFAULT 0 CHECK(step_index BETWEEN 0 AND 7),
+		reason_code TEXT NOT NULL DEFAULT '',
+		preflight_digest TEXT NOT NULL DEFAULT '',
+		preflight_evidence_digest TEXT NOT NULL DEFAULT '',
+		preview_digest TEXT NOT NULL DEFAULT '',
+		operation_id TEXT REFERENCES operation_receipts(operation_id),
+		profile_id TEXT NOT NULL DEFAULT '',
+		profile_digest TEXT NOT NULL DEFAULT '',
+		repository_binding_digest TEXT NOT NULL DEFAULT '',
+		configuration_generation_id INTEGER NOT NULL DEFAULT 0,
+		incarnation_id TEXT NOT NULL DEFAULT '',
+		readiness_snapshot_id TEXT NOT NULL DEFAULT '',
+		linear_label_id TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		settled_at TEXT NOT NULL DEFAULT ''
+	)`,
+	`CREATE UNIQUE INDEX repository_onboarding_one_active_repository ON repository_onboardings(canonical_repository) WHERE status NOT IN ('cancelled','conflict','ready_disabled')`,
+	`CREATE UNIQUE INDEX repository_onboarding_one_active_source ON repository_onboardings(source_path_digest) WHERE status NOT IN ('cancelled','conflict','ready_disabled')`,
+	`CREATE INDEX repository_onboarding_runnable ON repository_onboardings(status,updated_at,onboarding_id)`,
+	`CREATE TABLE repository_onboarding_path_claims (
+		onboarding_id TEXT NOT NULL REFERENCES repository_onboardings(onboarding_id),
+		path_digest TEXT NOT NULL,
+		PRIMARY KEY(onboarding_id,path_digest)
+	)`,
+	`CREATE INDEX repository_onboarding_path_claim_digest ON repository_onboarding_path_claims(path_digest,onboarding_id)`,
+	`CREATE TABLE repository_onboarding_steps (
+		onboarding_id TEXT NOT NULL REFERENCES repository_onboardings(onboarding_id),
+		step_name TEXT NOT NULL CHECK(step_name IN ('roots_created','linear_label_observed','configuration_applied','configuration_converged','lifecycle_created','readiness_published','settled')),
+		step_order INTEGER NOT NULL CHECK(step_order BETWEEN 1 AND 7),
+		intent_digest TEXT NOT NULL,
+		status TEXT NOT NULL CHECK(status IN ('intended','observed')),
+		outcome TEXT NOT NULL CHECK(outcome IN ('pending','succeeded','failed','conflict','ambiguous')),
+		reason_code TEXT NOT NULL DEFAULT '',
+		evidence_digest TEXT NOT NULL DEFAULT '',
+		intended_at TEXT NOT NULL,
+		observed_at TEXT NOT NULL DEFAULT '',
+		PRIMARY KEY(onboarding_id,step_name),
+		UNIQUE(onboarding_id,step_order)
+	)`,
+	`CREATE TRIGGER repository_onboarding_configuration_exclusion BEFORE INSERT ON repository_onboarding_steps
+		WHEN NEW.step_name='configuration_applied' AND (
+			EXISTS(SELECT 1 FROM configuration_drafts WHERE lifecycle IN ('open','applying','ambiguous')) OR
+			EXISTS(SELECT 1 FROM repository_removal_drafts WHERE lifecycle IN ('open','applying','ambiguous')) OR
+			EXISTS(SELECT 1 FROM configuration_apply_intents WHERE status IN ('accepted','ambiguous')) OR
+			EXISTS(SELECT 1 FROM configuration_recovery_intents WHERE status IN ('accepted','ambiguous')) OR
+			EXISTS(SELECT 1 FROM repository_onboardings o WHERE o.status IN ('accepted','running','waiting_for_operator') AND o.onboarding_id<>NEW.onboarding_id)
+		) BEGIN SELECT RAISE(ABORT,'configuration mutation is already active'); END`,
+	`CREATE TRIGGER configuration_draft_excludes_onboarding BEFORE INSERT ON configuration_drafts
+		WHEN EXISTS(SELECT 1 FROM repository_onboardings o WHERE o.status IN ('accepted','running','waiting_for_operator')) BEGIN SELECT RAISE(ABORT,'configuration mutation is already active'); END`,
+	`CREATE TRIGGER configuration_recovery_excludes_onboarding BEFORE INSERT ON configuration_recovery_intents
+		WHEN EXISTS(SELECT 1 FROM repository_onboardings o WHERE o.status IN ('accepted','running','waiting_for_operator')) BEGIN SELECT RAISE(ABORT,'configuration mutation is already active'); END`,
+	`CREATE TRIGGER repository_removal_excludes_onboarding BEFORE INSERT ON repository_removal_drafts
+		WHEN EXISTS(SELECT 1 FROM repository_onboardings o WHERE o.status IN ('accepted','running','waiting_for_operator')) BEGIN SELECT RAISE(ABORT,'configuration mutation is already active'); END`,
+}
+
+var migrationV37ReceiptRebuild = []string{
+	`PRAGMA legacy_alter_table = ON`,
+	`DROP INDEX operation_receipts_target`,
+	`DROP INDEX operation_receipts_source_action`,
+	`ALTER TABLE operation_receipts RENAME TO operation_receipts_v36`,
+	`CREATE TABLE operation_receipts (
+		operation_id TEXT PRIMARY KEY, authority_key TEXT NOT NULL UNIQUE, operation_anchor_digest TEXT NOT NULL,
+		operation_type TEXT NOT NULL CHECK(operation_type IN ('decide','retry','abandon','recover_ci_wait','recover_owned_push','accept_external_merge','apply_configuration','restore_configuration','recheck_repository','enable_repository','disable_repository','remove_repository','onboard_repository')),
+		scope_kind TEXT NOT NULL CHECK(scope_kind IN ('controller','repository','run','onboarding')), target_id TEXT NOT NULL,
+		requester_login TEXT NOT NULL, requester_database_id INTEGER NOT NULL, requester_node_id TEXT NOT NULL, requester_actor_type TEXT NOT NULL,
+		request_digest TEXT NOT NULL, expected_authority_digest TEXT NOT NULL, target_binding_digest TEXT NOT NULL,
+		phase TEXT NOT NULL CHECK(phase IN ('accepted','applied','observed')), outcome TEXT NOT NULL CHECK(outcome IN ('pending','succeeded','failed','conflict','ambiguous')),
+		resulting_authority_digest TEXT NOT NULL DEFAULT '', resulting_state TEXT NOT NULL DEFAULT '', resulting_version INTEGER NOT NULL DEFAULT 0 CHECK(resulting_version >= 0), evidence_digest TEXT NOT NULL DEFAULT '', result_digest TEXT NOT NULL DEFAULT '', accepted_at TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT '', settled_at TEXT NOT NULL DEFAULT '', source_action_id TEXT NOT NULL DEFAULT ''
+	)`,
+	`INSERT INTO operation_receipts SELECT * FROM operation_receipts_v36`,
+	`DROP TABLE operation_receipts_v36`,
+	`CREATE INDEX operation_receipts_target ON operation_receipts(scope_kind,target_id,accepted_at,operation_id)`,
+	`CREATE UNIQUE INDEX operation_receipts_source_action ON operation_receipts(source_action_id) WHERE source_action_id<>''`,
+}
+
+func migrateSQLiteV37Upgrade(ctx context.Context, db sqliteTransactioner) error {
+	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		return err
+	}
+	defer db.ExecContext(ctx, `PRAGMA foreign_keys = ON`)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var current int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&current); err != nil {
+		return err
+	}
+	if current >= 37 {
+		return tx.Commit()
+	}
+	if current != 36 {
+		return fmt.Errorf("repository onboarding migration requires schema 36, found %d", current)
+	}
+	for _, statement := range append(append([]string(nil), migrationV37ReceiptRebuild...), migrationV37...) {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("migrate schema to version 37: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,applied_at) VALUES(37,?)`, nowText()); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA legacy_alter_table = OFF`); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
+		return err
+	}
+	var violations int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_foreign_key_check`).Scan(&violations); err != nil || violations != 0 {
+		return errors.New("schema 37 foreign key validation failed")
 	}
 	return nil
 }

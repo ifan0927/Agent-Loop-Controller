@@ -80,6 +80,12 @@ the state machine.
   fencing for both manual and automatic starts. Retirement removes only the
   exact configuration profile after fresh worker convergence and preserves run,
   receipt, audit, local, GitHub, and Linear history.
+- Restart-safe existing-checkout onboarding with typed open, read-only
+  preflight, semantic preview, start, cancel, show, and resume commands. The
+  persisted worker saga creates only Controller-owned roots, creates or adopts
+  the exact Linear repository label, applies one source-bound configuration
+  addition, waits for fresh worker convergence, publishes readiness, and stops
+  in a disabled lifecycle until an operator explicitly enables it.
 - Deterministically ordered bounded worker scheduling with one nonterminal run
   per repository, a configurable local-heavy-work capacity, durable leases and
   permits, restart-stable parked states, retry schedules, local
@@ -188,9 +194,10 @@ desired/effective convergence fencing are also implemented, together with the
 normal typed-change draft/preview/apply slice and Controller-owned forward
 rollback, plus exact safe external-drift recovery with durable receipt replay
 and no new generation. Repository lifecycle, readiness, guarded retirement,
-zero-repository disabled-admission operation, and admission fencing are also
-implemented. Unsafe or ambiguous configuration repair remains out of scope;
-restart-safe onboarding is the next separate operator foundation.
+zero-repository disabled-admission operation, admission fencing, and the
+restart-safe existing-checkout onboarding saga are also implemented. Unsafe or
+ambiguous configuration repair remains out of scope; empty-repository
+initialization is the next separate operator foundation.
 The TUI and `agentctl operator` are planned, not current behavior. HTTP, a Web
 UI, outbound notifications, Hermes runtime integration, public API/webhook
 admission, and cross-repository transactions remain deferred or exploratory.

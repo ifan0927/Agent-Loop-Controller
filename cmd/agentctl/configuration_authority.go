@@ -139,13 +139,9 @@ func loadManagedConfiguration(path string) (bootstrap.Bootstrap, error) {
 // identity published by successful authority initialization. Production
 // callers must not fall back to a path-only SQLite open after proof.
 func openManagedConfigurationStore(loaded bootstrap.Bootstrap) (*sqlitestore.Store, error) {
-	locator, found, err := configurationadapter.ReadLocator(loaded.Path)
-	if err != nil || !found || locator.DatabasePath != loaded.Controller.DatabasePath {
-		return nil, errors.New("configuration authority locator conflicts")
-	}
-	store, err := sqlitestore.OpenConfigurationAuthority(context.Background(), locator.DatabasePath, loaded.Path, locator.DatabaseIdentity, false)
+	store, err := openBoundConfigurationStore(loaded)
 	if err != nil {
-		return nil, errors.New("configuration authority store is unavailable")
+		return nil, err
 	}
 	profiles, err := loaded.Registry.ListRepositoryProfiles(context.Background())
 	if err != nil {
@@ -159,6 +155,21 @@ func openManagedConfigurationStore(loaded bootstrap.Bootstrap) (*sqlitestore.Sto
 	if err := store.ReconcileRepositoryRechecks(context.Background(), time.Now().UTC()); err != nil {
 		store.Close()
 		return nil, errors.New("repository recheck reconciliation failed")
+	}
+	return store, nil
+}
+
+// openBoundConfigurationStore proves the exact configuration/database binding
+// without adopting lifecycle state or reconciling interrupted repository
+// operations. Read-only onboarding commands use this composition boundary.
+func openBoundConfigurationStore(loaded bootstrap.Bootstrap) (*sqlitestore.Store, error) {
+	locator, found, err := configurationadapter.ReadLocator(loaded.Path)
+	if err != nil || !found || locator.DatabasePath != loaded.Controller.DatabasePath {
+		return nil, errors.New("configuration authority locator conflicts")
+	}
+	store, err := sqlitestore.OpenConfigurationAuthority(context.Background(), locator.DatabasePath, loaded.Path, locator.DatabaseIdentity, false)
+	if err != nil {
+		return nil, errors.New("configuration authority store is unavailable")
 	}
 	return store, nil
 }

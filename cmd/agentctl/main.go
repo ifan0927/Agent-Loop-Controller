@@ -58,6 +58,8 @@ func main() {
 		err = config(os.Args[2:])
 	case "repository":
 		err = repositoryCommand(os.Args[2:])
+	case "onboarding":
+		err = onboardingCommand(os.Args[2:])
 	case "github-read":
 		err = githubRead(os.Args[2:])
 	default:
@@ -1685,5 +1687,5 @@ func decodeTask(reader io.Reader) (domain.CodingTask, error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: agentctl <version|plan|spike|local|linear|controller|config|repository|github-read> [options]")
+	fmt.Fprintln(os.Stderr, "usage: agentctl <version|plan|spike|local|linear|controller|config|repository|onboarding|github-read> [options]")
 }

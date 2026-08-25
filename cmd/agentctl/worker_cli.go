@@ -94,9 +94,21 @@ func controllerWorker(args []string) error {
 	instanceID := uuid.NewString()
 	output := workerOutput{WorkerInstanceID: instanceID, ConfigurationDigest: loaded.Digest, Status: workerStatusRunning}
 	configured := loaded.Automation.LinearTodoAdmission
+	output.Disabled = !configured.Enabled
 	if !configured.Enabled {
-		output.Disabled, output.Stopped, output.PreviousStatus, output.Status = true, "disabled", workerStatusRunning, workerStatusStopping
-		return emitAutomaticWorkerOutput(output)
+		store, openErr := openManagedConfigurationStore(loaded)
+		if openErr != nil {
+			return errors.New("automatic admission state store is unavailable")
+		}
+		runnable, listErr := store.ListRunnableOnboardings(context.Background(), 1)
+		closeErr := store.Close()
+		if listErr != nil || closeErr != nil {
+			return errors.New("onboarding state discovery failed")
+		}
+		if len(runnable) == 0 {
+			output.Stopped, output.PreviousStatus, output.Status = "disabled", workerStatusRunning, workerStatusStopping
+			return emitAutomaticWorkerOutput(output)
+		}
 	}
 	workerLock, err := acquireWorkerProcessLock(filepath.Dir(loaded.Controller.DatabasePath))
 	if err != nil {
@@ -133,7 +145,11 @@ func controllerWorker(args []string) error {
 	if *once {
 		workerCapacity = 1
 	}
-	result, err := runBoundedAdmissionWorkerWithHeartbeat(ctx, *once, configured.PollInterval, workerCapacity, runtime.dispatch, reporter, func() {
+	pollInterval := configured.PollInterval
+	if pollInterval <= 0 {
+		pollInterval = 30 * time.Second
+	}
+	result, err := runBoundedAdmissionWorkerWithHeartbeat(ctx, *once, pollInterval, workerCapacity, runtime.dispatch, reporter, func() {
 		fprintfWorkerStart(instanceID, loaded.Digest)
 	})
 	if err != nil {
@@ -252,6 +268,18 @@ func (l *workerProcessLock) Close() error {
 
 func newAutomaticWorkerRuntime(loaded bootstrap.Bootstrap, instanceID string) (automaticWorkerRuntime, error) {
 	configured := loaded.Automation.LinearTodoAdmission
+	if !configured.Enabled {
+		store, err := openManagedConfigurationStore(loaded)
+		if err != nil {
+			return automaticWorkerRuntime{}, errors.New("automatic admission state store is unavailable")
+		}
+		onboarding, err := composeOnboardingService(loaded, store, true)
+		if err != nil {
+			_ = store.Close()
+			return automaticWorkerRuntime{}, errors.New("onboarding worker is unavailable")
+		}
+		return automaticWorkerRuntime{store: store, dispatch: onboardingWorkerDispatch(store, onboarding, nil)}, nil
+	}
 	credentials, err := linearCredentialSourceForRef(loaded, configured.CredentialSourceRef)
 	if err != nil {
 		return automaticWorkerRuntime{}, errors.New("automatic admission credential source is unavailable")
@@ -309,7 +337,32 @@ func newAutomaticWorkerRuntime(loaded bootstrap.Bootstrap, instanceID string) (a
 		_ = store.Close()
 		return automaticWorkerRuntime{}, errors.New("automatic admission worker is unavailable")
 	}
-	return automaticWorkerRuntime{store: store, dispatch: dispatcher.Dispatch}, nil
+	onboarding, err := composeOnboardingService(loaded, store, true)
+	if err != nil {
+		_ = store.Close()
+		return automaticWorkerRuntime{}, errors.New("onboarding worker is unavailable")
+	}
+	return automaticWorkerRuntime{store: store, dispatch: onboardingWorkerDispatch(store, onboarding, dispatcher.Dispatch)}, nil
+}
+
+func onboardingWorkerDispatch(store *sqlitestore.Store, onboarding *application.OnboardingService, fallback admissionWorkerDispatch) admissionWorkerDispatch {
+	return func(ctx context.Context) (application.LinearTodoDispatchResult, error) {
+		ids, err := store.ListRunnableOnboardings(ctx, 1)
+		if err != nil {
+			return application.LinearTodoDispatchResult{}, errors.New("runnable onboarding discovery failed")
+		}
+		if len(ids) != 0 {
+			result, err := onboarding.Continue(ctx, ids[0])
+			if err != nil {
+				return application.LinearTodoDispatchResult{}, err
+			}
+			return application.LinearTodoDispatchResult{Outcome: "onboarding_" + string(result.Status), ScanDigest: application.ConfigurationEvidenceDigest("onboarding-worker-v1", result.OnboardingID, string(result.Status))}, nil
+		}
+		if fallback != nil {
+			return fallback(ctx)
+		}
+		return application.LinearTodoDispatchResult{Outcome: application.LinearTodoDispatchNoCandidate, ScanDigest: application.ConfigurationEvidenceDigest("onboarding-worker-idle-v1", "none")}, nil
+	}
 }
 
 func configureSchedulingAuthorities(store *sqlitestore.Store, loaded bootstrap.Bootstrap) error {

@@ -149,7 +149,7 @@ controller-authorized runtime observation, configuration generations/CAS,
 desired/effective convergence fencing, the first normal typed-change slice, and
 forward rollback, exact safe external-drift recovery, repository lifecycle,
 readiness, guarded retirement, zero-repository disabled-admission operation,
-and admission fencing are complete. Unsafe or ambiguous configuration
+admission fencing, and restart-safe existing-checkout onboarding are complete. Unsafe or ambiguous configuration
 repair remains deliberately out of scope. Do not create
 speculative TUI, HTTP, or frontend slices before their Controller contracts
 exist.
@@ -160,14 +160,17 @@ Bounded multi-repository concurrency, local operator authorization, operation
 receipts, legal-action offers, worker runtime observation, and configuration
 transaction/convergence authority, normal typed-change drafts, forward rollback,
 exact safe external-drift recovery, repository lifecycle/readiness, guarded
-retirement, and zero-repository disabled-admission operation are complete. The remaining
+retirement, zero-repository disabled-admission operation, and restart-safe
+existing-checkout onboarding are complete. The remaining
 presentation-independent sequence is:
 
-1. restart-safe onboarding saga;
-2. existing-checkout adoption;
-3. empty-repository initialization;
-4. routine Controller projections;
-5. activity and audit integrity.
+1. empty-repository initialization;
+2. routine Controller projections;
+3. activity and audit integrity.
+
+The persisted onboarding saga and existing-checkout adoption are complete.
+They leave every newly adopted repository `ready_disabled`; enablement remains
+a separate explicit operator action.
 
 These services own policy, authorization, idempotency, reconciliation, and
 sanitized evidence independently of presentation. GitHub repository creation,

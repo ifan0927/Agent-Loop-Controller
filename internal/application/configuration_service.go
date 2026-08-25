@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
@@ -553,6 +554,33 @@ func (s *ConfigurationService) CheckNewAdmission(ctx context.Context) (NewAdmiss
 	return decision, nil
 }
 
+// CheckNewAdmissionReadOnly proves the same exact desired/effective/live
+// boundary without reconciling, publishing drift, or advancing effective
+// authority. Preflight callers use it when observation itself must be pure.
+func (s *ConfigurationService) CheckNewAdmissionReadOnly(ctx context.Context) (NewAdmissionDecision, error) {
+	now := s.now().UTC()
+	authority, found, err := s.store.ConfigurationAuthority(ctx)
+	if err != nil || !found {
+		return NewAdmissionDecision{Allowed: false, Reason: ConfigurationReasonRuntimeUnknown}, nil
+	}
+	if authority.Incomplete != nil || authority.IncompleteRecovery != nil || authority.Desired.State != ConfigurationGenerationEffective || authority.EffectiveID != authority.Desired.GenerationID {
+		return NewAdmissionDecision{Allowed: false, Reason: ConfigurationReasonRestartRequired}, nil
+	}
+	if authority.CanonicalConfigPath != s.files.CanonicalConfigPath() || !s.files.HasRaw(authority.Desired.Digest, authority.Desired.Size) || s.runtime == nil {
+		return NewAdmissionDecision{Allowed: false, Reason: ConfigurationReasonRuntimeUnknown}, nil
+	}
+	runtime, err := s.runtime.ObserveConfigurationRuntime(ctx, now)
+	if err != nil || runtime.Liveness != RuntimeLivenessFresh || runtime.LoadedConfigurationDigest != authority.Desired.Digest || runtime.LastObservedAt == nil {
+		return NewAdmissionDecision{Allowed: false, Reason: ConfigurationReasonRuntimeUnknown}, nil
+	}
+	live, liveCandidate, liveErr := s.files.ReadLive()
+	desired, desiredErr := s.files.ReadRaw(authority.Desired.Digest, authority.Desired.Size)
+	if liveErr != nil || desiredErr != nil || liveCandidate.Digest != authority.Desired.Digest || !bytes.Equal(live, desired) {
+		return NewAdmissionDecision{Allowed: false, Reason: ConfigurationReasonExternalDrift}, nil
+	}
+	return NewAdmissionDecision{Allowed: true, Reason: ConfigurationReasonReady, Authority: ConfigurationAdmissionAuthority{GenerationID: authority.Desired.GenerationID, Digest: authority.Desired.Digest, AuthorityVersion: authority.Version, ValidThrough: runtime.LastObservedAt.UTC().Add(WorkerHeartbeatStaleAfter)}}, nil
+}
+
 func (s *ConfigurationService) History(ctx context.Context, requester Requester) ([]ConfigurationGeneration, error) {
 	if _, _, _, err := s.authorize(ctx, requester); err != nil {
 		return nil, err
@@ -655,6 +683,8 @@ func configurationApplyReceiptFor(expectedGenerationID int64, expectedDigest str
 	anchor := configurationDigest("configuration-apply", strconv.FormatInt(expectedGenerationID, 10), expectedDigest, candidate.Digest)
 	if provenance.Kind == ConfigurationApplyRollback {
 		anchor = configurationDigest("configuration-apply-v2", strconv.FormatInt(expectedGenerationID, 10), expectedDigest, candidate.Digest, string(provenance.Kind), strconv.FormatInt(provenance.RollbackSourceGenerationID, 10), provenance.RollbackSourceDigest)
+	} else if provenance.Kind == ConfigurationApplyOnboarding {
+		anchor = configurationDigest("configuration-apply-v3", strconv.FormatInt(expectedGenerationID, 10), expectedDigest, candidate.Digest, string(provenance.Kind), provenance.OnboardingSourceID, provenance.OnboardingSourceDigest)
 	}
 	return NewOperationReceipt(OperationReceiptInput{OperationType: OperationApplyConfiguration, Scope: ScopeController, TargetID: target.TargetID, Requester: requester.identity, RequestDigest: candidate.Digest, ExpectedAuthorityDigest: expectedDigest, OperationAnchorDigest: anchor, TargetBindingDigest: target.TargetBindingDigest, AcceptedAt: at})
 }
@@ -708,9 +738,11 @@ func normalizedConfigurationApplyProvenance(value ConfigurationApplyProvenance) 
 	}
 	switch value.Kind {
 	case ConfigurationApplyNormal:
-		return value, value.RollbackSourceGenerationID == 0 && value.RollbackSourceDigest == ""
+		return value, value.RollbackSourceGenerationID == 0 && value.RollbackSourceDigest == "" && value.OnboardingSourceID == "" && value.OnboardingSourceDigest == ""
 	case ConfigurationApplyRollback:
-		return value, value.RollbackSourceGenerationID > 0 && validAuthorityDigest(value.RollbackSourceDigest)
+		return value, value.RollbackSourceGenerationID > 0 && validAuthorityDigest(value.RollbackSourceDigest) && value.OnboardingSourceID == "" && value.OnboardingSourceDigest == ""
+	case ConfigurationApplyOnboarding:
+		return value, strings.HasPrefix(value.OnboardingSourceID, "onboarding-") && validAuthorityDigest(value.OnboardingSourceDigest) && value.RollbackSourceGenerationID == 0 && value.RollbackSourceDigest == ""
 	default:
 		return ConfigurationApplyProvenance{}, false
 	}
