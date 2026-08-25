@@ -8,10 +8,11 @@ import (
 )
 
 const (
-	WorkerHeartbeatLegacySchemaVersion = 1
-	WorkerHeartbeatSchemaVersion       = 2
-	WorkerHeartbeatCadence             = 15 * time.Second
-	WorkerHeartbeatStaleAfter          = 45 * time.Second
+	WorkerHeartbeatLegacySchemaVersion   = 1
+	WorkerHeartbeatPreviousSchemaVersion = 2
+	WorkerHeartbeatSchemaVersion         = 3
+	WorkerHeartbeatCadence               = 15 * time.Second
+	WorkerHeartbeatStaleAfter            = 45 * time.Second
 )
 
 type RuntimeLiveness string
@@ -71,6 +72,10 @@ type RuntimeHeartbeatEvidence struct {
 	Activity                     RuntimeActivity
 	PreviousActivity             RuntimeActivity
 	Cycles                       int
+	LastCycleOutcome             string
+	LastQueueDecisionReason      string
+	LastCycleCompletedAt         time.Time
+	NextAdmissionEvaluationAt    time.Time
 	ObservedAt                   time.Time
 	SupervisorProcessUnavailable bool
 	SupervisorProcessConflict    bool
@@ -107,6 +112,25 @@ type RuntimeObservation struct {
 	LastObservedAt            *time.Time               `json:"last_observed_at,omitempty"`
 	HeartbeatAgeSeconds       *int64                   `json:"heartbeat_age_seconds,omitempty"`
 	Reason                    RuntimeObservationReason `json:"reason"`
+	AdmissionCadence          RuntimeAdmissionCadence  `json:"admission_cadence"`
+}
+
+type RuntimeAdmissionCadenceState string
+
+const (
+	RuntimeAdmissionCadenceKnown   RuntimeAdmissionCadenceState = "known"
+	RuntimeAdmissionCadenceUnknown RuntimeAdmissionCadenceState = "unknown"
+)
+
+// RuntimeAdmissionCadence is a sanitized projection of worker-owned cadence.
+// Schema-v2 heartbeat files remain useful for liveness but cannot establish
+// these newer fields.
+type RuntimeAdmissionCadence struct {
+	State                     RuntimeAdmissionCadenceState `json:"state"`
+	LastCycleOutcome          string                       `json:"last_cycle_outcome,omitempty"`
+	LastQueueDecisionReason   string                       `json:"last_queue_decision_reason,omitempty"`
+	LastCycleCompletedAt      *time.Time                   `json:"last_cycle_completed_at,omitempty"`
+	NextAdmissionEvaluationAt *time.Time                   `json:"next_admission_evaluation_at,omitempty"`
 }
 
 type RuntimeObservationService struct {
@@ -189,6 +213,15 @@ func (s *RuntimeObservationService) classify(ctx context.Context, evidence Runti
 		observation.LoadedConfigurationDigest = evidence.LoadedConfigurationDigest
 	}
 	observation.LastObservedAt = runtimeObservedAt(evidence.ObservedAt)
+	if evidence.SchemaVersion == WorkerHeartbeatSchemaVersion {
+		observation.AdmissionCadence = RuntimeAdmissionCadence{
+			State:                     RuntimeAdmissionCadenceKnown,
+			LastCycleOutcome:          evidence.LastCycleOutcome,
+			LastQueueDecisionReason:   evidence.LastQueueDecisionReason,
+			LastCycleCompletedAt:      runtimeOptionalObservedAt(evidence.LastCycleCompletedAt),
+			NextAdmissionEvaluationAt: runtimeOptionalObservedAt(evidence.NextAdmissionEvaluationAt),
+		}
+	}
 	if evidence.ObservedAt.After(now) {
 		observation.Liveness = RuntimeLivenessConflict
 		observation.Reason = RuntimeReasonHeartbeatTimestampConflict
@@ -251,7 +284,7 @@ func (s *RuntimeObservationService) classify(ctx context.Context, evidence Runti
 }
 
 func runtimeObservation(liveness RuntimeLiveness, activity RuntimeActivity, reason RuntimeObservationReason) RuntimeObservation {
-	return RuntimeObservation{Liveness: liveness, Activity: activity, Reason: reason}
+	return RuntimeObservation{Liveness: liveness, Activity: activity, Reason: reason, AdmissionCadence: RuntimeAdmissionCadence{State: RuntimeAdmissionCadenceUnknown}}
 }
 
 func runtimeObservedAt(value time.Time) *time.Time {
@@ -259,12 +292,19 @@ func runtimeObservedAt(value time.Time) *time.Time {
 	return &observed
 }
 
-func validRuntimeHeartbeatEvidence(evidence RuntimeHeartbeatEvidence, legacy bool) bool {
-	expectedSchema := WorkerHeartbeatSchemaVersion
-	if legacy {
-		expectedSchema = WorkerHeartbeatLegacySchemaVersion
+func runtimeOptionalObservedAt(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
 	}
-	if evidence.SchemaVersion != expectedSchema || !safeRuntimeIdentity(evidence.WorkerInstanceID, 128) || evidence.ProcessID < 1 || !safeRuntimeIdentity(evidence.ProcessStartIdentity, 128) || evidence.Cycles < 0 || evidence.ObservedAt.IsZero() || !validRuntimeActivity(evidence.Activity) {
+	return runtimeObservedAt(value)
+}
+
+func validRuntimeHeartbeatEvidence(evidence RuntimeHeartbeatEvidence, legacy bool) bool {
+	validSchema := evidence.SchemaVersion == WorkerHeartbeatSchemaVersion || evidence.SchemaVersion == WorkerHeartbeatPreviousSchemaVersion
+	if legacy {
+		validSchema = evidence.SchemaVersion == WorkerHeartbeatLegacySchemaVersion
+	}
+	if !validSchema || !safeRuntimeIdentity(evidence.WorkerInstanceID, 128) || evidence.ProcessID < 1 || !safeRuntimeIdentity(evidence.ProcessStartIdentity, 128) || evidence.Cycles < 0 || evidence.ObservedAt.IsZero() || !validRuntimeActivity(evidence.Activity) {
 		return false
 	}
 	if evidence.PreviousActivity != "" && !validRuntimeActivity(evidence.PreviousActivity) {
@@ -273,7 +313,37 @@ func validRuntimeHeartbeatEvidence(evidence RuntimeHeartbeatEvidence, legacy boo
 	if legacy {
 		return evidence.BuildIdentity == "" && evidence.LoadedConfigurationDigest == ""
 	}
-	return safeRuntimeIdentity(evidence.BuildIdentity, 128) && validRuntimeDigest(evidence.LoadedConfigurationDigest)
+	if !safeRuntimeIdentity(evidence.BuildIdentity, 128) || !validRuntimeDigest(evidence.LoadedConfigurationDigest) {
+		return false
+	}
+	if evidence.SchemaVersion == WorkerHeartbeatPreviousSchemaVersion {
+		return evidence.LastCycleOutcome == "" && evidence.LastQueueDecisionReason == "" && evidence.LastCycleCompletedAt.IsZero() && evidence.NextAdmissionEvaluationAt.IsZero()
+	}
+	if evidence.LastCycleOutcome == "" {
+		return evidence.LastQueueDecisionReason == "" && evidence.LastCycleCompletedAt.IsZero()
+	}
+	return evidence.Cycles > 0 && ValidRuntimeCycleOutcome(evidence.LastCycleOutcome) && (evidence.LastQueueDecisionReason == "" || ValidRuntimeQueueDecisionReason(evidence.LastQueueDecisionReason)) && !evidence.LastCycleCompletedAt.IsZero()
+}
+
+func ValidRuntimeCycleOutcome(value string) bool {
+	switch value {
+	case LinearTodoDispatchNoCandidate, LinearTodoDispatchDriven, LinearTodoDispatchAttention, LinearTodoDispatchWaiting, LinearTodoDispatchRetryWait, LinearTodoDispatchRetryScheduled:
+		return true
+	default:
+		return false
+	}
+}
+
+func ValidRuntimeQueueDecisionReason(value string) bool {
+	switch value {
+	case LinearTodoQueueDecisionNoCandidate, LinearTodoQueueDecisionActiveRun, LinearTodoQueueDecisionIncompleteScan,
+		LinearTodoQueueDecisionSelectedPriority, LinearTodoQueueDecisionSchedulerAttention, LinearTodoQueueDecisionRetryAttention,
+		LinearTodoQueueDecisionCapacityFull, LinearTodoQueueDecisionAdmissionBusy, LinearTodoQueueDecisionNoEligibleCandidate,
+		LinearTodoQueueDecisionConfigurationFenced, QueueCandidateRepositoryIneligible:
+		return true
+	default:
+		return false
+	}
 }
 
 func validRuntimeActivity(activity RuntimeActivity) bool {

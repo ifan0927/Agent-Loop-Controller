@@ -23,16 +23,20 @@ const (
 )
 
 type workerStatusSnapshot struct {
-	SchemaVersion       int       `json:"schema_version"`
-	WorkerInstanceID    string    `json:"worker_instance_id"`
-	ProcessID           int       `json:"process_id"`
-	ProcessStartID      string    `json:"process_start_id"`
-	BuildIdentity       string    `json:"build_identity,omitempty"`
-	ConfigurationDigest string    `json:"loaded_configuration_digest,omitempty"`
-	Status              string    `json:"status"`
-	PreviousStatus      string    `json:"previous_status,omitempty"`
-	Cycles              int       `json:"cycles"`
-	ObservedAt          time.Time `json:"observed_at"`
+	SchemaVersion             int       `json:"schema_version"`
+	WorkerInstanceID          string    `json:"worker_instance_id"`
+	ProcessID                 int       `json:"process_id"`
+	ProcessStartID            string    `json:"process_start_id"`
+	BuildIdentity             string    `json:"build_identity,omitempty"`
+	ConfigurationDigest       string    `json:"loaded_configuration_digest,omitempty"`
+	Status                    string    `json:"status"`
+	PreviousStatus            string    `json:"previous_status,omitempty"`
+	Cycles                    int       `json:"cycles"`
+	ObservedAt                time.Time `json:"observed_at"`
+	LastCycleOutcome          string    `json:"last_cycle_outcome,omitempty"`
+	LastQueueDecisionReason   string    `json:"last_queue_decision_reason,omitempty"`
+	LastCycleCompletedAt      time.Time `json:"last_cycle_completed_at,omitempty"`
+	NextAdmissionEvaluationAt time.Time `json:"next_admission_evaluation_at,omitempty"`
 }
 
 type workerStatusReporter struct {
@@ -154,7 +158,11 @@ func (r *workerStatusReporter) Heartbeat() error {
 }
 
 func (r *workerStatusReporter) publishLatestLocked() error {
-	snapshot := workerStatusSnapshot{SchemaVersion: workerStatusSchemaVersion, WorkerInstanceID: r.instanceID, ProcessID: r.processID, ProcessStartID: r.processStartID, BuildIdentity: r.buildIdentity, ConfigurationDigest: r.configurationDigest, Status: r.latest.Status, PreviousStatus: r.latest.PreviousStatus, Cycles: r.latest.Cycles, ObservedAt: r.now().UTC()}
+	queueReason := ""
+	if r.latest.QueueDecision != nil {
+		queueReason = r.latest.QueueDecision.Reason
+	}
+	snapshot := workerStatusSnapshot{SchemaVersion: workerStatusSchemaVersion, WorkerInstanceID: r.instanceID, ProcessID: r.processID, ProcessStartID: r.processStartID, BuildIdentity: r.buildIdentity, ConfigurationDigest: r.configurationDigest, Status: r.latest.Status, PreviousStatus: r.latest.PreviousStatus, Cycles: r.latest.Cycles, ObservedAt: r.now().UTC(), LastCycleOutcome: r.latest.LastOutcome, LastQueueDecisionReason: queueReason, LastCycleCompletedAt: r.latest.LastCycleCompletedAt, NextAdmissionEvaluationAt: r.latest.NextAdmissionEvaluationAt}
 	if err := validateWorkerStatusSnapshot(snapshot); err != nil {
 		return err
 	}
@@ -255,14 +263,14 @@ func readWorkerStatusEvidence(configPath string, expectedUID int) (workerStatusS
 }
 
 func validateWorkerStatusSnapshot(snapshot workerStatusSnapshot) error {
-	if snapshot.SchemaVersion != workerStatusSchemaVersion && snapshot.SchemaVersion != application.WorkerHeartbeatLegacySchemaVersion || strings.TrimSpace(snapshot.WorkerInstanceID) == "" || snapshot.ProcessID < 1 || !validProcessStartIdentity(snapshot.ProcessStartID) || snapshot.Cycles < 0 || snapshot.ObservedAt.IsZero() {
+	if snapshot.SchemaVersion != workerStatusSchemaVersion && snapshot.SchemaVersion != application.WorkerHeartbeatPreviousSchemaVersion && snapshot.SchemaVersion != application.WorkerHeartbeatLegacySchemaVersion || strings.TrimSpace(snapshot.WorkerInstanceID) == "" || snapshot.ProcessID < 1 || !validProcessStartIdentity(snapshot.ProcessStartID) || snapshot.Cycles < 0 || snapshot.ObservedAt.IsZero() {
 		return errors.New("worker status snapshot is invalid")
 	}
 	if !validWorkerStatus(snapshot.Status) || snapshot.PreviousStatus != "" && !validWorkerStatus(snapshot.PreviousStatus) {
 		return errors.New("worker status snapshot is invalid")
 	}
 	if snapshot.SchemaVersion == application.WorkerHeartbeatLegacySchemaVersion {
-		if snapshot.BuildIdentity != "" || snapshot.ConfigurationDigest != "" {
+		if snapshot.BuildIdentity != "" || snapshot.ConfigurationDigest != "" || hasWorkerCadence(snapshot) {
 			return errors.New("worker status snapshot is invalid")
 		}
 		return nil
@@ -270,7 +278,26 @@ func validateWorkerStatusSnapshot(snapshot workerStatusSnapshot) error {
 	if !validWorkerBuildIdentity(snapshot.BuildIdentity) || !validWorkerConfigurationDigest(snapshot.ConfigurationDigest) {
 		return errors.New("worker status snapshot is invalid")
 	}
+	if snapshot.SchemaVersion == application.WorkerHeartbeatPreviousSchemaVersion {
+		if hasWorkerCadence(snapshot) {
+			return errors.New("worker status snapshot is invalid")
+		}
+		return nil
+	}
+	if snapshot.LastCycleOutcome == "" {
+		if snapshot.LastQueueDecisionReason != "" || !snapshot.LastCycleCompletedAt.IsZero() {
+			return errors.New("worker status snapshot is invalid")
+		}
+		return nil
+	}
+	if snapshot.Cycles < 1 || !application.ValidRuntimeCycleOutcome(snapshot.LastCycleOutcome) || snapshot.LastQueueDecisionReason != "" && !application.ValidRuntimeQueueDecisionReason(snapshot.LastQueueDecisionReason) || snapshot.LastCycleCompletedAt.IsZero() {
+		return errors.New("worker status snapshot is invalid")
+	}
 	return nil
+}
+
+func hasWorkerCadence(snapshot workerStatusSnapshot) bool {
+	return snapshot.LastCycleOutcome != "" || snapshot.LastQueueDecisionReason != "" || !snapshot.LastCycleCompletedAt.IsZero() || !snapshot.NextAdmissionEvaluationAt.IsZero()
 }
 
 func validProcessStartIdentity(value string) bool {
@@ -345,6 +372,10 @@ func (r workerHeartbeatReader) ReadRuntimeHeartbeat(ctx context.Context) (applic
 		Activity:                     application.RuntimeActivity(snapshot.Status),
 		PreviousActivity:             application.RuntimeActivity(snapshot.PreviousStatus),
 		Cycles:                       snapshot.Cycles,
+		LastCycleOutcome:             snapshot.LastCycleOutcome,
+		LastQueueDecisionReason:      snapshot.LastQueueDecisionReason,
+		LastCycleCompletedAt:         snapshot.LastCycleCompletedAt,
+		NextAdmissionEvaluationAt:    snapshot.NextAdmissionEvaluationAt,
 		ObservedAt:                   snapshot.ObservedAt,
 		SupervisorProcessUnavailable: r.supervisorProcessRequired && r.expectedProcessID < 1,
 		SupervisorProcessConflict:    r.supervisorProcessRequired && r.expectedProcessID > 0 && snapshot.ProcessID != r.expectedProcessID,

@@ -540,6 +540,22 @@ func (s *ConfigurationService) Projection(ctx context.Context, requester Request
 	return s.project(authority, runtime), nil
 }
 
+// ProjectionReadOnly classifies persisted authority, the exact live file, and
+// runtime evidence without reconciling or publishing any observation.
+func (s *ConfigurationService) ProjectionReadOnly(ctx context.Context, requester Requester, now time.Time) (ConfigurationConvergenceProjection, error) {
+	authority, _, _, err := s.authorize(ctx, requester)
+	if err != nil {
+		return ConfigurationConvergenceProjection{}, err
+	}
+	runtime := RuntimeObservation{Liveness: RuntimeLivenessUnknown, Activity: RuntimeActivityUnknown, Reason: RuntimeReasonHeartbeatUnavailable, AdmissionCadence: RuntimeAdmissionCadence{State: RuntimeAdmissionCadenceUnknown}}
+	if s.runtime != nil {
+		if observed, observeErr := s.runtime.ObserveConfigurationRuntime(ctx, now.UTC()); observeErr == nil {
+			runtime = observed
+		}
+	}
+	return s.project(authority, runtime), nil
+}
+
 func (s *ConfigurationService) CheckNewAdmission(ctx context.Context) (NewAdmissionDecision, error) {
 	now := s.now().UTC()
 	authority, runtime, err := s.ReconcileRuntime(ctx, now)

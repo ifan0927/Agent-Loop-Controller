@@ -199,8 +199,12 @@ restart-safe existing-checkout onboarding saga and restart-safe empty-repository
 initialization are also implemented. The latter derives a Controller-owned
 source checkout, creates one deterministic empty initial revision, and uses a
 guarded non-force host-SSH publication before reusing the shared
-`ready_disabled` tail. Unsafe or ambiguous configuration repair remains out of
-scope; routine Controller projections are the next operator foundation.
+`ready_disabled` tail. Versioned routine Controller application projections
+for Overview, runs and fixed delivery gates, queue, active attention,
+repositories, onboarding, and settings are also implemented; they are bounded,
+scope-authorized, sanitized, and side-effect free. Unsafe or ambiguous
+configuration repair remains out of scope; activity and audit integrity are the
+next operator foundation.
 The TUI and `agentctl operator` are planned, not current behavior. HTTP, a Web
 UI, outbound notifications, Hermes runtime integration, public API/webhook
 admission, and cross-repository transactions remain deferred or exploratory.

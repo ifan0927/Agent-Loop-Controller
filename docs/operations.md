@@ -959,7 +959,8 @@ includes `previous_status`. The active supervisor atomically replaces the privat
 each activity transition, and every fixed 15 seconds even while quiet or
 parked. The current schema binds the worker instance, PID, OS process-start
 identity, binary build identity, exact loaded configuration digest, sanitized
-activity, cycle metadata, and observation time. It stores no configuration
+activity, last completed cycle outcome, last queue-decision reason,
+worker-owned next admission evaluation, and observation time. It stores no configuration
 generation. Each publication uses a bounded exclusive mode-`0600` temporary
 leaf, complete write and fsync, and atomic replacement; routine heartbeats do
 not append logs or SQLite audit rows.
@@ -969,8 +970,10 @@ The controller-scope runtime observation classifies this evidence as `fresh`,
 Age through 45 seconds is fresh only when the live PID and exact process-start
 identity match; age over 45 seconds is stale. Missing processes, PID reuse,
 unsafe or invalid evidence, unavailable identity, and future timestamps fail
-closed to finite reasons. A schema-v1 activity snapshot remains recognizable
-legacy evidence but can never satisfy heartbeat freshness. LaunchAgent and
+closed to finite reasons. A schema-v2 heartbeat remains current
+liveness/activity evidence and projects the newer cadence fields as unknown. A
+schema-v1 activity snapshot remains recognizable legacy evidence but can never
+satisfy heartbeat freshness. LaunchAgent and
 LaunchDaemon status use this same observation and additionally require the
 heartbeat PID to match launchd's observed service PID. Their JSON does not
 expose PID, process-start identity, UID, heartbeat path, or raw file errors.
@@ -2342,6 +2345,13 @@ be `fresh`; workload activity is not runtime readiness.
 **Possible durable stop states**
 
 No controller run state change.
+
+Routine application queries are currently library contracts for the planned
+local operator adapter; they do not add public CLI routes. They read persisted
+queue, run, attention, repository, onboarding, and configuration evidence only.
+They never trigger Linear, GitHub, Git, verifier, credential, or readiness
+refreshes, and the settings convergence path performs no reconciliation or
+authority write.
 
 **Safety notes**
 

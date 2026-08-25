@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"time"
@@ -11,6 +12,100 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
+
+func (s *Store) ListAuthorizedOnboardings(ctx context.Context, input application.AuthorizedOnboardingQuery) (application.AuthorizedOnboardingPage, error) {
+	if input.Requester.Validate() != nil || input.Scopes.Empty() || input.Limit < 1 || input.Limit > application.RoutineQueryMaximumLimit+1 || input.BeforeUpdatedAt.IsZero() != (input.BeforeOnboardingID == "") {
+		return application.AuthorizedOnboardingPage{}, errors.New("authorized onboarding collection is invalid")
+	}
+	bindings := input.Scopes.RepositoryBindingDigests()
+	where := `(repository_binding_digest='' AND lower(requester_login)=lower(?) AND requester_database_id=? AND requester_node_id=? AND requester_actor_type=?)`
+	args := []any{input.Requester.Login, input.Requester.DatabaseID, input.Requester.NodeID, input.Requester.ActorType}
+	if len(bindings) != 0 {
+		where += ` OR repository_binding_digest IN (` + strings.TrimSuffix(strings.Repeat("?,", len(bindings)), ",") + `)`
+		for _, binding := range bindings {
+			args = append(args, binding)
+		}
+	}
+	where = `(` + where + `)`
+	if input.Repository != "" {
+		where += ` AND canonical_repository=?`
+		args = append(args, input.Repository)
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return application.AuthorizedOnboardingPage{}, err
+	}
+	defer tx.Rollback()
+	var total int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_onboardings WHERE `+where, args...).Scan(&total); err != nil {
+		return application.AuthorizedOnboardingPage{}, err
+	}
+	pageWhere := where
+	pageArgs := append([]any(nil), args...)
+	if !input.BeforeUpdatedAt.IsZero() {
+		pageWhere += ` AND (updated_at<? OR (updated_at=? AND onboarding_id<?))`
+		formatted := formatTime(input.BeforeUpdatedAt)
+		pageArgs = append(pageArgs, formatted, formatted, input.BeforeOnboardingID)
+	}
+	pageArgs = append(pageArgs, input.Limit)
+	rows, err := tx.QueryContext(ctx, `SELECT onboarding_id FROM repository_onboardings WHERE `+pageWhere+` ORDER BY updated_at DESC,onboarding_id DESC LIMIT ?`, pageArgs...)
+	if err != nil {
+		return application.AuthorizedOnboardingPage{}, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return application.AuthorizedOnboardingPage{}, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return application.AuthorizedOnboardingPage{}, err
+	}
+	page := application.AuthorizedOnboardingPage{Total: total}
+	for _, id := range ids {
+		value, found, err := onboardingByID(ctx, tx, id)
+		if err != nil || !found {
+			return application.AuthorizedOnboardingPage{}, fmt.Errorf("authorized onboarding snapshot conflicts")
+		}
+		value.CompletedSteps, err = onboardingCompletedSteps(ctx, tx, id)
+		if err != nil {
+			return application.AuthorizedOnboardingPage{}, err
+		}
+		page.Onboardings = append(page.Onboardings, value)
+	}
+	return page, tx.Commit()
+}
+
+func (s *Store) CurrentRepositoryOnboarding(ctx context.Context, repository string) (application.Onboarding, bool, error) {
+	if strings.TrimSpace(repository) == "" {
+		return application.Onboarding{}, false, errors.New("repository onboarding target is invalid")
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return application.Onboarding{}, false, err
+	}
+	defer tx.Rollback()
+	var id string
+	err = tx.QueryRowContext(ctx, `SELECT onboarding_id FROM repository_onboardings WHERE canonical_repository=? AND repository_binding_digest<>'' ORDER BY updated_at DESC,onboarding_id DESC LIMIT 1`, repository).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return application.Onboarding{}, false, nil
+	}
+	if err != nil {
+		return application.Onboarding{}, false, err
+	}
+	value, found, err := onboardingByID(ctx, tx, id)
+	if err != nil || !found {
+		return application.Onboarding{}, false, err
+	}
+	value.CompletedSteps, err = onboardingCompletedSteps(ctx, tx, id)
+	if err != nil {
+		return application.Onboarding{}, false, err
+	}
+	return value, true, tx.Commit()
+}
 
 const onboardingSelect = `SELECT onboarding_id,onboarding_kind,canonical_repository,private_input_digest,source_path_digest,request_digest,requester_login,requester_database_id,requester_node_id,requester_actor_type,base_generation_id,base_digest,configuration_authority_version,status,reason_code,preflight_digest,preview_digest,COALESCE(operation_id,''),profile_id,profile_digest,repository_binding_digest,configuration_generation_id,incarnation_id,readiness_snapshot_id,linear_label_id,initial_revision_sha,accepted_at,created_at,updated_at,settled_at FROM repository_onboardings`
 
