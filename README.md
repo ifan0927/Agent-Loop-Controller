@@ -195,9 +195,12 @@ normal typed-change draft/preview/apply slice and Controller-owned forward
 rollback, plus exact safe external-drift recovery with durable receipt replay
 and no new generation. Repository lifecycle, readiness, guarded retirement,
 zero-repository disabled-admission operation, admission fencing, and the
-restart-safe existing-checkout onboarding saga are also implemented. Unsafe or
-ambiguous configuration repair remains out of scope; empty-repository
-initialization is the next separate operator foundation.
+restart-safe existing-checkout onboarding saga and restart-safe empty-repository
+initialization are also implemented. The latter derives a Controller-owned
+source checkout, creates one deterministic empty initial revision, and uses a
+guarded non-force host-SSH publication before reusing the shared
+`ready_disabled` tail. Unsafe or ambiguous configuration repair remains out of
+scope; routine Controller projections are the next operator foundation.
 The TUI and `agentctl operator` are planned, not current behavior. HTTP, a Web
 UI, outbound notifications, Hermes runtime integration, public API/webhook
 admission, and cross-repository transactions remain deferred or exploratory.

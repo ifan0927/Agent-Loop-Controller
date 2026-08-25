@@ -58,7 +58,7 @@ func (o ReadinessObserver) ObserveRepositoryGit(ctx context.Context, profile Rea
 	remote, err := runner.Output(ctx, "git", "-C", profile.SourcePath, "remote", "get-url", "origin")
 	if err != nil {
 		local = repositoryGitResult(domain.ReadinessLocalCheckout, domain.RepositoryNotReady, "origin_binding_missing", profile, now)
-	} else if strings.TrimSpace(string(remote)) != profile.OriginPath {
+	} else if !sameOriginBinding(strings.TrimSpace(string(remote)), profile.OriginPath) {
 		local = repositoryGitResult(domain.ReadinessLocalCheckout, domain.RepositoryConflict, "origin_binding_conflict", profile, now)
 	}
 	if _, err := runner.Output(ctx, "git", "-C", profile.SourcePath, "show-ref", "--verify", "--quiet", "refs/heads/"+profile.BaseBranch); err != nil {

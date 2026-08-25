@@ -28,7 +28,7 @@ func (r *readinessRunner) Output(_ context.Context, program string, args ...stri
 }
 
 func TestReadinessObserverUsesOnlyReadOnlyGitArgv(t *testing.T) {
-	runner := &readinessRunner{outputs: [][]byte{[]byte("true\n"), []byte("https://github.com/owner/repo.git\n"), nil}, errors: make([]error, 3)}
+	runner := &readinessRunner{outputs: [][]byte{[]byte("true\n"), []byte("git@github.com:owner/repo.git\n"), nil}, errors: make([]error, 3)}
 	profile := ReadinessProfile{ProfileDigest: strings.Repeat("a", 64), RepositoryBindingDigest: strings.Repeat("b", 64), SourcePath: "/private/repo", OriginPath: "https://github.com/owner/repo.git", BaseBranch: "main"}
 	results, err := (ReadinessObserver{Runner: runner, Now: func() time.Time { return time.Date(2026, 8, 24, 1, 0, 0, 0, time.UTC) }}).ObserveRepositoryGit(context.Background(), profile)
 	if err != nil || results[0].Status != domain.RepositoryReady || results[1].Status != domain.RepositoryReady {

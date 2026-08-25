@@ -3,6 +3,7 @@ package configuration
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -22,7 +23,7 @@ func TestPrivateOnboardingInputReplaysWithoutProjectingSourcePath(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	input := domain.ExistingCheckoutOnboardingInput{SourcePath: filepath.Join(root, "checkout"), CanonicalRepository: "owner/repository", GitHubAppProfileRef: "github-app-profile:primary", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, LinearLabelSlug: "repository"}
+	input := domain.ExistingRepositoryOnboardingInput(domain.ExistingCheckoutOnboardingInput{SourcePath: filepath.Join(root, "checkout"), CanonicalRepository: "owner/repository", GitHubAppProfileRef: "github-app-profile:primary", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, LinearLabelSlug: "repository"})
 	digest := application.OnboardingPrivateInputDigest(input)
 	if err := files.Put("onboarding-private-input", input, digest); err != nil {
 		t.Fatal(err)
@@ -30,14 +31,43 @@ func TestPrivateOnboardingInputReplaysWithoutProjectingSourcePath(t *testing.T) 
 	if err := files.Put("onboarding-private-input", input, digest); err != nil {
 		t.Fatalf("exact replay failed: %v", err)
 	}
+	raw, err := os.ReadFile(filepath.Join(root, "authority", "onboarding", "onboarding-private-input", "input.json"))
+	if err != nil || bytes.Contains(raw, []byte(`"kind"`)) {
+		t.Fatalf("legacy private leaf changed: %q err=%v", raw, err)
+	}
 	loaded, err := files.Get("onboarding-private-input", digest)
-	if err != nil || loaded.SourcePath != input.SourcePath || loaded.CanonicalRepository != input.CanonicalRepository {
+	if err != nil || loaded.Kind != domain.OnboardingExistingCheckout || loaded.SourcePath != input.SourcePath || loaded.CanonicalRepository != input.CanonicalRepository {
 		t.Fatalf("loaded=%+v err=%v", loaded, err)
 	}
 	conflict := input
 	conflict.BaseBranch = "release"
 	if err := files.Put("onboarding-private-input", conflict, application.OnboardingPrivateInputDigest(conflict)); err == nil {
 		t.Fatal("conflicting private authority was accepted")
+	}
+}
+
+func TestEmptyOnboardingInputDerivesSourceAndPersistsClosedKind(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	configPath := filepath.Join(root, "controller.json")
+	if err := os.WriteFile(configPath, []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := files.DeriveManagedSource("owner/repository")
+	if err != nil || source != filepath.Join(root, "repositories", "owner--repository", "source") {
+		t.Fatalf("source=%q err=%v", source, err)
+	}
+	input := domain.ManagedEmptyRepositoryOnboardingInput(domain.EmptyRepositoryOnboardingInput{CanonicalRepository: "owner/repository", GitHubAppProfileRef: "github-app-profile:primary", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, LinearLabelSlug: "repository"}, source)
+	digest := application.OnboardingPrivateInputDigest(input)
+	if err := files.Put("onboarding-empty-input", input, digest); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := files.Get("onboarding-empty-input", digest)
+	if err != nil || loaded.Kind != domain.OnboardingEmptyRepository || loaded.SourcePath != source {
+		t.Fatalf("loaded=%+v err=%v", loaded, err)
 	}
 }
 
@@ -99,6 +129,10 @@ func TestOnboardingRootsArePrivateOwnedAndExactReplayOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	wantLegacyDigest := applicationDigest("onboarding-roots-v1", "onboarding-root-owner", "owner/repository", repositoryRoot, runRoot, worktreeRoot)
+	if first.EvidenceDigest != wantLegacyDigest {
+		t.Fatalf("legacy evidence digest=%q want=%q", first.EvidenceDigest, wantLegacyDigest)
+	}
 	replayed, err := EnsureOnboardingRoots(repositoryRoot, runRoot, worktreeRoot, "onboarding-root-owner", "owner/repository")
 	if err != nil || replayed.EvidenceDigest != first.EvidenceDigest {
 		t.Fatalf("replayed=%+v err=%v", replayed, err)
@@ -111,5 +145,27 @@ func TestOnboardingRootsArePrivateOwnedAndExactReplayOnly(t *testing.T) {
 	}
 	if _, err := EnsureOnboardingRoots(repositoryRoot, runRoot, worktreeRoot, "onboarding-other-owner", "owner/repository"); err == nil {
 		t.Fatal("root ownership conflict was accepted")
+	}
+}
+
+func TestEmptyOnboardingRootsBindManagedSourceWithoutCreatingCheckout(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	repositoryRoot := filepath.Join(root, "repositories", "owner--repository")
+	sourcePath := filepath.Join(repositoryRoot, "source")
+	runRoot := filepath.Join(repositoryRoot, "runs")
+	worktreeRoot := filepath.Join(repositoryRoot, "worktrees")
+	if err := InspectEmptyOnboardingPaths(repositoryRoot, sourcePath, runRoot, worktreeRoot, nil); err != nil {
+		t.Fatal(err)
+	}
+	created, err := EnsureEmptyOnboardingRoots(repositoryRoot, sourcePath, runRoot, worktreeRoot, "onboarding-empty-roots", "owner/repository")
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified, err := VerifyEmptyOnboardingRoots(repositoryRoot, sourcePath, runRoot, worktreeRoot, "onboarding-empty-roots", "owner/repository")
+	if err != nil || verified.EvidenceDigest != created.EvidenceDigest {
+		t.Fatalf("verified=%+v err=%v", verified, err)
+	}
+	if _, err := os.Lstat(sourcePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("managed source was created before its step: %v", err)
 	}
 }

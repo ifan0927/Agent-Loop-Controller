@@ -11,7 +11,8 @@ legacy LaunchAgent or LaunchDaemon.
 Production operation currently targets one local macOS user. Prepare:
 
 - Go version declared by [`go.mod`](../go.mod);
-- Git and a clean local source checkout for every configured repository;
+- Git and either a clean local source checkout or one existing empty GitHub
+  repository selected for Controller-managed initialization;
 - `ripgrep` with PCRE2 support for repository and retained-evidence scans;
 - a compatible authenticated Codex CLI available by a fixed executable name or
   canonical absolute path;
@@ -65,6 +66,11 @@ The default macOS controller root is:
   logs/                 private launchd worker logs, mode 0700
     worker.stdout.log   mode 0600
     worker.stderr.log   mode 0600
+  repositories/         Controller-owned onboarding roots, mode 0700
+    owner--repository/
+      source/            managed checkout for empty-repository onboarding
+      runs/              repository run/artifact root
+      worktrees/         isolated worktree root
 ```
 
 The GitHub App PEM is a separate protected regular file at the absolute path
@@ -380,7 +386,7 @@ duration syntax such as `30s`, `15m`, and `24h`.
 
 ### Normal operator commands
 
-### `onboarding existing open`, `preflight`, `preview`, `start`, `show`, `cancel`, and `resume`
+### `onboarding existing open`, `empty open`, `preflight`, `preview`, `start`, `show`, `cancel`, and `resume`
 
 Use this workflow to adopt one exact existing clean checkout without editing
 configuration or SQLite by hand:
@@ -395,6 +401,14 @@ agentctl onboarding existing open \
   --verifier-ids fixture-go-test \
   --linear-label-slug repository \
   <requester flags>
+agentctl onboarding empty open \
+  --request-id '<stable-id>' \
+  --repository owner/repository \
+  --github-app-profile github-app-profile:repository \
+  --base-branch main \
+  --verifier-ids fixture-go-test \
+  --linear-label-slug repository \
+  <requester flags>
 agentctl onboarding preflight '<onboarding-id>' <requester flags>
 agentctl onboarding preview '<onboarding-id>' <requester flags>
 agentctl onboarding start '<onboarding-id>' \
@@ -403,15 +417,26 @@ agentctl onboarding start '<onboarding-id>' \
 agentctl onboarding show '<onboarding-id>' <requester flags>
 ```
 
-`open` retains the exact absolute path only in private Controller authority;
-JSON projections and SQLite contain its digest. `preflight` is read-only: it
-requires a canonical owner-controlled non-symlink checkout at its exact Git
-top level, a clean selected base branch, no in-progress Git operation, an
-exact matching credential-free GitHub origin, and local HEAD equal to a
-bounded remote base-head read. It also verifies the selected App/profile,
-verifier IDs, non-overlapping Controller roots, and exact Linear team/label
-state. `preview` names the ordered effects and the final `ready_disabled`
-state without exposing paths, URLs, credentials, or raw external payloads.
+Existing-checkout `open` retains the exact absolute path only in private
+Controller authority; JSON projections and SQLite contain its digest. Empty-
+repository `open` accepts no source path, remote URL, SSH setting, commit
+metadata, or lifecycle intent. It derives one managed source beneath the
+Controller repository root and retains that path only in the same private
+closed input authority.
+
+`preflight` is read-only. Existing checkout validation requires a canonical
+owner-controlled non-symlink checkout at its exact Git top level, a clean
+selected base branch, no in-progress Git operation, an exact matching
+credential-free GitHub origin, and local HEAD equal to a bounded remote
+base-head read. Empty-repository validation proves that the managed source and
+roots do not exist or overlap another authority, proves the exact GitHub App
+repository, and runs bounded `git ls-remote --refs` against the canonical
+GitHub SSH remote; any advertised ref or unavailable read fails preflight.
+Both kinds verify the App/profile, verifier IDs, configuration authority, and
+exact Linear team/label state. `preview` names the selected kind, its exact
+ordered effects, retained progress, possible worker restart, and final
+`ready_disabled` state without exposing paths, URLs, credentials, SSH state,
+or raw external payloads.
 
 `start` requires both exact digests and reruns preflight before accepting the
 receipt. The worker then resumes the durable saga before normal issue
@@ -420,7 +445,13 @@ admission. A configuration addition intentionally produces
 operator-correctable waits expose `resume`; fix the named external condition
 and reuse that command. `cancel` is legal only before start. Reusing the same
 open/start/resume request replays persisted authority rather than duplicating
-effects. Partial roots, an already-created Linear label, and an applied
+effects. Empty-repository execution creates only an empty managed checkout and
+one deterministic `Initialize repository` root commit, then publishes only
+`refs/heads/<base>:refs/heads/<base>` without force. A restart or lost response
+re-reads all remote refs before retry: the exact intended base is adopted, an
+empty remote waits for explicit `resume`, divergence conflicts, and an
+unobservable outcome requires the bounded runbook. Partial roots, managed
+source, initial revision/base, an already-created Linear label, and an applied
 configuration are retained and reconciled; there is no implicit destructive
 rollback.
 

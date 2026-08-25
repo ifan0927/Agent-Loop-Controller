@@ -13,7 +13,7 @@ import (
 
 func onboardingCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: agentctl onboarding <existing|preflight|preview|start|show|cancel|resume> [options]")
+		return errors.New("usage: agentctl onboarding <existing|empty|preflight|preview|start|show|cancel|resume> [options]")
 	}
 	switch args[0] {
 	case "existing":
@@ -21,13 +21,48 @@ func onboardingCommand(args []string) error {
 			return errors.New("usage: agentctl onboarding existing open [options]")
 		}
 		return onboardingOpen(args[2:])
+	case "empty":
+		if len(args) < 2 || args[1] != "open" {
+			return errors.New("usage: agentctl onboarding empty open [options]")
+		}
+		return onboardingEmptyOpen(args[2:])
 	case "preflight", "preview", "show", "cancel", "resume":
 		return onboardingReadOrMutate(args[0], args[1:])
 	case "start":
 		return onboardingStart(args[1:])
 	default:
-		return errors.New("usage: agentctl onboarding <existing|preflight|preview|start|show|cancel|resume> [options]")
+		return errors.New("usage: agentctl onboarding <existing|empty|preflight|preview|start|show|cancel|resume> [options]")
 	}
+}
+
+func onboardingEmptyOpen(args []string) error {
+	flags := flag.NewFlagSet("onboarding empty open", flag.ContinueOnError)
+	requester := addRequesterFlags(flags)
+	configPath := configPathFlag(flags)
+	requestID := flags.String("request-id", "", "stable caller request identity")
+	repository := flags.String("repository", "", "expected canonical owner/repository")
+	githubProfile := flags.String("github-app-profile", "", "existing GitHub App profile reference")
+	baseBranch := flags.String("base-branch", "", "selected base branch")
+	verifiers := flags.String("verifier-ids", "", "comma-separated existing verifier IDs")
+	linearSlug := flags.String("linear-label-slug", "", "repository label slug without repo: prefix")
+	ciSlowThreshold := flags.Duration("ci-slow-threshold", 0, "optional CI slow threshold")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	verifierIDs := splitVerifierIDs(*verifiers)
+	if flags.NArg() != 0 || !requester.complete() || strings.TrimSpace(*requestID) == "" || strings.TrimSpace(*repository) == "" || strings.TrimSpace(*githubProfile) == "" || strings.TrimSpace(*baseBranch) == "" || len(verifierIDs) == 0 || strings.TrimSpace(*linearSlug) == "" {
+		return errors.New("complete empty-repository input and requester authority are required")
+	}
+	service, store, err := composeOnboardingCLIService(*configPath, false)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	result, err := service.OpenEmpty(context.Background(), application.EmptyRepositoryOnboardingOpenCommand{Requester: requester.value(), RequestID: *requestID, Input: domain.EmptyRepositoryOnboardingInput{CanonicalRepository: strings.ToLower(*repository), GitHubAppProfileRef: *githubProfile, BaseBranch: *baseBranch, VerifierIDs: verifierIDs, LinearLabelSlug: *linearSlug, CISlowThreshold: *ciSlowThreshold}})
+	if err != nil {
+		return err
+	}
+	return printJSON(result)
 }
 
 func onboardingOpen(args []string) error {

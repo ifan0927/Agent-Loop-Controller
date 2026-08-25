@@ -1171,7 +1171,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 37; migration history is code, not a
+inspection. The current schema is version 38; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees
@@ -1464,7 +1464,7 @@ workflow policy. It consumes bounded sanitized projections and only the legal
 actions offered by Controller application services. It is not a database
 administration tool, orchestrator, or second state machine.
 
-Repository onboarding remains a persisted Controller saga. A new-project flow
+Repository onboarding is a persisted Controller saga. A new-project flow
 begins from an existing empty GitHub repository, creates the managed local
 checkout and initial base revision, creates or adopts the exact Linear
 `repo:<slug>` label, validates the repository profile, applies configuration,
@@ -1473,19 +1473,28 @@ matching local checkout and GitHub origin without rewriting user-owned Git
 state. Partial progress is resumed or reconciled; external resources are not
 destructively rolled back by implication.
 
-The implemented existing-project saga persists only sanitized path and
-observation digests in SQLite. Before configuration apply, its exact absolute
-source path remains only in a private Controller-owned input leaf; the accepted
-managed repository profile then carries that path as configuration authority.
-Preflight is read-only across Git, GitHub, Linear, configuration, lifecycle,
-and readiness authority. Start rechecks the
-exact preflight before atomically accepting an onboarding operation receipt.
-Each later step records intent before effect and observed settlement after it:
-Controller roots, exact Linear label create/adopt, one source-bound
-configuration addition, fresh worker convergence, disabled lifecycle creation,
-complete readiness publication, then `ready_disabled`. A restart resumes the
-first unsettled step; failed external effects require an exact reread before
-retry, and partial progress is never implicitly rolled back.
+Both implemented kinds persist only sanitized path and observation digests in
+SQLite. Before configuration apply, an existing checkout path or derived
+managed source path remains only in a private Controller-owned, closed
+kind-discriminated input leaf. Preflight is read-only across local paths, Git,
+GitHub, Linear, configuration, lifecycle, and readiness authority. Start
+rechecks the exact preflight before atomically accepting an onboarding
+operation receipt.
+
+`existing_checkout` retains its seven-step topology and never mutates the
+user-owned checkout. `empty_repository` uses a ten-step topology: Controller
+roots, managed source creation, deterministic empty root revision, guarded
+initial-base publication, then the same Linear label, source-bound
+configuration addition, fresh worker convergence, disabled lifecycle,
+complete readiness, and settlement tail. The initial revision fixes the
+Controller author identity, empty tree, message, base branch, and accepted UTC
+second. Host Git transport uses the exact credential-free GitHub SSH remote and
+a plain non-force base refspec. Every push outcome is followed by a complete
+remote-ref reread and an exact GitHub App base-ref read before local
+remote-tracking settlement. A restart resumes the first unsettled kind-specific
+step; a proven published ref is adopted without another push, ambiguous or
+divergent evidence fails closed, and partial progress is never implicitly
+rolled back. Both kinds complete only as `ready_disabled`.
 
 GitHub repository creation, project templates, UI secret provisioning, GitHub
 approval or review resolution, general Linear issue editing, privileged helper
@@ -1519,7 +1528,7 @@ around it. The principal table groups are:
 | configuration generation, authority, apply/recovery-intent, and convergence tables | Immutable desired/effective metadata, one Controller-wide CAS mutation authority, crash reconciliation state, optional immutable rollback-source identity, and meaningful sanitized transitions; raw desired bytes remain outside SQLite and external bytes are never stored |
 | `configuration_drafts` | At most one active Controller-wide normal or rollback-origin typed draft, revision/edit replay authority, immutable rollback source when applicable, sanitized validation/preview evidence, and generation/receipt settlement; no raw candidate, path, identity, or credential authority |
 | repository lifecycle, readiness, recheck, and removal tables | Immutable incarnation history, one current canonical/profile/binding authority, complete readiness evidence, exclusive source-bound removal draft and accepted/applied/observed settlement, and tombstone evidence; no external-resource deletion authority |
-| repository onboarding and onboarding-step tables | One active canonical repository/source-path digest, sanitized preflight and preview bindings, ordered intent-before-effect settlements, partial-progress recovery, and final disabled incarnation/readiness evidence; exact source paths remain outside SQLite |
+| repository onboarding and onboarding-step tables | One active canonical repository/source-path digest, one of two closed kind-specific step plans, sanitized preflight/preview bindings and exact initial SHA, ordered intent-before-effect settlements, partial-progress recovery, and final disabled incarnation/readiness evidence; exact source paths and raw Git/remote output remain outside SQLite |
 
 ### Current state versus evidence
 
@@ -1627,9 +1636,11 @@ resolution is not approval, and an approval for an old head is stale.
   transactions.
 - Linear admission and completion observation are implemented, but completion
   remains external automation/human authority.
-- GitHub writes require a narrowly permissioned selected-repository App.
-- Unsafe or ambiguous configuration recovery, transactional repository
-  onboarding, the local TUI, optional HTTP/Web adapters,
+- GitHub API writes require a narrowly permissioned selected-repository App;
+  empty-repository base publication is the separate guarded host-SSH Git
+  transport described above.
+- Unsafe or ambiguous configuration recovery, routine Controller projections,
+  the local TUI, optional HTTP/Web adapters,
   notification transport, Hermes runtime integration, public API, webhooks,
   and multi-tenant authorization are not implemented.
 - External live E2E acceptance remains restricted to isolated fixture

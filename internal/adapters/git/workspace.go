@@ -127,6 +127,10 @@ func (w Workspace) hasStagedChanges(ctx context.Context, directory string) (bool
 }
 
 func (w Workspace) run(ctx context.Context, directory string, args ...string) (string, error) {
+	return w.runWithEnvironment(ctx, directory, nil, args...)
+}
+
+func (w Workspace) runWithEnvironment(ctx context.Context, directory string, environment []string, args ...string) (string, error) {
 	captureRoot, err := os.MkdirTemp("", "agentctl-git-")
 	if err != nil {
 		return "", gitCommandError{category: processadapter.FailureArtifactSetup}
@@ -146,7 +150,7 @@ func (w Workspace) run(ctx context.Context, directory string, args ...string) (s
 		StderrPath:           stderrPath,
 		MustNotExist:         []string{stdoutPath, stderrPath},
 		ExcludedEnv:          managedGitExcludedEnvironment,
-		Environment:          managedGitEnvironment,
+		Environment:          append(append([]string(nil), managedGitEnvironment...), environment...),
 		EnvironmentAllowlist: []string{"HOME"},
 	})
 	result = processadapter.NormalizeResult(result, runErr)

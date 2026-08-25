@@ -12,7 +12,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const onboardingSelect = `SELECT onboarding_id,onboarding_kind,canonical_repository,private_input_digest,source_path_digest,request_digest,requester_login,requester_database_id,requester_node_id,requester_actor_type,base_generation_id,base_digest,configuration_authority_version,status,reason_code,preflight_digest,preview_digest,COALESCE(operation_id,''),profile_id,profile_digest,repository_binding_digest,configuration_generation_id,incarnation_id,readiness_snapshot_id,linear_label_id,created_at,updated_at,settled_at FROM repository_onboardings`
+const onboardingSelect = `SELECT onboarding_id,onboarding_kind,canonical_repository,private_input_digest,source_path_digest,request_digest,requester_login,requester_database_id,requester_node_id,requester_actor_type,base_generation_id,base_digest,configuration_authority_version,status,reason_code,preflight_digest,preview_digest,COALESCE(operation_id,''),profile_id,profile_digest,repository_binding_digest,configuration_generation_id,incarnation_id,readiness_snapshot_id,linear_label_id,initial_revision_sha,accepted_at,created_at,updated_at,settled_at FROM repository_onboardings`
 
 func (s *Store) OpenOnboarding(ctx context.Context, input application.OnboardingOpenInput) (application.Onboarding, bool, error) {
 	if !validOnboardingOpen(input) {
@@ -77,6 +77,15 @@ func (s *Store) Onboarding(ctx context.Context, onboardingID string) (applicatio
 	}
 	steps, err := onboardingCompletedSteps(ctx, s.db, onboardingID)
 	value.CompletedSteps = steps
+	plan, ok := domain.OnboardingStepPlan(value.Kind)
+	if !ok || len(steps) > len(plan) {
+		return application.Onboarding{}, false, application.ErrOnboardingConflict
+	}
+	for index := range steps {
+		if steps[index] != plan[index] {
+			return application.Onboarding{}, false, application.ErrOnboardingConflict
+		}
+	}
 	return value, true, err
 }
 
@@ -147,7 +156,7 @@ func (s *Store) StartOnboarding(ctx context.Context, input application.Onboardin
 	if err := insertOperationReceiptTx(ctx, tx, input.Receipt, ""); err != nil {
 		return application.Onboarding{}, application.OperationReceipt{}, false, application.ErrOperationReceiptConflict
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE repository_onboardings SET status='accepted',preview_digest=?,operation_id=?,profile_id=?,profile_digest=?,repository_binding_digest=?,updated_at=? WHERE onboarding_id=? AND status='preflight_ready'`, input.PreviewDigest, input.Receipt.OperationID, input.Profile.ProfileID, input.Profile.ProfileDigest, input.Profile.RepositoryBindingDigest, formatTime(input.AcceptedAt), input.OnboardingID)
+	result, err := tx.ExecContext(ctx, `UPDATE repository_onboardings SET status='accepted',preview_digest=?,operation_id=?,profile_id=?,profile_digest=?,repository_binding_digest=?,accepted_at=?,updated_at=? WHERE onboarding_id=? AND status='preflight_ready'`, input.PreviewDigest, input.Receipt.OperationID, input.Profile.ProfileID, input.Profile.ProfileDigest, input.Profile.RepositoryBindingDigest, formatTime(input.AcceptedAt.UTC().Truncate(time.Second)), formatTime(input.AcceptedAt), input.OnboardingID)
 	if err != nil {
 		return application.Onboarding{}, application.OperationReceipt{}, false, err
 	}
@@ -199,8 +208,7 @@ func (s *Store) ResumeOnboarding(ctx context.Context, onboardingID string, at ti
 }
 
 func (s *Store) BeginOnboardingStep(ctx context.Context, input application.OnboardingStepIntent) (bool, error) {
-	order := onboardingStepOrder(input.Step)
-	if input.OnboardingID == "" || order == 0 || !validConfigurationDigest(input.IntentDigest) || input.IntendedAt.IsZero() {
+	if input.OnboardingID == "" || !validConfigurationDigest(input.IntentDigest) || input.IntendedAt.IsZero() {
 		return false, errors.New("onboarding step intent is invalid")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -211,6 +219,10 @@ func (s *Store) BeginOnboardingStep(ctx context.Context, input application.Onboa
 	current, found, err := onboardingByID(ctx, tx, input.OnboardingID)
 	if err != nil || !found {
 		return false, application.ErrOnboardingNotFound
+	}
+	order := onboardingStepOrder(current.Kind, input.Step)
+	if order == 0 {
+		return false, application.ErrOnboardingConflict
 	}
 	if current.Status != domain.OnboardingAccepted && current.Status != domain.OnboardingRunning || currentStepIndex(ctx, tx, input.OnboardingID)+1 != order {
 		return false, application.ErrOnboardingConflict
@@ -236,8 +248,7 @@ func (s *Store) BeginOnboardingStep(ctx context.Context, input application.Onboa
 }
 
 func (s *Store) SettleOnboardingStep(ctx context.Context, input application.OnboardingStepSettlement) (application.Onboarding, error) {
-	order := onboardingStepOrder(input.Step)
-	if input.OnboardingID == "" || order == 0 || input.ObservedAt.IsZero() || !validConfigurationDigest(input.Observation.EvidenceDigest) || input.Observation.Outcome == application.OperationOutcomePending && input.Observation.ReasonCode == "" {
+	if input.OnboardingID == "" || input.ObservedAt.IsZero() || !validConfigurationDigest(input.Observation.EvidenceDigest) || input.Observation.Outcome == application.OperationOutcomePending && input.Observation.ReasonCode == "" {
 		return application.Onboarding{}, errors.New("onboarding step settlement is invalid")
 	}
 	if input.Observation.LinearLabelID != "" && (input.Step != domain.OnboardingStepLinearLabelObserved || len(input.Observation.LinearLabelID) > 128 || strings.ContainsRune(input.Observation.LinearLabelID, '\x00')) || input.Step == domain.OnboardingStepLinearLabelObserved && input.Observation.Outcome == application.OperationOutcomeSucceeded && input.Observation.LinearLabelID == "" {
@@ -251,6 +262,16 @@ func (s *Store) SettleOnboardingStep(ctx context.Context, input application.Onbo
 	current, found, err := onboardingByID(ctx, tx, input.OnboardingID)
 	if err != nil || !found {
 		return application.Onboarding{}, application.ErrOnboardingNotFound
+	}
+	order := onboardingStepOrder(current.Kind, input.Step)
+	if order == 0 {
+		return application.Onboarding{}, application.ErrOnboardingConflict
+	}
+	if input.Observation.InitialRevisionSHA != "" && (input.Step != domain.OnboardingStepInitialRevisionCreated || input.Observation.Outcome != application.OperationOutcomeSucceeded || !validOnboardingSHA(input.Observation.InitialRevisionSHA)) || input.Step == domain.OnboardingStepInitialRevisionCreated && input.Observation.Outcome == application.OperationOutcomeSucceeded && !validOnboardingSHA(input.Observation.InitialRevisionSHA) {
+		return application.Onboarding{}, errors.New("onboarding initial revision settlement is invalid")
+	}
+	if input.Step == domain.OnboardingStepInitialBasePublished && input.Observation.Outcome == application.OperationOutcomeSucceeded && !validOnboardingSHA(current.InitialRevisionSHA) {
+		return application.Onboarding{}, application.ErrOnboardingConflict
 	}
 	var status, outcome, evidence string
 	if err := tx.QueryRowContext(ctx, `SELECT status,outcome,evidence_digest FROM repository_onboarding_steps WHERE onboarding_id=? AND step_name=? AND step_order=?`, input.OnboardingID, string(input.Step), order).Scan(&status, &outcome, &evidence); err != nil {
@@ -296,7 +317,7 @@ func (s *Store) SettleOnboardingStep(ctx context.Context, input application.Onbo
 	default:
 		return application.Onboarding{}, errors.New("onboarding step outcome is invalid")
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE repository_onboardings SET status=?,step_index=?,reason_code=?,profile_id=CASE WHEN ?<>'' THEN ? ELSE profile_id END,profile_digest=CASE WHEN ?<>'' THEN ? ELSE profile_digest END,repository_binding_digest=CASE WHEN ?<>'' THEN ? ELSE repository_binding_digest END,configuration_generation_id=CASE WHEN ?>0 THEN ? ELSE configuration_generation_id END,incarnation_id=CASE WHEN ?<>'' THEN ? ELSE incarnation_id END,readiness_snapshot_id=CASE WHEN ?<>'' THEN ? ELSE readiness_snapshot_id END,linear_label_id=CASE WHEN ?<>'' THEN ? ELSE linear_label_id END,updated_at=?,settled_at=? WHERE onboarding_id=?`, string(nextStatus), stepIndex, input.Observation.ReasonCode, input.Observation.ProfileID, input.Observation.ProfileID, input.Observation.ProfileDigest, input.Observation.ProfileDigest, input.Observation.RepositoryBindingDigest, input.Observation.RepositoryBindingDigest, input.Observation.ConfigurationGenerationID, input.Observation.ConfigurationGenerationID, input.Observation.IncarnationID, input.Observation.IncarnationID, input.Observation.ReadinessSnapshotID, input.Observation.ReadinessSnapshotID, input.Observation.LinearLabelID, input.Observation.LinearLabelID, formatTime(input.ObservedAt), settled, input.OnboardingID)
+	_, err = tx.ExecContext(ctx, `UPDATE repository_onboardings SET status=?,step_index=?,reason_code=?,profile_id=CASE WHEN ?<>'' THEN ? ELSE profile_id END,profile_digest=CASE WHEN ?<>'' THEN ? ELSE profile_digest END,repository_binding_digest=CASE WHEN ?<>'' THEN ? ELSE repository_binding_digest END,configuration_generation_id=CASE WHEN ?>0 THEN ? ELSE configuration_generation_id END,incarnation_id=CASE WHEN ?<>'' THEN ? ELSE incarnation_id END,readiness_snapshot_id=CASE WHEN ?<>'' THEN ? ELSE readiness_snapshot_id END,linear_label_id=CASE WHEN ?<>'' THEN ? ELSE linear_label_id END,initial_revision_sha=CASE WHEN ?<>'' THEN ? ELSE initial_revision_sha END,updated_at=?,settled_at=? WHERE onboarding_id=?`, string(nextStatus), stepIndex, input.Observation.ReasonCode, input.Observation.ProfileID, input.Observation.ProfileID, input.Observation.ProfileDigest, input.Observation.ProfileDigest, input.Observation.RepositoryBindingDigest, input.Observation.RepositoryBindingDigest, input.Observation.ConfigurationGenerationID, input.Observation.ConfigurationGenerationID, input.Observation.IncarnationID, input.Observation.IncarnationID, input.Observation.ReadinessSnapshotID, input.Observation.ReadinessSnapshotID, input.Observation.LinearLabelID, input.Observation.LinearLabelID, input.Observation.InitialRevisionSHA, input.Observation.InitialRevisionSHA, formatTime(input.ObservedAt), settled, input.OnboardingID)
 	if err != nil {
 		return application.Onboarding{}, err
 	}
@@ -377,8 +398,8 @@ func onboardingByID(ctx context.Context, query interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, id string) (application.Onboarding, bool, error) {
 	var value application.Onboarding
-	var kind, status, created, updated, settled string
-	err := query.QueryRowContext(ctx, onboardingSelect+` WHERE onboarding_id=?`, id).Scan(&value.OnboardingID, &kind, &value.CanonicalRepository, &value.PrivateInputDigest, &value.SourcePathDigest, &value.RequestDigest, &value.Requester.Login, &value.Requester.DatabaseID, &value.Requester.NodeID, &value.Requester.ActorType, &value.ConfigurationBaseGenerationID, &value.ConfigurationBaseDigest, &value.ConfigurationAuthorityVersion, &status, &value.ReasonCode, &value.PreflightDigest, &value.PreviewDigest, &value.OperationID, &value.ProfileID, &value.ProfileDigest, &value.RepositoryBindingDigest, &value.ConfigurationGenerationID, &value.IncarnationID, &value.ReadinessSnapshotID, &value.LinearLabelID, &created, &updated, &settled)
+	var kind, status, accepted, created, updated, settled string
+	err := query.QueryRowContext(ctx, onboardingSelect+` WHERE onboarding_id=?`, id).Scan(&value.OnboardingID, &kind, &value.CanonicalRepository, &value.PrivateInputDigest, &value.SourcePathDigest, &value.RequestDigest, &value.Requester.Login, &value.Requester.DatabaseID, &value.Requester.NodeID, &value.Requester.ActorType, &value.ConfigurationBaseGenerationID, &value.ConfigurationBaseDigest, &value.ConfigurationAuthorityVersion, &status, &value.ReasonCode, &value.PreflightDigest, &value.PreviewDigest, &value.OperationID, &value.ProfileID, &value.ProfileDigest, &value.RepositoryBindingDigest, &value.ConfigurationGenerationID, &value.IncarnationID, &value.ReadinessSnapshotID, &value.LinearLabelID, &value.InitialRevisionSHA, &accepted, &created, &updated, &settled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return application.Onboarding{}, false, nil
 	}
@@ -387,7 +408,7 @@ func onboardingByID(ctx context.Context, query interface {
 	}
 	value.Kind, value.Status = domain.OnboardingKind(kind), domain.OnboardingStatus(status)
 	value.Requester = domain.GitHubUserIdentity{Login: value.Requester.Login, DatabaseID: value.Requester.DatabaseID, NodeID: value.Requester.NodeID, ActorType: value.Requester.ActorType}
-	value.CreatedAt, value.UpdatedAt, value.SettledAt = parseTime(created), parseTime(updated), parseTime(settled)
+	value.AcceptedAt, value.CreatedAt, value.UpdatedAt, value.SettledAt = parseTime(accepted), parseTime(created), parseTime(updated), parseTime(settled)
 	return value, true, nil
 }
 
@@ -437,8 +458,12 @@ func currentStepIndex(ctx context.Context, query interface {
 	return index
 }
 
-func onboardingStepOrder(step domain.OnboardingStep) int {
-	for index, candidate := range domain.OnboardingOrderedSteps {
+func onboardingStepOrder(kind domain.OnboardingKind, step domain.OnboardingStep) int {
+	plan, ok := domain.OnboardingStepPlan(kind)
+	if !ok {
+		return 0
+	}
+	for index, candidate := range plan {
 		if candidate == step {
 			return index + 1
 		}
@@ -447,7 +472,20 @@ func onboardingStepOrder(step domain.OnboardingStep) int {
 }
 
 func validOnboardingOpen(input application.OnboardingOpenInput) bool {
-	return strings.HasPrefix(input.OnboardingID, "onboarding-") && input.Kind == domain.OnboardingExistingCheckout && strings.Count(input.CanonicalRepository, "/") == 1 && input.Requester.Validate() == nil && validConfigurationDigest(input.PrivateInputDigest) && validConfigurationDigest(input.SourcePathDigest) && validOnboardingPathClaims(input.SourcePathDigest, input.SourceAncestorDigests) && validConfigurationDigest(input.RequestDigest) && input.ConfigurationBaseGenerationID > 0 && validConfigurationDigest(input.ConfigurationBaseDigest) && input.ConfigurationAuthorityVersion > 0 && !input.OpenedAt.IsZero()
+	_, validKind := domain.OnboardingStepPlan(input.Kind)
+	return strings.HasPrefix(input.OnboardingID, "onboarding-") && validKind && strings.Count(input.CanonicalRepository, "/") == 1 && input.Requester.Validate() == nil && validConfigurationDigest(input.PrivateInputDigest) && validConfigurationDigest(input.SourcePathDigest) && validOnboardingPathClaims(input.SourcePathDigest, input.SourceAncestorDigests) && validConfigurationDigest(input.RequestDigest) && input.ConfigurationBaseGenerationID > 0 && validConfigurationDigest(input.ConfigurationBaseDigest) && input.ConfigurationAuthorityVersion > 0 && !input.OpenedAt.IsZero()
+}
+
+func validOnboardingSHA(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	for _, char := range value {
+		if !(char >= '0' && char <= '9' || char >= 'a' && char <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func validOnboardingPathClaims(source string, claims []string) bool {
