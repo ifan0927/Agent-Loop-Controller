@@ -155,7 +155,9 @@ func TestControllerWorkerSubprocessSIGTERMClosesCompleteRuntime(t *testing.T) {
 		stderr.Close()
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
+	// Race-instrumented subprocess startup can exceed five seconds on hosted
+	// runners while the full package suite is contending for CPU.
+	deadline := time.Now().Add(15 * time.Second)
 	var childPID int
 	for time.Now().Before(deadline) {
 		data, readErr := os.ReadFile(marker)
