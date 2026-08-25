@@ -149,8 +149,9 @@ controller-authorized runtime observation, configuration generations/CAS,
 desired/effective convergence fencing, the first normal typed-change slice, and
 forward rollback, exact safe external-drift recovery, repository lifecycle,
 readiness, guarded retirement, zero-repository disabled-admission operation,
-admission fencing, restart-safe existing-checkout onboarding, and guarded
-empty-repository initialization are complete. Unsafe or ambiguous configuration
+admission fencing, restart-safe existing-checkout onboarding, guarded
+empty-repository initialization, and the bounded routine Controller projection
+family are complete. Unsafe or ambiguous configuration
 repair remains deliberately out of scope. Do not create
 speculative TUI, HTTP, or frontend slices before their Controller contracts
 exist.
@@ -162,12 +163,11 @@ receipts, legal-action offers, worker runtime observation, and configuration
 transaction/convergence authority, normal typed-change drafts, forward rollback,
 exact safe external-drift recovery, repository lifecycle/readiness, guarded
 retirement, zero-repository disabled-admission operation, restart-safe
-existing-checkout onboarding, and guarded empty-repository initialization are
-complete. The remaining
+existing-checkout onboarding, guarded empty-repository initialization, and
+routine Controller projections are complete. The remaining
 presentation-independent sequence is:
 
-1. routine Controller projections;
-2. activity and audit integrity.
+1. activity and audit integrity.
 
 The persisted onboarding saga, existing-checkout adoption, and deterministic
 empty-repository initialization are complete. They leave every newly added

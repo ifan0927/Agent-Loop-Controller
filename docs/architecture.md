@@ -567,7 +567,7 @@ Worker runtime liveness is a separate application contract from workload
 activity and configuration convergence. After strict configuration, process
 lock, credential topology, SQLite compatibility, supervisor fencing,
 scheduling reconciliation, and production dispatcher construction succeed,
-the active supervisor publishes schema-v2 private heartbeat evidence
+the active supervisor publishes schema-v3 private heartbeat evidence
 immediately and on a fixed 15-second cadence. This is normally the automatic
 worker; the mutually exclusive manual `linear start` and `controller run`
 supervisors publish the same process-bound evidence for their own lifetime.
@@ -579,8 +579,11 @@ state and ordinary restart reconciliation remain recovery authority.
 
 The heartbeat atomically replaces the prior private telemetry leaf and binds
 the worker instance, PID, OS process-start identity, binary build identity,
-exact loaded configuration digest, sanitized activity, cycle metadata, and
-observation time. It is not an append-only audit stream. Schema-v1
+exact loaded configuration digest, sanitized activity, the last completed
+cycle outcome, last queue-decision reason, worker-owned next admission
+evaluation, and observation time. It is not an append-only audit stream.
+Schema-v2 remains valid for liveness and activity while its newer cadence
+fields project as unknown. Schema-v1
 activity-driven snapshots are finite legacy inputs and never current heartbeat
 evidence. The controller-authorized runtime observation service uses injected
 time plus a narrow process-identity observer to return `fresh`, `stale`,
@@ -1425,10 +1428,16 @@ application use cases and sanitized projections. It must not execute shell
 instructions, read Mac files directly, manufacture decisions/approval, or own
 workflow state.
 
-### Planned local operator interface boundary
+### Routine query and planned local operator interface boundary
 
-The planned routine local operator interface is a TUI over Controller-owned
-application contracts:
+The implemented routine query family is a versioned, bounded application
+contract for Controller Overview, queue, compact runs and fixed delivery gates,
+active attention, repositories, onboarding, and settings. Every query first
+authenticates the complete configured operator, applies scope before collection
+shape, and returns only allowlisted typed fields with sanitized response
+digests. Routine reads do not reconcile, refresh external systems, acknowledge
+attention, or advance workflow authority. The planned local operator interface
+is a TUI over these Controller-owned application contracts:
 
 ```text
 current CLI ----\
@@ -1639,7 +1648,7 @@ resolution is not approval, and an approval for an old head is stale.
 - GitHub API writes require a narrowly permissioned selected-repository App;
   empty-repository base publication is the separate guarded host-SSH Git
   transport described above.
-- Unsafe or ambiguous configuration recovery, routine Controller projections,
+- Unsafe or ambiguous configuration recovery, activity/audit integrity,
   the local TUI, optional HTTP/Web adapters,
   notification transport, Hermes runtime integration, public API, webhooks,
   and multi-tenant authorization are not implemented.

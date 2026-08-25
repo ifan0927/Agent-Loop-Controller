@@ -208,3 +208,28 @@ func TestRuntimeObservationProjectionDoesNotDisclosePrivateAuthority(t *testing.
 		}
 	}
 }
+
+func TestRuntimeObservationProjectsCurrentCadenceAndKeepsSchemaV2Unknown(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	evidence := currentRuntimeEvidence(now)
+	evidence.LastCycleOutcome = LinearTodoDispatchNoCandidate
+	evidence.LastQueueDecisionReason = LinearTodoQueueDecisionNoCandidate
+	evidence.LastCycleCompletedAt = now.Add(-time.Second)
+	evidence.NextAdmissionEvaluationAt = now.Add(time.Minute)
+	service, _, _, requester := runtimeObservationFixture(t, evidence, RuntimeHeartbeatCurrent, RuntimeProcessObservation{State: RuntimeProcessPresent, StartIdentity: evidence.ProcessStartIdentity})
+	observation, err := service.Observe(context.Background(), requester, now)
+	if err != nil || observation.AdmissionCadence.State != RuntimeAdmissionCadenceKnown || observation.AdmissionCadence.LastCycleOutcome != LinearTodoDispatchNoCandidate || observation.AdmissionCadence.LastQueueDecisionReason != LinearTodoQueueDecisionNoCandidate || observation.AdmissionCadence.NextAdmissionEvaluationAt == nil {
+		t.Fatalf("observation=%+v err=%v", observation, err)
+	}
+
+	evidence.SchemaVersion = WorkerHeartbeatPreviousSchemaVersion
+	evidence.LastCycleOutcome = ""
+	evidence.LastQueueDecisionReason = ""
+	evidence.LastCycleCompletedAt = time.Time{}
+	evidence.NextAdmissionEvaluationAt = time.Time{}
+	service, _, _, requester = runtimeObservationFixture(t, evidence, RuntimeHeartbeatCurrent, RuntimeProcessObservation{State: RuntimeProcessPresent, StartIdentity: evidence.ProcessStartIdentity})
+	observation, err = service.Observe(context.Background(), requester, now)
+	if err != nil || observation.Liveness != RuntimeLivenessFresh || observation.Activity != evidence.Activity || observation.AdmissionCadence.State != RuntimeAdmissionCadenceUnknown {
+		t.Fatalf("schema-v2 observation=%+v err=%v", observation, err)
+	}
+}

@@ -10,12 +10,14 @@ import (
 )
 
 type admissionWorkerResult struct {
-	Cycles         int
-	LastOutcome    string
-	QueueDecision  *application.LinearTodoQueueDecision
-	Stopped        string
-	Status         string
-	PreviousStatus string
+	Cycles                    int
+	LastOutcome               string
+	QueueDecision             *application.LinearTodoQueueDecision
+	Stopped                   string
+	Status                    string
+	PreviousStatus            string
+	LastCycleCompletedAt      time.Time
+	NextAdmissionEvaluationAt time.Time
 }
 
 const (
@@ -195,13 +197,19 @@ func runBoundedAdmissionWorkerAtObserved(ctx context.Context, once bool, poll ti
 		}
 		result.LastOutcome = cycle.Outcome
 		result.QueueDecision = cycle.QueueDecision
-		if cycle.Outcome == application.LinearTodoDispatchNoCandidate || cycle.QueueDecision != nil && cycle.QueueDecision.Reason == application.LinearTodoQueueDecisionNoEligibleCandidate {
-			nextAdmissionScan = now().UTC().Add(poll)
+		result.LastCycleCompletedAt = now().UTC()
+		if !once && (cycle.Outcome == application.LinearTodoDispatchNoCandidate || cycle.QueueDecision != nil && cycle.QueueDecision.Reason == application.LinearTodoQueueDecisionNoEligibleCandidate) {
+			nextAdmissionScan = result.LastCycleCompletedAt.Add(poll)
 		} else {
 			nextAdmissionScan = time.Time{}
 		}
 		if !cycle.NextRunnableAt.IsZero() && (nextWake.IsZero() || cycle.NextRunnableAt.Before(nextWake)) {
 			nextWake = cycle.NextRunnableAt
+		}
+		if once {
+			result.NextAdmissionEvaluationAt = time.Time{}
+		} else {
+			result.NextAdmissionEvaluationAt = earliestWorkerEvaluation(nextAdmissionScan, nextWake)
 		}
 		nextStatus := admissionWorkerStatus(cycle)
 		if bounded.active > 0 {
@@ -254,6 +262,20 @@ func runBoundedAdmissionWorkerAtObserved(ctx context.Context, once bool, poll ti
 			return result, nil
 		}
 	}
+}
+
+func earliestWorkerEvaluation(values ...time.Time) time.Time {
+	var earliest time.Time
+	for _, value := range values {
+		if value.IsZero() {
+			continue
+		}
+		value = value.UTC()
+		if earliest.IsZero() || value.Before(earliest) {
+			earliest = value
+		}
+	}
+	return earliest
 }
 
 func observeAdmissionWorker(observe admissionWorkerObserve, result admissionWorkerResult) error {

@@ -12,6 +12,81 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 )
 
+func (s *Store) ListRoutineAttentionCandidates(ctx context.Context, input application.RoutineAttentionCandidateQuery) ([]application.OperatorAttentionEvent, error) {
+	if input.Scopes.Empty() || input.Limit < 1 || input.Limit > 1001 {
+		return nil, errors.New("routine attention candidate query is invalid")
+	}
+	where := "1=1"
+	args := []any{}
+	switch input.Scope {
+	case application.ScopeController:
+		if !input.Scopes.HasController() {
+			return nil, errors.New("routine attention controller scope is invalid")
+		}
+	case application.ScopeRepository:
+		if input.TargetID == "" || input.RepositoryProfileID == "" || len(input.Scopes.RepositoryBindingDigests()) != 1 {
+			return nil, errors.New("routine attention repository scope is invalid")
+		}
+		where = "repository_profile_id=?"
+		args = append(args, input.RepositoryProfileID)
+	case application.ScopeRun:
+		if input.TargetID == "" {
+			return nil, errors.New("routine attention run scope is invalid")
+		}
+		var binding string
+		if err := s.db.QueryRowContext(ctx, `SELECT repository_binding_digest FROM runs WHERE run_id=?`, input.TargetID).Scan(&binding); err != nil || !input.Scopes.AllowsRun(input.TargetID, binding) {
+			return nil, application.ErrRunNotFound
+		}
+		where = "run_id=?"
+		args = append(args, input.TargetID)
+	default:
+		return nil, errors.New("routine attention scope is invalid")
+	}
+	args = append(args, input.Limit)
+	query := `SELECT event_key,payload_digest,schema_version,event_type,run_id,linear_identifier,repository_profile_id,repository_profile_name,controller_state,severity,reason_code,allowed_actions_json,evidence_digest,occurred_at,observed_at,legacy_payload_digest,legacy_delivery_status,retry_failure_class FROM (
+		SELECT event_key,payload_digest,schema_version,event_type,run_id,linear_identifier,repository_profile_id,repository_profile_name,controller_state,severity,reason_code,allowed_actions_json,evidence_digest,occurred_at,observed_at,legacy_payload_digest,legacy_delivery_status,retry_failure_class,
+		ROW_NUMBER() OVER (PARTITION BY event_type,run_id,linear_identifier,repository_profile_id ORDER BY occurred_at DESC,event_key DESC) AS routine_rank
+		FROM operator_attention_outbox WHERE ` + where + `
+	) WHERE routine_rank=1 LIMIT ?`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []application.OperatorAttentionEvent
+	for rows.Next() {
+		event, err := scanOperatorAttention(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, event)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) LatestQueueAttention(ctx context.Context, scopes application.AuthorizedScopeSet) (application.RoutineQueueAttention, bool, error) {
+	if !scopes.HasController() {
+		return application.RoutineQueueAttention{}, false, errors.New("routine queue attention scope is invalid")
+	}
+	var occurredAt, severity, eventType string
+	err := s.db.QueryRowContext(ctx, `SELECT occurred_at,severity,event_type FROM operator_attention_outbox WHERE event_type IN (?,?) ORDER BY occurred_at DESC,event_key DESC LIMIT 1`, application.OperatorAttentionCandidateScan, application.OperatorAttentionSchedulerLease).Scan(&occurredAt, &severity, &eventType)
+	if errors.Is(err, sql.ErrNoRows) {
+		return application.RoutineQueueAttention{}, false, nil
+	}
+	if err != nil {
+		return application.RoutineQueueAttention{}, false, err
+	}
+	observed := parseTime(occurredAt)
+	if observed.IsZero() {
+		return application.RoutineQueueAttention{}, false, errors.New("routine queue attention is corrupt")
+	}
+	reason := "candidate_scan_attention"
+	if eventType == application.OperatorAttentionSchedulerLease {
+		reason = "scheduler_attention"
+	}
+	return application.RoutineQueueAttention{OccurredAt: observed, Degraded: severity == "critical" || severity == "error", ReasonCode: reason}, true, nil
+}
+
 // AppendOperatorAttention inserts immutable local-only evidence. A repeated
 // key is safe only when its complete sanitized payload digest is identical.
 func (s *Store) AppendOperatorAttention(ctx context.Context, event application.OperatorAttentionEvent) (bool, error) {
