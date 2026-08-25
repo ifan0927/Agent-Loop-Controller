@@ -33,8 +33,10 @@ import (
 const schemaVersion = 37
 
 const (
-	sqliteMigrationRetryDelay  = 10 * time.Millisecond
-	sqliteMigrationRetryWindow = 5 * time.Second
+	sqliteMigrationRetryDelay = 10 * time.Millisecond
+	// The window bounds both schema work and lock retries. Receipt-table
+	// rebuilds under the race detector can exceed five seconds on hosted CI.
+	sqliteMigrationRetryWindow = 30 * time.Second
 )
 
 type Store struct {
