@@ -380,6 +380,54 @@ duration syntax such as `30s`, `15m`, and `24h`.
 
 ### Normal operator commands
 
+### `onboarding existing open`, `preflight`, `preview`, `start`, `show`, `cancel`, and `resume`
+
+Use this workflow to adopt one exact existing clean checkout without editing
+configuration or SQLite by hand:
+
+```sh
+agentctl onboarding existing open \
+  --request-id '<stable-id>' \
+  --source-path '/absolute/canonical/checkout' \
+  --repository owner/repository \
+  --github-app-profile github-app-profile:repository \
+  --base-branch main \
+  --verifier-ids fixture-go-test \
+  --linear-label-slug repository \
+  <requester flags>
+agentctl onboarding preflight '<onboarding-id>' <requester flags>
+agentctl onboarding preview '<onboarding-id>' <requester flags>
+agentctl onboarding start '<onboarding-id>' \
+  --preflight-digest '<digest>' --preview-digest '<digest>' \
+  <requester flags>
+agentctl onboarding show '<onboarding-id>' <requester flags>
+```
+
+`open` retains the exact absolute path only in private Controller authority;
+JSON projections and SQLite contain its digest. `preflight` is read-only: it
+requires a canonical owner-controlled non-symlink checkout at its exact Git
+top level, a clean selected base branch, no in-progress Git operation, an
+exact matching credential-free GitHub origin, and local HEAD equal to a
+bounded remote base-head read. It also verifies the selected App/profile,
+verifier IDs, non-overlapping Controller roots, and exact Linear team/label
+state. `preview` names the ordered effects and the final `ready_disabled`
+state without exposing paths, URLs, credentials, or raw external payloads.
+
+`start` requires both exact digests and reruns preflight before accepting the
+receipt. The worker then resumes the durable saga before normal issue
+admission. A configuration addition intentionally produces
+`worker_restart_required`; restart the managed worker, then use `show`. Other
+operator-correctable waits expose `resume`; fix the named external condition
+and reuse that command. `cancel` is legal only before start. Reusing the same
+open/start/resume request replays persisted authority rather than duplicating
+effects. Partial roots, an already-created Linear label, and an applied
+configuration are retained and reconciled; there is no implicit destructive
+rollback.
+
+Completion is `ready_disabled`, even when all readiness dimensions are ready.
+Inspect the repository projection and run `agentctl repository enable` with a
+new stable request ID only after deliberate operator approval.
+
 ### `repository list`, `inspect`, `recheck`, `enable`, `disable`, and `remove`
 
 **Purpose**
@@ -454,7 +502,7 @@ profiles, Linear labels/issues, credentials/references, and artifacts are not
 deleted. Removing the last repository is permitted only with automatic
 admission disabled; the worker then has no repository admission source. A
 configuration rollback does not restore the retired incarnation. Re-onboard
-the same canonical name through the future onboarding workflow to create a new
+the same canonical name through the onboarding workflow to create a new
 incarnation; never edit SQLite or configuration files to revive the tombstone.
 
 **Related commands**

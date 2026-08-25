@@ -31,7 +31,7 @@ var referencePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$`
 var githubOwnerPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$`)
 var githubRepositoryPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
 var githubAppProfilePattern = regexp.MustCompile(`^github-app-profile:[a-z0-9][a-z0-9._-]{0,63}$`)
-var linearLabelPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
+var linearLabelPattern = regexp.MustCompile(`^(?:repo:)?[a-z0-9][a-z0-9._-]{0,63}$`)
 
 type OperatorIdentityPolicy struct {
 	AllowedLogins []string               `json:"allowed_logins"`

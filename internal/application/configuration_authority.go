@@ -129,8 +129,9 @@ type ConfigurationGeneration struct {
 type ConfigurationApplyKind string
 
 const (
-	ConfigurationApplyNormal   ConfigurationApplyKind = "normal"
-	ConfigurationApplyRollback ConfigurationApplyKind = "rollback"
+	ConfigurationApplyNormal     ConfigurationApplyKind = "normal"
+	ConfigurationApplyRollback   ConfigurationApplyKind = "rollback"
+	ConfigurationApplyOnboarding ConfigurationApplyKind = "onboarding"
 )
 
 // ConfigurationApplyProvenance is Controller-derived intent evidence. The
@@ -140,13 +141,18 @@ type ConfigurationApplyProvenance struct {
 	Kind                       ConfigurationApplyKind
 	RollbackSourceGenerationID int64
 	RollbackSourceDigest       string
+	OnboardingSourceID         string
+	OnboardingSourceDigest     string
 }
 
 func (p ConfigurationApplyProvenance) Valid() bool {
 	if p.Kind == "" || p.Kind == ConfigurationApplyNormal {
-		return p.RollbackSourceGenerationID == 0 && p.RollbackSourceDigest == ""
+		return p.RollbackSourceGenerationID == 0 && p.RollbackSourceDigest == "" && p.OnboardingSourceID == "" && p.OnboardingSourceDigest == ""
 	}
-	return p.Kind == ConfigurationApplyRollback && p.RollbackSourceGenerationID > 0 && validAuthorityDigest(p.RollbackSourceDigest)
+	if p.Kind == ConfigurationApplyRollback {
+		return p.RollbackSourceGenerationID > 0 && validAuthorityDigest(p.RollbackSourceDigest) && p.OnboardingSourceID == "" && p.OnboardingSourceDigest == ""
+	}
+	return p.Kind == ConfigurationApplyOnboarding && strings.HasPrefix(p.OnboardingSourceID, "onboarding-") && validAuthorityDigest(p.OnboardingSourceDigest) && p.RollbackSourceGenerationID == 0 && p.RollbackSourceDigest == ""
 }
 
 type ConfigurationApplyIntent struct {

@@ -243,8 +243,9 @@ repository collections hide tombstones; historical runs, snapshots, attempts,
 receipts, configuration generations, audit evidence, local paths, credentials,
 and external GitHub/Linear resources are never deleted by retirement. A later
 configuration rollback cannot clear a tombstone. Reintroducing the same
-canonical repository through onboarding creates a new enabled incarnation with
-initial unknown readiness and inherits no prior readiness or lifecycle intent.
+canonical repository through onboarding creates a fresh disabled incarnation,
+publishes a fresh readiness snapshot, and inherits no prior readiness or
+lifecycle intent.
 
 ## 5. End-to-End Data Flow
 
@@ -1170,7 +1171,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 36; migration history is code, not a
+inspection. The current schema is version 37; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees
@@ -1443,8 +1444,8 @@ future HTTP ----------------------/
 
 Controller application services define authorization, legal-action offers,
 operation receipts, idempotency, and audit evidence independently of
-presentation; repository onboarding and configuration transactions remain
-later foundations. CLI, TUI, and any future HTTP adapter call the same typed
+presentation. Repository onboarding and configuration transactions use those
+same contracts. CLI, TUI, and any future HTTP adapter call the same typed
 services. A presentation adapter may
 authenticate, validate, bound, and render requests; it may not duplicate state
 transitions, authorization, scheduling, or external-write policy.
@@ -1471,6 +1472,20 @@ and observes worker readiness. An existing-project flow validates and adopts a
 matching local checkout and GitHub origin without rewriting user-owned Git
 state. Partial progress is resumed or reconciled; external resources are not
 destructively rolled back by implication.
+
+The implemented existing-project saga persists only sanitized path and
+observation digests in SQLite. Before configuration apply, its exact absolute
+source path remains only in a private Controller-owned input leaf; the accepted
+managed repository profile then carries that path as configuration authority.
+Preflight is read-only across Git, GitHub, Linear, configuration, lifecycle,
+and readiness authority. Start rechecks the
+exact preflight before atomically accepting an onboarding operation receipt.
+Each later step records intent before effect and observed settlement after it:
+Controller roots, exact Linear label create/adopt, one source-bound
+configuration addition, fresh worker convergence, disabled lifecycle creation,
+complete readiness publication, then `ready_disabled`. A restart resumes the
+first unsettled step; failed external effects require an exact reread before
+retry, and partial progress is never implicitly rolled back.
 
 GitHub repository creation, project templates, UI secret provisioning, GitHub
 approval or review resolution, general Linear issue editing, privileged helper
@@ -1504,6 +1519,7 @@ around it. The principal table groups are:
 | configuration generation, authority, apply/recovery-intent, and convergence tables | Immutable desired/effective metadata, one Controller-wide CAS mutation authority, crash reconciliation state, optional immutable rollback-source identity, and meaningful sanitized transitions; raw desired bytes remain outside SQLite and external bytes are never stored |
 | `configuration_drafts` | At most one active Controller-wide normal or rollback-origin typed draft, revision/edit replay authority, immutable rollback source when applicable, sanitized validation/preview evidence, and generation/receipt settlement; no raw candidate, path, identity, or credential authority |
 | repository lifecycle, readiness, recheck, and removal tables | Immutable incarnation history, one current canonical/profile/binding authority, complete readiness evidence, exclusive source-bound removal draft and accepted/applied/observed settlement, and tombstone evidence; no external-resource deletion authority |
+| repository onboarding and onboarding-step tables | One active canonical repository/source-path digest, sanitized preflight and preview bindings, ordered intent-before-effect settlements, partial-progress recovery, and final disabled incarnation/readiness evidence; exact source paths remain outside SQLite |
 
 ### Current state versus evidence
 

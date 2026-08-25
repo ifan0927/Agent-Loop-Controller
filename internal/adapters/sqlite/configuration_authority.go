@@ -264,6 +264,19 @@ func (s *Store) BeginConfigurationApply(ctx context.Context, input application.C
 			return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, application.ErrConfigurationAuthorityConflict
 		}
 	}
+	if input.Provenance.Kind == application.ConfigurationApplyOnboarding {
+		var status, requestDigest, baseDigest string
+		var baseGeneration int64
+		var stepIntent int
+		if err := tx.QueryRowContext(ctx, `SELECT o.status,o.request_digest,o.base_generation_id,o.base_digest,EXISTS(SELECT 1 FROM repository_onboarding_steps s WHERE s.onboarding_id=o.onboarding_id AND s.step_name='configuration_applied' AND s.status='intended' AND s.outcome='pending') FROM repository_onboardings o WHERE o.onboarding_id=?`, input.Provenance.OnboardingSourceID).Scan(&status, &requestDigest, &baseGeneration, &baseDigest, &stepIntent); err != nil || requestDigest != input.Provenance.OnboardingSourceDigest || baseGeneration != authority.Desired.GenerationID || baseDigest != authority.Desired.Digest || status != "accepted" && status != "running" || stepIntent != 1 {
+			return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, application.ErrConfigurationAuthorityConflict
+		}
+	} else {
+		var activeOnboarding int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_onboardings WHERE status IN ('accepted','running','waiting_for_operator')`).Scan(&activeOnboarding); err != nil || activeOnboarding != 0 {
+			return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, application.ErrConfigurationApplyInProgress
+		}
+	}
 	var pruneClaim int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM configuration_raw_prune_claims WHERE digest=?`, input.Candidate.Digest).Scan(&pruneClaim); err != nil {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, err
@@ -292,7 +305,7 @@ func (s *Store) BeginConfigurationApply(ctx context.Context, input application.C
 	if _, err := tx.ExecContext(ctx, `INSERT INTO configuration_apply_intents(generation_id,parent_generation_id,parent_digest,target_digest,operation_id,status,accepted_at) VALUES(?,?,?,?,?,'accepted',?)`, generationID, authority.Desired.GenerationID, authority.Desired.Digest, input.Candidate.Digest, input.Receipt.OperationID, formatTime(input.AcceptedAt)); err != nil {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, err
 	}
-	evidence := configurationEvidence("apply-accepted", generationID, input.Candidate.Digest, input.Receipt.OperationID, input.Provenance.RollbackSourceGenerationID, input.Provenance.RollbackSourceDigest)
+	evidence := configurationEvidence("apply-accepted", generationID, input.Candidate.Digest, input.Receipt.OperationID, input.Provenance.RollbackSourceGenerationID, input.Provenance.RollbackSourceDigest, input.Provenance.OnboardingSourceID, input.Provenance.OnboardingSourceDigest)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO configuration_convergence_events(event_type,generation_id,operation_id,digest,reason_code,evidence_digest,observed_at) VALUES('apply_accepted',?,?,?,?,?,?)`, generationID, input.Receipt.OperationID, input.Candidate.Digest, string(application.ConfigurationReasonApplyIncomplete), evidence, formatTime(input.AcceptedAt)); err != nil {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, err
 	}
@@ -753,7 +766,14 @@ func configurationGenerationMatchesProvenance(generation application.Configurati
 	if provenance.Kind == application.ConfigurationApplyNormal {
 		return generation.RollbackSourceGenerationID == 0 && generation.RollbackSourceDigest == ""
 	}
-	return generation.RollbackSourceGenerationID == provenance.RollbackSourceGenerationID && generation.RollbackSourceDigest == provenance.RollbackSourceDigest
+	if provenance.Kind == application.ConfigurationApplyRollback {
+		return generation.RollbackSourceGenerationID == provenance.RollbackSourceGenerationID && generation.RollbackSourceDigest == provenance.RollbackSourceDigest
+	}
+	// Onboarding provenance is bound by the exact deterministic operation
+	// receipt replay above and by the source saga in the acceptance transaction.
+	// It intentionally does not add columns to the historical generation shape,
+	// so older readers remain forward-fenced by schema rather than scan layout.
+	return provenance.Kind == application.ConfigurationApplyOnboarding && generation.RollbackSourceGenerationID == 0 && generation.RollbackSourceDigest == ""
 }
 
 func validConfigurationMetadata(digest string, size int64, schema int) bool {

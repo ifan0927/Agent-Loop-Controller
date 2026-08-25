@@ -4,6 +4,7 @@ package configuration
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -16,7 +17,9 @@ import (
 	"syscall"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/bootstrap"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/localregistry"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
 const (
@@ -268,6 +271,169 @@ func (f *Files) ValidateRepositoryRemovalCandidate(base, candidate []byte, targe
 		return application.ValidatedConfigurationCandidate{}, errors.New("repository removal candidate changes protected configuration authority")
 	}
 	return candidateFromBootstrap(targetLoaded, len(candidate)), nil
+}
+
+// MaterializeRepositoryAddition appends one typed repository profile to the
+// exact current-schema base while preserving all unrelated configuration.
+func (f *Files) MaterializeRepositoryAddition(base []byte, repository localregistry.Repository) ([]byte, application.LocalRepository, error) {
+	baseLoaded, err := bootstrap.ValidateCurrentBytes(f.configPath, base)
+	if err != nil {
+		return nil, application.LocalRepository{}, err
+	}
+	canonical := repository.CanonicalName()
+	if baseLoaded.Registry.HasRepository(canonical) {
+		return nil, application.LocalRepository{}, errors.New("repository addition target already exists")
+	}
+	var document map[string]json.RawMessage
+	if err := decodeStrictRawDocument(base, &document); err != nil {
+		return nil, application.LocalRepository{}, err
+	}
+	var repositories []json.RawMessage
+	if err := json.Unmarshal(document["repositories"], &repositories); err != nil {
+		return nil, application.LocalRepository{}, errors.New("repository collection is invalid")
+	}
+	repositoryJSON, err := json.Marshal(repository)
+	if err != nil {
+		return nil, application.LocalRepository{}, err
+	}
+	repositories = append(repositories, repositoryJSON)
+	repositoriesJSON, err := json.Marshal(repositories)
+	if err != nil {
+		return nil, application.LocalRepository{}, err
+	}
+	document["repositories"] = repositoriesJSON
+	candidate, err := json.MarshalIndent(document, "", "  ")
+	if err != nil {
+		return nil, application.LocalRepository{}, err
+	}
+	candidate = append(candidate, '\n')
+	targetLoaded, err := bootstrap.ValidateCurrentBytes(f.configPath, candidate)
+	if err != nil {
+		return nil, application.LocalRepository{}, err
+	}
+	if len(targetLoaded.Registry.Bindings()) != len(baseLoaded.Registry.Bindings())+1 {
+		return nil, application.LocalRepository{}, errors.New("repository addition has an invalid collection delta")
+	}
+	baseAuthorities := candidateFromBootstrap(baseLoaded, len(base)).Repositories
+	targetAuthorities := candidateFromBootstrap(targetLoaded, len(candidate)).Repositories
+	for name, authority := range baseAuthorities {
+		if !reflect.DeepEqual(targetAuthorities[name], authority) {
+			return nil, application.LocalRepository{}, errors.New("repository addition changes unrelated repository authority")
+		}
+	}
+	baseProtected, err := protectedConfigurationDocument(base)
+	if err != nil {
+		return nil, application.LocalRepository{}, err
+	}
+	targetProtected, err := protectedConfigurationDocument(candidate)
+	if err != nil || !bytes.Equal(baseProtected, targetProtected) {
+		return nil, application.LocalRepository{}, errors.New("repository addition changes protected configuration authority")
+	}
+	profile, found, err := targetLoaded.Registry.RepositoryProfile(context.Background(), canonical)
+	if err != nil || !found {
+		return nil, application.LocalRepository{}, errors.New("repository addition profile is unavailable")
+	}
+	return candidate, profile.Profile, nil
+}
+
+func (f *Files) ValidateRepositoryAdditionCandidate(base, candidate []byte, expected application.LocalRepository) (application.ValidatedConfigurationCandidate, error) {
+	baseLoaded, err := bootstrap.ValidateCurrentBytes(f.configPath, base)
+	if err != nil {
+		return application.ValidatedConfigurationCandidate{}, err
+	}
+	targetLoaded, err := bootstrap.ValidateCurrentBytes(f.configPath, candidate)
+	if err != nil {
+		return application.ValidatedConfigurationCandidate{}, err
+	}
+	profile, found, err := targetLoaded.Registry.RepositoryProfile(context.Background(), expected.CanonicalRepository)
+	if err != nil || !found || profile.Profile.ProfileID != expected.ProfileID || profile.Profile.ProfileDigest != expected.ProfileDigest || profile.Profile.RepositoryBindingDigest != expected.RepositoryBindingDigest || len(targetLoaded.Registry.Bindings()) != len(baseLoaded.Registry.Bindings())+1 {
+		return application.ValidatedConfigurationCandidate{}, errors.New("repository addition authority conflicts")
+	}
+	baseAuthorities := candidateFromBootstrap(baseLoaded, len(base)).Repositories
+	targetAuthorities := candidateFromBootstrap(targetLoaded, len(candidate)).Repositories
+	delete(targetAuthorities, expected.CanonicalRepository)
+	if !reflect.DeepEqual(baseAuthorities, targetAuthorities) {
+		return application.ValidatedConfigurationCandidate{}, errors.New("repository addition changes unrelated repository authority")
+	}
+	baseProtected, err := protectedConfigurationDocument(base)
+	if err != nil {
+		return application.ValidatedConfigurationCandidate{}, err
+	}
+	targetProtected, err := protectedConfigurationDocument(candidate)
+	if err != nil || !bytes.Equal(baseProtected, targetProtected) {
+		return application.ValidatedConfigurationCandidate{}, errors.New("repository addition changes protected configuration authority")
+	}
+	return candidateFromBootstrap(targetLoaded, len(candidate)), nil
+}
+
+type onboardingPrivateInput struct {
+	Digest string                                 `json:"digest"`
+	Input  domain.ExistingCheckoutOnboardingInput `json:"input"`
+}
+
+func (f *Files) Put(onboardingID string, input domain.ExistingCheckoutOnboardingInput, expectedDigest string) error {
+	if !validOnboardingPrivateID(onboardingID) || input.Validate() != nil || application.OnboardingPrivateInputDigest(input) != expectedDigest {
+		return errors.New("private onboarding input is invalid")
+	}
+	root := filepath.Join(f.root, "onboarding")
+	if err := f.ensureRoots(); err != nil {
+		return errors.New("private onboarding authority is unavailable")
+	}
+	if err := ensurePrivateDirectory(root, f.uid); err != nil {
+		return errors.New("private onboarding authority is unsafe")
+	}
+	directory := filepath.Join(root, onboardingID)
+	if err := ensurePrivateDirectory(directory, f.uid); err != nil {
+		return errors.New("private onboarding authority is unsafe")
+	}
+	payload, err := json.Marshal(onboardingPrivateInput{Digest: expectedDigest, Input: input})
+	if err != nil {
+		return err
+	}
+	payload = append(payload, '\n')
+	path := filepath.Join(directory, "input.json")
+	if err := atomicPrivateWrite(path, payload, f.uid, true, nil); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return err
+		}
+		existing, readErr := readPrivateRegular(path, f.uid, 32<<10, true)
+		if readErr != nil || !bytes.Equal(existing, payload) {
+			return errors.New("private onboarding input conflicts")
+		}
+	}
+	return nil
+}
+
+func (f *Files) Get(onboardingID, expectedDigest string) (domain.ExistingCheckoutOnboardingInput, error) {
+	if !validOnboardingPrivateID(onboardingID) || !validDigest(expectedDigest) {
+		return domain.ExistingCheckoutOnboardingInput{}, errors.New("private onboarding input authority is invalid")
+	}
+	root := filepath.Join(f.root, "onboarding")
+	directory := filepath.Join(root, onboardingID)
+	if inspectPrivateDirectory(f.root, f.uid, true) != nil || inspectPrivateDirectory(root, f.uid, true) != nil || inspectPrivateDirectory(directory, f.uid, true) != nil {
+		return domain.ExistingCheckoutOnboardingInput{}, errors.New("private onboarding input authority is unsafe")
+	}
+	payload, err := readPrivateRegular(filepath.Join(directory, "input.json"), f.uid, 32<<10, true)
+	if err != nil {
+		return domain.ExistingCheckoutOnboardingInput{}, errors.New("private onboarding input is unavailable")
+	}
+	var stored onboardingPrivateInput
+	if decodeStrictRawDocument(payload, &stored) != nil || stored.Input.Validate() != nil || stored.Digest != expectedDigest || application.OnboardingPrivateInputDigest(stored.Input) != expectedDigest {
+		return domain.ExistingCheckoutOnboardingInput{}, errors.New("private onboarding input conflicts")
+	}
+	return stored.Input, nil
+}
+
+func validOnboardingPrivateID(value string) bool {
+	if !strings.HasPrefix(value, "onboarding-") || len(value) > 96 {
+		return false
+	}
+	for _, char := range value {
+		if !(char >= 'a' && char <= 'z' || char >= '0' && char <= '9' || char == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 func decodeStrictRawDocument(payload []byte, target any) error {

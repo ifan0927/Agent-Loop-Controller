@@ -471,6 +471,37 @@ func TestConfigurationServiceBaselineApplyReplayConvergenceAndDrift(t *testing.T
 	}
 }
 
+func TestConfigurationReadOnlyAdmissionCheckDoesNotAdvanceAuthority(t *testing.T) {
+	service, store, files, runtime, _ := configurationServiceFixture(t)
+	ctx := context.Background()
+	authority, err := service.Initialize(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	runtime.observation = freshConfigurationRuntime(authority.Desired.Digest, now)
+	if decision, err := service.CheckNewAdmission(ctx); err != nil || !decision.Allowed {
+		t.Fatalf("initial convergence decision=%+v err=%v", decision, err)
+	}
+	before, found, err := store.ConfigurationAuthority(ctx)
+	if err != nil || !found {
+		t.Fatalf("before=%+v found=%t err=%v", before, found, err)
+	}
+	for range 2 {
+		decision, err := service.CheckNewAdmissionReadOnly(ctx)
+		if err != nil || !decision.Allowed || decision.Authority.GenerationID != before.Desired.GenerationID || decision.Authority.Digest != before.Desired.Digest {
+			t.Fatalf("read-only decision=%+v err=%v", decision, err)
+		}
+	}
+	after, found, err := store.ConfigurationAuthority(ctx)
+	if err != nil || !found || after.Version != before.Version || after.Desired.GenerationID != before.Desired.GenerationID || after.EffectiveID != before.EffectiveID || after.Incomplete != nil || after.IncompleteRecovery != nil {
+		t.Fatalf("before=%+v after=%+v found=%t err=%v", before, after, found, err)
+	}
+	if !bytes.Equal(files.live, []byte("baseline configuration")) {
+		t.Fatal("read-only admission check changed live configuration")
+	}
+}
+
 func TestConfigurationApplyImmediatelyObservesAlreadyLoadedHistoricalDigest(t *testing.T) {
 	service, _, _, runtime, requester := configurationServiceFixture(t)
 	ctx := context.Background()

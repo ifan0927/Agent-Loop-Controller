@@ -139,15 +139,11 @@ func TestRepositoryRemovalPersistsIntentWaitsForObservationAndNeverResurrects(t 
 		t.Fatalf("rollback resurrected retired incarnation: %v", err)
 	}
 
-	if err := store.AdoptRepositoryLifecycleBaseline(ctx, application.RepositoryBaselineInput{Profiles: []application.RepositoryProfileAuthority{profile}, AdoptedAt: now.Add(17 * time.Second)}); err != nil {
-		t.Fatal(err)
-	}
-	reonboarded, err := store.RepositoryOperationAuthority(ctx, profile.Authority.Repository)
-	if err != nil || reonboarded.Lifecycle.IncarnationID == incarnationID || reonboarded.Lifecycle.Intent != application.RepositoryEnabled || reonboarded.Snapshot.ReasonCode != "initial_recheck_required" {
-		t.Fatalf("reonboarded=%+v err=%v", reonboarded, err)
+	if err := store.AdoptRepositoryLifecycleBaseline(ctx, application.RepositoryBaselineInput{Profiles: []application.RepositoryProfileAuthority{profile}, AdoptedAt: now.Add(17 * time.Second)}); !errors.Is(err, application.ErrRepositoryLifecycleConflict) {
+		t.Fatalf("repository was implicitly re-onboarded without accepted saga: %v", err)
 	}
 	var history int
-	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_lifecycles WHERE repository=?`, profile.Authority.Repository).Scan(&history); err != nil || history != 2 {
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_lifecycles WHERE repository=?`, profile.Authority.Repository).Scan(&history); err != nil || history != 1 {
 		t.Fatalf("history=%d err=%v", history, err)
 	}
 }

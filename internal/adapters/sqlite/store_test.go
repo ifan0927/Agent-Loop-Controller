@@ -937,6 +937,7 @@ func TestMigratesLegacyCodeRabbitApprovalColumnWithoutLosingApproval(t *testing.
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE automatic_retry_schedules`); err != nil {
 		t.Fatal(err)
 	}
+	removeOnboardingV37(t, store.db)
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE operator_attention_outbox`); err != nil {
 		t.Fatal(err)
 	}
@@ -948,7 +949,7 @@ func TestMigratesLegacyCodeRabbitApprovalColumnWithoutLosingApproval(t *testing.
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE operation_receipts`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36)`); err != nil {
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE trusted_review_feedback_conflicts`); err != nil {
@@ -980,6 +981,23 @@ func TestMigratesLegacyCodeRabbitApprovalColumnWithoutLosingApproval(t *testing.
 	}
 	if removed != 0 || preserved != 1 {
 		t.Fatalf("removed=%d preserved=%d", removed, preserved)
+	}
+}
+
+func removeOnboardingV37(t *testing.T, db *sql.DB) {
+	t.Helper()
+	for _, statement := range []string{
+		`DROP TRIGGER IF EXISTS repository_onboarding_configuration_exclusion`,
+		`DROP TRIGGER IF EXISTS configuration_draft_excludes_onboarding`,
+		`DROP TRIGGER IF EXISTS configuration_recovery_excludes_onboarding`,
+		`DROP TRIGGER IF EXISTS repository_removal_excludes_onboarding`,
+		`DROP TABLE IF EXISTS repository_onboarding_steps`,
+		`DROP TABLE IF EXISTS repository_onboarding_path_claims`,
+		`DROP TABLE IF EXISTS repository_onboardings`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
