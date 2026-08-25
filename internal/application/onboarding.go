@@ -42,9 +42,11 @@ type Onboarding struct {
 	IncarnationID                 string                        `json:"incarnation_id,omitempty"`
 	ReadinessSnapshotID           string                        `json:"readiness_snapshot_id,omitempty"`
 	LinearLabelID                 string                        `json:"linear_label_id,omitempty"`
+	InitialRevisionSHA            string                        `json:"initial_revision_sha,omitempty"`
 	CreatedAt                     time.Time                     `json:"created_at"`
 	UpdatedAt                     time.Time                     `json:"updated_at"`
 	SettledAt                     time.Time                     `json:"settled_at,omitempty"`
+	AcceptedAt                    time.Time                     `json:"-"`
 
 	Requester domain.GitHubUserIdentity `json:"-"`
 }
@@ -62,6 +64,7 @@ type OnboardingPreflight struct {
 
 type OnboardingPreview struct {
 	OnboardingID               string                  `json:"onboarding_id"`
+	Kind                       domain.OnboardingKind   `json:"kind,omitempty"`
 	CanonicalRepository        string                  `json:"canonical_repository"`
 	Policy                     OnboardingPolicyPreview `json:"policy"`
 	OrderedEffects             []domain.OnboardingStep `json:"ordered_effects"`
@@ -85,6 +88,12 @@ type OnboardingOpenCommand struct {
 	Requester Requester
 	RequestID string
 	Input     domain.ExistingCheckoutOnboardingInput
+}
+
+type EmptyRepositoryOnboardingOpenCommand struct {
+	Requester Requester
+	RequestID string
+	Input     domain.EmptyRepositoryOnboardingInput
 }
 
 type OnboardingCommand struct {
@@ -118,6 +127,7 @@ type OnboardingStepObservation struct {
 	IncarnationID             string
 	ReadinessSnapshotID       string
 	LinearLabelID             string
+	InitialRevisionSHA        string
 }
 
 type OnboardingOpenInput struct {
@@ -182,21 +192,26 @@ type OnboardingStore interface {
 }
 
 type OnboardingPrivateInputStore interface {
-	Put(string, domain.ExistingCheckoutOnboardingInput, string) error
-	Get(string, string) (domain.ExistingCheckoutOnboardingInput, error)
+	Put(string, domain.RepositoryOnboardingInput, string) error
+	Get(string, string) (domain.RepositoryOnboardingInput, error)
+}
+
+type OnboardingPathAuthority interface {
+	DeriveManagedSource(string) (string, error)
 }
 
 type OnboardingPreflightPort interface {
-	ObserveOnboardingPreflight(context.Context, domain.ExistingCheckoutOnboardingInput, ConfigurationAdmissionAuthority) (OnboardingPreflightEvidence, error)
+	ObserveOnboardingPreflight(context.Context, domain.RepositoryOnboardingInput, ConfigurationAdmissionAuthority) (OnboardingPreflightEvidence, error)
 }
 
 type OnboardingStepExecutor interface {
-	ExecuteOnboardingStep(context.Context, Onboarding, domain.ExistingCheckoutOnboardingInput, domain.OnboardingStep) (OnboardingStepObservation, error)
+	ExecuteOnboardingStep(context.Context, Onboarding, domain.RepositoryOnboardingInput, domain.OnboardingStep) (OnboardingStepObservation, error)
 }
 
 type OnboardingService struct {
 	store         OnboardingStore
 	private       OnboardingPrivateInputStore
+	paths         OnboardingPathAuthority
 	authorizer    *AuthorizationService
 	configuration *ConfigurationService
 	preflight     OnboardingPreflightPort
@@ -204,18 +219,14 @@ type OnboardingService struct {
 	now           func() time.Time
 }
 
-func NewOnboardingService(store OnboardingStore, private OnboardingPrivateInputStore, authorizer *AuthorizationService, configuration *ConfigurationService, preflight OnboardingPreflightPort, executor OnboardingStepExecutor) (*OnboardingService, error) {
-	if store == nil || private == nil || authorizer == nil || configuration == nil || preflight == nil {
+func NewOnboardingService(store OnboardingStore, private OnboardingPrivateInputStore, paths OnboardingPathAuthority, authorizer *AuthorizationService, configuration *ConfigurationService, preflight OnboardingPreflightPort, executor OnboardingStepExecutor) (*OnboardingService, error) {
+	if store == nil || private == nil || paths == nil || authorizer == nil || configuration == nil || preflight == nil {
 		return nil, errors.New("onboarding dependencies are required")
 	}
-	return &OnboardingService{store: store, private: private, authorizer: authorizer, configuration: configuration, preflight: preflight, executor: executor, now: func() time.Time { return time.Now().UTC() }}, nil
+	return &OnboardingService{store: store, private: private, paths: paths, authorizer: authorizer, configuration: configuration, preflight: preflight, executor: executor, now: func() time.Time { return time.Now().UTC() }}, nil
 }
 
 func (s *OnboardingService) Open(ctx context.Context, command OnboardingOpenCommand) (Onboarding, error) {
-	configured, err := s.authorizer.ResolveConfiguredRequester(command.Requester)
-	if err != nil {
-		return Onboarding{}, hiddenTargetError()
-	}
 	input := command.Input
 	input.CanonicalRepository = strings.ToLower(strings.TrimSpace(input.CanonicalRepository))
 	input.GitHubAppProfileRef = strings.TrimSpace(input.GitHubAppProfileRef)
@@ -223,16 +234,49 @@ func (s *OnboardingService) Open(ctx context.Context, command OnboardingOpenComm
 	input.LinearLabelSlug = strings.TrimSpace(input.LinearLabelSlug)
 	input.VerifierIDs = append([]string(nil), input.VerifierIDs...)
 	slices.Sort(input.VerifierIDs)
-	if strings.TrimSpace(command.RequestID) == "" || len(command.RequestID) > 128 || strings.ContainsRune(command.RequestID, '\x00') || input.Validate() != nil {
+	if input.Validate() != nil {
 		return Onboarding{}, serviceError(ErrorInvalidInput, "existing-checkout onboarding input is invalid", nil)
 	}
+	return s.open(ctx, command.Requester, command.RequestID, domain.ExistingRepositoryOnboardingInput(input))
+}
+
+func (s *OnboardingService) OpenEmpty(ctx context.Context, command EmptyRepositoryOnboardingOpenCommand) (Onboarding, error) {
+	input := command.Input
+	input.CanonicalRepository = strings.ToLower(strings.TrimSpace(input.CanonicalRepository))
+	input.GitHubAppProfileRef = strings.TrimSpace(input.GitHubAppProfileRef)
+	input.BaseBranch = strings.TrimSpace(input.BaseBranch)
+	input.LinearLabelSlug = strings.TrimSpace(input.LinearLabelSlug)
+	input.VerifierIDs = append([]string(nil), input.VerifierIDs...)
+	slices.Sort(input.VerifierIDs)
+	if input.Validate() != nil {
+		return Onboarding{}, serviceError(ErrorInvalidInput, "empty-repository onboarding input is invalid", nil)
+	}
+	derived, err := s.paths.DeriveManagedSource(input.CanonicalRepository)
+	if err != nil {
+		return Onboarding{}, serviceError(ErrorConflict, "managed source authority is unavailable", nil)
+	}
+	return s.open(ctx, command.Requester, command.RequestID, domain.ManagedEmptyRepositoryOnboardingInput(input, derived))
+}
+
+func (s *OnboardingService) open(ctx context.Context, requester Requester, requestID string, input domain.RepositoryOnboardingInput) (Onboarding, error) {
+	configured, err := s.authorizer.ResolveConfiguredRequester(requester)
+	if err != nil {
+		return Onboarding{}, hiddenTargetError()
+	}
+	if strings.TrimSpace(requestID) == "" || len(requestID) > 128 || strings.ContainsRune(requestID, '\x00') || input.Validate() != nil {
+		return Onboarding{}, serviceError(ErrorInvalidInput, "repository onboarding input is invalid", nil)
+	}
 	privateDigest := onboardingInputDigest(input)
-	identitySeedDigest := digestText("onboarding-identity-v1\x00" + command.RequestID + "\x00" + privateDigest + "\x00" + configured.Identity().NodeID)
+	identitySeed := "onboarding-identity-v2\x00" + requestID + "\x00" + string(input.Kind) + "\x00" + privateDigest + "\x00" + configured.Identity().NodeID
+	if input.Kind == domain.OnboardingExistingCheckout {
+		identitySeed = "onboarding-identity-v1\x00" + requestID + "\x00" + privateDigest + "\x00" + configured.Identity().NodeID
+	}
+	identitySeedDigest := digestText(identitySeed)
 	onboardingID := "onboarding-" + identitySeedDigest[:32]
 	if existing, found, lookupErr := s.store.Onboarding(ctx, onboardingID); lookupErr != nil {
 		return Onboarding{}, classifyOnboardingError(lookupErr)
 	} else if found {
-		if existing.Kind != domain.OnboardingExistingCheckout || existing.CanonicalRepository != input.CanonicalRepository || existing.PrivateInputDigest != privateDigest || !existing.Requester.Equal(configured.Identity()) {
+		if existing.Kind != input.Kind || existing.CanonicalRepository != input.CanonicalRepository || existing.PrivateInputDigest != privateDigest || !existing.Requester.Equal(configured.Identity()) {
 			return Onboarding{}, serviceError(ErrorConflict, "onboarding open authority changed", nil)
 		}
 		if err := s.private.Put(onboardingID, input, privateDigest); err != nil {
@@ -244,12 +288,16 @@ func (s *OnboardingService) Open(ctx context.Context, command OnboardingOpenComm
 	if err != nil || !admission.Allowed {
 		return Onboarding{}, serviceError(ErrorConflict, "configuration authority is unavailable for onboarding", err)
 	}
-	requestDigest := digestText("onboarding-open-v1\x00" + identitySeedDigest + "\x00" + admission.Authority.Digest + "\x00" + strconv.FormatInt(admission.Authority.GenerationID, 10))
+	requestSeed := "onboarding-open-v2\x00" + identitySeedDigest + "\x00" + string(input.Kind) + "\x00" + admission.Authority.Digest + "\x00" + strconv.FormatInt(admission.Authority.GenerationID, 10)
+	if input.Kind == domain.OnboardingExistingCheckout {
+		requestSeed = "onboarding-open-v1\x00" + identitySeedDigest + "\x00" + admission.Authority.Digest + "\x00" + strconv.FormatInt(admission.Authority.GenerationID, 10)
+	}
+	requestDigest := digestText(requestSeed)
 	if err := s.private.Put(onboardingID, input, privateDigest); err != nil {
 		return Onboarding{}, serviceError(ErrorConflict, "private onboarding input could not be retained", nil)
 	}
 	sourceDigest, ancestorDigests := onboardingSourcePathDigests(input.SourcePath)
-	opened, _, err := s.store.OpenOnboarding(ctx, OnboardingOpenInput{OnboardingID: onboardingID, Kind: domain.OnboardingExistingCheckout, CanonicalRepository: input.CanonicalRepository, Requester: configured.Identity(), PrivateInputDigest: privateDigest, SourcePathDigest: sourceDigest, SourceAncestorDigests: ancestorDigests, RequestDigest: requestDigest, ConfigurationBaseGenerationID: admission.Authority.GenerationID, ConfigurationBaseDigest: admission.Authority.Digest, ConfigurationAuthorityVersion: admission.Authority.AuthorityVersion, OpenedAt: s.now().UTC()})
+	opened, _, err := s.store.OpenOnboarding(ctx, OnboardingOpenInput{OnboardingID: onboardingID, Kind: input.Kind, CanonicalRepository: input.CanonicalRepository, Requester: configured.Identity(), PrivateInputDigest: privateDigest, SourcePathDigest: sourceDigest, SourceAncestorDigests: ancestorDigests, RequestDigest: requestDigest, ConfigurationBaseGenerationID: admission.Authority.GenerationID, ConfigurationBaseDigest: admission.Authority.Digest, ConfigurationAuthorityVersion: admission.Authority.AuthorityVersion, OpenedAt: s.now().UTC()})
 	if err != nil {
 		return Onboarding{}, classifyOnboardingError(err)
 	}
@@ -313,7 +361,14 @@ func (s *OnboardingService) Preview(ctx context.Context, command OnboardingComma
 	if threshold == 0 {
 		threshold = 20 * time.Minute
 	}
-	preview := OnboardingPreview{OnboardingID: onboarding.OnboardingID, CanonicalRepository: onboarding.CanonicalRepository, Policy: OnboardingPolicyPreview{GitHubAppProfileRef: input.GitHubAppProfileRef, BaseBranch: input.BaseBranch, VerifierIDs: append([]string(nil), input.VerifierIDs...), LinearLabel: "repo:" + input.LinearLabelSlug, CISlowThreshold: threshold.String()}, OrderedEffects: append([]domain.OnboardingStep(nil), domain.OnboardingOrderedSteps...), FinalState: domain.OnboardingReadyDisabled, RetainsPartialProgress: true, RollbackAvailable: false, WorkerRestartMayBeRequired: true, PreflightDigest: onboarding.PreflightDigest}
+	plan, ok := domain.OnboardingStepPlan(onboarding.Kind)
+	if !ok {
+		return OnboardingPreview{}, serviceError(ErrorConflict, "onboarding kind is invalid", nil)
+	}
+	preview := OnboardingPreview{OnboardingID: onboarding.OnboardingID, CanonicalRepository: onboarding.CanonicalRepository, Policy: OnboardingPolicyPreview{GitHubAppProfileRef: input.GitHubAppProfileRef, BaseBranch: input.BaseBranch, VerifierIDs: append([]string(nil), input.VerifierIDs...), LinearLabel: "repo:" + input.LinearLabelSlug, CISlowThreshold: threshold.String()}, OrderedEffects: plan, FinalState: domain.OnboardingReadyDisabled, RetainsPartialProgress: true, RollbackAvailable: false, WorkerRestartMayBeRequired: true, PreflightDigest: onboarding.PreflightDigest}
+	if onboarding.Kind == domain.OnboardingEmptyRepository {
+		preview.Kind = onboarding.Kind
+	}
 	raw, _ := json.Marshal(preview)
 	preview.PreviewDigest = digestText("onboarding-preview-v1\x00" + string(raw))
 	return preview, nil
@@ -430,9 +485,23 @@ func (s *OnboardingService) Continue(ctx context.Context, onboardingID string) (
 	if err != nil {
 		return Onboarding{}, serviceError(ErrorConflict, "private onboarding input is unavailable", nil)
 	}
-	for len(onboarding.CompletedSteps) < len(domain.OnboardingOrderedSteps) {
-		step := domain.OnboardingOrderedSteps[len(onboarding.CompletedSteps)]
-		intentDigest := digestText("onboarding-step-intent-v1\x00" + onboarding.OnboardingID + "\x00" + string(step) + "\x00" + onboarding.RequestDigest)
+	plan, ok := domain.OnboardingStepPlan(onboarding.Kind)
+	if !ok {
+		return Onboarding{}, serviceError(ErrorConflict, "onboarding kind is invalid", nil)
+	}
+	for len(onboarding.CompletedSteps) < len(plan) {
+		step := plan[len(onboarding.CompletedSteps)]
+		intentParts := "onboarding-step-intent-v2\x00" + onboarding.OnboardingID + "\x00" + string(onboarding.Kind) + "\x00" + string(step) + "\x00" + onboarding.RequestDigest
+		if onboarding.Kind == domain.OnboardingExistingCheckout {
+			intentParts = "onboarding-step-intent-v1\x00" + onboarding.OnboardingID + "\x00" + string(step) + "\x00" + onboarding.RequestDigest
+		}
+		if step == domain.OnboardingStepInitialRevisionCreated {
+			intentParts += "\x00" + onboarding.AcceptedAt.UTC().Truncate(time.Second).Format(time.RFC3339)
+		}
+		if step == domain.OnboardingStepInitialBasePublished {
+			intentParts += "\x00refs/heads/" + input.BaseBranch + "\x00" + onboarding.InitialRevisionSHA + "\x00empty-remote-v1"
+		}
+		intentDigest := digestText(intentParts)
 		if _, err := s.store.BeginOnboardingStep(ctx, OnboardingStepIntent{OnboardingID: onboarding.OnboardingID, Step: step, IntentDigest: intentDigest, IntendedAt: s.now().UTC()}); err != nil {
 			return Onboarding{}, classifyOnboardingError(err)
 		}
@@ -479,15 +548,19 @@ func (s *OnboardingService) authorized(ctx context.Context, command OnboardingCo
 	return onboarding, nil
 }
 
-func onboardingInputDigest(input domain.ExistingCheckoutOnboardingInput) string {
-	raw, _ := json.Marshal(struct {
-		SourcePath, Repository, Profile, Branch, Label, Threshold string
-		Verifiers                                                 []string
-	}{input.SourcePath, input.CanonicalRepository, input.GitHubAppProfileRef, input.BaseBranch, input.LinearLabelSlug, input.CISlowThreshold.String(), input.VerifierIDs})
-	return digestText("onboarding-private-input-v1\x00" + string(raw))
+func onboardingInputDigest(input domain.RepositoryOnboardingInput) string {
+	if input.Kind == domain.OnboardingExistingCheckout {
+		raw, _ := json.Marshal(struct {
+			SourcePath, Repository, Profile, Branch, Label, Threshold string
+			Verifiers                                                 []string
+		}{input.SourcePath, input.CanonicalRepository, input.GitHubAppProfileRef, input.BaseBranch, input.LinearLabelSlug, input.CISlowThreshold.String(), input.VerifierIDs})
+		return digestText("onboarding-private-input-v1\x00" + string(raw))
+	}
+	raw, _ := json.Marshal(input)
+	return digestText("onboarding-private-input-v2\x00" + string(raw))
 }
 
-func OnboardingPrivateInputDigest(input domain.ExistingCheckoutOnboardingInput) string {
+func OnboardingPrivateInputDigest(input domain.RepositoryOnboardingInput) string {
 	return onboardingInputDigest(input)
 }
 
@@ -509,7 +582,7 @@ func onboardingPreflightDigest(onboarding Onboarding, evidence OnboardingPreflig
 	return digestText("onboarding-preflight-v1\x00" + onboarding.OnboardingID + "\x00" + onboarding.PrivateInputDigest + "\x00" + evidence.EvidenceDigest + "\x00" + strconv.FormatInt(authority.GenerationID, 10) + "\x00" + authority.Digest + "\x00" + strconv.FormatInt(authority.AuthorityVersion, 10) + "\x00" + evidence.Profile.ProfileDigest + "\x00" + evidence.Profile.RepositoryBindingDigest)
 }
 
-func validOnboardingProfile(input domain.ExistingCheckoutOnboardingInput, profile LocalRepository) bool {
+func validOnboardingProfile(input domain.RepositoryOnboardingInput, profile LocalRepository) bool {
 	identitiesValid := (profile.ProfileDigest == "" && profile.RepositoryBindingDigest == "") || validAuthorityDigest(profile.ProfileDigest) && validAuthorityDigest(profile.RepositoryBindingDigest)
 	return profile.CanonicalRepository == input.CanonicalRepository && profile.SourcePath == input.SourcePath && profile.BaseBranch == input.BaseBranch && profile.GitHubAppProfileRef == input.GitHubAppProfileRef && profile.LinearLabel == "repo:"+input.LinearLabelSlug && slices.Equal(profile.VerifierIDs, input.VerifierIDs) && identitiesValid
 }
@@ -536,6 +609,12 @@ func onboardingStepFailureReason(step domain.OnboardingStep) string {
 	switch step {
 	case domain.OnboardingStepRootsCreated:
 		return "controller_roots_unavailable"
+	case domain.OnboardingStepManagedSourceCreated:
+		return "managed_source_unavailable"
+	case domain.OnboardingStepInitialRevisionCreated:
+		return "initial_revision_unavailable"
+	case domain.OnboardingStepInitialBasePublished:
+		return "initial_base_publication_unavailable"
 	case domain.OnboardingStepLinearLabelObserved:
 		return "linear_label_observation_failed"
 	case domain.OnboardingStepConfigurationApplied:

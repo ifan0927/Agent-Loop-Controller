@@ -367,11 +367,16 @@ func (f *Files) ValidateRepositoryAdditionCandidate(base, candidate []byte, expe
 }
 
 type onboardingPrivateInput struct {
+	Digest string                           `json:"digest"`
+	Input  domain.RepositoryOnboardingInput `json:"input"`
+}
+
+type onboardingPrivateInputV1 struct {
 	Digest string                                 `json:"digest"`
 	Input  domain.ExistingCheckoutOnboardingInput `json:"input"`
 }
 
-func (f *Files) Put(onboardingID string, input domain.ExistingCheckoutOnboardingInput, expectedDigest string) error {
+func (f *Files) Put(onboardingID string, input domain.RepositoryOnboardingInput, expectedDigest string) error {
 	if !validOnboardingPrivateID(onboardingID) || input.Validate() != nil || application.OnboardingPrivateInputDigest(input) != expectedDigest {
 		return errors.New("private onboarding input is invalid")
 	}
@@ -386,7 +391,14 @@ func (f *Files) Put(onboardingID string, input domain.ExistingCheckoutOnboarding
 	if err := ensurePrivateDirectory(directory, f.uid); err != nil {
 		return errors.New("private onboarding authority is unsafe")
 	}
-	payload, err := json.Marshal(onboardingPrivateInput{Digest: expectedDigest, Input: input})
+	var payload []byte
+	var err error
+	if input.Kind == domain.OnboardingExistingCheckout {
+		legacy := domain.ExistingCheckoutOnboardingInput{SourcePath: input.SourcePath, CanonicalRepository: input.CanonicalRepository, GitHubAppProfileRef: input.GitHubAppProfileRef, BaseBranch: input.BaseBranch, VerifierIDs: append([]string(nil), input.VerifierIDs...), LinearLabelSlug: input.LinearLabelSlug, CISlowThreshold: input.CISlowThreshold}
+		payload, err = json.Marshal(onboardingPrivateInputV1{Digest: expectedDigest, Input: legacy})
+	} else {
+		payload, err = json.Marshal(onboardingPrivateInput{Digest: expectedDigest, Input: input})
+	}
 	if err != nil {
 		return err
 	}
@@ -404,24 +416,40 @@ func (f *Files) Put(onboardingID string, input domain.ExistingCheckoutOnboarding
 	return nil
 }
 
-func (f *Files) Get(onboardingID, expectedDigest string) (domain.ExistingCheckoutOnboardingInput, error) {
+func (f *Files) Get(onboardingID, expectedDigest string) (domain.RepositoryOnboardingInput, error) {
 	if !validOnboardingPrivateID(onboardingID) || !validDigest(expectedDigest) {
-		return domain.ExistingCheckoutOnboardingInput{}, errors.New("private onboarding input authority is invalid")
+		return domain.RepositoryOnboardingInput{}, errors.New("private onboarding input authority is invalid")
 	}
 	root := filepath.Join(f.root, "onboarding")
 	directory := filepath.Join(root, onboardingID)
 	if inspectPrivateDirectory(f.root, f.uid, true) != nil || inspectPrivateDirectory(root, f.uid, true) != nil || inspectPrivateDirectory(directory, f.uid, true) != nil {
-		return domain.ExistingCheckoutOnboardingInput{}, errors.New("private onboarding input authority is unsafe")
+		return domain.RepositoryOnboardingInput{}, errors.New("private onboarding input authority is unsafe")
 	}
 	payload, err := readPrivateRegular(filepath.Join(directory, "input.json"), f.uid, 32<<10, true)
 	if err != nil {
-		return domain.ExistingCheckoutOnboardingInput{}, errors.New("private onboarding input is unavailable")
+		return domain.RepositoryOnboardingInput{}, errors.New("private onboarding input is unavailable")
 	}
 	var stored onboardingPrivateInput
-	if decodeStrictRawDocument(payload, &stored) != nil || stored.Input.Validate() != nil || stored.Digest != expectedDigest || application.OnboardingPrivateInputDigest(stored.Input) != expectedDigest {
-		return domain.ExistingCheckoutOnboardingInput{}, errors.New("private onboarding input conflicts")
+	if decodeStrictRawDocument(payload, &stored) == nil && stored.Input.Validate() == nil && stored.Digest == expectedDigest && application.OnboardingPrivateInputDigest(stored.Input) == expectedDigest {
+		return stored.Input, nil
 	}
-	return stored.Input, nil
+	var legacy onboardingPrivateInputV1
+	if decodeStrictRawDocument(payload, &legacy) == nil && legacy.Input.Validate() == nil {
+		converted := domain.ExistingRepositoryOnboardingInput(legacy.Input)
+		if legacy.Digest == expectedDigest && application.OnboardingPrivateInputDigest(converted) == expectedDigest {
+			return converted, nil
+		}
+	}
+	return domain.RepositoryOnboardingInput{}, errors.New("private onboarding input conflicts")
+}
+
+func (f *Files) DeriveManagedSource(repository string) (string, error) {
+	parts := strings.Split(repository, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || repository != strings.ToLower(repository) {
+		return "", errors.New("managed source repository authority is invalid")
+	}
+	name := strings.ReplaceAll(repository, "/", "--")
+	return filepath.Join(filepath.Dir(f.configPath), "repositories", name, "source"), nil
 }
 
 func validOnboardingPrivateID(value string) bool {

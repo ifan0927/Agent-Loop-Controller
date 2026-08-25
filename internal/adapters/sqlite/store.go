@@ -30,7 +30,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 37
+const schemaVersion = 38
 
 const (
 	sqliteMigrationRetryDelay = 10 * time.Millisecond
@@ -654,7 +654,13 @@ func migrateSQLite(ctx context.Context, db sqliteTransactioner, supportedVersion
 			existingVersion = 36
 		}
 		if supportedVersion >= 37 && existingVersion < 37 {
-			return migrateSQLiteV37Upgrade(ctx, db)
+			if err := migrateSQLiteV37Upgrade(ctx, db); err != nil {
+				return err
+			}
+			existingVersion = 37
+		}
+		if supportedVersion >= 38 && existingVersion < 38 {
+			return migrateSQLiteV38Upgrade(ctx, db)
 		}
 	}
 	return migrateSQLiteGeneric(ctx, db, supportedVersion)
@@ -756,6 +762,8 @@ func migrateSQLiteGeneric(ctx context.Context, db sqliteTransactioner, supported
 			statements = migrationV36
 		case 37:
 			statements = migrationV37
+		case 38:
+			statements = migrationV38
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -1753,6 +1761,145 @@ func migrateSQLiteV37Upgrade(ctx context.Context, db sqliteTransactioner) error 
 	var violations int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_foreign_key_check`).Scan(&violations); err != nil || violations != 0 {
 		return errors.New("schema 37 foreign key validation failed")
+	}
+	return nil
+}
+
+var migrationV38 = []string{
+	`DROP TRIGGER IF EXISTS repository_onboarding_configuration_exclusion`,
+	`DROP TRIGGER IF EXISTS configuration_draft_excludes_onboarding`,
+	`DROP TRIGGER IF EXISTS configuration_recovery_excludes_onboarding`,
+	`DROP TRIGGER IF EXISTS repository_removal_excludes_onboarding`,
+	`DROP INDEX IF EXISTS repository_onboarding_one_active_repository`,
+	`DROP INDEX IF EXISTS repository_onboarding_one_active_source`,
+	`DROP INDEX IF EXISTS repository_onboarding_runnable`,
+	`DROP INDEX IF EXISTS repository_onboarding_path_claim_digest`,
+	`ALTER TABLE repository_onboarding_steps RENAME TO repository_onboarding_steps_v37`,
+	`ALTER TABLE repository_onboarding_path_claims RENAME TO repository_onboarding_path_claims_v37`,
+	`ALTER TABLE repository_onboardings RENAME TO repository_onboardings_v37`,
+	`CREATE TABLE repository_onboardings (
+		onboarding_id TEXT PRIMARY KEY,
+		onboarding_kind TEXT NOT NULL CHECK(onboarding_kind IN ('existing_checkout','empty_repository')),
+		canonical_repository TEXT NOT NULL,
+		private_input_digest TEXT NOT NULL,
+		source_path_digest TEXT NOT NULL,
+		request_digest TEXT NOT NULL UNIQUE,
+		requester_login TEXT NOT NULL,
+		requester_database_id INTEGER NOT NULL,
+		requester_node_id TEXT NOT NULL,
+		requester_actor_type TEXT NOT NULL,
+		base_generation_id INTEGER NOT NULL,
+		base_digest TEXT NOT NULL,
+		configuration_authority_version INTEGER NOT NULL,
+		status TEXT NOT NULL CHECK(status IN ('opened','preflight_ready','cancelled','accepted','running','waiting_for_operator','conflict','ready_disabled')),
+		step_index INTEGER NOT NULL DEFAULT 0 CHECK(step_index BETWEEN 0 AND 10),
+		reason_code TEXT NOT NULL DEFAULT '',
+		preflight_digest TEXT NOT NULL DEFAULT '',
+		preflight_evidence_digest TEXT NOT NULL DEFAULT '',
+		preview_digest TEXT NOT NULL DEFAULT '',
+		operation_id TEXT REFERENCES operation_receipts(operation_id),
+		profile_id TEXT NOT NULL DEFAULT '',
+		profile_digest TEXT NOT NULL DEFAULT '',
+		repository_binding_digest TEXT NOT NULL DEFAULT '',
+		configuration_generation_id INTEGER NOT NULL DEFAULT 0,
+		incarnation_id TEXT NOT NULL DEFAULT '',
+		readiness_snapshot_id TEXT NOT NULL DEFAULT '',
+		linear_label_id TEXT NOT NULL DEFAULT '',
+		initial_revision_sha TEXT NOT NULL DEFAULT '' CHECK(initial_revision_sha='' OR length(initial_revision_sha) IN (40,64)),
+		accepted_at TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		settled_at TEXT NOT NULL DEFAULT ''
+	)`,
+	`INSERT INTO repository_onboardings(onboarding_id,onboarding_kind,canonical_repository,private_input_digest,source_path_digest,request_digest,requester_login,requester_database_id,requester_node_id,requester_actor_type,base_generation_id,base_digest,configuration_authority_version,status,step_index,reason_code,preflight_digest,preflight_evidence_digest,preview_digest,operation_id,profile_id,profile_digest,repository_binding_digest,configuration_generation_id,incarnation_id,readiness_snapshot_id,linear_label_id,initial_revision_sha,accepted_at,created_at,updated_at,settled_at)
+	 SELECT onboarding_id,onboarding_kind,canonical_repository,private_input_digest,source_path_digest,request_digest,requester_login,requester_database_id,requester_node_id,requester_actor_type,base_generation_id,base_digest,configuration_authority_version,status,step_index,reason_code,preflight_digest,preflight_evidence_digest,preview_digest,operation_id,profile_id,profile_digest,repository_binding_digest,configuration_generation_id,incarnation_id,readiness_snapshot_id,linear_label_id,'',CASE WHEN operation_id IS NULL THEN '' ELSE COALESCE((SELECT accepted_at FROM operation_receipts r WHERE r.operation_id=repository_onboardings_v37.operation_id),'') END,created_at,updated_at,settled_at FROM repository_onboardings_v37`,
+	`CREATE UNIQUE INDEX repository_onboarding_one_active_repository ON repository_onboardings(canonical_repository) WHERE status NOT IN ('cancelled','conflict','ready_disabled')`,
+	`CREATE UNIQUE INDEX repository_onboarding_one_active_source ON repository_onboardings(source_path_digest) WHERE status NOT IN ('cancelled','conflict','ready_disabled')`,
+	`CREATE INDEX repository_onboarding_runnable ON repository_onboardings(status,updated_at,onboarding_id)`,
+	`CREATE TABLE repository_onboarding_path_claims (
+		onboarding_id TEXT NOT NULL REFERENCES repository_onboardings(onboarding_id),
+		path_digest TEXT NOT NULL,
+		PRIMARY KEY(onboarding_id,path_digest)
+	)`,
+	`INSERT INTO repository_onboarding_path_claims SELECT * FROM repository_onboarding_path_claims_v37`,
+	`CREATE INDEX repository_onboarding_path_claim_digest ON repository_onboarding_path_claims(path_digest,onboarding_id)`,
+	`CREATE TABLE repository_onboarding_steps (
+		onboarding_id TEXT NOT NULL REFERENCES repository_onboardings(onboarding_id),
+		step_name TEXT NOT NULL CHECK(step_name IN ('roots_created','managed_source_created','initial_revision_created','initial_base_published','linear_label_observed','configuration_applied','configuration_converged','lifecycle_created','readiness_published','settled')),
+		step_order INTEGER NOT NULL CHECK(step_order BETWEEN 1 AND 10),
+		intent_digest TEXT NOT NULL,
+		status TEXT NOT NULL CHECK(status IN ('intended','observed')),
+		outcome TEXT NOT NULL CHECK(outcome IN ('pending','succeeded','failed','conflict','ambiguous')),
+		reason_code TEXT NOT NULL DEFAULT '',
+		evidence_digest TEXT NOT NULL DEFAULT '',
+		intended_at TEXT NOT NULL,
+		observed_at TEXT NOT NULL DEFAULT '',
+		PRIMARY KEY(onboarding_id,step_name),
+		UNIQUE(onboarding_id,step_order)
+	)`,
+	`INSERT INTO repository_onboarding_steps SELECT * FROM repository_onboarding_steps_v37`,
+	`DROP TABLE repository_onboarding_steps_v37`,
+	`DROP TABLE repository_onboarding_path_claims_v37`,
+	`DROP TABLE repository_onboardings_v37`,
+	`CREATE TRIGGER repository_onboarding_configuration_exclusion BEFORE INSERT ON repository_onboarding_steps
+		WHEN NEW.step_name='configuration_applied' AND (
+			EXISTS(SELECT 1 FROM configuration_drafts WHERE lifecycle IN ('open','applying','ambiguous')) OR
+			EXISTS(SELECT 1 FROM repository_removal_drafts WHERE lifecycle IN ('open','applying','ambiguous')) OR
+			EXISTS(SELECT 1 FROM configuration_apply_intents WHERE status IN ('accepted','ambiguous')) OR
+			EXISTS(SELECT 1 FROM configuration_recovery_intents WHERE status IN ('accepted','ambiguous')) OR
+			EXISTS(SELECT 1 FROM repository_onboardings o WHERE o.status IN ('accepted','running','waiting_for_operator') AND o.onboarding_id<>NEW.onboarding_id)
+		) BEGIN SELECT RAISE(ABORT,'configuration mutation is already active'); END`,
+	`CREATE TRIGGER configuration_draft_excludes_onboarding BEFORE INSERT ON configuration_drafts
+		WHEN EXISTS(SELECT 1 FROM repository_onboardings o WHERE o.status IN ('accepted','running','waiting_for_operator')) BEGIN SELECT RAISE(ABORT,'configuration mutation is already active'); END`,
+	`CREATE TRIGGER configuration_recovery_excludes_onboarding BEFORE INSERT ON configuration_recovery_intents
+		WHEN EXISTS(SELECT 1 FROM repository_onboardings o WHERE o.status IN ('accepted','running','waiting_for_operator')) BEGIN SELECT RAISE(ABORT,'configuration mutation is already active'); END`,
+	`CREATE TRIGGER repository_removal_excludes_onboarding BEFORE INSERT ON repository_removal_drafts
+		WHEN EXISTS(SELECT 1 FROM repository_onboardings o WHERE o.status IN ('accepted','running','waiting_for_operator')) BEGIN SELECT RAISE(ABORT,'configuration mutation is already active'); END`,
+}
+
+func migrateSQLiteV38Upgrade(ctx context.Context, db sqliteTransactioner) error {
+	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		return err
+	}
+	defer db.ExecContext(ctx, `PRAGMA foreign_keys = ON`)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var current int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&current); err != nil {
+		return err
+	}
+	if current >= 38 {
+		return tx.Commit()
+	}
+	if current != 37 {
+		return fmt.Errorf("empty repository onboarding migration requires schema 37, found %d", current)
+	}
+	if _, err := tx.ExecContext(ctx, `PRAGMA legacy_alter_table = ON`); err != nil {
+		return err
+	}
+	for _, statement := range migrationV38 {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("migrate schema to version 38: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,applied_at) VALUES(38,?)`, nowText()); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA legacy_alter_table = OFF`); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
+		return err
+	}
+	var violations int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_foreign_key_check`).Scan(&violations); err != nil || violations != 0 {
+		return errors.New("schema 38 foreign key validation failed")
 	}
 	return nil
 }

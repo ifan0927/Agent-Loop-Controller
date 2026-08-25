@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -184,7 +185,7 @@ func TestOnboardingV37MigrationPreservesV36AndAddsReceiptScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if version, err := store.SchemaVersion(context.Background()); err != nil || version != 37 {
+	if version, err := store.SchemaVersion(context.Background()); err != nil || version != schemaVersion {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	var tables int
@@ -196,5 +197,89 @@ func TestOnboardingV37MigrationPreservesV36AndAddsReceiptScope(t *testing.T) {
 	receipt := application.NewOperationReceipt(application.OperationReceiptInput{OperationType: application.OperationOnboardRepository, Scope: application.ScopeOnboarding, TargetID: "onboarding-migrated", Requester: requester, RequestDigest: strings.Repeat("a", 64), ExpectedAuthorityDigest: strings.Repeat("b", 64), OperationAnchorDigest: strings.Repeat("c", 64), TargetBindingDigest: strings.Repeat("d", 64), AcceptedAt: now})
 	if _, created, err := store.BeginOperationReceipt(context.Background(), receipt); err != nil || !created {
 		t.Fatalf("onboarding receipt created=%t err=%v", created, err)
+	}
+}
+
+func TestEmptyRepositoryOnboardingPersistsKindSpecificOrderAndInitialSHA(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 8, 25, 5, 0, 0, 123456789, time.UTC)
+	digest := func(character string) string { return strings.Repeat(character, 64) }
+	requester := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
+	input := application.OnboardingOpenInput{OnboardingID: "onboarding-empty-order", Kind: domain.OnboardingEmptyRepository, CanonicalRepository: "owner/empty", Requester: requester, PrivateInputDigest: digest("a"), SourcePathDigest: digest("b"), SourceAncestorDigests: []string{digest("0"), digest("b")}, RequestDigest: digest("c"), ConfigurationBaseGenerationID: 1, ConfigurationBaseDigest: digest("d"), ConfigurationAuthorityVersion: 1, OpenedAt: now}
+	opened, _, err := store.OpenOnboarding(ctx, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := store.SaveOnboardingPreflight(ctx, application.OnboardingPreflightInput{OnboardingID: opened.OnboardingID, ExpectedStatus: domain.OnboardingOpened, PreflightDigest: digest("e"), EvidenceDigest: digest("f"), ObservedAt: now.Add(time.Second)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := application.NewOperationReceipt(application.OperationReceiptInput{OperationType: application.OperationOnboardRepository, Scope: application.ScopeOnboarding, TargetID: opened.OnboardingID, Requester: requester, RequestDigest: opened.RequestDigest, ExpectedAuthorityDigest: opened.ConfigurationBaseDigest, OperationAnchorDigest: digest("1"), TargetBindingDigest: digest("2"), AcceptedAt: now.Add(2 * time.Second)})
+	started, _, _, err := store.StartOnboarding(ctx, application.OnboardingStartAcceptance{OnboardingID: opened.OnboardingID, Expected: ready, PreflightDigest: ready.PreflightDigest, PreviewDigest: digest("3"), Profile: application.LocalRepository{CanonicalRepository: opened.CanonicalRepository}, Receipt: receipt, AcceptedAt: receipt.AcceptedAt})
+	if err != nil || !started.AcceptedAt.Equal(receipt.AcceptedAt.UTC().Truncate(time.Second)) {
+		t.Fatalf("started=%+v err=%v", started, err)
+	}
+	if _, err := store.BeginOnboardingStep(ctx, application.OnboardingStepIntent{OnboardingID: opened.OnboardingID, Step: domain.OnboardingStepLinearLabelObserved, IntentDigest: digest("4"), IntendedAt: now.Add(3 * time.Second)}); !errors.Is(err, application.ErrOnboardingConflict) {
+		t.Fatalf("out-of-order step error=%v", err)
+	}
+	sha := strings.Repeat("1", 40)
+	for index, step := range domain.EmptyRepositoryOnboardingSteps[:4] {
+		if _, err := store.BeginOnboardingStep(ctx, application.OnboardingStepIntent{OnboardingID: opened.OnboardingID, Step: step, IntentDigest: digest(string(rune('5' + index))), IntendedAt: now.Add(time.Duration(3+index*2) * time.Second)}); err != nil {
+			t.Fatalf("begin %s: %v", step, err)
+		}
+		observation := application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "step_ready", EvidenceDigest: digest(string(rune('a' + index)))}
+		if step == domain.OnboardingStepInitialRevisionCreated {
+			observation.InitialRevisionSHA = sha
+		}
+		started, err = store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: opened.OnboardingID, Step: step, Observation: observation, ObservedAt: now.Add(time.Duration(4+index*2) * time.Second)})
+		if err != nil {
+			t.Fatalf("settle %s: %v", step, err)
+		}
+	}
+	if started.InitialRevisionSHA != sha || !slices.Equal(started.CompletedSteps, domain.EmptyRepositoryOnboardingSteps[:4]) {
+		t.Fatalf("onboarding=%+v", started)
+	}
+}
+
+func TestOnboardingV38MigrationPreservesVersion37RowsExactly(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "controller.db")
+	legacy, err := openWithSupportedSchema(path, 37)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 25, 6, 0, 0, 0, time.UTC)
+	digest := func(character string) string { return strings.Repeat(character, 64) }
+	requester := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
+	receipt := application.NewOperationReceipt(application.OperationReceiptInput{OperationType: application.OperationOnboardRepository, Scope: application.ScopeOnboarding, TargetID: "onboarding-version-37", Requester: requester, RequestDigest: digest("a"), ExpectedAuthorityDigest: digest("b"), OperationAnchorDigest: digest("c"), TargetBindingDigest: digest("d"), AcceptedAt: now})
+	if _, _, err := legacy.BeginOperationReceipt(ctx, receipt); err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.db.ExecContext(ctx, `INSERT INTO repository_onboardings(onboarding_id,onboarding_kind,canonical_repository,private_input_digest,source_path_digest,request_digest,requester_login,requester_database_id,requester_node_id,requester_actor_type,base_generation_id,base_digest,configuration_authority_version,status,step_index,preflight_digest,preview_digest,operation_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'running',1,?,?,?,?,?)`, "onboarding-version-37", "existing_checkout", "owner/legacy", digest("e"), digest("f"), receipt.RequestDigest, requester.Login, requester.DatabaseID, requester.NodeID, requester.ActorType, 1, receipt.ExpectedAuthorityDigest, 1, digest("1"), digest("2"), receipt.OperationID, formatTime(now.Add(-time.Hour)), formatTime(now.Add(time.Minute)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.db.ExecContext(ctx, `INSERT INTO repository_onboarding_path_claims(onboarding_id,path_digest) VALUES(?,?)`, "onboarding-version-37", digest("f")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.db.ExecContext(ctx, `INSERT INTO repository_onboarding_steps(onboarding_id,step_name,step_order,intent_digest,status,outcome,evidence_digest,intended_at,observed_at) VALUES(?,'roots_created',1,?,'observed','succeeded',?,?,?)`, "onboarding-version-37", digest("3"), digest("4"), formatTime(now.Add(2*time.Minute)), formatTime(now.Add(3*time.Minute))); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	value, found, err := store.Onboarding(ctx, "onboarding-version-37")
+	if err != nil || !found || value.Kind != domain.OnboardingExistingCheckout || value.InitialRevisionSHA != "" || !value.AcceptedAt.Equal(now) || !slices.Equal(value.CompletedSteps, []domain.OnboardingStep{domain.OnboardingStepRootsCreated}) || !value.CreatedAt.Equal(now.Add(-time.Hour)) || !value.UpdatedAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("value=%+v found=%t err=%v", value, found, err)
 	}
 }

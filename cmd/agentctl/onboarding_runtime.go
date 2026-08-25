@@ -60,7 +60,7 @@ func composeOnboardingService(loaded bootstrap.Bootstrap, store *sqlitestore.Sto
 			return nil, err
 		}
 	}
-	return application.NewOnboardingService(store, files, authorizer, configuration, runtime, runtime)
+	return application.NewOnboardingService(store, files, files, authorizer, configuration, runtime, runtime)
 }
 
 func composeOnboardingRepositoryService(loaded bootstrap.Bootstrap, store *sqlitestore.Store, convergence *application.ConfigurationService, linear *linearadapter.Client, authorizer *application.AuthorizationService) (*application.RepositoryService, error) {
@@ -74,7 +74,7 @@ func composeOnboardingRepositoryService(loaded bootstrap.Bootstrap, store *sqlit
 	return application.NewRepositoryService(store, authorizer, loaded.Registry, observers)
 }
 
-func (r *onboardingRuntime) ObserveOnboardingPreflight(ctx context.Context, input domain.ExistingCheckoutOnboardingInput, authority application.ConfigurationAdmissionAuthority) (application.OnboardingPreflightEvidence, error) {
+func (r *onboardingRuntime) ObserveOnboardingPreflight(ctx context.Context, input domain.RepositoryOnboardingInput, authority application.ConfigurationAdmissionAuthority) (application.OnboardingPreflightEvidence, error) {
 	now := time.Now().UTC()
 	fail := func(reason string) (application.OnboardingPreflightEvidence, error) {
 		return application.OnboardingPreflightEvidence{Ready: false, ReasonCode: reason, EvidenceDigest: application.ConfigurationEvidenceDigest("onboarding-preflight-failed-v1", input.CanonicalRepository, reason, authority.Digest), ObservedAt: now}, nil
@@ -98,18 +98,42 @@ func (r *onboardingRuntime) ObserveOnboardingPreflight(ctx context.Context, inpu
 		}
 	}
 	repositoryRoot, runRoot, worktreeRoot := onboardingRepositoryRoots(r.loaded.Path, input.CanonicalRepository)
-	forbidden := []string{filepath.Dir(r.loaded.Path), filepath.Dir(r.loaded.Controller.DatabasePath), repositoryRoot, runRoot, worktreeRoot}
+	forbidden := []string{r.loaded.Path, r.loaded.Controller.DatabasePath, filepath.Join(filepath.Dir(r.loaded.Path), "authority")}
 	for _, binding := range r.loaded.Registry.Bindings() {
 		forbidden = append(forbidden, binding.SourcePath, binding.RunRoot, binding.WorktreeRoot)
 		if filepath.IsAbs(binding.OriginPath) {
 			forbidden = append(forbidden, binding.OriginPath)
 		}
 	}
-	gitObservation, err := (gitadapter.ExistingCheckoutInspector{}).Inspect(ctx, gitadapter.ExistingCheckoutRequest{SourcePath: input.SourcePath, CanonicalRepository: input.CanonicalRepository, BaseBranch: input.BaseBranch, ForbiddenRoots: forbidden})
-	if err != nil {
-		return fail("checkout_preflight_failed")
+	var gitEvidence, origin string
+	if input.Kind == domain.OnboardingExistingCheckout {
+		existingForbidden := append(append([]string(nil), forbidden...), repositoryRoot, runRoot, worktreeRoot)
+		gitObservation, err := (gitadapter.ExistingCheckoutInspector{}).Inspect(ctx, gitadapter.ExistingCheckoutRequest{SourcePath: input.SourcePath, CanonicalRepository: input.CanonicalRepository, BaseBranch: input.BaseBranch, ForbiddenRoots: existingForbidden})
+		if err != nil {
+			return fail("checkout_preflight_failed")
+		}
+		gitEvidence, origin = gitObservation.EvidenceDigest, gitObservation.Origin
+	} else if input.Kind == domain.OnboardingEmptyRepository {
+		derived, deriveErr := r.files.DeriveManagedSource(input.CanonicalRepository)
+		if deriveErr != nil || derived != input.SourcePath || configurationadapter.InspectEmptyOnboardingPaths(repositoryRoot, input.SourcePath, runRoot, worktreeRoot, forbidden) != nil {
+			return fail("managed_source_preflight_failed")
+		}
+		emptyGit := gitadapter.EmptyRepositoryGit{}
+		if emptyGit.ValidateBaseBranch(ctx, filepath.Dir(r.loaded.Path), input.BaseBranch) != nil {
+			return fail("base_branch_invalid")
+		}
+		remote, remoteErr := emptyGit.ObserveRemoteRefs(ctx, filepath.Dir(r.loaded.Path), input.CanonicalRepository)
+		if remoteErr != nil {
+			return fail("ssh_remote_observation_unavailable")
+		}
+		if len(remote.Refs) != 0 {
+			return fail("remote_repository_not_empty")
+		}
+		gitEvidence, origin = remote.EvidenceDigest, canonicalGitHubSSHOrigin(input.CanonicalRepository)
+	} else {
+		return fail("onboarding_kind_conflict")
 	}
-	partial := r.partialProfile(input, gitObservation.Origin, runRoot, worktreeRoot)
+	partial := r.partialProfile(input, origin, runRoot, worktreeRoot)
 	githubClient, err := githubapp.New(profile.Config, nil, nil)
 	if err != nil {
 		return fail("github_observation_unavailable")
@@ -122,19 +146,48 @@ func (r *onboardingRuntime) ObserveOnboardingPreflight(ctx context.Context, inpu
 	if err != nil {
 		return fail("linear_label_observation_unavailable")
 	}
-	evidence := application.ConfigurationEvidenceDigest("onboarding-preflight-v1", input.CanonicalRepository, gitObservation.EvidenceDigest, githubResults[0].EvidenceDigest, githubResults[1].EvidenceDigest, label.EvidenceDigest, authority.Digest, strings.Join(input.VerifierIDs, "\x00"), repositoryRoot, runRoot, worktreeRoot)
+	evidence := application.ConfigurationEvidenceDigest("onboarding-preflight-v2", string(input.Kind), input.CanonicalRepository, gitEvidence, githubResults[0].EvidenceDigest, githubResults[1].EvidenceDigest, label.EvidenceDigest, authority.Digest, strings.Join(input.VerifierIDs, "\x00"), repositoryRoot, input.SourcePath, runRoot, worktreeRoot)
+	if input.Kind == domain.OnboardingExistingCheckout {
+		evidence = application.ConfigurationEvidenceDigest("onboarding-preflight-v1", input.CanonicalRepository, gitEvidence, githubResults[0].EvidenceDigest, githubResults[1].EvidenceDigest, label.EvidenceDigest, authority.Digest, strings.Join(input.VerifierIDs, "\x00"), repositoryRoot, runRoot, worktreeRoot)
+	}
 	return application.OnboardingPreflightEvidence{Ready: true, ReasonCode: "preflight_ready", EvidenceDigest: evidence, Profile: partial, ObservedAt: now}, nil
 }
 
-func (r *onboardingRuntime) ExecuteOnboardingStep(ctx context.Context, onboarding application.Onboarding, input domain.ExistingCheckoutOnboardingInput, step domain.OnboardingStep) (application.OnboardingStepObservation, error) {
+func (r *onboardingRuntime) ExecuteOnboardingStep(ctx context.Context, onboarding application.Onboarding, input domain.RepositoryOnboardingInput, step domain.OnboardingStep) (application.OnboardingStepObservation, error) {
 	repositoryRoot, runRoot, worktreeRoot := onboardingRepositoryRoots(r.loaded.Path, input.CanonicalRepository)
 	switch step {
 	case domain.OnboardingStepRootsCreated:
-		evidence, err := configurationadapter.EnsureOnboardingRoots(repositoryRoot, runRoot, worktreeRoot, onboarding.OnboardingID, input.CanonicalRepository)
+		var evidence configurationadapter.OnboardingRootEvidence
+		var err error
+		if input.Kind == domain.OnboardingEmptyRepository {
+			evidence, err = configurationadapter.EnsureEmptyOnboardingRoots(repositoryRoot, input.SourcePath, runRoot, worktreeRoot, onboarding.OnboardingID, input.CanonicalRepository)
+		} else {
+			evidence, err = configurationadapter.EnsureOnboardingRoots(repositoryRoot, runRoot, worktreeRoot, onboarding.OnboardingID, input.CanonicalRepository)
+		}
 		if err != nil {
 			return application.OnboardingStepObservation{Outcome: application.OperationOutcomeConflict, ReasonCode: "root_ownership_conflict", EvidenceDigest: application.ConfigurationEvidenceDigest("onboarding-root-conflict-v1", onboarding.OnboardingID)}, nil
 		}
 		return application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "roots_ready", EvidenceDigest: evidence.EvidenceDigest}, nil
+	case domain.OnboardingStepManagedSourceCreated:
+		if input.Kind != domain.OnboardingEmptyRepository {
+			return application.OnboardingStepObservation{Outcome: application.OperationOutcomeConflict, ReasonCode: "onboarding_kind_conflict", EvidenceDigest: application.ConfigurationEvidenceDigest("onboarding-kind-conflict-v1", onboarding.OnboardingID, string(step))}, nil
+		}
+		if _, err := configurationadapter.VerifyEmptyOnboardingRoots(repositoryRoot, input.SourcePath, runRoot, worktreeRoot, onboarding.OnboardingID, input.CanonicalRepository); err != nil {
+			return application.OnboardingStepObservation{Outcome: application.OperationOutcomeConflict, ReasonCode: "managed_source_ownership_conflict", EvidenceDigest: application.ConfigurationEvidenceDigest("managed-source-owner-conflict-v1", onboarding.OnboardingID)}, nil
+		}
+		evidence, err := (gitadapter.EmptyRepositoryGit{}).EnsureManagedSource(ctx, repositoryRoot, input.SourcePath, input.CanonicalRepository, input.BaseBranch)
+		if err != nil {
+			return application.OnboardingStepObservation{Outcome: application.OperationOutcomeConflict, ReasonCode: "managed_source_conflict", EvidenceDigest: application.ConfigurationEvidenceDigest("managed-source-conflict-v1", onboarding.OnboardingID)}, nil
+		}
+		return application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "managed_source_ready", EvidenceDigest: evidence}, nil
+	case domain.OnboardingStepInitialRevisionCreated:
+		sha, evidence, err := (gitadapter.EmptyRepositoryGit{}).EnsureInitialRevision(ctx, input.SourcePath, input.CanonicalRepository, input.BaseBranch, onboarding.AcceptedAt)
+		if err != nil {
+			return application.OnboardingStepObservation{Outcome: application.OperationOutcomeConflict, ReasonCode: "initial_revision_conflict", EvidenceDigest: application.ConfigurationEvidenceDigest("initial-revision-conflict-v1", onboarding.OnboardingID)}, nil
+		}
+		return application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "initial_revision_ready", EvidenceDigest: evidence, InitialRevisionSHA: sha}, nil
+	case domain.OnboardingStepInitialBasePublished:
+		return r.publishInitialBase(ctx, onboarding, input)
 	case domain.OnboardingStepLinearLabelObserved:
 		return r.ensureLinearLabel(ctx, onboarding, input)
 	case domain.OnboardingStepConfigurationApplied:
@@ -185,7 +238,49 @@ func (r *onboardingRuntime) ExecuteOnboardingStep(ctx context.Context, onboardin
 	}
 }
 
-func (r *onboardingRuntime) ensureLinearLabel(ctx context.Context, onboarding application.Onboarding, input domain.ExistingCheckoutOnboardingInput) (application.OnboardingStepObservation, error) {
+func (r *onboardingRuntime) publishInitialBase(ctx context.Context, onboarding application.Onboarding, input domain.RepositoryOnboardingInput) (application.OnboardingStepObservation, error) {
+	sha := onboarding.InitialRevisionSHA
+	if input.Kind != domain.OnboardingEmptyRepository || sha == "" {
+		return application.OnboardingStepObservation{Outcome: application.OperationOutcomeConflict, ReasonCode: "initial_revision_authority_conflict", EvidenceDigest: application.ConfigurationEvidenceDigest("initial-base-authority-conflict-v1", onboarding.OnboardingID)}, nil
+	}
+	git := gitadapter.EmptyRepositoryGit{}
+	remote, err := git.PublishInitialBase(ctx, input.SourcePath, input.CanonicalRepository, input.BaseBranch, sha)
+	if err != nil && remote.EvidenceDigest == "" {
+		return application.OnboardingStepObservation{Outcome: application.OperationOutcomeAmbiguous, ReasonCode: "initial_push_outcome_ambiguous", EvidenceDigest: application.ConfigurationEvidenceDigest("initial-push-ambiguous-v1", onboarding.OnboardingID, sha)}, nil
+	}
+	ref := "refs/heads/" + input.BaseBranch
+	if len(remote.Refs) == 0 {
+		return application.OnboardingStepObservation{Outcome: application.OperationOutcomeFailed, ReasonCode: "initial_push_not_observed", EvidenceDigest: application.ConfigurationEvidenceDigest("initial-push-empty-v1", onboarding.OnboardingID, sha, remote.EvidenceDigest)}, nil
+	}
+	if len(remote.Refs) != 1 || remote.Refs[ref] != sha {
+		return application.OnboardingStepObservation{Outcome: application.OperationOutcomeConflict, ReasonCode: "initial_remote_ref_conflict", EvidenceDigest: application.ConfigurationEvidenceDigest("initial-push-conflict-v1", onboarding.OnboardingID, sha, remote.EvidenceDigest)}, nil
+	}
+	profile, ok := r.loaded.GitHubProfiles[input.GitHubAppProfileRef]
+	if !ok {
+		return application.OnboardingStepObservation{Outcome: application.OperationOutcomeConflict, ReasonCode: "github_profile_identity_conflict", EvidenceDigest: application.ConfigurationEvidenceDigest("initial-push-profile-conflict-v1", onboarding.OnboardingID)}, nil
+	}
+	client, clientErr := githubapp.New(profile.Config, nil, nil)
+	if clientErr != nil {
+		return application.OnboardingStepObservation{Outcome: application.OperationOutcomeFailed, ReasonCode: "github_base_observation_unavailable", EvidenceDigest: application.ConfigurationEvidenceDigest("initial-push-github-wait-v1", onboarding.OnboardingID, sha)}, nil
+	}
+	github := client.ObserveInitialBase(ctx, input.CanonicalRepository, input.BaseBranch, sha)
+	switch github.Status {
+	case githubapp.BaseRefUnavailable:
+		return application.OnboardingStepObservation{Outcome: application.OperationOutcomeFailed, ReasonCode: github.ReasonCode, EvidenceDigest: github.EvidenceDigest}, nil
+	case githubapp.BaseRefConflict:
+		return application.OnboardingStepObservation{Outcome: application.OperationOutcomeConflict, ReasonCode: github.ReasonCode, EvidenceDigest: github.EvidenceDigest}, nil
+	case githubapp.BaseRefReady:
+		localEvidence, settleErr := git.SettlePublishedSource(ctx, input.SourcePath, input.CanonicalRepository, input.BaseBranch, sha)
+		if settleErr != nil {
+			return application.OnboardingStepObservation{Outcome: application.OperationOutcomeConflict, ReasonCode: "published_source_conflict", EvidenceDigest: application.ConfigurationEvidenceDigest("published-source-conflict-v1", onboarding.OnboardingID, sha)}, nil
+		}
+		return application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "initial_base_published", EvidenceDigest: application.ConfigurationEvidenceDigest("initial-base-published-v1", onboarding.OnboardingID, sha, remote.EvidenceDigest, github.EvidenceDigest, localEvidence)}, nil
+	default:
+		return application.OnboardingStepObservation{Outcome: application.OperationOutcomeAmbiguous, ReasonCode: "github_base_observation_ambiguous", EvidenceDigest: application.ConfigurationEvidenceDigest("initial-push-github-ambiguous-v1", onboarding.OnboardingID, sha)}, nil
+	}
+}
+
+func (r *onboardingRuntime) ensureLinearLabel(ctx context.Context, onboarding application.Onboarding, input domain.RepositoryOnboardingInput) (application.OnboardingStepObservation, error) {
 	name := "repo:" + input.LinearLabelSlug
 	observed, err := r.linear.LookupRepositoryLabel(ctx, name)
 	if err != nil {
@@ -210,7 +305,7 @@ func (r *onboardingRuntime) ensureLinearLabel(ctx context.Context, onboarding ap
 	return application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "linear_label_ready", EvidenceDigest: observed.EvidenceDigest, LinearLabelID: observed.LabelID}, nil
 }
 
-func (r *onboardingRuntime) applyOnboardingConfiguration(ctx context.Context, onboarding application.Onboarding, input domain.ExistingCheckoutOnboardingInput, runRoot, worktreeRoot string) (application.OnboardingStepObservation, error) {
+func (r *onboardingRuntime) applyOnboardingConfiguration(ctx context.Context, onboarding application.Onboarding, input domain.RepositoryOnboardingInput, runRoot, worktreeRoot string) (application.OnboardingStepObservation, error) {
 	label, err := r.linear.LookupRepositoryLabel(ctx, "repo:"+input.LinearLabelSlug)
 	if err != nil {
 		return application.OnboardingStepObservation{}, err
@@ -245,7 +340,7 @@ func (r *onboardingRuntime) applyOnboardingConfiguration(ctx context.Context, on
 	return application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "configuration_applied", EvidenceDigest: application.ConfigurationEvidenceDigest("onboarding-configuration-v1", onboarding.OnboardingID, result.Generation.Digest, fmt.Sprint(result.Generation.GenerationID), result.Receipt.EvidenceDigest), ProfileID: profile.ProfileID, ProfileDigest: profile.ProfileDigest, RepositoryBindingDigest: profile.RepositoryBindingDigest, ConfigurationGenerationID: result.Generation.GenerationID}, nil
 }
 
-func (r *onboardingRuntime) partialProfile(input domain.ExistingCheckoutOnboardingInput, origin, runRoot, worktreeRoot string) application.LocalRepository {
+func (r *onboardingRuntime) partialProfile(input domain.RepositoryOnboardingInput, origin, runRoot, worktreeRoot string) application.LocalRepository {
 	profile := r.loaded.GitHubProfiles[input.GitHubAppProfileRef]
 	threshold := input.CISlowThreshold
 	if threshold == 0 {
@@ -262,7 +357,7 @@ func (r *onboardingRuntime) partialProfile(input domain.ExistingCheckoutOnboardi
 	return application.LocalRepository{CanonicalRepository: input.CanonicalRepository, LinearLabel: "repo:" + input.LinearLabelSlug, OriginPath: origin, SourcePath: input.SourcePath, RunRoot: runRoot, WorktreeRoot: worktreeRoot, BaseBranch: input.BaseBranch, VerifierRegistryRef: "builtin:v1", VerifierIDs: append([]string(nil), input.VerifierIDs...), GitHubAppProfileRef: input.GitHubAppProfileRef, GitHubAppID: profile.Config.AppID, GitHubInstallationID: profile.Config.InstallationID, ExpectedRepositoryID: profile.Config.RepositoryID, CISlowThreshold: threshold, AllowedOperatorLogins: allowed, TrustedOperatorActors: actors}
 }
 
-func (r *onboardingRuntime) repositoryDocument(input domain.ExistingCheckoutOnboardingInput, runRoot, worktreeRoot string, profile bootstrap.GitHubProfile) localregistry.Repository {
+func (r *onboardingRuntime) repositoryDocument(input domain.RepositoryOnboardingInput, runRoot, worktreeRoot string, profile bootstrap.GitHubProfile) localregistry.Repository {
 	parts := strings.Split(input.CanonicalRepository, "/")
 	trusted := onboardingTrustedActors(r.loaded)
 	allowed := make([]string, 0, len(trusted))
@@ -300,4 +395,9 @@ func onboardingRepositoryRoots(configPath, repository string) (string, string, s
 
 func canonicalGitHubOrigin(owner, repository string) string {
 	return "https://github.com/" + strings.ToLower(owner) + "/" + strings.ToLower(repository) + ".git"
+}
+
+func canonicalGitHubSSHOrigin(repository string) string {
+	remote, _ := gitadapter.CanonicalGitHubSSHRemote(repository)
+	return remote
 }
