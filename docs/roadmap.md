@@ -151,7 +151,9 @@ forward rollback, exact safe external-drift recovery, repository lifecycle,
 readiness, guarded retirement, zero-repository disabled-admission operation,
 admission fencing, restart-safe existing-checkout onboarding, guarded
 empty-repository initialization, and the bounded routine Controller projection
-family are complete. Unsafe or ambiguous configuration
+family are complete. Durable activity list/detail, operation-receipt history,
+transactional current indexing, bounded legacy reconstruction, and runtime
+classification reconciliation are complete. Unsafe or ambiguous configuration
 repair remains deliberately out of scope. Do not create
 speculative TUI, HTTP, or frontend slices before their Controller contracts
 exist.
@@ -164,10 +166,11 @@ transaction/convergence authority, normal typed-change drafts, forward rollback,
 exact safe external-drift recovery, repository lifecycle/readiness, guarded
 retirement, zero-repository disabled-admission operation, restart-safe
 existing-checkout onboarding, guarded empty-repository initialization, and
-routine Controller projections are complete. The remaining
+routine Controller projections and the activity/history foundation are
+complete. The remaining
 presentation-independent sequence is:
 
-1. activity and audit integrity.
+1. Controller-wide audit-integrity readiness and explicit integrity recheck.
 
 The persisted onboarding saga, existing-checkout adoption, and deterministic
 empty-repository initialization are complete. They leave every newly added

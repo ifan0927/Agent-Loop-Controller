@@ -30,7 +30,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 38
+const schemaVersion = 39
 
 const (
 	sqliteMigrationRetryDelay = 10 * time.Millisecond
@@ -660,7 +660,13 @@ func migrateSQLite(ctx context.Context, db sqliteTransactioner, supportedVersion
 			existingVersion = 37
 		}
 		if supportedVersion >= 38 && existingVersion < 38 {
-			return migrateSQLiteV38Upgrade(ctx, db)
+			if err := migrateSQLiteV38Upgrade(ctx, db); err != nil {
+				return err
+			}
+			existingVersion = 38
+		}
+		if supportedVersion >= 39 && existingVersion < 39 {
+			return migrateSQLiteGeneric(ctx, db, supportedVersion)
 		}
 	}
 	return migrateSQLiteGeneric(ctx, db, supportedVersion)
@@ -764,6 +770,8 @@ func migrateSQLiteGeneric(ctx context.Context, db sqliteTransactioner, supported
 			statements = migrationV37
 		case 38:
 			statements = migrationV38
+		case 39:
+			statements = migrationV39
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -1857,6 +1865,72 @@ var migrationV38 = []string{
 		WHEN EXISTS(SELECT 1 FROM repository_onboardings o WHERE o.status IN ('accepted','running','waiting_for_operator')) BEGIN SELECT RAISE(ABORT,'configuration mutation is already active'); END`,
 }
 
+var migrationV39 = []string{
+	`CREATE TABLE IF NOT EXISTS activity_events (
+		ingestion_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+		event_id TEXT NOT NULL UNIQUE,
+		schema_version TEXT NOT NULL CHECK(schema_version='v1'),
+		source_kind TEXT NOT NULL,
+		source_identity TEXT NOT NULL,
+		source_evidence_digest TEXT NOT NULL,
+		snapshot_digest TEXT NOT NULL,
+		category TEXT NOT NULL CHECK(category IN ('run','attention','operation','repository','onboarding','configuration','worker','admission_capacity')),
+		event_kind TEXT NOT NULL,
+		actor TEXT NOT NULL CHECK(actor IN ('controller','configured_operator','external_authority','unknown')),
+		scope_kind TEXT NOT NULL CHECK(scope_kind IN ('controller','repository','run','onboarding')),
+		target_id TEXT NOT NULL,
+		target_binding_digest TEXT NOT NULL,
+		reason_code TEXT NOT NULL,
+		prior_state TEXT NOT NULL DEFAULT '',
+		resulting_state TEXT NOT NULL DEFAULT '',
+		prior_version INTEGER NOT NULL DEFAULT 0,
+		resulting_version INTEGER NOT NULL DEFAULT 0,
+		occurred_at TEXT NOT NULL,
+		observed_at TEXT NOT NULL DEFAULT '',
+		settled_at TEXT NOT NULL DEFAULT '',
+		related_resources_json TEXT NOT NULL DEFAULT '[]',
+		operation_ids_json TEXT NOT NULL DEFAULT '[]',
+		evidence_digests_json TEXT NOT NULL DEFAULT '[]',
+		ingestion_class TEXT NOT NULL CHECK(ingestion_class IN ('current','backfill','runtime')),
+		legacy_reconstructable INTEGER NOT NULL CHECK(legacy_reconstructable IN (0,1)),
+		UNIQUE(source_kind,source_identity,event_kind)
+	)`,
+	`CREATE INDEX IF NOT EXISTS activity_events_order ON activity_events(occurred_at DESC,event_id DESC,ingestion_sequence)`,
+	`CREATE INDEX IF NOT EXISTS activity_events_category_order ON activity_events(category,occurred_at DESC,event_id DESC,ingestion_sequence)`,
+	`CREATE INDEX IF NOT EXISTS activity_events_scope_order ON activity_events(scope_kind,target_id,occurred_at DESC,event_id DESC,ingestion_sequence)`,
+	`CREATE TABLE IF NOT EXISTS activity_operation_links (
+		operation_id TEXT PRIMARY KEY REFERENCES operation_receipts(operation_id),
+		event_id TEXT NOT NULL REFERENCES activity_events(event_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS activity_operation_links_event ON activity_operation_links(event_id,operation_id)`,
+	`CREATE TABLE IF NOT EXISTS activity_backfill_progress (
+		source_kind TEXT PRIMARY KEY,
+		cursor_sequence INTEGER NOT NULL DEFAULT 0,
+		status TEXT NOT NULL CHECK(status IN ('pending','running','complete','conflict')),
+		indexed_through TEXT NOT NULL DEFAULT '',
+		evidence_digest TEXT NOT NULL DEFAULT '',
+		reason_code TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL
+	)`,
+	`INSERT OR IGNORE INTO activity_backfill_progress(source_kind,status,updated_at) VALUES
+		('run_transition','pending',CURRENT_TIMESTAMP),
+		('operation_receipt','pending',CURRENT_TIMESTAMP),
+		('operator_attention','pending',CURRENT_TIMESTAMP),
+		('repository_lifecycle','pending',CURRENT_TIMESTAMP),
+		('onboarding','pending',CURRENT_TIMESTAMP),
+		('configuration','pending',CURRENT_TIMESTAMP)`,
+	`CREATE TABLE IF NOT EXISTS activity_runtime_state (
+		source_kind TEXT NOT NULL,
+		source_identity TEXT NOT NULL,
+		classification TEXT NOT NULL,
+		source_evidence_digest TEXT NOT NULL,
+		observed_at TEXT NOT NULL,
+		status TEXT NOT NULL CHECK(status IN ('ready','degraded','conflict')),
+		reason_code TEXT NOT NULL,
+		PRIMARY KEY(source_kind,source_identity)
+	)`,
+}
+
 func migrateSQLiteV38Upgrade(ctx context.Context, db sqliteTransactioner) error {
 	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
 		return err
@@ -2400,6 +2474,9 @@ func (s *Store) CreateRun(ctx context.Context, input application.CreateRunInput)
 		VALUES(?,1,'',?,'run created','task snapshot','',?)`, run.ID, domain.StateReceived, formatTime(now)); err != nil {
 		return application.Run{}, false, err
 	}
+	if err := appendRunTransitionActivityTx(ctx, tx, run.ID, 1, "", string(domain.StateReceived), "run created", "task snapshot", "", now, ""); err != nil {
+		return application.Run{}, false, err
+	}
 	if hasExplicitSchedulingAuthority {
 		if _, _, reserved, err := reserveSchedulingAuthoritiesTx(ctx, tx, run, application.SchedulingReservation{}, s.defaultHeavyPermitOwner(run.ID), now); err != nil {
 			return application.Run{}, false, err
@@ -2649,6 +2726,9 @@ func (s *Store) MarkLinearSourceDrift(ctx context.Context, runID string, expecte
 	if _, err := tx.ExecContext(ctx, `INSERT INTO transitions VALUES(?,?,?,?,?,?,?,?)`, runID, sequence, expectedState, domain.StateManualIntervention, "Linear source drift requires a human decision", evidence, "", now); err != nil {
 		return false, err
 	}
+	if err := appendRunTransitionActivityTx(ctx, tx, runID, sequence, string(expectedState), string(domain.StateManualIntervention), "Linear source drift requires a human decision", evidence, "", parseTime(now), ""); err != nil {
+		return false, err
+	}
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
@@ -2718,6 +2798,9 @@ func (s *Store) Transition(ctx context.Context, id string, expected, next domain
 	if _, err := tx.ExecContext(ctx, `INSERT INTO transitions VALUES(?,?,?,?,?,?,?,?)`, id, sequence, expected, next, reason, evidence, head, now); err != nil {
 		return err
 	}
+	if err := appendRunTransitionActivityTx(ctx, tx, id, sequence, string(expected), string(next), reason, evidence, head, parseTime(now), ""); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -2762,6 +2845,9 @@ func (s *Store) BeginRepair(ctx context.Context, id, oldHead, evidence string) e
 		return errors.New("repair compare update lost")
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO transitions VALUES(?,?,?,?,?,?,?,?)`, id, sequence, domain.StateRepairing, domain.StateExecuting, "begin normalized GitHub finding repair", evidence, oldHead, now); err != nil {
+		return err
+	}
+	if err := appendRunTransitionActivityTx(ctx, tx, id, sequence, string(domain.StateRepairing), string(domain.StateExecuting), "begin normalized GitHub finding repair", evidence, oldHead, parseTime(now), ""); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -3009,6 +3095,9 @@ func (s *Store) SaveGitHubReadSuccess(ctx context.Context, runID, leaseOwner str
 		if _, err := tx.ExecContext(ctx, `INSERT INTO transitions(run_id,sequence,from_state,to_state,reason,evidence_reference,bound_head,created_at) VALUES(?,?,?,?,?,?,?,?)`, runID, sequence, expectedState, nextState, transitionReason, "github_read_evidence:"+hex.EncodeToString(sum[:]), e.PullRequest.HeadSHA, nowText()); err != nil {
 			return err
 		}
+		if err := appendStoredRunTransitionActivityTx(ctx, tx, runID, sequence, ""); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -3109,6 +3198,9 @@ func (s *Store) SaveGitHubManualPRTargetDrift(ctx context.Context, runID, leaseO
 		return errors.New("atomic GitHub target-drift state update mismatch")
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO transitions(run_id,sequence,from_state,to_state,reason,evidence_reference,bound_head,created_at) VALUES(?,?,?,?,?,?,?,?)`, runID, sequence, expectedState, domain.StateManualIntervention, reason, "github_read_evidence:"+hex.EncodeToString(sum[:]), persisted.HeadSHA, nowText()); err != nil {
+		return err
+	}
+	if err := appendStoredRunTransitionActivityTx(ctx, tx, runID, sequence, ""); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -3474,6 +3566,9 @@ func (s *Store) RecordMergePolicyPending(ctx context.Context, runID string, reco
 	if _, err := tx.ExecContext(ctx, `INSERT INTO transitions(run_id,sequence,from_state,to_state,reason,evidence_reference,bound_head,created_at) VALUES(?,?,?,?,?,?,?,?)`, runID, sequence, domain.StateMerging, domain.StateAwaitingGitHubMergeability, "GitHub merge protection awaits human thread resolution", "merge_policy_pending", candidateHead, now); err != nil {
 		return err
 	}
+	if err := appendRunTransitionActivityTx(ctx, tx, runID, sequence, string(domain.StateMerging), string(domain.StateAwaitingGitHubMergeability), "GitHub merge protection awaits human thread resolution", "merge_policy_pending", candidateHead, parseTime(now), ""); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -3760,6 +3855,9 @@ func (s *Store) TransitionReviewReplyRun(ctx context.Context, runID, owner strin
 	if _, err := tx.ExecContext(ctx, `INSERT INTO transitions VALUES(?,?,?,?,?,?,?,?)`, runID, sequence, expected, next, reason, evidence, head, now); err != nil {
 		return err
 	}
+	if err := appendRunTransitionActivityTx(ctx, tx, runID, sequence, string(expected), string(next), reason, evidence, head, parseTime(now), ""); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -3969,6 +4067,9 @@ func (s *Store) RequireManualInterventionForTrustedFeedbackDrift(ctx context.Con
 		return errors.New("trusted feedback drift state update lost")
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO transitions(run_id,sequence,from_state,to_state,reason,evidence_reference,bound_head,created_at) VALUES(?,?,?,?,?,?,?,?)`, runID, sequence, expectedState, domain.StateManualIntervention, application.TrustedReviewFeedbackDriftReason, "trusted_feedback_conflict:"+observedDigest, "", nowText()); err != nil {
+		return err
+	}
+	if err := appendStoredRunTransitionActivityTx(ctx, tx, runID, sequence, ""); err != nil {
 		return err
 	}
 	return tx.Commit()

@@ -347,6 +347,22 @@ func newAutomaticWorkerRuntime(loaded bootstrap.Bootstrap, instanceID string) (a
 
 func onboardingWorkerDispatch(store *sqlitestore.Store, onboarding *application.OnboardingService, fallback admissionWorkerDispatch) admissionWorkerDispatch {
 	return func(ctx context.Context) (application.LinearTodoDispatchResult, error) {
+		now := time.Now().UTC()
+		if authority, found, err := store.ConfigurationAuthority(ctx); err == nil && found {
+			if _, _, reconcileErr := store.ReconcileWorkerActivity(ctx, application.RuntimeActivityObservation{SourceKind: "worker_readiness", SourceIdentity: "automatic-worker", Classification: "running", SourceEvidenceDigest: application.ConfigurationEvidenceDigest("worker-readiness-v1", "automatic-worker", "running", authority.Desired.Digest), TargetBindingDigest: authority.Desired.Digest, OccurredAt: now, ObservedAt: now}); reconcileErr != nil {
+				_ = store.RecordActivityIndexingFailure(ctx, "worker_readiness", "runtime_reconciliation_failed", now)
+			} else {
+				_ = store.RecordActivityIndexingRecovery(ctx, "worker_readiness", now)
+			}
+		}
+		// Activity backfill is deliberately one bounded SQLite-only batch per
+		// worker opportunity. It consumes no heavy-work permit and never delays
+		// normal onboarding or admission after a recoverable indexing failure.
+		if _, err := store.BackfillActivityBatch(ctx, 25, now); err != nil {
+			_ = store.RecordActivityIndexingFailure(ctx, "legacy_backfill", "bounded_backfill_failed", now)
+		} else {
+			_ = store.RecordActivityIndexingRecovery(ctx, "legacy_backfill", now)
+		}
 		ids, err := store.ListRunnableOnboardings(ctx, 1)
 		if err != nil {
 			return application.LinearTodoDispatchResult{}, errors.New("runnable onboarding discovery failed")

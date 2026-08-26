@@ -2353,6 +2353,31 @@ They never trigger Linear, GitHub, Git, verifier, credential, or readiness
 refreshes, and the settings convergence path performs no reconciliation or
 authority write.
 
+Activity list/detail and operation-receipt history are also application-only
+query contracts; no new public CLI route is added. Activity defaults to 50 and
+rejects limits above 100. Receipt history defaults to 25 and rejects limits
+above 100. Both authenticate the complete configured operator before applying
+scope and filters, counting, ordering, pagination, or cursor construction.
+Continuation cursors are opaque and invalid after scope or filter drift.
+Queries never backfill, reconcile runtime observations, inspect files, contact
+external systems, acknowledge attention, or change workflow state.
+
+The automatic worker performs at most one bounded SQLite-only legacy activity
+backfill batch per dispatch opportunity before normal onboarding/admission
+work, without taking a local-heavy-work permit. Progress resumes after restart;
+current indexing and backfill can interleave through deterministic identities.
+Coverage reports a finite state and reason, the proven/indexed boundary when
+available, progress counts, runtime freshness when available, and fixed legacy
+limitations. `complete` means complete only within reconstructable persisted
+evidence. A source conflict stops that source and preserves completed progress;
+an indexing failure degrades coverage and does not authorize or stop ordinary
+Controller workflow.
+The next successful indexing cycle clears a transient degradation marker.
+Known fixed legacy gaps remain listed even when coverage is `complete` within
+the reconstructable boundary: non-persisted worker/runtime and repository
+intent transitions, partially reconstructable attention resolution, and
+admission-capacity history that is not part of the backfill set.
+
 **Safety notes**
 
 Also inspect private worker logs and controller run state when the service has
@@ -2715,8 +2740,15 @@ effects remain automatic/controller evidence. Decision, retry, abandon,
 CI-wait recovery, owned-push recovery, and external-merge acceptance all bind
 this action-specific journal to the common scope-neutral operation receipt
 before controller mutation. The presentation-independent legal-action and
-single-receipt application queries are not new CLI mutation commands. Every
-execution still enters its dedicated revalidation, ownership, exact-head, CAS,
+single-receipt application queries are not new CLI mutation commands. The
+bounded operation-history application query returns these same sanitized
+receipt fields ordered by immutable `accepted_at` and operation identity. It
+does not expose authority keys, operation anchors, raw requests, command
+arguments, process/session identities, run idempotency keys, or private
+evidence. Receipt phase/outcome may advance while browsing without changing
+collection order.
+
+Every execution still enters its dedicated revalidation, ownership, exact-head, CAS,
 lease, and reconciliation boundary; there is no generic state-mutation
 interface.
 

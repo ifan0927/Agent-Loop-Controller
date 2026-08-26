@@ -99,6 +99,11 @@ func (s *Store) AdvanceOperationReceipt(ctx context.Context, mutation applicatio
 	if err := application.ValidateOperationReceipt(updated); err != nil {
 		return application.OperationReceipt{}, false, err
 	}
+	if updated.Outcome != application.OperationOutcomePending {
+		if err := appendSettledOperationActivityTx(ctx, tx, updated.OperationID, application.ActivityIngestionCurrent); err != nil {
+			return application.OperationReceipt{}, false, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return application.OperationReceipt{}, false, err
 	}
@@ -207,6 +212,19 @@ func syncOperationReceiptForActionTx(ctx context.Context, tx *sql.Tx, actionID s
 	}
 	if changed, rowsErr := result.RowsAffected(); rowsErr != nil || changed != 1 {
 		return errors.New("operator action receipt synchronization lost")
+	}
+	if receipt.Outcome != application.OperationOutcomePending {
+		if action.ResultingTransitionSequence > action.TransitionSequence {
+			if err := appendStoredRunTransitionActivityTx(ctx, tx, action.RunID, action.ResultingTransitionSequence, receipt.OperationID); err != nil {
+				return err
+			}
+		}
+		if err := appendSettledOperationActivityTx(ctx, tx, receipt.OperationID, application.ActivityIngestionCurrent); err != nil {
+			return err
+		}
+		if err := appendAttentionResolutionForActionTx(ctx, tx, action, receipt); err != nil {
+			return err
+		}
 	}
 	return nil
 }

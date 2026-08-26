@@ -202,9 +202,15 @@ guarded non-force host-SSH publication before reusing the shared
 `ready_disabled` tail. Versioned routine Controller application projections
 for Overview, runs and fixed delivery gates, queue, active attention,
 repositories, onboarding, and settings are also implemented; they are bounded,
-scope-authorized, sanitized, and side-effect free. Unsafe or ambiguous
-configuration repair remains out of scope; activity and audit integrity are the
-next operator foundation.
+scope-authorized, sanitized, and side-effect free. Durable versioned activity
+list/detail projections and bounded operation-receipt history are implemented
+as presentation-independent application contracts. Meaningful current SQLite
+facts append their immutable sanitized activity snapshots transactionally;
+the worker performs bounded restart-safe reconstruction of legacy evidence and
+reports explicit coverage limitations for history that was never persisted.
+Unsafe or ambiguous configuration repair remains out of scope;
+Controller-wide audit-integrity readiness and integrity recheck are the next
+operator foundation.
 The TUI and `agentctl operator` are planned, not current behavior. HTTP, a Web
 UI, outbound notifications, Hermes runtime integration, public API/webhook
 admission, and cross-repository transactions remain deferred or exploratory.

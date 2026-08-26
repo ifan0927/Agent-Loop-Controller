@@ -395,6 +395,7 @@ The acceptance matrix requires:
 | Repository retirement | Schema-35 upgrade preservation, immutable incarnation/tombstone identity, exclusive removal/configuration draft authority, every typed guard category, sanitized preview, intent-before-file apply, accepted/applied/observed receipt replay, response-loss reconciliation, exact worker convergence retirement, current-query hiding with historical evidence retention, final-profile disabled-admission operation, rollback non-resurrection, and same-name fresh-incarnation onboarding |
 | Existing-checkout onboarding | Read-only real-Git preflight with no object/ref/index mutation, unsafe/symlink/overlap rejection, exact local/remote base-head proof, sanitized path evidence, open/start/resume replay, pre-start cancel, one-active-repository/source constraints, migration and restart recovery, intent-before-effect step ordering, Linear lookup/create/reread, source-bound configuration exclusion, fresh worker convergence, disabled lifecycle creation, and complete readiness settlement |
 | Routine queries | Authorization before lookup/count/order/page, schema- and scope-bound cursors, deterministic sanitized digests, fixed eleven-gate order, exact-head invalidation, conservative attention supersession, latest-complete queue reads, pre-binding onboarding discovery, schema-v2 heartbeat compatibility, and read-only settings convergence |
+| Activity and operation history | Closed classifications and validation, deterministic immutable identity/replay conflict, source-transaction rollback, one-primary-event operation correlation, bounded schema-only migration/backfill/restart/interleaving, runtime unchanged suppression and conflict coverage, authorization-first filters/count/order/page, ingestion-watermark pagination, stable receipt ordering during monotonic advance, cursor drift, corruption failure, and negative sanitization |
 | Typed configuration drafts | One active normal or rollback-origin draft under concurrent open, authorization-before-lookup and hidden targets, every allowlisted field and input bound, edit/discard replay, validation and preview invalidation, v32-compatible normal identity plus deterministic source-bound rollback identity, schema-1-through-5 scalar projection, source-prune/open exclusion plus exact post-open replay after pruning, committed intent/receipt source evidence, immutable generation provenance, unchanged-byte no-op, real apply, response-loss/restart replay, capacity drain impact, sanitized output, and isolated CLI restart/convergence acceptance |
 | Bounded concurrency | Generic capacity above two, same-repository exclusion, drain-on-reduction, sibling failure isolation, and restart reconstruction |
 | Implementation | Owned worktree, resumable session, exact candidate, successful verifier batch |
@@ -438,7 +439,7 @@ that bypass safety solely to make fault injection easier.
 ## Database Migrations
 
 SQLite migrations are ordered in `internal/adapters/sqlite/store.go`; the current
-schema version is 38. Opening a database applies missing forward migrations in a
+schema version is 39. Opening a database applies missing forward migrations in a
 transaction. A database newer than the binary fails closed.
 
 The repository-retirement compatibility review preserves the preceding

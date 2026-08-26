@@ -155,6 +155,9 @@ func (s *Store) SettleConfigurationRecovery(ctx context.Context, settlement appl
 		if _, err := tx.ExecContext(ctx, `INSERT INTO configuration_convergence_events(event_type,generation_id,operation_id,digest,reason_code,evidence_digest,observed_at) VALUES('drift_cleared',?,?,?,?,?,?)`, intent.DesiredGenerationID, intent.OperationID, intent.DesiredDigest, string(application.ConfigurationReasonReady), settlement.EvidenceDigest, formatTime(settlement.SettledAt)); err != nil {
 			return application.ConfigurationAuthority{}, application.ConfigurationRecoveryIntent{}, application.OperationReceipt{}, false, err
 		}
+		if err := appendConfigurationActivityTx(ctx, tx, "drift_cleared", intent.DesiredGenerationID, intent.OperationID, intent.DesiredDigest, settlement.EvidenceDigest, settlement.SettledAt); err != nil {
+			return application.ConfigurationAuthority{}, application.ConfigurationRecoveryIntent{}, application.OperationReceipt{}, false, err
+		}
 		if err := configurationOne(tx.ExecContext(ctx, `UPDATE configuration_authority SET authority_version=authority_version+1,updated_at=? WHERE authority_id=1 AND desired_generation_id=? AND authority_version=?`, formatTime(settlement.SettledAt), intent.DesiredGenerationID, intent.AuthorityVersion)); err != nil {
 			return application.ConfigurationAuthority{}, application.ConfigurationRecoveryIntent{}, application.OperationReceipt{}, false, application.ErrConfigurationAuthorityConflict
 		}
@@ -164,6 +167,9 @@ func (s *Store) SettleConfigurationRecovery(ctx context.Context, settlement appl
 		return application.ConfigurationAuthority{}, application.ConfigurationRecoveryIntent{}, application.OperationReceipt{}, false, err
 	}
 	if err := configurationOne(tx.ExecContext(ctx, `UPDATE operation_receipts SET phase='observed',outcome=?,result_digest=?,settled_at=? WHERE operation_id=? AND phase='applied'`, string(outcome), resultDigest, formatTime(settlement.SettledAt), settlement.OperationID)); err != nil {
+		return application.ConfigurationAuthority{}, application.ConfigurationRecoveryIntent{}, application.OperationReceipt{}, false, err
+	}
+	if err := appendSettledOperationActivityTx(ctx, tx, settlement.OperationID, application.ActivityIngestionCurrent); err != nil {
 		return application.ConfigurationAuthority{}, application.ConfigurationRecoveryIntent{}, application.OperationReceipt{}, false, err
 	}
 	authority, _, err = configurationAuthorityQuery(ctx, tx)

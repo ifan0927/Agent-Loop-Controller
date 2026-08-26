@@ -479,6 +479,9 @@ func settleRepositoryRemovalForEffectiveTx(ctx context.Context, tx *sql.Tx, obse
 		if changed, _ := result.RowsAffected(); changed != 1 {
 			return application.ErrOperationReceiptConflict
 		}
+		if err := appendSettledOperationActivityTx(ctx, tx, value.operationID, application.ActivityIngestionCurrent); err != nil {
+			return err
+		}
 	}
 	return nil
 }

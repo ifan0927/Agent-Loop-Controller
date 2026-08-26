@@ -81,6 +81,9 @@ func (s *Store) PersistFreshReviewFindings(ctx context.Context, evidence applica
 	if _, err := tx.ExecContext(ctx, `INSERT INTO transitions(run_id,sequence,from_state,to_state,reason,evidence_reference,bound_head,created_at) VALUES(?,?,?,?,?,?,?,?)`, evidence.RunID, sequence, domain.StateFreshReview, domain.StateRepairing, "fresh structured review findings persisted", evidence.TransitionReference(), evidence.ReviewedHead, now); err != nil {
 		return false, err
 	}
+	if err := appendRunTransitionActivityTx(ctx, tx, evidence.RunID, sequence, string(domain.StateFreshReview), string(domain.StateRepairing), "fresh structured review findings persisted", evidence.TransitionReference(), evidence.ReviewedHead, parseTime(now), ""); err != nil {
+		return false, err
+	}
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
