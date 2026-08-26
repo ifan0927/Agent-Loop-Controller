@@ -375,6 +375,9 @@ func (s *Store) AbandonAutomaticAdmission(ctx context.Context, request applicati
 	if _, err := tx.ExecContext(ctx, `INSERT INTO transitions(run_id,sequence,from_state,to_state,reason,evidence_reference,bound_head,created_at) VALUES(?,?,?,?,?,?,?,?)`, run.ID, sequence, request.ExpectedState, domain.StateFailed, application.AutomaticAdmissionAbandonTransition, evidence, run.CandidateHead, now); err != nil {
 		return application.Run{}, false, err
 	}
+	if err := appendRunTransitionActivityTx(ctx, tx, run.ID, sequence, string(request.ExpectedState), string(domain.StateFailed), application.AutomaticAdmissionAbandonTransition, evidence, run.CandidateHead, nowTime, ""); err != nil {
+		return application.Run{}, false, err
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE linear_todo_admission_journal SET status=?,mutation_intent_ref='',reason_code=?,updated_at=? WHERE run_id=? AND status=?`, application.LinearTodoAdmissionJournalManualIntervention, application.AutomaticAdmissionAbandonReason, now, run.ID, journal.Status); err != nil {
 		return application.Run{}, false, err
 	}
@@ -806,8 +809,10 @@ func insertReservedRun(ctx context.Context, tx *sql.Tx, run application.Run, now
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO transitions(run_id,sequence,from_state,to_state,reason,evidence_reference,bound_head,created_at) VALUES(?,1,'',?,'run created','task snapshot','',?)`, run.ID, domain.StateReceived, formatTime(now))
-	return err
+	if _, err = tx.ExecContext(ctx, `INSERT INTO transitions(run_id,sequence,from_state,to_state,reason,evidence_reference,bound_head,created_at) VALUES(?,1,'',?,'run created','task snapshot','',?)`, run.ID, domain.StateReceived, formatTime(now)); err != nil {
+		return err
+	}
+	return appendRunTransitionActivityTx(ctx, tx, run.ID, 1, "", string(domain.StateReceived), "run created", "task snapshot", "", now, "")
 }
 
 func requireNoAdmissionJournalCorruption(ctx context.Context, tx *sql.Tx) error {

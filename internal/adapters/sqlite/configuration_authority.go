@@ -435,6 +435,12 @@ func (s *Store) SettleConfigurationApply(ctx context.Context, settlement applica
 	if _, err := tx.ExecContext(ctx, `INSERT INTO configuration_convergence_events(event_type,generation_id,operation_id,digest,reason_code,evidence_digest,observed_at) VALUES(?,?,?,?,?,?,?)`, eventType, settlement.GenerationID, settlement.OperationID, generation.Digest, string(settlement.Reason), settlement.EvidenceDigest, formatTime(settlement.SettledAt)); err != nil {
 		return application.ConfigurationAuthority{}, application.OperationReceipt{}, false, err
 	}
+	if err := appendConfigurationActivityTx(ctx, tx, eventType, settlement.GenerationID, settlement.OperationID, generation.Digest, settlement.EvidenceDigest, settlement.SettledAt); err != nil {
+		return application.ConfigurationAuthority{}, application.OperationReceipt{}, false, err
+	}
+	if err := appendSettledOperationActivityTx(ctx, tx, settlement.OperationID, application.ActivityIngestionCurrent); err != nil {
+		return application.ConfigurationAuthority{}, application.OperationReceipt{}, false, err
+	}
 	if settlement.Outcome == application.ConfigurationApplyCommitted {
 		desiredEvidence := configurationEvidence("desired-changed", settlement.ParentID, settlement.GenerationID, generation.Digest)
 		if _, err := tx.ExecContext(ctx, `INSERT INTO configuration_convergence_events(event_type,generation_id,operation_id,digest,reason_code,evidence_digest,observed_at) VALUES('desired_changed',?,?,?,?,?,?)`, settlement.GenerationID, settlement.OperationID, generation.Digest, string(settlement.Reason), desiredEvidence, formatTime(settlement.SettledAt)); err != nil {
@@ -491,6 +497,9 @@ func (s *Store) ObserveConfigurationEffective(ctx context.Context, observation a
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO configuration_convergence_events(event_type,generation_id,digest,worker_instance_id,build_identity,reason_code,evidence_digest,observed_at) VALUES('effective_observed',?,?,?,?,?,?,?)`, observation.ExpectedGenerationID, observation.ExpectedDigest, observation.WorkerInstanceID, observation.BuildIdentity, string(application.ConfigurationReasonReady), observation.EvidenceDigest, formatTime(observation.ObservedAt)); err != nil {
 		return application.ConfigurationAuthority{}, false, err
 	}
+	if err := appendConfigurationActivityTx(ctx, tx, "effective_observed", observation.ExpectedGenerationID, "", observation.ExpectedDigest, observation.EvidenceDigest, observation.ObservedAt); err != nil {
+		return application.ConfigurationAuthority{}, false, err
+	}
 	if err := settleRepositoryRemovalForEffectiveTx(ctx, tx, observation); err != nil {
 		return application.ConfigurationAuthority{}, false, err
 	}
@@ -538,6 +547,13 @@ func (s *Store) ObserveConfigurationDrift(ctx context.Context, observation appli
 	}
 	evidence := configurationEvidence("drift-transition", observation.ExpectedGenerationID, eventType, observation.ObservedDigest, lastID)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO configuration_convergence_events(event_type,generation_id,digest,reason_code,evidence_digest,observed_at) VALUES(?,?,?,?,?,?)`, eventType, observation.ExpectedGenerationID, observation.ObservedDigest, string(observation.Reason), evidence, formatTime(observation.ObservedAt)); err != nil {
+		return false, err
+	}
+	bindingDigest := observation.ObservedDigest
+	if bindingDigest == "" {
+		bindingDigest = observation.ExpectedDigest
+	}
+	if err := appendConfigurationActivityTx(ctx, tx, eventType, observation.ExpectedGenerationID, "", bindingDigest, evidence, observation.ObservedAt); err != nil {
 		return false, err
 	}
 	if result, err := tx.ExecContext(ctx, `UPDATE configuration_authority SET authority_version=authority_version+1,updated_at=? WHERE authority_id=1 AND desired_generation_id=?`, formatTime(observation.ObservedAt), observation.ExpectedGenerationID); err != nil {

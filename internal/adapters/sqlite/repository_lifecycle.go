@@ -351,7 +351,7 @@ func (s *Store) PublishRepositoryRecheck(ctx context.Context, input application.
 		return application.RepositoryProjection{}, application.OperationReceipt{}, err
 	}
 	snapshot.SnapshotID = "repository-snapshot-" + strings.TrimPrefix(input.AttemptID, "repository-recheck-")
-	if err := insertRepositorySnapshotTx(ctx, tx, snapshot); err != nil {
+	if err := insertRepositorySnapshotTx(ctx, tx, snapshot, input.OperationID); err != nil {
 		return application.RepositoryProjection{}, application.OperationReceipt{}, err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE repository_lifecycles SET current_snapshot_id=?,updated_at=? WHERE incarnation_id=? AND retired_at='' AND removal_state='' AND lifecycle_version=? AND profile_digest=? AND repository_binding_digest=?`, snapshot.SnapshotID, formatTime(input.PublishedAt), current.Lifecycle.IncarnationID, current.Lifecycle.Version, current.Lifecycle.ProfileDigest, current.Lifecycle.RepositoryBindingDigest)
@@ -415,6 +415,9 @@ func (s *Store) SettleRepositoryRecheckFailure(ctx context.Context, input applic
 	if changed, _ := result.RowsAffected(); changed != 1 {
 		return application.ErrOperationReceiptConflict
 	}
+	if err := appendSettledOperationActivityTx(ctx, tx, input.OperationID, application.ActivityIngestionCurrent); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -446,7 +449,9 @@ func (s *Store) ChangeRepositoryLifecycle(ctx context.Context, input application
 		}
 	}
 	version := current.Lifecycle.Version
+	changedLifecycle := false
 	if current.Lifecycle.Intent != input.Intent {
+		changedLifecycle = true
 		version++
 		result, err := tx.ExecContext(ctx, `UPDATE repository_lifecycles SET intent=?,lifecycle_version=?,updated_at=? WHERE incarnation_id=? AND retired_at='' AND removal_state='' AND lifecycle_version=? AND intent=?`, string(input.Intent), version, formatTime(input.ChangedAt), current.Lifecycle.IncarnationID, current.Lifecycle.Version, string(current.Lifecycle.Intent))
 		if err != nil {
@@ -457,6 +462,11 @@ func (s *Store) ChangeRepositoryLifecycle(ctx context.Context, input application
 		}
 	}
 	resultDigest := repositoryDigest("repository-lifecycle-result-v1", current.Lifecycle.Repository, string(input.Intent), fmt.Sprint(version))
+	if changedLifecycle {
+		if err := appendRepositoryLifecycleActivityTx(ctx, tx, current.Lifecycle.Repository, current.Lifecycle.IncarnationID, current.Lifecycle.RepositoryBindingDigest, string(current.Lifecycle.Intent), string(input.Intent), version, input.OperationID, resultDigest, input.ChangedAt); err != nil {
+			return application.RepositoryProjection{}, application.OperationReceipt{}, err
+		}
+	}
 	receipt, err = settleRepositoryReceiptTx(ctx, tx, input.OperationID, string(input.Intent), version, resultDigest, resultDigest, input.ChangedAt)
 	if err != nil {
 		return application.RepositoryProjection{}, application.OperationReceipt{}, err
@@ -491,6 +501,9 @@ func (s *Store) SettleRepositoryLifecycleFailure(ctx context.Context, input appl
 	}
 	if changed, _ := result.RowsAffected(); changed != 1 {
 		return application.ErrOperationReceiptConflict
+	}
+	if err := appendSettledOperationActivityTx(ctx, tx, input.OperationID, application.ActivityIngestionCurrent); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -555,6 +568,9 @@ func (s *Store) ReconcileRepositoryRechecks(ctx context.Context, at time.Time) e
 		}
 		if changed, _ := receiptResult.RowsAffected(); changed != 1 {
 			return application.ErrOperationReceiptConflict
+		}
+		if err := appendSettledOperationActivityTx(ctx, tx, attempt.operationID, application.ActivityIngestionCurrent); err != nil {
+			return err
 		}
 	}
 	return tx.Commit()
@@ -791,7 +807,7 @@ func buildRepositorySnapshot(lifecycle application.RepositoryLifecycle, configur
 	return snapshot, snapshot.Validate()
 }
 
-func insertRepositorySnapshotTx(ctx context.Context, tx *sql.Tx, snapshot application.RepositoryReadinessSnapshot) error {
+func insertRepositorySnapshotTx(ctx context.Context, tx *sql.Tx, snapshot application.RepositoryReadinessSnapshot, operationID string) error {
 	if snapshot.Validate() != nil {
 		return errors.New("repository snapshot publication is invalid")
 	}
@@ -800,6 +816,15 @@ func insertRepositorySnapshotTx(ctx context.Context, tx *sql.Tx, snapshot applic
 	}
 	for _, result := range snapshot.Dimensions {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO repository_readiness_dimensions(snapshot_id,dimension,status,reason_code,identity_id,evidence_digest,observed_at) VALUES(?,?,?,?,?,?,?)`, snapshot.SnapshotID, string(result.Dimension), string(result.Status), result.ReasonCode, result.Identity, result.EvidenceDigest, formatTime(result.ObservedAt)); err != nil {
+			return err
+		}
+	}
+	sourceDigest := digestActivitySource(strings.Join([]string{snapshot.SnapshotID, string(snapshot.Status), snapshot.ReasonCode, snapshot.SnapshotDigest, formatTime(snapshot.ObservedAt), formatTime(snapshot.PublishedAt)}, "\x00"))
+	event := application.NewActivityEvent(application.ActivityEventInput{SourceKind: "repository_lifecycle", SourceIdentity: snapshot.SnapshotID, SourceEvidenceDigest: sourceDigest, Category: application.ActivityRepository, EventKind: application.ActivityRepositoryGateChange, Actor: application.ActivityActorController, Scope: application.ScopeRepository, TargetID: snapshot.Repository, TargetBindingDigest: snapshot.RepositoryBindingDigest, ReasonCode: application.ActivityReasonReadinessChanged, ResultingState: string(snapshot.Status), ResultingVersion: snapshot.LifecycleVersion, OccurredAt: snapshot.PublishedAt, ObservedAt: &snapshot.ObservedAt, RelatedResources: []application.ActivityRelatedResource{{Kind: application.ScopeRepository, ID: snapshot.Repository}}, OperationIDs: compactStrings(operationID), EvidenceDigests: compactDigests(snapshot.SnapshotDigest, sourceDigest), Coverage: application.ActivityEventCoverage{IngestionClass: application.ActivityIngestionCurrent, LegacyReconstructable: true}})
+	if available, err := activitySchemaAvailableTx(ctx, tx); err != nil {
+		return err
+	} else if available {
+		if _, _, err := appendActivityEventTx(ctx, tx, event); err != nil {
 			return err
 		}
 	}
@@ -843,6 +868,9 @@ func settleRepositoryReceiptTx(ctx context.Context, tx *sql.Tx, operationID, sta
 	if changed, _ := result.RowsAffected(); changed != 1 {
 		return application.OperationReceipt{}, application.ErrOperationReceiptConflict
 	}
+	if err := appendSettledOperationActivityTx(ctx, tx, operationID, application.ActivityIngestionCurrent); err != nil {
+		return application.OperationReceipt{}, err
+	}
 	updated, _, err := getOperationReceiptByIDTx(ctx, tx, operationID)
 	return updated, err
 }
@@ -867,7 +895,7 @@ func insertInitialRepositoryLifecycleTx(ctx context.Context, tx *sql.Tx, lifecyc
 	if err != nil {
 		return err
 	}
-	if err := insertRepositorySnapshotTx(ctx, tx, snapshot); err != nil {
+	if err := insertRepositorySnapshotTx(ctx, tx, snapshot, ""); err != nil {
 		return err
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE repository_lifecycles SET current_snapshot_id=? WHERE incarnation_id=? AND current_snapshot_id=''`, snapshot.SnapshotID, lifecycle.IncarnationID)

@@ -416,6 +416,32 @@ func (s *Store) SettleOnboardingStep(ctx context.Context, input application.Onbo
 	if err != nil {
 		return application.Onboarding{}, err
 	}
+	binding := current.RepositoryBindingDigest
+	if input.Observation.RepositoryBindingDigest != "" {
+		binding = input.Observation.RepositoryBindingDigest
+	}
+	if binding == "" {
+		binding = current.RequestDigest
+	}
+	eventKind, eventReason := application.ActivityOnboardingMilestone, application.ActivityReasonMilestone
+	if nextStatus == domain.OnboardingReadyDisabled {
+		eventKind, eventReason = application.ActivityOnboardingCompleted, application.ActivityReasonCompleted
+	} else if nextStatus == domain.OnboardingConflict {
+		eventKind, eventReason = application.ActivityOnboardingConflict, application.ActivityReasonConflict
+	}
+	operationIDs := []string{}
+	if nextStatus == domain.OnboardingReadyDisabled || nextStatus == domain.OnboardingConflict {
+		operationIDs = compactStrings(current.OperationID)
+	}
+	sourceDigest := digestActivitySource(strings.Join([]string{input.OnboardingID, string(input.Step), string(input.Observation.Outcome), input.Observation.ReasonCode, input.Observation.EvidenceDigest, formatTime(input.ObservedAt)}, "\x00"))
+	event := application.NewActivityEvent(application.ActivityEventInput{SourceKind: "onboarding", SourceIdentity: input.OnboardingID + ":" + string(input.Step), SourceEvidenceDigest: sourceDigest, Category: application.ActivityOnboarding, EventKind: eventKind, Actor: application.ActivityActorController, Scope: application.ScopeOnboarding, TargetID: input.OnboardingID, TargetBindingDigest: binding, ReasonCode: eventReason, ResultingState: string(nextStatus), ResultingVersion: int64(stepIndex), OccurredAt: input.ObservedAt, RelatedResources: []application.ActivityRelatedResource{{Kind: application.ScopeOnboarding, ID: input.OnboardingID}}, OperationIDs: operationIDs, EvidenceDigests: compactDigests(input.Observation.EvidenceDigest, sourceDigest), Coverage: application.ActivityEventCoverage{IngestionClass: application.ActivityIngestionCurrent, LegacyReconstructable: true}})
+	if available, err := activitySchemaAvailableTx(ctx, tx); err != nil {
+		return application.Onboarding{}, err
+	} else if available {
+		if _, _, err := appendActivityEventTx(ctx, tx, event); err != nil {
+			return application.Onboarding{}, err
+		}
+	}
 	if nextStatus == domain.OnboardingReadyDisabled || nextStatus == domain.OnboardingConflict {
 		receipt, found, receiptErr := getOperationReceiptByIDTx(ctx, tx, current.OperationID)
 		if receiptErr != nil || !found {
@@ -427,6 +453,9 @@ func (s *Store) SettleOnboardingStep(ctx context.Context, input application.Onbo
 			receiptOutcome, resultState = application.OperationOutcomeConflict, string(domain.OnboardingConflict)
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE operation_receipts SET phase='observed',outcome=?,resulting_authority_digest=?,resulting_state=?,resulting_version=?,evidence_digest=?,result_digest=?,applied_at=CASE WHEN applied_at='' THEN ? ELSE applied_at END,settled_at=? WHERE operation_id=? AND outcome='pending'`, string(receiptOutcome), current.RepositoryBindingDigest, resultState, stepIndex, input.Observation.EvidenceDigest, input.Observation.EvidenceDigest, formatTime(input.ObservedAt), formatTime(input.ObservedAt), receipt.OperationID); err != nil {
+			return application.Onboarding{}, err
+		}
+		if err := appendSettledOperationActivityTx(ctx, tx, receipt.OperationID, application.ActivityIngestionCurrent); err != nil {
 			return application.Onboarding{}, err
 		}
 	}

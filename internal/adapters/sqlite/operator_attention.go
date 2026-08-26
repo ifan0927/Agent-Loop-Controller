@@ -97,18 +97,35 @@ func (s *Store) AppendOperatorAttention(ctx context.Context, event application.O
 	if err != nil {
 		return false, err
 	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO operator_attention_outbox(event_key,payload_digest,schema_version,event_type,run_id,linear_identifier,repository_profile_id,repository_profile_name,controller_state,severity,reason_code,allowed_actions_json,evidence_digest,occurred_at,observed_at,legacy_payload_digest,legacy_delivery_status,created_at,retry_failure_class) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var superseded string
+	_ = tx.QueryRowContext(ctx, `SELECT event_key FROM operator_attention_outbox WHERE event_type=? AND run_id=? AND linear_identifier=? AND repository_profile_id=? ORDER BY occurred_at DESC,event_key DESC LIMIT 1`, event.EventType, event.RunID, event.LinearIdentifier, event.RepositoryProfileID).Scan(&superseded)
+	result, err := tx.ExecContext(ctx, `INSERT INTO operator_attention_outbox(event_key,payload_digest,schema_version,event_type,run_id,linear_identifier,repository_profile_id,repository_profile_name,controller_state,severity,reason_code,allowed_actions_json,evidence_digest,occurred_at,observed_at,legacy_payload_digest,legacy_delivery_status,created_at,retry_failure_class) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		event.EventKey, event.PayloadDigest, event.SchemaVersion, event.EventType, event.RunID, event.LinearIdentifier, event.RepositoryProfileID, event.RepositoryProfileName, event.ControllerState, event.Severity, event.ReasonCode, string(actions), event.EvidenceDigest, formatTime(event.OccurredAt), formatTime(event.ObservedAt), "", "", nowText(), event.RetryFailureClass)
 	if err == nil {
+		if available, checkErr := activitySchemaAvailableTx(ctx, tx); checkErr != nil {
+			return false, checkErr
+		} else if available {
+			if err := appendOperatorAttentionActivityTx(ctx, tx, event, superseded); err != nil {
+				return false, err
+			}
+		}
 		count, countErr := result.RowsAffected()
-		return count == 1, countErr
+		if countErr != nil {
+			return false, countErr
+		}
+		return count == 1, tx.Commit()
 	}
-	persisted, lookupErr := scanOperatorAttention(s.db.QueryRowContext(ctx, operatorAttentionSelect+` WHERE event_key=?`, event.EventKey))
+	persisted, lookupErr := scanOperatorAttention(tx.QueryRowContext(ctx, operatorAttentionSelect+` WHERE event_key=?`, event.EventKey))
 	if lookupErr != nil {
 		return false, err
 	}
 	if persisted.PayloadDigest == event.PayloadDigest || (persisted.SchemaVersion == application.OperatorAttentionLegacySchemaVersion && application.OperatorAttentionContentDigest(persisted) == application.OperatorAttentionContentDigest(event)) {
-		return false, nil
+		return false, tx.Commit()
 	}
 	return false, application.FormatOperatorAttentionConflict(event)
 }

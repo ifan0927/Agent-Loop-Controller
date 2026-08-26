@@ -590,12 +590,23 @@ func (s *Store) AppendSchedulingDecision(ctx context.Context, decision applicati
 	if err := decision.Validate(); err != nil {
 		return false, err
 	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO scheduling_decisions(decision_id,snapshot_digest,observed_at,capacity_identity,issue_uuid,issue_sequence,priority,repository_profile_id,run_id,repository_binding_digest,classification,reason_code,repository_slot_version,heavy_permit_version,admission_lease_version)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `INSERT INTO scheduling_decisions(decision_id,snapshot_digest,observed_at,capacity_identity,issue_uuid,issue_sequence,priority,repository_profile_id,run_id,repository_binding_digest,classification,reason_code,repository_slot_version,heavy_permit_version,admission_lease_version)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(decision_id) DO NOTHING`, decision.DecisionID, decision.SnapshotDigest, formatTime(decision.ObservedAt), decision.CapacityIdentity, decision.IssueUUID, decision.IssueSequence, decision.Priority, decision.RepositoryProfileID, decision.RunID, decision.RepositoryBindingDigest, decision.Classification, decision.ReasonCode, decision.RepositorySlotVersion, decision.HeavyPermitVersion, decision.AdmissionLeaseVersion)
 	if err != nil {
 		return false, err
 	}
 	count, _ := result.RowsAffected()
+	if err := appendAdmissionConflictActivityTx(ctx, tx, decision); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
 	return count == 1, nil
 }
 

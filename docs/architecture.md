@@ -1436,8 +1436,45 @@ active attention, repositories, onboarding, and settings. Every query first
 authenticates the complete configured operator, applies scope before collection
 shape, and returns only allowlisted typed fields with sanitized response
 digests. Routine reads do not reconcile, refresh external systems, acknowledge
-attention, or advance workflow authority. The planned local operator interface
-is a TUI over these Controller-owned application contracts:
+attention, or advance workflow authority. The activity/history contracts
+extend this same presentation-independent boundary.
+
+The implemented activity family is a separate append-only explanatory
+projection. It uses deterministic identities over schema version, private
+source kind, immutable source identity, and finite semantic event kind. Public
+snapshots expose only the eight closed categories, finite actor/reason/event
+classifications, authorized target, state/version changes, bounded typed links,
+times, evidence digests, and immutable per-event coverage class. The private
+source key and target binding never leave persistence. Exact replay is
+idempotent; identity or snapshot drift conflicts and never overwrites history.
+
+Meaningful SQLite-owned source facts and their activity rows commit in one
+transaction. A settled operation has exactly one primary activity link: a
+specific run, repository, onboarding, or configuration event owns the link
+when the settlement transaction produces that event; otherwise the receipt
+produces a generic operation event. Pending receipt phases remain visible only
+in bounded operation history. Runtime worker classification changes reconcile
+idempotently outside source transactions; unchanged heartbeat observations do
+not append events. Runtime lag or conflict degrades coverage without granting
+workflow authority.
+
+Activity list/detail and operation-history list are authorization-first,
+side-effect-free reads. Activity pages fix an ingestion watermark and bind the
+opaque cursor to schema, authorized-scope digest, filters, keyset position, and
+that watermark. Receipt pages bind the same authority/filter evidence to the
+immutable accepted-time ordering boundary, so later monotonic receipt advances
+do not reorder a page sequence. Automatic legacy reconstruction is bounded,
+SQLite-only, resumable per source, and worker-fair. Coverage distinguishes
+`complete`, `backfilling`, `degraded`, `unknown`, and `conflict`, and always
+discloses that non-persisted legacy worker/runtime transitions and repository
+intent history cannot be reconstructed, while legacy attention resolution is
+only partially reconstructable and admission-capacity decisions are not
+backfilled. A later successful indexing cycle clears a transient degradation;
+an immutable-source conflict remains explicit. Activity, coverage, cursors,
+and projection digests are never workflow or mutation authority.
+
+The planned local operator interface is a TUI over these Controller-owned
+application contracts:
 
 ```text
 current CLI ----\
@@ -1534,6 +1571,7 @@ around it. The principal table groups are:
 | `automatic_retry_schedules`, `operator_attention_outbox` | Restart-stable retry policy and immutable versioned operator-attention events; legacy delivery fields are storage-only evidence |
 | `operator_actions` | Action-specific authenticated recovery intent and legacy validated/applied/observed provenance, separate from automatic workflow evidence |
 | `operation_receipts` | Scope-neutral accepted/applied/observed operation identity, outcome, and sanitized result evidence; legacy operator actions are backfilled and mirrored here |
+| `activity_events`, operation links, backfill progress, and runtime classification state | Immutable sanitized activity snapshots, one-primary-event receipt correlation, stable ingestion watermarks, bounded restart progress, and explicit coverage evidence; never workflow authority |
 | configuration generation, authority, apply/recovery-intent, and convergence tables | Immutable desired/effective metadata, one Controller-wide CAS mutation authority, crash reconciliation state, optional immutable rollback-source identity, and meaningful sanitized transitions; raw desired bytes remain outside SQLite and external bytes are never stored |
 | `configuration_drafts` | At most one active Controller-wide normal or rollback-origin typed draft, revision/edit replay authority, immutable rollback source when applicable, sanitized validation/preview evidence, and generation/receipt settlement; no raw candidate, path, identity, or credential authority |
 | repository lifecycle, readiness, recheck, and removal tables | Immutable incarnation history, one current canonical/profile/binding authority, complete readiness evidence, exclusive source-bound removal draft and accepted/applied/observed settlement, and tombstone evidence; no external-resource deletion authority |
