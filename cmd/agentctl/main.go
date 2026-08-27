@@ -74,9 +74,11 @@ func main() {
 
 func controller(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: agentctl controller <start|run|drive|worker|launchagent|launchdaemon|status|inspect|continue|retry|recover-ci-wait|recover-owned-push|accept-external-merge|abandon|push|open-pr|reconcile|merge|reconcile-linear|cleanup> ...")
+		return errors.New("usage: agentctl controller <integrity|start|run|drive|worker|launchagent|launchdaemon|status|inspect|continue|retry|recover-ci-wait|recover-owned-push|accept-external-merge|abandon|push|open-pr|reconcile|merge|reconcile-linear|cleanup> ...")
 	}
 	switch args[0] {
+	case "integrity":
+		return controllerIntegrity(args[1:])
 	case "start":
 		return linearStart(args[1:])
 	case "run":

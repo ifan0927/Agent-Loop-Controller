@@ -30,7 +30,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 40
+const schemaVersion = 41
 
 const (
 	sqliteMigrationRetryDelay = 10 * time.Millisecond
@@ -665,8 +665,17 @@ func migrateSQLite(ctx context.Context, db sqliteTransactioner, supportedVersion
 			}
 			existingVersion = 38
 		}
-		if supportedVersion >= 39 && existingVersion < 39 {
-			return migrateSQLiteGeneric(ctx, db, supportedVersion)
+		if supportedVersion >= 39 && existingVersion < 40 {
+			if err := migrateSQLiteGeneric(ctx, db, min(supportedVersion, 40)); err != nil {
+				return err
+			}
+			existingVersion = min(supportedVersion, 40)
+		}
+		if supportedVersion >= 41 && existingVersion < 41 {
+			if err := migrateSQLiteV41Upgrade(ctx, db); err != nil {
+				return err
+			}
+			existingVersion = 41
 		}
 	}
 	return migrateSQLiteGeneric(ctx, db, supportedVersion)
@@ -774,6 +783,8 @@ func migrateSQLiteGeneric(ctx context.Context, db sqliteTransactioner, supported
 			statements = migrationV39
 		case 40:
 			statements = migrationV40
+		case 41:
+			statements = migrationV41
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -2098,6 +2109,142 @@ func integrityMigrationV40() []string {
 		}
 	}
 	return statements
+}
+
+var migrationV41 = integrityRecheckMigrationV41()
+
+func integrityRecheckMigrationV41() []string {
+	statements := []string{
+		`PRAGMA legacy_alter_table = ON`,
+		`DROP TRIGGER integrity_track_operation_receipts_insert`,
+		`DROP TRIGGER integrity_track_operation_receipts_update`,
+		`DROP TRIGGER integrity_track_operation_receipts_delete`,
+		`DROP TRIGGER integrity_track_activity_events_insert`,
+		`DROP TRIGGER integrity_track_activity_events_update`,
+		`DROP TRIGGER integrity_track_activity_events_delete`,
+		`DROP TRIGGER integrity_track_activity_operation_links_insert`,
+		`DROP TRIGGER integrity_track_activity_operation_links_update`,
+		`DROP TRIGGER integrity_track_activity_operation_links_delete`,
+		`DROP INDEX operation_receipts_target`,
+		`DROP INDEX operation_receipts_source_action`,
+		`ALTER TABLE operation_receipts RENAME TO operation_receipts_v40`,
+		`CREATE TABLE operation_receipts (
+			operation_id TEXT PRIMARY KEY, authority_key TEXT NOT NULL UNIQUE, operation_anchor_digest TEXT NOT NULL,
+			operation_type TEXT NOT NULL CHECK(operation_type IN ('decide','retry','abandon','recover_ci_wait','recover_owned_push','accept_external_merge','apply_configuration','restore_configuration','recheck_repository','enable_repository','disable_repository','remove_repository','onboard_repository','recheck_integrity')),
+			scope_kind TEXT NOT NULL CHECK(scope_kind IN ('controller','repository','run','onboarding')), target_id TEXT NOT NULL,
+			requester_login TEXT NOT NULL, requester_database_id INTEGER NOT NULL, requester_node_id TEXT NOT NULL, requester_actor_type TEXT NOT NULL,
+			request_digest TEXT NOT NULL, expected_authority_digest TEXT NOT NULL, target_binding_digest TEXT NOT NULL,
+			phase TEXT NOT NULL CHECK(phase IN ('accepted','applied','observed')), outcome TEXT NOT NULL CHECK(outcome IN ('pending','succeeded','failed','conflict','ambiguous')),
+			resulting_authority_digest TEXT NOT NULL DEFAULT '', resulting_state TEXT NOT NULL DEFAULT '', resulting_version INTEGER NOT NULL DEFAULT 0 CHECK(resulting_version >= 0), evidence_digest TEXT NOT NULL DEFAULT '', result_digest TEXT NOT NULL DEFAULT '', accepted_at TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT '', settled_at TEXT NOT NULL DEFAULT '', source_action_id TEXT NOT NULL DEFAULT ''
+		)`,
+		`INSERT INTO operation_receipts SELECT * FROM operation_receipts_v40`,
+		`DROP TABLE operation_receipts_v40`,
+		`CREATE INDEX operation_receipts_target ON operation_receipts(scope_kind,target_id,accepted_at,operation_id)`,
+		`CREATE UNIQUE INDEX operation_receipts_source_action ON operation_receipts(source_action_id) WHERE source_action_id<>''`,
+		`CREATE TABLE controller_integrity_rechecks (
+			request_key TEXT PRIMARY KEY, request_claim_digest TEXT NOT NULL UNIQUE, request_digest TEXT NOT NULL, request_schema_version TEXT NOT NULL CHECK(request_schema_version='v1'),
+			operation_id TEXT NOT NULL UNIQUE REFERENCES operation_receipts(operation_id), registry_version TEXT NOT NULL CHECK(registry_version='v1'),
+			pre_acceptance_generation INTEGER NOT NULL CHECK(pre_acceptance_generation>=0), accepted_generation INTEGER NOT NULL CHECK(accepted_generation>pre_acceptance_generation),
+			scan_id TEXT NOT NULL UNIQUE REFERENCES controller_integrity_scans(scan_id), target_generation INTEGER NOT NULL CHECK(target_generation=accepted_generation),
+			binding_digest TEXT NOT NULL DEFAULT '', status TEXT NOT NULL CHECK(status IN ('active','observed','conflict','ambiguous')),
+			observation_id TEXT NOT NULL DEFAULT '', observation_digest TEXT NOT NULL DEFAULT '', readiness TEXT NOT NULL DEFAULT '' CHECK(readiness IN ('','ready','not_ready','unknown','conflict')),
+			reason_code TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, settled_at TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE UNIQUE INDEX controller_integrity_one_active_recheck ON controller_integrity_rechecks(status) WHERE status='active'`,
+		`CREATE TABLE controller_integrity_active_recheck (
+			singleton INTEGER PRIMARY KEY CHECK(singleton=1), request_key TEXT NOT NULL UNIQUE REFERENCES controller_integrity_rechecks(request_key),
+			operation_id TEXT NOT NULL UNIQUE REFERENCES operation_receipts(operation_id), scan_id TEXT NOT NULL UNIQUE REFERENCES controller_integrity_scans(scan_id),
+			target_generation INTEGER NOT NULL CHECK(target_generation>=0), created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE controller_integrity_finalization_guard (
+			singleton INTEGER PRIMARY KEY CHECK(singleton=1), operation_id TEXT NOT NULL UNIQUE REFERENCES operation_receipts(operation_id),
+			scan_id TEXT NOT NULL UNIQUE REFERENCES controller_integrity_scans(scan_id), target_generation INTEGER NOT NULL CHECK(target_generation>=0),
+			activity_event_id TEXT NOT NULL UNIQUE, activity_source_identity TEXT NOT NULL, activity_link_operation_id TEXT NOT NULL,
+			entered_at TEXT NOT NULL, CHECK(activity_source_identity=operation_id), CHECK(activity_link_operation_id=operation_id)
+		)`,
+		`CREATE TRIGGER integrity_guard_operation_receipt_reject BEFORE UPDATE ON operation_receipts
+			WHEN EXISTS(SELECT 1 FROM controller_integrity_finalization_guard g WHERE g.operation_id=OLD.operation_id)
+			AND NOT (OLD.operation_id=NEW.operation_id AND OLD.operation_type='recheck_integrity' AND OLD.scope_kind='controller' AND OLD.target_id='controller-integrity' AND OLD.phase='applied' AND OLD.outcome='pending' AND NEW.phase='observed' AND NEW.outcome='succeeded' AND EXISTS(SELECT 1 FROM controller_integrity_finalization_guard g JOIN controller_integrity_rechecks r ON r.operation_id=g.operation_id AND r.scan_id=g.scan_id AND r.target_generation=g.target_generation AND r.status='active' JOIN controller_integrity_active_recheck a ON a.operation_id=g.operation_id AND a.scan_id=g.scan_id AND a.target_generation=g.target_generation AND a.request_key=r.request_key WHERE g.operation_id=OLD.operation_id))
+			BEGIN SELECT RAISE(ABORT,'integrity finalization receipt mismatch'); END`,
+		`CREATE TRIGGER integrity_guard_activity_event_reject BEFORE INSERT ON activity_events
+			WHEN EXISTS(SELECT 1 FROM controller_integrity_finalization_guard g WHERE NEW.source_identity=g.operation_id OR NEW.event_id=g.activity_event_id)
+			AND NOT EXISTS(SELECT 1 FROM controller_integrity_finalization_guard g JOIN controller_integrity_rechecks r ON r.operation_id=g.operation_id AND r.scan_id=g.scan_id AND r.target_generation=g.target_generation AND r.status='active' JOIN controller_integrity_active_recheck a ON a.operation_id=g.operation_id AND a.scan_id=g.scan_id AND a.target_generation=g.target_generation AND a.request_key=r.request_key WHERE NEW.event_id=g.activity_event_id AND NEW.source_kind='operation_receipt' AND NEW.source_identity=g.activity_source_identity AND NEW.category='operation' AND NEW.event_kind='operation_settled' AND NEW.actor='configured_operator' AND NEW.scope_kind='controller' AND NEW.target_id='controller-integrity' AND NEW.reason_code='succeeded' AND NEW.operation_ids_json=json_array(g.operation_id))
+			BEGIN SELECT RAISE(ABORT,'integrity finalization activity mismatch'); END`,
+		`CREATE TRIGGER integrity_guard_activity_link_reject BEFORE INSERT ON activity_operation_links
+			WHEN EXISTS(SELECT 1 FROM controller_integrity_finalization_guard g WHERE NEW.operation_id=g.operation_id OR NEW.event_id=g.activity_event_id)
+			AND NOT EXISTS(SELECT 1 FROM controller_integrity_finalization_guard g JOIN controller_integrity_rechecks r ON r.operation_id=g.operation_id AND r.scan_id=g.scan_id AND r.target_generation=g.target_generation AND r.status='active' JOIN controller_integrity_active_recheck a ON a.operation_id=g.operation_id AND a.scan_id=g.scan_id AND a.target_generation=g.target_generation AND a.request_key=r.request_key WHERE NEW.operation_id=g.activity_link_operation_id AND NEW.event_id=g.activity_event_id)
+			BEGIN SELECT RAISE(ABORT,'integrity finalization activity link mismatch'); END`,
+		`PRAGMA legacy_alter_table = OFF`,
+	}
+	statements = append(statements,
+		integrityTrackingTrigger("operation_receipts", "INSERT", ""),
+		integrityTrackingTrigger("operation_receipts", "UPDATE", `NOT EXISTS(SELECT 1 FROM controller_integrity_finalization_guard g JOIN controller_integrity_rechecks r ON r.operation_id=g.operation_id AND r.scan_id=g.scan_id AND r.target_generation=g.target_generation AND r.status='active' JOIN controller_integrity_active_recheck a ON a.operation_id=g.operation_id AND a.scan_id=g.scan_id AND a.target_generation=g.target_generation AND a.request_key=r.request_key WHERE g.operation_id=OLD.operation_id AND OLD.operation_type='recheck_integrity' AND OLD.scope_kind='controller' AND OLD.target_id='controller-integrity' AND OLD.phase='applied' AND OLD.outcome='pending' AND NEW.phase='observed' AND NEW.outcome='succeeded')`),
+		integrityTrackingTrigger("operation_receipts", "DELETE", ""),
+		integrityTrackingTrigger("activity_events", "INSERT", `NOT EXISTS(SELECT 1 FROM controller_integrity_finalization_guard g JOIN controller_integrity_rechecks r ON r.operation_id=g.operation_id AND r.scan_id=g.scan_id AND r.target_generation=g.target_generation AND r.status='active' JOIN controller_integrity_active_recheck a ON a.operation_id=g.operation_id AND a.scan_id=g.scan_id AND a.target_generation=g.target_generation AND a.request_key=r.request_key WHERE NEW.event_id=g.activity_event_id AND NEW.source_kind='operation_receipt' AND NEW.source_identity=g.activity_source_identity AND NEW.category='operation' AND NEW.event_kind='operation_settled' AND NEW.actor='configured_operator' AND NEW.scope_kind='controller' AND NEW.target_id='controller-integrity' AND NEW.reason_code='succeeded' AND NEW.operation_ids_json=json_array(g.operation_id))`),
+		integrityTrackingTrigger("activity_events", "UPDATE", ""),
+		integrityTrackingTrigger("activity_events", "DELETE", ""),
+		integrityTrackingTrigger("activity_operation_links", "INSERT", `NOT EXISTS(SELECT 1 FROM controller_integrity_finalization_guard g JOIN controller_integrity_rechecks r ON r.operation_id=g.operation_id AND r.scan_id=g.scan_id AND r.target_generation=g.target_generation AND r.status='active' JOIN controller_integrity_active_recheck a ON a.operation_id=g.operation_id AND a.scan_id=g.scan_id AND a.target_generation=g.target_generation AND a.request_key=r.request_key WHERE NEW.operation_id=g.activity_link_operation_id AND NEW.event_id=g.activity_event_id)`),
+		integrityTrackingTrigger("activity_operation_links", "UPDATE", ""),
+		integrityTrackingTrigger("activity_operation_links", "DELETE", ""),
+	)
+	return statements
+}
+
+func integrityTrackingTrigger(table, operation, when string) string {
+	condition := ""
+	if when != "" {
+		condition = " WHEN " + when
+	}
+	return fmt.Sprintf(`CREATE TRIGGER integrity_track_%s_%s AFTER %s ON %s%s BEGIN
+		UPDATE controller_integrity_generation SET generation=generation+1,updated_at=CURRENT_TIMESTAMP WHERE singleton=1;
+		INSERT INTO controller_integrity_scope_revisions(family,scope_kind,scope_id,revision_generation,updated_at)
+		SELECT 'operation_activity','controller','local-controller',generation,CURRENT_TIMESTAMP FROM controller_integrity_generation WHERE singleton=1
+		ON CONFLICT(family,scope_kind,scope_id) DO UPDATE SET revision_generation=excluded.revision_generation,updated_at=excluded.updated_at;
+	END`, table, strings.ToLower(operation), operation, table, condition)
+}
+
+func migrateSQLiteV41Upgrade(ctx context.Context, db sqliteTransactioner) error {
+	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		return err
+	}
+	defer db.ExecContext(ctx, `PRAGMA foreign_keys = ON`)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var current int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&current); err != nil {
+		return err
+	}
+	if current >= 41 {
+		return tx.Commit()
+	}
+	if current != 40 {
+		return fmt.Errorf("integrity recheck migration requires schema 40, found %d", current)
+	}
+	for _, statement := range migrationV41 {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("migrate schema to version 41: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,applied_at) VALUES(41,?)`, nowText()); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA legacy_alter_table = OFF`); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
+		return err
+	}
+	var violations int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_foreign_key_check`).Scan(&violations); err != nil || violations != 0 {
+		return errors.New("schema 41 foreign key validation failed")
+	}
+	return nil
 }
 
 func migrateSQLiteV38Upgrade(ctx context.Context, db sqliteTransactioner) error {

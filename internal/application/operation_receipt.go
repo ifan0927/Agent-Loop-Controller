@@ -31,6 +31,7 @@ const (
 	OperationDisableRepository    OperationType = "disable_repository"
 	OperationRemoveRepository     OperationType = "remove_repository"
 	OperationOnboardRepository    OperationType = "onboard_repository"
+	OperationRecheckIntegrity     OperationType = "recheck_integrity"
 )
 
 type OperationPhase string
@@ -355,7 +356,7 @@ func ValidateOperationReceiptMutation(mutation OperationReceiptMutation) error {
 
 func validOperationType(value OperationType) bool {
 	switch value {
-	case OperationDecide, OperationRetry, OperationAbandon, OperationRecoverCIWait, OperationRecoverOwnedPush, OperationAcceptExternalMerge, OperationApplyConfiguration, OperationRestoreConfiguration, OperationRecheckRepository, OperationEnableRepository, OperationDisableRepository, OperationRemoveRepository, OperationOnboardRepository:
+	case OperationDecide, OperationRetry, OperationAbandon, OperationRecoverCIWait, OperationRecoverOwnedPush, OperationAcceptExternalMerge, OperationApplyConfiguration, OperationRestoreConfiguration, OperationRecheckRepository, OperationEnableRepository, OperationDisableRepository, OperationRemoveRepository, OperationOnboardRepository, OperationRecheckIntegrity:
 		return true
 	default:
 		return false

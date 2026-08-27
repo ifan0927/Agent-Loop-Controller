@@ -1493,6 +1493,39 @@ racing mutation supersedes and requeues the scan. Immutable family states are
 A prior observation remains history, but its effective readiness becomes
 `unknown` immediately when the registry or source generation advances.
 
+The configured operator may explicitly request the closed
+`recheck_integrity` Controller operation. One versioned private request key
+binds the exact requester and caller request ID; exact replay returns the same
+common operation receipt and immutable scan binding. Acceptance inserts and
+applies that receipt before capturing the resulting source generation, then
+atomically supersedes any older automatic scan and binds the deterministic
+replacement scan for that post-receipt generation. At most one explicit
+recheck is active. Neither the CLI nor any caller can select families, rules,
+SQL, bounds, generations, scan identities, repair, force, or skip behavior.
+
+Automatic maintenance and explicit requests share the same scan cursor, lease,
+seven family checks, convergence bound, and publication path. A competing
+unexpired lease leaves the receipt applied and pending for worker continuation.
+A later registered-source mutation supersedes the bound scan and atomically
+settles the receipt as observed/conflict without rebinding. Restart resumes
+only the exact committed scan and cursor; replay never creates replacement
+work for an already applied receipt.
+
+Successful explicit finalization uses one schema-v41 persistence-private guard
+inside the exact SQLite publication transaction. It suppresses generation
+advancement only for settling that one `recheck_integrity` receipt and
+inserting its deterministic generic operation activity event and primary link.
+The transaction then reruns `operation_activity`, replaces only that scan's
+pre-final family evidence, validates the receipt, activity, link, generation,
+guard identity, and absence of unrelated mutation, publishes the observation,
+advances the current pointer, settles the recheck binding, and removes both
+the active pointer and guard. Any mismatch or interruption rolls back the
+entire bundle, leaving the receipt applied/pending. Residual guard evidence,
+a published scan with a pending receipt, or a succeeded receipt without its
+exact observation is conflict evidence and is never automatically repaired.
+Operation success is distinct from readiness: the bound trusted observation
+may be `ready`, `not_ready`, `unknown`, or `conflict`.
+
 The summary and affected-scope detail contracts authenticate the complete
 configured operator before persistence lookup, counting, ordering, or cursor
 construction. Findings expose only opaque identity, family, finite reason,
@@ -1501,8 +1534,9 @@ time, and bounded classification metadata. Untrustworthy narrower bindings
 fall back to Controller scope. Cursors bind the immutable observation digest,
 authorization digest, filter digest, and keyset position. These projections are
 explanatory only: they do not block, authorize, repair, delete, or otherwise
-change existing workflow or external effects. Explicit receipt-backed recheck
-and presentation adapters remain follow-up work.
+change existing workflow or external effects. The receipt-backed recheck is
+implemented through the same application boundary; presentation adapters
+remain follow-up work.
 
 The planned local operator interface is a TUI over these Controller-owned
 application contracts:
@@ -1603,7 +1637,7 @@ around it. The principal table groups are:
 | `operator_actions` | Action-specific authenticated recovery intent and legacy validated/applied/observed provenance, separate from automatic workflow evidence |
 | `operation_receipts` | Scope-neutral accepted/applied/observed operation identity, outcome, and sanitized result evidence; legacy operator actions are backfilled and mirrored here |
 | `activity_events`, operation links, backfill progress, and runtime classification state | Immutable sanitized activity snapshots, one-primary-event receipt correlation, stable ingestion watermarks, bounded restart progress, and explicit coverage evidence; never workflow authority |
-| integrity registry, generation/revision, scan, checked-family, finding, observation, and current-pointer tables | Closed SQLite-only invariant registry, structural mutation coverage, one restart-safe bounded scan lane, immutable mutation-fenced observations, and sanitized explanatory findings; never workflow or repair authority |
+| integrity registry, generation/revision, scan, explicit-recheck binding/active/guard, checked-family, finding, observation, and current-pointer tables | Closed SQLite-only invariant registry, structural mutation coverage, one restart-safe bounded scan lane, receipt-bound post-acceptance rechecks, exact transaction-only finalization suppression, immutable mutation-fenced observations, and sanitized explanatory findings; never workflow or repair authority |
 | configuration generation, authority, apply/recovery-intent, and convergence tables | Immutable desired/effective metadata, one Controller-wide CAS mutation authority, crash reconciliation state, optional immutable rollback-source identity, and meaningful sanitized transitions; raw desired bytes remain outside SQLite and external bytes are never stored |
 | `configuration_drafts` | At most one active Controller-wide normal or rollback-origin typed draft, revision/edit replay authority, immutable rollback source when applicable, sanitized validation/preview evidence, and generation/receipt settlement; no raw candidate, path, identity, or credential authority |
 | repository lifecycle, readiness, recheck, and removal tables | Immutable incarnation history, one current canonical/profile/binding authority, complete readiness evidence, exclusive source-bound removal draft and accepted/applied/observed settlement, and tombstone evidence; no external-resource deletion authority |
