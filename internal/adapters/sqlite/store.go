@@ -782,6 +782,8 @@ func migrateSQLiteGeneric(ctx context.Context, db sqliteTransactioner, supported
 				return err
 			}
 		}
+		migrationStatements := make([]string, 0, len(statements))
+		integrityTablePresence := make(map[string]bool)
 		for _, statement := range statements {
 			if version == 40 && strings.HasPrefix(statement, "CREATE TRIGGER integrity_track_") {
 				parts := strings.SplitN(statement, " ON ", 2)
@@ -789,14 +791,27 @@ func migrateSQLiteGeneric(ctx context.Context, db sqliteTransactioner, supported
 					return errors.New("integrity mutation trigger is invalid")
 				}
 				table := strings.Fields(parts[1])[0]
-				var present int
-				if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&present); err != nil {
-					return err
+				present, checked := integrityTablePresence[table]
+				if !checked {
+					var count int
+					if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil {
+						return err
+					}
+					present = count != 0
+					integrityTablePresence[table] = present
 				}
-				if present == 0 {
+				if !present {
 					continue
 				}
 			}
+			migrationStatements = append(migrationStatements, statement)
+		}
+		if version == 40 {
+			statements = []string{strings.Join(migrationStatements, ";\n")}
+		} else {
+			statements = migrationStatements
+		}
+		for _, statement := range statements {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
 				return fmt.Errorf("migrate schema to version %d: %w", version, err)
 			}
