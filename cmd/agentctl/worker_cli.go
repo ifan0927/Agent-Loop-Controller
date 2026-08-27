@@ -374,10 +374,20 @@ func onboardingWorkerDispatch(store *sqlitestore.Store, onboarding *application.
 			}
 			return application.LinearTodoDispatchResult{Outcome: "onboarding_" + string(result.Status), ScanDigest: application.ConfigurationEvidenceDigest("onboarding-worker-v1", result.OnboardingID, string(result.Status))}, nil
 		}
+		var dispatchResult application.LinearTodoDispatchResult
 		if fallback != nil {
-			return fallback(ctx)
+			dispatchResult, err = fallback(ctx)
+			if err != nil {
+				return application.LinearTodoDispatchResult{}, err
+			}
+		} else {
+			dispatchResult = application.LinearTodoDispatchResult{Outcome: application.LinearTodoDispatchNoCandidate, ScanDigest: application.ConfigurationEvidenceDigest("onboarding-worker-idle-v1", "none")}
 		}
-		return application.LinearTodoDispatchResult{Outcome: application.LinearTodoDispatchNoCandidate, ScanDigest: application.ConfigurationEvidenceDigest("onboarding-worker-idle-v1", "none")}, nil
+		// Integrity maintenance receives one SQLite-only family batch only after
+		// onboarding and normal admission have had their opportunity. Its
+		// recoverable degradation never consumes a heavy permit or stops delivery.
+		_, _ = store.RunIntegrityMaintenance(ctx, "automatic-worker", time.Now().UTC())
+		return dispatchResult, nil
 	}
 }
 

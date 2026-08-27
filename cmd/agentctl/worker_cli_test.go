@@ -39,6 +39,27 @@ func TestControllerWorkerRejectsRootBeforeOpeningRuntime(t *testing.T) {
 	}
 }
 
+func TestWorkerRunsOneIntegrityFamilyAfterNormalDispatch(t *testing.T) {
+	store, err := sqlitestore.Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	fallbackCalled := false
+	dispatch := onboardingWorkerDispatch(store, nil, func(context.Context) (application.LinearTodoDispatchResult, error) {
+		fallbackCalled = true
+		return application.LinearTodoDispatchResult{Outcome: application.LinearTodoDispatchNoCandidate, ScanDigest: strings.Repeat("a", 64)}, nil
+	})
+	result, err := dispatch(context.Background())
+	if err != nil || !fallbackCalled || result.Outcome != application.LinearTodoDispatchNoCandidate {
+		t.Fatalf("result=%+v fallback=%t err=%v", result, fallbackCalled, err)
+	}
+	next, err := store.RunIntegrityMaintenance(context.Background(), "test-probe", time.Now().UTC())
+	if err != nil || next.Family != application.IntegrityRunDelivery {
+		t.Fatalf("worker did not commit exactly one first-family batch: next=%+v err=%v", next, err)
+	}
+}
+
 func TestWorkerProcessLockRejectsConcurrentWorkerAndRecoversAfterClose(t *testing.T) {
 	directory := t.TempDir()
 	if err := os.Chmod(directory, 0o700); err != nil {

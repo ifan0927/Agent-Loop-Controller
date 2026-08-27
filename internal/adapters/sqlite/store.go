@@ -30,7 +30,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 39
+const schemaVersion = 40
 
 const (
 	sqliteMigrationRetryDelay = 10 * time.Millisecond
@@ -772,6 +772,8 @@ func migrateSQLiteGeneric(ctx context.Context, db sqliteTransactioner, supported
 			statements = migrationV38
 		case 39:
 			statements = migrationV39
+		case 40:
+			statements = migrationV40
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -779,6 +781,35 @@ func migrateSQLiteGeneric(ctx context.Context, db sqliteTransactioner, supported
 			if err := ensureOperatorAttentionRetryFailureClassTx(ctx, tx); err != nil {
 				return err
 			}
+		}
+		migrationStatements := make([]string, 0, len(statements))
+		integrityTablePresence := make(map[string]bool)
+		for _, statement := range statements {
+			if version == 40 && strings.HasPrefix(statement, "CREATE TRIGGER integrity_track_") {
+				parts := strings.SplitN(statement, " ON ", 2)
+				if len(parts) != 2 {
+					return errors.New("integrity mutation trigger is invalid")
+				}
+				table := strings.Fields(parts[1])[0]
+				present, checked := integrityTablePresence[table]
+				if !checked {
+					var count int
+					if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil {
+						return err
+					}
+					present = count != 0
+					integrityTablePresence[table] = present
+				}
+				if !present {
+					continue
+				}
+			}
+			migrationStatements = append(migrationStatements, statement)
+		}
+		if version == 40 {
+			statements = []string{strings.Join(migrationStatements, ";\n")}
+		} else {
+			statements = migrationStatements
 		}
 		for _, statement := range statements {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -1929,6 +1960,144 @@ var migrationV39 = []string{
 		reason_code TEXT NOT NULL,
 		PRIMARY KEY(source_kind,source_identity)
 	)`,
+}
+
+var integritySourceFamilies = map[application.IntegrityFamily][]string{
+	application.IntegrityStorageSchema: {"schema_migrations"},
+	application.IntegrityRunDelivery: {
+		"runs", "transitions", "attempts", "verifications", "reviews", "side_effects",
+		"pull_requests", "poll_observations", "review_findings", "github_installations",
+		"github_request_observations", "github_read_evidence", "human_approval_observations",
+		"human_approvals", "trusted_review_feedback", "trusted_review_feedback_conflicts",
+		"trusted_review_reply_evidence", "merge_results", "linear_completion_observations",
+		"linear_request_observations", "ci_waits",
+	},
+	application.IntegrityOperationActivity: {
+		"operation_receipts", "operator_actions", "operator_attention_outbox", "activity_events",
+		"activity_operation_links", "activity_backfill_progress", "activity_runtime_state",
+	},
+	application.IntegrityConfiguration: {
+		"configuration_generations", "configuration_authority", "configuration_apply_intents",
+		"configuration_recovery_intents", "configuration_convergence_events", "configuration_baseline_anchor",
+		"configuration_drafts", "configuration_raw_prune_claims",
+	},
+	application.IntegrityRepositoryOnboarding: {
+		"repository_lifecycle_baseline", "repository_lifecycles", "repository_readiness_snapshots",
+		"repository_readiness_dimensions", "repository_recheck_attempts", "repository_recheck_observations",
+		"repository_removal_drafts", "repository_removal_intents", "repository_onboardings",
+		"repository_onboarding_path_claims", "repository_onboarding_steps",
+	},
+	application.IntegritySchedulingAdmission: {
+		"linear_todo_admission_lease", "linear_todo_admission_journal", "heavy_capacity_authority",
+		"repository_slots", "heavy_permits", "run_scheduling", "queue_snapshot", "scheduling_decisions",
+		"automatic_retry_schedules",
+	},
+	application.IntegrityOwnedResourceCleanup: {"owned_resources", "cleanup_results"},
+}
+
+var migrationV40 = integrityMigrationV40()
+
+func integrityMigrationV40() []string {
+	statements := []string{
+		`CREATE TABLE controller_integrity_generation (
+			singleton INTEGER PRIMARY KEY CHECK(singleton=1), generation INTEGER NOT NULL CHECK(generation>=0), updated_at TEXT NOT NULL
+		)`,
+		`INSERT INTO controller_integrity_generation(singleton,generation,updated_at) VALUES(1,0,CURRENT_TIMESTAMP)`,
+		`CREATE TABLE integrity_registry_families (
+			registry_version TEXT NOT NULL CHECK(registry_version='v1'), family TEXT NOT NULL,
+			family_order INTEGER NOT NULL CHECK(family_order BETWEEN 0 AND 6), reason_version TEXT NOT NULL CHECK(reason_version='v1'),
+			PRIMARY KEY(registry_version,family), UNIQUE(registry_version,family_order)
+		)`,
+		`INSERT INTO integrity_registry_families(registry_version,family,family_order,reason_version) VALUES
+			('v1','storage_schema',0,'v1'),('v1','run_delivery',1,'v1'),('v1','operation_activity',2,'v1'),
+			('v1','configuration',3,'v1'),('v1','repository_onboarding',4,'v1'),
+			('v1','scheduling_admission',5,'v1'),('v1','owned_resource_cleanup',6,'v1')`,
+		`CREATE TABLE integrity_registry_sources (
+			registry_version TEXT NOT NULL, family TEXT NOT NULL, table_name TEXT NOT NULL,
+			PRIMARY KEY(registry_version,table_name),
+			FOREIGN KEY(registry_version,family) REFERENCES integrity_registry_families(registry_version,family)
+		)`,
+		`CREATE TABLE controller_integrity_scope_revisions (
+			family TEXT NOT NULL, scope_kind TEXT NOT NULL CHECK(scope_kind IN ('controller','repository','run','onboarding')),
+			scope_id TEXT NOT NULL, revision_generation INTEGER NOT NULL CHECK(revision_generation>=0), updated_at TEXT NOT NULL,
+			PRIMARY KEY(family,scope_kind,scope_id)
+		)`,
+		`INSERT INTO controller_integrity_scope_revisions(family,scope_kind,scope_id,revision_generation,updated_at)
+			SELECT family,'controller','local-controller',0,CURRENT_TIMESTAMP FROM integrity_registry_families WHERE registry_version='v1'`,
+		`CREATE TABLE controller_integrity_scans (
+			scan_id TEXT PRIMARY KEY, registry_version TEXT NOT NULL CHECK(registry_version='v1'), target_generation INTEGER NOT NULL CHECK(target_generation>=0),
+			stable_boundary TEXT NOT NULL, family_cursor INTEGER NOT NULL DEFAULT 0 CHECK(family_cursor BETWEEN 0 AND 7),
+			status TEXT NOT NULL CHECK(status IN ('active','superseded','published','unknown','conflict')),
+			lease_owner TEXT NOT NULL DEFAULT '', lease_version INTEGER NOT NULL DEFAULT 0 CHECK(lease_version>=0), lease_expires_at TEXT NOT NULL DEFAULT '',
+			convergence_attempt INTEGER NOT NULL DEFAULT 0 CHECK(convergence_attempt BETWEEN 0 AND 8), reason_code TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE UNIQUE INDEX controller_integrity_one_active_scan ON controller_integrity_scans(status) WHERE status='active'`,
+		`CREATE TABLE controller_integrity_checked_families (
+			scan_id TEXT NOT NULL REFERENCES controller_integrity_scans(scan_id), family TEXT NOT NULL,
+			checked_revision INTEGER NOT NULL CHECK(checked_revision>=0), state TEXT NOT NULL CHECK(state IN ('ready','not_ready','unknown','conflict')),
+			reason_code TEXT NOT NULL, affected_scope_count INTEGER NOT NULL CHECK(affected_scope_count>=0),
+			count_complete INTEGER NOT NULL CHECK(count_complete IN (0,1)), coverage_complete INTEGER NOT NULL CHECK(coverage_complete IN (0,1)),
+			findings_digest TEXT NOT NULL, checked_at TEXT NOT NULL, PRIMARY KEY(scan_id,family)
+		)`,
+		`CREATE TABLE controller_integrity_scan_findings (
+			finding_id TEXT PRIMARY KEY, scan_id TEXT NOT NULL REFERENCES controller_integrity_scans(scan_id), family TEXT NOT NULL,
+			reason_code TEXT NOT NULL, private_scope_kind TEXT NOT NULL, private_scope_id TEXT NOT NULL,
+			public_scope_kind TEXT NOT NULL CHECK(public_scope_kind IN ('controller','repository','run','onboarding')),
+			public_target_id TEXT NOT NULL, classification_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
+			UNIQUE(scan_id,family,reason_code,private_scope_kind,private_scope_id)
+		)`,
+		`CREATE TABLE controller_integrity_observations (
+			observation_id TEXT PRIMARY KEY, schema_version TEXT NOT NULL CHECK(schema_version='v1'), registry_version TEXT NOT NULL CHECK(registry_version='v1'),
+			observation_digest TEXT NOT NULL UNIQUE, target_generation INTEGER NOT NULL CHECK(target_generation>=0),
+			published_generation INTEGER NOT NULL CHECK(published_generation=target_generation), scan_id TEXT NOT NULL UNIQUE REFERENCES controller_integrity_scans(scan_id),
+			effective_readiness TEXT NOT NULL CHECK(effective_readiness IN ('ready','not_ready','unknown','conflict')),
+			reason_code TEXT NOT NULL, affected_scope_count INTEGER NOT NULL CHECK(affected_scope_count>=0),
+			count_complete INTEGER NOT NULL CHECK(count_complete IN (0,1)), coverage_complete INTEGER NOT NULL CHECK(coverage_complete IN (0,1)),
+			observed_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE controller_integrity_observation_families (
+			observation_id TEXT NOT NULL REFERENCES controller_integrity_observations(observation_id), family TEXT NOT NULL,
+			state TEXT NOT NULL CHECK(state IN ('ready','not_ready','unknown','conflict')), reason_code TEXT NOT NULL,
+			checked_revision INTEGER NOT NULL CHECK(checked_revision>=0), affected_scope_count INTEGER NOT NULL CHECK(affected_scope_count>=0),
+			count_complete INTEGER NOT NULL CHECK(count_complete IN (0,1)), coverage_complete INTEGER NOT NULL CHECK(coverage_complete IN (0,1)),
+			PRIMARY KEY(observation_id,family)
+		)`,
+		`CREATE TABLE controller_integrity_observation_findings (
+			observation_id TEXT NOT NULL REFERENCES controller_integrity_observations(observation_id), finding_id TEXT NOT NULL,
+			family TEXT NOT NULL, reason_code TEXT NOT NULL,
+			public_scope_kind TEXT NOT NULL CHECK(public_scope_kind IN ('controller','repository','run','onboarding')),
+			public_target_id TEXT NOT NULL, classification_json TEXT NOT NULL DEFAULT '{}',
+			PRIMARY KEY(observation_id,finding_id)
+		)`,
+		`CREATE INDEX controller_integrity_findings_page ON controller_integrity_observation_findings(observation_id,family,public_scope_kind,public_target_id,finding_id)`,
+		`CREATE TABLE controller_integrity_current (
+			singleton INTEGER PRIMARY KEY CHECK(singleton=1), observation_id TEXT NOT NULL REFERENCES controller_integrity_observations(observation_id),
+			observation_digest TEXT NOT NULL, published_generation INTEGER NOT NULL CHECK(published_generation>=0)
+		)`,
+		`CREATE TRIGGER controller_integrity_observation_immutable_update BEFORE UPDATE ON controller_integrity_observations BEGIN SELECT RAISE(ABORT,'integrity observation is immutable'); END`,
+		`CREATE TRIGGER controller_integrity_observation_immutable_delete BEFORE DELETE ON controller_integrity_observations BEGIN SELECT RAISE(ABORT,'integrity observation is immutable'); END`,
+		`CREATE TRIGGER controller_integrity_family_immutable_update BEFORE UPDATE ON controller_integrity_observation_families BEGIN SELECT RAISE(ABORT,'integrity observation family is immutable'); END`,
+		`CREATE TRIGGER controller_integrity_family_immutable_delete BEFORE DELETE ON controller_integrity_observation_families BEGIN SELECT RAISE(ABORT,'integrity observation family is immutable'); END`,
+		`CREATE TRIGGER controller_integrity_finding_immutable_update BEFORE UPDATE ON controller_integrity_observation_findings BEGIN SELECT RAISE(ABORT,'integrity observation finding is immutable'); END`,
+		`CREATE TRIGGER controller_integrity_finding_immutable_delete BEFORE DELETE ON controller_integrity_observation_findings BEGIN SELECT RAISE(ABORT,'integrity observation finding is immutable'); END`,
+	}
+	families := application.IntegrityFamilies()
+	for _, family := range families {
+		for _, table := range integritySourceFamilies[family] {
+			statements = append(statements, fmt.Sprintf(`INSERT INTO integrity_registry_sources(registry_version,family,table_name) VALUES('v1','%s','%s')`, family, table))
+			for _, operation := range []string{"INSERT", "UPDATE", "DELETE"} {
+				trigger := "integrity_track_" + table + "_" + strings.ToLower(operation)
+				statements = append(statements, fmt.Sprintf(`CREATE TRIGGER %s AFTER %s ON %s BEGIN
+					UPDATE controller_integrity_generation SET generation=generation+1,updated_at=CURRENT_TIMESTAMP WHERE singleton=1;
+					INSERT INTO controller_integrity_scope_revisions(family,scope_kind,scope_id,revision_generation,updated_at)
+					SELECT '%s','controller','local-controller',generation,CURRENT_TIMESTAMP FROM controller_integrity_generation WHERE singleton=1
+					ON CONFLICT(family,scope_kind,scope_id) DO UPDATE SET revision_generation=excluded.revision_generation,updated_at=excluded.updated_at;
+				END`, trigger, operation, table, family))
+			}
+		}
+	}
+	return statements
 }
 
 func migrateSQLiteV38Upgrade(ctx context.Context, db sqliteTransactioner) error {

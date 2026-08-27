@@ -110,6 +110,10 @@ the state machine.
 - Persisted-state legal-action offers for decision, retry, abandon, CI-wait,
   owned-push, and external-merge recovery, backed by a scope-neutral operation
   receipt lifecycle that survives reconnects and controller restarts.
+- Automatic Controller-wide SQLite audit-integrity observations over a closed
+  seven-family registry, with transactionally enforced source generations,
+  restart-safe bounded scanning, mutation-fenced publication, and authorized
+  sanitized summary and affected-scope application queries.
 - macOS LaunchAgent and headless system LaunchDaemon tooling for building,
   installing, validating, starting, observing, and stopping exactly one local
   non-root supervisor process.

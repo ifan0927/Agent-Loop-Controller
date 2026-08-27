@@ -1174,7 +1174,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 38; migration history is code, not a
+inspection. The current schema is version 40; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees
@@ -1473,6 +1473,37 @@ backfilled. A later successful indexing cycle clears a transient degradation;
 an immutable-source conflict remains explicit. Activity, coverage, cursors,
 and projection digests are never workflow or mutation authority.
 
+Controller-wide audit-integrity observation is a separate persistence-only
+projection. Its versioned registry is closed to exactly `storage_schema`,
+`run_delivery`, `operation_activity`, `configuration`,
+`repository_onboarding`, `scheduling_admission`, and
+`owned_resource_cleanup`. SQLite triggers advance one monotonic source
+generation and the affected private family revision for every registered
+source-table mutation. Integrity scan, progress, finding, observation, and
+current-pointer writes are excluded, so maintenance cannot invalidate itself.
+
+The automatic worker gives onboarding and normal admission their opportunity
+first, then advances at most one SQLite-only integrity family batch without a
+heavy permit. One durable scan lane owns its registry version, target
+generation, cursor, lease, checked revisions, deterministic findings, and
+committed progress. Restart reuses committed progress. Publication requires
+all seven results and an unchanged source generation in one transaction; a
+racing mutation supersedes and requeues the scan. Immutable family states are
+`ready`, `not_ready`, `unknown`, and `conflict`, aggregated in that precedence.
+A prior observation remains history, but its effective readiness becomes
+`unknown` immediately when the registry or source generation advances.
+
+The summary and affected-scope detail contracts authenticate the complete
+configured operator before persistence lookup, counting, ordering, or cursor
+construction. Findings expose only opaque identity, family, finite reason,
+authorized `controller`, `repository`, `run`, or `onboarding` scope, observation
+time, and bounded classification metadata. Untrustworthy narrower bindings
+fall back to Controller scope. Cursors bind the immutable observation digest,
+authorization digest, filter digest, and keyset position. These projections are
+explanatory only: they do not block, authorize, repair, delete, or otherwise
+change existing workflow or external effects. Explicit receipt-backed recheck
+and presentation adapters remain follow-up work.
+
 The planned local operator interface is a TUI over these Controller-owned
 application contracts:
 
@@ -1572,6 +1603,7 @@ around it. The principal table groups are:
 | `operator_actions` | Action-specific authenticated recovery intent and legacy validated/applied/observed provenance, separate from automatic workflow evidence |
 | `operation_receipts` | Scope-neutral accepted/applied/observed operation identity, outcome, and sanitized result evidence; legacy operator actions are backfilled and mirrored here |
 | `activity_events`, operation links, backfill progress, and runtime classification state | Immutable sanitized activity snapshots, one-primary-event receipt correlation, stable ingestion watermarks, bounded restart progress, and explicit coverage evidence; never workflow authority |
+| integrity registry, generation/revision, scan, checked-family, finding, observation, and current-pointer tables | Closed SQLite-only invariant registry, structural mutation coverage, one restart-safe bounded scan lane, immutable mutation-fenced observations, and sanitized explanatory findings; never workflow or repair authority |
 | configuration generation, authority, apply/recovery-intent, and convergence tables | Immutable desired/effective metadata, one Controller-wide CAS mutation authority, crash reconciliation state, optional immutable rollback-source identity, and meaningful sanitized transitions; raw desired bytes remain outside SQLite and external bytes are never stored |
 | `configuration_drafts` | At most one active Controller-wide normal or rollback-origin typed draft, revision/edit replay authority, immutable rollback source when applicable, sanitized validation/preview evidence, and generation/receipt settlement; no raw candidate, path, identity, or credential authority |
 | repository lifecycle, readiness, recheck, and removal tables | Immutable incarnation history, one current canonical/profile/binding authority, complete readiness evidence, exclusive source-bound removal draft and accepted/applied/observed settlement, and tombstone evidence; no external-resource deletion authority |
@@ -1686,7 +1718,7 @@ resolution is not approval, and an approval for an old head is stale.
 - GitHub API writes require a narrowly permissioned selected-repository App;
   empty-repository base publication is the separate guarded host-SSH Git
   transport described above.
-- Unsafe or ambiguous configuration recovery, activity/audit integrity,
+- Unsafe or ambiguous configuration recovery, explicit integrity recheck,
   the local TUI, optional HTTP/Web adapters,
   notification transport, Hermes runtime integration, public API, webhooks,
   and multi-tenant authorization are not implemented.

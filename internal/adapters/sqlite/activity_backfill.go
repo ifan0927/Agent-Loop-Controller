@@ -189,7 +189,7 @@ func backfillActivitySourceTx(ctx context.Context, tx *sql.Tx, source string, cu
 			err = rows.Err()
 		}
 	case "onboarding":
-		rows, queryErr := tx.QueryContext(ctx, `SELECT s.rowid,s.onboarding_id,s.step_name,s.step_order,s.outcome,s.reason_code,s.evidence_digest,s.observed_at,o.repository_binding_digest,o.request_digest,o.operation_id FROM repository_onboarding_steps s JOIN repository_onboardings o ON o.onboarding_id=s.onboarding_id WHERE s.rowid>? AND s.status='observed' ORDER BY s.rowid LIMIT ?`, cursor, limit)
+		rows, queryErr := tx.QueryContext(ctx, `SELECT s.rowid,s.onboarding_id,s.step_name,s.step_order,s.outcome,s.reason_code,s.evidence_digest,s.observed_at,o.repository_binding_digest,o.request_digest,COALESCE(o.operation_id,'') FROM repository_onboarding_steps s JOIN repository_onboardings o ON o.onboarding_id=s.onboarding_id WHERE s.rowid>? AND s.status='observed' ORDER BY s.rowid LIMIT ?`, cursor, limit)
 		if queryErr != nil {
 			return last, indexedThrough, false, "", queryErr
 		}
@@ -223,7 +223,7 @@ func backfillActivitySourceTx(ctx context.Context, tx *sql.Tx, source string, cu
 			err = rows.Err()
 		}
 	case "configuration":
-		rows, queryErr := tx.QueryContext(ctx, `SELECT generation_id,origin,digest,lifecycle,reason_code,operation_id,created_at,settled_at FROM configuration_generations WHERE generation_id>? AND settled_at<>'' ORDER BY generation_id LIMIT ?`, cursor, limit)
+		rows, queryErr := tx.QueryContext(ctx, `SELECT generation_id,origin,digest,lifecycle,reason_code,COALESCE(operation_id,''),created_at,settled_at FROM configuration_generations WHERE generation_id>? AND settled_at<>'' ORDER BY generation_id LIMIT ?`, cursor, limit)
 		if queryErr != nil {
 			return last, indexedThrough, false, "", queryErr
 		}

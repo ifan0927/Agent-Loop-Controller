@@ -1007,6 +1007,16 @@ evidence is `conflict` and has no force-overwrite procedure in this milestone.
 Automatic and manual new admission remain fenced until the projection is
 `ready`; compatible existing runs continue under frozen authority.
 
+After onboarding and normal admission have received their opportunity, each
+worker cycle also advances at most one bounded Controller-wide integrity family
+batch. This maintenance reads SQLite only, consumes no heavy permit, commits
+restart progress transactionally, and never changes workflow readiness or
+external effects. Recoverable integrity degradation stays in its own projection
+and does not stop existing delivery. The implemented interface is the
+authorization-first application summary/detail contract; there is no new
+public CLI command, explicit recheck operation, activity-feed event, raw-row
+export, repair action, or manual SQL recovery procedure in this slice.
+
 **Related commands**
 
 `controller status`, `controller inspect`, `controller drive`, launchd
@@ -2692,6 +2702,16 @@ Do not ask the App, controller, Codex, or Hermes to approve, dismiss, resolve,
 or bypass protection.
 
 ## 11. Status and Inspection
+
+Controller-wide integrity summary and affected-scope detail are available to
+presentation adapters through the typed application query contract after exact
+configured-operator authentication. The summary is `unknown` before the first
+complete observation and immediately after a registered source generation
+advances. Detail is bounded to 50 findings by default and 100 maximum, uses an
+observation- and authorization-bound cursor, and exposes no SQL, table or row
+identity, path, URL, credential, payload, log, or arbitrary error. Existing
+`controller status` and `controller inspect` JSON remain unchanged. Explicit
+receipt-backed recheck and TUI rendering remain follow-up work.
 
 Important fields in the safe inspection projection include:
 

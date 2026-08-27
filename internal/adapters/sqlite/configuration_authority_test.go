@@ -21,6 +21,7 @@ import (
 
 func removeConfigurationV31(t *testing.T, db *sql.DB) {
 	t.Helper()
+	removeIntegrityV40(t, db)
 	for _, statement := range []string{
 		`DROP TRIGGER IF EXISTS configuration_recovery_excludes_repository_removal`,
 		`DROP TRIGGER IF EXISTS configuration_draft_excludes_repository_removal`,
@@ -37,6 +38,55 @@ func removeConfigurationV31(t *testing.T, db *sql.DB) {
 		`DROP TABLE IF EXISTS configuration_baseline_anchor`,
 		`DROP TRIGGER IF EXISTS configuration_generation_identity_immutable`,
 		`DROP TABLE IF EXISTS configuration_generations`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func removeIntegrityV40(t *testing.T, db *sql.DB) {
+	t.Helper()
+	rows, err := db.Query(`SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'integrity_track_%'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var triggers []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		triggers = append(triggers, name)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range triggers {
+		if _, err := db.Exec(`DROP TRIGGER ` + name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, statement := range []string{
+		`DROP TRIGGER IF EXISTS controller_integrity_finding_immutable_delete`,
+		`DROP TRIGGER IF EXISTS controller_integrity_finding_immutable_update`,
+		`DROP TRIGGER IF EXISTS controller_integrity_family_immutable_delete`,
+		`DROP TRIGGER IF EXISTS controller_integrity_family_immutable_update`,
+		`DROP TRIGGER IF EXISTS controller_integrity_observation_immutable_delete`,
+		`DROP TRIGGER IF EXISTS controller_integrity_observation_immutable_update`,
+		`DROP TABLE IF EXISTS controller_integrity_current`,
+		`DROP TABLE IF EXISTS controller_integrity_observation_findings`,
+		`DROP TABLE IF EXISTS controller_integrity_observation_families`,
+		`DROP TABLE IF EXISTS controller_integrity_observations`,
+		`DROP TABLE IF EXISTS controller_integrity_scan_findings`,
+		`DROP TABLE IF EXISTS controller_integrity_checked_families`,
+		`DROP TABLE IF EXISTS controller_integrity_scans`,
+		`DROP TABLE IF EXISTS controller_integrity_scope_revisions`,
+		`DROP TABLE IF EXISTS integrity_registry_sources`,
+		`DROP TABLE IF EXISTS integrity_registry_families`,
+		`DROP TABLE IF EXISTS controller_integrity_generation`,
+		`DELETE FROM schema_migrations WHERE version=40`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			t.Fatal(err)

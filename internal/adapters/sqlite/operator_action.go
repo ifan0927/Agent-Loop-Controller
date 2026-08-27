@@ -34,6 +34,18 @@ func (s *Store) listOperatorActions(ctx context.Context, runID string) ([]applic
 }
 
 func (s *Store) BeginOperatorAction(ctx context.Context, record application.OperatorActionRecord) (application.OperatorActionRecord, bool, error) {
+	for attempt := 0; ; attempt++ {
+		action, created, err := s.beginOperatorActionOnce(ctx, record)
+		if !operatorActionSQLiteBusy(err) || attempt >= 4 {
+			return action, created, err
+		}
+		if err := waitOperatorActionRetry(ctx, attempt); err != nil {
+			return application.OperatorActionRecord{}, false, err
+		}
+	}
+}
+
+func (s *Store) beginOperatorActionOnce(ctx context.Context, record application.OperatorActionRecord) (application.OperatorActionRecord, bool, error) {
 	if err := application.ValidateOperatorActionRecord(record); err != nil {
 		return application.OperatorActionRecord{}, false, err
 	}
