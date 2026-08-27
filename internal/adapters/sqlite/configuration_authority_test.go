@@ -23,6 +23,12 @@ func removeConfigurationV31(t *testing.T, db *sql.DB) {
 	t.Helper()
 	removeIntegrityV40(t, db)
 	for _, statement := range []string{
+		`DROP TRIGGER IF EXISTS integrity_guard_activity_link_reject`,
+		`DROP TRIGGER IF EXISTS integrity_guard_activity_event_reject`,
+		`DROP TRIGGER IF EXISTS integrity_guard_operation_receipt_reject`,
+		`DROP TABLE IF EXISTS controller_integrity_finalization_guard`,
+		`DROP TABLE IF EXISTS controller_integrity_active_recheck`,
+		`DROP TABLE IF EXISTS controller_integrity_rechecks`,
 		`DROP TRIGGER IF EXISTS configuration_recovery_excludes_repository_removal`,
 		`DROP TRIGGER IF EXISTS configuration_draft_excludes_repository_removal`,
 		`DROP TRIGGER IF EXISTS repository_removal_draft_excludes_configuration`,
@@ -86,7 +92,7 @@ func removeIntegrityV40(t *testing.T, db *sql.DB) {
 		`DROP TABLE IF EXISTS integrity_registry_sources`,
 		`DROP TABLE IF EXISTS integrity_registry_families`,
 		`DROP TABLE IF EXISTS controller_integrity_generation`,
-		`DELETE FROM schema_migrations WHERE version=40`,
+		`DELETE FROM schema_migrations WHERE version IN (40,41)`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			t.Fatal(err)

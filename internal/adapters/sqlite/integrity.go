@@ -48,10 +48,51 @@ func (s *Store) RunIntegrityMaintenance(ctx context.Context, owner string, obser
 	var target int64
 	var cursor, leaseVersion, convergenceAttempt int
 	err = tx.QueryRowContext(ctx, `SELECT scan_id,target_generation,family_cursor,lease_owner,lease_version,lease_expires_at,convergence_attempt FROM controller_integrity_scans WHERE status='active'`).Scan(&scanID, &target, &cursor, &leaseOwner, &leaseVersion, &leaseExpiry, &convergenceAttempt)
+	var recheck integrityRecheckBinding
+	explicitRecheck := false
+	var recheckSchema int
+	if schemaErr := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='controller_integrity_rechecks'`).Scan(&recheckSchema); schemaErr != nil {
+		return application.IntegrityMaintenanceResult{}, schemaErr
+	}
+	if err == nil && recheckSchema == 1 {
+		recheck, explicitRecheck, err = getIntegrityRecheckByScanTx(ctx, tx, scanID)
+		if err != nil {
+			return application.IntegrityMaintenanceResult{}, err
+		}
+		var activeRechecks int
+		if countErr := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM controller_integrity_rechecks WHERE status='active'`).Scan(&activeRechecks); countErr != nil {
+			return application.IntegrityMaintenanceResult{}, countErr
+		}
+		if explicitRecheck {
+			var exactPointer int
+			if pointerErr := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM controller_integrity_active_recheck WHERE singleton=1 AND request_key=? AND operation_id=? AND scan_id=? AND target_generation=?`, recheck.requestKey, recheck.operationID, recheck.scanID, recheck.targetGeneration).Scan(&exactPointer); pointerErr != nil || exactPointer != 1 || activeRechecks != 1 || recheck.status != "active" || recheck.receipt.Phase != application.OperationPhaseApplied || recheck.receipt.Outcome != application.OperationOutcomePending {
+				return application.IntegrityMaintenanceResult{}, application.ErrIntegrityRecheckConflict
+			}
+		} else if activeRechecks != 0 {
+			return application.IntegrityMaintenanceResult{}, application.ErrIntegrityRecheckConflict
+		}
+	} else if errors.Is(err, sql.ErrNoRows) && recheckSchema == 1 {
+		var activeRechecks int
+		if countErr := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM controller_integrity_rechecks WHERE status='active'`).Scan(&activeRechecks); countErr != nil {
+			return application.IntegrityMaintenanceResult{}, countErr
+		}
+		if activeRechecks != 0 {
+			return application.IntegrityMaintenanceResult{}, application.ErrIntegrityRecheckConflict
+		}
+	}
 	superseded := false
 	if err == nil && target != generation {
 		if _, err := tx.ExecContext(ctx, `UPDATE controller_integrity_scans SET status='superseded',reason_code='source_generation_advanced',lease_owner='',lease_expires_at='',updated_at=?,completed_at=? WHERE scan_id=? AND status='active'`, formatTime(observedAt), formatTime(observedAt), scanID); err != nil {
 			return application.IntegrityMaintenanceResult{}, err
+		}
+		if explicitRecheck {
+			if err := settleSupersededIntegrityRecheckTx(ctx, tx, recheck, generation, observedAt, "source_generation_advanced"); err != nil {
+				return application.IntegrityMaintenanceResult{}, err
+			}
+			if err := tx.Commit(); err != nil {
+				return application.IntegrityMaintenanceResult{}, err
+			}
+			return application.IntegrityMaintenanceResult{ScanID: scanID, TargetGeneration: target, Superseded: true}, nil
 		}
 		convergenceAttempt++
 		err, superseded = sql.ErrNoRows, true
@@ -109,7 +150,12 @@ func (s *Store) RunIntegrityMaintenance(ctx context.Context, owner string, obser
 		if _, err := tx.ExecContext(ctx, `UPDATE controller_integrity_scans SET family_cursor=7,lease_owner='',lease_expires_at='',updated_at=? WHERE scan_id=? AND status='active' AND lease_version=?`, formatTime(observedAt), scanID, leaseVersion); err != nil {
 			return application.IntegrityMaintenanceResult{}, err
 		}
-		if err := publishIntegrityObservationTx(ctx, tx, scanID, target, observedAt); err != nil {
+		if explicitRecheck {
+			err = finalizeIntegrityRecheckObservationTx(ctx, tx, recheck, observedAt)
+		} else {
+			err = publishIntegrityObservationTx(ctx, tx, scanID, target, observedAt)
+		}
+		if err != nil {
 			return application.IntegrityMaintenanceResult{}, err
 		}
 		maintenance.Published = true
@@ -141,8 +187,15 @@ func (s *Store) RunIntegrityMaintenance(ctx context.Context, owner string, obser
 		if current != target {
 			_, err = tx.ExecContext(ctx, `UPDATE controller_integrity_scans SET status='superseded',reason_code='publication_generation_advanced',lease_owner='',lease_expires_at='',updated_at=?,completed_at=? WHERE scan_id=? AND status='active'`, formatTime(observedAt), formatTime(observedAt), scanID)
 			maintenance.Superseded = true
+			if err == nil && explicitRecheck {
+				err = settleSupersededIntegrityRecheckTx(ctx, tx, recheck, current, observedAt, "publication_generation_advanced")
+			}
 		} else {
-			err = publishIntegrityObservationTx(ctx, tx, scanID, target, observedAt)
+			if explicitRecheck {
+				err = finalizeIntegrityRecheckObservationTx(ctx, tx, recheck, observedAt)
+			} else {
+				err = publishIntegrityObservationTx(ctx, tx, scanID, target, observedAt)
+			}
 			maintenance.Published = err == nil
 		}
 		if err != nil {
@@ -229,6 +282,14 @@ func checkIntegrityFamilyTx(ctx context.Context, tx *sql.Tx, family application.
 				}
 			}
 		}
+		var recheckObjects, residualGuards int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('controller_integrity_rechecks','controller_integrity_active_recheck','controller_integrity_finalization_guard')`).Scan(&recheckObjects); err != nil || recheckObjects != 3 {
+			addController("required_object_missing", "integrity_recheck", "schema-v41")
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM controller_integrity_finalization_guard`).Scan(&residualGuards); err != nil || residualGuards != 0 {
+			addController("finalization_guard_conflict", "integrity_recheck", "finalization-guard")
+			result.State, result.ReasonCode = application.IntegrityConflict, "finalization_guard_conflict"
+		}
 		var quick string
 		if err := tx.QueryRowContext(ctx, `PRAGMA quick_check(1)`).Scan(&quick); err != nil || quick != "ok" {
 			addController("sqlite_consistency_violation", "storage", "quick-check")
@@ -261,6 +322,15 @@ func checkIntegrityFamilyTx(ctx context.Context, tx *sql.Tx, family application.
 		}
 		if incomplete == 0 {
 			if err := queryIDs(`SELECT operation_id FROM operation_receipts r WHERE r.outcome<>'pending' AND (SELECT COUNT(*) FROM activity_operation_links l WHERE l.operation_id=r.operation_id)<>1 ORDER BY operation_id LIMIT ?`, "operation_activity_link_violation", "operation", application.ScopeController); err != nil {
+				return result, nil, err
+			}
+		}
+		var recheckSchema int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='controller_integrity_rechecks'`).Scan(&recheckSchema); err != nil {
+			return result, nil, err
+		}
+		if recheckSchema == 1 {
+			if err := queryIDs(`SELECT r.request_key FROM controller_integrity_rechecks r LEFT JOIN operation_receipts o ON o.operation_id=r.operation_id LEFT JOIN controller_integrity_scans s ON s.scan_id=r.scan_id WHERE (r.status='active' AND (o.phase<>'applied' OR o.outcome<>'pending' OR s.status<>'active' OR (SELECT COUNT(*) FROM controller_integrity_active_recheck a WHERE a.request_key=r.request_key AND a.operation_id=r.operation_id AND a.scan_id=r.scan_id AND a.target_generation=r.target_generation)<>1) AND NOT EXISTS(SELECT 1 FROM controller_integrity_finalization_guard g WHERE g.operation_id=r.operation_id AND g.scan_id=r.scan_id AND g.target_generation=r.target_generation AND o.phase='observed' AND o.outcome='succeeded')) OR (r.status='observed' AND (o.phase<>'observed' OR o.outcome<>'succeeded' OR s.status<>'published' OR r.observation_id='' OR NOT EXISTS(SELECT 1 FROM controller_integrity_observations i WHERE i.observation_id=r.observation_id AND i.scan_id=r.scan_id AND i.observation_digest=r.observation_digest AND i.target_generation=r.target_generation))) OR (r.status IN ('conflict','ambiguous') AND (o.phase<>'observed' OR o.outcome<>r.status OR r.observation_id<>'')) ORDER BY r.request_key LIMIT ?`, "integrity_recheck_binding_violation", "integrity_recheck", application.ScopeController); err != nil {
 				return result, nil, err
 			}
 		}
@@ -334,10 +404,10 @@ func persistIntegrityFamilyTx(ctx context.Context, tx *sql.Tx, scanID string, re
 	return err
 }
 
-func publishIntegrityObservationTx(ctx context.Context, tx *sql.Tx, scanID string, generation int64, observedAt time.Time) error {
+func buildIntegrityObservationTx(ctx context.Context, tx *sql.Tx, scanID string, generation int64, observedAt time.Time) (application.IntegrityObservation, []string, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT family,checked_revision,state,reason_code,affected_scope_count,count_complete,coverage_complete FROM controller_integrity_checked_families WHERE scan_id=? ORDER BY CASE family WHEN 'storage_schema' THEN 0 WHEN 'run_delivery' THEN 1 WHEN 'operation_activity' THEN 2 WHEN 'configuration' THEN 3 WHEN 'repository_onboarding' THEN 4 WHEN 'scheduling_admission' THEN 5 WHEN 'owned_resource_cleanup' THEN 6 ELSE 7 END`, scanID)
 	if err != nil {
-		return err
+		return application.IntegrityObservation{}, nil, err
 	}
 	var results []application.IntegrityFamilyResult
 	for rows.Next() {
@@ -345,19 +415,19 @@ func publishIntegrityObservationTx(ctx context.Context, tx *sql.Tx, scanID strin
 		var complete, coverage int
 		if err := rows.Scan(&result.Family, &result.CheckedRevision, &result.State, &result.ReasonCode, &result.AffectedScopeCount, &complete, &coverage); err != nil {
 			rows.Close()
-			return err
+			return application.IntegrityObservation{}, nil, err
 		}
 		result.CountComplete, result.CoverageComplete = complete != 0, coverage != 0
 		results = append(results, result)
 	}
 	if err := rows.Close(); err != nil || len(results) != len(application.IntegrityFamilies()) {
-		return errors.New("integrity publication family evidence conflicts")
+		return application.IntegrityObservation{}, nil, errors.New("integrity publication family evidence conflicts")
 	}
 	states := make([]application.IntegrityState, 0, len(results))
 	countComplete, coverageComplete := true, true
 	for index, result := range results {
 		if result.Family != application.IntegrityFamilies()[index] || result.Validate() != nil {
-			return errors.New("integrity publication family evidence conflicts")
+			return application.IntegrityObservation{}, nil, errors.New("integrity publication family evidence conflicts")
 		}
 		states = append(states, result.State)
 		countComplete = countComplete && result.CountComplete
@@ -370,43 +440,64 @@ func publishIntegrityObservationTx(ctx context.Context, tx *sql.Tx, scanID strin
 	}
 	var affected int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM (SELECT DISTINCT public_scope_kind,public_target_id FROM controller_integrity_scan_findings WHERE scan_id=?)`, scanID).Scan(&affected); err != nil {
-		return err
+		return application.IntegrityObservation{}, nil, err
 	}
 	observationID := integrityDigest("observation", scanID)
 	findingRows, err := tx.QueryContext(ctx, `SELECT finding_id FROM controller_integrity_scan_findings WHERE scan_id=? ORDER BY finding_id`, scanID)
 	if err != nil {
-		return err
+		return application.IntegrityObservation{}, nil, err
 	}
 	var findingIDs []string
 	for findingRows.Next() {
 		var findingID string
 		if err := findingRows.Scan(&findingID); err != nil {
 			findingRows.Close()
-			return err
+			return application.IntegrityObservation{}, nil, err
 		}
 		findingIDs = append(findingIDs, findingID)
 	}
 	if err := findingRows.Close(); err != nil {
-		return err
+		return application.IntegrityObservation{}, nil, err
 	}
 	observation := application.IntegrityObservation{SchemaVersion: application.IntegritySchemaVersion, RegistryVersion: application.IntegrityRegistryVersion, ObservationID: observationID, TargetGeneration: generation, PublishedGeneration: generation, ObservedAt: observedAt.UTC(), EffectiveReadiness: readiness, ReasonCode: reason, Results: results, AffectedScopeCount: affected, CountComplete: countComplete, CoverageComplete: coverageComplete}
-	digest := integrityObservationDigest(observation, findingIDs)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO controller_integrity_observations(observation_id,schema_version,registry_version,observation_digest,target_generation,published_generation,scan_id,effective_readiness,reason_code,affected_scope_count,count_complete,coverage_complete,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, observationID, application.IntegritySchemaVersion, application.IntegrityRegistryVersion, digest, generation, generation, scanID, readiness, reason, affected, boolInt(countComplete), boolInt(coverageComplete), formatTime(observedAt)); err != nil {
+	observation.Digest = integrityObservationDigest(observation, findingIDs)
+	return observation, findingIDs, nil
+}
+
+func persistIntegrityObservationTx(ctx context.Context, tx *sql.Tx, scanID string, observation application.IntegrityObservation) error {
+	if observation.Validate() != nil || observation.ObservationID != integrityDigest("observation", scanID) {
+		return errors.New("integrity observation publication is invalid")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO controller_integrity_observations(observation_id,schema_version,registry_version,observation_digest,target_generation,published_generation,scan_id,effective_readiness,reason_code,affected_scope_count,count_complete,coverage_complete,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, observation.ObservationID, observation.SchemaVersion, observation.RegistryVersion, observation.Digest, observation.TargetGeneration, observation.PublishedGeneration, scanID, observation.EffectiveReadiness, observation.ReasonCode, observation.AffectedScopeCount, boolInt(observation.CountComplete), boolInt(observation.CoverageComplete), formatTime(observation.ObservedAt)); err != nil {
 		return err
 	}
-	for _, result := range results {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO controller_integrity_observation_families(observation_id,family,state,reason_code,checked_revision,affected_scope_count,count_complete,coverage_complete) VALUES(?,?,?,?,?,?,?,?)`, observationID, result.Family, result.State, result.ReasonCode, result.CheckedRevision, result.AffectedScopeCount, boolInt(result.CountComplete), boolInt(result.CoverageComplete)); err != nil {
+	for _, result := range observation.Results {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO controller_integrity_observation_families(observation_id,family,state,reason_code,checked_revision,affected_scope_count,count_complete,coverage_complete) VALUES(?,?,?,?,?,?,?,?)`, observation.ObservationID, result.Family, result.State, result.ReasonCode, result.CheckedRevision, result.AffectedScopeCount, boolInt(result.CountComplete), boolInt(result.CoverageComplete)); err != nil {
 			return err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO controller_integrity_observation_findings(observation_id,finding_id,family,reason_code,public_scope_kind,public_target_id,classification_json) SELECT ?,finding_id,family,reason_code,public_scope_kind,public_target_id,classification_json FROM controller_integrity_scan_findings WHERE scan_id=?`, observationID, scanID); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO controller_integrity_observation_findings(observation_id,finding_id,family,reason_code,public_scope_kind,public_target_id,classification_json) SELECT ?,finding_id,family,reason_code,public_scope_kind,public_target_id,classification_json FROM controller_integrity_scan_findings WHERE scan_id=?`, observation.ObservationID, scanID); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO controller_integrity_current(singleton,observation_id,observation_digest,published_generation) VALUES(1,?,?,?) ON CONFLICT(singleton) DO UPDATE SET observation_id=excluded.observation_id,observation_digest=excluded.observation_digest,published_generation=excluded.published_generation`, observationID, digest, generation); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO controller_integrity_current(singleton,observation_id,observation_digest,published_generation) VALUES(1,?,?,?) ON CONFLICT(singleton) DO UPDATE SET observation_id=excluded.observation_id,observation_digest=excluded.observation_digest,published_generation=excluded.published_generation`, observation.ObservationID, observation.Digest, observation.PublishedGeneration); err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE controller_integrity_scans SET status='published',reason_code=?,lease_owner='',lease_expires_at='',updated_at=?,completed_at=? WHERE scan_id=? AND status='active'`, reason, formatTime(observedAt), formatTime(observedAt), scanID)
+	result, err := tx.ExecContext(ctx, `UPDATE controller_integrity_scans SET status='published',reason_code=?,lease_owner='',lease_expires_at='',updated_at=?,completed_at=? WHERE scan_id=? AND status='active'`, observation.ReasonCode, formatTime(observation.ObservedAt), formatTime(observation.ObservedAt), scanID)
+	if err != nil {
+		return err
+	}
+	if changed, rowsErr := result.RowsAffected(); rowsErr != nil || changed != 1 {
+		return errors.New("integrity scan publication conflicts")
+	}
 	return err
+}
+
+func publishIntegrityObservationTx(ctx context.Context, tx *sql.Tx, scanID string, generation int64, observedAt time.Time) error {
+	observation, _, err := buildIntegrityObservationTx(ctx, tx, scanID, generation, observedAt)
+	if err != nil {
+		return err
+	}
+	return persistIntegrityObservationTx(ctx, tx, scanID, observation)
 }
 
 func (s *Store) IntegritySummary(ctx context.Context, scopes application.AuthorizedScopeSet) (application.IntegritySummary, error) {

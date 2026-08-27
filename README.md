@@ -113,7 +113,11 @@ the state machine.
 - Automatic Controller-wide SQLite audit-integrity observations over a closed
   seven-family registry, with transactionally enforced source generations,
   restart-safe bounded scanning, mutation-fenced publication, and authorized
-  sanitized summary and affected-scope application queries.
+  sanitized summary and affected-scope application queries. The configured
+  operator can request or exactly replay one receipt-backed explicit recheck;
+  it scans only the post-receipt generation through the same worker lane and
+  atomically binds the settled receipt, generic activity event, and immutable
+  observation.
 - macOS LaunchAgent and headless system LaunchDaemon tooling for building,
   installing, validating, starting, observing, and stopping exactly one local
   non-root supervisor process.
@@ -212,9 +216,9 @@ as presentation-independent application contracts. Meaningful current SQLite
 facts append their immutable sanitized activity snapshots transactionally;
 the worker performs bounded restart-safe reconstruction of legacy evidence and
 reports explicit coverage limitations for history that was never persisted.
-Unsafe or ambiguous configuration repair remains out of scope;
-Controller-wide audit-integrity readiness and integrity recheck are the next
-operator foundation.
+Unsafe or ambiguous configuration repair remains out of scope. Controller-wide
+audit-integrity readiness and its explicit receipt-backed recheck are
+implemented, completing the presentation-independent operator foundation.
 The TUI and `agentctl operator` are planned, not current behavior. HTTP, a Web
 UI, outbound notifications, Hermes runtime integration, public API/webhook
 admission, and cross-repository transactions remain deferred or exploratory.

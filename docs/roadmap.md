@@ -128,7 +128,7 @@ to cover at least 90 percent of routine local work:
 ```text
 completed controller, bounded-concurrency, and authorization foundation
   -> operation receipts and legal actions
-  -> remaining controller operator foundations
+  -> completed presentation-independent controller operator foundations
   -> local TUI operator console
   -> optional future adapters only when justified
      |- Operator API
@@ -156,10 +156,10 @@ transactional current indexing, bounded legacy reconstruction, and runtime
 classification reconciliation are complete. Unsafe or ambiguous configuration
 repair remains deliberately out of scope. Automatic Controller-wide
 audit-integrity observations, structural mutation generations, bounded
-restart-safe scanning, and authorized sanitized queries are complete; explicit
-receipt-backed integrity recheck remains the next foundation slice. Do not create
-speculative TUI, HTTP, or frontend slices before their Controller contracts
-exist.
+restart-safe scanning, authorized sanitized queries, and the receipt-backed
+explicit Controller-wide integrity recheck are complete. Phase 1's
+presentation-independent foundations are complete. Do not create speculative
+HTTP or frontend slices before a demonstrated consumer exists.
 
 ### Phase 1: controller operator foundations
 
@@ -169,11 +169,10 @@ transaction/convergence authority, normal typed-change drafts, forward rollback,
 exact safe external-drift recovery, repository lifecycle/readiness, guarded
 retirement, zero-repository disabled-admission operation, restart-safe
 existing-checkout onboarding, guarded empty-repository initialization, and
-routine Controller projections, the activity/history foundation, and automatic
-Controller-wide audit-integrity observations are complete. The remaining
-presentation-independent sequence is:
-
-1. Receipt-backed explicit Controller-wide integrity recheck.
+routine Controller projections, the activity/history foundation, automatic
+Controller-wide audit-integrity observations, and the receipt-backed explicit
+Controller-wide integrity recheck are complete. This completes the Phase 1
+presentation-independent foundation; the local TUI remains Phase 2 work.
 
 The persisted onboarding saga, existing-checkout adoption, and deterministic
 empty-repository initialization are complete. They leave every newly added

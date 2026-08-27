@@ -192,6 +192,9 @@ func (s AuthorizedScopeSet) AllowsOperationTarget(target OperationReceiptTarget)
 	if target.Scope == ScopeController && target.TargetID == ConfigurationTargetID {
 		return s.HasController()
 	}
+	if target.Scope == ScopeController && target.TargetID == IntegrityTargetID {
+		return s.HasController()
+	}
 	return slices.ContainsFunc(s.scopes, func(scope AuthorityScope) bool {
 		return scope.Kind == target.Scope && scope.ID == target.TargetID && scope.AuthorityDigest == target.TargetBindingDigest
 	})

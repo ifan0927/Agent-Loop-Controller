@@ -386,7 +386,9 @@ func onboardingWorkerDispatch(store *sqlitestore.Store, onboarding *application.
 		// Integrity maintenance receives one SQLite-only family batch only after
 		// onboarding and normal admission have had their opportunity. Its
 		// recoverable degradation never consumes a heavy permit or stops delivery.
-		_, _ = store.RunIntegrityMaintenance(ctx, "automatic-worker", time.Now().UTC())
+		if maintenance, maintenanceErr := application.NewIntegrityMaintenanceService(store); maintenanceErr == nil {
+			_, _ = maintenance.Run(ctx, "automatic-worker", time.Now().UTC())
+		}
 		return dispatchResult, nil
 	}
 }

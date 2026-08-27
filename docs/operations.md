@@ -1119,6 +1119,51 @@ Inspect a manual-intervention stop before retrying; `drive` is not an override.
 
 `controller status`, `controller inspect`, `controller continue`.
 
+### `controller integrity status`, `findings`, and `recheck`
+
+**Purpose**
+
+Read the current Controller-wide SQLite audit-integrity result, list its
+sanitized findings, or request/replay one explicit receipt-backed recheck.
+
+**Syntax**
+
+```sh
+agentctl controller integrity status [--config <file>] <requester flags>
+agentctl controller integrity findings [--family <family>] [--scope <scope>] \
+  [--target <exact-public-target>] [--limit <1..100>] [--cursor <cursor>] \
+  [--config <file>] <requester flags>
+agentctl controller integrity recheck --request-id <id> \
+  [--config <file>] <requester flags>
+```
+
+All three commands require the complete configured operator identity. `status`
+and `findings` are pure SQLite reads. Findings accept only the seven registered
+families, public `controller`, `repository`, `run`, or `onboarding` scope, an
+exact public target, and the existing 50-default/100-maximum page bounds.
+
+`recheck` accepts one non-empty request ID of at most 128 characters. It creates
+or replays a common Controller-scoped operation receipt, binds it permanently
+to the deterministic scan for the source generation produced after receipt
+application, and attempts only bounded progress. A valid competing lease or an
+unfinished scan returns `pending`; the automatic worker continues the same
+scan lane. Repeat the command with the exact same requester and request ID to
+retrieve or advance that durable operation. A different request while one is
+active returns `integrity_recheck_active` without another receipt or scan.
+
+When the source generation changes after acceptance, the receipt settles as a
+conflict and never follows a new scan. A successful operation returns its exact
+immutable observation even when readiness is `not_ready`, `unknown`, or
+`conflict`; operation outcome and readiness are separate. Restart, response
+loss, or a rolled-back finalization is recovered through exact replay or normal
+worker maintenance.
+
+There is no force, repair, skip, custom-check, rule, target-generation, scan-ID,
+raw-SQL, receipt-status, or manual-SQL interface. Do not edit the database to
+clear pending/conflict evidence. Preserve the request ID and replay; if durable
+evidence is contradictory, retain it for diagnosis rather than attempting an
+ad-hoc repair.
+
 ### `controller status`
 
 **Purpose**

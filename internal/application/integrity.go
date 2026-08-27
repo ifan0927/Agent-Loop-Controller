@@ -194,9 +194,6 @@ func (s *IntegrityQueryService) Summary(ctx context.Context, requester Requester
 }
 
 func (s *IntegrityQueryService) Findings(ctx context.Context, query IntegrityFindingQuery) (IntegrityFindingPage, error) {
-	if query.Family != "" && !query.Family.Valid() || query.Scope != "" && !slices.Contains([]AuthorityScopeKind{ScopeController, ScopeRepository, ScopeRun, ScopeOnboarding}, query.Scope) || query.Limit < 0 || query.Limit > IntegrityMaximumLimit || strings.ContainsRune(query.TargetID, '\x00') {
-		return IntegrityFindingPage{}, serviceError(ErrorInvalidInput, "integrity finding query is invalid", nil)
-	}
 	configured, err := s.authorizer.ResolveConfiguredRequester(query.Requester)
 	if err != nil {
 		return IntegrityFindingPage{}, err
@@ -204,6 +201,9 @@ func (s *IntegrityQueryService) Findings(ctx context.Context, query IntegrityFin
 	scopes, err := s.authorizer.ControllerScopes(configured)
 	if err != nil {
 		return IntegrityFindingPage{}, err
+	}
+	if query.Family != "" && !query.Family.Valid() || query.Scope != "" && !slices.Contains([]AuthorityScopeKind{ScopeController, ScopeRepository, ScopeRun, ScopeOnboarding}, query.Scope) || query.Limit < 0 || query.Limit > IntegrityMaximumLimit || strings.ContainsRune(query.TargetID, '\x00') {
+		return IntegrityFindingPage{}, serviceError(ErrorInvalidInput, "integrity finding query is invalid", nil)
 	}
 	if query.Limit == 0 {
 		query.Limit = IntegrityDefaultLimit
@@ -217,4 +217,26 @@ type IntegrityMaintenanceResult struct {
 	TargetGeneration int64           `json:"target_generation"`
 	Published        bool            `json:"published"`
 	Superseded       bool            `json:"superseded"`
+}
+
+type IntegrityMaintenancePort interface {
+	RunIntegrityMaintenance(context.Context, string, time.Time) (IntegrityMaintenanceResult, error)
+}
+
+type IntegrityMaintenanceService struct {
+	port IntegrityMaintenancePort
+}
+
+func NewIntegrityMaintenanceService(port IntegrityMaintenancePort) (*IntegrityMaintenanceService, error) {
+	if port == nil {
+		return nil, errors.New("integrity maintenance is unavailable")
+	}
+	return &IntegrityMaintenanceService{port: port}, nil
+}
+
+func (s *IntegrityMaintenanceService) Run(ctx context.Context, owner string, observedAt time.Time) (IntegrityMaintenanceResult, error) {
+	if s == nil || s.port == nil || strings.TrimSpace(owner) == "" || strings.ContainsRune(owner, '\x00') || observedAt.IsZero() {
+		return IntegrityMaintenanceResult{}, errors.New("integrity maintenance request is invalid")
+	}
+	return s.port.RunIntegrityMaintenance(ctx, owner, observedAt.UTC())
 }
