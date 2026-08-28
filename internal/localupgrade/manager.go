@@ -161,9 +161,9 @@ func (m *Manager) Prepare(ctx context.Context, request PrepareRequest) (result R
 		if err != nil {
 			return err
 		}
-		resolved, err := m.runner.Run(ctx, "", "git", "rev-parse", "--verify", request.Revision+"^{commit}")
-		if err != nil || resolved.ExitCode != 0 || strings.TrimSpace(string(resolved.Stdout)) != request.Revision {
-			return errors.New("candidate revision is unavailable")
+		sourceRoot, err := resolveCandidateSource(ctx, m.runner, request.Revision)
+		if err != nil {
+			return err
 		}
 		prepareRoot, err := os.MkdirTemp(m.upgradeRoot(), ".prepare-")
 		if err != nil {
@@ -173,29 +173,24 @@ func (m *Manager) Prepare(ctx context.Context, request PrepareRequest) (result R
 		if err := os.Chmod(prepareRoot, 0o700); err != nil {
 			return errors.New("candidate workspace is unavailable")
 		}
-		worktree := filepath.Join(prepareRoot, "worktree")
-		added, err := m.runner.Run(ctx, "", "git", "worktree", "add", "--detach", worktree, request.Revision)
-		if err != nil || added.ExitCode != 0 {
-			return errors.New("isolated candidate worktree could not be created")
+		candidateRepository := filepath.Join(prepareRoot, "repository")
+		if err := cloneCandidateRepository(ctx, m.runner, sourceRoot, candidateRepository, request.Revision); err != nil {
+			return err
 		}
-		defer m.runner.Run(context.Background(), "", "git", "worktree", "remove", "--force", worktree)
-		if clean, err := gitWorktreeClean(ctx, m.runner, worktree); err != nil || !clean {
-			return errors.New("candidate worktree is dirty or unverifiable")
-		}
-		gate, err := m.runner.Run(ctx, worktree, filepath.Join(worktree, "scripts", "verify-controller.sh"))
+		gate, err := m.runner.Run(ctx, candidateRepository, filepath.Join(candidateRepository, "scripts", "verify-controller.sh"))
 		if err != nil || gate.ExitCode != 0 {
 			return errors.New("candidate verification gate failed")
 		}
 		candidatePath := filepath.Join(prepareRoot, "agentctl")
-		built, err := m.runner.Run(ctx, worktree, "go", "build", "-trimpath", "-o", candidatePath, "./cmd/agentctl")
+		built, err := m.runner.Run(ctx, candidateRepository, "go", "build", "-trimpath", "-o", candidatePath, "./cmd/agentctl")
 		if err != nil || built.ExitCode != 0 {
 			return errors.New("candidate build failed")
 		}
-		if clean, err := gitWorktreeClean(ctx, m.runner, worktree); err != nil || !clean {
-			return errors.New("candidate build modified its exact worktree")
+		if clean, err := gitCheckoutClean(ctx, m.runner, candidateRepository); err != nil || !clean {
+			return errors.New("candidate build modified its exact repository")
 		}
 		candidate, err := inspectBinary(ctx, m.runner, candidatePath, m.uid)
-		if err != nil || candidate.GoVersion == "" || candidate.ModulePath != "github.com/ifan0927/Agent-Loop-Controller/cmd/agentctl" || candidate.GoVCSRevision != request.Revision || candidate.GoVCSModified || candidate.GoVCSTime == "" || !candidate.Structured || candidate.Build.VCSRevision != candidate.GoVCSRevision || candidate.Build.VCSTime != candidate.GoVCSTime || candidate.Build.VCSModified != candidate.GoVCSModified || candidate.Build.SupportedControllerSchemaVersion < database.SchemaVersion {
+		if err != nil || !candidateCompatible(candidate, request.Revision, database.SchemaVersion) {
 			return errors.New("candidate build identity is unverifiable or incompatible")
 		}
 		id := "upgrade-" + strings.ReplaceAll(uuid.NewString(), "-", "")
@@ -243,9 +238,78 @@ func (m *Manager) Prepare(ctx context.Context, request PrepareRequest) (result R
 	return result, nil
 }
 
-func gitWorktreeClean(ctx context.Context, runner commandRunner, path string) (bool, error) {
+func resolveCandidateSource(ctx context.Context, runner commandRunner, revision string) (string, error) {
+	rootResult, err := runner.Run(ctx, "", "git", "rev-parse", "--show-toplevel")
+	if err != nil || rootResult.ExitCode != 0 {
+		return "", errors.New("candidate source repository is unavailable")
+	}
+	root := strings.TrimSpace(string(rootResult.Stdout))
+	if !canonicalAbsolute(root) || strings.ContainsAny(root, "\r\n\x00") {
+		return "", errors.New("candidate source repository is unsafe")
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil || resolvedRoot != root {
+		return "", errors.New("candidate source repository is unsafe")
+	}
+	info, err := os.Stat(root)
+	if err != nil || !info.IsDir() {
+		return "", errors.New("candidate source repository is unavailable")
+	}
+	resolved, err := runner.Run(ctx, root, "git", "rev-parse", "--verify", revision+"^{commit}")
+	if err != nil || resolved.ExitCode != 0 || strings.TrimSpace(string(resolved.Stdout)) != revision {
+		return "", errors.New("candidate revision is unavailable")
+	}
+	return root, nil
+}
+
+func cloneCandidateRepository(ctx context.Context, runner commandRunner, sourceRoot, destination, revision string) error {
+	cloned, err := runner.Run(ctx, "", "git", "clone", "--local", "--no-hardlinks", "--no-checkout", "--no-tags", "--", sourceRoot, destination)
+	if err != nil || cloned.ExitCode != 0 {
+		return errors.New("isolated candidate repository could not be created")
+	}
+	gitDirectory := filepath.Join(destination, ".git")
+	info, err := os.Lstat(gitDirectory)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("candidate repository metadata is unsafe")
+	}
+	common, err := runner.Run(ctx, destination, "git", "rev-parse", "--git-common-dir")
+	if err != nil || common.ExitCode != 0 || strings.TrimSpace(string(common.Stdout)) != ".git" {
+		return errors.New("candidate repository object storage is shared or unverifiable")
+	}
+	if _, err := os.Lstat(filepath.Join(gitDirectory, "objects", "info", "alternates")); !errors.Is(err, os.ErrNotExist) {
+		return errors.New("candidate repository object storage is shared or unverifiable")
+	}
+	checkedOut, err := runner.Run(ctx, destination, "git", "checkout", "--detach", revision)
+	if err != nil || checkedOut.ExitCode != 0 {
+		return errors.New("candidate revision could not be checked out")
+	}
+	head, err := runner.Run(ctx, destination, "git", "rev-parse", "HEAD")
+	if err != nil || head.ExitCode != 0 || strings.TrimSpace(string(head.Stdout)) != revision {
+		return errors.New("candidate checkout revision is unverifiable")
+	}
+	if clean, err := gitCheckoutClean(ctx, runner, destination); err != nil || !clean {
+		return errors.New("candidate repository is dirty or unverifiable")
+	}
+	return nil
+}
+
+func gitCheckoutClean(ctx context.Context, runner commandRunner, path string) (bool, error) {
 	result, err := runner.Run(ctx, path, "git", "status", "--porcelain=v1", "--untracked-files=all")
 	return err == nil && result.ExitCode == 0 && len(bytes.TrimSpace(result.Stdout)) == 0, err
+}
+
+func candidateCompatible(candidate binaryEvidence, revision string, databaseSchema int) bool {
+	return candidate.GoVersion != "" &&
+		candidate.ModulePath == "github.com/ifan0927/Agent-Loop-Controller/cmd/agentctl" &&
+		candidate.GoVCSRevision == revision &&
+		!candidate.GoVCSModified &&
+		candidate.GoVCSTime != "" &&
+		candidate.Structured &&
+		validBuildInfo(candidate.Build) &&
+		candidate.Build.VCSRevision == candidate.GoVCSRevision &&
+		candidate.Build.VCSTime == candidate.GoVCSTime &&
+		candidate.Build.VCSModified == candidate.GoVCSModified &&
+		candidate.Build.SupportedControllerSchemaVersion >= databaseSchema
 }
 
 func inspectBinary(ctx context.Context, runner commandRunner, path string, uid int) (binaryEvidence, error) {
@@ -260,7 +324,7 @@ func inspectBinary(ctx context.Context, runner commandRunner, path string, uid i
 	evidence := binaryEvidence{Digest: digest, Size: info.Size(), Mode: uint32(info.Mode().Perm())}
 	if metadata, metadataErr := stdbuildinfo.ReadFile(path); metadataErr == nil {
 		evidence.GoVersion = metadata.GoVersion
-		evidence.ModulePath = metadata.Main.Path
+		evidence.ModulePath = metadata.Path
 		for _, setting := range metadata.Settings {
 			switch setting.Key {
 			case "vcs.revision":
