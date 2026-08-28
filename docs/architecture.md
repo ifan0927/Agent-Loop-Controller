@@ -1174,7 +1174,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 40; migration history is code, not a
+inspection. The current schema is version 41; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees
@@ -1326,6 +1326,37 @@ Restart races, stale files, legacy activity snapshots, and PID reuse therefore
 cannot be adopted as a fresh worker. Privileged launchd mutation remains in the
 CLI/runbook boundary; runtime observation adds no start, stop, install,
 restart, or migration authority.
+
+### Local binary replacement
+
+The repository-owned `scripts/local-agentctl-upgrade.sh` is an operator-driven
+host adapter, not Controller workflow state and not a self-update service. It
+accepts one exact local Git commit, builds and verifies that commit in a
+detached worktree, and stages one candidate in a private single-active bundle.
+The candidate's structured build identity binds product version, clean VCS
+revision and time, modified state, and the schema version exported by the
+SQLite adapter's single supported-schema source. The same identity is emitted
+by the worker heartbeat; the plain `agentctl version` contract remains
+compatible.
+
+Replacement is fenced by explicit LaunchAgent or LaunchDaemon selection,
+four-label/domain observation, and the existing process-lifetime worker lock.
+The adapter creates a consistent SQLite snapshot through the pinned driver's
+online backup API, then persists replacement intent before atomically replacing
+the same-filesystem binary. The snapshot is evidence only and has no restore
+interface. Host-upgrade phases live in an atomically synchronized filesystem
+journal because binary and database schema compatibility can span Controller
+database versions.
+
+Durable `bootstrap_intent` is the irreversible authority boundary. Before it,
+the exact previous binary may be restored only while the worker remains fenced
+and database identity/schema are unchanged. After it, no managed binary or
+database rollback is allowed: missing launchd responses, worker identity
+conflicts, or readiness failures preserve the bundle for attention. Cleanup is
+authorized only by an exact candidate/heartbeat/configuration/schema/supervisor
+match plus healthy Controller readiness, or by an equally verified pre-intent
+rollback. It writes one current-installation manifest and removes only the
+closed set of artifacts owned by that completed bundle.
 
 ### Operator-attention boundary
 

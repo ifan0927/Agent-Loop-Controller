@@ -63,7 +63,7 @@ type manualControllerHeartbeat struct {
 }
 
 func startManualControllerHeartbeat(parent context.Context, configPath, configurationDigest string) (context.Context, *manualControllerHeartbeat, error) {
-	reporter, err := newWorkerStatusReporter(configPath, "manual-"+uuid.NewString(), version, configurationDigest)
+	reporter, err := newWorkerStatusReporter(configPath, "manual-"+uuid.NewString(), currentBuild.BuildIdentity, configurationDigest)
 	if err != nil {
 		return nil, nil, errors.New("manual controller heartbeat is unavailable")
 	}

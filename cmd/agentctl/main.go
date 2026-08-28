@@ -29,10 +29,13 @@ import (
 	sqlitefixture "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite/sqlitetest"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/verifier"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/buildidentity"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
 const version = "0.1.0-dev"
+
+var currentBuild = buildidentity.Current(version, sqlitestore.SupportedSchemaVersion)
 
 func main() {
 	if len(os.Args) < 2 {
@@ -43,7 +46,7 @@ func main() {
 	var err error
 	switch os.Args[1] {
 	case "version":
-		fmt.Println(version)
+		err = versionCommand(os.Args[2:])
 	case "plan":
 		err = plan(os.Args[2:])
 	case "spike":
@@ -70,6 +73,17 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+func versionCommand(args []string) error {
+	if len(args) == 0 {
+		fmt.Println(version)
+		return nil
+	}
+	if len(args) == 1 && args[0] == "--json" {
+		return printJSON(currentBuild)
+	}
+	return errors.New("usage: agentctl version [--json]")
 }
 
 func controller(args []string) error {

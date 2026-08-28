@@ -135,7 +135,7 @@ func controllerWorker(args []string) error {
 			_ = store.Close()
 		}
 	}()
-	reporter, err := newWorkerStatusReporter(path, instanceID, version, loaded.Digest)
+	reporter, err := newWorkerStatusReporter(path, instanceID, currentBuild.BuildIdentity, loaded.Digest)
 	if err != nil {
 		return errors.New("automatic admission worker status is unavailable")
 	}
