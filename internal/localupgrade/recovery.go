@@ -405,7 +405,7 @@ func legacyRecoveryPreview(evidence recoveryPreviewEvidence) legacyRecoveryPrevi
 		UpgradeID: evidence.UpgradeID, Revision: evidence.Revision, Supervisor: evidence.Supervisor, FailureReason: evidence.FailureReason,
 		ConfigDigest: evidence.ConfigDigest, Installed: evidence.Installed, OldDatabase: evidence.OldDatabase, Replacement: evidence.Replacement,
 		Verification: legacyReplacementDatabaseVerification{
-			ContentDigest: verification.ContentDigest, AuthorityDigest: verification.AuthorityDigest, SchemaVersion: verification.SchemaVersion,
+			ContentDigest: verification.ContentDigest, AuthorityDigest: verification.LegacyAuthorityDigest, SchemaVersion: verification.SchemaVersion,
 			IntegrityOK: verification.IntegrityOK, ForeignKeysOK: verification.ForeignKeysOK, BindingMatches: verification.BindingMatches,
 			DesiredConfigurationMatch: verification.DesiredConfigurationMatch, ReadinessReason: verification.Readiness.ReplacementReason,
 		},
@@ -415,10 +415,13 @@ func legacyRecoveryPreview(evidence recoveryPreviewEvidence) legacyRecoveryPrevi
 
 func recoveryVerificationMatches(recovery *databaseRecoveryEvidence, observed replacementDatabaseVerification) bool {
 	if recovery.Version != 1 {
-		return observed == recovery.Verification
+		observed.LegacyAuthorityDigest = ""
+		expected := recovery.Verification
+		expected.LegacyAuthorityDigest = ""
+		return observed == expected
 	}
 	legacy := recovery.Verification
-	return legacy.ContentDigest == observed.ContentDigest && legacy.AuthorityDigest == observed.AuthorityDigest && legacy.SchemaVersion == observed.SchemaVersion && legacy.IntegrityOK == observed.IntegrityOK && legacy.ForeignKeysOK == observed.ForeignKeysOK && legacy.BindingMatches == observed.BindingMatches && legacy.DesiredConfigurationMatch == observed.DesiredConfigurationMatch && legacy.LegacyReadinessReason == observed.Readiness.ReplacementReason
+	return legacy.ContentDigest == observed.ContentDigest && legacy.AuthorityDigest == observed.LegacyAuthorityDigest && legacy.SchemaVersion == observed.SchemaVersion && legacy.IntegrityOK == observed.IntegrityOK && legacy.ForeignKeysOK == observed.ForeignKeysOK && legacy.BindingMatches == observed.BindingMatches && legacy.DesiredConfigurationMatch == observed.DesiredConfigurationMatch && legacy.LegacyReadinessReason == observed.Readiness.ReplacementReason
 }
 
 func databaseIdentity(evidence databaseEvidence) application.DatabaseFileIdentity {

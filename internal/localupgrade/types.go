@@ -115,6 +115,7 @@ type recoveryReadinessVerification struct {
 type replacementDatabaseVerification struct {
 	ContentDigest             string                        `json:"content_digest"`
 	AuthorityDigest           string                        `json:"authority_digest"`
+	LegacyAuthorityDigest     string                        `json:"-"`
 	SchemaVersion             int                           `json:"schema_version"`
 	IntegrityOK               bool                          `json:"integrity_ok"`
 	ForeignKeysOK             bool                          `json:"foreign_keys_ok"`

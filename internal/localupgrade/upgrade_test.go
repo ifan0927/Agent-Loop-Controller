@@ -1076,11 +1076,55 @@ func TestMonotonicIntegrityPendingRecoveryReplaysEveryDurableTransition(t *testi
 
 func TestExactRecoveryVersionOneIntentRemainsReplayable(t *testing.T) {
 	manager, predecessor, predecessorBundle, revision, replacement := seedAuthorizedDatabaseRelocation(t)
-	evidence, _, err := manager.collectRecoveryPreview(context.Background(), predecessor, revision, predecessor.Database, false)
+	contentDigest, err := replacementDatabaseContentDigest(predecessor.DatabasePath, manager.uid, replacement)
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacyRaw, err := json.Marshal(legacyRecoveryPreview(evidence))
+	legacyAuthority := struct {
+		CanonicalConfigPath string `json:"canonical_config_path"`
+		DatabasePath        string `json:"database_path"`
+		DesiredID           int64  `json:"desired_id"`
+		EffectiveID         int64  `json:"effective_id"`
+		AuthorityVersion    int64  `json:"authority_version"`
+		DesiredDigest       string `json:"desired_digest"`
+		DesiredLifecycle    string `json:"desired_lifecycle"`
+		EffectiveDigest     string `json:"effective_digest"`
+		EffectiveLifecycle  string `json:"effective_lifecycle"`
+		IntegrityGeneration int64  `json:"integrity_generation"`
+		PublishedGeneration int64  `json:"published_generation"`
+		IntegrityReadiness  string `json:"integrity_readiness"`
+	}{
+		CanonicalConfigPath: predecessor.ConfigPath, DatabasePath: predecessor.DatabasePath,
+		DesiredID: 1, EffectiveID: 1, AuthorityVersion: 1,
+		DesiredDigest: predecessor.ConfigDigest, DesiredLifecycle: "effective",
+		EffectiveDigest: predecessor.ConfigDigest, EffectiveLifecycle: "effective",
+		IntegrityGeneration: 1, PublishedGeneration: 1, IntegrityReadiness: "not_ready",
+	}
+	legacyAuthorityRaw, err := json.Marshal(legacyAuthority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyAuthorityDigest := sha256Hex(legacyAuthorityRaw)
+	legacyVerification := legacyReplacementDatabaseVerification{
+		ContentDigest: contentDigest, AuthorityDigest: legacyAuthorityDigest, SchemaVersion: replacement.SchemaVersion,
+		IntegrityOK: true, ForeignKeysOK: true, BindingMatches: true, DesiredConfigurationMatch: true,
+		ReadinessReason: predecessor.FailureReason,
+	}
+	installed, err := inspectBinary(context.Background(), manager.runner, predecessor.BinaryPath, manager.uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locator, found, err := configurationadapter.ReadLocator(predecessor.ConfigPath)
+	if err != nil || !found {
+		t.Fatalf("locator found=%t err=%v", found, err)
+	}
+	legacyPreview := legacyRecoveryPreviewEvidence{
+		UpgradeID: predecessor.UpgradeID, Revision: revision, Supervisor: predecessor.Supervisor, FailureReason: predecessor.FailureReason,
+		ConfigDigest: predecessor.ConfigDigest, Installed: installed, OldDatabase: predecessor.Database, Replacement: replacement,
+		Verification: legacyVerification, LocatorVersion: locator.Version, LocatorConfigPath: locator.ConfigPath,
+		LocatorDBPath: locator.DatabasePath, SupervisorsAbsent: true,
+	}
+	legacyRaw, err := json.Marshal(legacyPreview)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1103,10 +1147,17 @@ func TestExactRecoveryVersionOneIntentRemainsReplayable(t *testing.T) {
 	if err != nil || intent.DatabaseRecovery == nil {
 		t.Fatalf("intent=%+v err=%v", intent, err)
 	}
+	if intent.DatabaseRecovery.Verification.AuthorityDigest == legacyAuthorityDigest {
+		t.Fatal("version-two fixture did not prove its expanded authority digest differs from version one")
+	}
 	intent.DatabaseRecovery.Version = 1
 	intent.DatabaseRecovery.PreviewDigest = legacyDigest
-	intent.DatabaseRecovery.Verification.LegacyReadinessReason = intent.DatabaseRecovery.Verification.Readiness.ReplacementReason
-	intent.DatabaseRecovery.Verification.Readiness = recoveryReadinessVerification{}
+	intent.DatabaseRecovery.Verification = replacementDatabaseVerification{
+		ContentDigest: legacyVerification.ContentDigest, AuthorityDigest: legacyVerification.AuthorityDigest,
+		SchemaVersion: legacyVerification.SchemaVersion, IntegrityOK: legacyVerification.IntegrityOK,
+		ForeignKeysOK: legacyVerification.ForeignKeysOK, BindingMatches: legacyVerification.BindingMatches,
+		DesiredConfigurationMatch: legacyVerification.DesiredConfigurationMatch, LegacyReadinessReason: legacyVerification.ReadinessReason,
+	}
 	if err := writeJournal(predecessorBundle, intent, manager.uid); err != nil {
 		t.Fatal(err)
 	}
@@ -1116,9 +1167,9 @@ func TestExactRecoveryVersionOneIntentRemainsReplayable(t *testing.T) {
 	if err != nil || resumed.State != "prepared" || resumed.UpgradeID != intent.SuccessorID {
 		t.Fatalf("resumed=%+v expected=%s err=%v", resumed, intent.SuccessorID, err)
 	}
-	locator, found, err := configurationadapter.ReadLocator(predecessor.ConfigPath)
-	if err != nil || !found || locator.DatabaseIdentity != databaseIdentity(replacement) {
-		t.Fatalf("locator=%+v found=%t err=%v", locator, found, err)
+	replayedLocator, replayedFound, err := configurationadapter.ReadLocator(predecessor.ConfigPath)
+	if err != nil || !replayedFound || replayedLocator.DatabaseIdentity != databaseIdentity(replacement) {
+		t.Fatalf("locator=%+v found=%t err=%v", replayedLocator, replayedFound, err)
 	}
 }
 

@@ -70,6 +70,23 @@ type replacementAuthorityState struct {
 	IntegrityReadiness             string `json:"integrity_readiness"`
 }
 
+// legacyReplacementAuthorityState preserves the exact authority JSON shape
+// hashed by database-recovery evidence version one.
+type legacyReplacementAuthorityState struct {
+	CanonicalConfigPath string `json:"canonical_config_path"`
+	DatabasePath        string `json:"database_path"`
+	DesiredID           int64  `json:"desired_id"`
+	EffectiveID         int64  `json:"effective_id"`
+	AuthorityVersion    int64  `json:"authority_version"`
+	DesiredDigest       string `json:"desired_digest"`
+	DesiredLifecycle    string `json:"desired_lifecycle"`
+	EffectiveDigest     string `json:"effective_digest"`
+	EffectiveLifecycle  string `json:"effective_lifecycle"`
+	IntegrityGeneration int64  `json:"integrity_generation"`
+	PublishedGeneration int64  `json:"published_generation"`
+	IntegrityReadiness  string `json:"integrity_readiness"`
+}
+
 func verifyReplacementDatabase(ctx context.Context, path, configPath, configDigest, expectedReason string, expectedSchema, uid int) (databaseEvidence, replacementDatabaseVerification, error) {
 	info, stat, err := safeRegularFile(path, uid, false)
 	if err != nil || info.Mode().Perm() != 0o600 || stat.Nlink != 1 {
@@ -143,15 +160,30 @@ func verifyReplacementDatabase(ctx context.Context, path, configPath, configDige
 	if err != nil {
 		return databaseEvidence{}, replacementDatabaseVerification{}, errors.New("replacement configuration authority evidence is unavailable")
 	}
+	legacyAuthorityRaw, err := json.Marshal(legacyReplacementAuthority(state))
+	if err != nil {
+		return databaseEvidence{}, replacementDatabaseVerification{}, errors.New("replacement configuration authority evidence is unavailable")
+	}
 	contentAfter, err := replacementDatabaseContentDigest(path, uid, identity)
 	if err != nil || contentAfter != contentBefore {
 		return databaseEvidence{}, replacementDatabaseVerification{}, errors.New("replacement Controller database changed during verification")
 	}
 	verification := replacementDatabaseVerification{
-		ContentDigest: contentBefore, AuthorityDigest: sha256Hex(authorityRaw), SchemaVersion: schema,
+		ContentDigest: contentBefore, AuthorityDigest: sha256Hex(authorityRaw), LegacyAuthorityDigest: sha256Hex(legacyAuthorityRaw), SchemaVersion: schema,
 		IntegrityOK: true, ForeignKeysOK: true, BindingMatches: true, DesiredConfigurationMatch: true, Readiness: readiness,
 	}
 	return identity, verification, nil
+}
+
+func legacyReplacementAuthority(state replacementAuthorityState) legacyReplacementAuthorityState {
+	return legacyReplacementAuthorityState{
+		CanonicalConfigPath: state.CanonicalConfigPath, DatabasePath: state.DatabasePath,
+		DesiredID: state.DesiredID, EffectiveID: state.EffectiveID, AuthorityVersion: state.AuthorityVersion,
+		DesiredDigest: state.DesiredDigest, DesiredLifecycle: state.DesiredLifecycle,
+		EffectiveDigest: state.EffectiveDigest, EffectiveLifecycle: state.EffectiveLifecycle,
+		IntegrityGeneration: state.IntegrityGeneration, PublishedGeneration: state.PublishedGeneration,
+		IntegrityReadiness: state.IntegrityReadiness,
+	}
 }
 
 func classifyRecoveryReadiness(state replacementAuthorityState, predecessorReason, replacementReason string) (recoveryReadinessVerification, error) {
