@@ -119,8 +119,8 @@ func createFixtureDatabase(t *testing.T, path string, completeReadiness bool) da
 			`CREATE TABLE configuration_generations(generation_id INTEGER PRIMARY KEY,digest TEXT,lifecycle TEXT)`,
 			`CREATE TABLE configuration_authority(authority_id INTEGER PRIMARY KEY,desired_generation_id INTEGER,effective_generation_id INTEGER)`,
 			`CREATE TABLE controller_integrity_generation(singleton INTEGER PRIMARY KEY,generation INTEGER)`,
-			`CREATE TABLE controller_integrity_current(singleton INTEGER PRIMARY KEY,observation_id TEXT,published_generation INTEGER)`,
-			`CREATE TABLE controller_integrity_observations(observation_id TEXT PRIMARY KEY,effective_readiness TEXT)`,
+			`CREATE TABLE controller_integrity_current(singleton INTEGER PRIMARY KEY,observation_id TEXT,observation_digest TEXT,published_generation INTEGER)`,
+			`CREATE TABLE controller_integrity_observations(observation_id TEXT PRIMARY KEY,schema_version TEXT,registry_version TEXT,observation_digest TEXT,target_generation INTEGER,published_generation INTEGER,effective_readiness TEXT)`,
 		)
 	}
 	for _, statement := range statements {
@@ -550,8 +550,8 @@ func TestObserveSeparatesPendingIntegrityFromHealthyCompletion(t *testing.T) {
 		`INSERT INTO configuration_generations VALUES(1,'` + j.ConfigDigest + `','effective')`,
 		`INSERT INTO configuration_authority VALUES(1,1,1)`,
 		`INSERT INTO controller_integrity_generation VALUES(1,2)`,
-		`INSERT INTO controller_integrity_observations VALUES('observation-1','ready')`,
-		`INSERT INTO controller_integrity_current VALUES(1,'observation-1',1)`,
+		`INSERT INTO controller_integrity_observations VALUES('observation-1','v1','v1','` + strings.Repeat("1", 64) + `',1,1,'ready')`,
+		`INSERT INTO controller_integrity_current VALUES(1,'observation-1','` + strings.Repeat("1", 64) + `',1)`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			db.Close()
@@ -765,8 +765,8 @@ func seedEligibleSuccessor(t *testing.T) (*Manager, journal, string, string, *in
 		`INSERT INTO configuration_generations VALUES(1,'` + predecessor.ConfigDigest + `','effective')`,
 		`INSERT INTO configuration_authority VALUES(1,1,1)`,
 		`INSERT INTO controller_integrity_generation VALUES(1,1)`,
-		`INSERT INTO controller_integrity_observations VALUES('observation-1','not_ready')`,
-		`INSERT INTO controller_integrity_current VALUES(1,'observation-1',1)`,
+		`INSERT INTO controller_integrity_observations VALUES('observation-1','v1','v1','` + strings.Repeat("1", 64) + `',1,1,'not_ready')`,
+		`INSERT INTO controller_integrity_current VALUES(1,'observation-1','` + strings.Repeat("1", 64) + `',1)`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			db.Close()
@@ -879,6 +879,32 @@ func seedAuthorizedDatabaseRelocation(t *testing.T) (*Manager, journal, string, 
 	return manager, predecessor, predecessorBundle, revision, replacement
 }
 
+func seedMonotonicIntegrityPendingRelocation(t *testing.T) (*Manager, journal, string, string, databaseEvidence) {
+	t.Helper()
+	manager, predecessor, predecessorBundle, revision, replacement := seedAuthorizedDatabaseRelocation(t)
+	db, err := sql.Open("sqlite", sqliteURI(predecessor.DatabasePath, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`UPDATE controller_integrity_generation SET generation=2 WHERE singleton=1`,
+		`UPDATE controller_integrity_observations SET effective_readiness='conflict' WHERE observation_id='observation-1'`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	predecessor.FailureReason = "integrity_conflict"
+	if err := writeJournal(predecessorBundle, predecessor, manager.uid); err != nil {
+		t.Fatal(err)
+	}
+	return manager, predecessor, predecessorBundle, revision, replacement
+}
+
 func TestSuccessorRecoveryPreviewAndPrepareRebindOnlyVerifiedDatabaseIdentity(t *testing.T) {
 	manager, predecessor, predecessorBundle, revision, replacement := seedAuthorizedDatabaseRelocation(t)
 	preview, err := manager.PreviewSuccessorRecovery(context.Background(), SuccessorRecoveryPreviewRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision})
@@ -905,6 +931,245 @@ func TestSuccessorRecoveryPreviewAndPrepareRebindOnlyVerifiedDatabaseIdentity(t 
 	}
 	if _, err := os.Stat(filepath.Join(predecessorBundle, "snapshot.db")); err != nil {
 		t.Fatal("failed predecessor evidence was not preserved")
+	}
+}
+
+func TestSuccessorRecoveryAcceptsMonotonicIntegrityPendingAfterRecordedConflict(t *testing.T) {
+	manager, predecessor, _, revision, replacement := seedMonotonicIntegrityPendingRelocation(t)
+	preview, err := manager.PreviewSuccessorRecovery(context.Background(), SuccessorRecoveryPreviewRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision})
+	if err != nil || preview.State != "eligible" || !validSHA256(preview.PreviewDigest) {
+		t.Fatalf("preview=%+v err=%v", preview, err)
+	}
+	rawPreview, _ := json.Marshal(preview)
+	for _, forbidden := range []string{"integrity_conflict", "integrity_pending", "current_newer_than_published", "observation-1", predecessor.ConfigDigest, fmt.Sprint(predecessor.Database.Inode), fmt.Sprint(replacement.Inode)} {
+		if strings.Contains(string(rawPreview), forbidden) {
+			t.Fatalf("preview exposed private readiness evidence %q: %s", forbidden, rawPreview)
+		}
+	}
+	result, err := manager.RecoverPrepareSuccessor(context.Background(), SuccessorRecoverPrepareRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision, PreviewDigest: preview.PreviewDigest, DatabaseRelocationConfirmed: true, FullBackupConfirmed: true})
+	if err != nil || result.State != "prepared" || result.Reason != "verified_recovered_successor_activated" {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	persisted, _, err := manager.loadBundleJournal(predecessor.UpgradeID)
+	if err != nil || persisted.DatabaseRecovery == nil {
+		t.Fatalf("predecessor=%+v err=%v", persisted, err)
+	}
+	readiness := persisted.DatabaseRecovery.Verification.Readiness
+	if readiness.Relationship != recoveryReadinessIntegrityConflictPending || readiness.PredecessorReason != "integrity_conflict" || readiness.ReplacementReason != "integrity_pending" || readiness.GenerationRelationship != integrityGenerationAdvanced || readiness.CurrentGeneration != 2 || readiness.PublishedGeneration != 1 || !readiness.CurrentObservationValid || readiness.ObservationReadiness != "conflict" {
+		t.Fatalf("readiness=%+v", readiness)
+	}
+}
+
+func TestSuccessorRecoveryRejectsUnverifiedIntegrityPendingRelationships(t *testing.T) {
+	for _, scenario := range []struct {
+		name              string
+		predecessorReason string
+		statements        []string
+	}{
+		{name: "generation did not advance", predecessorReason: "integrity_conflict", statements: []string{`UPDATE controller_integrity_observations SET effective_readiness='unknown' WHERE observation_id='observation-1'`}},
+		{name: "published generation is newer", predecessorReason: "integrity_conflict", statements: []string{`UPDATE controller_integrity_generation SET generation=0 WHERE singleton=1`, `UPDATE controller_integrity_observations SET effective_readiness='conflict' WHERE observation_id='observation-1'`}},
+		{name: "current observation is missing", predecessorReason: "integrity_conflict", statements: []string{`UPDATE controller_integrity_generation SET generation=2 WHERE singleton=1`, `DELETE FROM controller_integrity_current WHERE singleton=1`}},
+		{name: "current observation digest conflicts", predecessorReason: "integrity_conflict", statements: []string{`UPDATE controller_integrity_generation SET generation=2 WHERE singleton=1`, `UPDATE controller_integrity_current SET observation_digest='` + strings.Repeat("2", 64) + `' WHERE singleton=1`}},
+		{name: "current observation generation conflicts", predecessorReason: "integrity_conflict", statements: []string{`UPDATE controller_integrity_generation SET generation=2 WHERE singleton=1`, `UPDATE controller_integrity_observations SET target_generation=0 WHERE observation_id='observation-1'`}},
+		{name: "predecessor reason is unrelated", predecessorReason: "integrity_not_ready", statements: []string{`UPDATE controller_integrity_generation SET generation=2 WHERE singleton=1`}},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			manager, predecessor, predecessorBundle, revision, _ := seedAuthorizedDatabaseRelocation(t)
+			db, err := sql.Open("sqlite", sqliteURI(predecessor.DatabasePath, false))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, statement := range scenario.statements {
+				if _, err := db.Exec(statement); err != nil {
+					db.Close()
+					t.Fatal(err)
+				}
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			predecessor.FailureReason = scenario.predecessorReason
+			if err := writeJournal(predecessorBundle, predecessor, manager.uid); err != nil {
+				t.Fatal(err)
+			}
+			before, _ := os.ReadFile(filepath.Join(predecessorBundle, "journal.json"))
+			if _, err := manager.PreviewSuccessorRecovery(context.Background(), SuccessorRecoveryPreviewRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision}); err == nil {
+				t.Fatal("unverified integrity-pending relationship produced a recovery preview")
+			}
+			after, _ := os.ReadFile(filepath.Join(predecessorBundle, "journal.json"))
+			if string(before) != string(after) {
+				t.Fatal("rejected preview changed predecessor evidence")
+			}
+		})
+	}
+}
+
+func TestSuccessorRecoveryRejectsIntegrityGenerationDriftAfterPreview(t *testing.T) {
+	manager, predecessor, predecessorBundle, revision, _ := seedMonotonicIntegrityPendingRelocation(t)
+	preview, err := manager.PreviewSuccessorRecovery(context.Background(), SuccessorRecoveryPreviewRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", sqliteURI(predecessor.DatabasePath, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE controller_integrity_generation SET generation=3 WHERE singleton=1`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(filepath.Join(predecessorBundle, "journal.json"))
+	request := SuccessorRecoverPrepareRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision, PreviewDigest: preview.PreviewDigest, DatabaseRelocationConfirmed: true, FullBackupConfirmed: true}
+	if _, err := manager.RecoverPrepareSuccessor(context.Background(), request); err == nil || !strings.Contains(err.Error(), "preview changed") {
+		t.Fatalf("generation drift err=%v", err)
+	}
+	after, _ := os.ReadFile(filepath.Join(predecessorBundle, "journal.json"))
+	if string(before) != string(after) {
+		t.Fatal("generation drift created recovery intent")
+	}
+}
+
+func TestMonotonicIntegrityPendingRecoveryReplaysEveryDurableTransition(t *testing.T) {
+	for _, point := range []string{"after_successor_recovery_intent", "after_successor_recovery_locator", "after_successor_recovery_journal", "after_successor_bundle", "after_predecessor_superseded", "after_successor_activation"} {
+		t.Run(point, func(t *testing.T) {
+			manager, predecessor, _, revision, replacement := seedMonotonicIntegrityPendingRelocation(t)
+			preview, err := manager.PreviewSuccessorRecovery(context.Background(), SuccessorRecoveryPreviewRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := SuccessorRecoverPrepareRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision, PreviewDigest: preview.PreviewDigest, DatabaseRelocationConfirmed: true, FullBackupConfirmed: true}
+			manager.fail = func(observed string) error {
+				if observed == point {
+					return errors.New("injected monotonic recovery interruption")
+				}
+				return nil
+			}
+			if _, err := manager.RecoverPrepareSuccessor(context.Background(), request); err == nil {
+				t.Fatal("injected monotonic recovery interruption was ignored")
+			}
+			intent, _, err := manager.loadBundleJournal(predecessor.UpgradeID)
+			if err != nil || intent.SuccessorID == "" {
+				t.Fatalf("intent=%+v err=%v", intent, err)
+			}
+			manager.fail = nil
+			resumed, err := manager.RecoverPrepareSuccessor(context.Background(), request)
+			if err != nil || resumed.UpgradeID != intent.SuccessorID || resumed.State != "prepared" {
+				t.Fatalf("resumed=%+v expected=%s err=%v", resumed, intent.SuccessorID, err)
+			}
+			entries, _ := os.ReadDir(manager.upgradeRoot())
+			bundleCount := 0
+			for _, entry := range entries {
+				if entry.IsDir() && strings.HasPrefix(entry.Name(), "upgrade-") {
+					bundleCount++
+				}
+			}
+			locator, _, _ := configurationadapter.ReadLocator(predecessor.ConfigPath)
+			if bundleCount != 2 || locator.DatabaseIdentity != databaseIdentity(replacement) {
+				t.Fatalf("bundle_count=%d locator=%+v", bundleCount, locator)
+			}
+		})
+	}
+}
+
+func TestExactRecoveryVersionOneIntentRemainsReplayable(t *testing.T) {
+	manager, predecessor, predecessorBundle, revision, replacement := seedAuthorizedDatabaseRelocation(t)
+	contentDigest, err := replacementDatabaseContentDigest(predecessor.DatabasePath, manager.uid, replacement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyAuthority := struct {
+		CanonicalConfigPath string `json:"canonical_config_path"`
+		DatabasePath        string `json:"database_path"`
+		DesiredID           int64  `json:"desired_id"`
+		EffectiveID         int64  `json:"effective_id"`
+		AuthorityVersion    int64  `json:"authority_version"`
+		DesiredDigest       string `json:"desired_digest"`
+		DesiredLifecycle    string `json:"desired_lifecycle"`
+		EffectiveDigest     string `json:"effective_digest"`
+		EffectiveLifecycle  string `json:"effective_lifecycle"`
+		IntegrityGeneration int64  `json:"integrity_generation"`
+		PublishedGeneration int64  `json:"published_generation"`
+		IntegrityReadiness  string `json:"integrity_readiness"`
+	}{
+		CanonicalConfigPath: predecessor.ConfigPath, DatabasePath: predecessor.DatabasePath,
+		DesiredID: 1, EffectiveID: 1, AuthorityVersion: 1,
+		DesiredDigest: predecessor.ConfigDigest, DesiredLifecycle: "effective",
+		EffectiveDigest: predecessor.ConfigDigest, EffectiveLifecycle: "effective",
+		IntegrityGeneration: 1, PublishedGeneration: 1, IntegrityReadiness: "not_ready",
+	}
+	legacyAuthorityRaw, err := json.Marshal(legacyAuthority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyAuthorityDigest := sha256Hex(legacyAuthorityRaw)
+	legacyVerification := legacyReplacementDatabaseVerification{
+		ContentDigest: contentDigest, AuthorityDigest: legacyAuthorityDigest, SchemaVersion: replacement.SchemaVersion,
+		IntegrityOK: true, ForeignKeysOK: true, BindingMatches: true, DesiredConfigurationMatch: true,
+		ReadinessReason: predecessor.FailureReason,
+	}
+	installed, err := inspectBinary(context.Background(), manager.runner, predecessor.BinaryPath, manager.uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locator, found, err := configurationadapter.ReadLocator(predecessor.ConfigPath)
+	if err != nil || !found {
+		t.Fatalf("locator found=%t err=%v", found, err)
+	}
+	legacyPreview := legacyRecoveryPreviewEvidence{
+		UpgradeID: predecessor.UpgradeID, Revision: revision, Supervisor: predecessor.Supervisor, FailureReason: predecessor.FailureReason,
+		ConfigDigest: predecessor.ConfigDigest, Installed: installed, OldDatabase: predecessor.Database, Replacement: replacement,
+		Verification: legacyVerification, LocatorVersion: locator.Version, LocatorConfigPath: locator.ConfigPath,
+		LocatorDBPath: locator.DatabasePath, SupervisorsAbsent: true,
+	}
+	legacyRaw, err := json.Marshal(legacyPreview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyDigest := sha256Hex(legacyRaw)
+	preview, err := manager.PreviewSuccessorRecovery(context.Background(), SuccessorRecoveryPreviewRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.fail = func(point string) error {
+		if point == "after_successor_recovery_intent" {
+			return errors.New("stop before legacy replay")
+		}
+		return nil
+	}
+	request := SuccessorRecoverPrepareRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision, PreviewDigest: preview.PreviewDigest, DatabaseRelocationConfirmed: true, FullBackupConfirmed: true}
+	if _, err := manager.RecoverPrepareSuccessor(context.Background(), request); err == nil {
+		t.Fatal("recovery intent interruption was ignored")
+	}
+	intent, _, err := manager.loadBundleJournal(predecessor.UpgradeID)
+	if err != nil || intent.DatabaseRecovery == nil {
+		t.Fatalf("intent=%+v err=%v", intent, err)
+	}
+	if intent.DatabaseRecovery.Verification.AuthorityDigest == legacyAuthorityDigest {
+		t.Fatal("version-two fixture did not prove its expanded authority digest differs from version one")
+	}
+	intent.DatabaseRecovery.Version = 1
+	intent.DatabaseRecovery.PreviewDigest = legacyDigest
+	intent.DatabaseRecovery.Verification = replacementDatabaseVerification{
+		ContentDigest: legacyVerification.ContentDigest, AuthorityDigest: legacyVerification.AuthorityDigest,
+		SchemaVersion: legacyVerification.SchemaVersion, IntegrityOK: legacyVerification.IntegrityOK,
+		ForeignKeysOK: legacyVerification.ForeignKeysOK, BindingMatches: legacyVerification.BindingMatches,
+		DesiredConfigurationMatch: legacyVerification.DesiredConfigurationMatch, LegacyReadinessReason: legacyVerification.ReadinessReason,
+	}
+	if err := writeJournal(predecessorBundle, intent, manager.uid); err != nil {
+		t.Fatal(err)
+	}
+	manager.fail = nil
+	request.PreviewDigest = legacyDigest
+	resumed, err := manager.RecoverPrepareSuccessor(context.Background(), request)
+	if err != nil || resumed.State != "prepared" || resumed.UpgradeID != intent.SuccessorID {
+		t.Fatalf("resumed=%+v expected=%s err=%v", resumed, intent.SuccessorID, err)
+	}
+	replayedLocator, replayedFound, err := configurationadapter.ReadLocator(predecessor.ConfigPath)
+	if err != nil || !replayedFound || replayedLocator.DatabaseIdentity != databaseIdentity(replacement) {
+		t.Fatalf("locator=%+v found=%t err=%v", replayedLocator, replayedFound, err)
 	}
 }
 

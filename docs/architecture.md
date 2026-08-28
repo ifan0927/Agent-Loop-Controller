@@ -1394,9 +1394,16 @@ predecessor journal and private authority locator. A query-only verifier pins
 the replacement file's owner, private mode, single link, canonical path,
 schema, SQLite and foreign-key integrity, internal configuration paths, desired
 configuration authority, readiness reason, and stable database/WAL content.
-The preview digest also binds the predecessor binary, supervisor absence,
-failure evidence, and exact successor revision. Only the digest and required
-confirmation names are rendered; paths, device/inode values, locator bytes,
+Readiness normally remains an exact match with the predecessor's durable
+failure reason. The sole additional relationship is a durable predecessor
+`integrity_conflict` followed by `integrity_pending` when a valid current
+published observation is older than a strictly newer integrity generation.
+That stale observation cannot assert current Controller readiness. The typed
+relationship, both generations, observation consistency, predecessor failure,
+replacement readiness, predecessor binary, supervisor absence, and exact
+successor revision are all bound into the private preview evidence and digest.
+Only the digest and required confirmation names are rendered; paths,
+device/inode values, observation identities, generation values, locator bytes,
 configuration digests, database contents, and credentials remain private.
 
 Prepare requires explicit relocation and encrypted-full-backup confirmations,
@@ -1409,7 +1416,9 @@ with directory synchronization. The journal then binds the observed
 replacement identity and publication before the existing independent-clone
 successor staging and active-pointer transfer. Restart distinguishes the old
 locator, the exact recovered locator, and every unexpected third identity;
-identical replay resumes one successor while drift preserves all evidence.
+identical replay resumes one successor while generation, observation,
+configuration, content, binary, supervisor, or locator drift preserves all
+evidence.
 Successful successor cleanup retains the failed predecessor's complete recovery
 record.
 

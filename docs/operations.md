@@ -2991,9 +2991,15 @@ predecessor, replacement database safety, supported schema, SQLite and
 foreign-key integrity, configuration authority/readiness, stable database/WAL
 content, supervisor absence, and successor revision. Its JSON is sanitized and
 returns a `preview_digest`; it never returns paths, device/inode values, locator
-bytes, configuration digests, database contents, or credentials. Preview does
-not migrate SQLite, change the locator, create a successor, start a worker, or
-move the active pointer.
+bytes, observation identities, integrity generation values, configuration
+digests, database contents, or credentials. Readiness normally must exactly
+match the predecessor's recorded failure. One narrow case also accepts a
+recorded `integrity_conflict` when later Controller activity advanced the
+integrity generation beyond a still-valid published observation, making the
+stopped replacement derive `integrity_pending`; this is not general
+`integrity_pending` successor eligibility. Preview does not migrate SQLite,
+run an integrity recheck, change the locator, create a successor, start a
+worker, or move the active pointer.
 
 After independently confirming both the relocation and encrypted full backup,
 use the exact preview digest:
@@ -3013,11 +3019,12 @@ Prepare reruns every preview check, verifies the successor through the normal
 independent-clone gate, durably records recovery intent, atomically rebinds only
 the exact locator database identity, and activates one verified successor.
 Identical retries resume the same recovery and successor after response loss.
-Any database/WAL content, schema, binding, configuration, binary, supervisor,
-preview, locator, or third-identity drift fails closed. `status` reports
-`successor-recover-prepare` while recovery or recovered successor preparation
-is interrupted. Never substitute a new preview after durable recovery intent;
-resume with the same predecessor ID, revision, digest, and confirmations.
+Any integrity generation, current observation, database/WAL content, schema,
+binding, configuration, binary, supervisor, preview, locator, or third-identity
+drift fails closed. `status` reports `successor-recover-prepare` while recovery
+or recovered successor preparation is interrupted. Never substitute a new
+preview after durable recovery intent; resume with the same predecessor ID,
+revision, digest, and confirmations.
 
 After successor preparation, boot out the selected supervisor, create a new
 encrypted full backup of the Controller root and external credentials, and use

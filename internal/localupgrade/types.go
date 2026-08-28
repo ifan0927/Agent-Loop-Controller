@@ -86,15 +86,43 @@ type databaseEvidence struct {
 	SchemaVersion int    `json:"schema_version"`
 }
 
+type recoveryReadinessRelationship string
+
+const (
+	recoveryReadinessExactMatch               recoveryReadinessRelationship = "exact_reason_match"
+	recoveryReadinessIntegrityConflictPending recoveryReadinessRelationship = "integrity_conflict_to_monotonic_pending"
+)
+
+type integrityGenerationRelationship string
+
+const (
+	integrityGenerationCurrent        integrityGenerationRelationship = "current_matches_published"
+	integrityGenerationAdvanced       integrityGenerationRelationship = "current_newer_than_published"
+	integrityGenerationPublishedAhead integrityGenerationRelationship = "published_newer_than_current"
+)
+
+type recoveryReadinessVerification struct {
+	Relationship            recoveryReadinessRelationship   `json:"relationship"`
+	PredecessorReason       string                          `json:"predecessor_reason"`
+	ReplacementReason       string                          `json:"replacement_reason"`
+	GenerationRelationship  integrityGenerationRelationship `json:"generation_relationship"`
+	CurrentGeneration       int64                           `json:"current_generation"`
+	PublishedGeneration     int64                           `json:"published_generation"`
+	CurrentObservationValid bool                            `json:"current_observation_valid"`
+	ObservationReadiness    string                          `json:"observation_readiness"`
+}
+
 type replacementDatabaseVerification struct {
-	ContentDigest             string `json:"content_digest"`
-	AuthorityDigest           string `json:"authority_digest"`
-	SchemaVersion             int    `json:"schema_version"`
-	IntegrityOK               bool   `json:"integrity_ok"`
-	ForeignKeysOK             bool   `json:"foreign_keys_ok"`
-	BindingMatches            bool   `json:"binding_matches"`
-	DesiredConfigurationMatch bool   `json:"desired_configuration_match"`
-	ReadinessReason           string `json:"readiness_reason"`
+	ContentDigest             string                        `json:"content_digest"`
+	AuthorityDigest           string                        `json:"authority_digest"`
+	LegacyAuthorityDigest     string                        `json:"-"`
+	SchemaVersion             int                           `json:"schema_version"`
+	IntegrityOK               bool                          `json:"integrity_ok"`
+	ForeignKeysOK             bool                          `json:"foreign_keys_ok"`
+	BindingMatches            bool                          `json:"binding_matches"`
+	DesiredConfigurationMatch bool                          `json:"desired_configuration_match"`
+	LegacyReadinessReason     string                        `json:"readiness_reason,omitempty"`
+	Readiness                 recoveryReadinessVerification `json:"readiness"`
 }
 
 type databaseRecoveryEvidence struct {

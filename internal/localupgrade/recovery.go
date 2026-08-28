@@ -12,7 +12,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 )
 
-const databaseRecoveryEvidenceVersion = 1
+const databaseRecoveryEvidenceVersion = 2
 
 type recoveryPreviewEvidence struct {
 	UpgradeID         string                          `json:"upgrade_id"`
@@ -28,6 +28,33 @@ type recoveryPreviewEvidence struct {
 	LocatorConfigPath string                          `json:"locator_config_path"`
 	LocatorDBPath     string                          `json:"locator_database_path"`
 	SupervisorsAbsent bool                            `json:"supervisors_absent"`
+}
+
+type legacyReplacementDatabaseVerification struct {
+	ContentDigest             string `json:"content_digest"`
+	AuthorityDigest           string `json:"authority_digest"`
+	SchemaVersion             int    `json:"schema_version"`
+	IntegrityOK               bool   `json:"integrity_ok"`
+	ForeignKeysOK             bool   `json:"foreign_keys_ok"`
+	BindingMatches            bool   `json:"binding_matches"`
+	DesiredConfigurationMatch bool   `json:"desired_configuration_match"`
+	ReadinessReason           string `json:"readiness_reason"`
+}
+
+type legacyRecoveryPreviewEvidence struct {
+	UpgradeID         string                                `json:"upgrade_id"`
+	Revision          string                                `json:"revision"`
+	Supervisor        string                                `json:"supervisor"`
+	FailureReason     string                                `json:"failure_reason"`
+	ConfigDigest      string                                `json:"configuration_digest"`
+	Installed         binaryEvidence                        `json:"installed_predecessor"`
+	OldDatabase       databaseEvidence                      `json:"old_database"`
+	Replacement       databaseEvidence                      `json:"replacement_database"`
+	Verification      legacyReplacementDatabaseVerification `json:"replacement_verification"`
+	LocatorVersion    int                                   `json:"locator_version"`
+	LocatorConfigPath string                                `json:"locator_config_path"`
+	LocatorDBPath     string                                `json:"locator_database_path"`
+	SupervisorsAbsent bool                                  `json:"supervisors_absent"`
 }
 
 func (m *Manager) PreviewSuccessorRecovery(ctx context.Context, request SuccessorRecoveryPreviewRequest) (preview SuccessorRecoveryPreview, finalErr error) {
@@ -285,11 +312,11 @@ func (m *Manager) publishRecoveredLocator(ctx context.Context, predecessor *jour
 	if recovery == nil {
 		return errors.New("successor database recovery intent is unavailable")
 	}
-	evidence, digest, err := m.collectRecoveryPreview(ctx, *predecessor, revision, recovery.OldDatabase, true)
+	evidence, digest, err := m.collectPersistedRecoveryPreview(ctx, *predecessor, revision, recovery, true)
 	if err != nil {
 		return err
 	}
-	if digest != recovery.PreviewDigest || evidence.Replacement != recovery.ReplacementDatabase || evidence.Verification != recovery.Verification {
+	if digest != recovery.PreviewDigest || evidence.Replacement != recovery.ReplacementDatabase || !recoveryVerificationMatches(recovery, evidence.Verification) {
 		return errors.New("successor database recovery evidence changed before locator publication")
 	}
 	files, err := configurationadapter.NewFiles(predecessor.ConfigPath)
@@ -301,11 +328,11 @@ func (m *Manager) publishRecoveredLocator(ctx context.Context, predecessor *jour
 		return errors.New("successor database recovery filesystem lock is unavailable")
 	}
 	defer lock.Release()
-	evidence, digest, err = m.collectRecoveryPreview(ctx, *predecessor, revision, recovery.OldDatabase, true)
+	evidence, digest, err = m.collectPersistedRecoveryPreview(ctx, *predecessor, revision, recovery, true)
 	if err != nil {
 		return err
 	}
-	if digest != recovery.PreviewDigest || evidence.Replacement != recovery.ReplacementDatabase || evidence.Verification != recovery.Verification {
+	if digest != recovery.PreviewDigest || evidence.Replacement != recovery.ReplacementDatabase || !recoveryVerificationMatches(recovery, evidence.Verification) {
 		return errors.New("successor database recovery evidence changed under filesystem lock")
 	}
 	locator, found, err := configurationadapter.ReadLocator(predecessor.ConfigPath)
@@ -325,11 +352,11 @@ func (m *Manager) publishRecoveredLocator(ctx context.Context, predecessor *jour
 	default:
 		return errors.New("successor database recovery encountered a third locator identity")
 	}
-	evidence, digest, err = m.collectRecoveryPreview(ctx, *predecessor, revision, recovery.OldDatabase, true)
+	evidence, digest, err = m.collectPersistedRecoveryPreview(ctx, *predecessor, revision, recovery, true)
 	if err != nil {
 		return err
 	}
-	if digest != recovery.PreviewDigest || evidence.Replacement != recovery.ReplacementDatabase || evidence.Verification != recovery.Verification {
+	if digest != recovery.PreviewDigest || evidence.Replacement != recovery.ReplacementDatabase || !recoveryVerificationMatches(recovery, evidence.Verification) {
 		return errors.New("successor database recovery evidence changed after locator publication")
 	}
 	now := m.now()
@@ -345,8 +372,8 @@ func (m *Manager) validatePublishedRecovery(ctx context.Context, predecessor jou
 	if recovery == nil || recovery.LocatorPublishedAt == nil || predecessor.Database != recovery.ReplacementDatabase {
 		return binaryEvidence{}, errors.New("published successor database recovery evidence is unavailable")
 	}
-	evidence, digest, err := m.collectRecoveryPreview(ctx, predecessor, revision, recovery.OldDatabase, true)
-	if err != nil || digest != recovery.PreviewDigest || evidence.Replacement != recovery.ReplacementDatabase || evidence.Verification != recovery.Verification {
+	evidence, digest, err := m.collectPersistedRecoveryPreview(ctx, predecessor, revision, recovery, true)
+	if err != nil || digest != recovery.PreviewDigest || evidence.Replacement != recovery.ReplacementDatabase || !recoveryVerificationMatches(recovery, evidence.Verification) {
 		return binaryEvidence{}, errors.New("published successor database recovery evidence changed")
 	}
 	locator, found, err := configurationadapter.ReadLocator(predecessor.ConfigPath)
@@ -354,6 +381,47 @@ func (m *Manager) validatePublishedRecovery(ctx context.Context, predecessor jou
 		return binaryEvidence{}, errors.New("published successor database recovery locator conflicts")
 	}
 	return evidence.Installed, nil
+}
+
+func (m *Manager) collectPersistedRecoveryPreview(ctx context.Context, predecessor journal, revision string, recovery *databaseRecoveryEvidence, locatorMayBeRecovered bool) (recoveryPreviewEvidence, string, error) {
+	evidence, digest, err := m.collectRecoveryPreview(ctx, predecessor, revision, recovery.OldDatabase, locatorMayBeRecovered)
+	if err != nil || recovery.Version != 1 {
+		return evidence, digest, err
+	}
+	if evidence.Verification.Readiness.Relationship != recoveryReadinessExactMatch {
+		return recoveryPreviewEvidence{}, "", errors.New("legacy successor recovery readiness evidence changed")
+	}
+	legacy := legacyRecoveryPreview(evidence)
+	raw, err := json.Marshal(legacy)
+	if err != nil {
+		return recoveryPreviewEvidence{}, "", errors.New("legacy successor recovery preview evidence is unavailable")
+	}
+	return evidence, sha256Hex(raw), nil
+}
+
+func legacyRecoveryPreview(evidence recoveryPreviewEvidence) legacyRecoveryPreviewEvidence {
+	verification := evidence.Verification
+	return legacyRecoveryPreviewEvidence{
+		UpgradeID: evidence.UpgradeID, Revision: evidence.Revision, Supervisor: evidence.Supervisor, FailureReason: evidence.FailureReason,
+		ConfigDigest: evidence.ConfigDigest, Installed: evidence.Installed, OldDatabase: evidence.OldDatabase, Replacement: evidence.Replacement,
+		Verification: legacyReplacementDatabaseVerification{
+			ContentDigest: verification.ContentDigest, AuthorityDigest: verification.LegacyAuthorityDigest, SchemaVersion: verification.SchemaVersion,
+			IntegrityOK: verification.IntegrityOK, ForeignKeysOK: verification.ForeignKeysOK, BindingMatches: verification.BindingMatches,
+			DesiredConfigurationMatch: verification.DesiredConfigurationMatch, ReadinessReason: verification.Readiness.ReplacementReason,
+		},
+		LocatorVersion: evidence.LocatorVersion, LocatorConfigPath: evidence.LocatorConfigPath, LocatorDBPath: evidence.LocatorDBPath, SupervisorsAbsent: evidence.SupervisorsAbsent,
+	}
+}
+
+func recoveryVerificationMatches(recovery *databaseRecoveryEvidence, observed replacementDatabaseVerification) bool {
+	if recovery.Version != 1 {
+		observed.LegacyAuthorityDigest = ""
+		expected := recovery.Verification
+		expected.LegacyAuthorityDigest = ""
+		return observed == expected
+	}
+	legacy := recovery.Verification
+	return legacy.ContentDigest == observed.ContentDigest && legacy.AuthorityDigest == observed.LegacyAuthorityDigest && legacy.SchemaVersion == observed.SchemaVersion && legacy.IntegrityOK == observed.IntegrityOK && legacy.ForeignKeysOK == observed.ForeignKeysOK && legacy.BindingMatches == observed.BindingMatches && legacy.DesiredConfigurationMatch == observed.DesiredConfigurationMatch && legacy.LegacyReadinessReason == observed.Readiness.ReplacementReason
 }
 
 func databaseIdentity(evidence databaseEvidence) application.DatabaseFileIdentity {

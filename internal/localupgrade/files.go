@@ -275,7 +275,7 @@ func validateJournal(value journal, id string) error {
 	}
 	if value.DatabaseRecovery != nil {
 		recovery := value.DatabaseRecovery
-		if value.SchemaVersion < 3 || recovery.Version != 1 || !validSHA256(recovery.PreviewDigest) || recovery.OldDatabase.Device == 0 || recovery.OldDatabase.Inode == 0 || recovery.ReplacementDatabase.Device == 0 || recovery.ReplacementDatabase.Inode == 0 || recovery.OldDatabase == recovery.ReplacementDatabase || recovery.ReplacementDatabase.SchemaVersion != value.Candidate.Build.SupportedControllerSchemaVersion || !validRevision(recovery.SuccessorRevision) || recovery.SuccessorRevision != value.SuccessorRevision || !recovery.DatabaseRelocationConfirmed || !recovery.FullBackupConfirmed || recovery.IntentAt.IsZero() || !validReplacementVerification(recovery.Verification, value.FailureReason) {
+		if value.SchemaVersion < 3 || recovery.Version < 1 || recovery.Version > databaseRecoveryEvidenceVersion || !validSHA256(recovery.PreviewDigest) || recovery.OldDatabase.Device == 0 || recovery.OldDatabase.Inode == 0 || recovery.ReplacementDatabase.Device == 0 || recovery.ReplacementDatabase.Inode == 0 || recovery.OldDatabase == recovery.ReplacementDatabase || recovery.ReplacementDatabase.SchemaVersion != value.Candidate.Build.SupportedControllerSchemaVersion || !validRevision(recovery.SuccessorRevision) || recovery.SuccessorRevision != value.SuccessorRevision || !recovery.DatabaseRelocationConfirmed || !recovery.FullBackupConfirmed || recovery.IntentAt.IsZero() || !validReplacementVerification(recovery.Verification, value.FailureReason, recovery.Version) {
 			return errors.New("upgrade journal database recovery evidence is invalid")
 		}
 		if value.Phase != "successor_recovery_intent" && value.Phase != "successor_prepare_intent" && value.Phase != "superseded" {
@@ -305,8 +305,31 @@ func validSHA256(value string) bool {
 	return true
 }
 
-func validReplacementVerification(value replacementDatabaseVerification, reason string) bool {
-	return validSHA256(value.ContentDigest) && validSHA256(value.AuthorityDigest) && value.SchemaVersion > 0 && value.IntegrityOK && value.ForeignKeysOK && value.BindingMatches && value.DesiredConfigurationMatch && value.ReadinessReason == reason
+func validReplacementVerification(value replacementDatabaseVerification, reason string, version int) bool {
+	if !validSHA256(value.ContentDigest) || !validSHA256(value.AuthorityDigest) || value.SchemaVersion <= 0 || !value.IntegrityOK || !value.ForeignKeysOK || !value.BindingMatches || !value.DesiredConfigurationMatch {
+		return false
+	}
+	if version == 1 {
+		return value.LegacyReadinessReason == reason && value.Readiness == (recoveryReadinessVerification{})
+	}
+	if version != databaseRecoveryEvidenceVersion || value.LegacyReadinessReason != "" {
+		return false
+	}
+	readiness := value.Readiness
+	if readiness.PredecessorReason != reason || readiness.CurrentGeneration < 0 || readiness.PublishedGeneration < 0 {
+		return false
+	}
+	if readiness.GenerationRelationship != classifyIntegrityGeneration(readiness.CurrentGeneration, readiness.PublishedGeneration) {
+		return false
+	}
+	switch readiness.Relationship {
+	case recoveryReadinessExactMatch:
+		return readiness.ReplacementReason == reason
+	case recoveryReadinessIntegrityConflictPending:
+		return reason == "integrity_conflict" && readiness.ReplacementReason == "integrity_pending" && readiness.GenerationRelationship == integrityGenerationAdvanced && readiness.CurrentGeneration > readiness.PublishedGeneration && readiness.CurrentObservationValid && validIntegrityReadiness(readiness.ObservationReadiness)
+	default:
+		return false
+	}
 }
 
 func validUpgradeID(value string) bool {
