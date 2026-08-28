@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -144,11 +145,36 @@ func TestOperatorRetryConcurrentIdenticalCommandsShareOneAction(t *testing.T) {
 	close(start)
 	one, two := <-results, <-results
 	if one.err != nil || two.err != nil || one.result.Action.ActionID == "" || one.result.Action.ActionID != two.result.Action.ActionID || one.result.Action.Status != application.OperatorActionStatusObserved || two.result.Action.Status != application.OperatorActionStatusObserved {
-		t.Fatalf("one=%+v two=%+v", one, two)
+		t.Fatalf("one=%+v one_err=%v one_cause=%v two=%+v two_err=%v two_cause=%v", one.result, one.err, errors.Unwrap(one.err), two.result, two.err, errors.Unwrap(two.err))
 	}
 	inspection, err := firstStore.Inspect(context.Background(), run.ID)
 	if err != nil || len(inspection.OperatorActions) != 1 || len(inspection.RetrySchedules) != 1 || inspection.RetrySchedules[0].Status != application.RetryScheduleScheduled {
 		t.Fatalf("inspection=%+v err=%v", inspection, err)
+	}
+}
+
+func TestOperatorActionSQLiteBusyRetryUsesBoundedContextWindow(t *testing.T) {
+	attempts := 0
+	err := retryOperatorActionSQLite(context.Background(), func(context.Context) error {
+		attempts++
+		if attempts <= 6 {
+			return errors.New("SQLITE_BUSY: database is locked")
+		}
+		return nil
+	})
+	if err != nil || attempts != 7 {
+		t.Fatalf("attempts=%d err=%v", attempts, err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	attempts = 0
+	err = retryOperatorActionSQLite(ctx, func(context.Context) error {
+		attempts++
+		cancel()
+		return errors.New("SQLITE_BUSY: database is locked")
+	})
+	if !errors.Is(err, context.Canceled) || attempts != 1 {
+		t.Fatalf("cancel attempts=%d err=%v", attempts, err)
 	}
 }
 

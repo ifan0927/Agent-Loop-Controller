@@ -66,6 +66,8 @@ The default macOS controller root is:
   logs/                 private launchd worker logs, mode 0700
     worker.stdout.log   mode 0600
     worker.stderr.log   mode 0600
+  local-upgrades/       one private active local binary upgrade, mode 0700
+  current-installation.json  last verified installed identity, mode 0600
   repositories/         Controller-owned onboarding roots, mode 0700
     owner--repository/
       source/            managed checkout for empty-repository onboarding
@@ -2871,20 +2873,108 @@ artifacts into GitHub/Linear comments.
 
 ## 14. Backup and Upgrade
 
-1. Boot out and confirm the worker is stopped.
-2. Back up the private controller root and external credential files using an
-   operator-controlled encrypted mechanism. Preserve permissions and do not
-   commit the backup.
-3. Build/install the new binary outside the repository.
-4. Run `version`, `config validate`, `config inspect`, `config doctor`, and
-   selected supervisor doctor/validation.
-5. Let the application open the database and apply ordered migrations. Never
-   downgrade a database whose schema is newer than the binary supports.
-6. Render/lint the new plist. Replace an old plist only after bootout and
-   deliberate operator removal; `install` never overwrites it.
-7. Bootstrap, observe status/logs, and inspect the resumed run.
+Use the repository-owned managed workflow for a non-root, worker-owned installed
+binary. Select the supervisor explicitly; host state never chooses it. The
+script never invokes `sudo`, fetches Git history, downloads a binary, restores a
+database, or advances a phase from `status`.
 
-There is no automatic backup command or migration rollback command.
+```sh
+REVISION="$(git rev-parse HEAD)" # must be the intended full clean 40-char commit
+BIN="$HOME/.local/bin/agentctl"
+CONFIG="$HOME/Library/Application Support/agent-loop-controller/controller.json"
+SUPERVISOR="launchdaemon" # or launchagent
+
+./scripts/local-agentctl-upgrade.sh prepare \
+  --revision "$REVISION" --supervisor "$SUPERVISOR" \
+  --binary "$BIN" --config "$CONFIG"
+
+# Use the returned upgrade_id for every later command.
+./scripts/local-agentctl-upgrade.sh status --upgrade-id "$UPGRADE_ID"
+```
+
+`prepare` validates the exact local commit without fetch, pull, or branch
+movement; runs the canonical gate in an isolated detached worktree; stages the
+candidate on the installed target filesystem; and records candidate/previous
+digests plus safe Go build metadata. Root-owned, symlinked, hard-linked,
+wrong-owner, dirty, or unverifiable targets and candidates are unsupported. Use
+the existing manual process for a root-owned binary.
+
+Before replacement, create a separate encrypted full backup of the Controller
+root and every external credential file. The managed SQLite snapshot is only
+consistency and recovery evidence; it is never a substitute for that backup.
+
+```sh
+# Choose exactly one existing lifecycle command for the selected supervisor.
+# LaunchAgent:
+"$BIN" controller launchagent bootout --binary "$BIN" --config "$CONFIG"
+# LaunchDaemon (do not also run the LaunchAgent command):
+sudo "$BIN" controller launchdaemon bootout \
+  --binary "$BIN" --config "$CONFIG" --user "$(id -un)"
+
+./scripts/local-agentctl-upgrade.sh replace \
+  --upgrade-id "$UPGRADE_ID" --full-backup-confirmed
+./scripts/local-agentctl-upgrade.sh authorize-bootstrap --upgrade-id "$UPGRADE_ID"
+```
+
+`replace` proves the selected, opposite, and legacy labels are absent, retains
+`worker.lock`, creates a verified online SQLite backup, and atomically replaces
+the binary. `authorize-bootstrap` durably writes `bootstrap_intent` before it
+returns an argv instruction. Invoke that instruction directly; prepend `sudo`
+only for the returned LaunchDaemon instruction. A lost response is recovered
+with `status`, never by assuming authorization failed.
+
+After `bootstrap_intent`, previous-binary restoration is permanently forbidden.
+The worker alone opens and migrates the Controller database. Observe in bounded
+steps until the exact supervisor PID/process-start identity, candidate build,
+current compatible schema, fresh heartbeat, loaded configuration digest,
+desired/effective configuration convergence, and Controller integrity/readiness
+all agree:
+
+```sh
+./scripts/local-agentctl-upgrade.sh observe --upgrade-id "$UPGRADE_ID"
+./scripts/local-agentctl-upgrade.sh status --upgrade-id "$UPGRADE_ID"
+./scripts/local-agentctl-upgrade.sh cleanup --upgrade-id "$UPGRADE_ID"
+```
+
+Integrity recheck may be pending; rerun `observe` later. Missing heartbeat,
+launch failure, identity mismatch, readiness conflict, or ambiguous evidence
+enters attention and preserves the bundle. Cleanup is allowed only after a
+healthy upgrade with ready Controller state. Machine output keeps these axes
+separate as `upgrade_health` and `controller_readiness`.
+
+Before bootstrap intent, an operator may instead keep the selected supervisor
+absent and run:
+
+```sh
+./scripts/local-agentctl-upgrade.sh rollback --upgrade-id "$UPGRADE_ID"
+# Bootstrap the selected supervisor with the existing lifecycle command.
+./scripts/local-agentctl-upgrade.sh observe --upgrade-id "$UPGRADE_ID"
+./scripts/local-agentctl-upgrade.sh cleanup --upgrade-id "$UPGRADE_ID"
+```
+
+Rollback restores only the exact previous binary. It never restores the SQLite
+snapshot, downgrades schema, or starts a worker. Interrupted
+`replacement_intent`, `rollback_intent`, `bootstrap_intent`, and
+`cleanup_intent` are deterministic: rerun `status`, then only its stated next
+action. Never delete or edit the active bundle or journal manually.
+
+### Unsupported root-owned binary fallback
+
+The managed workflow deliberately rejects a root-owned installed binary and
+never changes ownership to adopt it. Retain the manual procedure for that
+topology:
+
+1. Boot out the selected supervisor and prove its exact label is absent.
+2. Create the external encrypted Controller-root and credential backup.
+3. Build the intended exact clean revision and run the canonical gate.
+4. As the operator-selected privileged action, replace the root-owned binary
+   while preserving its owner and mode; do not run the managed upgrade script.
+5. Run `version --json`, configuration validation/doctor, and selected
+   supervisor validation before bootstrap.
+6. Bootstrap through the existing lifecycle command, then verify the exact
+   launchd PID, worker heartbeat/build identity, configuration convergence,
+   schema, integrity, and readiness. Never downgrade or manually restore the
+   Controller database.
 
 ## 15. Troubleshooting
 

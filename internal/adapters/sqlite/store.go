@@ -32,6 +32,10 @@ import (
 
 const schemaVersion = 41
 
+// SupportedSchemaVersion is the single maintained source for the newest
+// Controller database schema understood by this binary.
+const SupportedSchemaVersion = schemaVersion
+
 const (
 	sqliteMigrationRetryDelay = 10 * time.Millisecond
 	// The window bounds both schema work and lock retries. Receipt-table

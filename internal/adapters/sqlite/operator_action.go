@@ -16,6 +16,14 @@ import (
 
 const operatorActionSelect = `SELECT action_id,idempotency_key,payload_digest,request_digest,expected_authority_digest,run_id,repository,expected_state,run_idempotency_key,transition_sequence,action_type,requester_login,requester_database_id,requester_node_id,requester_actor_type,reason_code,attention_event_key,status,result_status,resulting_state,resulting_transition_sequence,evidence_digest,outcome_digest,next_eligible_at,received_at,validated_at,applied_at,observed_at FROM operator_actions`
 
+// SQLite snapshot write upgrades can report SQLITE_BUSY immediately instead of
+// honoring the connection busy timeout. Retry the complete transaction within
+// a bounded caller-aware window so an identical concurrent action can replay.
+const (
+	operatorActionSQLiteRetryDelay  = 10 * time.Millisecond
+	operatorActionSQLiteRetryWindow = 5 * time.Second
+)
+
 func (s *Store) listOperatorActions(ctx context.Context, runID string) ([]application.OperatorActionRecord, error) {
 	rows, err := s.db.QueryContext(ctx, operatorActionSelect+` WHERE run_id=? ORDER BY transition_sequence,action_id`, runID)
 	if err != nil {
@@ -34,15 +42,24 @@ func (s *Store) listOperatorActions(ctx context.Context, runID string) ([]applic
 }
 
 func (s *Store) BeginOperatorAction(ctx context.Context, record application.OperatorActionRecord) (application.OperatorActionRecord, bool, error) {
-	for attempt := 0; ; attempt++ {
-		action, created, err := s.beginOperatorActionOnce(ctx, record)
-		if !operatorActionSQLiteBusy(err) || attempt >= 4 {
-			return action, created, err
-		}
-		if err := waitOperatorActionRetry(ctx, attempt); err != nil {
-			return application.OperatorActionRecord{}, false, err
-		}
+	var action application.OperatorActionRecord
+	var created bool
+	err := retryOperatorActionSQLite(ctx, func(retryCtx context.Context) error {
+		var retryErr error
+		action, created, retryErr = s.beginOperatorActionOnce(retryCtx, record)
+		return retryErr
+	})
+	if !errors.Is(err, application.ErrOperatorActionConflict) {
+		return action, created, err
 	}
+	existing, found, lookupErr := scanOperatorActionMaybe(s.db.QueryRowContext(ctx, operatorActionSelect+` WHERE idempotency_key=?`, record.IdempotencyKey))
+	if lookupErr != nil {
+		return application.OperatorActionRecord{}, false, lookupErr
+	}
+	if found && existing.ActionID == record.ActionID && existing.PayloadDigest == record.PayloadDigest {
+		return existing, false, nil
+	}
+	return application.OperatorActionRecord{}, false, err
 }
 
 func (s *Store) beginOperatorActionOnce(ctx context.Context, record application.OperatorActionRecord) (application.OperatorActionRecord, bool, error) {
@@ -116,15 +133,15 @@ func (s *Store) ObserveOperatorActionResult(ctx context.Context, result applicat
 }
 
 func (s *Store) ApplyOperatorRetry(ctx context.Context, request application.OperatorRetryApply) (application.OperatorActionRecord, application.RetrySchedule, bool, error) {
-	for attempt := 0; ; attempt++ {
-		action, schedule, changed, err := s.applyOperatorRetryOnce(ctx, request)
-		if !operatorActionSQLiteBusy(err) || attempt >= 4 {
-			return action, schedule, changed, err
-		}
-		if err := waitOperatorActionRetry(ctx, attempt); err != nil {
-			return application.OperatorActionRecord{}, application.RetrySchedule{}, false, err
-		}
-	}
+	var action application.OperatorActionRecord
+	var schedule application.RetrySchedule
+	var changed bool
+	err := retryOperatorActionSQLite(ctx, func(retryCtx context.Context) error {
+		var retryErr error
+		action, schedule, changed, retryErr = s.applyOperatorRetryOnce(retryCtx, request)
+		return retryErr
+	})
+	return action, schedule, changed, err
 }
 
 func (s *Store) ApplyCIWaitRecovery(ctx context.Context, request application.CIWaitRecoveryApply) (application.OperatorActionRecord, application.RetrySchedule, bool, error) {
@@ -298,15 +315,14 @@ func (s *Store) applyOperatorRetryOnce(ctx context.Context, request application.
 }
 
 func (s *Store) advanceOperatorAction(ctx context.Context, result application.OperatorActionMutationResult, observed bool) (application.OperatorActionRecord, bool, error) {
-	for attempt := 0; ; attempt++ {
-		record, changed, err := s.advanceOperatorActionOnce(ctx, result, observed)
-		if !operatorActionSQLiteBusy(err) || attempt >= 4 {
-			return record, changed, err
-		}
-		if err := waitOperatorActionRetry(ctx, attempt); err != nil {
-			return application.OperatorActionRecord{}, false, err
-		}
-	}
+	var record application.OperatorActionRecord
+	var changed bool
+	err := retryOperatorActionSQLite(ctx, func(retryCtx context.Context) error {
+		var retryErr error
+		record, changed, retryErr = s.advanceOperatorActionOnce(retryCtx, result, observed)
+		return retryErr
+	})
+	return record, changed, err
 }
 
 func (s *Store) advanceOperatorActionOnce(ctx context.Context, result application.OperatorActionMutationResult, observed bool) (application.OperatorActionRecord, bool, error) {
@@ -422,17 +438,21 @@ func validOperatorActionDigest(value string) bool {
 	return true
 }
 
-func operatorActionSQLiteBusy(err error) bool {
-	return sqliteBusy(err)
-}
-
-func waitOperatorActionRetry(ctx context.Context, attempt int) error {
-	timer := time.NewTimer(time.Duration(attempt+1) * time.Millisecond)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
+func retryOperatorActionSQLite(ctx context.Context, operation func(context.Context) error) error {
+	retryCtx, cancel := context.WithTimeout(ctx, operatorActionSQLiteRetryWindow)
+	defer cancel()
+	for attempt := 0; ; attempt++ {
+		err := operation(retryCtx)
+		if !sqliteBusy(err) {
+			return err
+		}
+		delay := min(time.Duration(attempt+1)*time.Millisecond, operatorActionSQLiteRetryDelay)
+		timer := time.NewTimer(delay)
+		select {
+		case <-retryCtx.Done():
+			timer.Stop()
+			return retryCtx.Err()
+		case <-timer.C:
+		}
 	}
 }
