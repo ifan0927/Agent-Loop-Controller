@@ -30,7 +30,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 41
+const schemaVersion = 42
 
 // SupportedSchemaVersion is the single maintained source for the newest
 // Controller database schema understood by this binary.
@@ -789,6 +789,8 @@ func migrateSQLiteGeneric(ctx context.Context, db sqliteTransactioner, supported
 			statements = migrationV40
 		case 41:
 			statements = migrationV41
+		case 42:
+			statements = migrationV42
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -2116,6 +2118,12 @@ func integrityMigrationV40() []string {
 }
 
 var migrationV41 = integrityRecheckMigrationV41()
+
+var migrationV42 = []string{
+	`UPDATE activity_backfill_progress SET status='pending',updated_at=CURRENT_TIMESTAMP
+		WHERE status='conflict' AND reason_code='immutable_source_conflict'
+		AND source_kind IN ('run_transition','repository_lifecycle','onboarding','operator_attention','operation_receipt')`,
+}
 
 func integrityRecheckMigrationV41() []string {
 	statements := []string{

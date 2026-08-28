@@ -819,8 +819,7 @@ func insertRepositorySnapshotTx(ctx context.Context, tx *sql.Tx, snapshot applic
 			return err
 		}
 	}
-	sourceDigest := digestActivitySource(strings.Join([]string{snapshot.SnapshotID, string(snapshot.Status), snapshot.ReasonCode, snapshot.SnapshotDigest, formatTime(snapshot.ObservedAt), formatTime(snapshot.PublishedAt)}, "\x00"))
-	event := application.NewActivityEvent(application.ActivityEventInput{SourceKind: "repository_lifecycle", SourceIdentity: snapshot.SnapshotID, SourceEvidenceDigest: sourceDigest, Category: application.ActivityRepository, EventKind: application.ActivityRepositoryGateChange, Actor: application.ActivityActorController, Scope: application.ScopeRepository, TargetID: snapshot.Repository, TargetBindingDigest: snapshot.RepositoryBindingDigest, ReasonCode: application.ActivityReasonReadinessChanged, ResultingState: string(snapshot.Status), ResultingVersion: snapshot.LifecycleVersion, OccurredAt: snapshot.PublishedAt, ObservedAt: &snapshot.ObservedAt, RelatedResources: []application.ActivityRelatedResource{{Kind: application.ScopeRepository, ID: snapshot.Repository}}, OperationIDs: compactStrings(operationID), EvidenceDigests: compactDigests(snapshot.SnapshotDigest, sourceDigest), Coverage: application.ActivityEventCoverage{IngestionClass: application.ActivityIngestionCurrent, LegacyReconstructable: true}})
+	event := newRepositoryReadinessActivityEvent(snapshot, operationID, application.ActivityIngestionCurrent)
 	if available, err := activitySchemaAvailableTx(ctx, tx); err != nil {
 		return err
 	} else if available {

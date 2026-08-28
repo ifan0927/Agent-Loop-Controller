@@ -54,7 +54,7 @@ func appendActivityEventTx(ctx context.Context, tx *sql.Tx, event application.Ac
 		if lookupErr != nil {
 			return application.ActivityEvent{}, false, lookupErr
 		}
-		if existing.SourceKind != event.SourceKind || existing.SourceIdentity != event.SourceIdentity || existing.SourceEvidenceDigest != event.SourceEvidenceDigest || existing.SnapshotDigest != event.SnapshotDigest {
+		if !application.ActivityEventsCompatibleForReplay(existing, event) {
 			return application.ActivityEvent{}, false, fmt.Errorf("%w: immutable snapshot changed", application.ErrActivityConflict)
 		}
 		if err := ensureActivityOperationLinksTx(ctx, tx, existing); err != nil {
@@ -337,16 +337,7 @@ func appendRunTransitionActivityTx(ctx context.Context, tx *sql.Tx, runID string
 	if !validOperatorActionDigest(binding) {
 		binding = application.LegacyRunAuthorityDigest(repository)
 	}
-	sourceDigest := digestActivitySource(strings.Join([]string{runID, fmt.Sprintf("%d", sequence), from, to, reason, evidence, head, formatTime(occurredAt)}, "\x00"))
-	operations := compactStrings(operationID)
-	event := application.NewActivityEvent(application.ActivityEventInput{
-		SourceKind: "run_transition", SourceIdentity: fmt.Sprintf("%s:%d", runID, sequence), SourceEvidenceDigest: sourceDigest,
-		Category: application.ActivityRun, EventKind: application.ActivityRunTransition, Actor: application.ActivityActorController,
-		Scope: application.ScopeRun, TargetID: runID, TargetBindingDigest: binding, ReasonCode: application.ActivityReasonStateChanged,
-		PriorState: from, ResultingState: to, PriorVersion: max(sequence-1, 0), ResultingVersion: sequence, OccurredAt: occurredAt,
-		RelatedResources: []application.ActivityRelatedResource{{Kind: application.ScopeRun, ID: runID}}, OperationIDs: operations, EvidenceDigests: []string{sourceDigest},
-		Coverage: application.ActivityEventCoverage{IngestionClass: application.ActivityIngestionCurrent, LegacyReconstructable: true},
-	})
+	event := newRunTransitionActivityEvent(runID, sequence, from, to, reason, evidence, head, occurredAt, binding, operationID, application.ActivityIngestionCurrent)
 	_, _, err = appendActivityEventTx(ctx, tx, event)
 	return err
 }
@@ -431,15 +422,14 @@ func appendOperatorAttentionActivityTx(ctx context.Context, tx *sql.Tx, event ap
 			return err
 		}
 	}
-	sourceDigest := digestActivitySource(strings.Join([]string{event.EventKey, event.PayloadDigest, event.EvidenceDigest, event.ReasonCode, formatTime(event.OccurredAt), formatTime(event.ObservedAt)}, "\x00"))
-	opened := application.NewActivityEvent(application.ActivityEventInput{SourceKind: "operator_attention", SourceIdentity: event.EventKey, SourceEvidenceDigest: sourceDigest, Category: application.ActivityAttention, EventKind: application.ActivityAttentionOpened, Actor: application.ActivityActorController, Scope: scope, TargetID: target, TargetBindingDigest: binding, ReasonCode: application.ActivityReasonOpened, OccurredAt: event.OccurredAt, ObservedAt: &event.ObservedAt, RelatedResources: []application.ActivityRelatedResource{{Kind: scope, ID: target}}, EvidenceDigests: compactDigests(event.EvidenceDigest, sourceDigest), Coverage: application.ActivityEventCoverage{IngestionClass: application.ActivityIngestionCurrent, LegacyReconstructable: true}})
+	opened := newOperatorAttentionActivityEvent(event.EventKey, event.PayloadDigest, event.ReasonCode, event.EvidenceDigest, event.OccurredAt, event.ObservedAt, scope, target, binding, application.ActivityIngestionCurrent)
 	if _, _, err := appendActivityEventTx(ctx, tx, opened); err != nil {
 		return err
 	}
 	if supersededEventID == "" {
 		return nil
 	}
-	supersededDigest := digestActivitySource(strings.Join([]string{supersededEventID, event.EventKey, sourceDigest}, "\x00"))
+	supersededDigest := digestActivitySource(strings.Join([]string{supersededEventID, event.EventKey, opened.SourceEvidenceDigest}, "\x00"))
 	superseded := application.NewActivityEvent(application.ActivityEventInput{SourceKind: "operator_attention_supersession", SourceIdentity: supersededEventID + ":" + event.EventKey, SourceEvidenceDigest: supersededDigest, Category: application.ActivityAttention, EventKind: application.ActivityAttentionSuperseded, Actor: application.ActivityActorController, Scope: scope, TargetID: target, TargetBindingDigest: binding, ReasonCode: application.ActivityReasonSuperseded, OccurredAt: event.OccurredAt, ObservedAt: &event.ObservedAt, RelatedResources: []application.ActivityRelatedResource{{Kind: scope, ID: target}}, EvidenceDigests: []string{supersededDigest}, Coverage: application.ActivityEventCoverage{IngestionClass: application.ActivityIngestionCurrent, LegacyReconstructable: true}})
 	_, _, err := appendActivityEventTx(ctx, tx, superseded)
 	return err

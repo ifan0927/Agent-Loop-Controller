@@ -33,6 +33,29 @@ func TestActivityEventIdentityIsDeterministicImmutableAndSanitized(t *testing.T)
 	}
 }
 
+func TestActivityReplayCompatibilityOnlyIgnoresCurrentBackfillClassification(t *testing.T) {
+	now := time.Date(2026, 8, 28, 1, 0, 0, 0, time.UTC)
+	input := ActivityEventInput{SourceKind: "run_transition", SourceIdentity: "run-1:2", SourceEvidenceDigest: strings.Repeat("a", 64), Category: ActivityRun, EventKind: ActivityRunTransition, Actor: ActivityActorController, Scope: ScopeRun, TargetID: "run-1", TargetBindingDigest: strings.Repeat("b", 64), ReasonCode: ActivityReasonStateChanged, PriorState: "received", ResultingState: "executing", PriorVersion: 1, ResultingVersion: 2, OccurredAt: now, RelatedResources: []ActivityRelatedResource{{Kind: ScopeRun, ID: "run-1"}}, EvidenceDigests: []string{strings.Repeat("a", 64)}, Coverage: ActivityEventCoverage{IngestionClass: ActivityIngestionCurrent, LegacyReconstructable: true}}
+	current := NewActivityEvent(input)
+	input.Coverage.IngestionClass = ActivityIngestionBackfill
+	backfill := NewActivityEvent(input)
+	if !ActivityEventsCompatibleForReplay(current, backfill) || !ActivityEventsCompatibleForReplay(backfill, current) {
+		t.Fatal("current and backfill replay should be compatible")
+	}
+	drift := backfill
+	drift.ResultingState = "failed"
+	drift.SnapshotDigest = activitySnapshotDigest(drift)
+	if ActivityEventsCompatibleForReplay(current, drift) {
+		t.Fatal("semantic drift was accepted as compatible replay")
+	}
+	runtime := backfill
+	runtime.Coverage.IngestionClass = ActivityIngestionRuntime
+	runtime.SnapshotDigest = activitySnapshotDigest(runtime)
+	if ActivityEventsCompatibleForReplay(current, runtime) {
+		t.Fatal("runtime ingestion was accepted as compatible backfill")
+	}
+}
+
 func TestActivityClassificationsAndCoverageAreClosed(t *testing.T) {
 	if got := ActivityCoveragePrecedence(ActivityCoverageComplete, ActivityCoverageBackfilling, ActivityCoverageDegraded); got != ActivityCoverageDegraded {
 		t.Fatalf("precedence=%s", got)

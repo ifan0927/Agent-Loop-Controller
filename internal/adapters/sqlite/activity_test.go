@@ -69,7 +69,6 @@ func TestActivityMigrationIsSchemaOnlyAndBackfillIsBoundedRestartSafe(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
 	var events int
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM activity_events`).Scan(&events); err != nil || events != 0 {
 		t.Fatalf("events=%d err=%v", events, err)
@@ -88,12 +87,94 @@ func TestActivityMigrationIsSchemaOnlyAndBackfillIsBoundedRestartSafe(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer store.Close()
 	result, err = store.BackfillActivityBatch(context.Background(), 1, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM activity_events WHERE category='run'`).Scan(&events); err != nil || events != 1 {
 		t.Fatalf("replayed events=%d err=%v", events, err)
+	}
+}
+
+func TestActivityV42MigrationReopensCompatibleConflictAndIntegrityConverges(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "controller.db")
+	legacy, err := openWithSupportedSchema(path, 41)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyAdmission, err := configureAdmissionTestStore(legacy, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := strings.Repeat("d", 64)
+	if _, err := legacyAdmission.db.Exec(`UPDATE activity_backfill_progress SET status='complete',updated_at=?`, nowText()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacyAdmission.db.Exec(`UPDATE activity_backfill_progress SET cursor_sequence=7,status='conflict',indexed_through=?,evidence_digest=?,reason_code='immutable_source_conflict',updated_at=? WHERE source_kind='run_transition'`, "2026-08-28T03:00:00Z", evidence, nowText()); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cursor int64
+	var status, indexedThrough, retainedEvidence, reason string
+	if err := store.db.QueryRow(`SELECT cursor_sequence,status,indexed_through,evidence_digest,reason_code FROM activity_backfill_progress WHERE source_kind='run_transition'`).Scan(&cursor, &status, &indexedThrough, &retainedEvidence, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if cursor != 7 || status != "pending" || indexedThrough != "2026-08-28T03:00:00Z" || retainedEvidence != evidence || reason != "immutable_source_conflict" {
+		t.Fatalf("cursor=%d status=%s indexed=%s evidence=%s reason=%s", cursor, status, indexedThrough, retainedEvidence, reason)
+	}
+	result, err := store.BackfillActivityBatch(context.Background(), 25, time.Date(2026, 8, 28, 4, 0, 0, 0, time.UTC))
+	if err != nil || result.SourceKind != "run_transition" || !result.Complete || result.Conflict {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	completeIntegrityActivityBackfill(t, store, time.Date(2026, 8, 28, 4, 1, 0, 0, time.UTC))
+	publishIntegrityObservation(t, store, time.Date(2026, 8, 28, 4, 2, 0, 0, time.UTC))
+	service, requester := integrityQueryService(t, store)
+	summary, err := service.Summary(context.Background(), requester)
+	if err != nil || summary.Readiness != application.IntegrityReady {
+		t.Fatalf("summary=%+v err=%v", summary, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.db.QueryRow(`SELECT status,evidence_digest,reason_code FROM activity_backfill_progress WHERE source_kind='run_transition'`).Scan(&status, &retainedEvidence, &reason); err != nil || status != "complete" || retainedEvidence != "" || reason != "" {
+		t.Fatalf("restart status=%s evidence=%s reason=%s err=%v", status, retainedEvidence, reason, err)
+	}
+}
+
+func TestActivityV42MigrationDoesNotReopenUnrelatedConflict(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "controller.db")
+	legacy, err := openWithSupportedSchema(path, 41)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.db.Exec(`UPDATE activity_backfill_progress SET cursor_sequence=3,status='conflict',evidence_digest=?,reason_code='immutable_source_conflict',updated_at=? WHERE source_kind='configuration'`, strings.Repeat("e", 64), nowText()); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var status string
+	var cursor int64
+	if err := store.db.QueryRow(`SELECT cursor_sequence,status FROM activity_backfill_progress WHERE source_kind='configuration'`).Scan(&cursor, &status); err != nil || cursor != 3 || status != "conflict" {
+		t.Fatalf("cursor=%d status=%s err=%v", cursor, status, err)
 	}
 }
 
@@ -125,6 +206,83 @@ func TestActivityReplayConflictAndCorruptDetailFailClosed(t *testing.T) {
 	scopes, _ := authorizer.ControllerScopes(configured)
 	if _, _, err := store.GetActivity(context.Background(), event.EventID, scopes); err == nil || errors.Is(err, application.ErrActivityNotFound) {
 		t.Fatalf("corruption error=%v", err)
+	}
+}
+
+func TestActivityCurrentAndBackfillInterleavingPreservesFirstSnapshot(t *testing.T) {
+	now := time.Date(2026, 8, 28, 2, 0, 0, 0, time.UTC)
+	digestA, digestB, digestC := strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64)
+	type eventPair struct {
+		current  application.ActivityEvent
+		backfill application.ActivityEvent
+	}
+	paired := func(build func(application.ActivityIngestionClass) application.ActivityEvent) eventPair {
+		return eventPair{current: build(application.ActivityIngestionCurrent), backfill: build(application.ActivityIngestionBackfill)}
+	}
+	onboarding := func(ingestion application.ActivityIngestionClass) application.ActivityEvent {
+		event, valid := newOnboardingActivityEvent("onboarding-1", domain.OnboardingStepSettled, 10, application.OperationOutcomeSucceeded, "ready", digestA, now, digestB, "", ingestion)
+		if !valid {
+			t.Fatal("onboarding fixture is invalid")
+		}
+		return event
+	}
+	tests := map[string]eventPair{
+		"run transition": paired(func(ingestion application.ActivityIngestionClass) application.ActivityEvent {
+			return newRunTransitionActivityEvent("run-1", 2, "received", "admitting", "admit", "authority", digestA[:40], now, digestB, "", ingestion)
+		}),
+		"repository readiness": paired(func(ingestion application.ActivityIngestionClass) application.ActivityEvent {
+			return newRepositoryReadinessActivityEvent(application.RepositoryReadinessSnapshot{SnapshotID: "snapshot-1", Repository: "owner/repo", RepositoryBindingDigest: digestB, LifecycleVersion: 3, Status: domain.RepositoryReady, ReasonCode: "ready", SnapshotDigest: digestC, ObservedAt: now.Add(-time.Minute), PublishedAt: now}, "", ingestion)
+		}),
+		"onboarding": paired(onboarding),
+		"operator attention": paired(func(ingestion application.ActivityIngestionClass) application.ActivityEvent {
+			return newOperatorAttentionActivityEvent("attention-1", digestA, "manual_intervention", digestC, now, now.Add(time.Second), application.ScopeController, "controller", digestB, ingestion)
+		}),
+		"settled operation": paired(func(ingestion application.ActivityIngestionClass) application.ActivityEvent {
+			sourceDigest := digestActivitySource(strings.Join([]string{"operation-1", "observed", "succeeded", digestA, digestC}, "\x00"))
+			return application.NewActivityEvent(application.ActivityEventInput{SourceKind: "operation_receipt", SourceIdentity: "operation-1", SourceEvidenceDigest: sourceDigest, Category: application.ActivityOperation, EventKind: application.ActivityOperationSettled, Actor: application.ActivityActorConfiguredOperator, Scope: application.ScopeController, TargetID: "controller-integrity", TargetBindingDigest: digestB, ReasonCode: application.ActivityReasonSucceeded, ResultingState: "ready", ResultingVersion: 1, OccurredAt: now, SettledAt: &now, RelatedResources: []application.ActivityRelatedResource{{Kind: application.ScopeController, ID: "controller-integrity"}}, EvidenceDigests: []string{digestA, digestC}, Coverage: application.ActivityEventCoverage{IngestionClass: ingestion, LegacyReconstructable: true}})
+		}),
+	}
+	for name, pair := range tests {
+		for _, order := range []struct {
+			name          string
+			first, replay application.ActivityEvent
+		}{{name: "live-first", first: pair.current, replay: pair.backfill}, {name: "backfill-first", first: pair.backfill, replay: pair.current}} {
+			t.Run(name+"/"+order.name, func(t *testing.T) {
+				store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer store.Close()
+				persisted, created, err := store.AppendActivityEvent(context.Background(), order.first)
+				if err != nil || !created {
+					t.Fatalf("initial append created=%t err=%v", created, err)
+				}
+				replayed, created, err := store.AppendActivityEvent(context.Background(), order.replay)
+				if err != nil || created {
+					t.Fatalf("replay created=%t err=%v", created, err)
+				}
+				if replayed.SnapshotDigest != persisted.SnapshotDigest || replayed.Coverage != persisted.Coverage || replayed.IngestionSequence != persisted.IngestionSequence {
+					t.Fatalf("persisted=%+v replayed=%+v", persisted, replayed)
+				}
+			})
+		}
+	}
+}
+
+func TestActivityCurrentBackfillSemanticDriftStillConflicts(t *testing.T) {
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 8, 28, 3, 0, 0, 0, time.UTC)
+	current := newRunTransitionActivityEvent("run-drift", 2, "received", "admitting", "admit", "authority", strings.Repeat("a", 40), now, strings.Repeat("b", 64), "", application.ActivityIngestionCurrent)
+	if _, _, err := store.AppendActivityEvent(context.Background(), current); err != nil {
+		t.Fatal(err)
+	}
+	backfill := newRunTransitionActivityEvent("run-drift", 2, "received", "failed", "admit", "authority", strings.Repeat("a", 40), now, strings.Repeat("b", 64), "", application.ActivityIngestionBackfill)
+	if _, _, err := store.AppendActivityEvent(context.Background(), backfill); !errors.Is(err, application.ErrActivityConflict) {
+		t.Fatalf("semantic drift error=%v", err)
 	}
 }
 

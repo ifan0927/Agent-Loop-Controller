@@ -92,7 +92,7 @@ func writeFixtureFile(t *testing.T, path, contents string, mode os.FileMode) {
 }
 
 func fixtureBuild(revision string) buildidentity.Info {
-	return buildidentity.Info{ProductVersion: "0.1.0-dev", BuildIdentity: "sha256:" + strings.Repeat("a", 64), VCSRevision: revision, VCSTime: "2026-08-28T00:00:00Z", SupportedControllerSchemaVersion: 41}
+	return buildidentity.Info{ProductVersion: "0.1.0-dev", BuildIdentity: "sha256:" + strings.Repeat("a", 64), VCSRevision: revision, VCSTime: "2026-08-28T00:00:00Z", SupportedControllerSchemaVersion: 42}
 }
 
 func binaryScript(build buildidentity.Info) string {
@@ -108,7 +108,7 @@ func createFixtureDatabase(t *testing.T, path string, completeReadiness bool) da
 	}
 	statements := []string{
 		`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY)`,
-		`INSERT INTO schema_migrations(version) VALUES(41)`,
+		`INSERT INTO schema_migrations(version) VALUES(42)`,
 	}
 	if completeReadiness {
 		statements = append(statements,
@@ -641,7 +641,7 @@ func TestCleanupResumesAfterJournalRemoval(t *testing.T) {
 	if err := writeJournal(bundle, j, manager.uid); err != nil {
 		t.Fatal(err)
 	}
-	current := currentInstallation{SchemaVersion: 1, UpgradeID: j.UpgradeID, Supervisor: j.Supervisor, BinaryDigest: j.Candidate.Digest, BuildIdentity: j.Candidate.Build.BuildIdentity, VCSRevision: j.Revision, DatabaseSchema: 41, VerifiedAt: now}
+	current := currentInstallation{SchemaVersion: 1, UpgradeID: j.UpgradeID, Supervisor: j.Supervisor, BinaryDigest: j.Candidate.Digest, BuildIdentity: j.Candidate.Build.BuildIdentity, VCSRevision: j.Revision, DatabaseSchema: 42, VerifiedAt: now}
 	if err := writePrivateJSON(filepath.Join(manager.controllerRoot(), "current-installation.json"), current, manager.uid); err != nil {
 		t.Fatal(err)
 	}

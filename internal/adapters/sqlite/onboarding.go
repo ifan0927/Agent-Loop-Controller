@@ -423,18 +423,10 @@ func (s *Store) SettleOnboardingStep(ctx context.Context, input application.Onbo
 	if binding == "" {
 		binding = current.RequestDigest
 	}
-	eventKind, eventReason := application.ActivityOnboardingMilestone, application.ActivityReasonMilestone
-	if nextStatus == domain.OnboardingReadyDisabled {
-		eventKind, eventReason = application.ActivityOnboardingCompleted, application.ActivityReasonCompleted
-	} else if nextStatus == domain.OnboardingConflict {
-		eventKind, eventReason = application.ActivityOnboardingConflict, application.ActivityReasonConflict
+	event, validActivity := newOnboardingActivityEvent(input.OnboardingID, input.Step, int64(order), input.Observation.Outcome, input.Observation.ReasonCode, input.Observation.EvidenceDigest, input.ObservedAt, binding, current.OperationID, application.ActivityIngestionCurrent)
+	if !validActivity || event.ResultingState != string(nextStatus) || event.ResultingVersion != int64(stepIndex) {
+		return application.Onboarding{}, errors.New("onboarding activity classification is invalid")
 	}
-	operationIDs := []string{}
-	if nextStatus == domain.OnboardingReadyDisabled || nextStatus == domain.OnboardingConflict {
-		operationIDs = compactStrings(current.OperationID)
-	}
-	sourceDigest := digestActivitySource(strings.Join([]string{input.OnboardingID, string(input.Step), string(input.Observation.Outcome), input.Observation.ReasonCode, input.Observation.EvidenceDigest, formatTime(input.ObservedAt)}, "\x00"))
-	event := application.NewActivityEvent(application.ActivityEventInput{SourceKind: "onboarding", SourceIdentity: input.OnboardingID + ":" + string(input.Step), SourceEvidenceDigest: sourceDigest, Category: application.ActivityOnboarding, EventKind: eventKind, Actor: application.ActivityActorController, Scope: application.ScopeOnboarding, TargetID: input.OnboardingID, TargetBindingDigest: binding, ReasonCode: eventReason, ResultingState: string(nextStatus), ResultingVersion: int64(stepIndex), OccurredAt: input.ObservedAt, RelatedResources: []application.ActivityRelatedResource{{Kind: application.ScopeOnboarding, ID: input.OnboardingID}}, OperationIDs: operationIDs, EvidenceDigests: compactDigests(input.Observation.EvidenceDigest, sourceDigest), Coverage: application.ActivityEventCoverage{IngestionClass: application.ActivityIngestionCurrent, LegacyReconstructable: true}})
 	if available, err := activitySchemaAvailableTx(ctx, tx); err != nil {
 		return application.Onboarding{}, err
 	} else if available {

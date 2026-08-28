@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
 const defaultActivityBackfillBatch = 25
@@ -96,8 +97,7 @@ func backfillActivitySourceTx(ctx context.Context, tx *sql.Tx, source string, cu
 			if scanErr := rows.Scan(&rowID, &runID, &sequence, &from, &to, &reason, &evidence, &head, &created, &binding, &operationID); scanErr != nil {
 				return last, indexedThrough, false, "", scanErr
 			}
-			sourceDigest := digestActivitySource(strings.Join([]string{runID, strconv.FormatInt(sequence, 10), from, to, reason, evidence, head, created}, "\x00"))
-			event := application.NewActivityEvent(application.ActivityEventInput{SourceKind: source, SourceIdentity: runID + ":" + strconv.FormatInt(sequence, 10), SourceEvidenceDigest: sourceDigest, Category: application.ActivityRun, EventKind: application.ActivityRunTransition, Actor: application.ActivityActorController, Scope: application.ScopeRun, TargetID: runID, TargetBindingDigest: binding, ReasonCode: application.ActivityReasonStateChanged, PriorState: from, ResultingState: to, PriorVersion: max(sequence-1, 0), ResultingVersion: sequence, OccurredAt: parseTime(created), RelatedResources: []application.ActivityRelatedResource{{Kind: application.ScopeRun, ID: runID}}, OperationIDs: compactStrings(operationID), EvidenceDigests: []string{sourceDigest}, Coverage: application.ActivityEventCoverage{IngestionClass: application.ActivityIngestionBackfill, LegacyReconstructable: true}})
+			event := newRunTransitionActivityEvent(runID, sequence, from, to, reason, evidence, head, parseTime(created), binding, operationID, application.ActivityIngestionBackfill)
 			if !appendEvent(rowID, event) {
 				break
 			}
@@ -158,8 +158,8 @@ func backfillActivitySourceTx(ctx context.Context, tx *sql.Tx, source string, cu
 					return last, indexedThrough, false, "", lookupErr
 				}
 			}
-			sourceDigest := digestActivitySource(strings.Join([]string{eventKey, payload, reason, evidence, occurred, observed}, "\x00"))
-			event := application.NewActivityEvent(application.ActivityEventInput{SourceKind: source, SourceIdentity: eventKey, SourceEvidenceDigest: sourceDigest, Category: application.ActivityAttention, EventKind: application.ActivityAttentionOpened, Actor: application.ActivityActorController, Scope: scope, TargetID: target, TargetBindingDigest: binding, ReasonCode: application.ActivityReasonOpened, OccurredAt: parseTime(occurred), ObservedAt: parseOptionalTime(observed), RelatedResources: []application.ActivityRelatedResource{{Kind: scope, ID: target}}, EvidenceDigests: compactDigests(evidence, sourceDigest), Coverage: application.ActivityEventCoverage{IngestionClass: application.ActivityIngestionBackfill, LegacyReconstructable: true}})
+			observedAt := parseTime(observed)
+			event := newOperatorAttentionActivityEvent(eventKey, payload, reason, evidence, parseTime(occurred), observedAt, scope, target, binding, application.ActivityIngestionBackfill)
 			if !appendEvent(rowID, event) {
 				break
 			}
@@ -179,8 +179,7 @@ func backfillActivitySourceTx(ctx context.Context, tx *sql.Tx, source string, cu
 			if scanErr := rows.Scan(&rowID, &id, &repository, &binding, &version, &status, &reason, &snapshot, &observed, &published, &operationID); scanErr != nil {
 				return last, indexedThrough, false, "", scanErr
 			}
-			sourceDigest := digestActivitySource(strings.Join([]string{id, status, reason, snapshot, published}, "\x00"))
-			event := application.NewActivityEvent(application.ActivityEventInput{SourceKind: source, SourceIdentity: id, SourceEvidenceDigest: sourceDigest, Category: application.ActivityRepository, EventKind: application.ActivityRepositoryGateChange, Actor: application.ActivityActorController, Scope: application.ScopeRepository, TargetID: repository, TargetBindingDigest: binding, ReasonCode: application.ActivityReasonReadinessChanged, ResultingState: status, ResultingVersion: version, OccurredAt: parseTime(published), ObservedAt: parseOptionalTime(observed), RelatedResources: []application.ActivityRelatedResource{{Kind: application.ScopeRepository, ID: repository}}, OperationIDs: compactStrings(operationID), EvidenceDigests: compactDigests(snapshot, sourceDigest), Coverage: application.ActivityEventCoverage{IngestionClass: application.ActivityIngestionBackfill, LegacyReconstructable: true}})
+			event := newRepositoryReadinessActivityEvent(application.RepositoryReadinessSnapshot{SnapshotID: id, Repository: repository, RepositoryBindingDigest: binding, LifecycleVersion: version, Status: domain.RepositoryReadinessStatus(status), ReasonCode: reason, SnapshotDigest: snapshot, ObservedAt: parseTime(observed), PublishedAt: parseTime(published)}, operationID, application.ActivityIngestionBackfill)
 			if !appendEvent(rowID, event) {
 				break
 			}
@@ -203,18 +202,10 @@ func backfillActivitySourceTx(ctx context.Context, tx *sql.Tx, source string, cu
 			if binding == "" {
 				binding = requestDigest
 			}
-			kind, eventReason := application.ActivityOnboardingMilestone, application.ActivityReasonMilestone
-			if step == "settled" && outcome == "succeeded" {
-				kind, eventReason = application.ActivityOnboardingCompleted, application.ActivityReasonCompleted
-			} else if outcome == "conflict" {
-				kind, eventReason = application.ActivityOnboardingConflict, application.ActivityReasonConflict
+			event, valid := newOnboardingActivityEvent(id, domain.OnboardingStep(step), order, application.OperationOutcome(outcome), reason, evidence, parseTime(observed), binding, operationID, application.ActivityIngestionBackfill)
+			if !valid {
+				return last, indexedThrough, false, "", errors.New("stored onboarding activity classification is invalid")
 			}
-			sourceDigest := digestActivitySource(strings.Join([]string{id, step, outcome, reason, evidence, observed}, "\x00"))
-			operations := []string(nil)
-			if step == "settled" || outcome == "conflict" {
-				operations = compactStrings(operationID)
-			}
-			event := application.NewActivityEvent(application.ActivityEventInput{SourceKind: source, SourceIdentity: id + ":" + step, SourceEvidenceDigest: sourceDigest, Category: application.ActivityOnboarding, EventKind: kind, Actor: application.ActivityActorController, Scope: application.ScopeOnboarding, TargetID: id, TargetBindingDigest: binding, ReasonCode: eventReason, ResultingState: step + ":" + outcome, ResultingVersion: order, OccurredAt: parseTime(observed), RelatedResources: []application.ActivityRelatedResource{{Kind: application.ScopeOnboarding, ID: id}}, OperationIDs: operations, EvidenceDigests: compactDigests(evidence, sourceDigest), Coverage: application.ActivityEventCoverage{IngestionClass: application.ActivityIngestionBackfill, LegacyReconstructable: true}})
 			if !appendEvent(rowID, event) {
 				break
 			}
