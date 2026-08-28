@@ -17,7 +17,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/bootstrap"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/buildidentity"
 )
@@ -30,6 +29,7 @@ type Manager struct {
 	now                   func() time.Time
 	runner                commandRunner
 	fail                  func(string) error
+	buildCandidate        func(context.Context, string, int) (preparedCandidate, error)
 }
 
 func (m *Manager) failAt(point string) error {
@@ -161,39 +161,13 @@ func (m *Manager) Prepare(ctx context.Context, request PrepareRequest) (result R
 		if err != nil {
 			return err
 		}
-		sourceRoot, err := resolveCandidateSource(ctx, m.runner, request.Revision)
+		prepared, err := m.prepareVerifiedCandidate(ctx, request.Revision, database.SchemaVersion)
 		if err != nil {
 			return err
 		}
-		prepareRoot, err := os.MkdirTemp(m.upgradeRoot(), ".prepare-")
-		if err != nil {
-			return errors.New("candidate workspace is unavailable")
-		}
-		defer os.RemoveAll(prepareRoot)
-		if err := os.Chmod(prepareRoot, 0o700); err != nil {
-			return errors.New("candidate workspace is unavailable")
-		}
-		candidateRepository := filepath.Join(prepareRoot, "repository")
-		if err := cloneCandidateRepository(ctx, m.runner, sourceRoot, candidateRepository, request.Revision); err != nil {
-			return err
-		}
-		gate, err := m.runner.Run(ctx, candidateRepository, filepath.Join(candidateRepository, "scripts", "verify-controller.sh"))
-		if err != nil || gate.ExitCode != 0 {
-			return errors.New("candidate verification gate failed")
-		}
-		candidatePath := filepath.Join(prepareRoot, "agentctl")
-		built, err := m.runner.Run(ctx, candidateRepository, "go", "build", "-trimpath", "-o", candidatePath, "./cmd/agentctl")
-		if err != nil || built.ExitCode != 0 {
-			return errors.New("candidate build failed")
-		}
-		if clean, err := gitCheckoutClean(ctx, m.runner, candidateRepository); err != nil || !clean {
-			return errors.New("candidate build modified its exact repository")
-		}
-		candidate, err := inspectBinary(ctx, m.runner, candidatePath, m.uid)
-		if err != nil || !candidateCompatible(candidate, request.Revision, database.SchemaVersion) {
-			return errors.New("candidate build identity is unverifiable or incompatible")
-		}
-		id := "upgrade-" + strings.ReplaceAll(uuid.NewString(), "-", "")
+		defer prepared.Cleanup()
+		candidate, candidatePath := prepared.Evidence, prepared.Path
+		id := newUpgradeID()
 		bundle := m.bundlePath(id)
 		if err := os.Mkdir(bundle, 0o700); err != nil {
 			return errors.New("private upgrade bundle could not be created")
@@ -222,9 +196,7 @@ func (m *Manager) Prepare(ctx context.Context, request PrepareRequest) (result R
 		if err := writeJournal(bundle, j, m.uid); err != nil {
 			return err
 		}
-		if err := writePrivateJSON(m.activePath(), struct {
-			UpgradeID string `json:"upgrade_id"`
-		}{id}, m.uid); err != nil {
+		if err := m.writeActiveUpgrade(id); err != nil {
 			return err
 		}
 		bundleCreated = false
@@ -236,6 +208,57 @@ func (m *Manager) Prepare(ctx context.Context, request PrepareRequest) (result R
 		return Result{}, err
 	}
 	return result, nil
+}
+
+type preparedCandidate struct {
+	Evidence binaryEvidence
+	Path     string
+	Cleanup  func()
+}
+
+func (m *Manager) prepareVerifiedCandidate(ctx context.Context, revision string, databaseSchema int) (preparedCandidate, error) {
+	if m.buildCandidate != nil {
+		return m.buildCandidate(ctx, revision, databaseSchema)
+	}
+	sourceRoot, err := resolveCandidateSource(ctx, m.runner, revision)
+	if err != nil {
+		return preparedCandidate{}, err
+	}
+	prepareRoot, err := os.MkdirTemp(m.upgradeRoot(), ".prepare-")
+	if err != nil {
+		return preparedCandidate{}, errors.New("candidate workspace is unavailable")
+	}
+	cleanup := func() { _ = os.RemoveAll(prepareRoot) }
+	if err := os.Chmod(prepareRoot, 0o700); err != nil {
+		cleanup()
+		return preparedCandidate{}, errors.New("candidate workspace is unavailable")
+	}
+	candidateRepository := filepath.Join(prepareRoot, "repository")
+	if err := cloneCandidateRepository(ctx, m.runner, sourceRoot, candidateRepository, revision); err != nil {
+		cleanup()
+		return preparedCandidate{}, err
+	}
+	gate, err := m.runner.Run(ctx, candidateRepository, filepath.Join(candidateRepository, "scripts", "verify-controller.sh"))
+	if err != nil || gate.ExitCode != 0 {
+		cleanup()
+		return preparedCandidate{}, errors.New("candidate verification gate failed")
+	}
+	candidatePath := filepath.Join(prepareRoot, "agentctl")
+	built, err := m.runner.Run(ctx, candidateRepository, "go", "build", "-trimpath", "-o", candidatePath, "./cmd/agentctl")
+	if err != nil || built.ExitCode != 0 {
+		cleanup()
+		return preparedCandidate{}, errors.New("candidate build failed")
+	}
+	if clean, err := gitCheckoutClean(ctx, m.runner, candidateRepository); err != nil || !clean {
+		cleanup()
+		return preparedCandidate{}, errors.New("candidate build modified its exact repository")
+	}
+	candidate, err := inspectBinary(ctx, m.runner, candidatePath, m.uid)
+	if err != nil || !candidateCompatible(candidate, revision, databaseSchema) {
+		cleanup()
+		return preparedCandidate{}, errors.New("candidate build identity is unverifiable or incompatible")
+	}
+	return preparedCandidate{Evidence: candidate, Path: candidatePath, Cleanup: cleanup}, nil
 }
 
 func resolveCandidateSource(ctx context.Context, runner commandRunner, revision string) (string, error) {
@@ -380,7 +403,7 @@ func canonicalAbsolute(path string) bool {
 }
 
 func resultFor(j journal, state, reason, next string) Result {
-	result := Result{UpgradeID: j.UpgradeID, State: state, Reason: reason, NextAction: next, Supervisor: j.Supervisor, CandidateBuild: j.Candidate.Build.BuildIdentity, BootstrapIntent: j.BootstrapIntentAt != nil, UpgradeHealth: "pending", ControllerReadiness: "unknown"}
+	result := Result{UpgradeID: j.UpgradeID, State: state, Reason: reason, NextAction: next, Supervisor: j.Supervisor, CandidateBuild: j.Candidate.Build.BuildIdentity, PredecessorUpgradeID: j.PredecessorID, SuccessorUpgradeID: j.SuccessorID, BootstrapIntent: j.BootstrapIntentAt != nil, UpgradeHealth: "pending", ControllerReadiness: "unknown"}
 	switch state {
 	case "healthy", "rollback_healthy", "observed_healthy", "cleaned":
 		result.UpgradeHealth, result.ControllerReadiness = "healthy", "ready"
@@ -390,11 +413,22 @@ func resultFor(j journal, state, reason, next string) Result {
 		}
 	case "attention":
 		result.UpgradeHealth, result.ControllerReadiness = "failed", "conflict"
-		if strings.HasPrefix(reason, "integrity_") || reason == "configuration_not_converged" {
+		if eligibleSuccessorReason(reason) {
 			result.UpgradeHealth, result.ControllerReadiness = "healthy", "not_ready"
 		}
+	case "superseded":
+		result.UpgradeHealth, result.ControllerReadiness = "healthy", "not_ready"
 	}
 	return result
+}
+
+func eligibleSuccessorReason(reason string) bool {
+	switch reason {
+	case "configuration_not_converged", "integrity_not_ready", "integrity_conflict":
+		return true
+	default:
+		return false
+	}
 }
 
 func digestFile(path string) (string, error) {

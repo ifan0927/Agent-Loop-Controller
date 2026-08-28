@@ -12,9 +12,34 @@ import (
 
 func (m *Manager) Status(ctx context.Context, id string) (result Result, finalErr error) {
 	err := m.withActiveLock(id, func() error {
-		j, bundle, err := m.loadJournal(id)
+		j, bundle, err := m.loadBundleJournal(id)
 		if err != nil {
 			return err
+		}
+		if j.Phase == "superseded" && !exists(m.activePath()) && !exists(m.bundlePath(j.SuccessorID)) {
+			result = resultFor(j, "superseded", "verified_successor_linked", "none")
+			return nil
+		}
+		active, err := m.readActiveUpgrade()
+		if err != nil {
+			return err
+		}
+		if j.Phase == "superseded" {
+			next := "none"
+			if active.UpgradeID == j.UpgradeID {
+				next = "successor-prepare"
+			} else if active.UpgradeID == j.SuccessorID {
+				next = "status_successor"
+			}
+			result = resultFor(j, "superseded", "verified_successor_linked", next)
+			return nil
+		}
+		if active.UpgradeID != id {
+			return errors.New("upgrade is not the active managed bundle")
+		}
+		if j.Phase == "successor_prepare_intent" {
+			result = resultFor(j, "successor_preparation_interrupted", "successor_prepare_intent_durable", "successor-prepare")
+			return nil
 		}
 		result = m.reconcileStatus(ctx, j, bundle)
 		return nil
@@ -148,7 +173,10 @@ func (m *Manager) postIntentStatus(ctx context.Context, j journal) Result {
 	}
 }
 
-func (m *Manager) Replace(ctx context.Context, id string) (result Result, finalErr error) {
+func (m *Manager) Replace(ctx context.Context, id string, fullBackupConfirmed bool) (result Result, finalErr error) {
+	if !fullBackupConfirmed {
+		return Result{}, errors.New("replacement requires a newly confirmed encrypted full backup")
+	}
 	err := m.withActiveLock(id, func() error {
 		j, bundle, err := m.loadJournal(id)
 		if err != nil {
