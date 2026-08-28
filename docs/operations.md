@@ -2969,6 +2969,56 @@ and revision; `status --upgrade-id "$FAILED_UPGRADE_ID"` reports whether the
 durable successor intent or terminal link exists. Response loss never
 authorizes another successor.
 
+If an operator-confirmed local file relocation replaced the Controller database
+inode at the same canonical path before an ordinary successor could be
+prepared, first boot out the selected supervisor and prove the selected,
+opposite, and legacy supervisors are absent. Do not edit the private locator,
+SQLite, or the predecessor journal. Create a new encrypted full backup of the
+Controller root and every external credential file, then run the read-only
+preview:
+
+```sh
+FAILED_UPGRADE_ID="$UPGRADE_ID"
+SUCCESSOR_REVISION="$(git rev-parse HEAD)" # intended different full clean commit
+
+./scripts/local-agentctl-upgrade.sh successor-recovery-preview \
+  --upgrade-id "$FAILED_UPGRADE_ID" \
+  --revision "$SUCCESSOR_REVISION"
+```
+
+The preview verifies the unchanged canonical binding, exact installed
+predecessor, replacement database safety, supported schema, SQLite and
+foreign-key integrity, configuration authority/readiness, stable database/WAL
+content, supervisor absence, and successor revision. Its JSON is sanitized and
+returns a `preview_digest`; it never returns paths, device/inode values, locator
+bytes, configuration digests, database contents, or credentials. Preview does
+not migrate SQLite, change the locator, create a successor, start a worker, or
+move the active pointer.
+
+After independently confirming both the relocation and encrypted full backup,
+use the exact preview digest:
+
+```sh
+./scripts/local-agentctl-upgrade.sh successor-recover-prepare \
+  --upgrade-id "$FAILED_UPGRADE_ID" \
+  --revision "$SUCCESSOR_REVISION" \
+  --preview-digest "$PREVIEW_DIGEST" \
+  --database-relocation-confirmed \
+  --full-backup-confirmed
+
+UPGRADE_ID="$SUCCESSOR_UPGRADE_ID" # returned by the command
+```
+
+Prepare reruns every preview check, verifies the successor through the normal
+independent-clone gate, durably records recovery intent, atomically rebinds only
+the exact locator database identity, and activates one verified successor.
+Identical retries resume the same recovery and successor after response loss.
+Any database/WAL content, schema, binding, configuration, binary, supervisor,
+preview, locator, or third-identity drift fails closed. `status` reports
+`successor-recover-prepare` while recovery or recovered successor preparation
+is interrupted. Never substitute a new preview after durable recovery intent;
+resume with the same predecessor ID, revision, digest, and confirmations.
+
 After successor preparation, boot out the selected supervisor, create a new
 encrypted full backup of the Controller root and external credentials, and use
 the normal guarded lifecycle:
@@ -3053,6 +3103,7 @@ topology:
 | LaunchDaemon not running | Run LaunchDaemon `status`, verify the root-owned exact plist and worker-owned assets, then bootstrap or kickstart only when the sanitized next action permits it. |
 | Supervisor conflict | Boot out and prove absence of the current service, preserve its plist under a non-`.plist` rollback name, and retry the selected supervisor preflight. Never load both. |
 | Worker already running | Inspect both launchd domains and the process-lifetime lock owner. Do not remove the lock file or bypass the scheduler lease while a worker may still be alive. |
+| Managed upgrade database identity changed after an authorized relocation | Keep every supervisor absent and run `successor-recovery-preview` for the failed post-bootstrap upgrade and intended successor revision. After a new encrypted full backup, use the exact digest with `successor-recover-prepare` and both confirmations. Never edit the locator, SQLite, journal, inode evidence, or active pointer manually; binding, content, schema, supervisor, or third-identity drift must remain fail-closed. |
 
 When evidence remains unclear, stop external writes and preserve sanitized
 artifacts for review. The correct fallback is `manual_intervention`, not manual

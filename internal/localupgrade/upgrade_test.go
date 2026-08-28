@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	configurationadapter "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/configuration"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/buildidentity"
 	_ "modernc.org/sqlite"
 )
@@ -65,7 +66,10 @@ func (r fixtureRunner) Run(ctx context.Context, directory, name string, args ...
 
 func newFixtureManager(t *testing.T, runner commandRunner) *Manager {
 	t.Helper()
-	home := t.TempDir()
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
 	manager := &Manager{home: home, launchDaemonDirectory: filepath.Join(home, "LaunchDaemons"), uid: os.Getuid(), user: "fixture-worker", now: func() time.Time { return now }, runner: runner}
 	if err := ensurePrivateDirectory(manager.controllerRoot(), manager.uid); err != nil {
@@ -811,6 +815,317 @@ func seedEligibleSuccessor(t *testing.T) (*Manager, journal, string, string, *in
 		return preparedCandidate{Evidence: evidence, Path: path, Cleanup: func() { _ = os.Remove(path) }}, nil
 	}
 	return manager, predecessor, predecessorBundle, successorRevision, &buildCount
+}
+
+func seedAuthorizedDatabaseRelocation(t *testing.T) (*Manager, journal, string, string, databaseEvidence) {
+	t.Helper()
+	manager, predecessor, predecessorBundle, revision, _ := seedEligibleSuccessor(t)
+	runner := manager.runner.(successorRunner)
+	runner.fixtureRunner = fixtureRunner{}
+	manager.runner = runner
+	workerLock, err := os.OpenFile(filepath.Join(filepath.Dir(predecessor.DatabasePath), "worker.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil || workerLock.Close() != nil {
+		t.Fatal("fixture worker lock is unavailable")
+	}
+
+	db, err := sql.Open("sqlite", sqliteURI(predecessor.DatabasePath, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`ALTER TABLE configuration_authority ADD COLUMN canonical_config_path TEXT`,
+		`ALTER TABLE configuration_authority ADD COLUMN database_path TEXT`,
+		`ALTER TABLE configuration_authority ADD COLUMN authority_version INTEGER`,
+		`UPDATE configuration_authority SET canonical_config_path='` + predecessor.ConfigPath + `',database_path='` + predecessor.DatabasePath + `',authority_version=1 WHERE authority_id=1`,
+		`CREATE TABLE configuration_apply_intents(status TEXT NOT NULL)`,
+		`CREATE TABLE configuration_recovery_intents(status TEXT NOT NULL)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	files, err := configurationadapter.NewFiles(predecessor.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := files.BindDatabaseIdentity(predecessor.DatabasePath, databaseIdentity(predecessor.Database)); err != nil {
+		t.Fatal(err)
+	}
+	if err := files.PublishLocator(predecessor.DatabasePath); err != nil {
+		t.Fatal(err)
+	}
+	replacementPath := predecessor.DatabasePath + ".relocated"
+	if _, err := createConsistentSnapshot(context.Background(), predecessor.DatabasePath, replacementPath, manager.uid, predecessor.Database); err != nil {
+		t.Fatal(err)
+	}
+	displacedPath := predecessor.DatabasePath + ".displaced"
+	if err := os.Rename(predecessor.DatabasePath, displacedPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacementPath, predecessor.DatabasePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncDirectory(filepath.Dir(predecessor.DatabasePath)); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := inspectDatabaseReadOnly(predecessor.DatabasePath, manager.uid)
+	if err != nil || replacement == predecessor.Database {
+		t.Fatalf("replacement=%+v old=%+v err=%v", replacement, predecessor.Database, err)
+	}
+	return manager, predecessor, predecessorBundle, revision, replacement
+}
+
+func TestSuccessorRecoveryPreviewAndPrepareRebindOnlyVerifiedDatabaseIdentity(t *testing.T) {
+	manager, predecessor, predecessorBundle, revision, replacement := seedAuthorizedDatabaseRelocation(t)
+	preview, err := manager.PreviewSuccessorRecovery(context.Background(), SuccessorRecoveryPreviewRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision})
+	if err != nil || preview.State != "eligible" || !validSHA256(preview.PreviewDigest) || len(preview.RequiredConfirmations) != 2 {
+		t.Fatalf("preview=%+v err=%v", preview, err)
+	}
+	rawPreview, _ := json.Marshal(preview)
+	for _, forbidden := range []string{predecessor.ConfigPath, predecessor.DatabasePath, fmt.Sprint(predecessor.Database.Inode), fmt.Sprint(replacement.Inode), predecessor.ConfigDigest} {
+		if strings.Contains(string(rawPreview), forbidden) {
+			t.Fatalf("preview exposed private evidence %q: %s", forbidden, rawPreview)
+		}
+	}
+	result, err := manager.RecoverPrepareSuccessor(context.Background(), SuccessorRecoverPrepareRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision, PreviewDigest: preview.PreviewDigest, DatabaseRelocationConfirmed: true, FullBackupConfirmed: true})
+	if err != nil || result.State != "prepared" || result.Reason != "verified_recovered_successor_activated" || result.NextAction != "replace" || !validUpgradeID(result.UpgradeID) {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	locator, found, err := configurationadapter.ReadLocator(predecessor.ConfigPath)
+	if err != nil || !found || locator.DatabaseIdentity != databaseIdentity(replacement) {
+		t.Fatalf("locator=%+v found=%t err=%v", locator, found, err)
+	}
+	persisted, _, err := manager.loadBundleJournal(predecessor.UpgradeID)
+	if err != nil || persisted.Phase != "superseded" || persisted.Database != replacement || persisted.DatabaseRecovery == nil || persisted.DatabaseRecovery.OldDatabase != predecessor.Database || persisted.DatabaseRecovery.ReplacementDatabase != replacement || persisted.DatabaseRecovery.PreviewDigest != preview.PreviewDigest || persisted.DatabaseRecovery.LocatorPublishedAt == nil {
+		t.Fatalf("predecessor=%+v err=%v", persisted, err)
+	}
+	if _, err := os.Stat(filepath.Join(predecessorBundle, "snapshot.db")); err != nil {
+		t.Fatal("failed predecessor evidence was not preserved")
+	}
+}
+
+func TestSuccessorRecoveryDurableTransitionsReplayOneSuccessor(t *testing.T) {
+	for _, point := range []string{"after_successor_recovery_intent", "after_successor_recovery_locator", "after_successor_recovery_journal", "after_successor_bundle", "after_predecessor_superseded", "after_successor_activation"} {
+		t.Run(point, func(t *testing.T) {
+			manager, predecessor, _, revision, replacement := seedAuthorizedDatabaseRelocation(t)
+			preview, err := manager.PreviewSuccessorRecovery(context.Background(), SuccessorRecoveryPreviewRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := SuccessorRecoverPrepareRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision, PreviewDigest: preview.PreviewDigest, DatabaseRelocationConfirmed: true, FullBackupConfirmed: true}
+			manager.fail = func(observed string) error {
+				if observed == point {
+					return errors.New("injected recovery interruption")
+				}
+				return nil
+			}
+			if _, err := manager.RecoverPrepareSuccessor(context.Background(), request); err == nil {
+				t.Fatal("injected recovery interruption was ignored")
+			}
+			intent, _, err := manager.loadBundleJournal(predecessor.UpgradeID)
+			if err != nil || intent.SuccessorID == "" {
+				t.Fatalf("intent=%+v err=%v", intent, err)
+			}
+			successorID := intent.SuccessorID
+			status, statusErr := manager.Status(context.Background(), predecessor.UpgradeID)
+			if statusErr != nil || status.NextAction != "successor-recover-prepare" && status.NextAction != "status_successor" {
+				t.Fatalf("status=%+v err=%v", status, statusErr)
+			}
+			manager.fail = nil
+			resumed, err := manager.RecoverPrepareSuccessor(context.Background(), request)
+			if err != nil || resumed.UpgradeID != successorID || resumed.State != "prepared" {
+				t.Fatalf("resumed=%+v expected=%s err=%v", resumed, successorID, err)
+			}
+			entries, _ := os.ReadDir(manager.upgradeRoot())
+			bundleCount := 0
+			for _, entry := range entries {
+				if entry.IsDir() && strings.HasPrefix(entry.Name(), "upgrade-") {
+					bundleCount++
+				}
+			}
+			locator, _, _ := configurationadapter.ReadLocator(predecessor.ConfigPath)
+			if bundleCount != 2 || locator.DatabaseIdentity != databaseIdentity(replacement) {
+				t.Fatalf("bundle_count=%d locator=%+v", bundleCount, locator)
+			}
+		})
+	}
+}
+
+func TestSuccessorRecoveryRejectsPreviewDriftAndThirdIdentityWithoutTransfer(t *testing.T) {
+	manager, predecessor, predecessorBundle, revision, _ := seedAuthorizedDatabaseRelocation(t)
+	preview, err := manager.PreviewSuccessorRecovery(context.Background(), SuccessorRecoveryPreviewRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(filepath.Join(predecessorBundle, "journal.json"))
+	badDigest := strings.Repeat("f", 64)
+	if _, err := manager.RecoverPrepareSuccessor(context.Background(), SuccessorRecoverPrepareRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision, PreviewDigest: badDigest, DatabaseRelocationConfirmed: true, FullBackupConfirmed: true}); err == nil || !strings.Contains(err.Error(), "preview changed") {
+		t.Fatalf("preview drift err=%v", err)
+	}
+	after, _ := os.ReadFile(filepath.Join(predecessorBundle, "journal.json"))
+	if string(before) != string(after) {
+		t.Fatal("preview drift changed managed upgrade evidence")
+	}
+	manager.fail = func(point string) error {
+		if point == "after_successor_recovery_intent" {
+			return errors.New("stop after intent")
+		}
+		return nil
+	}
+	request := SuccessorRecoverPrepareRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision, PreviewDigest: preview.PreviewDigest, DatabaseRelocationConfirmed: true, FullBackupConfirmed: true}
+	if _, err := manager.RecoverPrepareSuccessor(context.Background(), request); err == nil {
+		t.Fatal("recovery intent interruption was ignored")
+	}
+	manager.fail = nil
+	locator, _, err := configurationadapter.ReadLocator(predecessor.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := configurationadapter.NewFiles(predecessor.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, acquired, err := files.AcquireMutation()
+	if err != nil || !acquired {
+		t.Fatalf("lock acquired=%t err=%v", acquired, err)
+	}
+	third := locator.DatabaseIdentity
+	third.Inode++
+	// A syntactically valid but unobserved third identity is persisted directly
+	// only to model an attacker or unsupported manual edit after durable intent.
+	raw, _ := json.Marshal(configurationadapter.AuthorityLocator{Version: locator.Version, ConfigPath: locator.ConfigPath, DatabasePath: locator.DatabasePath, DatabaseIdentity: third})
+	raw = append(raw, '\n')
+	if err := atomicWritePrivate(filepath.Join(filepath.Dir(predecessor.ConfigPath), "authority", "locator.json"), raw, manager.uid); err != nil {
+		lock.Release()
+		t.Fatal(err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.RecoverPrepareSuccessor(context.Background(), request); err == nil || !strings.Contains(err.Error(), "unexpected database identity") {
+		t.Fatalf("third identity err=%v", err)
+	}
+}
+
+func TestReplacementDatabaseVerifierCoversWALIntegrityBindingAndSchema(t *testing.T) {
+	t.Run("WAL", func(t *testing.T) {
+		manager, predecessor, _, _, replacement := seedAuthorizedDatabaseRelocation(t)
+		db, err := sql.Open("sqlite", sqliteURI(predecessor.DatabasePath, false))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		for _, statement := range []string{`PRAGMA journal_mode=WAL`, `PRAGMA wal_autocheckpoint=0`, `CREATE TABLE recovery_wal_fixture(value TEXT)`, `INSERT INTO recovery_wal_fixture VALUES('durable')`} {
+			if _, err := db.Exec(statement); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !exists(predecessor.DatabasePath + "-wal") {
+			t.Fatal("WAL fixture was not retained")
+		}
+		observed, verification, err := verifyReplacementDatabase(context.Background(), predecessor.DatabasePath, predecessor.ConfigPath, predecessor.ConfigDigest, predecessor.FailureReason, predecessor.Candidate.Build.SupportedControllerSchemaVersion, manager.uid)
+		if err != nil || observed.Device != replacement.Device || observed.Inode != replacement.Inode || !verification.IntegrityOK || !verification.ForeignKeysOK || !validSHA256(verification.ContentDigest) {
+			t.Fatalf("observed=%+v verification=%+v err=%v", observed, verification, err)
+		}
+	})
+
+	for _, scenario := range []struct {
+		name   string
+		mutate func(*testing.T, *Manager, journal)
+	}{
+		{name: "binding mismatch", mutate: func(t *testing.T, _ *Manager, predecessor journal) {
+			db, err := sql.Open("sqlite", sqliteURI(predecessor.DatabasePath, false))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`UPDATE configuration_authority SET canonical_config_path='/unexpected/config.json' WHERE authority_id=1`); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "schema drift", mutate: func(t *testing.T, _ *Manager, predecessor journal) {
+			db, err := sql.Open("sqlite", sqliteURI(predecessor.DatabasePath, false))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`INSERT INTO schema_migrations(version) VALUES(43)`); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "hard link", mutate: func(t *testing.T, _ *Manager, predecessor journal) {
+			if err := os.Link(predecessor.DatabasePath, predecessor.DatabasePath+".link"); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "corruption", mutate: func(t *testing.T, _ *Manager, predecessor journal) {
+			file, err := os.OpenFile(predecessor.DatabasePath, os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := file.WriteAt([]byte("not-sqlite"), 0); err != nil {
+				file.Close()
+				t.Fatal(err)
+			}
+			if err := file.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			manager, predecessor, _, revision, _ := seedAuthorizedDatabaseRelocation(t)
+			scenario.mutate(t, manager, predecessor)
+			if _, err := manager.PreviewSuccessorRecovery(context.Background(), SuccessorRecoveryPreviewRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision}); err == nil {
+				t.Fatal("unsafe replacement database produced a recovery preview")
+			}
+		})
+	}
+}
+
+func TestSuccessorRecoveryRejectsDatabaseContentAndSupervisorDriftBeforeIntent(t *testing.T) {
+	manager, predecessor, predecessorBundle, revision, _ := seedAuthorizedDatabaseRelocation(t)
+	preview, err := manager.PreviewSuccessorRecovery(context.Background(), SuccessorRecoveryPreviewRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", sqliteURI(predecessor.DatabasePath, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE post_preview_drift(value TEXT)`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(filepath.Join(predecessorBundle, "journal.json"))
+	request := SuccessorRecoverPrepareRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision, PreviewDigest: preview.PreviewDigest, DatabaseRelocationConfirmed: true, FullBackupConfirmed: true}
+	if _, err := manager.RecoverPrepareSuccessor(context.Background(), request); err == nil || !strings.Contains(err.Error(), "preview changed") {
+		t.Fatalf("content drift err=%v", err)
+	}
+	after, _ := os.ReadFile(filepath.Join(predecessorBundle, "journal.json"))
+	if string(before) != string(after) {
+		t.Fatal("content drift created recovery intent")
+	}
+
+	manager, predecessor, _, revision, _ = seedAuthorizedDatabaseRelocation(t)
+	runner := manager.runner.(successorRunner)
+	runner.fixtureRunner = fixtureRunner{selectedTarget: fmt.Sprintf("gui/%d/%s", os.Getuid(), neutralLaunchdLabel), selectedPID: os.Getpid()}
+	manager.runner = runner
+	if _, err := manager.PreviewSuccessorRecovery(context.Background(), SuccessorRecoveryPreviewRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision}); err == nil || !strings.Contains(err.Error(), "every supervisor") {
+		t.Fatalf("running supervisor err=%v", err)
+	}
 }
 
 func TestSuccessorPrepareLinksTerminalPredecessorAndRejectsOrdinaryPrepare(t *testing.T) {

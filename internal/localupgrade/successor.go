@@ -24,6 +24,9 @@ func (m *Manager) PrepareSuccessor(ctx context.Context, request SuccessorPrepare
 			return err
 		}
 		if predecessor.Phase == "superseded" {
+			if predecessor.DatabaseRecovery != nil {
+				return errors.New("recovered successor activation requires successor-recover-prepare replay")
+			}
 			return m.resumeSuccessorActivation(predecessor, request.Revision, active, &result)
 		}
 		if active.UpgradeID != predecessor.UpgradeID {
@@ -209,7 +212,7 @@ func (m *Manager) validatePreparedSuccessor(predecessor journal, bundle string) 
 		return journal{}, errors.New("successor binary evidence is inconsistent")
 	}
 	var manifest candidateManifest
-	if err := readPrivateJSON(filepath.Join(bundle, "candidate-manifest.json"), m.uid, &manifest); err != nil || manifest.SchemaVersion != journalSchemaVersion || manifest.Revision != successor.Revision || manifest.Candidate != successor.Candidate || manifest.Previous != successor.Previous || manifest.Database != successor.Database || manifest.ConfigDigest != successor.ConfigDigest {
+	if err := readPrivateJSON(filepath.Join(bundle, "candidate-manifest.json"), m.uid, &manifest); err != nil || manifest.SchemaVersion != successor.SchemaVersion || manifest.Revision != successor.Revision || manifest.Candidate != successor.Candidate || manifest.Previous != successor.Previous || manifest.Database != successor.Database || manifest.ConfigDigest != successor.ConfigDigest {
 		return journal{}, errors.New("successor candidate manifest is inconsistent")
 	}
 	return successor, nil

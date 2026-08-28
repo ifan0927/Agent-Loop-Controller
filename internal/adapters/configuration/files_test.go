@@ -1093,6 +1093,65 @@ func canonicalTempDirectory(t *testing.T) string {
 	return path
 }
 
+func TestLocatorDatabaseIdentityRebindChangesOnlyExactExpectedIdentity(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	configPath := filepath.Join(root, "controller.json")
+	databasePath := filepath.Join(root, "controller.db")
+	if err := os.WriteFile(configPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(databasePath, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalInfo, _ := os.Lstat(databasePath)
+	original := fileIdentity(originalInfo)
+	if err := files.BindDatabaseIdentity(databasePath, original); err != nil || files.PublishLocator(databasePath) != nil {
+		t.Fatalf("bind/publish err=%v", err)
+	}
+	if err := os.WriteFile(databasePath+".replacement", []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(databasePath+".replacement", databasePath); err != nil {
+		t.Fatal(err)
+	}
+	replacementInfo, _ := os.Lstat(databasePath)
+	replacement := fileIdentity(replacementInfo)
+	locator, found, err := ReadLocator(configPath)
+	if err != nil || !found || locator.DatabaseIdentity != original {
+		t.Fatalf("locator=%+v found=%t err=%v", locator, found, err)
+	}
+	lock, acquired, err := files.AcquireMutation()
+	if err != nil || !acquired {
+		t.Fatalf("acquired=%t err=%v", acquired, err)
+	}
+	if err := files.RebindLocatorDatabaseIdentity(locator, replacement); err != nil {
+		lock.Release()
+		t.Fatal(err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+	rebound, found, err := ReadLocator(configPath)
+	if err != nil || !found || rebound.ConfigPath != locator.ConfigPath || rebound.DatabasePath != locator.DatabasePath || rebound.DatabaseIdentity != replacement {
+		t.Fatalf("rebound=%+v found=%t err=%v", rebound, found, err)
+	}
+	lock, acquired, err = files.AcquireMutation()
+	if err != nil || !acquired {
+		t.Fatalf("second acquired=%t err=%v", acquired, err)
+	}
+	if err := files.RebindLocatorDatabaseIdentity(locator, replacement); err == nil || !strings.Contains(err.Error(), "changed before rebind") {
+		lock.Release()
+		t.Fatalf("stale expected locator err=%v", err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func bindTestDatabase(t *testing.T, files *Files, path string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte("fixture database identity"), 0o600); err != nil {
