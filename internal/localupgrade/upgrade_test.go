@@ -164,6 +164,151 @@ func seedBundle(t *testing.T, manager *Manager, completeReadiness bool) (journal
 	return j, bundle
 }
 
+func commandOutput(t *testing.T, runner commandRunner, directory, name string, args ...string) string {
+	t.Helper()
+	result, err := runner.Run(context.Background(), directory, name, args...)
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("command %s %v exit=%d err=%v stderr=%s", name, args, result.ExitCode, err, result.Stderr)
+	}
+	return strings.TrimSpace(string(result.Stdout))
+}
+
+func gitObjectDirectory(t *testing.T, runner commandRunner, repository string) string {
+	t.Helper()
+	path := commandOutput(t, runner, repository, "git", "rev-parse", "--git-path", "objects")
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(repository, path)
+	}
+	return filepath.Clean(path)
+}
+
+func assertObjectStorageIsNotHardLinked(t *testing.T, source, candidate string) {
+	t.Helper()
+	foundComparableObject := false
+	err := filepath.Walk(source, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		relative, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		candidateInfo, err := os.Stat(filepath.Join(candidate, relative))
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if !candidateInfo.Mode().IsRegular() {
+			return nil
+		}
+		foundComparableObject = true
+		if os.SameFile(info, candidateInfo) {
+			t.Fatalf("candidate object %s is hard-linked to the source repository", relative)
+		}
+		return filepath.SkipAll
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !foundComparableObject {
+		t.Fatal("source and candidate repositories had no comparable Git object")
+	}
+}
+
+func TestIndependentCandidateRepositoryPreservesVCSBuildIdentity(t *testing.T) {
+	runner := osCommandRunner{}
+	revision := commandOutput(t, runner, "", "git", "rev-parse", "HEAD")
+	sourceRoot, err := resolveCandidateSource(context.Background(), runner, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeStatus := commandOutput(t, runner, sourceRoot, "git", "status", "--porcelain=v1", "--untracked-files=all")
+	beforeRefs := commandOutput(t, runner, sourceRoot, "git", "show-ref", "--head")
+
+	directory := t.TempDir()
+	candidateRepository := filepath.Join(directory, "repository")
+	if err := cloneCandidateRepository(context.Background(), runner, sourceRoot, candidateRepository, revision); err != nil {
+		t.Fatal(err)
+	}
+	if origin := commandOutput(t, runner, candidateRepository, "git", "remote", "get-url", "origin"); origin != sourceRoot {
+		t.Fatalf("candidate origin=%q want=%q", origin, sourceRoot)
+	}
+	if _, err := os.Lstat(filepath.Join(candidateRepository, ".git", "objects", "info", "alternates")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("candidate repository uses Git alternates")
+	}
+	assertObjectStorageIsNotHardLinked(t, gitObjectDirectory(t, runner, sourceRoot), gitObjectDirectory(t, runner, candidateRepository))
+
+	binary := filepath.Join(directory, "agentctl")
+	built, err := runner.Run(context.Background(), candidateRepository, "go", "build", "-trimpath", "-o", binary, "./cmd/agentctl")
+	if err != nil || built.ExitCode != 0 {
+		t.Fatalf("candidate build exit=%d err=%v stderr=%s", built.ExitCode, err, built.Stderr)
+	}
+	evidence, err := inspectBinary(context.Background(), runner, binary, os.Getuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !candidateCompatible(evidence, revision, evidence.Build.SupportedControllerSchemaVersion) {
+		t.Fatalf("candidate evidence=%+v", evidence)
+	}
+	if evidence.GoVCSTime == "" || evidence.Build.VCSTime != evidence.GoVCSTime || evidence.GoVCSModified || evidence.Build.VCSModified {
+		t.Fatalf("candidate VCS evidence=%+v", evidence)
+	}
+	if clean, err := gitCheckoutClean(context.Background(), runner, candidateRepository); err != nil || !clean {
+		t.Fatalf("candidate repository clean=%t err=%v", clean, err)
+	}
+	if after := commandOutput(t, runner, sourceRoot, "git", "status", "--porcelain=v1", "--untracked-files=all"); after != beforeStatus {
+		t.Fatalf("source status changed: before=%q after=%q", beforeStatus, after)
+	}
+	if after := commandOutput(t, runner, sourceRoot, "git", "show-ref", "--head"); after != beforeRefs {
+		t.Fatal("source references changed")
+	}
+}
+
+func TestCandidateCompatibilityRejectsUnverifiableBuildIdentity(t *testing.T) {
+	revision := strings.Repeat("b", 40)
+	build := fixtureBuild(revision)
+	candidate := binaryEvidence{
+		GoVersion:     "go1.26.1",
+		ModulePath:    "github.com/ifan0927/Agent-Loop-Controller/cmd/agentctl",
+		GoVCSRevision: revision,
+		GoVCSTime:     build.VCSTime,
+		Build:         build,
+		Structured:    true,
+	}
+	if !candidateCompatible(candidate, revision, build.SupportedControllerSchemaVersion) {
+		t.Fatal("valid candidate was rejected")
+	}
+	tests := []struct {
+		name   string
+		mutate func(*binaryEvidence)
+	}{
+		{name: "missing Go version", mutate: func(value *binaryEvidence) { value.GoVersion = "" }},
+		{name: "wrong module", mutate: func(value *binaryEvidence) { value.ModulePath = "example.invalid/agentctl" }},
+		{name: "missing Go revision", mutate: func(value *binaryEvidence) { value.GoVCSRevision = "" }},
+		{name: "modified Go build", mutate: func(value *binaryEvidence) { value.GoVCSModified = true }},
+		{name: "missing Go commit time", mutate: func(value *binaryEvidence) { value.GoVCSTime = "" }},
+		{name: "missing structured identity", mutate: func(value *binaryEvidence) { value.Structured = false }},
+		{name: "mismatched structured revision", mutate: func(value *binaryEvidence) { value.Build.VCSRevision = strings.Repeat("c", 40) }},
+		{name: "mismatched structured time", mutate: func(value *binaryEvidence) { value.Build.VCSTime = "2026-08-27T00:00:00Z" }},
+		{name: "mismatched structured modified state", mutate: func(value *binaryEvidence) { value.Build.VCSModified = true }},
+		{name: "incompatible schema", mutate: func(value *binaryEvidence) { value.Build.SupportedControllerSchemaVersion-- }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mutated := candidate
+			test.mutate(&mutated)
+			if candidateCompatible(mutated, revision, build.SupportedControllerSchemaVersion) {
+				t.Fatal("unverifiable candidate was accepted")
+			}
+		})
+	}
+}
+
 func TestConsistentSnapshotUsesSQLiteBackupAPIWithWAL(t *testing.T) {
 	directory := t.TempDir()
 	if err := os.Chmod(directory, 0o700); err != nil {
@@ -571,7 +716,7 @@ func TestLegacyGoBinaryWithoutStructuredVersionRetainsSafeBuildMetadata(t *testi
 		t.Fatalf("build exit=%d err=%v", result.ExitCode, err)
 	}
 	evidence, err := inspectBinary(context.Background(), osCommandRunner{}, binary, os.Getuid())
-	if err != nil || evidence.Structured || evidence.LegacyVersion != "legacy-v1" || evidence.GoVersion == "" {
+	if err != nil || evidence.Structured || evidence.LegacyVersion != "legacy-v1" || evidence.GoVersion == "" || evidence.ModulePath != "command-line-arguments" {
 		t.Fatalf("evidence=%+v err=%v", evidence, err)
 	}
 }

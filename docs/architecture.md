@@ -1331,8 +1331,9 @@ restart, or migration authority.
 
 The repository-owned `scripts/local-agentctl-upgrade.sh` is an operator-driven
 host adapter, not Controller workflow state and not a self-update service. It
-accepts one exact local Git commit, builds and verifies that commit in a
-detached worktree, and stages one candidate in a private single-active bundle.
+accepts one exact local Git commit, copies it into an independent local clone
+without shared object storage, builds and verifies the detached clean checkout,
+and stages one candidate in a private single-active bundle.
 The candidate's structured build identity binds product version, clean VCS
 revision and time, modified state, and the schema version exported by the
 SQLite adapter's single supported-schema source. The same identity is emitted

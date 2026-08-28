@@ -2893,11 +2893,12 @@ SUPERVISOR="launchdaemon" # or launchagent
 ```
 
 `prepare` validates the exact local commit without fetch, pull, or branch
-movement; runs the canonical gate in an isolated detached worktree; stages the
-candidate on the installed target filesystem; and records candidate/previous
-digests plus safe Go build metadata. Root-owned, symlinked, hard-linked,
-wrong-owner, dirty, or unverifiable targets and candidates are unsupported. Use
-the existing manual process for a root-owned binary.
+movement; copies it into an independent local clone without hard links or
+shared object storage; runs the canonical gate on the detached clean checkout;
+stages the candidate on the installed target filesystem; and records
+candidate/previous digests plus safe Go build metadata. Root-owned, symlinked,
+hard-linked, wrong-owner, dirty, or unverifiable targets and candidates are
+unsupported. Use the existing manual process for a root-owned binary.
 
 Before replacement, create a separate encrypted full backup of the Controller
 root and every external credential file. The managed SQLite snapshot is only
