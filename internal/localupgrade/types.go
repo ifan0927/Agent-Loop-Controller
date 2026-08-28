@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	journalSchemaVersion = 1
+	journalSchemaVersion = 2
 	neutralLaunchdLabel  = "io.agent-loop-controller.worker"
 	legacyLaunchdLabel   = "com.ifan.agent-loop-controller.worker"
 )
@@ -20,6 +20,11 @@ type PrepareRequest struct {
 	ConfigPath string
 }
 
+type SuccessorPrepareRequest struct {
+	PredecessorUpgradeID string
+	Revision             string
+}
+
 type Result struct {
 	UpgradeID            string   `json:"upgrade_id"`
 	State                string   `json:"state"`
@@ -29,6 +34,8 @@ type Result struct {
 	ControllerReadiness  string   `json:"controller_readiness"`
 	Supervisor           string   `json:"supervisor,omitempty"`
 	CandidateBuild       string   `json:"candidate_build_identity,omitempty"`
+	PredecessorUpgradeID string   `json:"predecessor_upgrade_id,omitempty"`
+	SuccessorUpgradeID   string   `json:"successor_upgrade_id,omitempty"`
 	BootstrapIntent      bool     `json:"bootstrap_intent"`
 	RequiresSudo         bool     `json:"requires_sudo,omitempty"`
 	BootstrapInstruction []string `json:"bootstrap_instruction,omitempty"`
@@ -79,10 +86,14 @@ type journal struct {
 	Database          databaseEvidence `json:"database"`
 	SnapshotDigest    string           `json:"snapshot_digest,omitempty"`
 	FailureReason     string           `json:"failure_reason,omitempty"`
+	PredecessorID     string           `json:"predecessor_upgrade_id,omitempty"`
+	SuccessorID       string           `json:"successor_upgrade_id,omitempty"`
+	SuccessorRevision string           `json:"successor_revision,omitempty"`
 	CreatedAt         time.Time        `json:"created_at"`
 	UpdatedAt         time.Time        `json:"updated_at"`
 	BootstrapIntentAt *time.Time       `json:"bootstrap_intent_at,omitempty"`
 	CompletedAt       *time.Time       `json:"completed_at,omitempty"`
+	SupersededAt      *time.Time       `json:"superseded_at,omitempty"`
 }
 
 type commandResult struct {

@@ -1359,6 +1359,28 @@ match plus healthy Controller readiness, or by an equally verified pre-intent
 rollback. It writes one current-installation manifest and removes only the
 closed set of artifacts owned by that completed bundle.
 
+An active post-bootstrap attention may create one managed successor only when
+the installed candidate, selected running supervisor, worker process identity,
+fresh heartbeat, loaded configuration, database topology, and binary health
+still verify, while Controller readiness is explicitly `not_ready`. The
+successor is built from another exact clean local revision through the same
+independent-clone gate. A durable predecessor intent fixes one successor
+identifier and revision before staging; atomically replaced journals link both
+bundles and terminalize the predecessor before the single active pointer moves
+to the prepared successor. Every transition is replayable, so response loss
+cannot create a second successor or ambiguous pointer authority. The
+predecessor bundle then becomes immutable retained evidence and is never a
+cleanup target.
+
+The successor binds its previous-binary evidence to the failed installed
+candidate, never to the predecessor's pre-bootstrap binary. Its replacement
+therefore reuses the normal absent-supervisor, worker-lock, current
+configuration/database, online snapshot, and newly confirmed encrypted-full-
+backup gates. Pre-intent successor rollback can restore only that failed
+candidate; after the successor's own `bootstrap_intent`, rollback is again
+permanently forbidden. Successful successor cleanup removes only the successor
+bundle and active pointer while retaining the terminal predecessor lineage.
+
 ### Operator-attention boundary
 
 Application services publish immutable versioned attention events through a

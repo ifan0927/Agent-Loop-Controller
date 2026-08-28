@@ -2943,6 +2943,52 @@ enters attention and preserves the bundle. Cleanup is allowed only after a
 healthy upgrade with ready Controller state. Machine output keeps these axes
 separate as `upgrade_health` and `controller_readiness`.
 
+An attention result whose `upgrade_health` is `healthy` and whose
+`controller_readiness` is `not_ready` may be eligible for one verified managed
+successor. Eligibility is limited to `configuration_not_converged`,
+`integrity_not_ready`, and `integrity_conflict`. Keep the selected worker
+running while preparing so its exact binary, supervisor PID/process-start
+identity, heartbeat, loaded configuration, database topology, and predecessor
+journal can be revalidated:
+
+```sh
+FAILED_UPGRADE_ID="$UPGRADE_ID"
+SUCCESSOR_REVISION="$(git rev-parse HEAD)" # intended different full clean commit
+
+./scripts/local-agentctl-upgrade.sh successor-prepare \
+  --upgrade-id "$FAILED_UPGRADE_ID" --revision "$SUCCESSOR_REVISION"
+
+# Replace UPGRADE_ID with the successor upgrade_id returned above.
+UPGRADE_ID="$SUCCESSOR_UPGRADE_ID"
+```
+
+Ordinary `prepare` continues to reject every active upgrade. Ineligible or
+changed attention evidence fails closed without modifying either bundle. An
+interrupted `successor-prepare` is resumed with the exact same predecessor ID
+and revision; `status --upgrade-id "$FAILED_UPGRADE_ID"` reports whether the
+durable successor intent or terminal link exists. Response loss never
+authorizes another successor.
+
+After successor preparation, boot out the selected supervisor, create a new
+encrypted full backup of the Controller root and external credentials, and use
+the normal guarded lifecycle:
+
+```sh
+./scripts/local-agentctl-upgrade.sh replace \
+  --upgrade-id "$UPGRADE_ID" --full-backup-confirmed
+./scripts/local-agentctl-upgrade.sh authorize-bootstrap --upgrade-id "$UPGRADE_ID"
+# Invoke the returned bootstrap instruction, then:
+./scripts/local-agentctl-upgrade.sh observe --upgrade-id "$UPGRADE_ID"
+./scripts/local-agentctl-upgrade.sh cleanup --upgrade-id "$UPGRADE_ID"
+```
+
+The predecessor bundle is immutable terminal evidence and is never deleted by
+successor cleanup. Before the successor's bootstrap intent, `rollback` can
+restore only the failed predecessor candidate that was installed when the
+successor was prepared; it cannot restore the predecessor's pre-bootstrap
+binary. Successful cleanup removes the successor bundle and active pointer but
+retains the predecessor-to-successor link for `status` and audit.
+
 Before bootstrap intent, an operator may instead keep the selected supervisor
 absent and run:
 

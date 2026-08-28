@@ -113,6 +113,15 @@ func atomicWritePrivate(path string, raw []byte, uid int) error {
 		return err
 	}
 	temporary := filepath.Join(parent, "."+filepath.Base(path)+".tmp")
+	if exists(temporary) {
+		info, stat, err := safeRegularFile(temporary, uid, false)
+		if err != nil || info.Mode().Perm() != 0o600 || stat.Nlink != 1 {
+			return errors.New("interrupted durable upgrade evidence is unsafe")
+		}
+		if err := os.Remove(temporary); err != nil || syncDirectory(parent) != nil {
+			return errors.New("interrupted durable upgrade evidence could not be reconciled")
+		}
+	}
 	file, err := os.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return errors.New("durable upgrade evidence could not be created")
@@ -177,6 +186,37 @@ func readPrivateJSON(path string, uid int, destination any) error {
 }
 
 func (m *Manager) loadJournal(id string) (journal, string, error) {
+	value, bundle, err := m.loadBundleJournal(id)
+	if err != nil {
+		return journal{}, "", err
+	}
+	active, err := m.readActiveUpgrade()
+	if err != nil || active.UpgradeID != id {
+		return journal{}, "", errors.New("upgrade is not the active managed bundle")
+	}
+	return value, bundle, nil
+}
+
+type activeUpgrade struct {
+	UpgradeID string `json:"upgrade_id"`
+}
+
+func (m *Manager) readActiveUpgrade() (activeUpgrade, error) {
+	var active activeUpgrade
+	if err := readPrivateJSON(m.activePath(), m.uid, &active); err != nil || !validUpgradeID(active.UpgradeID) {
+		return activeUpgrade{}, errors.New("active upgrade pointer is unavailable")
+	}
+	return active, nil
+}
+
+func (m *Manager) writeActiveUpgrade(id string) error {
+	if !validUpgradeID(id) {
+		return errors.New("active upgrade identifier is invalid")
+	}
+	return writePrivateJSON(m.activePath(), activeUpgrade{UpgradeID: id}, m.uid)
+}
+
+func (m *Manager) loadBundleJournal(id string) (journal, string, error) {
 	if !validUpgradeID(id) {
 		return journal{}, "", errors.New("upgrade identifier is invalid")
 	}
@@ -184,12 +224,6 @@ func (m *Manager) loadJournal(id string) (journal, string, error) {
 	info, err := os.Lstat(bundle)
 	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm() != 0o700 || !ownedByUID(info, m.uid) {
 		return journal{}, "", errors.New("upgrade bundle is unavailable")
-	}
-	var active struct {
-		UpgradeID string `json:"upgrade_id"`
-	}
-	if err := readPrivateJSON(m.activePath(), m.uid, &active); err != nil || active.UpgradeID != id {
-		return journal{}, "", errors.New("upgrade is not the active managed bundle")
 	}
 	var value journal
 	if err := readPrivateJSON(filepath.Join(bundle, "journal.json"), m.uid, &value); err != nil {
@@ -203,14 +237,38 @@ func (m *Manager) loadJournal(id string) (journal, string, error) {
 
 func validateJournal(value journal, id string) error {
 	validPhase := false
-	for _, phase := range []string{"prepared", "replacement_intent", "replacement_committed", "rollback_intent", "bootstrap_intent", "healthy", "attention", "rolled_back", "rollback_healthy", "cleanup_intent"} {
+	for _, phase := range []string{"prepared", "replacement_intent", "replacement_committed", "rollback_intent", "bootstrap_intent", "healthy", "attention", "rolled_back", "rollback_healthy", "cleanup_intent", "successor_prepare_intent", "superseded"} {
 		validPhase = validPhase || value.Phase == phase
 	}
-	if value.SchemaVersion != journalSchemaVersion || value.UpgradeID != id || !validPhase || value.Supervisor != "launchagent" && value.Supervisor != "launchdaemon" || !validRevision(value.Revision) || !canonicalAbsolute(value.BinaryPath) || !canonicalAbsolute(value.ConfigPath) || !canonicalAbsolute(value.DatabasePath) || value.ConfigDigest == "" || !validBuildInfo(value.Candidate.Build) || value.Candidate.Digest == "" || value.Previous.Digest == "" || value.CreatedAt.IsZero() || value.UpdatedAt.IsZero() {
+	if value.SchemaVersion < 1 || value.SchemaVersion > journalSchemaVersion || value.UpgradeID != id || !validPhase || value.Supervisor != "launchagent" && value.Supervisor != "launchdaemon" || !validRevision(value.Revision) || !canonicalAbsolute(value.BinaryPath) || !canonicalAbsolute(value.ConfigPath) || !canonicalAbsolute(value.DatabasePath) || value.ConfigDigest == "" || !validBuildInfo(value.Candidate.Build) || value.Candidate.Digest == "" || value.Previous.Digest == "" || value.CreatedAt.IsZero() || value.UpdatedAt.IsZero() {
 		return errors.New("upgrade journal is invalid")
 	}
-	if value.BootstrapIntentAt != nil && value.Phase != "bootstrap_intent" && value.Phase != "healthy" && value.Phase != "attention" && value.Phase != "cleanup_intent" {
+	if value.BootstrapIntentAt != nil && value.Phase != "bootstrap_intent" && value.Phase != "healthy" && value.Phase != "attention" && value.Phase != "cleanup_intent" && value.Phase != "successor_prepare_intent" && value.Phase != "superseded" {
 		return errors.New("upgrade journal bootstrap authority is contradictory")
+	}
+	if value.PredecessorID != "" && (!validUpgradeID(value.PredecessorID) || value.PredecessorID == id) {
+		return errors.New("upgrade journal predecessor link is invalid")
+	}
+	if value.SuccessorID != "" && (!validUpgradeID(value.SuccessorID) || value.SuccessorID == id || value.SuccessorID == value.PredecessorID || !validRevision(value.SuccessorRevision)) {
+		return errors.New("upgrade journal successor link is invalid")
+	}
+	if value.SuccessorID == "" && value.SuccessorRevision != "" {
+		return errors.New("upgrade journal successor revision is unbound")
+	}
+	if value.Phase == "successor_prepare_intent" && (value.BootstrapIntentAt == nil || !eligibleSuccessorReason(value.FailureReason) || value.SuccessorID == "" || value.SupersededAt != nil) {
+		return errors.New("upgrade journal successor intent is invalid")
+	}
+	if value.Phase == "superseded" && (value.BootstrapIntentAt == nil || !eligibleSuccessorReason(value.FailureReason) || value.SuccessorID == "" || value.SupersededAt == nil) {
+		return errors.New("upgrade journal supersession is invalid")
+	}
+	if value.Phase != "successor_prepare_intent" && value.Phase != "superseded" && value.SuccessorID != "" {
+		return errors.New("upgrade journal successor link is contradictory")
+	}
+	if value.Phase != "superseded" && value.SupersededAt != nil {
+		return errors.New("upgrade journal supersession time is contradictory")
+	}
+	if value.SchemaVersion == 1 && (value.PredecessorID != "" || value.SuccessorID != "" || value.SupersededAt != nil) {
+		return errors.New("legacy upgrade journal contains successor evidence")
 	}
 	return nil
 }

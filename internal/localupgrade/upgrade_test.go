@@ -23,6 +23,26 @@ type fixtureRunner struct {
 
 type topologyRunner map[string]bool
 
+type successorRunner struct {
+	fixtureRunner
+	sourceRoot string
+	revisions  map[string]bool
+}
+
+func (r successorRunner) Run(ctx context.Context, directory, name string, args ...string) (commandResult, error) {
+	if name == "git" && len(args) == 2 && args[0] == "rev-parse" && args[1] == "--show-toplevel" {
+		return commandResult{ExitCode: 0, Stdout: []byte(r.sourceRoot + "\n")}, nil
+	}
+	if name == "git" && len(args) == 3 && args[0] == "rev-parse" && args[1] == "--verify" {
+		revision := strings.TrimSuffix(args[2], "^{commit}")
+		if r.revisions[revision] {
+			return commandResult{ExitCode: 0, Stdout: []byte(revision + "\n")}, nil
+		}
+		return commandResult{ExitCode: 1}, nil
+	}
+	return r.fixtureRunner.Run(ctx, directory, name, args...)
+}
+
 func (r topologyRunner) Run(_ context.Context, _ string, name string, args ...string) (commandResult, error) {
 	if name != "launchctl" || len(args) != 2 || args[0] != "print" {
 		return commandResult{}, errors.New("unexpected command")
@@ -354,7 +374,7 @@ func TestConsistentSnapshotUsesSQLiteBackupAPIWithWAL(t *testing.T) {
 func TestReplaceIsRestartSafeAndBootstrapIntentPermanentlyForbidsRollback(t *testing.T) {
 	manager := newFixtureManager(t, fixtureRunner{})
 	j, bundle := seedBundle(t, manager, false)
-	result, err := manager.Replace(context.Background(), j.UpgradeID)
+	result, err := manager.Replace(context.Background(), j.UpgradeID, true)
 	if err != nil || result.State != "replaced" {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
@@ -383,7 +403,7 @@ func TestReplaceIsRestartSafeAndBootstrapIntentPermanentlyForbidsRollback(t *tes
 func TestRollbackRestoresOnlyPreviousBinaryAndNeverSnapshot(t *testing.T) {
 	manager := newFixtureManager(t, fixtureRunner{})
 	j, _ := seedBundle(t, manager, false)
-	if _, err := manager.Replace(context.Background(), j.UpgradeID); err != nil {
+	if _, err := manager.Replace(context.Background(), j.UpgradeID, true); err != nil {
 		t.Fatal(err)
 	}
 	databaseBefore, _ := digestFile(j.DatabasePath)
@@ -417,7 +437,7 @@ func TestReplacementDurablePhaseFailuresReconcileAndResume(t *testing.T) {
 				}
 				return nil
 			}
-			if _, err := manager.Replace(context.Background(), j.UpgradeID); err == nil {
+			if _, err := manager.Replace(context.Background(), j.UpgradeID, true); err == nil {
 				t.Fatal("injected replacement interruption was ignored")
 			}
 			manager.fail = nil
@@ -425,7 +445,7 @@ func TestReplacementDurablePhaseFailuresReconcileAndResume(t *testing.T) {
 			if err != nil || status.State != test.state {
 				t.Fatalf("status=%+v err=%v", status, err)
 			}
-			resumed, err := manager.Replace(context.Background(), j.UpgradeID)
+			resumed, err := manager.Replace(context.Background(), j.UpgradeID, true)
 			if err != nil || resumed.State != "replaced" {
 				t.Fatalf("resumed=%+v err=%v", resumed, err)
 			}
@@ -442,7 +462,7 @@ func TestInstalledTargetDriftAfterReplacementIntentFailsClosed(t *testing.T) {
 		}
 		return nil
 	}
-	if _, err := manager.Replace(context.Background(), j.UpgradeID); err == nil {
+	if _, err := manager.Replace(context.Background(), j.UpgradeID, true); err == nil {
 		t.Fatal("replacement interruption was ignored")
 	}
 	manager.fail = nil
@@ -451,7 +471,7 @@ func TestInstalledTargetDriftAfterReplacementIntentFailsClosed(t *testing.T) {
 	if err != nil || status.State != "attention" || status.Reason != "replacement_identity_ambiguous" {
 		t.Fatalf("status=%+v err=%v", status, err)
 	}
-	if _, err := manager.Replace(context.Background(), j.UpgradeID); err == nil || !strings.Contains(err.Error(), "drift") {
+	if _, err := manager.Replace(context.Background(), j.UpgradeID, true); err == nil || !strings.Contains(err.Error(), "drift") {
 		t.Fatalf("replace err=%v", err)
 	}
 }
@@ -461,7 +481,7 @@ func TestRollbackDurablePhaseFailuresReconcileAndResume(t *testing.T) {
 		t.Run(point, func(t *testing.T) {
 			manager := newFixtureManager(t, fixtureRunner{})
 			j, _ := seedBundle(t, manager, false)
-			if _, err := manager.Replace(context.Background(), j.UpgradeID); err != nil {
+			if _, err := manager.Replace(context.Background(), j.UpgradeID, true); err != nil {
 				t.Fatal(err)
 			}
 			manager.fail = func(observed string) error {
@@ -489,7 +509,7 @@ func TestRollbackDurablePhaseFailuresReconcileAndResume(t *testing.T) {
 func TestLostResponseAfterBootstrapIntentCannotReauthorizeRollback(t *testing.T) {
 	manager := newFixtureManager(t, fixtureRunner{})
 	j, _ := seedBundle(t, manager, false)
-	if _, err := manager.Replace(context.Background(), j.UpgradeID); err != nil {
+	if _, err := manager.Replace(context.Background(), j.UpgradeID, true); err != nil {
 		t.Fatal(err)
 	}
 	manager.fail = func(point string) error {
@@ -718,5 +738,310 @@ func TestLegacyGoBinaryWithoutStructuredVersionRetainsSafeBuildMetadata(t *testi
 	evidence, err := inspectBinary(context.Background(), osCommandRunner{}, binary, os.Getuid())
 	if err != nil || evidence.Structured || evidence.LegacyVersion != "legacy-v1" || evidence.GoVersion == "" || evidence.ModulePath != "command-line-arguments" {
 		t.Fatalf("evidence=%+v err=%v", evidence, err)
+	}
+}
+
+func seedEligibleSuccessor(t *testing.T) (*Manager, journal, string, string, *int) {
+	t.Helper()
+	pid := os.Getpid()
+	manager := newFixtureManager(t, fixtureRunner{selectedTarget: fmt.Sprintf("gui/%d/%s", os.Getuid(), neutralLaunchdLabel), selectedPID: pid})
+	predecessor, predecessorBundle := seedBundle(t, manager, true)
+	repositoryRoot := commandOutput(t, osCommandRunner{}, "", "git", "rev-parse", "--show-toplevel")
+	successorRevision := strings.Repeat("d", 40)
+	manager.runner = successorRunner{fixtureRunner: fixtureRunner{selectedTarget: fmt.Sprintf("gui/%d/%s", os.Getuid(), neutralLaunchdLabel), selectedPID: pid}, sourceRoot: repositoryRoot, revisions: map[string]bool{successorRevision: true, strings.Repeat("e", 40): true}}
+	if err := atomicallyInstall(filepath.Join(predecessorBundle, "candidate.bin"), predecessor.BinaryPath, 0o755, manager.uid, predecessor.Previous.Digest, predecessor.Candidate.Digest, predecessor.UpgradeID); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", sqliteURI(predecessor.DatabasePath, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`INSERT INTO configuration_generations VALUES(1,'` + predecessor.ConfigDigest + `','effective')`,
+		`INSERT INTO configuration_authority VALUES(1,1,1)`,
+		`INSERT INTO controller_integrity_generation VALUES(1,1)`,
+		`INSERT INTO controller_integrity_observations VALUES('observation-1','not_ready')`,
+		`INSERT INTO controller_integrity_current VALUES(1,'observation-1',1)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	now := manager.now()
+	predecessor.SchemaVersion = journalSchemaVersion
+	predecessor.Phase = "attention"
+	predecessor.FailureReason = "integrity_not_ready"
+	predecessor.BootstrapIntentAt = &now
+	predecessor.UpdatedAt = now
+	snapshotDigest, err := createConsistentSnapshot(context.Background(), predecessor.DatabasePath, filepath.Join(predecessorBundle, "snapshot.db"), manager.uid, predecessor.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	predecessor.SnapshotDigest = snapshotDigest
+	if err := writeJournal(predecessorBundle, predecessor, manager.uid); err != nil {
+		t.Fatal(err)
+	}
+	started, err := processStartIdentity(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	heartbeat := heartbeatEvidence{SchemaVersion: 3, WorkerInstanceID: "fixture-worker", ProcessID: pid, ProcessStartID: started, BuildIdentity: predecessor.Candidate.Build.BuildIdentity, ConfigurationDigest: predecessor.ConfigDigest, Status: "parked", ObservedAt: now}
+	if err := writePrivateJSON(predecessor.ConfigPath+".worker-status.json", heartbeat, manager.uid); err != nil {
+		t.Fatal(err)
+	}
+
+	buildCount := 0
+	manager.buildCandidate = func(_ context.Context, revision string, databaseSchema int) (preparedCandidate, error) {
+		buildCount++
+		build := fixtureBuild(revision)
+		build.BuildIdentity = "sha256:" + strings.Repeat("d", 64)
+		raw := binaryScript(build)
+		path := filepath.Join(manager.controllerRoot(), fmt.Sprintf("successor-candidate-%d", buildCount))
+		writeFixtureFile(t, path, raw, 0o755)
+		digest, _ := digestFile(path)
+		evidence := binaryEvidence{Digest: digest, Size: int64(len(raw)), Mode: 0o755, GoVersion: "go1.26.1", ModulePath: "github.com/ifan0927/Agent-Loop-Controller/cmd/agentctl", GoVCSRevision: revision, GoVCSTime: build.VCSTime, Build: build, Structured: true}
+		if !candidateCompatible(evidence, revision, databaseSchema) {
+			t.Fatal("fixture successor candidate is incompatible")
+		}
+		return preparedCandidate{Evidence: evidence, Path: path, Cleanup: func() { _ = os.Remove(path) }}, nil
+	}
+	return manager, predecessor, predecessorBundle, successorRevision, &buildCount
+}
+
+func TestSuccessorPrepareLinksTerminalPredecessorAndRejectsOrdinaryPrepare(t *testing.T) {
+	manager, predecessor, predecessorBundle, revision, _ := seedEligibleSuccessor(t)
+	result, err := manager.PrepareSuccessor(context.Background(), SuccessorPrepareRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision})
+	if err != nil || result.State != "prepared" || result.PredecessorUpgradeID != predecessor.UpgradeID || !validUpgradeID(result.UpgradeID) {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	persisted, _, err := manager.loadBundleJournal(predecessor.UpgradeID)
+	if err != nil || persisted.Phase != "superseded" || persisted.SuccessorID != result.UpgradeID || persisted.SupersededAt == nil {
+		t.Fatalf("predecessor=%+v err=%v", persisted, err)
+	}
+	if _, err := os.Stat(filepath.Join(predecessorBundle, "snapshot.db")); err != nil {
+		t.Fatal("predecessor snapshot evidence was not preserved")
+	}
+	active, err := manager.readActiveUpgrade()
+	if err != nil || active.UpgradeID != result.UpgradeID {
+		t.Fatalf("active=%+v err=%v", active, err)
+	}
+	if _, err := manager.Prepare(context.Background(), PrepareRequest{Revision: revision, Supervisor: predecessor.Supervisor, BinaryPath: predecessor.BinaryPath, ConfigPath: predecessor.ConfigPath}); err == nil || !strings.Contains(err.Error(), "active managed upgrade") {
+		t.Fatalf("ordinary prepare err=%v", err)
+	}
+}
+
+func TestIneligibleSuccessorAttentionDoesNotMutateEvidence(t *testing.T) {
+	manager, predecessor, predecessorBundle, revision, _ := seedEligibleSuccessor(t)
+	predecessor.FailureReason = "heartbeat_identity_failed"
+	if err := writeJournal(predecessorBundle, predecessor, manager.uid); err != nil {
+		t.Fatal(err)
+	}
+	beforeJournal, _ := os.ReadFile(filepath.Join(predecessorBundle, "journal.json"))
+	beforeEntries, _ := os.ReadDir(manager.upgradeRoot())
+	if _, err := manager.PrepareSuccessor(context.Background(), SuccessorPrepareRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision}); err == nil || !strings.Contains(err.Error(), "not eligible") {
+		t.Fatalf("successor err=%v", err)
+	}
+	afterJournal, _ := os.ReadFile(filepath.Join(predecessorBundle, "journal.json"))
+	afterEntries, _ := os.ReadDir(manager.upgradeRoot())
+	if string(beforeJournal) != string(afterJournal) || len(beforeEntries) != len(afterEntries) {
+		t.Fatal("ineligible successor preparation changed durable evidence")
+	}
+}
+
+func TestSuccessorPrepareDurableTransitionsReplayWithoutDuplicates(t *testing.T) {
+	for _, point := range []string{"after_successor_prepare_intent", "after_successor_bundle", "after_predecessor_superseded", "after_successor_activation"} {
+		t.Run(point, func(t *testing.T) {
+			manager, predecessor, _, revision, buildCount := seedEligibleSuccessor(t)
+			manager.fail = func(observed string) error {
+				if observed == point {
+					return errors.New("injected successor interruption")
+				}
+				return nil
+			}
+			if _, err := manager.PrepareSuccessor(context.Background(), SuccessorPrepareRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision}); err == nil {
+				t.Fatal("injected successor interruption was ignored")
+			}
+			manager.fail = nil
+			resumed, err := manager.PrepareSuccessor(context.Background(), SuccessorPrepareRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision})
+			if err != nil || resumed.State != "prepared" {
+				t.Fatalf("resumed=%+v err=%v", resumed, err)
+			}
+			persisted, _, err := manager.loadBundleJournal(predecessor.UpgradeID)
+			if err != nil || persisted.SuccessorID != resumed.UpgradeID || persisted.Phase != "superseded" {
+				t.Fatalf("predecessor=%+v err=%v", persisted, err)
+			}
+			entries, _ := os.ReadDir(manager.upgradeRoot())
+			bundleCount := 0
+			for _, entry := range entries {
+				if entry.IsDir() && strings.HasPrefix(entry.Name(), "upgrade-") {
+					bundleCount++
+				}
+			}
+			if bundleCount != 2 || *buildCount > 1 {
+				t.Fatalf("bundle_count=%d build_count=%d", bundleCount, *buildCount)
+			}
+		})
+	}
+}
+
+func TestSuccessorPrepareRemovesOnlyVerifiedPartialOwnedStagingOnReplay(t *testing.T) {
+	manager, predecessor, predecessorBundle, revision, _ := seedEligibleSuccessor(t)
+	manager.fail = func(point string) error {
+		if point == "after_successor_prepare_intent" {
+			return errors.New("injected successor interruption")
+		}
+		return nil
+	}
+	if _, err := manager.PrepareSuccessor(context.Background(), SuccessorPrepareRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision}); err == nil {
+		t.Fatal("injected successor interruption was ignored")
+	}
+	manager.fail = nil
+	intent, _, err := manager.loadJournal(predecessor.UpgradeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staging := filepath.Join(manager.upgradeRoot(), "."+intent.SuccessorID+".prepare")
+	if err := os.Mkdir(staging, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFixtureFile(t, filepath.Join(staging, "candidate.bin"), "partial", 0o600)
+	journalTemporary := filepath.Join(predecessorBundle, ".journal.json.tmp")
+	activeTemporary := filepath.Join(manager.upgradeRoot(), ".active.json.tmp")
+	writeFixtureFile(t, journalTemporary, "partial", 0o600)
+	writeFixtureFile(t, activeTemporary, "partial", 0o600)
+	resumed, err := manager.PrepareSuccessor(context.Background(), SuccessorPrepareRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision})
+	if err != nil || resumed.State != "prepared" || exists(staging) || exists(journalTemporary) || exists(activeTemporary) {
+		t.Fatalf("resumed=%+v err=%v staging=%t journal_tmp=%t active_tmp=%t", resumed, err, exists(staging), exists(journalTemporary), exists(activeTemporary))
+	}
+}
+
+func TestSuccessorReplacementRequiresFreshBackupAndCannotRestorePreBootstrapBinary(t *testing.T) {
+	manager, predecessor, _, revision, _ := seedEligibleSuccessor(t)
+	prepared, err := manager.PrepareSuccessor(context.Background(), SuccessorPrepareRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.runner = fixtureRunner{}
+	if _, err := manager.Replace(context.Background(), prepared.UpgradeID, false); err == nil || !strings.Contains(err.Error(), "newly confirmed") {
+		t.Fatalf("replacement without backup err=%v", err)
+	}
+	if _, err := manager.Replace(context.Background(), prepared.UpgradeID, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Rollback(context.Background(), prepared.UpgradeID); err != nil {
+		t.Fatal(err)
+	}
+	digest, _ := digestFile(predecessor.BinaryPath)
+	if digest != predecessor.Candidate.Digest || digest == predecessor.Previous.Digest {
+		t.Fatalf("rollback digest=%s predecessor_candidate=%s pre_bootstrap=%s", digest, predecessor.Candidate.Digest, predecessor.Previous.Digest)
+	}
+}
+
+func TestManagedSuccessorCanBecomeAnImmutablePredecessorInALaterRecovery(t *testing.T) {
+	manager, predecessor, _, firstRevision, _ := seedEligibleSuccessor(t)
+	runner := manager.runner.(successorRunner)
+	first, err := manager.PrepareSuccessor(context.Background(), SuccessorPrepareRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: firstRevision})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.fixtureRunner = fixtureRunner{}
+	manager.runner = runner
+	if _, err := manager.Replace(context.Background(), first.UpgradeID, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.AuthorizeBootstrap(context.Background(), first.UpgradeID); err != nil {
+		t.Fatal(err)
+	}
+	firstJournal, _, err := manager.loadJournal(first.UpgradeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid := os.Getpid()
+	runner.fixtureRunner = fixtureRunner{selectedTarget: fmt.Sprintf("gui/%d/%s", os.Getuid(), neutralLaunchdLabel), selectedPID: pid}
+	manager.runner = runner
+	started, err := processStartIdentity(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	heartbeat := heartbeatEvidence{SchemaVersion: 3, WorkerInstanceID: "first-successor-worker", ProcessID: pid, ProcessStartID: started, BuildIdentity: firstJournal.Candidate.Build.BuildIdentity, ConfigurationDigest: firstJournal.ConfigDigest, Status: "parked", ObservedAt: manager.now()}
+	if err := writePrivateJSON(firstJournal.ConfigPath+".worker-status.json", heartbeat, manager.uid); err != nil {
+		t.Fatal(err)
+	}
+	attention, err := manager.Observe(context.Background(), first.UpgradeID)
+	if err != nil || attention.State != "attention" || attention.ControllerReadiness != "not_ready" {
+		t.Fatalf("attention=%+v err=%v", attention, err)
+	}
+	secondRevision := strings.Repeat("e", 40)
+	second, err := manager.PrepareSuccessor(context.Background(), SuccessorPrepareRequest{PredecessorUpgradeID: first.UpgradeID, Revision: secondRevision})
+	if err != nil || second.PredecessorUpgradeID != first.UpgradeID {
+		t.Fatalf("second=%+v err=%v", second, err)
+	}
+	terminalFirst, _, err := manager.loadBundleJournal(first.UpgradeID)
+	if err != nil || terminalFirst.Phase != "superseded" || terminalFirst.PredecessorID != predecessor.UpgradeID || terminalFirst.SuccessorID != second.UpgradeID {
+		t.Fatalf("terminal first=%+v err=%v", terminalFirst, err)
+	}
+}
+
+func TestSuccessfulSuccessorCleanupRetainsTerminalPredecessor(t *testing.T) {
+	manager, predecessor, predecessorBundle, revision, _ := seedEligibleSuccessor(t)
+	prepared, err := manager.PrepareSuccessor(context.Background(), SuccessorPrepareRequest{PredecessorUpgradeID: predecessor.UpgradeID, Revision: revision})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.runner = fixtureRunner{}
+	if _, err := manager.Replace(context.Background(), prepared.UpgradeID, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.AuthorizeBootstrap(context.Background(), prepared.UpgradeID); err != nil {
+		t.Fatal(err)
+	}
+	successor, _, err := manager.loadJournal(prepared.UpgradeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", sqliteURI(successor.DatabasePath, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE controller_integrity_observations SET effective_readiness='ready' WHERE observation_id='observation-1'`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pid := os.Getpid()
+	manager.runner = fixtureRunner{selectedTarget: fmt.Sprintf("gui/%d/%s", os.Getuid(), neutralLaunchdLabel), selectedPID: pid}
+	started, err := processStartIdentity(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	heartbeat := heartbeatEvidence{SchemaVersion: 3, WorkerInstanceID: "successor-worker", ProcessID: pid, ProcessStartID: started, BuildIdentity: successor.Candidate.Build.BuildIdentity, ConfigurationDigest: successor.ConfigDigest, Status: "parked", ObservedAt: manager.now()}
+	if err := writePrivateJSON(successor.ConfigPath+".worker-status.json", heartbeat, manager.uid); err != nil {
+		t.Fatal(err)
+	}
+	observed, err := manager.Observe(context.Background(), successor.UpgradeID)
+	if err != nil || observed.State != "healthy" {
+		t.Fatalf("observed=%+v err=%v", observed, err)
+	}
+	cleaned, err := manager.Cleanup(context.Background(), successor.UpgradeID)
+	if err != nil || cleaned.State != "cleaned" {
+		t.Fatalf("cleaned=%+v err=%v", cleaned, err)
+	}
+	if exists(manager.activePath()) || exists(manager.bundlePath(successor.UpgradeID)) || !exists(predecessorBundle) {
+		t.Fatalf("active=%t successor=%t predecessor=%t", exists(manager.activePath()), exists(manager.bundlePath(successor.UpgradeID)), exists(predecessorBundle))
+	}
+	persisted, _, err := manager.loadBundleJournal(predecessor.UpgradeID)
+	if err != nil || persisted.Phase != "superseded" || persisted.SuccessorID != successor.UpgradeID {
+		t.Fatalf("predecessor=%+v err=%v", persisted, err)
+	}
+	status, err := manager.Status(context.Background(), predecessor.UpgradeID)
+	if err != nil || status.State != "superseded" || status.SuccessorUpgradeID != successor.UpgradeID || status.NextAction != "none" {
+		t.Fatalf("terminal status=%+v err=%v", status, err)
 	}
 }
