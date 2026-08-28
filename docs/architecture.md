@@ -1381,6 +1381,38 @@ candidate; after the successor's own `bootstrap_intent`, rollback is again
 permanently forbidden. Successful successor cleanup removes only the successor
 bundle and active pointer while retaining the terminal predecessor lineage.
 
+One narrower recovery precedes successor preparation when an operator-confirmed
+local file relocation changed the database inode at the unchanged canonical
+path. It is available only for the same post-bootstrap Controller-readiness
+attention reasons as an ordinary managed successor, but requires the selected,
+opposite, and legacy supervisors to be absent and the installed binary to remain
+the exact predecessor candidate. Ordinary startup remains bound to the existing
+locator and continues to reject the replacement inode.
+
+The read-only recovery preview derives the old locator identity from the
+predecessor journal and private authority locator. A query-only verifier pins
+the replacement file's owner, private mode, single link, canonical path,
+schema, SQLite and foreign-key integrity, internal configuration paths, desired
+configuration authority, readiness reason, and stable database/WAL content.
+The preview digest also binds the predecessor binary, supervisor absence,
+failure evidence, and exact successor revision. Only the digest and required
+confirmation names are rendered; paths, device/inode values, locator bytes,
+configuration digests, database contents, and credentials remain private.
+
+Prepare requires explicit relocation and encrypted-full-backup confirmations,
+revalidates the complete preview around candidate verification, and durably
+records one recovery intent and successor identity before locator mutation. The
+configuration filesystem adapter holds its stable mutation lock, pins the
+replacement database descriptor, accepts only the exact old or already-
+recovered locator, and atomically changes only the locator's database identity
+with directory synchronization. The journal then binds the observed
+replacement identity and publication before the existing independent-clone
+successor staging and active-pointer transfer. Restart distinguishes the old
+locator, the exact recovered locator, and every unexpected third identity;
+identical replay resumes one successor while drift preserves all evidence.
+Successful successor cleanup retains the failed predecessor's complete recovery
+record.
+
 ### Operator-attention boundary
 
 Application services publish immutable versioned attention events through a

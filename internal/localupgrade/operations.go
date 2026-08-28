@@ -28,6 +28,9 @@ func (m *Manager) Status(ctx context.Context, id string) (result Result, finalEr
 			next := "none"
 			if active.UpgradeID == j.UpgradeID {
 				next = "successor-prepare"
+				if j.DatabaseRecovery != nil {
+					next = "successor-recover-prepare"
+				}
 			} else if active.UpgradeID == j.SuccessorID {
 				next = "status_successor"
 			}
@@ -38,7 +41,15 @@ func (m *Manager) Status(ctx context.Context, id string) (result Result, finalEr
 			return errors.New("upgrade is not the active managed bundle")
 		}
 		if j.Phase == "successor_prepare_intent" {
-			result = resultFor(j, "successor_preparation_interrupted", "successor_prepare_intent_durable", "successor-prepare")
+			next := "successor-prepare"
+			if j.DatabaseRecovery != nil {
+				next = "successor-recover-prepare"
+			}
+			result = resultFor(j, "successor_preparation_interrupted", "successor_prepare_intent_durable", next)
+			return nil
+		}
+		if j.Phase == "successor_recovery_intent" {
+			result = resultFor(j, "successor_recovery_interrupted", "successor_recovery_intent_durable", "successor-recover-prepare")
 			return nil
 		}
 		result = m.reconcileStatus(ctx, j, bundle)

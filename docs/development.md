@@ -435,8 +435,11 @@ controller process. Cover at least:
 - local binary upgrade snapshot, replacement intent/effect/commit, rollback
   intent/effect/commit, bootstrap intent/response loss, bounded observation,
   successor prepare intent/staging/link/active-pointer transfer, repeated
-  response loss without duplicate successors, current-installation publication,
-  and each exact-owned cleanup artifact with terminal predecessor retention.
+  response loss without duplicate successors, authorized database-relocation
+  preview stability, recovery intent, old/recovered/third locator reconciliation,
+  locator publication, recovered journal binding, replacement database/WAL
+  content drift, current-installation publication, and each exact-owned cleanup
+  artifact with terminal predecessor and recovery-evidence retention.
 
 Inject failures through ports, loopback fixtures, canceled contexts, managed
 process fakes, or real disposable Git repositories. Never add production flags

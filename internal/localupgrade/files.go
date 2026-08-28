@@ -237,13 +237,13 @@ func (m *Manager) loadBundleJournal(id string) (journal, string, error) {
 
 func validateJournal(value journal, id string) error {
 	validPhase := false
-	for _, phase := range []string{"prepared", "replacement_intent", "replacement_committed", "rollback_intent", "bootstrap_intent", "healthy", "attention", "rolled_back", "rollback_healthy", "cleanup_intent", "successor_prepare_intent", "superseded"} {
+	for _, phase := range []string{"prepared", "replacement_intent", "replacement_committed", "rollback_intent", "bootstrap_intent", "healthy", "attention", "rolled_back", "rollback_healthy", "cleanup_intent", "successor_recovery_intent", "successor_prepare_intent", "superseded"} {
 		validPhase = validPhase || value.Phase == phase
 	}
 	if value.SchemaVersion < 1 || value.SchemaVersion > journalSchemaVersion || value.UpgradeID != id || !validPhase || value.Supervisor != "launchagent" && value.Supervisor != "launchdaemon" || !validRevision(value.Revision) || !canonicalAbsolute(value.BinaryPath) || !canonicalAbsolute(value.ConfigPath) || !canonicalAbsolute(value.DatabasePath) || value.ConfigDigest == "" || !validBuildInfo(value.Candidate.Build) || value.Candidate.Digest == "" || value.Previous.Digest == "" || value.CreatedAt.IsZero() || value.UpdatedAt.IsZero() {
 		return errors.New("upgrade journal is invalid")
 	}
-	if value.BootstrapIntentAt != nil && value.Phase != "bootstrap_intent" && value.Phase != "healthy" && value.Phase != "attention" && value.Phase != "cleanup_intent" && value.Phase != "successor_prepare_intent" && value.Phase != "superseded" {
+	if value.BootstrapIntentAt != nil && value.Phase != "bootstrap_intent" && value.Phase != "healthy" && value.Phase != "attention" && value.Phase != "cleanup_intent" && value.Phase != "successor_recovery_intent" && value.Phase != "successor_prepare_intent" && value.Phase != "superseded" {
 		return errors.New("upgrade journal bootstrap authority is contradictory")
 	}
 	if value.PredecessorID != "" && (!validUpgradeID(value.PredecessorID) || value.PredecessorID == id) {
@@ -258,10 +258,13 @@ func validateJournal(value journal, id string) error {
 	if value.Phase == "successor_prepare_intent" && (value.BootstrapIntentAt == nil || !eligibleSuccessorReason(value.FailureReason) || value.SuccessorID == "" || value.SupersededAt != nil) {
 		return errors.New("upgrade journal successor intent is invalid")
 	}
+	if value.Phase == "successor_recovery_intent" && (value.BootstrapIntentAt == nil || !eligibleSuccessorReason(value.FailureReason) || value.SuccessorID == "" || value.SupersededAt != nil || value.DatabaseRecovery == nil || value.DatabaseRecovery.LocatorPublishedAt != nil) {
+		return errors.New("upgrade journal successor recovery intent is invalid")
+	}
 	if value.Phase == "superseded" && (value.BootstrapIntentAt == nil || !eligibleSuccessorReason(value.FailureReason) || value.SuccessorID == "" || value.SupersededAt == nil) {
 		return errors.New("upgrade journal supersession is invalid")
 	}
-	if value.Phase != "successor_prepare_intent" && value.Phase != "superseded" && value.SuccessorID != "" {
+	if value.Phase != "successor_recovery_intent" && value.Phase != "successor_prepare_intent" && value.Phase != "superseded" && value.SuccessorID != "" {
 		return errors.New("upgrade journal successor link is contradictory")
 	}
 	if value.Phase != "superseded" && value.SupersededAt != nil {
@@ -270,7 +273,40 @@ func validateJournal(value journal, id string) error {
 	if value.SchemaVersion == 1 && (value.PredecessorID != "" || value.SuccessorID != "" || value.SupersededAt != nil) {
 		return errors.New("legacy upgrade journal contains successor evidence")
 	}
+	if value.DatabaseRecovery != nil {
+		recovery := value.DatabaseRecovery
+		if value.SchemaVersion < 3 || recovery.Version != 1 || !validSHA256(recovery.PreviewDigest) || recovery.OldDatabase.Device == 0 || recovery.OldDatabase.Inode == 0 || recovery.ReplacementDatabase.Device == 0 || recovery.ReplacementDatabase.Inode == 0 || recovery.OldDatabase == recovery.ReplacementDatabase || recovery.ReplacementDatabase.SchemaVersion != value.Candidate.Build.SupportedControllerSchemaVersion || !validRevision(recovery.SuccessorRevision) || recovery.SuccessorRevision != value.SuccessorRevision || !recovery.DatabaseRelocationConfirmed || !recovery.FullBackupConfirmed || recovery.IntentAt.IsZero() || !validReplacementVerification(recovery.Verification, value.FailureReason) {
+			return errors.New("upgrade journal database recovery evidence is invalid")
+		}
+		if value.Phase != "successor_recovery_intent" && value.Phase != "successor_prepare_intent" && value.Phase != "superseded" {
+			return errors.New("upgrade journal database recovery evidence is contradictory")
+		}
+		if value.Phase != "successor_recovery_intent" && recovery.LocatorPublishedAt == nil {
+			return errors.New("upgrade journal database recovery publication is unavailable")
+		}
+		if value.Phase == "successor_recovery_intent" && value.Database != recovery.OldDatabase || value.Phase != "successor_recovery_intent" && value.Database != recovery.ReplacementDatabase {
+			return errors.New("upgrade journal database recovery identity is contradictory")
+		}
+	} else if value.Phase == "successor_recovery_intent" {
+		return errors.New("upgrade journal database recovery evidence is unavailable")
+	}
 	return nil
+}
+
+func validSHA256(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' && character < 'a' || character > 'f' {
+			return false
+		}
+	}
+	return true
+}
+
+func validReplacementVerification(value replacementDatabaseVerification, reason string) bool {
+	return validSHA256(value.ContentDigest) && validSHA256(value.AuthorityDigest) && value.SchemaVersion > 0 && value.IntegrityOK && value.ForeignKeysOK && value.BindingMatches && value.DesiredConfigurationMatch && value.ReadinessReason == reason
 }
 
 func validUpgradeID(value string) bool {
