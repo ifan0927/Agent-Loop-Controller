@@ -253,6 +253,27 @@ func activitySnapshotDigest(event ActivityEvent) string {
 	return digestText("activity-snapshot-v1\x00" + string(raw))
 }
 
+// ActivityEventsCompatibleForReplay permits the same immutable source fact to
+// be discovered by live indexing and legacy backfill in either order. The
+// first persisted coverage classification remains part of immutable history;
+// every other private source and public semantic field must still match.
+func ActivityEventsCompatibleForReplay(persisted, replay ActivityEvent) bool {
+	if persisted.SourceKind != replay.SourceKind || persisted.SourceIdentity != replay.SourceIdentity || persisted.SourceEvidenceDigest != replay.SourceEvidenceDigest {
+		return false
+	}
+	if persisted.SnapshotDigest == replay.SnapshotDigest {
+		return true
+	}
+	classes := []ActivityIngestionClass{persisted.Coverage.IngestionClass, replay.Coverage.IngestionClass}
+	slices.Sort(classes)
+	if classes[0] != ActivityIngestionBackfill || classes[1] != ActivityIngestionCurrent {
+		return false
+	}
+	normalized := replay
+	normalized.Coverage.IngestionClass = persisted.Coverage.IngestionClass
+	return activitySnapshotDigest(normalized) == persisted.SnapshotDigest
+}
+
 func validActivityCategory(value ActivityCategory) bool {
 	return slices.Contains([]ActivityCategory{ActivityRun, ActivityAttention, ActivityOperation, ActivityRepository, ActivityOnboarding, ActivityConfiguration, ActivityWorker, ActivityAdmissionCapacity}, value)
 }

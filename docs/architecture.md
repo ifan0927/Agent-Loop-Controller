@@ -1174,7 +1174,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 41; migration history is code, not a
+inspection. The current schema is version 42; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees
@@ -1500,7 +1500,9 @@ snapshots expose only the eight closed categories, finite actor/reason/event
 classifications, authorized target, state/version changes, bounded typed links,
 times, evidence digests, and immutable per-event coverage class. The private
 source key and target binding never leave persistence. Exact replay is
-idempotent; identity or snapshot drift conflicts and never overwrites history.
+idempotent. Equivalent current/backfill discovery preserves the first persisted
+coverage classification; source or semantic snapshot drift conflicts and never
+overwrites history.
 
 Meaningful SQLite-owned source facts and their activity rows commit in one
 transaction. A settled operation has exactly one primary activity link: a

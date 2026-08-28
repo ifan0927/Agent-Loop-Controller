@@ -92,7 +92,7 @@ func removeIntegrityV40(t *testing.T, db *sql.DB) {
 		`DROP TABLE IF EXISTS integrity_registry_sources`,
 		`DROP TABLE IF EXISTS integrity_registry_families`,
 		`DROP TABLE IF EXISTS controller_integrity_generation`,
-		`DELETE FROM schema_migrations WHERE version IN (40,41)`,
+		`DELETE FROM schema_migrations WHERE version IN (40,41,42)`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			t.Fatal(err)

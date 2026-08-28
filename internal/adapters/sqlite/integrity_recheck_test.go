@@ -262,6 +262,6 @@ func TestIntegrityV41MigrationPreservesV40EvidenceAndOlderBinaryFailsClosed(t *t
 	}
 	if older, err := openWithSupportedSchema(path, 40); err == nil {
 		older.Close()
-		t.Fatal("schema-v40 binary accepted schema v41")
+		t.Fatal("schema-v40 binary accepted schema v42")
 	}
 }
