@@ -48,18 +48,26 @@ func databaseStillMatches(path string, uid int, expected databaseEvidence) bool 
 }
 
 type replacementAuthorityState struct {
-	CanonicalConfigPath string `json:"canonical_config_path"`
-	DatabasePath        string `json:"database_path"`
-	DesiredID           int64  `json:"desired_id"`
-	EffectiveID         int64  `json:"effective_id"`
-	AuthorityVersion    int64  `json:"authority_version"`
-	DesiredDigest       string `json:"desired_digest"`
-	DesiredLifecycle    string `json:"desired_lifecycle"`
-	EffectiveDigest     string `json:"effective_digest"`
-	EffectiveLifecycle  string `json:"effective_lifecycle"`
-	IntegrityGeneration int64  `json:"integrity_generation"`
-	PublishedGeneration int64  `json:"published_generation"`
-	IntegrityReadiness  string `json:"integrity_readiness"`
+	CanonicalConfigPath            string `json:"canonical_config_path"`
+	DatabasePath                   string `json:"database_path"`
+	DesiredID                      int64  `json:"desired_id"`
+	EffectiveID                    int64  `json:"effective_id"`
+	AuthorityVersion               int64  `json:"authority_version"`
+	DesiredDigest                  string `json:"desired_digest"`
+	DesiredLifecycle               string `json:"desired_lifecycle"`
+	EffectiveDigest                string `json:"effective_digest"`
+	EffectiveLifecycle             string `json:"effective_lifecycle"`
+	IntegrityGeneration            int64  `json:"integrity_generation"`
+	PublishedGeneration            int64  `json:"published_generation"`
+	CurrentObservationID           string `json:"current_observation_id"`
+	CurrentObservationDigest       string `json:"current_observation_digest"`
+	ObservationID                  string `json:"observation_id"`
+	ObservationDigest              string `json:"observation_digest"`
+	ObservationSchema              string `json:"observation_schema"`
+	ObservationRegistry            string `json:"observation_registry"`
+	ObservationTargetGeneration    int64  `json:"observation_target_generation"`
+	ObservationPublishedGeneration int64  `json:"observation_published_generation"`
+	IntegrityReadiness             string `json:"integrity_readiness"`
 }
 
 func verifyReplacementDatabase(ctx context.Context, path, configPath, configDigest, expectedReason string, expectedSchema, uid int) (databaseEvidence, replacementDatabaseVerification, error) {
@@ -112,7 +120,7 @@ func verifyReplacementDatabase(ctx context.Context, path, configPath, configDige
 		return databaseEvidence{}, replacementDatabaseVerification{}, errors.New("replacement Controller database foreign-key verification failed")
 	}
 	var state replacementAuthorityState
-	err = conn.QueryRowContext(ctx, `SELECT a.canonical_config_path,a.database_path,a.desired_generation_id,COALESCE(a.effective_generation_id,0),a.authority_version,d.digest,d.lifecycle,COALESCE(e.digest,''),COALESCE(e.lifecycle,''),g.generation,COALESCE(c.published_generation,0),COALESCE(o.effective_readiness,'') FROM configuration_authority a JOIN configuration_generations d ON d.generation_id=a.desired_generation_id LEFT JOIN configuration_generations e ON e.generation_id=a.effective_generation_id JOIN controller_integrity_generation g ON g.singleton=1 LEFT JOIN controller_integrity_current c ON c.singleton=1 LEFT JOIN controller_integrity_observations o ON o.observation_id=c.observation_id WHERE a.authority_id=1`).Scan(&state.CanonicalConfigPath, &state.DatabasePath, &state.DesiredID, &state.EffectiveID, &state.AuthorityVersion, &state.DesiredDigest, &state.DesiredLifecycle, &state.EffectiveDigest, &state.EffectiveLifecycle, &state.IntegrityGeneration, &state.PublishedGeneration, &state.IntegrityReadiness)
+	err = conn.QueryRowContext(ctx, `SELECT a.canonical_config_path,a.database_path,a.desired_generation_id,COALESCE(a.effective_generation_id,0),a.authority_version,d.digest,d.lifecycle,COALESCE(e.digest,''),COALESCE(e.lifecycle,''),g.generation,COALESCE(c.published_generation,0),COALESCE(c.observation_id,''),COALESCE(c.observation_digest,''),COALESCE(o.observation_id,''),COALESCE(o.observation_digest,''),COALESCE(o.schema_version,''),COALESCE(o.registry_version,''),COALESCE(o.target_generation,0),COALESCE(o.published_generation,0),COALESCE(o.effective_readiness,'') FROM configuration_authority a JOIN configuration_generations d ON d.generation_id=a.desired_generation_id LEFT JOIN configuration_generations e ON e.generation_id=a.effective_generation_id JOIN controller_integrity_generation g ON g.singleton=1 LEFT JOIN controller_integrity_current c ON c.singleton=1 LEFT JOIN controller_integrity_observations o ON o.observation_id=c.observation_id WHERE a.authority_id=1`).Scan(&state.CanonicalConfigPath, &state.DatabasePath, &state.DesiredID, &state.EffectiveID, &state.AuthorityVersion, &state.DesiredDigest, &state.DesiredLifecycle, &state.EffectiveDigest, &state.EffectiveLifecycle, &state.IntegrityGeneration, &state.PublishedGeneration, &state.CurrentObservationID, &state.CurrentObservationDigest, &state.ObservationID, &state.ObservationDigest, &state.ObservationSchema, &state.ObservationRegistry, &state.ObservationTargetGeneration, &state.ObservationPublishedGeneration, &state.IntegrityReadiness)
 	if err != nil || state.CanonicalConfigPath != configPath || state.DatabasePath != path {
 		return databaseEvidence{}, replacementDatabaseVerification{}, errors.New("replacement Controller database binding conflicts")
 	}
@@ -127,7 +135,8 @@ func verifyReplacementDatabase(ctx context.Context, path, configPath, configDige
 		return databaseEvidence{}, replacementDatabaseVerification{}, errors.New("replacement desired configuration authority conflicts")
 	}
 	readinessReason := replacementReadinessReason(state, configDigest)
-	if readinessReason != expectedReason {
+	readiness, err := classifyRecoveryReadiness(state, expectedReason, readinessReason)
+	if err != nil {
 		return databaseEvidence{}, replacementDatabaseVerification{}, errors.New("replacement Controller readiness evidence changed")
 	}
 	authorityRaw, err := json.Marshal(state)
@@ -140,9 +149,56 @@ func verifyReplacementDatabase(ctx context.Context, path, configPath, configDige
 	}
 	verification := replacementDatabaseVerification{
 		ContentDigest: contentBefore, AuthorityDigest: sha256Hex(authorityRaw), SchemaVersion: schema,
-		IntegrityOK: true, ForeignKeysOK: true, BindingMatches: true, DesiredConfigurationMatch: true, ReadinessReason: readinessReason,
+		IntegrityOK: true, ForeignKeysOK: true, BindingMatches: true, DesiredConfigurationMatch: true, Readiness: readiness,
 	}
 	return identity, verification, nil
+}
+
+func classifyRecoveryReadiness(state replacementAuthorityState, predecessorReason, replacementReason string) (recoveryReadinessVerification, error) {
+	verification := recoveryReadinessVerification{
+		PredecessorReason: predecessorReason, ReplacementReason: replacementReason,
+		GenerationRelationship: classifyIntegrityGeneration(state.IntegrityGeneration, state.PublishedGeneration),
+		CurrentGeneration:      state.IntegrityGeneration, PublishedGeneration: state.PublishedGeneration,
+		CurrentObservationValid: currentIntegrityObservationValid(state), ObservationReadiness: state.IntegrityReadiness,
+	}
+	if replacementReason == predecessorReason {
+		verification.Relationship = recoveryReadinessExactMatch
+		return verification, nil
+	}
+	if predecessorReason == "integrity_conflict" && replacementReason == "integrity_pending" && state.IntegrityGeneration > state.PublishedGeneration && verification.CurrentObservationValid {
+		verification.Relationship = recoveryReadinessIntegrityConflictPending
+		verification.GenerationRelationship = integrityGenerationAdvanced
+		return verification, nil
+	}
+	return recoveryReadinessVerification{}, errors.New("replacement readiness relationship is unavailable")
+}
+
+func classifyIntegrityGeneration(current, published int64) integrityGenerationRelationship {
+	if current == published {
+		return integrityGenerationCurrent
+	}
+	if current > published {
+		return integrityGenerationAdvanced
+	}
+	return integrityGenerationPublishedAhead
+}
+
+func currentIntegrityObservationValid(state replacementAuthorityState) bool {
+	return state.CurrentObservationID != "" && state.CurrentObservationID == state.ObservationID &&
+		validSHA256(state.CurrentObservationDigest) && state.CurrentObservationDigest == state.ObservationDigest &&
+		state.ObservationSchema == "v1" && state.ObservationRegistry == "v1" &&
+		state.ObservationTargetGeneration == state.PublishedGeneration &&
+		state.ObservationPublishedGeneration == state.PublishedGeneration &&
+		validIntegrityReadiness(state.IntegrityReadiness)
+}
+
+func validIntegrityReadiness(value string) bool {
+	switch value {
+	case "ready", "not_ready", "unknown", "conflict":
+		return true
+	default:
+		return false
+	}
 }
 
 func replacementReadinessReason(state replacementAuthorityState, configDigest string) string {
