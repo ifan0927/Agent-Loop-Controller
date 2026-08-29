@@ -39,7 +39,7 @@ func TestControllerWorkerRejectsRootBeforeOpeningRuntime(t *testing.T) {
 	}
 }
 
-func TestWorkerRunsOneIntegrityFamilyAfterNormalDispatch(t *testing.T) {
+func TestWorkerDispatchLeavesIntegrityMaintenanceToBoundedBoundary(t *testing.T) {
 	store, err := sqlitestore.Open(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -55,8 +55,8 @@ func TestWorkerRunsOneIntegrityFamilyAfterNormalDispatch(t *testing.T) {
 		t.Fatalf("result=%+v fallback=%t err=%v", result, fallbackCalled, err)
 	}
 	next, err := store.RunIntegrityMaintenance(context.Background(), "test-probe", time.Now().UTC())
-	if err != nil || next.Family != application.IntegrityRunDelivery {
-		t.Fatalf("worker did not commit exactly one first-family batch: next=%+v err=%v", next, err)
+	if err != nil || next.Family != application.IntegrityStorageSchema {
+		t.Fatalf("dispatch unexpectedly advanced integrity maintenance: next=%+v err=%v", next, err)
 	}
 }
 
@@ -297,7 +297,7 @@ func TestControllerWorkerSubprocessHelper(t *testing.T) {
 			store.Close()
 			return automaticWorkerRuntime{}, err
 		}
-		return automaticWorkerRuntime{store: store, dispatch: dispatcher.Dispatch}, nil
+		return automaticWorkerRuntime{store: store, dispatch: dispatcher.Dispatch, maintenance: integrityWorkerMaintenance(store)}, nil
 	}
 	if err := controllerWorker([]string{"--config", os.Getenv("IFAN_WORKER_CONFIG")}); err != nil {
 		t.Fatal(err)

@@ -30,6 +30,7 @@ const (
 type admissionWorkerDispatch func(context.Context) (application.LinearTodoDispatchResult, error)
 type admissionWorkerWait func(context.Context, time.Duration) error
 type admissionWorkerObserve func(admissionWorkerResult) error
+type admissionWorkerMaintenance func(context.Context)
 
 type boundedAdmissionWorker struct {
 	capacity int
@@ -40,14 +41,23 @@ type boundedAdmissionWorker struct {
 }
 
 func (w *boundedAdmissionWorker) drain() {
+	_ = w.drainWithError()
+}
+
+func (w *boundedAdmissionWorker) drainWithError() error {
+	var firstErr error
 	for w.active > 0 {
 		select {
-		case <-w.errors:
+		case err := <-w.errors:
+			if firstErr == nil {
+				firstErr = err
+			}
 			w.active--
 		case <-w.results:
 			w.active--
 		}
 	}
+	return firstErr
 }
 
 func newBoundedAdmissionWorker(capacity int, dispatch admissionWorkerDispatch) (*boundedAdmissionWorker, error) {
@@ -118,6 +128,10 @@ func runAdmissionWorkerAtObserved(ctx context.Context, once bool, poll time.Dura
 }
 
 func runBoundedAdmissionWorkerAtObserved(ctx context.Context, once bool, poll time.Duration, capacity int, dispatch admissionWorkerDispatch, wait admissionWorkerWait, now func() time.Time, observe admissionWorkerObserve) (admissionWorkerResult, error) {
+	return runBoundedAdmissionWorkerAtObservedWithMaintenance(ctx, once, poll, capacity, dispatch, wait, now, observe, nil)
+}
+
+func runBoundedAdmissionWorkerAtObservedWithMaintenance(ctx context.Context, once bool, poll time.Duration, capacity int, dispatch admissionWorkerDispatch, wait admissionWorkerWait, now func() time.Time, observe admissionWorkerObserve, maintenance admissionWorkerMaintenance) (admissionWorkerResult, error) {
 	if poll <= 0 || dispatch == nil || wait == nil || now == nil {
 		return admissionWorkerResult{}, errors.New("automatic admission worker configuration is invalid")
 	}
@@ -137,6 +151,7 @@ func runBoundedAdmissionWorkerAtObserved(ctx context.Context, once bool, poll ti
 	}
 	var nextWake time.Time
 	var nextAdmissionScan time.Time
+	maintenancePending := false
 	for {
 		if err := ctx.Err(); err != nil {
 			joinDispatches()
@@ -176,7 +191,9 @@ func runBoundedAdmissionWorkerAtObserved(ctx context.Context, once bool, poll ti
 		if runWakeDue {
 			dispatchNotBefore = time.Time{}
 		}
-		bounded.fillReady(dispatchCtx, cycleNow, dispatchNotBefore)
+		if !maintenancePending {
+			bounded.fillReady(dispatchCtx, cycleNow, dispatchNotBefore)
+		}
 		cycle, err := bounded.next(ctx)
 		// A cycle can surface context cancellation from a Linear read or a
 		// long-running driver. Treat the worker context as authoritative before
@@ -195,6 +212,7 @@ func runBoundedAdmissionWorkerAtObserved(ctx context.Context, once bool, poll ti
 			bounded.drain()
 			return result, err
 		}
+		maintenancePending = true
 		result.LastOutcome = cycle.Outcome
 		result.QueueDecision = cycle.QueueDecision
 		result.LastCycleCompletedAt = now().UTC()
@@ -221,9 +239,22 @@ func runBoundedAdmissionWorkerAtObserved(ctx context.Context, once bool, poll ti
 			return result, err
 		}
 		if once {
-			joinDispatches()
+			// Production --once uses capacity one. Draining rather than canceling
+			// also preserves the quiescence contract for direct bounded fixtures.
+			if err := bounded.drainWithError(); err != nil {
+				return result, err
+			}
+			if maintenancePending && maintenance != nil {
+				maintenance(ctx)
+			}
 			result.Stopped = "once"
 			return result, nil
+		}
+		if maintenancePending && bounded.active == 0 && len(bounded.results)+len(bounded.errors) == 0 {
+			if maintenance != nil {
+				maintenance(ctx)
+			}
+			maintenancePending = false
 		}
 		delay := poll
 		if cycle.Outcome == application.LinearTodoDispatchRetryWait || cycle.Outcome == application.LinearTodoDispatchRetryScheduled {

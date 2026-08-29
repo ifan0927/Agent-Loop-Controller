@@ -146,8 +146,8 @@ func (m *Manager) stageSuccessorBundle(predecessor journal, database databaseEvi
 	if !candidateCompatible(prepared.Evidence, predecessor.SuccessorRevision, database.SchemaVersion) {
 		return errors.New("successor candidate build identity is unverifiable or incompatible")
 	}
-	if predecessor.FailureReason == "integrity_convergence_exhausted" && prepared.Evidence.Build.SupportedControllerSchemaVersion < legacyIntegrityConvergenceSchemaVersion+1 {
-		return errors.New("integrity convergence successor does not support schema v43")
+	if (predecessor.FailureReason == "integrity_convergence_exhausted" || predecessor.FailureReason == "integrity_publication_not_stable") && prepared.Evidence.Build.SupportedControllerSchemaVersion < installedIntegrityPublicationSchemaVersion {
+		return errors.New("integrity recovery successor does not support schema v43")
 	}
 	finalBundle := m.bundlePath(predecessor.SuccessorID)
 	stagingBundle := filepath.Join(m.upgradeRoot(), "."+predecessor.SuccessorID+".prepare")
