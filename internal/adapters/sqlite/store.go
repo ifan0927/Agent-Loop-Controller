@@ -30,7 +30,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 42
+const schemaVersion = 43
 
 // SupportedSchemaVersion is the single maintained source for the newest
 // Controller database schema understood by this binary.
@@ -791,6 +791,8 @@ func migrateSQLiteGeneric(ctx context.Context, db sqliteTransactioner, supported
 			statements = migrationV41
 		case 42:
 			statements = migrationV42
+		case 43:
+			statements = migrationV43
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -2123,6 +2125,23 @@ var migrationV42 = []string{
 	`UPDATE activity_backfill_progress SET status='pending',updated_at=CURRENT_TIMESTAMP
 		WHERE status='conflict' AND reason_code='immutable_source_conflict'
 		AND source_kind IN ('run_transition','repository_lifecycle','onboarding','operator_attention','operation_receipt')`,
+}
+
+var migrationV43 = []string{
+	`DROP TRIGGER integrity_track_activity_runtime_state_update`,
+	`CREATE TRIGGER integrity_track_activity_runtime_state_update AFTER UPDATE ON activity_runtime_state
+		WHEN OLD.source_kind IS NOT NEW.source_kind
+			OR OLD.source_identity IS NOT NEW.source_identity
+			OR OLD.classification IS NOT NEW.classification
+			OR OLD.source_evidence_digest IS NOT NEW.source_evidence_digest
+			OR OLD.status IS NOT NEW.status
+			OR OLD.reason_code IS NOT NEW.reason_code
+		BEGIN
+			UPDATE controller_integrity_generation SET generation=generation+1,updated_at=CURRENT_TIMESTAMP WHERE singleton=1;
+			INSERT INTO controller_integrity_scope_revisions(family,scope_kind,scope_id,revision_generation,updated_at)
+			SELECT 'operation_activity','controller','local-controller',generation,CURRENT_TIMESTAMP FROM controller_integrity_generation WHERE singleton=1
+			ON CONFLICT(family,scope_kind,scope_id) DO UPDATE SET revision_generation=excluded.revision_generation,updated_at=excluded.updated_at;
+		END`,
 }
 
 func integrityRecheckMigrationV41() []string {

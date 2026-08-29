@@ -1174,7 +1174,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 42; migration history is code, not a
+inspection. The current schema is version 43; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees
@@ -1371,6 +1371,16 @@ to the prepared successor. Every transition is replayable, so response loss
 cannot create a second successor or ambiguous pointer authority. The
 predecessor bundle then becomes immutable retained evidence and is never a
 cleanup target.
+
+The compatibility-only `integrity_convergence_exhausted` attention is eligible
+under that same managed-successor boundary. It is derived only from a valid
+current v1 observation linked to a published convergence-attempt-eight scan
+whose exact seven registered families are all incomplete
+`unknown/convergence_bound_exhausted`, while the current integrity generation
+is equal to or newer than the published generation. The observation digest,
+current pointer, registry order, scan link, family set, and coverage/count
+evidence must all verify. Generic `integrity_pending`, partial or malformed
+evidence, and unrelated unknown results never gain successor authority.
 
 The successor binds its previous-binary evidence to the failed installed
 candidate, never to the predecessor's pre-bootstrap binary. Its replacement
@@ -1578,6 +1588,11 @@ projection. Its versioned registry is closed to exactly `storage_schema`,
 generation and the affected private family revision for every registered
 source-table mutation. Integrity scan, progress, finding, observation, and
 current-pointer writes are excluded, so maintenance cannot invalidate itself.
+For `activity_runtime_state`, an update that changes only `observed_at` is also
+excluded: freshness remains queryable but does not change the classified
+runtime authority. Insert, delete, or any change to source kind, source
+identity, classification, source-evidence digest, status, or reason still
+advances the `operation_activity` revision.
 
 The automatic worker gives onboarding and normal admission their opportunity
 first, then advances at most one SQLite-only integrity family batch without a
@@ -1589,6 +1604,12 @@ racing mutation supersedes and requeues the scan. Immutable family states are
 `ready`, `not_ready`, `unknown`, and `conflict`, aggregated in that precedence.
 A prior observation remains history, but its effective readiness becomes
 `unknown` immediately when the registry or source generation advances.
+Ordinary progress remains one family per cycle. When repeated source advance
+reaches the fixed convergence-attempt bound, one final SQLite-only transaction
+checks all seven fixed families and uses the same mutation-fenced publication
+path. It preserves each real family result and performs no external effect,
+heavy work, or retry loop; a mutation racing that fallback supersedes it rather
+than publishing stale readiness.
 
 The configured operator may explicitly request the closed
 `recheck_integrity` Controller operation. One versioned private request key
@@ -1734,7 +1755,7 @@ around it. The principal table groups are:
 | `operator_actions` | Action-specific authenticated recovery intent and legacy validated/applied/observed provenance, separate from automatic workflow evidence |
 | `operation_receipts` | Scope-neutral accepted/applied/observed operation identity, outcome, and sanitized result evidence; legacy operator actions are backfilled and mirrored here |
 | `activity_events`, operation links, backfill progress, and runtime classification state | Immutable sanitized activity snapshots, one-primary-event receipt correlation, stable ingestion watermarks, bounded restart progress, and explicit coverage evidence; never workflow authority |
-| integrity registry, generation/revision, scan, explicit-recheck binding/active/guard, checked-family, finding, observation, and current-pointer tables | Closed SQLite-only invariant registry, structural mutation coverage, one restart-safe bounded scan lane, receipt-bound post-acceptance rechecks, exact transaction-only finalization suppression, immutable mutation-fenced observations, and sanitized explanatory findings; never workflow or repair authority |
+| integrity registry, generation/revision, scan, explicit-recheck binding/active/guard, checked-family, finding, observation, and current-pointer tables | Closed SQLite-only invariant registry, semantic mutation coverage with a freshness-only runtime-state exception, one restart-safe bounded scan lane plus a single transaction-fenced full-family convergence fallback, receipt-bound post-acceptance rechecks, exact transaction-only finalization suppression, immutable mutation-fenced observations, and sanitized explanatory findings; never workflow or repair authority |
 | configuration generation, authority, apply/recovery-intent, and convergence tables | Immutable desired/effective metadata, one Controller-wide CAS mutation authority, crash reconciliation state, optional immutable rollback-source identity, and meaningful sanitized transitions; raw desired bytes remain outside SQLite and external bytes are never stored |
 | `configuration_drafts` | At most one active Controller-wide normal or rollback-origin typed draft, revision/edit replay authority, immutable rollback source when applicable, sanitized validation/preview evidence, and generation/receipt settlement; no raw candidate, path, identity, or credential authority |
 | repository lifecycle, readiness, recheck, and removal tables | Immutable incarnation history, one current canonical/profile/binding authority, complete readiness evidence, exclusive source-bound removal draft and accepted/applied/observed settlement, and tombstone evidence; no external-resource deletion authority |

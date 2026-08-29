@@ -395,8 +395,9 @@ The acceptance matrix requires:
 | Repository retirement | Schema-35 upgrade preservation, immutable incarnation/tombstone identity, exclusive removal/configuration draft authority, every typed guard category, sanitized preview, intent-before-file apply, accepted/applied/observed receipt replay, response-loss reconciliation, exact worker convergence retirement, current-query hiding with historical evidence retention, final-profile disabled-admission operation, rollback non-resurrection, and same-name fresh-incarnation onboarding |
 | Existing-checkout onboarding | Read-only real-Git preflight with no object/ref/index mutation, unsafe/symlink/overlap rejection, exact local/remote base-head proof, sanitized path evidence, open/start/resume replay, pre-start cancel, one-active-repository/source constraints, migration and restart recovery, intent-before-effect step ordering, Linear lookup/create/reread, source-bound configuration exclusion, fresh worker convergence, disabled lifecycle creation, and complete readiness settlement |
 | Routine queries | Authorization before lookup/count/order/page, schema- and scope-bound cursors, deterministic sanitized digests, fixed eleven-gate order, exact-head invalidation, conservative attention supersession, latest-complete queue reads, pre-binding onboarding discovery, schema-v2 heartbeat compatibility, and read-only settings convergence |
-| Local binary upgrade | Independently cloned exact detached clean revision and build identity, unshared Git object storage, worker-owned single-link target, selected/opposite/legacy supervisor fencing, online SQLite backup under WAL activity, replacement/rollback/bootstrap/cleanup intent interruption, permanent post-intent rollback rejection, bounded heartbeat/process/config/schema/integrity observation, eligible post-bootstrap readiness-attention successor preparation, immutable bidirectional predecessor/successor lineage, active-pointer replay, failed-candidate-only successor rollback, fresh full-backup confirmation, and exact-owned successor cleanup with predecessor retention |
-| Activity and operation history | Closed classifications and validation, deterministic immutable identity/replay conflict, current/backfill compatible replay with first-classification preservation, source-transaction rollback, one-primary-event operation correlation, bounded schema-only migration/backfill/restart/interleaving, runtime unchanged suppression and conflict coverage, authorization-first filters/count/order/page, ingestion-watermark pagination, stable receipt ordering during monotonic advance, cursor drift, corruption failure, and negative sanitization |
+| Local binary upgrade | Independently cloned exact detached clean revision and build identity, unshared Git object storage, worker-owned single-link target, selected/opposite/legacy supervisor fencing, online SQLite backup under WAL activity, replacement/rollback/bootstrap/cleanup intent interruption, permanent post-intent rollback rejection, bounded heartbeat/process/config/schema/integrity observation, eligible post-bootstrap readiness-attention successor preparation including exact legacy convergence-exhaustion evidence and malformed/generic-pending rejection, immutable bidirectional predecessor/successor lineage, active-pointer replay, failed-candidate-only successor rollback, fresh full-backup confirmation, and exact-owned successor cleanup with predecessor retention |
+| Activity and operation history | Closed classifications and validation, deterministic immutable identity/replay conflict, current/backfill compatible replay with first-classification preservation, source-transaction rollback, one-primary-event operation correlation, bounded schema-only migration/backfill/restart/interleaving, runtime unchanged suppression including no integrity-generation advance for freshness-only updates, semantic runtime-state trigger coverage, authorization-first filters/count/order/page, ingestion-watermark pagination, stable receipt ordering during monotonic advance, cursor drift, corruption failure, and negative sanitization |
+| Controller integrity | Seven-family registry and trigger coverage, one-family restart progress, freshness-only runtime-state exclusion, real full-family bounded-convergence fallback, publication-generation mutation fencing, explicit-recheck separation, exact legacy exhaustion successor classification, and malformed/partial/generic-pending rejection |
 | Typed configuration drafts | One active normal or rollback-origin draft under concurrent open, authorization-before-lookup and hidden targets, every allowlisted field and input bound, edit/discard replay, validation and preview invalidation, v32-compatible normal identity plus deterministic source-bound rollback identity, schema-1-through-5 scalar projection, source-prune/open exclusion plus exact post-open replay after pruning, committed intent/receipt source evidence, immutable generation provenance, unchanged-byte no-op, real apply, response-loss/restart replay, capacity drain impact, sanitized output, and isolated CLI restart/convergence acceptance |
 | Bounded concurrency | Generic capacity above two, same-repository exclusion, drain-on-reduction, sibling failure isolation, and restart reconstruction |
 | Implementation | Owned worktree, resumable session, exact candidate, successful verifier batch |
@@ -438,7 +439,9 @@ controller process. Cover at least:
   response loss without duplicate successors, authorized database-relocation
   preview stability, exact readiness and the narrow monotonic
   `integrity_conflict`-to-`integrity_pending` generation relationship, invalid
-  current-observation and generation drift, recovery intent,
+  current-observation and generation drift, exact pre-v43
+  `integrity_convergence_exhausted` successor attention plus malformed evidence
+  rejection, recovery intent,
   old/recovered/third locator reconciliation, locator publication, recovered
   journal binding, replacement database/WAL content drift, current-installation
   publication, and each exact-owned cleanup artifact with terminal predecessor
@@ -451,8 +454,14 @@ that bypass safety solely to make fault injection easier.
 ## Database Migrations
 
 SQLite migrations are ordered in `internal/adapters/sqlite/store.go`; the current
-schema version is 42. Opening a database applies missing forward migrations in a
+schema version is 43. Opening a database applies missing forward migrations in a
 transaction. A database newer than the binary fails closed.
+
+The v42-to-v43 fixture preserves every runtime-state row and all insert/delete
+tracking while replacing only the `activity_runtime_state` update trigger.
+Tests must prove that `observed_at`-only refreshes do not advance generation,
+all six semantic columns do, repeated worker/indexing freshness converges, and
+the seven-family fallback rejects a publication-time source mutation.
 
 The repository-retirement compatibility review preserves the preceding
 lifecycle/readiness boundary: existing lifecycle, snapshot, recheck, admission,

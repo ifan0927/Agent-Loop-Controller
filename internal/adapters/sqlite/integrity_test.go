@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -249,7 +250,7 @@ func TestIntegrityScanRestartAndMutationFence(t *testing.T) {
 	}
 }
 
-func TestIntegrityConvergenceBoundPublishesIncompleteUnknown(t *testing.T) {
+func TestIntegrityConvergenceBoundPublishesCurrentFullFamilyResult(t *testing.T) {
 	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -257,6 +258,13 @@ func TestIntegrityConvergenceBoundPublishesIncompleteUnknown(t *testing.T) {
 	defer store.Close()
 	now := time.Date(2026, 8, 27, 4, 0, 0, 0, time.UTC)
 	completeIntegrityActivityBackfill(t, store.Store, now)
+	run := activityTestRun("convergence-finding")
+	if _, created, err := store.CreateRun(context.Background(), application.CreateRunInput{Run: run}); err != nil || !created {
+		t.Fatalf("created=%t err=%v", created, err)
+	}
+	if _, err := store.db.Exec(`UPDATE runs SET current_state='executing' WHERE run_id=?`, run.ID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := store.RunIntegrityMaintenance(context.Background(), "racing-worker", now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
@@ -275,12 +283,53 @@ func TestIntegrityConvergenceBoundPublishesIncompleteUnknown(t *testing.T) {
 	}
 	service, requester := integrityQueryService(t, store.Store)
 	summary, err := service.Summary(context.Background(), requester)
-	if err != nil || !summary.Current || summary.Readiness != application.IntegrityUnknown || summary.Observation.CountComplete || summary.Observation.CoverageComplete {
+	if err != nil || !summary.Current || summary.Readiness != application.IntegrityNotReady || !summary.Observation.CountComplete || !summary.Observation.CoverageComplete {
 		t.Fatalf("summary=%+v err=%v", summary, err)
 	}
 	for _, result := range summary.Observation.Results {
-		if result.State != application.IntegrityUnknown || result.ReasonCode != "convergence_bound_exhausted" {
+		if result.Family == application.IntegrityRunDelivery {
+			if result.State != application.IntegrityNotReady || result.ReasonCode != "deterministic_findings" {
+				t.Fatalf("run delivery result=%+v", result)
+			}
+			continue
+		}
+		if result.State != application.IntegrityReady || result.ReasonCode != "complete" {
 			t.Fatalf("result=%+v", result)
 		}
+	}
+}
+
+func TestIntegrityConvergenceFallbackRejectsRacingSourceMutation(t *testing.T) {
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 8, 27, 5, 0, 0, 0, time.UTC)
+	completeIntegrityActivityBackfill(t, store.Store, now)
+	if _, err := store.RunIntegrityMaintenance(context.Background(), "racing-worker", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	for index := 1; index < 8; index++ {
+		if _, err := store.db.Exec(`UPDATE heavy_capacity_authority SET effective_identity=? WHERE namespace='local_heavy_work'`, fmt.Sprintf("race-%d", index)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.RunIntegrityMaintenance(context.Background(), "racing-worker", now.Add(time.Duration(index+1)*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.db.Exec(`CREATE TRIGGER integrity_test_fallback_race AFTER INSERT ON controller_integrity_checked_families BEGIN UPDATE controller_integrity_generation SET generation=generation+1 WHERE singleton=1; END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE heavy_capacity_authority SET effective_identity='race-final' WHERE namespace='local_heavy_work'`); err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.RunIntegrityMaintenance(context.Background(), "racing-worker", now.Add(9*time.Minute))
+	if err != nil || result.Published || !result.Superseded {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	var published int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM controller_integrity_scans WHERE target_generation=? AND status='published'`, result.TargetGeneration).Scan(&published); err != nil || published != 0 {
+		t.Fatalf("published=%d err=%v", published, err)
 	}
 }

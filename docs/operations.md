@@ -1018,6 +1018,13 @@ and does not stop existing delivery. The implemented interface is the
 authorization-first application summary/detail contract; there is no new
 public CLI command, explicit recheck operation, activity-feed event, raw-row
 export, repair action, or manual SQL recovery procedure in this slice.
+Repeated unchanged runtime-state publication refreshes `observed_at` without
+advancing the integrity generation; any semantic classification, evidence,
+status, reason, identity, insert, or delete still advances it. If repeated
+valid source writes exhaust the fixed convergence-attempt bound, that cycle
+runs one bounded SQLite-only check of all seven fixed families and publishes
+only when the generation remains unchanged. A racing mutation supersedes the
+fallback; there is no force-ready path or unbounded retry.
 
 **Related commands**
 
@@ -2946,7 +2953,8 @@ separate as `upgrade_health` and `controller_readiness`.
 An attention result whose `upgrade_health` is `healthy` and whose
 `controller_readiness` is `not_ready` may be eligible for one verified managed
 successor. Eligibility is limited to `configuration_not_converged`,
-`integrity_not_ready`, and `integrity_conflict`. Keep the selected worker
+`integrity_not_ready`, `integrity_conflict`, and the compatibility-only
+`integrity_convergence_exhausted`. Keep the selected worker
 running while preparing so its exact binary, supervisor PID/process-start
 identity, heartbeat, loaded configuration, database topology, and predecessor
 journal can be revalidated:
@@ -2968,6 +2976,17 @@ interrupted `successor-prepare` is resumed with the exact same predecessor ID
 and revision; `status --upgrade-id "$FAILED_UPGRADE_ID"` reports whether the
 durable successor intent or terminal link exists. Response loss never
 authorizes another successor.
+
+`integrity_convergence_exhausted` is recognized only for the exact immutable
+pre-v43 exhaustion observation: a valid current pointer and digest, a linked
+published attempt-eight scan, exactly the seven v1 registry families, every
+family `unknown / convergence_bound_exhausted`, incomplete aggregate and family
+count/coverage evidence, and a current generation equal to or newer than the
+published generation. Rerun `observe` to durably enter that attention, then use
+the ordinary `successor-prepare` command above with the intended v43-or-newer
+revision. Do not stop the selected worker before preparation. Generic
+`integrity_pending`, partial evidence, other unknown results, or changed
+heartbeat/configuration/topology evidence remain ineligible.
 
 If an operator-confirmed local file relocation replaced the Controller database
 inode at the same canonical path before an ordinary successor could be
@@ -3111,6 +3130,7 @@ topology:
 | Supervisor conflict | Boot out and prove absence of the current service, preserve its plist under a non-`.plist` rollback name, and retry the selected supervisor preflight. Never load both. |
 | Worker already running | Inspect both launchd domains and the process-lifetime lock owner. Do not remove the lock file or bypass the scheduler lease while a worker may still be alive. |
 | Managed upgrade database identity changed after an authorized relocation | Keep every supervisor absent and run `successor-recovery-preview` for the failed post-bootstrap upgrade and intended successor revision. After a new encrypted full backup, use the exact digest with `successor-recover-prepare` and both confirmations. Never edit the locator, SQLite, journal, inode evidence, or active pointer manually; binding, content, schema, supervisor, or third-identity drift must remain fail-closed. |
+| Managed upgrade remains pending after a pre-v43 integrity convergence exhaustion | Keep the selected worker running and rerun `observe`. Only an exact `integrity_convergence_exhausted` attention permits ordinary `successor-prepare` with a v43-or-newer revision. Generic `integrity_pending` is not eligible; never edit SQLite, the current pointer, scan evidence, or the upgrade journal. |
 
 When evidence remains unclear, stop external writes and preserve sanitized
 artifacts for review. The correct fallback is `manual_intervention`, not manual
