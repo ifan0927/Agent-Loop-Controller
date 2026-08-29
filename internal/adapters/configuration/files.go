@@ -116,6 +116,134 @@ func (f *Files) ValidateCurrent(payload []byte) (application.ValidatedConfigurat
 	return candidateFromBootstrap(loaded, len(payload)), nil
 }
 
+// MaterializeLegacyMigration converts one exact inline legacy document to the
+// current schema while proving that only the schema, configured operator, and
+// retired singleton-capacity leaves changed.
+func (f *Files) MaterializeLegacyMigration(base []byte) (application.ConfigurationMigrationMaterialization, error) {
+	source, err := bootstrap.ValidateBytes(f.configPath, base)
+	if err != nil {
+		return application.ConfigurationMigrationMaterialization{}, err
+	}
+	if source.Version < bootstrap.VersionTwo || source.Version > bootstrap.VersionFour || source.RegistryPath != "" || source.Controller.Operator.Validate() != nil {
+		return application.ConfigurationMigrationMaterialization{}, errors.New("legacy inline configuration is not eligible for migration")
+	}
+	var document map[string]json.RawMessage
+	if err := decodeStrictRawDocument(base, &document); err != nil {
+		return application.ConfigurationMigrationMaterialization{}, err
+	}
+	versionJSON, _ := json.Marshal(bootstrap.CurrentVersion)
+	document["version"] = versionJSON
+	var controller map[string]json.RawMessage
+	if err := decodeStrictRawDocument(document["controller"], &controller); err != nil {
+		return application.ConfigurationMigrationMaterialization{}, errors.New("legacy controller authority is invalid")
+	}
+	operatorJSON, err := json.Marshal(map[string]any{"login": source.Controller.Operator.Login, "database_id": source.Controller.Operator.DatabaseID, "node_id": source.Controller.Operator.NodeID, "type": source.Controller.Operator.ActorType})
+	if err != nil {
+		return application.ConfigurationMigrationMaterialization{}, err
+	}
+	controller["operator"] = operatorJSON
+	controllerJSON, err := json.Marshal(controller)
+	if err != nil {
+		return application.ConfigurationMigrationMaterialization{}, err
+	}
+	document["controller"] = controllerJSON
+	if source.Version == bootstrap.VersionThree && len(document["automation"]) != 0 {
+		var automation map[string]json.RawMessage
+		if err := decodeStrictRawDocument(document["automation"], &automation); err != nil {
+			return application.ConfigurationMigrationMaterialization{}, errors.New("legacy automation authority is invalid")
+		}
+		var admission map[string]json.RawMessage
+		if err := decodeStrictRawDocument(automation["linear_todo_admission"], &admission); err != nil {
+			return application.ConfigurationMigrationMaterialization{}, errors.New("legacy admission authority is invalid")
+		}
+		delete(admission, "max_active_runs")
+		admission["heavy_capacity"] = json.RawMessage("1")
+		admissionJSON, _ := json.Marshal(admission)
+		automation["linear_todo_admission"] = admissionJSON
+		automationJSON, _ := json.Marshal(automation)
+		document["automation"] = automationJSON
+	}
+	candidatePayload, err := json.MarshalIndent(document, "", "  ")
+	if err != nil {
+		return application.ConfigurationMigrationMaterialization{}, err
+	}
+	candidatePayload = append(candidatePayload, '\n')
+	target, err := bootstrap.ValidateCurrentBytes(f.configPath, candidatePayload)
+	if err != nil {
+		return application.ConfigurationMigrationMaterialization{}, err
+	}
+	preservation := application.ConfigurationMigrationPreservation{
+		ControllerAuthorityPreserved: source.Controller.DatabasePath == target.Controller.DatabasePath && source.Controller.CodexBinary == target.Controller.CodexBinary && source.Controller.RunTimeout == target.Controller.RunTimeout && source.Controller.Operator.Equal(target.Controller.Operator),
+		LinearAuthorityPreserved:     reflect.DeepEqual(source.Linear, target.Linear),
+		GitHubProfilesPreserved:      migrationGitHubProfilesEqual(source.GitHubProfiles, target.GitHubProfiles),
+		RepositoryProfilesPreserved:  reflect.DeepEqual(candidateFromBootstrap(source, len(base)).Repositories, candidateFromBootstrap(target, len(candidatePayload)).Repositories),
+		RepositoryBindingsPreserved:  reflect.DeepEqual(source.Registry.Bindings(), target.Registry.Bindings()),
+		AutomationPolicyPreserved:    migrationAutomationEqual(source.Automation, target.Automation),
+	}
+	if !preservation.ControllerAuthorityPreserved || !preservation.LinearAuthorityPreserved || !preservation.GitHubProfilesPreserved || !preservation.RepositoryProfilesPreserved || !preservation.RepositoryBindingsPreserved || !preservation.AutomationPolicyPreserved {
+		return application.ConfigurationMigrationMaterialization{}, errors.New("legacy configuration migration changes protected authority")
+	}
+	if !migrationAllowedRawDelta(base, candidatePayload) {
+		return application.ConfigurationMigrationMaterialization{}, errors.New("legacy configuration migration changes unsupported fields")
+	}
+	return application.ConfigurationMigrationMaterialization{Payload: candidatePayload, Candidate: candidateFromBootstrap(target, len(candidatePayload)), SourceSchema: source.Version, Preservation: preservation}, nil
+}
+
+func migrationAutomationEqual(source, target bootstrap.Automation) bool {
+	a, b := source.LinearTodoAdmission, target.LinearTodoAdmission
+	a.MaxActiveRuns, b.MaxActiveRuns = 0, 0
+	return reflect.DeepEqual(a, b)
+}
+
+func migrationGitHubProfilesEqual(source, target map[string]bootstrap.GitHubProfile) bool {
+	if len(source) != len(target) {
+		return false
+	}
+	for id, a := range source {
+		b, found := target[id]
+		if !found || a.ID != b.ID || !reflect.DeepEqual(a.Config, b.Config) {
+			return false
+		}
+	}
+	return true
+}
+
+func migrationAllowedRawDelta(source, target []byte) bool {
+	normalize := func(payload []byte) ([]byte, error) {
+		var document map[string]json.RawMessage
+		if err := decodeStrictRawDocument(payload, &document); err != nil {
+			return nil, err
+		}
+		delete(document, "version")
+		var controller map[string]json.RawMessage
+		if err := decodeStrictRawDocument(document["controller"], &controller); err != nil {
+			return nil, err
+		}
+		delete(controller, "operator")
+		document["controller"], _ = json.Marshal(controller)
+		if len(document["automation"]) != 0 {
+			var automation map[string]json.RawMessage
+			if err := decodeStrictRawDocument(document["automation"], &automation); err != nil {
+				return nil, err
+			}
+			if len(automation["linear_todo_admission"]) != 0 {
+				var admission map[string]json.RawMessage
+				if err := decodeStrictRawDocument(automation["linear_todo_admission"], &admission); err != nil {
+					return nil, err
+				}
+				delete(admission, "max_active_runs")
+				delete(admission, "heavy_capacity")
+				automation["linear_todo_admission"], _ = json.Marshal(admission)
+			}
+			document["automation"], _ = json.Marshal(automation)
+		}
+		return json.Marshal(document)
+	}
+	a, errA := normalize(source)
+	b, errB := normalize(target)
+	return errA == nil && errB == nil && bytes.Equal(a, b)
+}
+
 func (f *Files) ProjectEditable(payload []byte) (application.ConfigurationEditableSettings, error) {
 	settings, err := bootstrap.ProjectEditableSettings(f.configPath, payload)
 	if err != nil {

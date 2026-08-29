@@ -760,6 +760,41 @@ receipt evidence. Historical non-editable authority is never materialized.
 Response-loss and restart replay reconcile the same generation rather than
 creating another. Apply never starts, stops, or restarts a worker.
 
+One explicit schema-migration lane bridges readable inline configuration
+versions 2 through 4 to the current version 5 mutation boundary. Preview is
+read-only and requires the retained desired bytes, exact desired/effective/live
+convergence, a fresh matching worker, and no unresolved configuration or
+repository-topology mutation. The private configuration adapter changes only
+the schema number, the already deterministically derived Controller-wide
+operator, and version
+3's retired singleton capacity leaf. It proves decoded controller, Linear,
+GitHub App, repository, and automation authority remains functionally equal;
+repository profile, registry, and binding digests remain exactly equal. GitHub
+App raw JSON whitespace is not authority and its raw formatting digest is not
+a migration invariant, while its complete decoded profile and credential
+reference are. Raw profile bytes, credential references, paths, and private
+file identities never enter the preview.
+
+Apply recomputes the candidate from the exact retained legacy generation and
+requires its generation, digest, schema, configuration-authority version,
+candidate and migration digests, complete preview digest, configured requester,
+and a bounded stable request ID. SQLite atomically excludes active scalar
+drafts, recovery, repository removal, onboarding, and another apply. The
+existing `apply_configuration` receipt, durable apply intent, immutable raw
+generation, and filesystem exchange remain the sole effect and crash-recovery
+authority. The resulting generation records `schema_migration` provenance plus
+the request and preview binding before live replacement. Exact response-loss
+replay deliberately resolves that receipt from the superseded legacy parent
+after desired authority has already advanced to version 5; current-schema and
+current-generation guards run only for a new effect. Receipt identity binds the
+request, preview, and candidate before legacy raw is required. An observed exact
+replay therefore survives later pruning of the superseded source raw; an
+accepted replay loads the retained target generation and delegates the existing
+apply reconciler. A successful apply returns `restart_required`; only a fresh
+worker observation of the exact version-5 digest completes convergence. Version
+1 is excluded because its repository authority depends on an external registry
+file.
+
 Every production new-admission path uses this application-owned convergence
 gate. Automatic dispatch may continue driving an already-admitted run, but it
 checks the gate before candidate scan or Linear mutation and again immediately
@@ -1183,7 +1218,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 43; migration history is code, not a
+inspection. The current schema is version 44; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees

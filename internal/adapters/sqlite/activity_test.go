@@ -200,7 +200,7 @@ func TestActivityV43MigrationPreservesRowsAndTracksOnlySemanticRuntimeChanges(t 
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if version, err := store.SchemaVersion(context.Background()); err != nil || version != 43 {
+	if version, err := store.SchemaVersion(context.Background()); err != nil || version != schemaVersion {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	var rows int

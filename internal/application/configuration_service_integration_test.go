@@ -364,8 +364,32 @@ type configurationFaultStore struct {
 	*sqlitestore.Store
 	failBegin               bool
 	failSettle              bool
+	failBeginAfter          bool
+	failSettleAfter         bool
 	failRecoveryBeginAfter  bool
 	failRecoverySettleAfter bool
+}
+
+type configurationMigrationGuardStore struct {
+	*sqlitestore.Store
+	blocked bool
+}
+
+func (s *configurationMigrationGuardStore) ConfigurationMigrationBlocked(context.Context) (bool, error) {
+	return s.blocked, nil
+}
+
+type configurationMigrationDocumentFixture struct {
+	files        *configurationFilesFixture
+	target       []byte
+	sourceSchema int
+}
+
+func (f configurationMigrationDocumentFixture) MaterializeLegacyMigration([]byte) (application.ConfigurationMigrationMaterialization, error) {
+	return application.ConfigurationMigrationMaterialization{
+		Payload: f.target, Candidate: f.files.candidate(f.target, 5), SourceSchema: f.sourceSchema,
+		Preservation: application.ConfigurationMigrationPreservation{ControllerAuthorityPreserved: true, LinearAuthorityPreserved: true, GitHubProfilesPreserved: true, RepositoryProfilesPreserved: true, RepositoryBindingsPreserved: true, AutomationPolicyPreserved: true},
+	}, nil
 }
 
 type configurationNoOpRaceStore struct {
@@ -385,7 +409,12 @@ func (s *configurationFaultStore) BeginConfigurationApply(ctx context.Context, i
 		s.failBegin = false
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, errors.New("injected intent failure")
 	}
-	return s.Store.BeginConfigurationApply(ctx, input)
+	generation, receipt, created, err := s.Store.BeginConfigurationApply(ctx, input)
+	if err == nil && created && s.failBeginAfter {
+		s.failBeginAfter = false
+		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, errors.New("injected apply response loss after intent")
+	}
+	return generation, receipt, created, err
 }
 
 func (s *configurationFaultStore) SettleConfigurationApply(ctx context.Context, input application.ConfigurationApplySettlement) (application.ConfigurationAuthority, application.OperationReceipt, bool, error) {
@@ -393,7 +422,12 @@ func (s *configurationFaultStore) SettleConfigurationApply(ctx context.Context, 
 		s.failSettle = false
 		return application.ConfigurationAuthority{}, application.OperationReceipt{}, false, errors.New("injected settlement failure")
 	}
-	return s.Store.SettleConfigurationApply(ctx, input)
+	authority, receipt, changed, err := s.Store.SettleConfigurationApply(ctx, input)
+	if err == nil && changed && s.failSettleAfter {
+		s.failSettleAfter = false
+		return application.ConfigurationAuthority{}, application.OperationReceipt{}, false, errors.New("injected apply response loss after settlement")
+	}
+	return authority, receipt, changed, err
 }
 
 func (s *configurationFaultStore) BeginConfigurationRecovery(ctx context.Context, input application.ConfigurationRecoveryAcceptance) (application.ConfigurationRecoveryIntent, application.OperationReceipt, bool, error) {
@@ -630,6 +664,141 @@ func TestConfigurationServiceFaultBoundariesRemainReplayable(t *testing.T) {
 				t.Fatalf("target was not reconciled: %+v", current)
 			}
 		})
+	}
+}
+
+func TestConfigurationMigrationExactReplayCrossesDurableResponseLossBoundaries(t *testing.T) {
+	for _, boundary := range []string{"after_intent", "after_settlement"} {
+		t.Run(boundary, func(t *testing.T) {
+			baseService, store, files, runtime, requester := configurationServiceFixture(t)
+			files.baselineSchema = 3
+			authority, err := baseService.Initialize(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			runtime.observation = freshConfigurationRuntime(authority.Desired.Digest, time.Now().UTC())
+			faults := &configurationFaultStore{Store: store, failBeginAfter: boundary == "after_intent", failSettleAfter: boundary == "after_settlement"}
+			configuration, err := application.NewConfigurationService(faults, files, runtime)
+			if err != nil {
+				t.Fatal(err)
+			}
+			migration, command := configurationMigrationTestCommand(t, configuration, files, requester)
+			if _, err := migration.Apply(context.Background(), command); err == nil {
+				t.Fatal("injected migration response loss unexpectedly succeeded")
+			}
+			replayed, err := migration.Apply(context.Background(), command)
+			if err != nil || replayed.Apply.Generation.GenerationID != 2 || replayed.Apply.Receipt.Phase != application.OperationPhaseObserved || replayed.Apply.Generation.ApplyKind != application.ConfigurationApplySchemaMigration {
+				t.Fatalf("replayed=%+v err=%v", replayed, err)
+			}
+			generations, err := store.ListConfigurationGenerations(context.Background())
+			if err != nil || len(generations) != 2 {
+				t.Fatalf("generations=%+v err=%v", generations, err)
+			}
+			if boundary == "after_intent" && replayed.Apply.Generation.State != application.ConfigurationGenerationFailed {
+				t.Fatalf("intent-only replay state=%s", replayed.Apply.Generation.State)
+			}
+			if boundary == "after_settlement" && replayed.Apply.Generation.State != application.ConfigurationGenerationPendingRestart {
+				t.Fatalf("settled replay state=%s", replayed.Apply.Generation.State)
+			}
+		})
+	}
+}
+
+func TestConfigurationMigrationSettledReplaySurvivesLegacyRawPruning(t *testing.T) {
+	configuration, store, files, runtime, requester := configurationServiceFixture(t)
+	files.baselineSchema = 3
+	authority, err := configuration.Initialize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.observation = freshConfigurationRuntime(authority.Desired.Digest, time.Now().UTC())
+	migration, command := configurationMigrationTestCommand(t, configuration, files, requester)
+	first, err := migration.Apply(context.Background(), command)
+	if err != nil || first.Apply.Generation.GenerationID != 2 {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	claimed, err := store.ClaimConfigurationRawPrune(context.Background(), authority.Desired.Digest)
+	if err != nil || !claimed {
+		t.Fatalf("claimed=%t err=%v", claimed, err)
+	}
+	if err := files.RemoveRaw(authority.Desired.Digest); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteConfigurationRawPrune(context.Background(), authority.Desired.Digest, true); err != nil {
+		t.Fatal(err)
+	}
+	generations, err := store.ListConfigurationGenerations(context.Background())
+	if err != nil || generations[1].GenerationID != authority.Desired.GenerationID || generations[1].RawRetained {
+		t.Fatalf("generations=%+v err=%v", generations, err)
+	}
+	replayed, err := migration.Apply(context.Background(), command)
+	if err != nil || replayed.Apply.Generation.GenerationID != first.Apply.Generation.GenerationID || replayed.Apply.Receipt.OperationID != first.Apply.Receipt.OperationID {
+		t.Fatalf("replayed=%+v err=%v", replayed, err)
+	}
+	tampered := command
+	tampered.MigrationDigest = strings.Repeat("f", 64)
+	if _, err := migration.Apply(context.Background(), tampered); err == nil || !strings.Contains(err.Error(), "preview changed") {
+		t.Fatalf("tampered migration digest replay err=%v", err)
+	}
+}
+
+func TestConfigurationMigrationPreviewAndApplyRejectUnrelatedMutation(t *testing.T) {
+	baseService, store, files, runtime, requester := configurationServiceFixture(t)
+	files.baselineSchema = 3
+	authority, err := baseService.Initialize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.observation = freshConfigurationRuntime(authority.Desired.Digest, time.Now().UTC())
+	if _, _, err := baseService.ReconcileRuntime(context.Background(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	blockedStore := &configurationMigrationGuardStore{Store: store, blocked: true}
+	blockedConfiguration, err := application.NewConfigurationService(blockedStore, files, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := configurationMigrationDocumentFixture{files: files, target: []byte("migration target"), sourceSchema: 3}
+	blockedMigration, err := application.NewConfigurationMigrationService(blockedConfiguration, document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := blockedMigration.Preview(context.Background(), requester); err == nil || !strings.Contains(err.Error(), "idle mutation lane") {
+		t.Fatalf("blocked preview err=%v", err)
+	}
+
+	faults := &configurationFaultStore{Store: store, failBeginAfter: true}
+	configuration, err := application.NewConfigurationService(faults, files, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	migration, command := configurationMigrationTestCommand(t, configuration, files, requester)
+	if _, err := configuration.Apply(context.Background(), application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Payload: []byte("unrelated target")}); err == nil {
+		t.Fatal("unrelated intent response loss unexpectedly succeeded")
+	}
+	if _, err := migration.Apply(context.Background(), command); err == nil || !strings.Contains(err.Error(), "idle mutation lane") {
+		t.Fatalf("unrelated apply did not block migration: %v", err)
+	}
+}
+
+func configurationMigrationTestCommand(t *testing.T, configuration *application.ConfigurationService, files *configurationFilesFixture, requester application.Requester) (*application.ConfigurationMigrationService, application.ConfigurationMigrationApplyCommand) {
+	t.Helper()
+	if _, _, err := configuration.ReconcileRuntime(context.Background(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	document := configurationMigrationDocumentFixture{files: files, target: []byte("migration target"), sourceSchema: 3}
+	migration, err := application.NewConfigurationMigrationService(configuration, document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview, err := migration.Preview(context.Background(), requester)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return migration, application.ConfigurationMigrationApplyCommand{
+		Requester: requester, RequestID: "migration-request-1", ExpectedGenerationID: preview.ExpectedGenerationID, ExpectedDigest: preview.ExpectedDigest,
+		ExpectedAuthorityVersion: preview.ExpectedAuthorityVersion, SourceSchemaVersion: preview.SourceSchemaVersion, TargetSchemaVersion: preview.TargetSchemaVersion,
+		CandidateDigest: preview.CandidateDigest, MigrationDigest: preview.MigrationDigest, PreviewDigest: preview.PreviewDigest,
 	}
 }
 

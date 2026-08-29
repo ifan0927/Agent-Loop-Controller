@@ -7,11 +7,13 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 
+	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/bootstrap"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/adapters/localregistry"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 )
@@ -30,6 +32,148 @@ func TestEditableAuthorityProofIgnoresOnlyClosedTypedLeaves(t *testing.T) {
 	if editableAuthorityEqual(base, credentialChange) {
 		t.Fatal("non-editable credential authority change was accepted")
 	}
+}
+
+func TestMaterializeLegacyMigrationPreservesInlineAuthorityAcrossVersions(t *testing.T) {
+	for _, version := range []int{2, 3, 4} {
+		t.Run(strconv.Itoa(version), func(t *testing.T) {
+			root := canonicalTempDirectory(t)
+			payload, configPath := legacyInlineMigrationFixture(t, root, version)
+			files, err := NewFiles(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			migration, err := files.MaterializeLegacyMigration(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if migration.SourceSchema != version || migration.Candidate.SchemaVersion != 5 || migration.Candidate.Operator.Login != "operator" || !migration.Preservation.ControllerAuthorityPreserved || !migration.Preservation.LinearAuthorityPreserved || !migration.Preservation.GitHubProfilesPreserved || !migration.Preservation.RepositoryProfilesPreserved || !migration.Preservation.RepositoryBindingsPreserved || !migration.Preservation.AutomationPolicyPreserved {
+				t.Fatalf("migration=%+v", migration)
+			}
+			var candidate map[string]any
+			if err := json.Unmarshal(migration.Payload, &candidate); err != nil {
+				t.Fatal(err)
+			}
+			if candidate["version"] != float64(5) {
+				t.Fatalf("version=%v", candidate["version"])
+			}
+			controller := candidate["controller"].(map[string]any)
+			if controller["operator"].(map[string]any)["node_id"] != "USER_7" {
+				t.Fatalf("controller=%v", controller)
+			}
+			if version == 3 {
+				admission := candidate["automation"].(map[string]any)["linear_todo_admission"].(map[string]any)
+				if _, found := admission["max_active_runs"]; found || admission["heavy_capacity"] != float64(1) {
+					t.Fatalf("admission=%v", admission)
+				}
+			}
+			target, err := bootstrap.ValidateCurrentBytes(configPath, migration.Payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if version == 4 && target.Automation.LinearTodoAdmission.HeavyCapacity != 2 {
+				t.Fatalf("version-4 default capacity=%d", target.Automation.LinearTodoAdmission.HeavyCapacity)
+			}
+		})
+	}
+}
+
+func TestMaterializeLegacyMigrationRejectsMissingControllerWideOperator(t *testing.T) {
+	root := canonicalTempDirectory(t)
+	payload, configPath := legacyInlineMigrationFixture(t, root, 2)
+	var document map[string]any
+	if err := json.Unmarshal(payload, &document); err != nil {
+		t.Fatal(err)
+	}
+	clone := func(value map[string]any) map[string]any {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result map[string]any
+		if err := json.Unmarshal(encoded, &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	repositories := document["repositories"].([]any)
+	other := clone(repositories[0].(map[string]any))
+	other["name"] = "other"
+	other["github_app_profile_ref"] = "github-app-profile:other"
+	other["github_app_id"] = float64(21)
+	other["github_installation_id"] = float64(22)
+	other["expected_repository_id"] = float64(23)
+	for _, field := range []string{"origin_path", "source_path", "run_root", "worktree_root"} {
+		path := filepath.Join(root, "other-"+field)
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		other[field] = path
+	}
+	other["operator_identity_policy"] = map[string]any{"allowed_logins": []any{"other"}, "trusted_actors": []any{map[string]any{"database_id": float64(8), "node_id": "USER_8", "login": "other", "type": "User"}}}
+	document["repositories"] = append(repositories, other)
+	profiles := document["github_app_profiles"].([]any)
+	otherProfile := clone(profiles[0].(map[string]any))
+	otherProfile["id"] = "github-app-profile:other"
+	otherConfig := otherProfile["config"].(map[string]any)
+	otherConfig["app_id"] = float64(21)
+	otherConfig["installation_id"] = float64(22)
+	otherConfig["repository_name"] = "other"
+	otherConfig["repository_id"] = float64(23)
+	document["github_app_profiles"] = append(profiles, otherProfile)
+	ambiguous, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readable, err := bootstrap.ValidateBytes(configPath, ambiguous)
+	if err != nil || readable.Controller.Operator.Validate() == nil {
+		t.Fatalf("legacy no-common-operator fixture was not readable: operator=%+v err=%v", readable.Controller.Operator, err)
+	}
+	files, err := NewFiles(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := files.MaterializeLegacyMigration(ambiguous); err == nil {
+		t.Fatal("legacy configuration without a controller-wide operator was accepted")
+	}
+}
+
+func legacyInlineMigrationFixture(t *testing.T, root string, version int) ([]byte, string) {
+	t.Helper()
+	paths := []string{filepath.Join(root, "origin"), filepath.Join(root, "source"), filepath.Join(root, "runs"), filepath.Join(root, "worktrees")}
+	for _, path := range paths {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keyPath := filepath.Join(root, "app.pem")
+	if err := os.WriteFile(keyPath, []byte("private fixture key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	repository := localregistry.Repository{Owner: "owner", Name: "repo", OriginPath: paths[0], SourcePath: paths[1], RunRoot: paths[2], WorktreeRoot: paths[3], BaseBranch: "main", VerifierRegistryRef: "builtin:v1", VerifierIDs: []string{"fixture-go-test"}, GitHubAppProfileRef: "github-app-profile:fixture", GitHubAppID: 11, GitHubInstallationID: 12, ExpectedRepositoryID: 13, OperatorIdentityPolicy: localregistry.OperatorIdentityPolicy{AllowedLogins: []string{"operator"}, TrustedActors: []localregistry.TrustedActorIdentity{{DatabaseID: 7, NodeID: "USER_7", Login: "operator", Type: "User"}}}}
+	document := map[string]any{
+		"version":             version,
+		"controller":          map[string]any{"database_path": filepath.Join(root, "controller.db"), "codex_binary": "codex", "run_timeout": "30m"},
+		"linear":              map[string]any{"api_url": "https://api.linear.app/graphql", "credential_source_ref": "secret://env/IFAN_LOOP_LINEAR_TOKEN", "authorization_scheme": "bearer", "team_key": "IFAN", "http_timeout": "2s", "max_response_bytes": 4096, "label_page_size": 10, "max_label_pages": 1},
+		"repositories":        []localregistry.Repository{repository},
+		"github_app_profiles": []map[string]any{{"id": "github-app-profile:fixture", "config": map[string]any{"api_base_url": "https://api.github.com", "graphql_url": "https://api.github.com/graphql", "app_id": 11, "installation_id": 12, "repository_owner": "owner", "repository_name": "repo", "repository_id": 13, "private_key_file": keyPath, "http_timeout": "2s", "token_refresh_skew": "5m", "api_version": "2022-11-28"}}},
+	}
+	if version >= 3 {
+		admission := map[string]any{"enabled": true, "team_id": "123e4567-e89b-42d3-a456-426614174000", "team_key": "IFAN", "todo_state": map[string]any{"id": "123e4567-e89b-42d3-a456-426614174001", "name": "Todo", "type": "unstarted"}, "in_progress_state": map[string]any{"id": "123e4567-e89b-42d3-a456-426614174002", "name": "In Progress", "type": "started"}, "poll_interval": "5m", "delivery_poll_interval": "30s", "scheduler_lease_ttl": "1m", "scheduler_lease_renewal_interval": "20s", "max_candidates": 20, "max_pages": 5, "requester": map[string]any{"database_id": 7, "node_id": "USER_7", "login": "operator", "type": "User"}, "notification_mode": "local_outbox", "credential_source_ref": "secret://env/IFAN_LOOP_LINEAR_TOKEN"}
+		if version == 3 {
+			admission["max_active_runs"] = 1
+		}
+		document["automation"] = map[string]any{"linear_todo_admission": admission}
+	}
+	payload, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, "controller.json")
+	if err := os.WriteFile(configPath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return payload, configPath
 }
 
 func TestRepositoryRemovalCandidatePreservesUnrelatedAuthorityAndSupportsZeroRepositories(t *testing.T) {
