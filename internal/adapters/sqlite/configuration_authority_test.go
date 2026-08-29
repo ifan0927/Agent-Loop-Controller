@@ -92,7 +92,7 @@ func removeIntegrityV40(t *testing.T, db *sql.DB) {
 		`DROP TABLE IF EXISTS integrity_registry_sources`,
 		`DROP TABLE IF EXISTS integrity_registry_families`,
 		`DROP TABLE IF EXISTS controller_integrity_generation`,
-		`DELETE FROM schema_migrations WHERE version IN (40,41,42,43)`,
+		`DELETE FROM schema_migrations WHERE version IN (40,41,42,43,44)`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			t.Fatal(err)
@@ -148,6 +148,41 @@ func TestConfigurationV31MigratesV30AndPreservesReceipts(t *testing.T) {
 		if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("table=%s count=%d err=%v", table, count, err)
 		}
+	}
+}
+
+func TestConfigurationV44AddsSchemaMigrationProvenanceWithoutChangingLegacyGeneration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "controller.db")
+	legacy, err := openWithSupportedSchema(path, 43)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 29, 1, 0, 0, 0, time.UTC)
+	operator := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
+	candidate := application.ValidatedConfigurationCandidate{Digest: strings.Repeat("a", 64), Size: 1024, SchemaVersion: 3, DatabasePath: path, LinearTeamKey: "IFAN", Operator: operator, Repositories: map[string]application.ConfigurationRepositoryAuthority{}}
+	baseline := application.ConfigurationBaselineInput{Candidate: candidate, CanonicalConfigPath: filepath.Join(t.TempDir(), "controller.json"), ObservedAt: now}
+	if err := legacy.PrepareConfigurationBaseline(context.Background(), baseline); err != nil {
+		t.Fatal(err)
+	}
+	before, _, err := legacy.AdoptConfigurationBaseline(context.Background(), baseline)
+	if err != nil || before.Desired.SchemaVersion != 3 {
+		t.Fatalf("before=%+v err=%v", before, err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	current, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer current.Close()
+	authority, found, err := current.ConfigurationAuthority(context.Background())
+	if err != nil || !found || authority.Desired.GenerationID != before.Desired.GenerationID || authority.Desired.Digest != before.Desired.Digest || authority.Desired.ApplyKind != "" || authority.Desired.MigrationRequestID != "" || authority.Desired.MigrationPreviewDigest != "" {
+		t.Fatalf("authority=%+v found=%t err=%v", authority, found, err)
+	}
+	var columns int
+	if err := current.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('configuration_apply_intents') WHERE name IN ('apply_kind','migration_request_id','migration_preview_digest')`).Scan(&columns); err != nil || columns != 3 {
+		t.Fatalf("columns=%d err=%v", columns, err)
 	}
 }
 
@@ -823,6 +858,95 @@ func TestConfigurationRawPruneClaimAndApplyAcceptanceAreMutuallyExclusive(t *tes
 	}
 	if claimed, err := store.ClaimConfigurationRawPrune(ctx, accepted.Digest); err != nil || claimed {
 		t.Fatalf("accepted digest prune claimed=%t err=%v", claimed, err)
+	}
+}
+
+func TestConfigurationSchemaMigrationAcceptanceRequiresExactAuthorityAndIdleMutationLane(t *testing.T) {
+	newFixture := func(t *testing.T) (*Store, application.ConfigurationAuthority, domain.GitHubUserIdentity, string) {
+		t.Helper()
+		store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		operator := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
+		databasePath := filepath.Join(t.TempDir(), "owned.db")
+		baseline := application.ConfigurationBaselineInput{Candidate: application.ValidatedConfigurationCandidate{Digest: strings.Repeat("a", 64), Size: 42, SchemaVersion: 3, DatabasePath: databasePath, Operator: operator, Repositories: map[string]application.ConfigurationRepositoryAuthority{}}, CanonicalConfigPath: filepath.Join(t.TempDir(), "controller.json"), ObservedAt: time.Now().UTC()}
+		if err := store.PrepareConfigurationBaseline(context.Background(), baseline); err != nil {
+			t.Fatal(err)
+		}
+		authority, _, err := store.AdoptConfigurationBaseline(context.Background(), baseline)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return store, authority, operator, databasePath
+	}
+	begin := func(store *Store, authority application.ConfigurationAuthority, operator domain.GitHubUserIdentity, databasePath string, expectedVersion int64) error {
+		at := time.Now().UTC()
+		candidateDigest := strings.Repeat("b", 64)
+		receipt := application.NewOperationReceipt(application.OperationReceiptInput{OperationType: application.OperationApplyConfiguration, Scope: application.ScopeController, TargetID: application.ConfigurationTargetID, Requester: operator, RequestDigest: candidateDigest, ExpectedAuthorityDigest: authority.Desired.Digest, OperationAnchorDigest: strings.Repeat("c", 64), TargetBindingDigest: strings.Repeat("d", 64), AcceptedAt: at})
+		_, _, _, err := store.BeginConfigurationApply(context.Background(), application.ConfigurationApplyAcceptance{ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, ExpectedAuthorityVersion: expectedVersion, Candidate: application.ValidatedConfigurationCandidate{Digest: candidateDigest, Size: 43, SchemaVersion: 5, DatabasePath: databasePath, Operator: operator, Repositories: map[string]application.ConfigurationRepositoryAuthority{}}, Requester: operator, Receipt: receipt, Provenance: application.ConfigurationApplyProvenance{Kind: application.ConfigurationApplySchemaMigration, MigrationRequestID: "migration-request-1", MigrationPreviewDigest: strings.Repeat("e", 64)}, AcceptedAt: at})
+		return err
+	}
+
+	t.Run("authority version drift", func(t *testing.T) {
+		store, authority, operator, databasePath := newFixture(t)
+		if err := begin(store, authority, operator, databasePath, authority.Version+1); !errors.Is(err, application.ErrConfigurationAuthorityConflict) {
+			t.Fatalf("err=%v", err)
+		}
+	})
+
+	t.Run("active typed draft", func(t *testing.T) {
+		store, authority, operator, databasePath := newFixture(t)
+		settings := application.ConfigurationEditableSettings{RunTimeout: application.ConfigurationDuration(30 * time.Minute), Admission: application.ConfigurationEditableAdmissionSettings{PollInterval: application.ConfigurationDuration(5 * time.Minute), DeliveryPollInterval: application.ConfigurationDuration(30 * time.Second), SchedulerLeaseTTL: application.ConfigurationDuration(time.Minute), SchedulerLeaseRenewalInterval: application.ConfigurationDuration(20 * time.Second), MaxCandidates: 20, MaxPages: 5, HeavyCapacity: 1}}
+		now := formatTime(time.Now().UTC())
+		if _, err := store.db.Exec(`INSERT INTO configuration_drafts(draft_id,base_generation_id,base_digest,revision,lifecycle,run_timeout_ns,admission_enabled,admission_poll_interval_ns,delivery_poll_interval_ns,scheduler_lease_ttl_ns,scheduler_lease_renewal_interval_ns,max_candidates,max_pages,heavy_capacity,settings_digest,created_at,updated_at) VALUES(?,?,?,1,'open',?,?,?,?,?,?,?,?,?,?,?,?)`, "configuration-draft-0123456789abcdef0123456789abcdef", authority.Desired.GenerationID, authority.Desired.Digest, int64(settings.RunTimeout), 0, int64(settings.Admission.PollInterval), int64(settings.Admission.DeliveryPollInterval), int64(settings.Admission.SchedulerLeaseTTL), int64(settings.Admission.SchedulerLeaseRenewalInterval), settings.Admission.MaxCandidates, settings.Admission.MaxPages, settings.Admission.HeavyCapacity, application.ConfigurationSettingsDigest(settings), now, now); err != nil {
+			t.Fatal(err)
+		}
+		if err := begin(store, authority, operator, databasePath, authority.Version); !errors.Is(err, application.ErrConfigurationApplyInProgress) {
+			t.Fatalf("err=%v", err)
+		}
+		if blocked, err := store.ConfigurationMigrationBlocked(context.Background()); err != nil || !blocked {
+			t.Fatalf("blocked=%t err=%v", blocked, err)
+		}
+		generations, err := store.ListConfigurationGenerations(context.Background())
+		if err != nil || len(generations) != 1 {
+			t.Fatalf("generations=%d err=%v", len(generations), err)
+		}
+	})
+
+	insertOnboarding := func(t *testing.T, store *Store, authority application.ConfigurationAuthority, operator domain.GitHubUserIdentity, status string) {
+		t.Helper()
+		now := formatTime(time.Now().UTC())
+		if _, err := store.db.Exec(`INSERT INTO repository_onboardings(onboarding_id,onboarding_kind,canonical_repository,private_input_digest,source_path_digest,request_digest,requester_login,requester_database_id,requester_node_id,requester_actor_type,base_generation_id,base_digest,configuration_authority_version,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, "onboarding-status-fixture", "existing_checkout", "owner/repo", strings.Repeat("1", 64), strings.Repeat("2", 64), strings.Repeat("3", 64), operator.Login, operator.DatabaseID, operator.NodeID, operator.ActorType, authority.Desired.GenerationID, authority.Desired.Digest, authority.Version, status, now, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, status := range []string{"opened", "preflight_ready", "accepted", "running", "waiting_for_operator"} {
+		t.Run("active onboarding "+status, func(t *testing.T) {
+			store, authority, operator, databasePath := newFixture(t)
+			insertOnboarding(t, store, authority, operator, status)
+			if blocked, err := store.ConfigurationMigrationBlocked(context.Background()); err != nil || !blocked {
+				t.Fatalf("blocked=%t err=%v", blocked, err)
+			}
+			if err := begin(store, authority, operator, databasePath, authority.Version); !errors.Is(err, application.ErrConfigurationApplyInProgress) {
+				t.Fatalf("status=%s err=%v", status, err)
+			}
+		})
+	}
+
+	for _, status := range []string{"cancelled", "conflict", "ready_disabled"} {
+		t.Run("terminal onboarding "+status, func(t *testing.T) {
+			store, authority, operator, databasePath := newFixture(t)
+			insertOnboarding(t, store, authority, operator, status)
+			if blocked, err := store.ConfigurationMigrationBlocked(context.Background()); err != nil || blocked {
+				t.Fatalf("blocked=%t err=%v", blocked, err)
+			}
+			if err := begin(store, authority, operator, databasePath, authority.Version); err != nil {
+				t.Fatalf("status=%s err=%v", status, err)
+			}
+		})
 	}
 }
 

@@ -115,6 +115,9 @@ type ConfigurationGeneration struct {
 	OperationID                string                        `json:"operation_id,omitempty"`
 	RollbackSourceGenerationID int64                         `json:"rollback_source_generation_id,omitempty"`
 	RollbackSourceDigest       string                        `json:"rollback_source_digest,omitempty"`
+	ApplyKind                  ConfigurationApplyKind        `json:"apply_kind,omitempty"`
+	MigrationRequestID         string                        `json:"-"`
+	MigrationPreviewDigest     string                        `json:"-"`
 	SettlementEvidenceValid    bool                          `json:"-"`
 	State                      ConfigurationGenerationState  `json:"state"`
 	RawRetained                bool                          `json:"raw_retained"`
@@ -129,9 +132,10 @@ type ConfigurationGeneration struct {
 type ConfigurationApplyKind string
 
 const (
-	ConfigurationApplyNormal     ConfigurationApplyKind = "normal"
-	ConfigurationApplyRollback   ConfigurationApplyKind = "rollback"
-	ConfigurationApplyOnboarding ConfigurationApplyKind = "onboarding"
+	ConfigurationApplyNormal          ConfigurationApplyKind = "normal"
+	ConfigurationApplyRollback        ConfigurationApplyKind = "rollback"
+	ConfigurationApplyOnboarding      ConfigurationApplyKind = "onboarding"
+	ConfigurationApplySchemaMigration ConfigurationApplyKind = "schema_migration"
 )
 
 // ConfigurationApplyProvenance is Controller-derived intent evidence. The
@@ -143,16 +147,21 @@ type ConfigurationApplyProvenance struct {
 	RollbackSourceDigest       string
 	OnboardingSourceID         string
 	OnboardingSourceDigest     string
+	MigrationRequestID         string
+	MigrationPreviewDigest     string
 }
 
 func (p ConfigurationApplyProvenance) Valid() bool {
 	if p.Kind == "" || p.Kind == ConfigurationApplyNormal {
-		return p.RollbackSourceGenerationID == 0 && p.RollbackSourceDigest == "" && p.OnboardingSourceID == "" && p.OnboardingSourceDigest == ""
+		return p.RollbackSourceGenerationID == 0 && p.RollbackSourceDigest == "" && p.OnboardingSourceID == "" && p.OnboardingSourceDigest == "" && p.MigrationRequestID == "" && p.MigrationPreviewDigest == ""
 	}
 	if p.Kind == ConfigurationApplyRollback {
-		return p.RollbackSourceGenerationID > 0 && validAuthorityDigest(p.RollbackSourceDigest) && p.OnboardingSourceID == "" && p.OnboardingSourceDigest == ""
+		return p.RollbackSourceGenerationID > 0 && validAuthorityDigest(p.RollbackSourceDigest) && p.OnboardingSourceID == "" && p.OnboardingSourceDigest == "" && p.MigrationRequestID == "" && p.MigrationPreviewDigest == ""
 	}
-	return p.Kind == ConfigurationApplyOnboarding && strings.HasPrefix(p.OnboardingSourceID, "onboarding-") && validAuthorityDigest(p.OnboardingSourceDigest) && p.RollbackSourceGenerationID == 0 && p.RollbackSourceDigest == ""
+	if p.Kind == ConfigurationApplyOnboarding {
+		return strings.HasPrefix(p.OnboardingSourceID, "onboarding-") && validAuthorityDigest(p.OnboardingSourceDigest) && p.RollbackSourceGenerationID == 0 && p.RollbackSourceDigest == "" && p.MigrationRequestID == "" && p.MigrationPreviewDigest == ""
+	}
+	return p.Kind == ConfigurationApplySchemaMigration && validConfigurationMigrationRequestID(p.MigrationRequestID) && validAuthorityDigest(p.MigrationPreviewDigest) && p.RollbackSourceGenerationID == 0 && p.RollbackSourceDigest == "" && p.OnboardingSourceID == "" && p.OnboardingSourceDigest == ""
 }
 
 type ConfigurationApplyIntent struct {
@@ -244,13 +253,14 @@ type ConfigurationBaselineInput struct {
 }
 
 type ConfigurationApplyAcceptance struct {
-	ExpectedGenerationID int64
-	ExpectedDigest       string
-	Candidate            ValidatedConfigurationCandidate
-	Requester            domain.GitHubUserIdentity
-	Receipt              OperationReceipt
-	Provenance           ConfigurationApplyProvenance
-	AcceptedAt           time.Time
+	ExpectedGenerationID     int64
+	ExpectedDigest           string
+	ExpectedAuthorityVersion int64
+	Candidate                ValidatedConfigurationCandidate
+	Requester                domain.GitHubUserIdentity
+	Receipt                  OperationReceipt
+	Provenance               ConfigurationApplyProvenance
+	AcceptedAt               time.Time
 }
 
 type ConfigurationApplySettlement struct {
@@ -373,11 +383,12 @@ type ConfigurationRuntimeObserver interface {
 }
 
 type ConfigurationApplyCommand struct {
-	Requester            Requester
-	ExpectedGenerationID int64
-	ExpectedDigest       string
-	Payload              []byte
-	Provenance           ConfigurationApplyProvenance
+	Requester                Requester
+	ExpectedGenerationID     int64
+	ExpectedDigest           string
+	ExpectedAuthorityVersion int64
+	Payload                  []byte
+	Provenance               ConfigurationApplyProvenance
 }
 
 type ConfigurationApplyResult struct {

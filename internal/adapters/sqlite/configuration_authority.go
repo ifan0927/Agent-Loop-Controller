@@ -42,6 +42,10 @@ func configurationAuthorityQuery(ctx context.Context, query queryRower) (applica
 	if err != nil {
 		return application.ConfigurationAuthority{}, false, errors.New("configuration authority is corrupt")
 	}
+	desired, err = hydrateConfigurationApplyProvenance(ctx, query, desired)
+	if err != nil {
+		return application.ConfigurationAuthority{}, false, errors.New("configuration authority is corrupt")
+	}
 	authority.Desired = desired
 	intent, found, err := configurationIncompleteIntent(ctx, query)
 	if err != nil {
@@ -243,6 +247,10 @@ func (s *Store) BeginConfigurationApply(ctx context.Context, input application.C
 		if generationErr != nil {
 			return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, application.ErrConfigurationAuthorityConflict
 		}
+		generation, generationErr = hydrateConfigurationApplyProvenance(ctx, tx, generation)
+		if generationErr != nil {
+			return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, application.ErrConfigurationAuthorityConflict
+		}
 		if !configurationGenerationMatchesProvenance(generation, input.Provenance) {
 			return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, application.ErrConfigurationAuthorityConflict
 		}
@@ -255,7 +263,7 @@ func (s *Store) BeginConfigurationApply(ctx context.Context, input application.C
 	if authority.Incomplete != nil || authority.IncompleteRecovery != nil {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, application.ErrConfigurationApplyInProgress
 	}
-	if authority.Desired.GenerationID != input.ExpectedGenerationID || authority.Desired.Digest != input.ExpectedDigest || authority.DatabasePath != input.Candidate.DatabasePath {
+	if authority.Desired.GenerationID != input.ExpectedGenerationID || authority.Desired.Digest != input.ExpectedDigest || input.ExpectedAuthorityVersion > 0 && authority.Version != input.ExpectedAuthorityVersion || authority.DatabasePath != input.Candidate.DatabasePath {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, application.ErrConfigurationAuthorityConflict
 	}
 	if input.Provenance.Kind == application.ConfigurationApplyRollback {
@@ -277,6 +285,15 @@ func (s *Store) BeginConfigurationApply(ctx context.Context, input application.C
 			return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, application.ErrConfigurationApplyInProgress
 		}
 	}
+	if input.Provenance.Kind == application.ConfigurationApplySchemaMigration {
+		var blockers int
+		if err := tx.QueryRowContext(ctx, `SELECT
+			EXISTS(SELECT 1 FROM configuration_drafts WHERE lifecycle IN ('open','applying','ambiguous')) +
+			EXISTS(SELECT 1 FROM repository_removal_drafts WHERE lifecycle IN ('open','applying','ambiguous')) +
+			EXISTS(SELECT 1 FROM repository_onboardings WHERE status IN ('opened','preflight_ready','accepted','running','waiting_for_operator'))`).Scan(&blockers); err != nil || blockers != 0 {
+			return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, application.ErrConfigurationApplyInProgress
+		}
+	}
 	var pruneClaim int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM configuration_raw_prune_claims WHERE digest=?`, input.Candidate.Digest).Scan(&pruneClaim); err != nil {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, err
@@ -294,6 +311,13 @@ func (s *Store) BeginConfigurationApply(ctx context.Context, input application.C
 	if err := insertOperationReceiptTx(ctx, tx, input.Receipt, ""); err != nil {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, err
 	}
+	storedKind := input.Provenance.Kind
+	if storedKind == "" {
+		storedKind = application.ConfigurationApplyNormal
+	}
+	if storedKind == application.ConfigurationApplyOnboarding {
+		storedKind = application.ConfigurationApplyNormal
+	}
 	result, err := tx.ExecContext(ctx, `INSERT INTO configuration_generations(parent_generation_id,digest,target_size,schema_version,origin,requester_login,requester_database_id,requester_node_id,requester_actor_type,configured_operator_login,configured_operator_database_id,configured_operator_node_id,configured_operator_actor_type,operation_id,lifecycle,raw_retained,created_at,reason_code,rollback_source_generation_id,rollback_source_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'accepted',1,?,'',?,?)`, authority.Desired.GenerationID, input.Candidate.Digest, input.Candidate.Size, input.Candidate.SchemaVersion, string(application.ConfigurationOriginApply), input.Requester.Login, input.Requester.DatabaseID, input.Requester.NodeID, input.Requester.ActorType, input.Candidate.Operator.Login, input.Candidate.Operator.DatabaseID, input.Candidate.Operator.NodeID, input.Candidate.Operator.ActorType, input.Receipt.OperationID, formatTime(input.AcceptedAt), input.Provenance.RollbackSourceGenerationID, input.Provenance.RollbackSourceDigest)
 	if err != nil {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, err
@@ -302,7 +326,7 @@ func (s *Store) BeginConfigurationApply(ctx context.Context, input application.C
 	if err != nil {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO configuration_apply_intents(generation_id,parent_generation_id,parent_digest,target_digest,operation_id,status,accepted_at) VALUES(?,?,?,?,?,'accepted',?)`, generationID, authority.Desired.GenerationID, authority.Desired.Digest, input.Candidate.Digest, input.Receipt.OperationID, formatTime(input.AcceptedAt)); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO configuration_apply_intents(generation_id,parent_generation_id,parent_digest,target_digest,operation_id,status,accepted_at,apply_kind,migration_request_id,migration_preview_digest) VALUES(?,?,?,?,?,'accepted',?,?,?,?)`, generationID, authority.Desired.GenerationID, authority.Desired.Digest, input.Candidate.Digest, input.Receipt.OperationID, formatTime(input.AcceptedAt), string(storedKind), input.Provenance.MigrationRequestID, input.Provenance.MigrationPreviewDigest); err != nil {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, err
 	}
 	evidence := configurationEvidence("apply-accepted", generationID, input.Candidate.Digest, input.Receipt.OperationID, input.Provenance.RollbackSourceGenerationID, input.Provenance.RollbackSourceDigest, input.Provenance.OnboardingSourceID, input.Provenance.OnboardingSourceDigest)
@@ -313,10 +337,25 @@ func (s *Store) BeginConfigurationApply(ctx context.Context, input application.C
 	if err != nil {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, err
 	}
+	generation, err = hydrateConfigurationApplyProvenance(ctx, tx, generation)
+	if err != nil {
+		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, err
+	}
 	if err := tx.Commit(); err != nil {
 		return application.ConfigurationGeneration{}, application.OperationReceipt{}, false, err
 	}
 	return generation, input.Receipt, true, nil
+}
+
+func (s *Store) ConfigurationMigrationBlocked(ctx context.Context) (bool, error) {
+	var blockers int
+	err := s.db.QueryRowContext(ctx, `SELECT
+		EXISTS(SELECT 1 FROM configuration_drafts WHERE lifecycle IN ('open','applying','ambiguous')) +
+		EXISTS(SELECT 1 FROM repository_removal_drafts WHERE lifecycle IN ('open','applying','ambiguous')) +
+		EXISTS(SELECT 1 FROM repository_onboardings WHERE status IN ('opened','preflight_ready','accepted','running','waiting_for_operator')) +
+		EXISTS(SELECT 1 FROM configuration_apply_intents WHERE status IN ('accepted','ambiguous')) +
+		EXISTS(SELECT 1 FROM configuration_recovery_intents WHERE status IN ('accepted','ambiguous'))`).Scan(&blockers)
+	return blockers != 0, err
 }
 
 func requireConfigurationAdmissionAuthorityTx(ctx context.Context, tx *sql.Tx, expected application.ConfigurationAdmissionAuthority) error {
@@ -382,6 +421,10 @@ func (s *Store) SettleConfigurationApply(ctx context.Context, settlement applica
 	}
 	generation, err := scanConfigurationGeneration(tx.QueryRowContext(ctx, configurationGenerationSelect+` WHERE generation_id=?`, settlement.GenerationID))
 	if err != nil || generation.OperationID != settlement.OperationID || generation.ParentID != settlement.ParentID {
+		return application.ConfigurationAuthority{}, application.OperationReceipt{}, false, application.ErrConfigurationAuthorityConflict
+	}
+	generation, err = hydrateConfigurationApplyProvenance(ctx, tx, generation)
+	if err != nil {
 		return application.ConfigurationAuthority{}, application.OperationReceipt{}, false, application.ErrConfigurationAuthorityConflict
 	}
 	var lifecycle application.ConfigurationGenerationState
@@ -588,6 +631,10 @@ func (s *Store) ListConfigurationGenerations(ctx context.Context) ([]application
 		return nil, err
 	}
 	for index := range result {
+		result[index], err = hydrateConfigurationApplyProvenance(ctx, s.db, result[index])
+		if err != nil {
+			return nil, err
+		}
 		if result[index].SettlementEvidenceValid {
 			result[index].SettlementEvidenceValid = result[index].RawRetained && configurationRollbackSettlementEvidence(ctx, s.db, result[index])
 		}
@@ -761,13 +808,39 @@ func scanConfigurationGeneration(row rowScanner) (application.ConfigurationGener
 	generation.CreatedAt, generation.CommittedAt, generation.EffectiveAt = parseTime(created), parseTime(committed), parseTime(effective)
 	generation.SupersededAt, generation.SettledAt = parseTime(superseded), parseTime(settled)
 	generation.Reason = application.ConfigurationReason(reason)
-	if !validConfigurationMetadata(generation.Digest, generation.Size, generation.SchemaVersion) || generation.GenerationID <= 0 || generation.CreatedAt.IsZero() || generation.Origin != application.ConfigurationOriginBaseline && generation.Origin != application.ConfigurationOriginApply || generation.Origin == application.ConfigurationOriginBaseline && (generation.RollbackSourceGenerationID != 0 || generation.RollbackSourceDigest != "") || !configurationGenerationMatchesProvenance(generation, application.ConfigurationApplyProvenance{Kind: func() application.ConfigurationApplyKind {
-		if generation.RollbackSourceGenerationID > 0 || generation.RollbackSourceDigest != "" {
-			return application.ConfigurationApplyRollback
-		}
-		return application.ConfigurationApplyNormal
-	}(), RollbackSourceGenerationID: generation.RollbackSourceGenerationID, RollbackSourceDigest: generation.RollbackSourceDigest}) {
+	if generation.RollbackSourceGenerationID > 0 || generation.RollbackSourceDigest != "" {
+		generation.ApplyKind = application.ConfigurationApplyRollback
+	} else if generation.Origin == application.ConfigurationOriginApply {
+		generation.ApplyKind = application.ConfigurationApplyNormal
+	}
+	provenance := application.ConfigurationApplyProvenance{Kind: generation.ApplyKind, RollbackSourceGenerationID: generation.RollbackSourceGenerationID, RollbackSourceDigest: generation.RollbackSourceDigest}
+	if !validConfigurationMetadata(generation.Digest, generation.Size, generation.SchemaVersion) || generation.GenerationID <= 0 || generation.CreatedAt.IsZero() || generation.Origin != application.ConfigurationOriginBaseline && generation.Origin != application.ConfigurationOriginApply || generation.Origin == application.ConfigurationOriginBaseline && (generation.RollbackSourceGenerationID != 0 || generation.RollbackSourceDigest != "") || generation.Origin == application.ConfigurationOriginApply && !configurationGenerationMatchesProvenance(generation, provenance) {
 		return application.ConfigurationGeneration{}, errors.New("configuration generation is corrupt")
+	}
+	return generation, nil
+}
+
+func hydrateConfigurationApplyProvenance(ctx context.Context, query queryRower, generation application.ConfigurationGeneration) (application.ConfigurationGeneration, error) {
+	if generation.Origin != application.ConfigurationOriginApply {
+		return generation, nil
+	}
+	var version int
+	if err := query.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil {
+		return application.ConfigurationGeneration{}, err
+	}
+	if version < 44 {
+		return generation, nil
+	}
+	var kind, requestID, previewDigest string
+	if err := query.QueryRowContext(ctx, `SELECT apply_kind,migration_request_id,migration_preview_digest FROM configuration_apply_intents WHERE generation_id=?`, generation.GenerationID).Scan(&kind, &requestID, &previewDigest); err != nil {
+		return application.ConfigurationGeneration{}, err
+	}
+	generation.ApplyKind = application.ConfigurationApplyKind(kind)
+	generation.MigrationRequestID = requestID
+	generation.MigrationPreviewDigest = previewDigest
+	provenance := application.ConfigurationApplyProvenance{Kind: generation.ApplyKind, RollbackSourceGenerationID: generation.RollbackSourceGenerationID, RollbackSourceDigest: generation.RollbackSourceDigest, MigrationRequestID: requestID, MigrationPreviewDigest: previewDigest}
+	if !configurationGenerationMatchesProvenance(generation, provenance) {
+		return application.ConfigurationGeneration{}, errors.New("configuration apply provenance is corrupt")
 	}
 	return generation, nil
 }
@@ -780,16 +853,19 @@ func configurationGenerationMatchesProvenance(generation application.Configurati
 		return false
 	}
 	if provenance.Kind == application.ConfigurationApplyNormal {
-		return generation.RollbackSourceGenerationID == 0 && generation.RollbackSourceDigest == ""
+		return generation.ApplyKind == application.ConfigurationApplyNormal && generation.RollbackSourceGenerationID == 0 && generation.RollbackSourceDigest == "" && generation.MigrationRequestID == "" && generation.MigrationPreviewDigest == ""
 	}
 	if provenance.Kind == application.ConfigurationApplyRollback {
-		return generation.RollbackSourceGenerationID == provenance.RollbackSourceGenerationID && generation.RollbackSourceDigest == provenance.RollbackSourceDigest
+		return generation.ApplyKind == application.ConfigurationApplyRollback && generation.RollbackSourceGenerationID == provenance.RollbackSourceGenerationID && generation.RollbackSourceDigest == provenance.RollbackSourceDigest && generation.MigrationRequestID == "" && generation.MigrationPreviewDigest == ""
+	}
+	if provenance.Kind == application.ConfigurationApplySchemaMigration {
+		return generation.ApplyKind == application.ConfigurationApplySchemaMigration && generation.RollbackSourceGenerationID == 0 && generation.RollbackSourceDigest == "" && generation.MigrationRequestID == provenance.MigrationRequestID && generation.MigrationPreviewDigest == provenance.MigrationPreviewDigest
 	}
 	// Onboarding provenance is bound by the exact deterministic operation
 	// receipt replay above and by the source saga in the acceptance transaction.
 	// It intentionally does not add columns to the historical generation shape,
 	// so older readers remain forward-fenced by schema rather than scan layout.
-	return provenance.Kind == application.ConfigurationApplyOnboarding && generation.RollbackSourceGenerationID == 0 && generation.RollbackSourceDigest == ""
+	return provenance.Kind == application.ConfigurationApplyOnboarding && generation.ApplyKind == application.ConfigurationApplyNormal && generation.RollbackSourceGenerationID == 0 && generation.RollbackSourceDigest == "" && generation.MigrationRequestID == "" && generation.MigrationPreviewDigest == ""
 }
 
 func validConfigurationMetadata(digest string, size int64, schema int) bool {

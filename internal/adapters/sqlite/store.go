@@ -30,7 +30,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 43
+const schemaVersion = 44
 
 // SupportedSchemaVersion is the single maintained source for the newest
 // Controller database schema understood by this binary.
@@ -793,6 +793,8 @@ func migrateSQLiteGeneric(ctx context.Context, db sqliteTransactioner, supported
 			statements = migrationV42
 		case 43:
 			statements = migrationV43
+		case 44:
+			statements = migrationV44
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -2142,6 +2144,21 @@ var migrationV43 = []string{
 			SELECT 'operation_activity','controller','local-controller',generation,CURRENT_TIMESTAMP FROM controller_integrity_generation WHERE singleton=1
 			ON CONFLICT(family,scope_kind,scope_id) DO UPDATE SET revision_generation=excluded.revision_generation,updated_at=excluded.updated_at;
 		END`,
+}
+
+var migrationV44 = []string{
+	`ALTER TABLE configuration_apply_intents ADD COLUMN apply_kind TEXT NOT NULL DEFAULT 'normal' CHECK(apply_kind IN ('normal','rollback','schema_migration'))`,
+	`ALTER TABLE configuration_apply_intents ADD COLUMN migration_request_id TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE configuration_apply_intents ADD COLUMN migration_preview_digest TEXT NOT NULL DEFAULT ''`,
+	`UPDATE configuration_apply_intents SET apply_kind='rollback' WHERE generation_id IN (SELECT generation_id FROM configuration_generations WHERE rollback_source_generation_id>0)`,
+	`CREATE TRIGGER configuration_apply_provenance_insert BEFORE INSERT ON configuration_apply_intents
+		WHEN (NEW.apply_kind='normal' AND (NEW.migration_request_id<>'' OR NEW.migration_preview_digest<>'')) OR
+			(NEW.apply_kind='rollback' AND (NEW.migration_request_id<>'' OR NEW.migration_preview_digest<>'')) OR
+			(NEW.apply_kind='schema_migration' AND (length(NEW.migration_request_id)<1 OR length(NEW.migration_request_id)>128 OR length(NEW.migration_preview_digest)<>64))
+		BEGIN SELECT RAISE(ABORT,'configuration apply provenance is invalid'); END`,
+	`CREATE TRIGGER configuration_apply_provenance_immutable BEFORE UPDATE ON configuration_apply_intents
+		WHEN NEW.apply_kind<>OLD.apply_kind OR NEW.migration_request_id<>OLD.migration_request_id OR NEW.migration_preview_digest<>OLD.migration_preview_digest
+		BEGIN SELECT RAISE(ABORT,'configuration apply provenance is immutable'); END`,
 }
 
 func integrityRecheckMigrationV41() []string {

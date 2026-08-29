@@ -255,6 +255,9 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 	if command.ExpectedGenerationID != authority.Desired.GenerationID || command.ExpectedDigest != authority.Desired.Digest {
 		return ConfigurationApplyResult{}, serviceError(ErrorConflict, "configuration compare-and-swap authority changed", nil)
 	}
+	if command.ExpectedAuthorityVersion > 0 && command.ExpectedAuthorityVersion != authority.Version {
+		return ConfigurationApplyResult{}, serviceError(ErrorConflict, "configuration compare-and-swap authority changed", nil)
+	}
 	if candidate.DatabasePath != authority.DatabasePath {
 		return ConfigurationApplyResult{}, serviceError(ErrorConflict, "configuration authority relocation requires recovery", nil)
 	}
@@ -296,7 +299,7 @@ func (s *ConfigurationService) Apply(ctx context.Context, command ConfigurationA
 	if err := s.files.RetainRaw(candidate.Digest, command.Payload); err != nil {
 		return ConfigurationApplyResult{}, serviceError(ErrorInternal, "configuration target evidence could not be retained", nil)
 	}
-	generation, acceptedReceipt, created, err := s.store.BeginConfigurationApply(ctx, ConfigurationApplyAcceptance{ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, Candidate: candidate, Requester: configured.identity, Receipt: receipt, Provenance: provenance, AcceptedAt: receipt.AcceptedAt})
+	generation, acceptedReceipt, created, err := s.store.BeginConfigurationApply(ctx, ConfigurationApplyAcceptance{ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, ExpectedAuthorityVersion: command.ExpectedAuthorityVersion, Candidate: candidate, Requester: configured.identity, Receipt: receipt, Provenance: provenance, AcceptedAt: receipt.AcceptedAt})
 	if err != nil {
 		s.removeUnreferencedRaw(ctx, candidate.Digest)
 		return ConfigurationApplyResult{}, classifyConfigurationStoreError(err)
@@ -701,6 +704,8 @@ func configurationApplyReceiptFor(expectedGenerationID int64, expectedDigest str
 		anchor = configurationDigest("configuration-apply-v2", strconv.FormatInt(expectedGenerationID, 10), expectedDigest, candidate.Digest, string(provenance.Kind), strconv.FormatInt(provenance.RollbackSourceGenerationID, 10), provenance.RollbackSourceDigest)
 	} else if provenance.Kind == ConfigurationApplyOnboarding {
 		anchor = configurationDigest("configuration-apply-v3", strconv.FormatInt(expectedGenerationID, 10), expectedDigest, candidate.Digest, string(provenance.Kind), provenance.OnboardingSourceID, provenance.OnboardingSourceDigest)
+	} else if provenance.Kind == ConfigurationApplySchemaMigration {
+		anchor = configurationDigest("configuration-apply-v4", strconv.FormatInt(expectedGenerationID, 10), expectedDigest, candidate.Digest, string(provenance.Kind), provenance.MigrationRequestID, provenance.MigrationPreviewDigest)
 	}
 	return NewOperationReceipt(OperationReceiptInput{OperationType: OperationApplyConfiguration, Scope: ScopeController, TargetID: target.TargetID, Requester: requester.identity, RequestDigest: candidate.Digest, ExpectedAuthorityDigest: expectedDigest, OperationAnchorDigest: anchor, TargetBindingDigest: target.TargetBindingDigest, AcceptedAt: at})
 }
@@ -713,9 +718,15 @@ func ConfigurationApplyReceiptSettlesGeneration(receipt OperationReceipt, genera
 	if ValidateOperationReceipt(receipt) != nil || generation.Origin != ConfigurationOriginApply || generation.ParentID != parent.GenerationID || generation.Requester.Validate() != nil || generation.CreatedAt.IsZero() || generation.CommittedAt.IsZero() {
 		return false
 	}
-	provenance := ConfigurationApplyProvenance{Kind: ConfigurationApplyNormal}
+	provenance := ConfigurationApplyProvenance{Kind: generation.ApplyKind}
+	if provenance.Kind == "" {
+		provenance.Kind = ConfigurationApplyNormal
+	}
 	if generation.RollbackSourceGenerationID > 0 || generation.RollbackSourceDigest != "" {
 		provenance = ConfigurationApplyProvenance{Kind: ConfigurationApplyRollback, RollbackSourceGenerationID: generation.RollbackSourceGenerationID, RollbackSourceDigest: generation.RollbackSourceDigest}
+	} else if provenance.Kind == ConfigurationApplySchemaMigration {
+		provenance.MigrationRequestID = generation.MigrationRequestID
+		provenance.MigrationPreviewDigest = generation.MigrationPreviewDigest
 	}
 	if !provenance.Valid() {
 		return false
@@ -754,11 +765,13 @@ func normalizedConfigurationApplyProvenance(value ConfigurationApplyProvenance) 
 	}
 	switch value.Kind {
 	case ConfigurationApplyNormal:
-		return value, value.RollbackSourceGenerationID == 0 && value.RollbackSourceDigest == "" && value.OnboardingSourceID == "" && value.OnboardingSourceDigest == ""
+		return value, value.RollbackSourceGenerationID == 0 && value.RollbackSourceDigest == "" && value.OnboardingSourceID == "" && value.OnboardingSourceDigest == "" && value.MigrationRequestID == "" && value.MigrationPreviewDigest == ""
 	case ConfigurationApplyRollback:
-		return value, value.RollbackSourceGenerationID > 0 && validAuthorityDigest(value.RollbackSourceDigest) && value.OnboardingSourceID == "" && value.OnboardingSourceDigest == ""
+		return value, value.RollbackSourceGenerationID > 0 && validAuthorityDigest(value.RollbackSourceDigest) && value.OnboardingSourceID == "" && value.OnboardingSourceDigest == "" && value.MigrationRequestID == "" && value.MigrationPreviewDigest == ""
 	case ConfigurationApplyOnboarding:
-		return value, strings.HasPrefix(value.OnboardingSourceID, "onboarding-") && validAuthorityDigest(value.OnboardingSourceDigest) && value.RollbackSourceGenerationID == 0 && value.RollbackSourceDigest == ""
+		return value, strings.HasPrefix(value.OnboardingSourceID, "onboarding-") && validAuthorityDigest(value.OnboardingSourceDigest) && value.RollbackSourceGenerationID == 0 && value.RollbackSourceDigest == "" && value.MigrationRequestID == "" && value.MigrationPreviewDigest == ""
+	case ConfigurationApplySchemaMigration:
+		return value, value.Valid()
 	default:
 		return ConfigurationApplyProvenance{}, false
 	}

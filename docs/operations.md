@@ -161,6 +161,59 @@ and current desired authority, then materializes against current schema-5 base
 bytes so every non-editable current authority remains unchanged. Apply delegates
 to the existing generation/CAS service and never restarts the worker.
 
+For a healthy, exactly converged inline version-2, version-3, or version-4
+installation, use the explicit schema migration rather than editing JSON:
+
+```sh
+agentctl config migrate preview \
+  --requester <login> \
+  --requester-database-id <id> \
+  --requester-node-id <node-id> \
+  --requester-type User
+```
+
+Copy every returned authority field unchanged into `config migrate apply`, add
+one stable request ID, and keep it for every retry:
+
+```sh
+agentctl config migrate apply \
+  --request-id <stable-request-id> \
+  --expected-generation-id <generation> \
+  --expected-digest <digest> \
+  --expected-authority-version <version> \
+  --source-schema-version <2|3|4> \
+  --target-schema-version 5 \
+  --candidate-digest <candidate-digest> \
+  --migration-digest <migration-digest> \
+  --preview-digest <preview-digest> \
+  --requester <login> \
+  --requester-database-id <id> \
+  --requester-node-id <node-id> \
+  --requester-type User
+```
+
+Preview and apply accept no raw JSON, candidate file, path, identity override,
+or credential input. They expose no repository path, raw GitHub App profile,
+credential reference, database device/inode, or retained bytes. Migration
+preserves the decoded GitHub App and credential authority; JSON whitespace and
+its raw profile formatting digest are deliberately not semantic authority.
+Repository profile, registry, and binding digests remain exact. Version 3 maps
+`max_active_runs: 1` to `heavy_capacity: 1`; version 4 preserves explicit or
+default capacity semantics. Version 1 is not eligible because it uses an
+external repository registry.
+
+Apply fails closed on drift, stale or missing worker evidence, changed preview
+authority, missing retained source bytes for a new effect, an unavailable common
+operator, or any active configuration/removal/onboarding transaction. A
+successful result is durable before file replacement and reports
+`restart_required`. Repeating the exact request after response loss returns the
+original generation and receipt even though desired configuration is already
+version 5. An observed exact receipt remains replayable after normal retention
+prunes the superseded legacy raw; an accepted receipt requires its retained
+target bytes so normal reconciliation can finish. Restart through the normal
+supervisor procedure, then run `config status` until desired, effective, and
+loaded digests are equal. The command never restarts the worker itself.
+
 For one safely readable external edit, authorized `config status` includes a
 bounded `recovery` offer containing the exact desired generation/digest,
 authority version, and observed live digest. Pass those values unchanged to

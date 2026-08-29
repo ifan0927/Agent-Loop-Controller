@@ -399,6 +399,7 @@ The acceptance matrix requires:
 | Activity and operation history | Closed classifications and validation, deterministic immutable identity/replay conflict, current/backfill compatible replay with first-classification preservation, source-transaction rollback, one-primary-event operation correlation, bounded schema-only migration/backfill/restart/interleaving, runtime unchanged suppression including no integrity-generation advance for freshness-only updates, semantic runtime-state trigger coverage, authorization-first filters/count/order/page, ingestion-watermark pagination, stable receipt ordering during monotonic advance, cursor drift, corruption failure, and negative sanitization |
 | Controller integrity | Seven-family registry and trigger coverage, one-family restart progress, freshness-only runtime-state exclusion, real full-family bounded-convergence fallback at a quiescent bounded-worker boundary, no refill before sibling/deferred-cleanup drain, publication-generation mutation fencing, explicit-recheck separation, exact legacy exhaustion and repeated schema-v43 unstable-publication successor classification, and malformed/partial/generic-pending rejection |
 | Typed configuration drafts | One active normal or rollback-origin draft under concurrent open, authorization-before-lookup and hidden targets, every allowlisted field and input bound, edit/discard replay, validation and preview invalidation, v32-compatible normal identity plus deterministic source-bound rollback identity, schema-1-through-5 scalar projection, source-prune/open exclusion plus exact post-open replay after pruning, committed intent/receipt source evidence, immutable generation provenance, unchanged-byte no-op, real apply, response-loss/restart replay, capacity drain impact, sanitized output, and isolated CLI restart/convergence acceptance |
+| Configuration schema migration | Inline schema-2-through-4 materialization, version-3 singleton and version-4 default capacity preservation, deterministic common-operator derivation and no-common-operator rejection, exact repository profile/registry/binding digest preservation, decoded GitHub App and credential-authority equality independent of raw JSON whitespace, desired/effective/live convergence, every active mutation-lane exclusion including preflight onboarding, authority and preview invalidation, response loss after durable intent and settlement, exact accepted reconciliation, settled replay after desired advances to schema 5 and source-raw pruning, one `schema_migration` generation, sanitized output, post-restart convergence, and repository-removal materialization |
 | Bounded concurrency | Generic capacity above two, same-repository exclusion, drain-on-reduction, sibling failure isolation, quiescent maintenance without sibling cancellation or refills, and restart reconstruction |
 | Implementation | Owned worktree, resumable session, exact candidate, successful verifier batch |
 | Internal review | Fresh independent read-only review bound to candidate head; after repair, exact expected-finding dispositions cover both repair and full branch deltas |
@@ -429,6 +430,9 @@ controller process. Cover at least:
   exchange/fsync/reread, staged-leaf cleanup sync, same-digest receipt CAS,
   desired settlement, safe-drift recovery intent/exchange/replay/ambiguity,
   effective observation, and retention pruning;
+- inline configuration schema migration preview invalidation, accepted intent,
+  live exchange, settlement response loss, exact replay from the superseded
+  legacy parent, and post-restart schema-5 convergence;
 - push, PR create/adopt, review reply, and merge intent/observation;
 - pending CI/approval/thread resolution polling;
 - Linear completion observation;
@@ -455,7 +459,7 @@ that bypass safety solely to make fault injection easier.
 ## Database Migrations
 
 SQLite migrations are ordered in `internal/adapters/sqlite/store.go`; the current
-schema version is 43. Opening a database applies missing forward migrations in a
+schema version is 44. Opening a database applies missing forward migrations in a
 transaction. A database newer than the binary fails closed.
 
 The v42-to-v43 fixture preserves every runtime-state row and all insert/delete

@@ -73,6 +73,10 @@ the state machine.
   explicit discard. Eligible retained generations can be projected into a
   source-bound forward-rollback draft without restoring historical private
   authority or creating another apply path.
+- Explicit guarded inline configuration migration from readable schemas 2-4
+  to schema 5, with sanitized semantic preview, exact convergence and CAS
+  authority, durable `schema_migration` provenance, response-loss replay, and
+  operator-owned worker restart.
 - Durable per-repository `enabled`/`disabled` lifecycle authority with immutable
   incarnation identity, one-time compatibility-preserving baseline adoption,
   eight-dimension read-only readiness snapshots, restart-safe recheck receipts,
