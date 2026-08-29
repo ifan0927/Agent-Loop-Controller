@@ -43,8 +43,9 @@ type automaticWorkerDriver struct {
 }
 
 type automaticWorkerRuntime struct {
-	store    *sqlitestore.Store
-	dispatch admissionWorkerDispatch
+	store       *sqlitestore.Store
+	dispatch    admissionWorkerDispatch
+	maintenance admissionWorkerMaintenance
 }
 
 var buildAutomaticWorkerRuntime = newAutomaticWorkerRuntime
@@ -125,7 +126,7 @@ func controllerWorker(args []string) error {
 	if err != nil {
 		return err
 	}
-	if runtime.store == nil || runtime.dispatch == nil {
+	if runtime.store == nil || runtime.dispatch == nil || runtime.maintenance == nil {
 		return errors.New("automatic admission worker is unavailable")
 	}
 	store := runtime.store
@@ -149,7 +150,7 @@ func controllerWorker(args []string) error {
 	if pollInterval <= 0 {
 		pollInterval = 30 * time.Second
 	}
-	result, err := runBoundedAdmissionWorkerWithHeartbeat(ctx, *once, pollInterval, workerCapacity, runtime.dispatch, reporter, func() {
+	result, err := runBoundedAdmissionWorkerWithHeartbeatAndMaintenance(ctx, *once, pollInterval, workerCapacity, runtime.dispatch, runtime.maintenance, reporter, func() {
 		fprintfWorkerStart(instanceID, loaded.Digest)
 	})
 	if err != nil {
@@ -164,6 +165,10 @@ func controllerWorker(args []string) error {
 }
 
 func runBoundedAdmissionWorkerWithHeartbeat(ctx context.Context, once bool, poll time.Duration, capacity int, dispatch admissionWorkerDispatch, reporter *workerStatusReporter, started func()) (admissionWorkerResult, error) {
+	return runBoundedAdmissionWorkerWithHeartbeatAndMaintenance(ctx, once, poll, capacity, dispatch, nil, reporter, started)
+}
+
+func runBoundedAdmissionWorkerWithHeartbeatAndMaintenance(ctx context.Context, once bool, poll time.Duration, capacity int, dispatch admissionWorkerDispatch, maintenance admissionWorkerMaintenance, reporter *workerStatusReporter, started func()) (admissionWorkerResult, error) {
 	if reporter == nil {
 		return admissionWorkerResult{}, errors.New("automatic admission worker heartbeat is unavailable")
 	}
@@ -199,7 +204,7 @@ func runBoundedAdmissionWorkerWithHeartbeat(ctx context.Context, once bool, poll
 			}
 		}
 	}()
-	result, runErr := runBoundedAdmissionWorkerAtObserved(workerCtx, once, poll, capacity, dispatch, waitAdmissionWorker, func() time.Time { return time.Now().UTC() }, reporter.Observe)
+	result, runErr := runBoundedAdmissionWorkerAtObservedWithMaintenance(workerCtx, once, poll, capacity, dispatch, waitAdmissionWorker, func() time.Time { return time.Now().UTC() }, reporter.Observe, maintenance)
 	cancelWorker()
 	<-heartbeatStopped
 	select {
@@ -278,7 +283,7 @@ func newAutomaticWorkerRuntime(loaded bootstrap.Bootstrap, instanceID string) (a
 			_ = store.Close()
 			return automaticWorkerRuntime{}, errors.New("onboarding worker is unavailable")
 		}
-		return automaticWorkerRuntime{store: store, dispatch: onboardingWorkerDispatch(store, onboarding, nil)}, nil
+		return automaticWorkerRuntime{store: store, dispatch: onboardingWorkerDispatch(store, onboarding, nil), maintenance: integrityWorkerMaintenance(store)}, nil
 	}
 	credentials, err := linearCredentialSourceForRef(loaded, configured.CredentialSourceRef)
 	if err != nil {
@@ -342,7 +347,7 @@ func newAutomaticWorkerRuntime(loaded bootstrap.Bootstrap, instanceID string) (a
 		_ = store.Close()
 		return automaticWorkerRuntime{}, errors.New("onboarding worker is unavailable")
 	}
-	return automaticWorkerRuntime{store: store, dispatch: onboardingWorkerDispatch(store, onboarding, dispatcher.Dispatch)}, nil
+	return automaticWorkerRuntime{store: store, dispatch: onboardingWorkerDispatch(store, onboarding, dispatcher.Dispatch), maintenance: integrityWorkerMaintenance(store)}, nil
 }
 
 func onboardingWorkerDispatch(store *sqlitestore.Store, onboarding *application.OnboardingService, fallback admissionWorkerDispatch) admissionWorkerDispatch {
@@ -383,13 +388,19 @@ func onboardingWorkerDispatch(store *sqlitestore.Store, onboarding *application.
 		} else {
 			dispatchResult = application.LinearTodoDispatchResult{Outcome: application.LinearTodoDispatchNoCandidate, ScanDigest: application.ConfigurationEvidenceDigest("onboarding-worker-idle-v1", "none")}
 		}
-		// Integrity maintenance receives one SQLite-only family batch only after
-		// onboarding and normal admission have had their opportunity. Its
-		// recoverable degradation never consumes a heavy permit or stops delivery.
-		if maintenance, maintenanceErr := application.NewIntegrityMaintenanceService(store); maintenanceErr == nil {
-			_, _ = maintenance.Run(ctx, "automatic-worker", time.Now().UTC())
-		}
 		return dispatchResult, nil
+	}
+}
+
+func integrityWorkerMaintenance(store *sqlitestore.Store) admissionWorkerMaintenance {
+	maintenance, err := application.NewIntegrityMaintenanceService(store)
+	if err != nil {
+		return nil
+	}
+	return func(ctx context.Context) {
+		// Integrity degradation remains observable through the persistence
+		// projection and must not stop otherwise healthy delivery.
+		_, _ = maintenance.Run(ctx, "automatic-worker", time.Now().UTC())
 	}
 }
 

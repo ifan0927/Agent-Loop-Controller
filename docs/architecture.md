@@ -563,6 +563,15 @@ that the prior supervisor exited. The worker retains one
 admission/poll supervisor beyond heavy capacity so waiting runs cannot starve an
 idle repository.
 
+Integrity maintenance is owned by the outer bounded worker, not by an
+individual concurrent dispatch. Once any member of the current bounded batch
+returns, the worker stops refilling, lets every existing sibling finish without
+cancellation, consumes every buffered result, and waits for dispatch-deferred
+lease and scheduling cleanup before advancing one SQLite-only integrity batch.
+New dispatch admission resumes only after that quiescent maintenance boundary.
+An errored batch joins its siblings and reports the error without publishing
+maintenance evidence.
+
 Worker runtime liveness is a separate application contract from workload
 activity and configuration convergence. After strict configuration, process
 lock, credential topology, SQLite compatibility, supervisor fencing,
@@ -1382,6 +1391,17 @@ current pointer, registry order, scan link, family set, and coverage/count
 evidence must all verify. Generic `integrity_pending`, partial or malformed
 evidence, and unrelated unknown results never gain successor authority.
 
+The compatibility-only `integrity_publication_not_stable` attention is limited
+to an already-installed schema-v43 candidate. It requires the valid current
+pointer to a complete attempt-eight `ready` publication with the exact seven
+registered families, a second earlier publication with the same complete
+shape, intervening `source_generation_advanced` scan evidence, and a later
+active or superseded scan proving that Controller mutations immediately made
+the latest publication stale. Observation digests, scan identities and
+boundaries, registry order, family evidence, finding absence, and generation
+ordering must all verify. Generic stale readiness, one publication, partial or
+malformed evidence, and ordinary `integrity_pending` remain ineligible.
+
 The successor binds its previous-binary evidence to the failed installed
 candidate, never to the predecessor's pre-bootstrap binary. Its replacement
 therefore reuses the normal absent-supervisor, worker-lock, current
@@ -1595,8 +1615,9 @@ identity, classification, source-evidence digest, status, or reason still
 advances the `operation_activity` revision.
 
 The automatic worker gives onboarding and normal admission their opportunity
-first, then advances at most one SQLite-only integrity family batch without a
-heavy permit. One durable scan lane owns its registry version, target
+first. After the current bounded dispatch batch is fully quiescent, it advances
+at most one SQLite-only integrity family batch without a heavy permit, then
+resumes dispatch refills. One durable scan lane owns its registry version, target
 generation, cursor, lease, checked revisions, deterministic findings, and
 committed progress. Restart reuses committed progress. Publication requires
 all seven results and an unchanged source generation in one transaction; a

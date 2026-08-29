@@ -967,6 +967,14 @@ generation. Each publication uses a bounded exclusive mode-`0600` temporary
 leaf, complete write and fsync, and atomic replacement; routine heartbeats do
 not append logs or SQLite audit rows.
 
+Integrity maintenance runs only after a bounded dispatch batch becomes
+quiescent. Once one dispatch finishes, the worker stops adding replacements,
+allows existing siblings and their lease/scheduling cleanup to finish, consumes
+their buffered results, advances one maintenance batch, and then resumes normal
+admission. A long-running sibling is not canceled merely to publish readiness;
+an errored batch is joined and reported without a maintenance publication.
+`--once` uses the same boundary after its single dispatch.
+
 The controller-scope runtime observation classifies this evidence as `fresh`,
 `stale`, `offline`, `unknown`, or `conflict`, separately from worker activity.
 Age through 45 seconds is fresh only when the live PID and exact process-start
@@ -2954,7 +2962,7 @@ An attention result whose `upgrade_health` is `healthy` and whose
 `controller_readiness` is `not_ready` may be eligible for one verified managed
 successor. Eligibility is limited to `configuration_not_converged`,
 `integrity_not_ready`, `integrity_conflict`, and the compatibility-only
-`integrity_convergence_exhausted`. Keep the selected worker
+`integrity_convergence_exhausted` and `integrity_publication_not_stable`. Keep the selected worker
 running while preparing so its exact binary, supervisor PID/process-start
 identity, heartbeat, loaded configuration, database topology, and predecessor
 journal can be revalidated:
@@ -2987,6 +2995,18 @@ the ordinary `successor-prepare` command above with the intended v43-or-newer
 revision. Do not stop the selected worker before preparation. Generic
 `integrity_pending`, partial evidence, other unknown results, or changed
 heartbeat/configuration/topology evidence remain ineligible.
+
+`integrity_publication_not_stable` is recognized only for an installed
+schema-v43 candidate with repeated exact attempt-eight publications. Both the
+current and immediately preceding retained observations must be complete
+seven-family `ready / complete` evidence with valid digests and no findings;
+intervening `source_generation_advanced` scan history and a later active or
+superseded scan must prove that post-publication Controller mutations made the
+latest current pointer stale. Rerun `observe` to enter attention, then use the
+ordinary `successor-prepare` command with a different verified revision that
+supports schema v43 or newer. One ready publication, a generic stale pointer,
+generic `integrity_pending`, incomplete coverage, a malformed family or scan,
+or unrelated readiness evidence remains ineligible.
 
 If an operator-confirmed local file relocation replaced the Controller database
 inode at the same canonical path before an ordinary successor could be

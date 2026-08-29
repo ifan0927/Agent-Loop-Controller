@@ -408,6 +408,9 @@ func configurationAndIntegrityReadiness(ctx context.Context, path, configDigest 
 	if expectedSchema == legacyIntegrityConvergenceSchemaVersion && legacyIntegrityConvergenceExhausted(ctx, db) {
 		return "not_ready", "integrity_convergence_exhausted"
 	}
+	if expectedSchema == installedIntegrityPublicationSchemaVersion && integrityPublicationNotStable(ctx, db) {
+		return "not_ready", "integrity_publication_not_stable"
+	}
 	if generation != published {
 		return "pending", "integrity_pending"
 	}

@@ -424,7 +424,7 @@ func resultFor(j journal, state, reason, next string) Result {
 
 func eligibleSuccessorReason(reason string) bool {
 	switch reason {
-	case "configuration_not_converged", "integrity_not_ready", "integrity_conflict", "integrity_convergence_exhausted":
+	case "configuration_not_converged", "integrity_not_ready", "integrity_conflict", "integrity_convergence_exhausted", "integrity_publication_not_stable":
 		return true
 	default:
 		return false
