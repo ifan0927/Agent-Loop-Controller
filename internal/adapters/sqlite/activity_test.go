@@ -178,6 +178,137 @@ func TestActivityV42MigrationDoesNotReopenUnrelatedConflict(t *testing.T) {
 	}
 }
 
+func TestActivityV43MigrationPreservesRowsAndTracksOnlySemanticRuntimeChanges(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "controller.db")
+	legacy, err := openWithSupportedSchema(path, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.db.Exec(`INSERT INTO activity_runtime_state(source_kind,source_identity,classification,source_evidence_digest,observed_at,status,reason_code) VALUES('worker_readiness','automatic-worker','running',?,'2026-08-28T05:00:00Z','ready','unchanged_classification')`, strings.Repeat("a", 64)); err != nil {
+		t.Fatal(err)
+	}
+	var legacyTriggers int
+	if err := legacy.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'integrity_track_%'`).Scan(&legacyTriggers); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if version, err := store.SchemaVersion(context.Background()); err != nil || version != 43 {
+		t.Fatalf("version=%d err=%v", version, err)
+	}
+	var rows int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM activity_runtime_state WHERE source_kind='worker_readiness' AND source_identity='automatic-worker'`).Scan(&rows); err != nil || rows != 1 {
+		t.Fatalf("rows=%d err=%v", rows, err)
+	}
+	var triggers int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name IN ('integrity_track_activity_runtime_state_insert','integrity_track_activity_runtime_state_update','integrity_track_activity_runtime_state_delete')`).Scan(&triggers); err != nil || triggers != 3 {
+		t.Fatalf("triggers=%d err=%v", triggers, err)
+	}
+	var migratedTriggers int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'integrity_track_%'`).Scan(&migratedTriggers); err != nil || migratedTriggers != legacyTriggers {
+		t.Fatalf("legacy_triggers=%d migrated_triggers=%d err=%v", legacyTriggers, migratedTriggers, err)
+	}
+
+	generation := func() int64 {
+		var value int64
+		if err := store.db.QueryRow(`SELECT generation FROM controller_integrity_generation WHERE singleton=1`).Scan(&value); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	before := generation()
+	if _, err := store.db.Exec(`UPDATE activity_runtime_state SET observed_at='2026-08-28T05:01:00Z' WHERE source_kind='worker_readiness' AND source_identity='automatic-worker'`); err != nil {
+		t.Fatal(err)
+	}
+	if after := generation(); after != before {
+		t.Fatalf("freshness-only update advanced generation before=%d after=%d", before, after)
+	}
+
+	updates := []string{
+		`UPDATE activity_runtime_state SET source_kind='worker_runtime' WHERE source_kind='worker_readiness' AND source_identity='automatic-worker'`,
+		`UPDATE activity_runtime_state SET source_identity='automatic-worker-v2' WHERE source_kind='worker_runtime' AND source_identity='automatic-worker'`,
+		`UPDATE activity_runtime_state SET classification='parked' WHERE source_kind='worker_runtime' AND source_identity='automatic-worker-v2'`,
+		`UPDATE activity_runtime_state SET source_evidence_digest='` + strings.Repeat("b", 64) + `' WHERE source_kind='worker_runtime' AND source_identity='automatic-worker-v2'`,
+		`UPDATE activity_runtime_state SET status='degraded' WHERE source_kind='worker_runtime' AND source_identity='automatic-worker-v2'`,
+		`UPDATE activity_runtime_state SET reason_code='runtime_degraded' WHERE source_kind='worker_runtime' AND source_identity='automatic-worker-v2'`,
+	}
+	for index, statement := range updates {
+		before = generation()
+		if _, err := store.db.Exec(statement); err != nil {
+			t.Fatalf("semantic update %d: %v", index, err)
+		}
+		if after := generation(); after != before+1 {
+			t.Fatalf("semantic update %d generation before=%d after=%d", index, before, after)
+		}
+	}
+	before = generation()
+	if _, err := store.db.Exec(`INSERT INTO activity_runtime_state VALUES('activity_indexing','v43-fixture','ready',?,'2026-08-28T05:02:00Z','ready','recovered')`, strings.Repeat("c", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if after := generation(); after != before+1 {
+		t.Fatalf("insert generation before=%d after=%d", before, after)
+	}
+	before = generation()
+	if _, err := store.db.Exec(`DELETE FROM activity_runtime_state WHERE source_kind='activity_indexing' AND source_identity='v43-fixture'`); err != nil {
+		t.Fatal(err)
+	}
+	if after := generation(); after != before+1 {
+		t.Fatalf("delete generation before=%d after=%d", before, after)
+	}
+	var revision int64
+	if err := store.db.QueryRow(`SELECT revision_generation FROM controller_integrity_scope_revisions WHERE family='operation_activity' AND scope_kind='controller' AND scope_id='local-controller'`).Scan(&revision); err != nil || revision != generation() {
+		t.Fatalf("revision=%d generation=%d err=%v", revision, generation(), err)
+	}
+}
+
+func TestRuntimeFreshnessRefreshesDoNotAdvanceIntegrityGeneration(t *testing.T) {
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 8, 28, 6, 0, 0, 0, time.UTC)
+	observation := application.RuntimeActivityObservation{SourceKind: "worker_readiness", SourceIdentity: "automatic-worker", Classification: "running", SourceEvidenceDigest: strings.Repeat("a", 64), TargetBindingDigest: strings.Repeat("b", 64), OccurredAt: now, ObservedAt: now}
+	if _, created, err := store.ReconcileWorkerActivity(ctx, observation); err != nil || !created {
+		t.Fatalf("initial created=%t err=%v", created, err)
+	}
+	observation.ObservedAt = now.Add(time.Minute)
+	if _, created, err := store.ReconcileWorkerActivity(ctx, observation); err != nil || created {
+		t.Fatalf("settling created=%t err=%v", created, err)
+	}
+	var settled int64
+	if err := store.db.QueryRow(`SELECT generation FROM controller_integrity_generation WHERE singleton=1`).Scan(&settled); err != nil {
+		t.Fatal(err)
+	}
+	observation.ObservedAt = now.Add(2 * time.Minute)
+	if _, created, err := store.ReconcileWorkerActivity(ctx, observation); err != nil || created {
+		t.Fatalf("refresh created=%t err=%v", created, err)
+	}
+	if err := store.RecordActivityIndexingRecovery(ctx, "worker_readiness", now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordActivityIndexingRecovery(ctx, "worker_readiness", now.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	var after int64
+	if err := store.db.QueryRow(`SELECT generation FROM controller_integrity_generation WHERE singleton=1`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	// The first indexing-recovery call inserts one semantic runtime row. The
+	// worker refresh and repeated recovery update only observed_at.
+	if after != settled+1 {
+		t.Fatalf("freshness refresh advanced generation settled=%d after=%d", settled, after)
+	}
+}
+
 func TestActivityReplayConflictAndCorruptDetailFailClosed(t *testing.T) {
 	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {

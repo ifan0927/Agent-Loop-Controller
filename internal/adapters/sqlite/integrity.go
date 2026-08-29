@@ -137,32 +137,20 @@ func (s *Store) RunIntegrityMaintenance(ctx context.Context, owner string, obser
 	families := application.IntegrityFamilies()
 	maintenance := application.IntegrityMaintenanceResult{ScanID: scanID, TargetGeneration: target, Superseded: superseded}
 	if convergenceAttempt == 8 && cursor == 0 {
-		for _, family := range application.IntegrityFamilies() {
-			var revision int64
-			if err := tx.QueryRowContext(ctx, `SELECT revision_generation FROM controller_integrity_scope_revisions WHERE family=? AND scope_kind='controller' AND scope_id='local-controller'`, family).Scan(&revision); err != nil {
-				return application.IntegrityMaintenanceResult{}, errors.New("integrity convergence evidence conflicts")
+		for _, family := range families {
+			familyResult, findings, checkErr := checkIntegrityFamilyTx(ctx, tx, family)
+			if checkErr != nil {
+				familyResult = application.IntegrityFamilyResult{Family: family, State: application.IntegrityUnknown, ReasonCode: "bounded_check_failed", CountComplete: false, CoverageComplete: false}
+				findings = nil
 			}
-			familyResult := application.IntegrityFamilyResult{Family: family, State: application.IntegrityUnknown, ReasonCode: "convergence_bound_exhausted", CheckedRevision: revision, CountComplete: false, CoverageComplete: false}
-			if err := persistIntegrityFamilyTx(ctx, tx, scanID, familyResult, nil, observedAt); err != nil {
+			if err := persistIntegrityFamilyTx(ctx, tx, scanID, familyResult, findings, observedAt); err != nil {
 				return application.IntegrityMaintenanceResult{}, err
 			}
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE controller_integrity_scans SET family_cursor=7,lease_owner='',lease_expires_at='',updated_at=? WHERE scan_id=? AND status='active' AND lease_version=?`, formatTime(observedAt), scanID, leaseVersion); err != nil {
+		cursor = len(families)
+		if _, err := tx.ExecContext(ctx, `UPDATE controller_integrity_scans SET family_cursor=?,lease_owner='',lease_expires_at='',updated_at=? WHERE scan_id=? AND status='active' AND lease_version=?`, cursor, formatTime(observedAt), scanID, leaseVersion); err != nil {
 			return application.IntegrityMaintenanceResult{}, err
 		}
-		if explicitRecheck {
-			err = finalizeIntegrityRecheckObservationTx(ctx, tx, recheck, observedAt)
-		} else {
-			err = publishIntegrityObservationTx(ctx, tx, scanID, target, observedAt)
-		}
-		if err != nil {
-			return application.IntegrityMaintenanceResult{}, err
-		}
-		maintenance.Published = true
-		if err := tx.Commit(); err != nil {
-			return application.IntegrityMaintenanceResult{}, err
-		}
-		return maintenance, nil
 	}
 	if cursor < len(families) {
 		family := families[cursor]

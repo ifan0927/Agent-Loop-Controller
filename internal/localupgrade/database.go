@@ -402,7 +402,13 @@ func configurationAndIntegrityReadiness(ctx context.Context, path, configDigest 
 	var generation, published int64
 	var readiness string
 	err = db.QueryRowContext(ctx, `SELECT g.generation,c.published_generation,o.effective_readiness FROM controller_integrity_generation g LEFT JOIN controller_integrity_current c ON c.singleton=1 LEFT JOIN controller_integrity_observations o ON o.observation_id=c.observation_id WHERE g.singleton=1`).Scan(&generation, &published, &readiness)
-	if err != nil || generation != published {
+	if err != nil {
+		return "pending", "integrity_pending"
+	}
+	if expectedSchema == legacyIntegrityConvergenceSchemaVersion && legacyIntegrityConvergenceExhausted(ctx, db) {
+		return "not_ready", "integrity_convergence_exhausted"
+	}
+	if generation != published {
 		return "pending", "integrity_pending"
 	}
 	switch readiness {
