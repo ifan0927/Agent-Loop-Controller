@@ -104,8 +104,8 @@ running the canonical gate.
 ```sh
 go build ./cmd/agentctl
 gofmt -w cmd internal
-go test ./...
-go test -race ./...
+go test -p=1 ./...
+go test -race -p=1 ./...
 go vet ./...
 git diff --check
 ./scripts/verify-controller.sh
@@ -113,9 +113,12 @@ git diff --check
 
 The canonical repository gate is `./scripts/verify-controller.sh`. It checks
 formatting without rewriting, normal tests, race tests, vet, the deterministic
-GitHub read fixture, and credential-pattern scanning. GitHub Actions invokes the
-same script on pull requests and pushes to `main` with read-only contents
-permission.
+GitHub read fixture, and credential-pattern scanning. Both complete Go test
+suites serialize package binaries with `-p=1` because configuration and local
+upgrade packages intentionally contend for the same Controller-wide,
+filesystem-root mutation lock. Package-internal test concurrency is unchanged.
+GitHub Actions invokes the same script on pull requests and pushes to `main`
+with read-only contents permission.
 
 Launchd migration tests use temporary plist trees, synthetic `launchctl`
 observations, isolated controller databases, and real advisory-lock behavior.
