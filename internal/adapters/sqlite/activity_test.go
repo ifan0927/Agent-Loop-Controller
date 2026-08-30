@@ -212,7 +212,7 @@ func TestActivityV43MigrationPreservesRowsAndTracksOnlySemanticRuntimeChanges(t 
 		t.Fatalf("triggers=%d err=%v", triggers, err)
 	}
 	var migratedTriggers int
-	if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'integrity_track_%'`).Scan(&migratedTriggers); err != nil || migratedTriggers != legacyTriggers {
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'integrity_track_%'`).Scan(&migratedTriggers); err != nil || migratedTriggers != legacyTriggers+3 {
 		t.Fatalf("legacy_triggers=%d migrated_triggers=%d err=%v", legacyTriggers, migratedTriggers, err)
 	}
 

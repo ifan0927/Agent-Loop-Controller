@@ -30,7 +30,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 44
+const schemaVersion = 45
 
 // SupportedSchemaVersion is the single maintained source for the newest
 // Controller database schema understood by this binary.
@@ -681,8 +681,65 @@ func migrateSQLite(ctx context.Context, db sqliteTransactioner, supportedVersion
 			}
 			existingVersion = 41
 		}
+		if supportedVersion >= 45 && existingVersion < 45 {
+			if existingVersion < 44 {
+				if err := migrateSQLiteGeneric(ctx, db, 44); err != nil {
+					return err
+				}
+				existingVersion = 44
+			}
+			if err := migrateSQLiteV45Upgrade(ctx, db); err != nil {
+				return err
+			}
+			existingVersion = 45
+		}
 	}
 	return migrateSQLiteGeneric(ctx, db, supportedVersion)
+}
+
+func migrateSQLiteV45Upgrade(ctx context.Context, db sqliteTransactioner) error {
+	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		return err
+	}
+	defer db.ExecContext(ctx, `PRAGMA foreign_keys = ON`)
+	defer db.ExecContext(ctx, `PRAGMA legacy_alter_table = OFF`)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var current int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&current); err != nil {
+		return err
+	}
+	if current >= 45 {
+		return tx.Commit()
+	}
+	if current != 44 {
+		return fmt.Errorf("cleanup source recovery migration requires schema 44, found %d", current)
+	}
+	for _, statement := range migrationV45 {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("migrate schema to version 45: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,applied_at) VALUES(45,?)`, nowText()); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA legacy_alter_table = OFF`); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
+		return err
+	}
+	var violations int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_foreign_key_check`).Scan(&violations); err != nil || violations != 0 {
+		return errors.New("schema 45 foreign key validation failed")
+	}
+	return nil
 }
 
 func migrateSQLiteGeneric(ctx context.Context, db sqliteTransactioner, supportedVersion int) error {
@@ -795,6 +852,8 @@ func migrateSQLiteGeneric(ctx context.Context, db sqliteTransactioner, supported
 			statements = migrationV43
 		case 44:
 			statements = migrationV44
+		case 45:
+			statements = migrationV45
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -2013,7 +2072,7 @@ var integritySourceFamilies = map[application.IntegrityFamily][]string{
 		"repository_slots", "heavy_permits", "run_scheduling", "queue_snapshot", "scheduling_decisions",
 		"automatic_retry_schedules",
 	},
-	application.IntegrityOwnedResourceCleanup: {"owned_resources", "cleanup_results"},
+	application.IntegrityOwnedResourceCleanup: {"owned_resources", "cleanup_results", "cleanup_source_recovery_intents"},
 }
 
 var migrationV40 = integrityMigrationV40()
@@ -2106,6 +2165,12 @@ func integrityMigrationV40() []string {
 	families := application.IntegrityFamilies()
 	for _, family := range families {
 		for _, table := range integritySourceFamilies[family] {
+			// This source is introduced by schema v45. Its registry row and
+			// mutation triggers are installed by that migration so fresh schema
+			// creation does not reference a future table while applying v40.
+			if table == "cleanup_source_recovery_intents" {
+				continue
+			}
 			statements = append(statements, fmt.Sprintf(`INSERT INTO integrity_registry_sources(registry_version,family,table_name) VALUES('v1','%s','%s')`, family, table))
 			for _, operation := range []string{"INSERT", "UPDATE", "DELETE"} {
 				trigger := "integrity_track_" + table + "_" + strings.ToLower(operation)
@@ -2159,6 +2224,77 @@ var migrationV44 = []string{
 	`CREATE TRIGGER configuration_apply_provenance_immutable BEFORE UPDATE ON configuration_apply_intents
 		WHEN NEW.apply_kind<>OLD.apply_kind OR NEW.migration_request_id<>OLD.migration_request_id OR NEW.migration_preview_digest<>OLD.migration_preview_digest
 		BEGIN SELECT RAISE(ABORT,'configuration apply provenance is immutable'); END`,
+}
+
+var migrationV45 = cleanupSourceRecoveryMigrationV45()
+
+func cleanupSourceRecoveryMigrationV45() []string {
+	statements := []string{
+		`PRAGMA legacy_alter_table = ON`,
+		`DROP TRIGGER integrity_track_operation_receipts_insert`,
+		`DROP TRIGGER integrity_track_operation_receipts_update`,
+		`DROP TRIGGER integrity_track_operation_receipts_delete`,
+		`DROP TRIGGER integrity_guard_operation_receipt_reject`,
+		`DROP INDEX operation_receipts_target`,
+		`DROP INDEX operation_receipts_source_action`,
+		`ALTER TABLE operation_receipts RENAME TO operation_receipts_v44`,
+		`CREATE TABLE operation_receipts (
+			operation_id TEXT PRIMARY KEY, authority_key TEXT NOT NULL UNIQUE, operation_anchor_digest TEXT NOT NULL,
+			operation_type TEXT NOT NULL CHECK(operation_type IN ('decide','retry','abandon','recover_ci_wait','recover_owned_push','accept_external_merge','apply_configuration','restore_configuration','recheck_repository','enable_repository','disable_repository','remove_repository','onboard_repository','recheck_integrity','recover_cleanup_source')),
+			scope_kind TEXT NOT NULL CHECK(scope_kind IN ('controller','repository','run','onboarding')), target_id TEXT NOT NULL,
+			requester_login TEXT NOT NULL, requester_database_id INTEGER NOT NULL, requester_node_id TEXT NOT NULL, requester_actor_type TEXT NOT NULL,
+			request_digest TEXT NOT NULL, expected_authority_digest TEXT NOT NULL, target_binding_digest TEXT NOT NULL,
+			phase TEXT NOT NULL CHECK(phase IN ('accepted','applied','observed')), outcome TEXT NOT NULL CHECK(outcome IN ('pending','succeeded','failed','conflict','ambiguous')),
+			resulting_authority_digest TEXT NOT NULL DEFAULT '', resulting_state TEXT NOT NULL DEFAULT '', resulting_version INTEGER NOT NULL DEFAULT 0 CHECK(resulting_version >= 0), evidence_digest TEXT NOT NULL DEFAULT '', result_digest TEXT NOT NULL DEFAULT '', accepted_at TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT '', settled_at TEXT NOT NULL DEFAULT '', source_action_id TEXT NOT NULL DEFAULT ''
+		)`,
+		`INSERT INTO operation_receipts SELECT * FROM operation_receipts_v44`,
+		`DROP TABLE operation_receipts_v44`,
+		`CREATE INDEX operation_receipts_target ON operation_receipts(scope_kind,target_id,accepted_at,operation_id)`,
+		`CREATE UNIQUE INDEX operation_receipts_source_action ON operation_receipts(source_action_id) WHERE source_action_id<>''`,
+		`CREATE TABLE cleanup_source_recovery_intents (
+			request_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE REFERENCES operation_receipts(operation_id), run_id TEXT NOT NULL UNIQUE REFERENCES runs(run_id), repository TEXT NOT NULL,
+			transition_sequence INTEGER NOT NULL CHECK(transition_sequence>0), abandon_action_digest TEXT NOT NULL, attention_event_key TEXT NOT NULL, attention_evidence_digest TEXT NOT NULL,
+			ownership_digest TEXT NOT NULL, cleanup_digest TEXT NOT NULL, frozen_source_digest TEXT NOT NULL, replacement_source_digest TEXT NOT NULL,
+			replacement_identity_digest TEXT NOT NULL, repository_origin_digest TEXT NOT NULL, registration_digest TEXT NOT NULL,
+			repository_binding_digest TEXT NOT NULL, branch TEXT NOT NULL, candidate_head TEXT NOT NULL, preview_digest TEXT NOT NULL,
+			requester_login TEXT NOT NULL, requester_database_id INTEGER NOT NULL, requester_node_id TEXT NOT NULL, requester_actor_type TEXT NOT NULL,
+			stage TEXT NOT NULL CHECK(stage IN ('accepted','repair_intent','repair_observed','detach_intent','detach_observed','cleanup_intent','cleanup_observed','succeeded')),
+			created_at TEXT NOT NULL, updated_at TEXT NOT NULL, settled_at TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE TRIGGER cleanup_source_recovery_intent_immutable BEFORE UPDATE ON cleanup_source_recovery_intents
+			WHEN NEW.request_id<>OLD.request_id OR NEW.operation_id<>OLD.operation_id OR NEW.run_id<>OLD.run_id OR NEW.repository<>OLD.repository OR NEW.transition_sequence<>OLD.transition_sequence OR NEW.abandon_action_digest<>OLD.abandon_action_digest OR NEW.attention_event_key<>OLD.attention_event_key OR NEW.attention_evidence_digest<>OLD.attention_evidence_digest OR NEW.ownership_digest<>OLD.ownership_digest OR NEW.cleanup_digest<>OLD.cleanup_digest OR NEW.frozen_source_digest<>OLD.frozen_source_digest OR NEW.replacement_source_digest<>OLD.replacement_source_digest OR NEW.replacement_identity_digest<>OLD.replacement_identity_digest OR NEW.repository_origin_digest<>OLD.repository_origin_digest OR NEW.registration_digest<>OLD.registration_digest OR NEW.repository_binding_digest<>OLD.repository_binding_digest OR NEW.branch<>OLD.branch OR NEW.candidate_head<>OLD.candidate_head OR NEW.preview_digest<>OLD.preview_digest OR NEW.requester_login<>OLD.requester_login OR NEW.requester_database_id<>OLD.requester_database_id OR NEW.requester_node_id<>OLD.requester_node_id OR NEW.requester_actor_type<>OLD.requester_actor_type OR NEW.created_at<>OLD.created_at
+			BEGIN SELECT RAISE(ABORT,'cleanup source recovery authority is immutable'); END`,
+		`INSERT INTO integrity_registry_sources(registry_version,family,table_name) VALUES('v1','owned_resource_cleanup','cleanup_source_recovery_intents')`,
+		`CREATE TRIGGER integrity_track_cleanup_source_recovery_intents_insert AFTER INSERT ON cleanup_source_recovery_intents BEGIN
+			UPDATE controller_integrity_generation SET generation=generation+1,updated_at=CURRENT_TIMESTAMP WHERE singleton=1;
+			INSERT INTO controller_integrity_scope_revisions(family,scope_kind,scope_id,revision_generation,updated_at)
+			SELECT 'owned_resource_cleanup','controller','local-controller',generation,CURRENT_TIMESTAMP FROM controller_integrity_generation WHERE singleton=1
+			ON CONFLICT(family,scope_kind,scope_id) DO UPDATE SET revision_generation=excluded.revision_generation,updated_at=excluded.updated_at;
+		END`,
+		`CREATE TRIGGER integrity_track_cleanup_source_recovery_intents_update AFTER UPDATE ON cleanup_source_recovery_intents BEGIN
+			UPDATE controller_integrity_generation SET generation=generation+1,updated_at=CURRENT_TIMESTAMP WHERE singleton=1;
+			INSERT INTO controller_integrity_scope_revisions(family,scope_kind,scope_id,revision_generation,updated_at)
+			SELECT 'owned_resource_cleanup','controller','local-controller',generation,CURRENT_TIMESTAMP FROM controller_integrity_generation WHERE singleton=1
+			ON CONFLICT(family,scope_kind,scope_id) DO UPDATE SET revision_generation=excluded.revision_generation,updated_at=excluded.updated_at;
+		END`,
+		`CREATE TRIGGER integrity_track_cleanup_source_recovery_intents_delete AFTER DELETE ON cleanup_source_recovery_intents BEGIN
+			UPDATE controller_integrity_generation SET generation=generation+1,updated_at=CURRENT_TIMESTAMP WHERE singleton=1;
+			INSERT INTO controller_integrity_scope_revisions(family,scope_kind,scope_id,revision_generation,updated_at)
+			SELECT 'owned_resource_cleanup','controller','local-controller',generation,CURRENT_TIMESTAMP FROM controller_integrity_generation WHERE singleton=1
+			ON CONFLICT(family,scope_kind,scope_id) DO UPDATE SET revision_generation=excluded.revision_generation,updated_at=excluded.updated_at;
+		END`,
+		`CREATE TRIGGER integrity_guard_operation_receipt_reject BEFORE UPDATE ON operation_receipts
+			WHEN EXISTS(SELECT 1 FROM controller_integrity_finalization_guard g WHERE g.operation_id=OLD.operation_id)
+			AND NOT (OLD.operation_id=NEW.operation_id AND OLD.operation_type='recheck_integrity' AND OLD.scope_kind='controller' AND OLD.target_id='controller-integrity' AND OLD.phase='applied' AND OLD.outcome='pending' AND NEW.phase='observed' AND NEW.outcome='succeeded' AND EXISTS(SELECT 1 FROM controller_integrity_finalization_guard g JOIN controller_integrity_rechecks r ON r.operation_id=g.operation_id AND r.scan_id=g.scan_id AND r.target_generation=g.target_generation AND r.status='active' JOIN controller_integrity_active_recheck a ON a.operation_id=g.operation_id AND a.scan_id=g.scan_id AND a.target_generation=g.target_generation AND a.request_key=r.request_key WHERE g.operation_id=OLD.operation_id))
+			BEGIN SELECT RAISE(ABORT,'integrity finalization receipt mismatch'); END`,
+		`PRAGMA legacy_alter_table = OFF`,
+	}
+	statements = append(statements,
+		integrityTrackingTrigger("operation_receipts", "INSERT", ""),
+		integrityTrackingTrigger("operation_receipts", "UPDATE", `NOT EXISTS(SELECT 1 FROM controller_integrity_finalization_guard g JOIN controller_integrity_rechecks r ON r.operation_id=g.operation_id AND r.scan_id=g.scan_id AND r.target_generation=g.target_generation AND r.status='active' JOIN controller_integrity_active_recheck a ON a.operation_id=g.operation_id AND a.scan_id=g.scan_id AND a.target_generation=g.target_generation AND a.request_key=r.request_key WHERE g.operation_id=OLD.operation_id AND OLD.operation_type='recheck_integrity' AND OLD.scope_kind='controller' AND OLD.target_id='controller-integrity' AND OLD.phase='applied' AND OLD.outcome='pending' AND NEW.phase='observed' AND NEW.outcome='succeeded')`),
+		integrityTrackingTrigger("operation_receipts", "DELETE", ""),
+	)
+	return statements
 }
 
 func integrityRecheckMigrationV41() []string {
