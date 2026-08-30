@@ -2048,6 +2048,97 @@ external-merge recovery. Inspect `cleanup_progress`,
 
 `controller inspect`, `controller worker`.
 
+### `controller recover-cleanup-source preview|apply`
+
+**Purpose**
+
+Recover only the unfinished owned worktree cleanup for one
+terminal abandoned run after its frozen source checkout was deliberately moved.
+This is not a repository rebind or a general filesystem cleanup command.
+
+**When to use**
+
+Use only when `controller inspect` shows the exact observed abandon action as
+terminal `failed`, the current `cleanup_residue_attention`, failed or intended
+worktree cleanup, already-deleted local-branch ownership and cleanup evidence,
+an absent local branch ref, and no active run/process/scheduling authority.
+The complete requester identity must match both the current configured
+controller operator and the frozen run's trusted-operator authority.
+The frozen source must be unavailable, while the explicitly supplied
+replacement checkout must be the canonical same-UID checkout for the same
+origin and must still register the exact owned worktree, branch, and candidate
+head.
+
+**Syntax**
+
+```sh
+agentctl controller recover-cleanup-source preview '<run-id>' \
+  --replacement-source '<absolute-replacement-checkout>' \
+  <requester flags>
+
+agentctl controller recover-cleanup-source apply '<run-id>' \
+  --replacement-source '<same-absolute-replacement-checkout>' \
+  --request-id '<stable-request-id>' \
+  --preview-digest '<exact-preview-digest>' \
+  --source-relocation-confirmed \
+  <requester flags>
+```
+
+**What it does**
+
+Preview is read-only. Its output contains only eligibility, the preview digest,
+the required confirmation, the `worktree` resource class, and the
+next action. It never renders either source path, the worktree path, origin,
+raw Git output, credentials, or filesystem identity values.
+
+Apply re-runs the complete preview and then atomically accepts a common run
+operation receipt and schema-v45 recovery intent before the first Git write.
+It invokes the closed argv-only local sequence
+`git worktree repair --no-relative-paths` for the exact owned worktree,
+re-proves registration, the absent branch ref, candidate object, exact
+local `ORIG_HEAD` commit, digest-bound `ORIG_HEAD` and `COMMIT_EDITMSG` evidence,
+and clean index/content state, detaches only that owned worktree HEAD to the
+exact candidate, and removes the worktree without force. Any merge,
+cherry-pick, revert, rebase, sequencer, bisect, autostash, or unexpected
+per-worktree administration state makes recovery ineligible. Effective external
+filter configuration or any submodule index entry is also rejected before
+clean-state proof, so preview cannot start a filter or nested Git process. It
+never creates, updates, or deletes a local or remote branch ref, and disables
+Git hooks, filesystem monitoring, promisor lazy fetch, and replacement-object
+interpretation. The persisted replacement identity and Git state are re-proved
+before and after every effect and immediately before final settlement. An
+already absent exact worktree is adopted only when the replacement common
+directory proves its registration absent and the candidate object remains
+available; the branch ref must remain absent throughout.
+Successful settlement writes the ordinary cleanup and ownership results as
+`deleted`; an unchanged repository-removal draft then passes or fails through
+its existing guards.
+
+If the response is lost, repeat `apply` with the same request ID, preview
+digest, confirmation, and replacement path. The path remains private caller
+input and is never recovered or guessed from SQLite. A changed path, source
+identity, origin, registration, branch, head, status, attention, lease,
+ownership, or cleanup row conflicts. Ambiguous or failed proof leaves residue
+and the pending durable stage for exact replay.
+
+**Possible durable stop states**
+
+The run remains terminal `failed`. The recovery receipt is pending until every
+local effect and normal cleanup settlement is proven, then becomes
+observed/succeeded.
+
+**Safety notes**
+
+This command never fetches, pushes, contacts GitHub or Linear, deletes a remote
+branch, closes a pull request, removes artifacts, edits configuration or
+lifecycle state, changes the frozen run JSON, follows a symlink alias, or
+deletes an unknown/dirty/SHA-drifted resource. If the preview is ineligible, do
+not substitute manual SQL, `rm`, a symlink, or a force flag.
+
+**Related commands**
+
+`controller inspect`, `repository remove validate`.
+
 ### Compatibility and diagnostic commands
 
 ### `linear start` / `controller start`
@@ -3212,6 +3303,7 @@ topology:
 | Linear completion pending | Verify external Linear automation/state. The controller only observes; keep driving or use one `reconcile-linear` diagnostic read. |
 | Dirty source checkout | The controller leaves it untouched and emits attention. The operator decides how to clean/synchronize it, then retries cleanup if appropriate. |
 | Cleanup partial failure | Inspect per-resource results and actual ownership. Retry `drive`/`cleanup`; only unfinished owned resources are retried. |
+| Cleanup blocked after the frozen source checkout was relocated | For one terminal abandoned run with current cleanup-residue attention, use `recover-cleanup-source preview` with the canonical replacement checkout. Apply only the exact digest and confirmation. Never edit SQLite, recreate the old path with a symlink, force-remove the worktree, or bypass repository-removal validation. |
 | Worker candidate scan incomplete | Inspect pagination and identity authority. The controller admits none from a truncated, duplicate, contradictory, or otherwise ambiguous scan. |
 | Retry attention | Inspect failure class, phase, count, and reason. Terminal audit schedules do not authorize evidence deletion. |
 | LaunchAgent not running | Run LaunchAgent `status`, inspect finite reason codes and private logs, correct binary/config/log permissions, then kickstart only when status recommends it. |
