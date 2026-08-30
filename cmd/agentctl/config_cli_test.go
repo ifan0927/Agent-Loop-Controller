@@ -248,9 +248,10 @@ func TestConfigValidateAndInspectDoNotReadFileCredential(t *testing.T) {
 
 func TestControllerWorkerOnceHonorsDisabledConfigurationBeforeCredentialPreflight(t *testing.T) {
 	root := resolvedTempDir(t)
-	path, _ := writeControllerStatusConfig(t, root)
+	path, _ := writeCurrentManagedDraftConfig(t, root)
+	t.Setenv("IFAN_LOOP_LINEAR_TOKEN", "")
 	output, err := captureConfigOutput(func() error { return controller([]string{"worker", "--once", "--config", path}) })
-	if err != nil || !strings.Contains(output, `"disabled": true`) || !strings.Contains(output, `"stopped": "disabled"`) {
+	if err != nil || !strings.Contains(output, `"disabled": true`) || !strings.Contains(output, `"stopped": "once"`) || !strings.Contains(output, `"last_outcome": "no_candidate"`) {
 		t.Fatalf("output=%s err=%v", output, err)
 	}
 	for _, forbidden := range []string{root, "secret://", "IFAN_LOOP_LINEAR_TOKEN"} {

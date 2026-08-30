@@ -959,7 +959,9 @@ files to troubleshoot a sanitized conflict.
 
 **Purpose**
 
-Run automatic Linear Todo admission and the production driver.
+Run the supervised Controller worker. When enabled it performs automatic Linear
+Todo admission and production delivery; when disabled it remains alive for
+onboarding and integrity maintenance without normal admission.
 
 **When to use**
 
@@ -986,9 +988,11 @@ agentctl controller worker --once
 
 **What it does**
 
-Validates automation authority and credential topology, reconciles every
-nonterminal run and its repository slot, execution lease, and heavy permit,
-then resumes existing runnable work before scanning for new Todos. Heavy work
+Validates automation authority, acquires the process lock, and constructs the
+policy-appropriate runtime. When admission is enabled it validates credential
+topology, reconciles every nonterminal run and its repository slot, execution
+lease, and heavy permit, then resumes existing runnable work before scanning
+for new Todos. Heavy work
 remains bounded by `heavy_capacity`; one additional supervisor slot preserves
 admission and due external polls while all heavy supervisors are occupied. A
 short versioned admission lease serializes scan, authoritative reread, atomic
@@ -1020,6 +1024,19 @@ generation. Each publication uses a bounded exclusive mode-`0600` temporary
 leaf, complete write and fsync, and atomic replacement; routine heartbeats do
 not append logs or SQLite audit rows.
 
+When `automation.linear_todo_admission.enabled` is false, the worker still
+acquires the same process-lifetime lock, opens the managed store, publishes the
+same immediate and cadence-bound heartbeat for the exact loaded digest, and
+stays alive until cancellation or failure. Disabled mode has capacity one and
+uses only the existing onboarding dispatcher plus integrity maintenance. With
+no runnable onboarding it records `no_candidate` and waits for the next bounded
+opportunity; it does not read/check the normal-admission credential, contact
+Linear for Todo admission, reserve or create a run, or invoke a normal-admission
+fallback. An already accepted onboarding may continue its existing authorized
+Linear label/readiness steps. Disabled `--once` performs exactly one serialized
+onboarding/integrity opportunity, reports `disabled: true`, and exits with
+`stopped: once`.
+
 Integrity maintenance runs only after a bounded dispatch batch becomes
 quiescent. Once one dispatch finishes, the worker stops adding replacements,
 allows existing siblings and their lease/scheduling cleanup to finish, consumes
@@ -1043,7 +1060,7 @@ expose PID, process-start identity, UID, heartbeat path, or raw file errors.
 
 **Possible durable stop states**
 
-Disabled policy, `--once`, SIGINT, or SIGTERM. Human decision, manual
+`--once`, SIGINT, or SIGTERM. Disabled policy, human decision, manual
 intervention, retry attention, incomplete scan, no candidate, and terminal run are
 durable outcomes observed by the continuing worker, not process expiry.
 
