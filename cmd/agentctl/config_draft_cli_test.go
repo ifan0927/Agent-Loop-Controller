@@ -9,10 +9,257 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	sqlitestore "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 )
+
+func TestDisabledRuntimeConvergesTypedConfigurationAndClearsFinalRemovalPolicyGuards(t *testing.T) {
+	root := resolvedTempDir(t)
+	configPath, databasePath := writeCurrentManagedDraftConfig(t, root)
+	setFixtureAdmissionEnabled(t, configPath)
+	t.Setenv("IFAN_LOOP_LINEAR_TOKEN", "")
+	baseline, err := loadManagedConfiguration(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, initialHeartbeat, err := startManualControllerHeartbeat(context.Background(), baseline.Path, baseline.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer initialHeartbeat.Stop()
+	requester := managedDraftRequesterArgs(configPath)
+	if _, err := captureConfigOutput(func() error { return configCommand(append([]string{"status"}, requester...)) }); err != nil {
+		initialHeartbeat.Stop()
+		t.Fatal(err)
+	}
+	disableRepositoryArgs := append([]string{"disable", "owner/repo", "--request-id", "disabled-runtime-removal-fixture"}, requester...)
+	if _, err := captureConfigOutput(func() error { return repositoryCommand(disableRepositoryArgs) }); err != nil {
+		initialHeartbeat.Stop()
+		t.Fatal(err)
+	}
+	applied := applyAdmissionDisabledDraft(t, requester, baseline.Digest)
+	if err := initialHeartbeat.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadManagedConfiguration(configPath)
+	if err != nil || loaded.Digest != applied.Apply.Generation.Digest || loaded.Automation.LinearTodoAdmission.Enabled {
+		t.Fatalf("loaded=%+v err=%v", loaded, err)
+	}
+	lock, err := acquireWorkerProcessLock(filepath.Dir(databasePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	runtime, err := newAutomaticWorkerRuntime(loaded, "disabled-runtime-fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeOpen := true
+	defer func() {
+		if storeOpen {
+			_ = runtime.store.Close()
+		}
+	}()
+	reporter, err := newWorkerStatusReporter(configPath, "disabled-runtime-fixture", currentBuild.BuildIdentity, loaded.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalTicker := newWorkerHeartbeatTicker
+	ticker := &controllableWorkerHeartbeatTicker{ticks: make(chan time.Time, 1)}
+	newWorkerHeartbeatTicker = func(time.Duration) workerHeartbeatTicker {
+		return ticker
+	}
+	defer func() { newWorkerHeartbeatTicker = originalTicker }()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct {
+		result admissionWorkerResult
+		err    error
+	}, 1)
+	go func() {
+		result, runErr := runBoundedAdmissionWorkerWithHeartbeatAndMaintenance(ctx, false, time.Minute, automaticWorkerCapacity(loaded.Automation.LinearTodoAdmission, false), runtime.dispatch, runtime.maintenance, reporter, nil)
+		done <- struct {
+			result admissionWorkerResult
+			err    error
+		}{result: result, err: runErr}
+	}()
+	defer cancel()
+	first := waitForDisabledWorkerHeartbeat(t, configPath, loaded.Digest, time.Time{})
+	ticker.ticks <- time.Now().UTC()
+	second := waitForDisabledWorkerHeartbeat(t, configPath, loaded.Digest, first.ObservedAt)
+	if second.Cycles != first.Cycles || second.LastCycleOutcome != application.LinearTodoDispatchNoCandidate {
+		t.Fatalf("first=%+v second=%+v", first, second)
+	}
+	currentProcessStart, err := processStartIdentity(second.ProcessID)
+	if err != nil || currentProcessStart != second.ProcessStartID {
+		t.Fatalf("heartbeat process identity=%q current=%q err=%v", second.ProcessStartID, currentProcessStart, err)
+	}
+	runtimeObservation, err := application.NewConfigurationRuntimeObservationService(workerHeartbeatReader{configPath: configPath, expectedUID: os.Getuid()}, workerProcessIdentityObserver{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed, err := runtimeObservation.ObserveConfigurationRuntime(context.Background(), time.Now().UTC())
+	if err != nil || observed.Liveness != application.RuntimeLivenessFresh {
+		t.Fatalf("runtime observation=%+v err=%v", observed, err)
+	}
+	var statusOutput string
+	var status application.ManagedConfigurationStatus
+	for attempt := 0; attempt < 4; attempt++ {
+		statusOutput, err = captureConfigOutput(func() error { return configCommand(append([]string{"status"}, requester...)) })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal([]byte(statusOutput), &status); err != nil {
+			t.Fatal(err)
+		}
+		if status.Convergence.State == application.ConfigurationReady {
+			break
+		}
+		if status.Convergence.State != application.ConfigurationConflict || status.Convergence.Reason != application.ConfigurationReasonRuntimeConflict {
+			t.Fatalf("status=%+v output=%s", status, statusOutput)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if status.Convergence.State != application.ConfigurationReady || status.Convergence.DesiredGenerationID != applied.Apply.Generation.GenerationID || status.Convergence.EffectiveGenerationID != applied.Apply.Generation.GenerationID || status.Convergence.LoadedConfigurationDigest != loaded.Digest {
+		t.Fatalf("status=%+v output=%s", status, statusOutput)
+	}
+	openArgs := append([]string{"remove", "open", "owner/repo"}, requester...)
+	openOutput, err := captureConfigOutput(func() error { return repositoryCommand(openArgs) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var draft application.RepositoryRemovalDraft
+	if err := json.Unmarshal([]byte(openOutput), &draft); err != nil || draft.DraftID == "" {
+		t.Fatalf("draft=%+v output=%s err=%v", draft, openOutput, err)
+	}
+	validateArgs := append([]string{"remove", "validate", "--draft-id", draft.DraftID, "--revision", "1"}, requester...)
+	validationOutput, err := captureConfigOutput(func() error { return repositoryCommand(validateArgs) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var validation application.RepositoryRemovalValidation
+	if err := json.Unmarshal([]byte(validationOutput), &validation); err != nil || !removalGuardAllowed(validation.Guards, "live_configuration_converged") || !removalGuardAllowed(validation.Guards, "final_repository_admission_disabled") {
+		t.Fatalf("validation=%+v output=%s err=%v", validation, validationOutput, err)
+	}
+	if runs, err := runtime.store.ListNonterminalRuns(context.Background()); err != nil || len(runs) != 0 {
+		t.Fatalf("disabled idle runtime created normal admission runs: runs=%+v err=%v", runs, err)
+	}
+	cancel()
+	select {
+	case stopped := <-done:
+		if stopped.err != nil || stopped.result.Stopped != "canceled" {
+			t.Fatalf("stopped=%+v err=%v", stopped.result, stopped.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("disabled runtime did not stop within bound")
+	}
+	if err := closeWorkerStateStore(runtime.store); err != nil {
+		t.Fatal(err)
+	}
+	storeOpen = false
+	for _, output := range []string{statusOutput, openOutput, validationOutput} {
+		for _, sensitive := range []string{root, databasePath, "secret://", "IFAN_LOOP_LINEAR_TOKEN", "private-key-material"} {
+			if strings.Contains(output, sensitive) {
+				t.Fatalf("disabled runtime output leaked %q: %s", sensitive, output)
+			}
+		}
+	}
+}
+
+func setFixtureAdmissionEnabled(t *testing.T, configPath string) {
+	t.Helper()
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config map[string]any
+	if err := json.Unmarshal(raw, &config); err != nil {
+		t.Fatal(err)
+	}
+	admission := config["automation"].(map[string]any)["linear_todo_admission"].(map[string]any)
+	admission["enabled"] = true
+	admission["team_id"] = "123e4567-e89b-42d3-a456-426614174100"
+	admission["team_key"] = "IFAN"
+	admission["todo_state"] = map[string]any{"id": offlineAdmissionTodoState.ID, "name": offlineAdmissionTodoState.Name, "type": offlineAdmissionTodoState.Type}
+	admission["in_progress_state"] = map[string]any{"id": offlineAdmissionInProgressState.ID, "name": offlineAdmissionInProgressState.Name, "type": offlineAdmissionInProgressState.Type}
+	admission["requester"] = map[string]any{"database_id": 33, "node_id": "MDQ6VXNlcjMz", "login": "ifan0927", "type": "User"}
+	admission["notification_mode"] = "local_outbox"
+	admission["credential_source_ref"] = "secret://env/IFAN_LOOP_LINEAR_TOKEN"
+	rewritten, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, rewritten, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func applyAdmissionDisabledDraft(t *testing.T, requester []string, expectedDigest string) application.ConfigurationDraftApplyResult {
+	t.Helper()
+	openOutput, err := captureConfigOutput(func() error { return configCommand(append([]string{"draft", "open"}, requester...)) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var draft application.ConfigurationDraft
+	if err := json.Unmarshal([]byte(openOutput), &draft); err != nil {
+		t.Fatal(err)
+	}
+	setArgs := append([]string{"draft", "set", "--draft-id", draft.DraftID, "--revision", "1", "--automatic-admission-enabled=false"}, requester...)
+	setOutput, err := captureConfigOutput(func() error { return configCommand(setArgs) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(setOutput), &draft); err != nil || draft.Revision != 2 || draft.Settings.Admission.Enabled {
+		t.Fatalf("draft=%+v output=%s err=%v", draft, setOutput, err)
+	}
+	validateArgs := append([]string{"draft", "validate", "--draft-id", draft.DraftID, "--revision", "2"}, requester...)
+	if _, err := captureConfigOutput(func() error { return configCommand(validateArgs) }); err != nil {
+		t.Fatal(err)
+	}
+	previewArgs := append([]string{"draft", "preview", "--draft-id", draft.DraftID, "--revision", "2"}, requester...)
+	previewOutput, err := captureConfigOutput(func() error { return configCommand(previewArgs) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var preview application.ConfigurationPreview
+	if err := json.Unmarshal([]byte(previewOutput), &preview); err != nil {
+		t.Fatal(err)
+	}
+	applyArgs := append([]string{"draft", "apply", "--draft-id", draft.DraftID, "--revision", "2", "--preview-digest", preview.PreviewDigest, "--expected-generation-id", "1", "--expected-digest", expectedDigest}, requester...)
+	applyOutput, err := captureConfigOutput(func() error { return configCommand(applyArgs) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var applied application.ConfigurationDraftApplyResult
+	if err := json.Unmarshal([]byte(applyOutput), &applied); err != nil || applied.Convergence.State != application.ConfigurationRestartRequired || applied.Apply.Generation.GenerationID != 2 {
+		t.Fatalf("applied=%+v output=%s err=%v", applied, applyOutput, err)
+	}
+	return applied
+}
+
+func waitForDisabledWorkerHeartbeat(t *testing.T, configPath, digest string, after time.Time) workerStatusSnapshot {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot, err := readWorkerStatusSnapshot(configPath)
+		if err == nil && snapshot.ConfigurationDigest == digest && snapshot.Cycles >= 1 && snapshot.LastCycleOutcome == application.LinearTodoDispatchNoCandidate && snapshot.ObservedAt.After(after) {
+			return snapshot
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("disabled worker heartbeat did not become fresh within bound")
+	return workerStatusSnapshot{}
+}
+
+func removalGuardAllowed(guards []application.RepositoryRemovalGuardResult, name string) bool {
+	for _, guard := range guards {
+		if guard.Guard == name {
+			return guard.Allowed
+		}
+	}
+	return false
+}
 
 func TestManagedConfigDraftCLIIsolatedTypedApplyAndConvergence(t *testing.T) {
 	root := resolvedTempDir(t)

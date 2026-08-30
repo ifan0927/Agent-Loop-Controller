@@ -48,6 +48,10 @@ type automaticWorkerRuntime struct {
 	maintenance admissionWorkerMaintenance
 }
 
+type onboardingContinuer interface {
+	Continue(context.Context, string) (application.Onboarding, error)
+}
+
 var buildAutomaticWorkerRuntime = newAutomaticWorkerRuntime
 var emitAutomaticWorkerOutput = func(output workerOutput) error { return printJSON(output) }
 var observeAutomaticWorkerStoreClosed = func() {}
@@ -96,21 +100,6 @@ func controllerWorker(args []string) error {
 	output := workerOutput{WorkerInstanceID: instanceID, ConfigurationDigest: loaded.Digest, Status: workerStatusRunning}
 	configured := loaded.Automation.LinearTodoAdmission
 	output.Disabled = !configured.Enabled
-	if !configured.Enabled {
-		store, openErr := openManagedConfigurationStore(loaded)
-		if openErr != nil {
-			return errors.New("automatic admission state store is unavailable")
-		}
-		runnable, listErr := store.ListRunnableOnboardings(context.Background(), 1)
-		closeErr := store.Close()
-		if listErr != nil || closeErr != nil {
-			return errors.New("onboarding state discovery failed")
-		}
-		if len(runnable) == 0 {
-			output.Stopped, output.PreviousStatus, output.Status = "disabled", workerStatusRunning, workerStatusStopping
-			return emitAutomaticWorkerOutput(output)
-		}
-	}
 	workerLock, err := acquireWorkerProcessLock(filepath.Dir(loaded.Controller.DatabasePath))
 	if err != nil {
 		return err
@@ -142,10 +131,7 @@ func controllerWorker(args []string) error {
 	}
 	ctx, stop := workerSignalContext()
 	defer stop()
-	workerCapacity := configured.HeavyCapacity + 1
-	if *once {
-		workerCapacity = 1
-	}
+	workerCapacity := automaticWorkerCapacity(configured, *once)
 	pollInterval := configured.PollInterval
 	if pollInterval <= 0 {
 		pollInterval = 30 * time.Second
@@ -162,6 +148,13 @@ func controllerWorker(args []string) error {
 	}
 	storeOpen = false
 	return emitAutomaticWorkerOutput(output)
+}
+
+func automaticWorkerCapacity(configured bootstrap.LinearTodoAdmission, once bool) int {
+	if !configured.Enabled || once {
+		return 1
+	}
+	return configured.HeavyCapacity + 1
 }
 
 func runBoundedAdmissionWorkerWithHeartbeat(ctx context.Context, once bool, poll time.Duration, capacity int, dispatch admissionWorkerDispatch, reporter *workerStatusReporter, started func()) (admissionWorkerResult, error) {
@@ -350,7 +343,7 @@ func newAutomaticWorkerRuntime(loaded bootstrap.Bootstrap, instanceID string) (a
 	return automaticWorkerRuntime{store: store, dispatch: onboardingWorkerDispatch(store, onboarding, dispatcher.Dispatch), maintenance: integrityWorkerMaintenance(store)}, nil
 }
 
-func onboardingWorkerDispatch(store *sqlitestore.Store, onboarding *application.OnboardingService, fallback admissionWorkerDispatch) admissionWorkerDispatch {
+func onboardingWorkerDispatch(store *sqlitestore.Store, onboarding onboardingContinuer, fallback admissionWorkerDispatch) admissionWorkerDispatch {
 	return func(ctx context.Context) (application.LinearTodoDispatchResult, error) {
 		now := time.Now().UTC()
 		if authority, found, err := store.ConfigurationAuthority(ctx); err == nil && found {

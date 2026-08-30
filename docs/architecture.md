@@ -574,8 +574,8 @@ maintenance evidence.
 
 Worker runtime liveness is a separate application contract from workload
 activity and configuration convergence. After strict configuration, process
-lock, credential topology, SQLite compatibility, supervisor fencing,
-scheduling reconciliation, and production dispatcher construction succeed,
+lock, SQLite compatibility, supervisor fencing, and the policy-appropriate
+production dispatcher construction succeed,
 the active supervisor publishes schema-v3 private heartbeat evidence
 immediately and on a fixed 15-second cadence. This is normally the automatic
 worker; the mutually exclusive manual `linear start` and `controller run`
@@ -585,6 +585,17 @@ not reset that cadence. The single supervisor heartbeat covers all bounded
 repository dispatches; there is no per-run heartbeat. Publication failure
 cancels and joins dispatch and fails the worker nonzero, while SQLite workflow
 state and ordinary restart reconciliation remain recovery authority.
+
+Disabled automatic admission fences only the normal Linear Todo-admission
+path; it does not terminate the supervisor. The disabled worker retains the
+ordinary process lock, heartbeat, onboarding-only dispatcher, and quiescent
+integrity maintenance for an indefinite lifetime. It never constructs the
+normal admission fallback or reads/checks its credential. Idle dispatch returns
+the bounded no-candidate outcome. An already accepted onboarding may use its
+existing operator-authorized Linear label/readiness effects, but disabled mode
+serializes every opportunity at capacity one so the same saga cannot be
+executed by sibling slots. Disabled `--once` executes one such bounded
+onboarding/integrity opportunity and exits with the ordinary one-shot reason.
 
 The heartbeat atomically replaces the prior private telemetry leaf and binds
 the worker instance, PID, OS process-start identity, binary build identity,
@@ -1649,8 +1660,9 @@ runtime authority. Insert, delete, or any change to source kind, source
 identity, classification, source-evidence digest, status, or reason still
 advances the `operation_activity` revision.
 
-The automatic worker gives onboarding and normal admission their opportunity
-first. After the current bounded dispatch batch is fully quiescent, it advances
+The automatic worker gives onboarding and, only while automatic admission is
+enabled, normal admission their opportunity first. After the current bounded
+dispatch batch is fully quiescent, it advances
 at most one SQLite-only integrity family batch without a heavy permit, then
 resumes dispatch refills. One durable scan lane owns its registry version, target
 generation, cursor, lease, checked revisions, deterministic findings, and

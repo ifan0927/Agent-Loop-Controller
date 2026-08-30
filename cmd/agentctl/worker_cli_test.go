@@ -60,6 +60,73 @@ func TestWorkerDispatchLeavesIntegrityMaintenanceToBoundedBoundary(t *testing.T)
 	}
 }
 
+type countingOnboardingContinuer struct {
+	calls int
+	id    string
+}
+
+func (c *countingOnboardingContinuer) Continue(_ context.Context, onboardingID string) (application.Onboarding, error) {
+	c.calls++
+	if onboardingID != c.id {
+		return application.Onboarding{}, errors.New("unexpected onboarding identity")
+	}
+	return application.Onboarding{OnboardingID: onboardingID, Status: domain.OnboardingRunning}, nil
+}
+
+func TestDisabledWorkerSerializesRunnableOnboardingWithoutAdmissionFallback(t *testing.T) {
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "controller.db")
+	store, err := sqlitestore.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC)
+	digest := func(value string) string { return strings.Repeat(value, 64) }
+	operator := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
+	baseline := application.ConfigurationBaselineInput{Candidate: application.ValidatedConfigurationCandidate{Digest: digest("a"), Size: 100, SchemaVersion: 5, DatabasePath: databasePath, Operator: operator}, CanonicalConfigPath: filepath.Join(t.TempDir(), "controller.json"), ObservedAt: now}
+	if err := store.PrepareConfigurationBaseline(ctx, baseline); err != nil {
+		t.Fatal(err)
+	}
+	authority, _, err := store.AdoptConfigurationBaseline(ctx, baseline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, _, err = store.ObserveConfigurationEffective(ctx, application.ConfigurationEffectiveObservation{ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, WorkerInstanceID: "fixture-worker", BuildIdentity: "fixture-build", ObservedAt: now.Add(time.Second), EvidenceDigest: digest("b")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	onboardingID := "onboarding-disabled-worker"
+	opened, _, err := store.OpenOnboarding(ctx, application.OnboardingOpenInput{OnboardingID: onboardingID, Kind: domain.OnboardingExistingCheckout, CanonicalRepository: "owner/new", Requester: operator, PrivateInputDigest: digest("c"), SourcePathDigest: digest("d"), SourceAncestorDigests: []string{digest("d")}, RequestDigest: digest("e"), ConfigurationBaseGenerationID: authority.Desired.GenerationID, ConfigurationBaseDigest: authority.Desired.Digest, ConfigurationAuthorityVersion: authority.Version, OpenedAt: now.Add(2 * time.Second)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := store.SaveOnboardingPreflight(ctx, application.OnboardingPreflightInput{OnboardingID: onboardingID, ExpectedStatus: opened.Status, PreflightDigest: digest("f"), EvidenceDigest: digest("1"), ObservedAt: now.Add(3 * time.Second)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := application.NewOperationReceipt(application.OperationReceiptInput{OperationType: application.OperationOnboardRepository, Scope: application.ScopeOnboarding, TargetID: onboardingID, Requester: operator, RequestDigest: opened.RequestDigest, ExpectedAuthorityDigest: authority.Desired.Digest, OperationAnchorDigest: digest("2"), TargetBindingDigest: digest("3"), AcceptedAt: now.Add(4 * time.Second)})
+	profile := application.LocalRepository{CanonicalRepository: "owner/new", ProfileID: "profile-new", ProfileDigest: digest("4"), RepositoryBindingDigest: digest("5")}
+	if _, _, _, err := store.StartOnboarding(ctx, application.OnboardingStartAcceptance{OnboardingID: onboardingID, Expected: ready, PreflightDigest: ready.PreflightDigest, PreviewDigest: digest("6"), Profile: profile, Receipt: receipt, AcceptedAt: receipt.AcceptedAt}); err != nil {
+		t.Fatal(err)
+	}
+
+	configured := bootstrap.LinearTodoAdmission{Enabled: false, HeavyCapacity: application.MaxHeavyCapacity}
+	if capacity := automaticWorkerCapacity(configured, false); capacity != 1 {
+		t.Fatalf("disabled capacity=%d want=1", capacity)
+	}
+	continuer := &countingOnboardingContinuer{id: onboardingID}
+	fallbackCalls := 0
+	dispatch := onboardingWorkerDispatch(store, continuer, func(context.Context) (application.LinearTodoDispatchResult, error) {
+		fallbackCalls++
+		return application.LinearTodoDispatchResult{}, errors.New("normal admission fallback was called")
+	})
+	result, err := runBoundedAdmissionWorkerAtObserved(ctx, true, time.Minute, automaticWorkerCapacity(configured, false), dispatch, waitAdmissionWorker, func() time.Time { return now.Add(5 * time.Second) }, nil)
+	if err != nil || result.Stopped != "once" || result.LastOutcome != "onboarding_running" || continuer.calls != 1 || fallbackCalls != 0 {
+		t.Fatalf("result=%+v onboarding_calls=%d fallback_calls=%d err=%v", result, continuer.calls, fallbackCalls, err)
+	}
+}
+
 func TestWorkerProcessLockRejectsConcurrentWorkerAndRecoversAfterClose(t *testing.T) {
 	directory := t.TempDir()
 	if err := os.Chmod(directory, 0o700); err != nil {
