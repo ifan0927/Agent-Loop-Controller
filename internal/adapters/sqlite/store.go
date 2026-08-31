@@ -30,7 +30,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 45
+const schemaVersion = 46
 
 // SupportedSchemaVersion is the single maintained source for the newest
 // Controller database schema understood by this binary.
@@ -854,6 +854,8 @@ func migrateSQLiteGeneric(ctx context.Context, db sqliteTransactioner, supported
 			statements = migrationV44
 		case 45:
 			statements = migrationV45
+		case 46:
+			statements = migrationV46
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -913,6 +915,11 @@ func migrateSQLiteGeneric(ctx context.Context, db sqliteTransactioner, supported
 		}
 		if version == 30 {
 			if err := backfillOperationReceiptsV30Tx(ctx, tx); err != nil {
+				return err
+			}
+		}
+		if version == 46 {
+			if err := migrateOnboardingAttemptsV46Tx(ctx, tx); err != nil {
 				return err
 			}
 		}
@@ -2227,6 +2234,10 @@ var migrationV44 = []string{
 }
 
 var migrationV45 = cleanupSourceRecoveryMigrationV45()
+
+var migrationV46 = []string{
+	`ALTER TABLE repository_onboarding_steps ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 1 CHECK(attempt_number>0)`,
+}
 
 func cleanupSourceRecoveryMigrationV45() []string {
 	statements := []string{

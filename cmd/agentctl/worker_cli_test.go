@@ -65,6 +65,39 @@ type countingOnboardingContinuer struct {
 	id    string
 }
 
+type workerOnboardingPrivateStore struct {
+	input domain.RepositoryOnboardingInput
+}
+
+func (s workerOnboardingPrivateStore) Put(string, domain.RepositoryOnboardingInput, string) error {
+	return nil
+}
+
+func (s workerOnboardingPrivateStore) Get(string, string) (domain.RepositoryOnboardingInput, error) {
+	return s.input, nil
+}
+
+type workerOnboardingPaths struct{}
+
+func (workerOnboardingPaths) DeriveManagedSource(string) (string, error) { return "/fixture", nil }
+
+type workerOnboardingPreflight struct{}
+
+func (workerOnboardingPreflight) ObserveOnboardingPreflight(context.Context, domain.RepositoryOnboardingInput, application.ConfigurationAdmissionAuthority) (application.OnboardingPreflightEvidence, error) {
+	return application.OnboardingPreflightEvidence{}, nil
+}
+
+type workerOnboardingExecutor struct {
+	outcomes []application.OperationOutcome
+	calls    int
+}
+
+func (e *workerOnboardingExecutor) ExecuteOnboardingStep(_ context.Context, _ application.Onboarding, _ domain.RepositoryOnboardingInput, _ domain.OnboardingStep) (application.OnboardingStepObservation, error) {
+	outcome := e.outcomes[e.calls]
+	e.calls++
+	return application.OnboardingStepObservation{Outcome: outcome, ReasonCode: "fixture_external_observation", EvidenceDigest: application.ConfigurationEvidenceDigest("worker-onboarding-attempt", strconv.Itoa(e.calls))}, nil
+}
+
 func (c *countingOnboardingContinuer) Continue(_ context.Context, onboardingID string) (application.Onboarding, error) {
 	c.calls++
 	if onboardingID != c.id {
@@ -125,6 +158,86 @@ func TestDisabledWorkerSerializesRunnableOnboardingWithoutAdmissionFallback(t *t
 	if err != nil || result.Stopped != "once" || result.LastOutcome != "onboarding_running" || continuer.calls != 1 || fallbackCalls != 0 {
 		t.Fatalf("result=%+v onboarding_calls=%d fallback_calls=%d err=%v", result, continuer.calls, fallbackCalls, err)
 	}
+}
+
+func TestWorkerDispatchParksUnavailableOnboardingRetryAndContinuesAfterResume(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlitestore.Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 8, 31, 3, 0, 0, 0, time.UTC)
+	digest := func(value string) string { return strings.Repeat(value, 64) }
+	operator := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
+	onboardingID := "onboarding-worker-retry"
+	opened, _, err := store.OpenOnboarding(ctx, application.OnboardingOpenInput{OnboardingID: onboardingID, Kind: domain.OnboardingExistingCheckout, CanonicalRepository: "owner/retry", Requester: operator, PrivateInputDigest: digest("a"), SourcePathDigest: digest("b"), SourceAncestorDigests: []string{digest("b")}, RequestDigest: digest("c"), ConfigurationBaseGenerationID: 1, ConfigurationBaseDigest: digest("d"), ConfigurationAuthorityVersion: 1, OpenedAt: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := store.SaveOnboardingPreflight(ctx, application.OnboardingPreflightInput{OnboardingID: onboardingID, ExpectedStatus: opened.Status, PreflightDigest: digest("e"), EvidenceDigest: digest("f"), ObservedAt: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := application.NewOperationReceipt(application.OperationReceiptInput{OperationType: application.OperationOnboardRepository, Scope: application.ScopeOnboarding, TargetID: onboardingID, Requester: operator, RequestDigest: opened.RequestDigest, ExpectedAuthorityDigest: opened.ConfigurationBaseDigest, OperationAnchorDigest: digest("1"), TargetBindingDigest: digest("2"), AcceptedAt: now})
+	if _, _, _, err := store.StartOnboarding(ctx, application.OnboardingStartAcceptance{OnboardingID: onboardingID, Expected: ready, PreflightDigest: ready.PreflightDigest, PreviewDigest: digest("3"), Profile: application.LocalRepository{CanonicalRepository: opened.CanonicalRepository}, Receipt: receipt, AcceptedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	authorizer, err := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: operator})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := &workerOnboardingExecutor{outcomes: []application.OperationOutcome{application.OperationOutcomePending, application.OperationOutcomeSucceeded, application.OperationOutcomePending}}
+	input := domain.ExistingRepositoryOnboardingInput(domain.ExistingCheckoutOnboardingInput{SourcePath: "/fixture", CanonicalRepository: opened.CanonicalRepository, GitHubAppProfileRef: "fixture", BaseBranch: "main", VerifierIDs: []string{"fixture"}, LinearLabelSlug: "retry"})
+	service, err := application.NewOnboardingService(store, workerOnboardingPrivateStore{input: input}, workerOnboardingPaths{}, authorizer, new(application.ConfigurationService), workerOnboardingPreflight{}, executor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fallbackCalls := 0
+	dispatch := onboardingWorkerDispatch(store, service, func(context.Context) (application.LinearTodoDispatchResult, error) {
+		fallbackCalls++
+		return application.LinearTodoDispatchResult{}, errors.New("normal admission fallback was called")
+	})
+	parked, err := dispatch(ctx)
+	if err != nil || parked.Outcome != "onboarding_waiting_for_operator" || executor.calls != 1 || fallbackCalls != 0 {
+		t.Fatalf("parked=%+v executor_calls=%d fallback_calls=%d err=%v", parked, executor.calls, fallbackCalls, err)
+	}
+	requester := application.Requester{ID: operator.Login, Kind: "github_login", DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, ActorType: operator.ActorType}
+	resumed, err := service.Resume(ctx, application.OnboardingCommand{Requester: requester, OnboardingID: onboardingID})
+	if err != nil || resumed.Status != domain.OnboardingRunning {
+		t.Fatalf("resumed=%+v err=%v", resumed, err)
+	}
+	continued, err := dispatch(ctx)
+	if err != nil || continued.Outcome != "onboarding_waiting_for_operator" || executor.calls != 3 || fallbackCalls != 0 {
+		t.Fatalf("continued=%+v executor_calls=%d fallback_calls=%d err=%v", continued, executor.calls, fallbackCalls, err)
+	}
+	configured, err := authorizer.ResolveConfiguredRequester(requester)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopes, err := authorizer.ControllerScopes(configured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events int
+	if err := queryWorkerOnboardingRetryEvidence(store, onboardingID, scopes, &events); err != nil || events != 3 {
+		t.Fatalf("events=%d err=%v", events, err)
+	}
+}
+
+func queryWorkerOnboardingRetryEvidence(store *sqlitestore.Store, onboardingID string, scopes application.AuthorizedScopeSet, events *int) error {
+	// Public worker tests intentionally avoid SQLite internals. The persisted
+	// projection and activity query independently prove the retry stayed normal.
+	value, found, err := store.Onboarding(context.Background(), onboardingID)
+	if err != nil || !found || len(value.CompletedSteps) != 1 {
+		return errors.New("onboarding retry projection is unavailable")
+	}
+	page, err := store.ListActivity(context.Background(), application.ActivityStoreQuery{Scopes: scopes, Filter: application.ActivityFilter{Scope: application.ScopeOnboarding, TargetID: onboardingID}, Limit: 10})
+	if err != nil {
+		return err
+	}
+	*events = len(page.Events)
+	return nil
 }
 
 func TestWorkerProcessLockRejectsConcurrentWorkerAndRecoversAfterClose(t *testing.T) {

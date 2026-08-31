@@ -45,7 +45,10 @@ func newOperatorAttentionActivityEvent(eventKey, payloadDigest, reasonCode, evid
 	})
 }
 
-func newOnboardingActivityEvent(onboardingID string, step domain.OnboardingStep, order int64, outcome application.OperationOutcome, reason, evidence string, observedAt time.Time, binding, operationID string, ingestion application.ActivityIngestionClass) (application.ActivityEvent, bool) {
+func newOnboardingActivityEvent(onboardingID string, step domain.OnboardingStep, order, attempt int64, outcome application.OperationOutcome, reason, evidence string, observedAt time.Time, binding, operationID string, ingestion application.ActivityIngestionClass) (application.ActivityEvent, bool) {
+	if attempt < 1 {
+		return application.ActivityEvent{}, false
+	}
 	state := domain.OnboardingRunning
 	version := order - 1
 	switch outcome {
@@ -71,9 +74,15 @@ func newOnboardingActivityEvent(onboardingID string, step domain.OnboardingStep,
 	if state == domain.OnboardingReadyDisabled || state == domain.OnboardingConflict {
 		operationIDs = compactStrings(operationID)
 	}
-	sourceDigest := digestActivitySource(strings.Join([]string{onboardingID, string(step), string(outcome), reason, evidence, formatTime(observedAt)}, "\x00"))
+	sourceIdentity := onboardingID + ":" + string(step)
+	sourceParts := []string{onboardingID, string(step), string(outcome), reason, evidence, formatTime(observedAt)}
+	if attempt > 1 {
+		sourceIdentity += ":attempt:" + strconv.FormatInt(attempt, 10)
+		sourceParts = append(sourceParts, strconv.FormatInt(attempt, 10))
+	}
+	sourceDigest := digestActivitySource(strings.Join(sourceParts, "\x00"))
 	return application.NewActivityEvent(application.ActivityEventInput{
-		SourceKind: "onboarding", SourceIdentity: onboardingID + ":" + string(step), SourceEvidenceDigest: sourceDigest,
+		SourceKind: "onboarding", SourceIdentity: sourceIdentity, SourceEvidenceDigest: sourceDigest,
 		Category: application.ActivityOnboarding, EventKind: eventKind, Actor: application.ActivityActorController,
 		Scope: application.ScopeOnboarding, TargetID: onboardingID, TargetBindingDigest: binding, ReasonCode: eventReason,
 		ResultingState: string(state), ResultingVersion: version, OccurredAt: observedAt,

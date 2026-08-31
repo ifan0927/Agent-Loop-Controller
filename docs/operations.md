@@ -498,7 +498,9 @@ receipt. The worker then resumes the durable saga before normal issue
 admission. A configuration addition intentionally produces
 `worker_restart_required`; restart the managed worker, then use `show`. Other
 operator-correctable waits expose `resume`; fix the named external condition
-and reuse that command. `cancel` is legal only before start. Reusing the same
+and reuse that command. Resume durably creates one new attempt for the current
+failed or pending step. Exact replay while the onboarding is already running
+does not create another attempt. `cancel` is legal only before start. Reusing the same
 open/start/resume request replays persisted authority rather than duplicating
 effects. Empty-repository execution creates only an empty managed checkout and
 one deterministic `Initialize repository` root commit, then publishes only

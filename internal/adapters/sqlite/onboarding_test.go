@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -12,6 +13,290 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
+
+func TestOnboardingResumeAdvancesDurableAttemptsWithoutActivityConflict(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "controller.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 31, 1, 0, 0, 0, time.UTC)
+	digest := func(value string) string { return strings.Repeat(value, 64) }
+	started, receipt := startOnboardingRetryFixture(t, store, "onboarding-attempts", now)
+	intent := application.OnboardingStepIntent{OnboardingID: started.OnboardingID, Step: domain.OnboardingStepRootsCreated, IntentDigest: digest("4"), IntendedAt: now.Add(time.Second)}
+	if changed, beginErr := store.BeginOnboardingStep(ctx, intent); beginErr != nil || !changed {
+		t.Fatalf("begin changed=%t err=%v", changed, beginErr)
+	}
+
+	outcomes := []application.OperationOutcome{application.OperationOutcomeFailed, application.OperationOutcomePending, application.OperationOutcomeFailed, application.OperationOutcomeSucceeded}
+	for index, outcome := range outcomes {
+		attempt := int64(index + 1)
+		if index > 0 {
+			resumed, changed, resumeErr := store.ResumeOnboarding(ctx, started.OnboardingID, now.Add(time.Duration(index*3)*time.Second))
+			if resumeErr != nil || !changed || resumed.Status != domain.OnboardingRunning {
+				t.Fatalf("attempt %d resume=%+v changed=%t err=%v", attempt, resumed, changed, resumeErr)
+			}
+			if replayed, replayChanged, replayErr := store.ResumeOnboarding(ctx, started.OnboardingID, now.Add(time.Duration(index*3+1)*time.Second)); replayErr != nil || replayChanged || replayed.Status != domain.OnboardingRunning {
+				t.Fatalf("attempt %d replay=%+v changed=%t err=%v", attempt, replayed, replayChanged, replayErr)
+			}
+			if changed, beginErr := store.BeginOnboardingStep(ctx, intent); beginErr != nil || changed {
+				t.Fatalf("attempt %d begin replay changed=%t err=%v", attempt, changed, beginErr)
+			}
+		}
+		var storedAttempt int64
+		if err := store.db.QueryRow(`SELECT attempt_number FROM repository_onboarding_steps WHERE onboarding_id=? AND step_name=?`, started.OnboardingID, string(intent.Step)).Scan(&storedAttempt); err != nil || storedAttempt != attempt {
+			t.Fatalf("attempt=%d stored=%d err=%v", attempt, storedAttempt, err)
+		}
+		observation := application.OnboardingStepObservation{Outcome: outcome, ReasonCode: "fixture_attempt", EvidenceDigest: digest(string(rune('5' + index)))}
+		settled, settleErr := store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: started.OnboardingID, Step: intent.Step, Observation: observation, ObservedAt: now.Add(time.Duration(index*3+2) * time.Second)})
+		if settleErr != nil {
+			t.Fatalf("attempt %d settle: %v", attempt, settleErr)
+		}
+		if outcome == application.OperationOutcomeSucceeded {
+			if settled.Status != domain.OnboardingRunning || !slices.Equal(settled.CompletedSteps, []domain.OnboardingStep{intent.Step}) {
+				t.Fatalf("attempt %d settled=%+v", attempt, settled)
+			}
+		} else if settled.Status != domain.OnboardingWaitingForOperator || len(settled.CompletedSteps) != 0 {
+			t.Fatalf("attempt %d settled=%+v", attempt, settled)
+		}
+		if index == 1 {
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			store, err = Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	defer store.Close()
+
+	rows, err := store.db.Query(`SELECT source_identity FROM activity_events WHERE source_kind='onboarding' AND target_id=? ORDER BY occurred_at`, started.OnboardingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var identities []string
+	for rows.Next() {
+		var identity string
+		if err := rows.Scan(&identity); err != nil {
+			t.Fatal(err)
+		}
+		identities = append(identities, identity)
+	}
+	expected := []string{
+		started.OnboardingID + ":roots_created",
+		started.OnboardingID + ":roots_created:attempt:2",
+		started.OnboardingID + ":roots_created:attempt:3",
+		started.OnboardingID + ":roots_created:attempt:4",
+	}
+	if !slices.Equal(identities, expected) {
+		t.Fatalf("activity identities=%v", identities)
+	}
+	var phase, receiptOutcome string
+	if err := store.db.QueryRow(`SELECT phase,outcome FROM operation_receipts WHERE operation_id=?`, receipt.OperationID).Scan(&phase, &receiptOutcome); err != nil || phase != string(application.OperationPhaseAccepted) || receiptOutcome != string(application.OperationOutcomePending) {
+		t.Fatalf("receipt phase=%s outcome=%s err=%v", phase, receiptOutcome, err)
+	}
+}
+
+func TestOnboardingV46MigratesOnlyExactInterruptedResumeAndContinues(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "controller.db")
+	legacy, err := openWithSupportedSchema(path, 45)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 31, 2, 0, 0, 0, time.UTC)
+	exactID, exactReceipt, exactEvent := seedV45InterruptedOnboarding(t, legacy, "exact", now, func(*application.ActivityEvent) {})
+	seedV45InterruptedOnboarding(t, legacy, "missing-activity", now.Add(time.Hour), func(event *application.ActivityEvent) {
+		event.SourceIdentity += ":unrelated"
+	})
+	seedV45InterruptedOnboarding(t, legacy, "wrong-target", now.Add(2*time.Hour), func(event *application.ActivityEvent) {
+		event.TargetID += "-other"
+		*event = application.NewActivityEvent(activityInputFromEvent(*event))
+	})
+	seedV45InterruptedOnboarding(t, legacy, "wrong-binding", now.Add(3*time.Hour), func(event *application.ActivityEvent) {
+		event.TargetBindingDigest = application.ConfigurationEvidenceDigest("wrong-binding")
+		*event = application.NewActivityEvent(activityInputFromEvent(*event))
+	})
+	seedV45InterruptedOnboarding(t, legacy, "altered-related", now.Add(4*time.Hour), func(event *application.ActivityEvent) {
+		event.RelatedResources[0].ID += "-other"
+		*event = application.NewActivityEvent(activityInputFromEvent(*event))
+	})
+	seedV45InterruptedOnboarding(t, legacy, "wrong-order", now.Add(5*time.Hour), func(event *application.ActivityEvent) {
+		if _, err := legacy.db.Exec(`UPDATE repository_onboarding_steps SET step_order=3 WHERE onboarding_id=? AND step_name='linear_label_observed'`, event.TargetID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := legacy.db.Exec(`UPDATE repository_onboardings SET step_index=2 WHERE onboarding_id=?`, event.TargetID); err != nil {
+			t.Fatal(err)
+		}
+	})
+	seedV45InterruptedOnboarding(t, legacy, "wrong-prefix", now.Add(6*time.Hour), func(event *application.ActivityEvent) {
+		if _, err := legacy.db.Exec(`UPDATE repository_onboarding_steps SET step_name='managed_source_created' WHERE onboarding_id=? AND step_name='roots_created'`, event.TargetID); err != nil {
+			t.Fatal(err)
+		}
+	})
+	seedV45InterruptedOnboarding(t, legacy, "wrong-prior-intent", now.Add(7*time.Hour), func(event *application.ActivityEvent) {
+		if _, err := legacy.db.Exec(`UPDATE repository_onboarding_steps SET intent_digest=? WHERE onboarding_id=? AND step_name='roots_created'`, application.ConfigurationEvidenceDigest("wrong-prior-intent"), event.TargetID); err != nil {
+			t.Fatal(err)
+		}
+	})
+	wrongReceiptID, wrongReceipt, _ := seedV45InterruptedOnboarding(t, legacy, "wrong-receipt", now.Add(8*time.Hour), func(*application.ActivityEvent) {})
+	if _, err := legacy.db.Exec(`UPDATE operation_receipts SET target_binding_digest=? WHERE operation_id=?`, application.ConfigurationEvidenceDigest("wrong-receipt-binding"), wrongReceipt.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	seedV45InterruptedOnboarding(t, legacy, "successful", now.Add(9*time.Hour), func(event *application.ActivityEvent) {
+		event.ResultingState = string(domain.OnboardingRunning)
+		*event = application.NewActivityEvent(activityInputFromEvent(*event))
+	})
+	seedV45InterruptedOnboarding(t, legacy, "terminal", now.Add(10*time.Hour), func(event *application.ActivityEvent) {
+		if _, err := legacy.db.Exec(`UPDATE repository_onboardings SET status='conflict' WHERE onboarding_id=?`, event.TargetID); err != nil {
+			t.Fatal(err)
+		}
+	})
+	corruptID, _, corruptEvent := seedV45InterruptedOnboarding(t, legacy, "corrupt-snapshot", now.Add(11*time.Hour), func(*application.ActivityEvent) {})
+	if _, err := legacy.db.Exec(`UPDATE activity_events SET snapshot_digest=? WHERE event_id=?`, application.ConfigurationEvidenceDigest("corrupt-snapshot"), corruptEvent.EventID); err != nil {
+		t.Fatal(err)
+	}
+	before, err := scanActivityEvent(legacy.db.QueryRow(activityEventSelect+` WHERE event_id=?`, exactEvent.EventID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for id, expectedAttempt := range map[string]int64{exactID: 2, "onboarding-v45-missing-activity": 1, "onboarding-v45-wrong-target": 1, "onboarding-v45-wrong-binding": 1, "onboarding-v45-altered-related": 1, "onboarding-v45-wrong-order": 1, "onboarding-v45-wrong-prefix": 1, "onboarding-v45-wrong-prior-intent": 1, wrongReceiptID: 1, "onboarding-v45-successful": 1, "onboarding-v45-terminal": 1, corruptID: 1} {
+		var attempt int64
+		if err := store.db.QueryRow(`SELECT attempt_number FROM repository_onboarding_steps WHERE onboarding_id=? AND step_name='linear_label_observed'`, id).Scan(&attempt); err != nil || attempt != expectedAttempt {
+			t.Fatalf("onboarding=%s attempt=%d want=%d err=%v", id, attempt, expectedAttempt, err)
+		}
+	}
+	after, err := scanActivityEvent(store.db.QueryRow(activityEventSelect+` WHERE event_id=?`, exactEvent.EventID))
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatalf("prior activity changed: before=%+v after=%+v err=%v", before, after, err)
+	}
+	var repositoryRevisionBefore, activityRevisionBefore int64
+	if err := store.db.QueryRow(`SELECT
+		(SELECT revision_generation FROM controller_integrity_scope_revisions WHERE family='repository_onboarding' AND scope_kind='controller' AND scope_id='local-controller'),
+		(SELECT revision_generation FROM controller_integrity_scope_revisions WHERE family='operation_activity' AND scope_kind='controller' AND scope_id='local-controller')`).Scan(&repositoryRevisionBefore, &activityRevisionBefore); err != nil {
+		t.Fatal(err)
+	}
+	settled, err := store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: exactID, Step: domain.OnboardingStepLinearLabelObserved, Observation: application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "linear_label_ready", EvidenceDigest: strings.Repeat("9", 64), LinearLabelID: "label-recovered"}, ObservedAt: now.Add(10 * time.Minute)})
+	if err != nil || settled.Status != domain.OnboardingRunning || !slices.Equal(settled.CompletedSteps, []domain.OnboardingStep{domain.OnboardingStepRootsCreated, domain.OnboardingStepLinearLabelObserved}) {
+		t.Fatalf("settled=%+v err=%v", settled, err)
+	}
+	var eventCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM activity_events WHERE source_kind='onboarding' AND target_id=?`, exactID).Scan(&eventCount); err != nil || eventCount != 2 {
+		t.Fatalf("event count=%d err=%v", eventCount, err)
+	}
+	var repositoryRevisionAfter, activityRevisionAfter int64
+	if err := store.db.QueryRow(`SELECT
+		(SELECT revision_generation FROM controller_integrity_scope_revisions WHERE family='repository_onboarding' AND scope_kind='controller' AND scope_id='local-controller'),
+		(SELECT revision_generation FROM controller_integrity_scope_revisions WHERE family='operation_activity' AND scope_kind='controller' AND scope_id='local-controller')`).Scan(&repositoryRevisionAfter, &activityRevisionAfter); err != nil || repositoryRevisionAfter <= repositoryRevisionBefore || activityRevisionAfter <= activityRevisionBefore {
+		t.Fatalf("repository revision %d->%d activity revision %d->%d err=%v", repositoryRevisionBefore, repositoryRevisionAfter, activityRevisionBefore, activityRevisionAfter, err)
+	}
+	var phase, outcome string
+	if err := store.db.QueryRow(`SELECT phase,outcome FROM operation_receipts WHERE operation_id=?`, exactReceipt.OperationID).Scan(&phase, &outcome); err != nil || phase != string(application.OperationPhaseAccepted) || outcome != string(application.OperationOutcomePending) {
+		t.Fatalf("receipt phase=%s outcome=%s err=%v", phase, outcome, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, found, err := store.Onboarding(ctx, exactID)
+	if err != nil || !found || len(value.CompletedSteps) != 2 || value.LinearLabelID != "label-recovered" {
+		t.Fatalf("reopened=%+v found=%t err=%v", value, found, err)
+	}
+	var onboardings, roots, minimumAttempt int
+	if err := store.db.QueryRow(`SELECT
+		(SELECT COUNT(*) FROM repository_onboardings WHERE onboarding_id=?),
+		(SELECT COUNT(*) FROM repository_onboarding_steps WHERE onboarding_id=? AND step_name='roots_created'),
+		(SELECT MIN(attempt_number) FROM repository_onboarding_steps)`, exactID, exactID).Scan(&onboardings, &roots, &minimumAttempt); err != nil || onboardings != 1 || roots != 1 || minimumAttempt < 1 {
+		t.Fatalf("onboardings=%d roots=%d minimum_attempt=%d err=%v", onboardings, roots, minimumAttempt, err)
+	}
+}
+
+func startOnboardingRetryFixture(t *testing.T, store *Store, id string, now time.Time) (application.Onboarding, application.OperationReceipt) {
+	t.Helper()
+	ctx := context.Background()
+	digest := func(value string) string { return strings.Repeat(value, 64) }
+	requester := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
+	opened, _, err := store.OpenOnboarding(ctx, application.OnboardingOpenInput{OnboardingID: id, Kind: domain.OnboardingExistingCheckout, CanonicalRepository: "owner/" + id, Requester: requester, PrivateInputDigest: digest("a"), SourcePathDigest: digest("b"), SourceAncestorDigests: []string{digest("b")}, RequestDigest: digest("c"), ConfigurationBaseGenerationID: 1, ConfigurationBaseDigest: digest("d"), ConfigurationAuthorityVersion: 1, OpenedAt: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := store.SaveOnboardingPreflight(ctx, application.OnboardingPreflightInput{OnboardingID: id, ExpectedStatus: opened.Status, PreflightDigest: digest("e"), EvidenceDigest: digest("f"), ObservedAt: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := application.NewOperationReceipt(application.OperationReceiptInput{OperationType: application.OperationOnboardRepository, Scope: application.ScopeOnboarding, TargetID: id, Requester: requester, RequestDigest: opened.RequestDigest, ExpectedAuthorityDigest: opened.ConfigurationBaseDigest, OperationAnchorDigest: digest("1"), TargetBindingDigest: digest("2"), AcceptedAt: now})
+	started, _, _, err := store.StartOnboarding(ctx, application.OnboardingStartAcceptance{OnboardingID: id, Expected: ready, PreflightDigest: ready.PreflightDigest, PreviewDigest: digest("3"), Profile: application.LocalRepository{CanonicalRepository: opened.CanonicalRepository}, Receipt: receipt, AcceptedAt: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return started, receipt
+}
+
+func seedV45InterruptedOnboarding(t *testing.T, store *Store, suffix string, now time.Time, mutate func(*application.ActivityEvent)) (string, application.OperationReceipt, application.ActivityEvent) {
+	t.Helper()
+	id := "onboarding-v45-" + suffix
+	digest := func(value string) string {
+		return application.ConfigurationEvidenceDigest("v45-onboarding", suffix, value)
+	}
+	requester := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
+	preflight, preview := digest("preflight"), digest("preview")
+	startAnchor := digestBytes([]byte("onboarding-start-v1\x00" + id + "\x00" + preflight + "\x00" + preview))
+	receipt := application.NewOperationReceipt(application.OperationReceiptInput{OperationType: application.OperationOnboardRepository, Scope: application.ScopeOnboarding, TargetID: id, Requester: requester, RequestDigest: digest("request"), ExpectedAuthorityDigest: digest("authority"), OperationAnchorDigest: startAnchor, TargetBindingDigest: onboardingV46IdentityDigest(requester), AcceptedAt: now})
+	if _, _, err := store.BeginOperationReceipt(context.Background(), receipt); err != nil {
+		t.Fatal(err)
+	}
+	binding := digest("repository-binding")
+	labelIntent := digestBytes([]byte("onboarding-step-intent-v1\x00" + id + "\x00" + string(domain.OnboardingStepLinearLabelObserved) + "\x00" + receipt.RequestDigest))
+	_, err := store.db.Exec(`INSERT INTO repository_onboardings(onboarding_id,onboarding_kind,canonical_repository,private_input_digest,source_path_digest,request_digest,requester_login,requester_database_id,requester_node_id,requester_actor_type,base_generation_id,base_digest,configuration_authority_version,status,step_index,reason_code,preflight_digest,preview_digest,operation_id,repository_binding_digest,accepted_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'running',1,'',?,?,?,?,?,?,?)`, id, "existing_checkout", "owner/"+suffix, digest("private"), digest("source"), receipt.RequestDigest, requester.Login, requester.DatabaseID, requester.NodeID, requester.ActorType, 1, receipt.ExpectedAuthorityDigest, 1, preflight, preview, receipt.OperationID, binding, formatTime(now), formatTime(now), formatTime(now.Add(3*time.Minute)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO repository_onboarding_steps(onboarding_id,step_name,step_order,intent_digest,status,outcome,reason_code,evidence_digest,intended_at,observed_at) VALUES
+		(?,'roots_created',1,?,'observed','succeeded','roots_ready',?,?,?),
+		(?,'linear_label_observed',2,?,'intended','pending','','',?,'')`, id, digestBytes([]byte("onboarding-step-intent-v1\x00"+id+"\x00"+string(domain.OnboardingStepRootsCreated)+"\x00"+receipt.RequestDigest)), digest("roots-evidence"), formatTime(now.Add(time.Minute)), formatTime(now.Add(90*time.Second)), id, labelIntent, formatTime(now.Add(3*time.Minute))); err != nil {
+		t.Fatal(err)
+	}
+	event, valid := newOnboardingActivityEvent(id, domain.OnboardingStepLinearLabelObserved, 2, 1, application.OperationOutcomeFailed, "linear_label_outcome_unknown", application.ConfigurationEvidenceDigest("onboarding-linear-unknown-v1", id), now.Add(2*time.Minute), binding, receipt.OperationID, application.ActivityIngestionCurrent)
+	if !valid {
+		t.Fatal("v45 event fixture is invalid")
+	}
+	mutate(&event)
+	if event.SourceIdentity == id+":linear_label_observed:unrelated" {
+		return id, receipt, event
+	}
+	tx, err := store.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, _, err := appendActivityEventTx(context.Background(), tx, event)
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("append event=%+v err=%v", stored, err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit event=%+v err=%v", stored, err)
+	}
+	return id, receipt, stored
+}
+
+func activityInputFromEvent(event application.ActivityEvent) application.ActivityEventInput {
+	return application.ActivityEventInput{SourceKind: event.SourceKind, SourceIdentity: event.SourceIdentity, SourceEvidenceDigest: event.SourceEvidenceDigest, Category: event.Category, EventKind: event.EventKind, Actor: event.Actor, Scope: event.Scope, TargetID: event.TargetID, TargetBindingDigest: event.TargetBindingDigest, ReasonCode: event.ReasonCode, PriorState: event.PriorState, ResultingState: event.ResultingState, PriorVersion: event.PriorVersion, ResultingVersion: event.ResultingVersion, OccurredAt: event.OccurredAt, ObservedAt: event.ObservedAt, SettledAt: event.SettledAt, RelatedResources: event.RelatedResources, OperationIDs: event.OperationIDs, EvidenceDigests: event.EvidenceDigests, Coverage: event.Coverage}
+}
 
 func TestOnboardingSagaReplaysAndResumesAfterStoreRestart(t *testing.T) {
 	ctx := context.Background()

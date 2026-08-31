@@ -188,21 +188,29 @@ func backfillActivitySourceTx(ctx context.Context, tx *sql.Tx, source string, cu
 			err = rows.Err()
 		}
 	case "onboarding":
-		rows, queryErr := tx.QueryContext(ctx, `SELECT s.rowid,s.onboarding_id,s.step_name,s.step_order,s.outcome,s.reason_code,s.evidence_digest,s.observed_at,o.repository_binding_digest,o.request_digest,COALESCE(o.operation_id,'') FROM repository_onboarding_steps s JOIN repository_onboardings o ON o.onboarding_id=s.onboarding_id WHERE s.rowid>? AND s.status='observed' ORDER BY s.rowid LIMIT ?`, cursor, limit)
+		attemptProjection := "1"
+		var attemptColumn int
+		if queryErr := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('repository_onboarding_steps') WHERE name='attempt_number'`).Scan(&attemptColumn); queryErr != nil {
+			return last, indexedThrough, false, "", queryErr
+		}
+		if attemptColumn == 1 {
+			attemptProjection = "s.attempt_number"
+		}
+		rows, queryErr := tx.QueryContext(ctx, `SELECT s.rowid,s.onboarding_id,s.step_name,s.step_order,`+attemptProjection+`,s.outcome,s.reason_code,s.evidence_digest,s.observed_at,o.repository_binding_digest,o.request_digest,COALESCE(o.operation_id,'') FROM repository_onboarding_steps s JOIN repository_onboardings o ON o.onboarding_id=s.onboarding_id WHERE s.rowid>? AND s.status='observed' ORDER BY s.rowid LIMIT ?`, cursor, limit)
 		if queryErr != nil {
 			return last, indexedThrough, false, "", queryErr
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var rowID, order int64
+			var rowID, order, attempt int64
 			var id, step, outcome, reason, evidence, observed, binding, requestDigest, operationID string
-			if scanErr := rows.Scan(&rowID, &id, &step, &order, &outcome, &reason, &evidence, &observed, &binding, &requestDigest, &operationID); scanErr != nil {
+			if scanErr := rows.Scan(&rowID, &id, &step, &order, &attempt, &outcome, &reason, &evidence, &observed, &binding, &requestDigest, &operationID); scanErr != nil {
 				return last, indexedThrough, false, "", scanErr
 			}
 			if binding == "" {
 				binding = requestDigest
 			}
-			event, valid := newOnboardingActivityEvent(id, domain.OnboardingStep(step), order, application.OperationOutcome(outcome), reason, evidence, parseTime(observed), binding, operationID, application.ActivityIngestionBackfill)
+			event, valid := newOnboardingActivityEvent(id, domain.OnboardingStep(step), order, attempt, application.OperationOutcome(outcome), reason, evidence, parseTime(observed), binding, operationID, application.ActivityIngestionBackfill)
 			if !valid {
 				return last, indexedThrough, false, "", errors.New("stored onboarding activity classification is invalid")
 			}
