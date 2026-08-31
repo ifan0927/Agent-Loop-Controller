@@ -1026,6 +1026,14 @@ generation. Each publication uses a bounded exclusive mode-`0600` temporary
 leaf, complete write and fsync, and atomic replacement; routine heartbeats do
 not append logs or SQLite audit rows.
 
+An onboarding cycle keeps its exact sanitized outcome in that heartbeat:
+`onboarding_accepted`, `onboarding_running`,
+`onboarding_waiting_for_operator`, `onboarding_conflict`, or
+`onboarding_ready_disabled`. Waiting and conflict are parked worker states;
+the other legal onboarding outcomes remain running, and the same classification
+is retained in worker runtime activity. These parked results do not stop the
+supervisor, and unknown onboarding outcomes remain invalid.
+
 When `automation.linear_todo_admission.enabled` is false, the worker still
 acquires the same process-lifetime lock, opens the managed store, publishes the
 same immediate and cadence-bound heartbeat for the exact loaded digest, and

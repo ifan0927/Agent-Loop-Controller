@@ -126,6 +126,23 @@ func TestAdmissionWorkerProjectsDrivingAndParkedStatuses(t *testing.T) {
 	}
 }
 
+func TestAdmissionWorkerProjectsClosedOnboardingCycleStatuses(t *testing.T) {
+	for _, test := range []struct {
+		outcome string
+		status  string
+	}{
+		{outcome: application.RuntimeCycleOnboardingAccepted, status: workerStatusRunning},
+		{outcome: application.RuntimeCycleOnboardingRunning, status: workerStatusRunning},
+		{outcome: application.RuntimeCycleOnboardingWaitingForOperator, status: workerStatusParked},
+		{outcome: application.RuntimeCycleOnboardingConflict, status: workerStatusParked},
+		{outcome: application.RuntimeCycleOnboardingReadyDisabled, status: workerStatusRunning},
+	} {
+		if status := admissionWorkerStatus(application.LinearTodoDispatchResult{Outcome: test.outcome}); status != test.status {
+			t.Fatalf("outcome=%s status=%s want=%s", test.outcome, status, test.status)
+		}
+	}
+}
+
 func TestAdmissionWorkerDoesNotRecreateInMemoryRetryPolicy(t *testing.T) {
 	result, err := runAdmissionWorker(context.Background(), false, time.Minute, func(context.Context) (application.LinearTodoDispatchResult, error) {
 		return application.LinearTodoDispatchResult{}, &application.ServiceError{Category: application.ErrorUnavailable, Message: "unavailable"}

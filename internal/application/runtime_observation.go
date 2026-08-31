@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"time"
+
+	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
 const (
@@ -34,6 +36,50 @@ const (
 	RuntimeActivityStopping RuntimeActivity = "stopping"
 	RuntimeActivityUnknown  RuntimeActivity = "unknown"
 )
+
+const (
+	RuntimeCycleOnboardingAccepted           = "onboarding_accepted"
+	RuntimeCycleOnboardingRunning            = "onboarding_running"
+	RuntimeCycleOnboardingWaitingForOperator = "onboarding_waiting_for_operator"
+	RuntimeCycleOnboardingConflict           = "onboarding_conflict"
+	RuntimeCycleOnboardingReadyDisabled      = "onboarding_ready_disabled"
+)
+
+type onboardingRuntimeCycleDefinition struct {
+	status   domain.OnboardingStatus
+	outcome  string
+	activity RuntimeActivity
+}
+
+var onboardingRuntimeCycleDefinitions = [...]onboardingRuntimeCycleDefinition{
+	{status: domain.OnboardingAccepted, outcome: RuntimeCycleOnboardingAccepted, activity: RuntimeActivityRunning},
+	{status: domain.OnboardingRunning, outcome: RuntimeCycleOnboardingRunning, activity: RuntimeActivityRunning},
+	{status: domain.OnboardingWaitingForOperator, outcome: RuntimeCycleOnboardingWaitingForOperator, activity: RuntimeActivityParked},
+	{status: domain.OnboardingConflict, outcome: RuntimeCycleOnboardingConflict, activity: RuntimeActivityParked},
+	{status: domain.OnboardingReadyDisabled, outcome: RuntimeCycleOnboardingReadyDisabled, activity: RuntimeActivityRunning},
+}
+
+// OnboardingRuntimeCycleOutcome returns the exact heartbeat outcome for a
+// status that can legally cross the automatic onboarding dispatch boundary.
+func OnboardingRuntimeCycleOutcome(status domain.OnboardingStatus) (string, bool) {
+	for _, definition := range onboardingRuntimeCycleDefinitions {
+		if definition.status == status {
+			return definition.outcome, true
+		}
+	}
+	return "", false
+}
+
+// RuntimeCycleOnboardingActivity classifies only the closed onboarding cycle
+// vocabulary. Unknown prefixes and non-dispatch onboarding states fail closed.
+func RuntimeCycleOnboardingActivity(outcome string) (RuntimeActivity, bool) {
+	for _, definition := range onboardingRuntimeCycleDefinitions {
+		if definition.outcome == outcome {
+			return definition.activity, true
+		}
+	}
+	return "", false
+}
 
 type RuntimeObservationReason string
 
@@ -329,9 +375,9 @@ func ValidRuntimeCycleOutcome(value string) bool {
 	switch value {
 	case LinearTodoDispatchNoCandidate, LinearTodoDispatchDriven, LinearTodoDispatchAttention, LinearTodoDispatchWaiting, LinearTodoDispatchRetryWait, LinearTodoDispatchRetryScheduled:
 		return true
-	default:
-		return false
 	}
+	_, valid := RuntimeCycleOnboardingActivity(value)
+	return valid
 }
 
 func ValidRuntimeQueueDecisionReason(value string) bool {
