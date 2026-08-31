@@ -126,6 +126,44 @@ func TestWorkerStatusReaderRejectsSymlinkAndUnknownState(t *testing.T) {
 	}
 }
 
+func TestWorkerStatusReporterAcceptsOnlyClosedOnboardingCycleOutcomes(t *testing.T) {
+	for _, test := range []struct {
+		outcome string
+		status  string
+	}{
+		{outcome: application.RuntimeCycleOnboardingAccepted, status: workerStatusRunning},
+		{outcome: application.RuntimeCycleOnboardingRunning, status: workerStatusRunning},
+		{outcome: application.RuntimeCycleOnboardingWaitingForOperator, status: workerStatusParked},
+		{outcome: application.RuntimeCycleOnboardingConflict, status: workerStatusParked},
+		{outcome: application.RuntimeCycleOnboardingReadyDisabled, status: workerStatusRunning},
+	} {
+		t.Run(test.outcome, func(t *testing.T) {
+			config := filepath.Join(resolvedTempDir(t), "controller.json")
+			reporter, err := newWorkerStatusReporter(config, "worker-"+test.outcome, version, strings.Repeat("a", 64))
+			if err != nil {
+				t.Fatal(err)
+			}
+			completedAt := time.Date(2026, 8, 31, 4, 0, 0, 0, time.UTC)
+			reporter.now = func() time.Time { return completedAt }
+			if err := reporter.Observe(admissionWorkerResult{Status: test.status, Cycles: 1, LastOutcome: test.outcome, LastCycleCompletedAt: completedAt}); err != nil {
+				t.Fatal(err)
+			}
+			snapshot, state := readWorkerStatusEvidence(config, os.Getuid())
+			if state != application.RuntimeHeartbeatCurrent || snapshot.LastCycleOutcome != test.outcome || snapshot.Status != test.status {
+				t.Fatalf("snapshot=%+v state=%s", snapshot, state)
+			}
+		})
+	}
+	config := filepath.Join(resolvedTempDir(t), "controller.json")
+	reporter, err := newWorkerStatusReporter(config, "worker-invalid-onboarding", version, strings.Repeat("b", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reporter.Observe(admissionWorkerResult{Status: workerStatusRunning, Cycles: 1, LastOutcome: "onboarding_opened", LastCycleCompletedAt: time.Now().UTC()}); err == nil {
+		t.Fatal("non-dispatch onboarding outcome was accepted")
+	}
+}
+
 func TestWorkerHeartbeatRemainsPeriodicForQuietAndParkedActivity(t *testing.T) {
 	for _, test := range []struct {
 		name     string
@@ -291,6 +329,15 @@ func TestWorkerStatusReaderRejectsUnsafeOrContradictoryCurrentEvidence(t *testin
 		{name: "missing build", mutate: func(snapshot *workerStatusSnapshot) { snapshot.BuildIdentity = "" }},
 		{name: "missing digest", mutate: func(snapshot *workerStatusSnapshot) { snapshot.ConfigurationDigest = "" }},
 		{name: "unknown schema", mutate: func(snapshot *workerStatusSnapshot) { snapshot.SchemaVersion++ }},
+		{name: "unknown onboarding outcome", mutate: func(snapshot *workerStatusSnapshot) {
+			snapshot.LastCycleOutcome = "onboarding_unknown"
+			snapshot.LastCycleCompletedAt = snapshot.ObservedAt
+		}},
+		{name: "schema v2 carrying onboarding cadence", mutate: func(snapshot *workerStatusSnapshot) {
+			snapshot.SchemaVersion = application.WorkerHeartbeatPreviousSchemaVersion
+			snapshot.LastCycleOutcome = application.RuntimeCycleOnboardingRunning
+			snapshot.LastCycleCompletedAt = snapshot.ObservedAt
+		}},
 		{name: "legacy carrying current authority", mutate: func(snapshot *workerStatusSnapshot) {
 			snapshot.SchemaVersion = application.WorkerHeartbeatLegacySchemaVersion
 		}},

@@ -62,6 +62,37 @@ func currentRuntimeEvidence(now time.Time) RuntimeHeartbeatEvidence {
 	}
 }
 
+func TestRuntimeCycleOutcomesIncludeOnlyLegalOnboardingDispatchStatuses(t *testing.T) {
+	tests := []struct {
+		status   domain.OnboardingStatus
+		outcome  string
+		activity RuntimeActivity
+	}{
+		{status: domain.OnboardingAccepted, outcome: RuntimeCycleOnboardingAccepted, activity: RuntimeActivityRunning},
+		{status: domain.OnboardingRunning, outcome: RuntimeCycleOnboardingRunning, activity: RuntimeActivityRunning},
+		{status: domain.OnboardingWaitingForOperator, outcome: RuntimeCycleOnboardingWaitingForOperator, activity: RuntimeActivityParked},
+		{status: domain.OnboardingConflict, outcome: RuntimeCycleOnboardingConflict, activity: RuntimeActivityParked},
+		{status: domain.OnboardingReadyDisabled, outcome: RuntimeCycleOnboardingReadyDisabled, activity: RuntimeActivityRunning},
+	}
+	for _, test := range tests {
+		outcome, valid := OnboardingRuntimeCycleOutcome(test.status)
+		activity, classified := RuntimeCycleOnboardingActivity(test.outcome)
+		if !valid || outcome != test.outcome || !classified || activity != test.activity || !ValidRuntimeCycleOutcome(test.outcome) {
+			t.Fatalf("status=%s outcome=%q valid=%t activity=%s classified=%t", test.status, outcome, valid, activity, classified)
+		}
+	}
+	for _, status := range []domain.OnboardingStatus{domain.OnboardingOpened, domain.OnboardingPreflightReady, domain.OnboardingCancelled, "unknown"} {
+		if outcome, valid := OnboardingRuntimeCycleOutcome(status); valid || outcome != "" {
+			t.Fatalf("non-dispatch status=%s outcome=%q valid=%t", status, outcome, valid)
+		}
+	}
+	for _, outcome := range []string{"onboarding_opened", "onboarding_preflight_ready", "onboarding_cancelled", "onboarding_unknown", "onboarding_"} {
+		if activity, valid := RuntimeCycleOnboardingActivity(outcome); valid || activity != "" || ValidRuntimeCycleOutcome(outcome) {
+			t.Fatalf("unknown outcome=%q activity=%s valid=%t", outcome, activity, valid)
+		}
+	}
+}
+
 func TestRuntimeObservationRequiresControllerScopeBeforeReadingEvidence(t *testing.T) {
 	now := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
 	service, reader, processes, _ := runtimeObservationFixture(t, currentRuntimeEvidence(now), RuntimeHeartbeatCurrent, RuntimeProcessObservation{State: RuntimeProcessPresent, StartIdentity: "darwin:100:2"})

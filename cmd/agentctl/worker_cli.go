@@ -346,13 +346,6 @@ func newAutomaticWorkerRuntime(loaded bootstrap.Bootstrap, instanceID string) (a
 func onboardingWorkerDispatch(store *sqlitestore.Store, onboarding onboardingContinuer, fallback admissionWorkerDispatch) admissionWorkerDispatch {
 	return func(ctx context.Context) (application.LinearTodoDispatchResult, error) {
 		now := time.Now().UTC()
-		if authority, found, err := store.ConfigurationAuthority(ctx); err == nil && found {
-			if _, _, reconcileErr := store.ReconcileWorkerActivity(ctx, application.RuntimeActivityObservation{SourceKind: "worker_readiness", SourceIdentity: "automatic-worker", Classification: "running", SourceEvidenceDigest: application.ConfigurationEvidenceDigest("worker-readiness-v1", "automatic-worker", "running", authority.Desired.Digest), TargetBindingDigest: authority.Desired.Digest, OccurredAt: now, ObservedAt: now}); reconcileErr != nil {
-				_ = store.RecordActivityIndexingFailure(ctx, "worker_readiness", "runtime_reconciliation_failed", now)
-			} else {
-				_ = store.RecordActivityIndexingRecovery(ctx, "worker_readiness", now)
-			}
-		}
 		// Activity backfill is deliberately one bounded SQLite-only batch per
 		// worker opportunity. It consumes no heavy-work permit and never delays
 		// normal onboarding or admission after a recoverable indexing failure.
@@ -370,8 +363,15 @@ func onboardingWorkerDispatch(store *sqlitestore.Store, onboarding onboardingCon
 			if err != nil {
 				return application.LinearTodoDispatchResult{}, err
 			}
-			return application.LinearTodoDispatchResult{Outcome: "onboarding_" + string(result.Status), ScanDigest: application.ConfigurationEvidenceDigest("onboarding-worker-v1", result.OnboardingID, string(result.Status))}, nil
+			outcome, valid := application.OnboardingRuntimeCycleOutcome(result.Status)
+			if !valid {
+				return application.LinearTodoDispatchResult{}, errors.New("onboarding worker returned an invalid status")
+			}
+			activity, _ := application.RuntimeCycleOnboardingActivity(outcome)
+			reconcileAutomaticWorkerActivity(ctx, store, string(activity), result.OnboardingID, outcome, time.Now().UTC())
+			return application.LinearTodoDispatchResult{Outcome: outcome, ScanDigest: application.ConfigurationEvidenceDigest("onboarding-worker-v1", result.OnboardingID, string(result.Status))}, nil
 		}
+		reconcileAutomaticWorkerActivity(ctx, store, "running", "", "", now)
 		var dispatchResult application.LinearTodoDispatchResult
 		if fallback != nil {
 			dispatchResult, err = fallback(ctx)
@@ -382,6 +382,30 @@ func onboardingWorkerDispatch(store *sqlitestore.Store, onboarding onboardingCon
 			dispatchResult = application.LinearTodoDispatchResult{Outcome: application.LinearTodoDispatchNoCandidate, ScanDigest: application.ConfigurationEvidenceDigest("onboarding-worker-idle-v1", "none")}
 		}
 		return dispatchResult, nil
+	}
+}
+
+func reconcileAutomaticWorkerActivity(ctx context.Context, store *sqlitestore.Store, classification, onboardingID, onboardingOutcome string, now time.Time) {
+	if onboardingID != "" {
+		activity, valid := application.RuntimeCycleOnboardingActivity(onboardingOutcome)
+		if !valid || string(activity) != classification {
+			_ = store.RecordActivityIndexingFailure(ctx, "worker_readiness", "runtime_reconciliation_failed", now)
+			return
+		}
+	}
+	authority, found, err := store.ConfigurationAuthority(ctx)
+	if err != nil || !found {
+		return
+	}
+	evidenceParts := []string{"worker-readiness-v1", "automatic-worker", classification, authority.Desired.Digest}
+	if onboardingID != "" {
+		evidenceParts = []string{"worker-readiness-v2", "automatic-worker", classification, authority.Desired.Digest, onboardingID, onboardingOutcome}
+	}
+	evidence := application.ConfigurationEvidenceDigest(evidenceParts...)
+	if _, _, reconcileErr := store.ReconcileWorkerActivity(ctx, application.RuntimeActivityObservation{SourceKind: "worker_readiness", SourceIdentity: "automatic-worker", Classification: classification, SourceEvidenceDigest: evidence, TargetBindingDigest: authority.Desired.Digest, OccurredAt: now, ObservedAt: now}); reconcileErr != nil {
+		_ = store.RecordActivityIndexingFailure(ctx, "worker_readiness", "runtime_reconciliation_failed", now)
+	} else {
+		_ = store.RecordActivityIndexingRecovery(ctx, "worker_readiness", now)
 	}
 }
 

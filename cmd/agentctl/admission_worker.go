@@ -325,6 +325,9 @@ func stopAdmissionWorker(result *admissionWorkerResult) {
 }
 
 func admissionWorkerStatus(cycle application.LinearTodoDispatchResult) string {
+	if activity, valid := application.RuntimeCycleOnboardingActivity(cycle.Outcome); valid {
+		return string(activity)
+	}
 	if cycle.Outcome == application.LinearTodoDispatchAttention {
 		return workerStatusParked
 	}

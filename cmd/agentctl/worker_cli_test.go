@@ -61,8 +61,9 @@ func TestWorkerDispatchLeavesIntegrityMaintenanceToBoundedBoundary(t *testing.T)
 }
 
 type countingOnboardingContinuer struct {
-	calls int
-	id    string
+	calls  int
+	id     string
+	status domain.OnboardingStatus
 }
 
 type workerOnboardingPrivateStore struct {
@@ -103,7 +104,11 @@ func (c *countingOnboardingContinuer) Continue(_ context.Context, onboardingID s
 	if onboardingID != c.id {
 		return application.Onboarding{}, errors.New("unexpected onboarding identity")
 	}
-	return application.Onboarding{OnboardingID: onboardingID, Status: domain.OnboardingRunning}, nil
+	status := c.status
+	if status == "" {
+		status = domain.OnboardingRunning
+	}
+	return application.Onboarding{OnboardingID: onboardingID, Status: status}, nil
 }
 
 func TestDisabledWorkerSerializesRunnableOnboardingWithoutAdmissionFallback(t *testing.T) {
@@ -155,14 +160,20 @@ func TestDisabledWorkerSerializesRunnableOnboardingWithoutAdmissionFallback(t *t
 		return application.LinearTodoDispatchResult{}, errors.New("normal admission fallback was called")
 	})
 	result, err := runBoundedAdmissionWorkerAtObserved(ctx, true, time.Minute, automaticWorkerCapacity(configured, false), dispatch, waitAdmissionWorker, func() time.Time { return now.Add(5 * time.Second) }, nil)
-	if err != nil || result.Stopped != "once" || result.LastOutcome != "onboarding_running" || continuer.calls != 1 || fallbackCalls != 0 {
+	if err != nil || result.Stopped != "once" || result.LastOutcome != application.RuntimeCycleOnboardingRunning || continuer.calls != 1 || fallbackCalls != 0 {
 		t.Fatalf("result=%+v onboarding_calls=%d fallback_calls=%d err=%v", result, continuer.calls, fallbackCalls, err)
+	}
+	continuer.status = domain.OnboardingOpened
+	if _, err := dispatch(ctx); err == nil || err.Error() != "onboarding worker returned an invalid status" || fallbackCalls != 0 {
+		t.Fatalf("invalid status err=%v fallback_calls=%d", err, fallbackCalls)
 	}
 }
 
 func TestWorkerDispatchParksUnavailableOnboardingRetryAndContinuesAfterResume(t *testing.T) {
 	ctx := context.Background()
-	store, err := sqlitestore.Open(filepath.Join(t.TempDir(), "controller.db"))
+	root := t.TempDir()
+	databasePath := filepath.Join(root, "controller.db")
+	store, err := sqlitestore.Open(databasePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,8 +181,16 @@ func TestWorkerDispatchParksUnavailableOnboardingRetryAndContinuesAfterResume(t 
 	now := time.Date(2026, 8, 31, 3, 0, 0, 0, time.UTC)
 	digest := func(value string) string { return strings.Repeat(value, 64) }
 	operator := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
+	baseline := application.ConfigurationBaselineInput{Candidate: application.ValidatedConfigurationCandidate{Digest: digest("d"), Size: 100, SchemaVersion: 5, DatabasePath: databasePath, Operator: operator}, CanonicalConfigPath: filepath.Join(root, "controller.json"), ObservedAt: now}
+	if err := store.PrepareConfigurationBaseline(ctx, baseline); err != nil {
+		t.Fatal(err)
+	}
+	authority, _, err := store.AdoptConfigurationBaseline(ctx, baseline)
+	if err != nil {
+		t.Fatal(err)
+	}
 	onboardingID := "onboarding-worker-retry"
-	opened, _, err := store.OpenOnboarding(ctx, application.OnboardingOpenInput{OnboardingID: onboardingID, Kind: domain.OnboardingExistingCheckout, CanonicalRepository: "owner/retry", Requester: operator, PrivateInputDigest: digest("a"), SourcePathDigest: digest("b"), SourceAncestorDigests: []string{digest("b")}, RequestDigest: digest("c"), ConfigurationBaseGenerationID: 1, ConfigurationBaseDigest: digest("d"), ConfigurationAuthorityVersion: 1, OpenedAt: now})
+	opened, _, err := store.OpenOnboarding(ctx, application.OnboardingOpenInput{OnboardingID: onboardingID, Kind: domain.OnboardingExistingCheckout, CanonicalRepository: "owner/retry", Requester: operator, PrivateInputDigest: digest("a"), SourcePathDigest: digest("b"), SourceAncestorDigests: []string{digest("b")}, RequestDigest: digest("c"), ConfigurationBaseGenerationID: authority.Desired.GenerationID, ConfigurationBaseDigest: authority.Desired.Digest, ConfigurationAuthorityVersion: authority.Version, OpenedAt: now})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,18 +217,50 @@ func TestWorkerDispatchParksUnavailableOnboardingRetryAndContinuesAfterResume(t 
 		fallbackCalls++
 		return application.LinearTodoDispatchResult{}, errors.New("normal admission fallback was called")
 	})
-	parked, err := dispatch(ctx)
-	if err != nil || parked.Outcome != "onboarding_waiting_for_operator" || executor.calls != 1 || fallbackCalls != 0 {
-		t.Fatalf("parked=%+v executor_calls=%d fallback_calls=%d err=%v", parked, executor.calls, fallbackCalls, err)
-	}
 	requester := application.Requester{ID: operator.Login, Kind: "github_login", DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, ActorType: operator.ActorType}
-	resumed, err := service.Resume(ctx, application.OnboardingCommand{Requester: requester, OnboardingID: onboardingID})
-	if err != nil || resumed.Status != domain.OnboardingRunning {
-		t.Fatalf("resumed=%+v err=%v", resumed, err)
+	reporter, err := newWorkerStatusReporter(filepath.Join(root, "controller.json"), "worker-onboarding-retry", version, digest("7"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	continued, err := dispatch(ctx)
-	if err != nil || continued.Outcome != "onboarding_waiting_for_operator" || executor.calls != 3 || fallbackCalls != 0 {
-		t.Fatalf("continued=%+v executor_calls=%d fallback_calls=%d err=%v", continued, executor.calls, fallbackCalls, err)
+	clock := now.Add(20 * time.Minute)
+	reporter.now = func() time.Time { return clock }
+	runtimeService, err := application.NewRuntimeObservationService(workerHeartbeatReader{configPath: filepath.Join(root, "controller.json"), expectedUID: os.Getuid()}, workerProcessIdentityObserver{}, authorizer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHeartbeat := func(cycles int) {
+		t.Helper()
+		snapshot, state := readWorkerStatusEvidence(filepath.Join(root, "controller.json"), os.Getuid())
+		if state != application.RuntimeHeartbeatCurrent || snapshot.Cycles != cycles || snapshot.Status != workerStatusParked || snapshot.LastCycleOutcome != application.RuntimeCycleOnboardingWaitingForOperator || snapshot.LastCycleCompletedAt.IsZero() {
+			t.Fatalf("snapshot=%+v state=%s", snapshot, state)
+		}
+		observation, observeErr := runtimeService.Observe(context.Background(), requester, clock)
+		if observeErr != nil || observation.Liveness != application.RuntimeLivenessFresh || observation.Activity != application.RuntimeActivityParked || observation.AdmissionCadence.State != application.RuntimeAdmissionCadenceKnown || observation.AdmissionCadence.LastCycleOutcome != application.RuntimeCycleOnboardingWaitingForOperator {
+			t.Fatalf("observation=%+v err=%v", observation, observeErr)
+		}
+	}
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	waits := 0
+	result, err := runBoundedAdmissionWorkerAtObserved(workerCtx, false, time.Minute, 1, dispatch, func(context.Context, time.Duration) error {
+		waits++
+		assertHeartbeat(waits)
+		if waits == 1 {
+			resumed, resumeErr := service.Resume(ctx, application.OnboardingCommand{Requester: requester, OnboardingID: onboardingID})
+			if resumeErr != nil || resumed.Status != domain.OnboardingRunning {
+				t.Fatalf("resumed=%+v err=%v", resumed, resumeErr)
+			}
+			clock = clock.Add(time.Second)
+			return nil
+		}
+		cancelWorker()
+		return context.Canceled
+	}, func() time.Time { return clock }, reporter.Observe)
+	if err != nil || result.Stopped != "canceled" || result.Cycles != 2 || result.LastOutcome != application.RuntimeCycleOnboardingWaitingForOperator || result.PreviousStatus != workerStatusParked || executor.calls != 3 || fallbackCalls != 0 || waits != 2 {
+		t.Fatalf("result=%+v waits=%d executor_calls=%d fallback_calls=%d err=%v", result, waits, executor.calls, fallbackCalls, err)
+	}
+	final, state := readWorkerStatusEvidence(filepath.Join(root, "controller.json"), os.Getuid())
+	if state != application.RuntimeHeartbeatCurrent || final.Status != workerStatusStopping || final.PreviousStatus != workerStatusParked || final.LastCycleOutcome != application.RuntimeCycleOnboardingWaitingForOperator {
+		t.Fatalf("final=%+v state=%s", final, state)
 	}
 	configured, err := authorizer.ResolveConfiguredRequester(requester)
 	if err != nil {
@@ -222,6 +273,19 @@ func TestWorkerDispatchParksUnavailableOnboardingRetryAndContinuesAfterResume(t 
 	var events int
 	if err := queryWorkerOnboardingRetryEvidence(store, onboardingID, scopes, &events); err != nil || events != 3 {
 		t.Fatalf("events=%d err=%v", events, err)
+	}
+	workerActivity, err := store.ListActivity(ctx, application.ActivityStoreQuery{Scopes: scopes, Filter: application.ActivityFilter{Category: application.ActivityWorker, Scope: application.ScopeController}, Limit: 10})
+	expectedWorkerEvidence := application.ConfigurationEvidenceDigest("worker-readiness-v2", "automatic-worker", string(application.RuntimeActivityParked), authority.Desired.Digest, onboardingID, application.RuntimeCycleOnboardingWaitingForOperator)
+	conflictWorkerEvidence := application.ConfigurationEvidenceDigest("worker-readiness-v2", "automatic-worker", string(application.RuntimeActivityParked), authority.Desired.Digest, onboardingID, application.RuntimeCycleOnboardingConflict)
+	if expectedWorkerEvidence == conflictWorkerEvidence {
+		t.Fatal("distinct parked onboarding outcomes share runtime evidence")
+	}
+	if err != nil || len(workerActivity.Events) != 1 {
+		t.Fatalf("worker activity=%+v err=%v", workerActivity, err)
+	}
+	workerEvent := workerActivity.Events[0]
+	if workerEvent.ResultingState != string(application.RuntimeActivityParked) || workerEvent.SourceEvidenceDigest != expectedWorkerEvidence || workerEvent.TargetBindingDigest != authority.Desired.Digest || len(workerEvent.EvidenceDigests) != 1 || workerEvent.EvidenceDigests[0] != expectedWorkerEvidence {
+		t.Fatalf("worker event=%+v expected_evidence=%s", workerEvent, expectedWorkerEvidence)
 	}
 }
 

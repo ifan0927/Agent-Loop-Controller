@@ -644,6 +644,13 @@ the worker instance, PID, OS process-start identity, binary build identity,
 exact loaded configuration digest, sanitized activity, the last completed
 cycle outcome, last queue-decision reason, worker-owned next admission
 evaluation, and observation time. It is not an append-only audit stream.
+Onboarding cycles retain the closed `onboarding_accepted`,
+`onboarding_running`, `onboarding_waiting_for_operator`,
+`onboarding_conflict`, and `onboarding_ready_disabled` outcomes. Waiting and
+conflict project a parked supervisor; the other three preserve a running
+supervisor. The same classification is reconciled into worker runtime activity
+evidence. No other onboarding status or arbitrary prefixed value is valid
+heartbeat authority.
 Schema-v2 remains valid for liveness and activity while its newer cadence
 fields project as unknown. Schema-v1
 activity-driven snapshots are finite legacy inputs and never current heartbeat
