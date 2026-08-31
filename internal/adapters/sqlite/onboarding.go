@@ -3,9 +3,12 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -288,10 +291,14 @@ func (s *Store) ResumeOnboarding(ctx context.Context, onboardingID string, at ti
 	if current.Status != domain.OnboardingWaitingForOperator {
 		return application.Onboarding{}, false, application.ErrOnboardingConflict
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM repository_onboarding_steps WHERE onboarding_id=? AND step_order=? AND outcome IN ('failed','pending')`, onboardingID, currentStepIndex(ctx, tx, onboardingID)+1); err != nil {
+	result, err := tx.ExecContext(ctx, `UPDATE repository_onboarding_steps SET attempt_number=attempt_number+1,status='intended',outcome='pending',reason_code='',evidence_digest='',intended_at=?,observed_at='' WHERE onboarding_id=? AND step_order=? AND status='observed' AND outcome IN ('failed','pending')`, formatTime(at), onboardingID, currentStepIndex(ctx, tx, onboardingID)+1)
+	if err != nil {
 		return application.Onboarding{}, false, err
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE repository_onboardings SET status='running',reason_code='',updated_at=? WHERE onboarding_id=? AND status='waiting_for_operator'`, formatTime(at), onboardingID)
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return application.Onboarding{}, false, application.ErrOnboardingConflict
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE repository_onboardings SET status='running',reason_code='',updated_at=? WHERE onboarding_id=? AND status='waiting_for_operator'`, formatTime(at), onboardingID)
 	if err != nil {
 		return application.Onboarding{}, false, err
 	}
@@ -323,9 +330,10 @@ func (s *Store) BeginOnboardingStep(ctx context.Context, input application.Onboa
 		return false, application.ErrOnboardingConflict
 	}
 	var digest, status string
-	err = tx.QueryRowContext(ctx, `SELECT intent_digest,status FROM repository_onboarding_steps WHERE onboarding_id=? AND step_name=?`, input.OnboardingID, string(input.Step)).Scan(&digest, &status)
+	var attempt int64
+	err = tx.QueryRowContext(ctx, `SELECT intent_digest,status,attempt_number FROM repository_onboarding_steps WHERE onboarding_id=? AND step_name=?`, input.OnboardingID, string(input.Step)).Scan(&digest, &status, &attempt)
 	if err == nil {
-		if digest == input.IntentDigest && status == "intended" {
+		if digest == input.IntentDigest && status == "intended" && attempt > 0 {
 			return false, tx.Commit()
 		}
 		return false, application.ErrOnboardingConflict
@@ -333,7 +341,7 @@ func (s *Store) BeginOnboardingStep(ctx context.Context, input application.Onboa
 	if !errors.Is(err, sql.ErrNoRows) {
 		return false, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO repository_onboarding_steps(onboarding_id,step_name,step_order,intent_digest,status,outcome,intended_at) VALUES(?,?,?,?,'intended','pending',?)`, input.OnboardingID, string(input.Step), order, input.IntentDigest, formatTime(input.IntendedAt)); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO repository_onboarding_steps(onboarding_id,step_name,step_order,intent_digest,status,outcome,intended_at,attempt_number) VALUES(?,?,?,?,'intended','pending',?,1)`, input.OnboardingID, string(input.Step), order, input.IntentDigest, formatTime(input.IntendedAt)); err != nil {
 		return false, application.ErrOnboardingConflict
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE repository_onboardings SET status='running',updated_at=? WHERE onboarding_id=?`, formatTime(input.IntendedAt), input.OnboardingID); err != nil {
@@ -369,7 +377,8 @@ func (s *Store) SettleOnboardingStep(ctx context.Context, input application.Onbo
 		return application.Onboarding{}, application.ErrOnboardingConflict
 	}
 	var status, outcome, evidence string
-	if err := tx.QueryRowContext(ctx, `SELECT status,outcome,evidence_digest FROM repository_onboarding_steps WHERE onboarding_id=? AND step_name=? AND step_order=?`, input.OnboardingID, string(input.Step), order).Scan(&status, &outcome, &evidence); err != nil {
+	var attempt int64
+	if err := tx.QueryRowContext(ctx, `SELECT status,outcome,evidence_digest,attempt_number FROM repository_onboarding_steps WHERE onboarding_id=? AND step_name=? AND step_order=?`, input.OnboardingID, string(input.Step), order).Scan(&status, &outcome, &evidence, &attempt); err != nil || attempt < 1 {
 		return application.Onboarding{}, application.ErrOnboardingConflict
 	}
 	if status == "observed" {
@@ -381,8 +390,12 @@ func (s *Store) SettleOnboardingStep(ctx context.Context, input application.Onbo
 	if status != "intended" || currentStepIndex(ctx, tx, input.OnboardingID)+1 != order {
 		return application.Onboarding{}, application.ErrOnboardingConflict
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE repository_onboarding_steps SET status='observed',outcome=?,reason_code=?,evidence_digest=?,observed_at=? WHERE onboarding_id=? AND step_name=? AND status='intended'`, string(input.Observation.Outcome), input.Observation.ReasonCode, input.Observation.EvidenceDigest, formatTime(input.ObservedAt), input.OnboardingID, string(input.Step)); err != nil {
+	result, err := tx.ExecContext(ctx, `UPDATE repository_onboarding_steps SET status='observed',outcome=?,reason_code=?,evidence_digest=?,observed_at=? WHERE onboarding_id=? AND step_name=? AND status='intended' AND attempt_number=?`, string(input.Observation.Outcome), input.Observation.ReasonCode, input.Observation.EvidenceDigest, formatTime(input.ObservedAt), input.OnboardingID, string(input.Step), attempt)
+	if err != nil {
 		return application.Onboarding{}, err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return application.Onboarding{}, application.ErrOnboardingConflict
 	}
 	if input.Step == domain.OnboardingStepConfigurationApplied && input.Observation.Outcome == application.OperationOutcomeSucceeded {
 		if !validConfigurationDigest(input.Observation.ProfileDigest) || !validConfigurationDigest(input.Observation.RepositoryBindingDigest) || input.Observation.ProfileID == "" {
@@ -423,7 +436,7 @@ func (s *Store) SettleOnboardingStep(ctx context.Context, input application.Onbo
 	if binding == "" {
 		binding = current.RequestDigest
 	}
-	event, validActivity := newOnboardingActivityEvent(input.OnboardingID, input.Step, int64(order), input.Observation.Outcome, input.Observation.ReasonCode, input.Observation.EvidenceDigest, input.ObservedAt, binding, current.OperationID, application.ActivityIngestionCurrent)
+	event, validActivity := newOnboardingActivityEvent(input.OnboardingID, input.Step, int64(order), attempt, input.Observation.Outcome, input.Observation.ReasonCode, input.Observation.EvidenceDigest, input.ObservedAt, binding, current.OperationID, application.ActivityIngestionCurrent)
 	if !validActivity || event.ResultingState != string(nextStatus) || event.ResultingVersion != int64(stepIndex) {
 		return application.Onboarding{}, errors.New("onboarding activity classification is invalid")
 	}
@@ -585,6 +598,131 @@ func onboardingStepOrder(kind domain.OnboardingKind, step domain.OnboardingStep)
 		}
 	}
 	return 0
+}
+
+type onboardingV46MigrationCandidate struct {
+	id, kind, requestDigest, repositoryBindingDigest, operationID string
+	baseDigest, preflightDigest, previewDigest, acceptedAt        string
+	requester                                                     domain.GitHubUserIdentity
+	stepIndex, stepOrder                                          int64
+}
+
+func migrateOnboardingAttemptsV46Tx(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `SELECT o.onboarding_id,o.onboarding_kind,o.request_digest,o.repository_binding_digest,COALESCE(o.operation_id,''),o.base_digest,o.preflight_digest,o.preview_digest,o.accepted_at,o.requester_login,o.requester_database_id,o.requester_node_id,o.requester_actor_type,o.step_index,s.step_order
+		FROM repository_onboardings o JOIN repository_onboarding_steps s ON s.onboarding_id=o.onboarding_id
+		WHERE o.status='running' AND o.reason_code='' AND o.onboarding_kind='existing_checkout' AND s.step_name='linear_label_observed' AND s.step_order=2
+		AND s.status='intended' AND s.outcome='pending' AND s.reason_code='' AND s.evidence_digest=''
+		AND s.observed_at='' AND s.attempt_number=1 AND o.step_index=s.step_order-1
+		ORDER BY o.onboarding_id`)
+	if err != nil {
+		return err
+	}
+	var candidates []onboardingV46MigrationCandidate
+	for rows.Next() {
+		var candidate onboardingV46MigrationCandidate
+		if err := rows.Scan(&candidate.id, &candidate.kind, &candidate.requestDigest, &candidate.repositoryBindingDigest, &candidate.operationID, &candidate.baseDigest, &candidate.preflightDigest, &candidate.previewDigest, &candidate.acceptedAt, &candidate.requester.Login, &candidate.requester.DatabaseID, &candidate.requester.NodeID, &candidate.requester.ActorType, &candidate.stepIndex, &candidate.stepOrder); err != nil {
+			rows.Close()
+			return err
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, candidate := range candidates {
+		if !validOnboardingV46CandidateTx(ctx, tx, candidate) {
+			continue
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE repository_onboarding_steps SET attempt_number=2
+			WHERE onboarding_id=? AND step_name='linear_label_observed' AND step_order=?
+			AND status='intended' AND outcome='pending' AND reason_code='' AND evidence_digest=''
+			AND observed_at='' AND attempt_number=1
+			AND EXISTS(SELECT 1 FROM repository_onboardings o WHERE o.onboarding_id=? AND o.status='running' AND o.reason_code='' AND o.step_index=?)`, candidate.id, candidate.stepOrder, candidate.id, candidate.stepIndex)
+		if err != nil {
+			return err
+		}
+		if changed, _ := result.RowsAffected(); changed != 1 {
+			return errors.New("onboarding attempt migration authority changed")
+		}
+	}
+	return nil
+}
+
+func validOnboardingV46CandidateTx(ctx context.Context, tx *sql.Tx, candidate onboardingV46MigrationCandidate) bool {
+	plan, ok := domain.OnboardingStepPlan(domain.OnboardingKind(candidate.kind))
+	acceptedAt := parseTime(candidate.acceptedAt)
+	if !ok || domain.OnboardingKind(candidate.kind) != domain.OnboardingExistingCheckout || candidate.stepOrder != 2 || candidate.stepIndex != 1 || plan[0] != domain.OnboardingStepRootsCreated || plan[1] != domain.OnboardingStepLinearLabelObserved || !validConfigurationDigest(candidate.requestDigest) || !validConfigurationDigest(candidate.baseDigest) || !validConfigurationDigest(candidate.preflightDigest) || !validConfigurationDigest(candidate.previewDigest) || candidate.requester.Validate() != nil || acceptedAt.IsZero() || candidate.operationID == "" {
+		return false
+	}
+	binding := candidate.repositoryBindingDigest
+	if binding == "" {
+		binding = candidate.requestDigest
+	}
+	if !validConfigurationDigest(binding) {
+		return false
+	}
+	receipt, found, err := getOperationReceiptByIDTx(ctx, tx, candidate.operationID)
+	anchor := digestBytes([]byte("onboarding-start-v1\x00" + candidate.id + "\x00" + candidate.preflightDigest + "\x00" + candidate.previewDigest))
+	identityBinding := onboardingV46IdentityDigest(candidate.requester)
+	expectedReceipt := application.NewOperationReceipt(application.OperationReceiptInput{OperationType: application.OperationOnboardRepository, Scope: application.ScopeOnboarding, TargetID: candidate.id, Requester: candidate.requester, RequestDigest: candidate.requestDigest, ExpectedAuthorityDigest: candidate.baseDigest, OperationAnchorDigest: anchor, TargetBindingDigest: identityBinding, AcceptedAt: acceptedAt})
+	if err != nil || !found || receipt.Phase != application.OperationPhaseAccepted || receipt.Outcome != application.OperationOutcomePending || !sameAcceptedOperationReceipt(receipt, expectedReceipt) {
+		return false
+	}
+	steps, err := tx.QueryContext(ctx, `SELECT step_name,step_order,intent_digest,status,outcome,reason_code,evidence_digest,intended_at,observed_at,attempt_number FROM repository_onboarding_steps WHERE onboarding_id=? ORDER BY step_order`, candidate.id)
+	if err != nil {
+		return false
+	}
+	type storedStep struct {
+		name, intent, status, outcome, reason, evidence, intended, observed string
+		order, attempt                                                      int64
+	}
+	var stored []storedStep
+	for steps.Next() {
+		var step storedStep
+		if err := steps.Scan(&step.name, &step.order, &step.intent, &step.status, &step.outcome, &step.reason, &step.evidence, &step.intended, &step.observed, &step.attempt); err != nil {
+			steps.Close()
+			return false
+		}
+		stored = append(stored, step)
+	}
+	if steps.Close() != nil || len(stored) != int(candidate.stepOrder) {
+		return false
+	}
+	lastObserved := receipt.AcceptedAt
+	for index, step := range stored {
+		intendedAt := parseTime(step.intended)
+		if step.order != int64(index+1) || domain.OnboardingStep(step.name) != plan[index] || !validConfigurationDigest(step.intent) || step.attempt != 1 || intendedAt.IsZero() || intendedAt.Before(lastObserved) {
+			return false
+		}
+		if index < len(stored)-1 {
+			expectedIntent := digestBytes([]byte("onboarding-step-intent-v1\x00" + candidate.id + "\x00" + step.name + "\x00" + candidate.requestDigest))
+			observedAt := parseTime(step.observed)
+			if step.intent != expectedIntent || step.status != "observed" || step.outcome != string(application.OperationOutcomeSucceeded) || !validConfigurationDigest(step.evidence) || observedAt.IsZero() || observedAt.Before(intendedAt) {
+				return false
+			}
+			lastObserved = observedAt
+			continue
+		}
+		intentParts := "onboarding-step-intent-v2\x00" + candidate.id + "\x00" + candidate.kind + "\x00" + string(domain.OnboardingStepLinearLabelObserved) + "\x00" + candidate.requestDigest
+		if domain.OnboardingKind(candidate.kind) == domain.OnboardingExistingCheckout {
+			intentParts = "onboarding-step-intent-v1\x00" + candidate.id + "\x00" + string(domain.OnboardingStepLinearLabelObserved) + "\x00" + candidate.requestDigest
+		}
+		if step.intent != digestBytes([]byte(intentParts)) || step.status != "intended" || step.outcome != string(application.OperationOutcomePending) || step.reason != "" || step.evidence != "" || step.observed != "" {
+			return false
+		}
+	}
+	event, err := scanActivityEvent(tx.QueryRowContext(ctx, activityEventSelect+` WHERE source_kind='onboarding' AND source_identity=? AND event_kind='onboarding_milestone'`, candidate.id+":"+string(domain.OnboardingStepLinearLabelObserved)))
+	currentIntendedAt := parseTime(stored[len(stored)-1].intended)
+	if err != nil || event.Coverage.IngestionClass != application.ActivityIngestionCurrent || event.OccurredAt.Before(lastObserved) || event.OccurredAt.After(currentIntendedAt) {
+		return false
+	}
+	expected, valid := newOnboardingActivityEvent(candidate.id, domain.OnboardingStepLinearLabelObserved, candidate.stepOrder, 1, application.OperationOutcomeFailed, "linear_label_outcome_unknown", application.ConfigurationEvidenceDigest("onboarding-linear-unknown-v1", candidate.id), event.OccurredAt, binding, candidate.operationID, application.ActivityIngestionCurrent)
+	event.IngestionSequence = 0
+	return valid && reflect.DeepEqual(event, expected)
+}
+
+func onboardingV46IdentityDigest(identity domain.GitHubUserIdentity) string {
+	return digestBytes([]byte(strings.ToLower(identity.Login) + "\x00" + hex.EncodeToString([]byte(identity.NodeID)) + "\x00" + identity.ActorType + "\x00" + strconv.FormatInt(identity.DatabaseID, 10)))
 }
 
 func validOnboardingOpen(input application.OnboardingOpenInput) bool {

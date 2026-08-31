@@ -1274,7 +1274,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 45; migration history is code, not a
+inspection. The current schema is version 46; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees
@@ -1807,7 +1807,12 @@ workflow policy. It consumes bounded sanitized projections and only the legal
 actions offered by Controller application services. It is not a database
 administration tool, orchestrator, or second state machine.
 
-Repository onboarding is a persisted Controller saga. A new-project flow
+Repository onboarding is a persisted Controller saga. Each step row owns a
+positive durable attempt number. Resume atomically re-arms the current failed
+or pending step and advances that attempt; immutable activity remains
+explanatory history rather than retry authority. Attempt 1 retains its legacy
+activity identity, while later attempts use deterministic attempt-qualified
+identities and evidence digests. A new-project flow
 begins from an existing empty GitHub repository, creates the managed local
 checkout and initial base revision, creates or adopts the exact Linear
 `repo:<slug>` label, validates the repository profile, applies configuration,
@@ -1873,7 +1878,7 @@ around it. The principal table groups are:
 | configuration generation, authority, apply/recovery-intent, and convergence tables | Immutable desired/effective metadata, one Controller-wide CAS mutation authority, crash reconciliation state, optional immutable rollback-source identity, and meaningful sanitized transitions; raw desired bytes remain outside SQLite and external bytes are never stored |
 | `configuration_drafts` | At most one active Controller-wide normal or rollback-origin typed draft, revision/edit replay authority, immutable rollback source when applicable, sanitized validation/preview evidence, and generation/receipt settlement; no raw candidate, path, identity, or credential authority |
 | repository lifecycle, readiness, recheck, and removal tables | Immutable incarnation history, one current canonical/profile/binding authority, complete readiness evidence, exclusive source-bound removal draft and accepted/applied/observed settlement, and tombstone evidence; no external-resource deletion authority |
-| repository onboarding and onboarding-step tables | One active canonical repository/source-path digest, one of two closed kind-specific step plans, sanitized preflight/preview bindings and exact initial SHA, ordered intent-before-effect settlements, partial-progress recovery, and final disabled incarnation/readiness evidence; exact source paths and raw Git/remote output remain outside SQLite |
+| repository onboarding and onboarding-step tables | One active canonical repository/source-path digest, one of two closed kind-specific step plans, a positive durable current-step attempt, sanitized preflight/preview bindings and exact initial SHA, ordered intent-before-effect settlements, monotonic partial-progress recovery, and final disabled incarnation/readiness evidence; exact source paths and raw Git/remote output remain outside SQLite |
 
 ### Current state versus evidence
 

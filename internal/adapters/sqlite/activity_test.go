@@ -350,12 +350,17 @@ func TestActivityCurrentAndBackfillInterleavingPreservesFirstSnapshot(t *testing
 	paired := func(build func(application.ActivityIngestionClass) application.ActivityEvent) eventPair {
 		return eventPair{current: build(application.ActivityIngestionCurrent), backfill: build(application.ActivityIngestionBackfill)}
 	}
-	onboarding := func(ingestion application.ActivityIngestionClass) application.ActivityEvent {
-		event, valid := newOnboardingActivityEvent("onboarding-1", domain.OnboardingStepSettled, 10, application.OperationOutcomeSucceeded, "ready", digestA, now, digestB, "", ingestion)
-		if !valid {
-			t.Fatal("onboarding fixture is invalid")
+	onboarding := func(attempt int64) func(application.ActivityIngestionClass) application.ActivityEvent {
+		return func(ingestion application.ActivityIngestionClass) application.ActivityEvent {
+			event, valid := newOnboardingActivityEvent("onboarding-1", domain.OnboardingStepSettled, 10, 1, application.OperationOutcomeSucceeded, "ready", digestA, now, digestB, "", ingestion)
+			if attempt > 1 {
+				event, valid = newOnboardingActivityEvent("onboarding-1", domain.OnboardingStepSettled, 10, attempt, application.OperationOutcomeSucceeded, "ready", digestA, now, digestB, "", ingestion)
+			}
+			if !valid {
+				t.Fatal("onboarding fixture is invalid")
+			}
+			return event
 		}
-		return event
 	}
 	tests := map[string]eventPair{
 		"run transition": paired(func(ingestion application.ActivityIngestionClass) application.ActivityEvent {
@@ -364,7 +369,8 @@ func TestActivityCurrentAndBackfillInterleavingPreservesFirstSnapshot(t *testing
 		"repository readiness": paired(func(ingestion application.ActivityIngestionClass) application.ActivityEvent {
 			return newRepositoryReadinessActivityEvent(application.RepositoryReadinessSnapshot{SnapshotID: "snapshot-1", Repository: "owner/repo", RepositoryBindingDigest: digestB, LifecycleVersion: 3, Status: domain.RepositoryReady, ReasonCode: "ready", SnapshotDigest: digestC, ObservedAt: now.Add(-time.Minute), PublishedAt: now}, "", ingestion)
 		}),
-		"onboarding": paired(onboarding),
+		"onboarding attempt 1": paired(onboarding(1)),
+		"onboarding attempt 2": paired(onboarding(2)),
 		"operator attention": paired(func(ingestion application.ActivityIngestionClass) application.ActivityEvent {
 			return newOperatorAttentionActivityEvent("attention-1", digestA, "manual_intervention", digestC, now, now.Add(time.Second), application.ScopeController, "controller", digestB, ingestion)
 		}),
@@ -397,6 +403,29 @@ func TestActivityCurrentAndBackfillInterleavingPreservesFirstSnapshot(t *testing
 				}
 			})
 		}
+	}
+}
+
+func TestOnboardingAttemptOneActivityConstructionRemainsByteCompatible(t *testing.T) {
+	now := time.Date(2026, 8, 28, 2, 30, 0, 0, time.UTC)
+	evidence, binding := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	actual, valid := newOnboardingActivityEvent("onboarding-compatibility", domain.OnboardingStepSettled, 10, 1, application.OperationOutcomeSucceeded, "ready", evidence, now, binding, "", application.ActivityIngestionCurrent)
+	if !valid {
+		t.Fatal("attempt-one activity is invalid")
+	}
+	sourceDigest := digestActivitySource(strings.Join([]string{"onboarding-compatibility", string(domain.OnboardingStepSettled), string(application.OperationOutcomeSucceeded), "ready", evidence, formatTime(now)}, "\x00"))
+	expected := application.NewActivityEvent(application.ActivityEventInput{
+		SourceKind: "onboarding", SourceIdentity: "onboarding-compatibility:settled", SourceEvidenceDigest: sourceDigest,
+		Category: application.ActivityOnboarding, EventKind: application.ActivityOnboardingCompleted, Actor: application.ActivityActorController,
+		Scope: application.ScopeOnboarding, TargetID: "onboarding-compatibility", TargetBindingDigest: binding, ReasonCode: application.ActivityReasonCompleted,
+		ResultingState: string(domain.OnboardingReadyDisabled), ResultingVersion: 10, OccurredAt: now,
+		RelatedResources: []application.ActivityRelatedResource{{Kind: application.ScopeOnboarding, ID: "onboarding-compatibility"}},
+		EvidenceDigests:  compactDigests(evidence, sourceDigest), Coverage: application.ActivityEventCoverage{IngestionClass: application.ActivityIngestionCurrent, LegacyReconstructable: true},
+	})
+	actualJSON, _ := json.Marshal(actual)
+	expectedJSON, _ := json.Marshal(expected)
+	if string(actualJSON) != string(expectedJSON) {
+		t.Fatalf("attempt-one bytes changed:\nactual=%s\nexpected=%s", actualJSON, expectedJSON)
 	}
 }
 
