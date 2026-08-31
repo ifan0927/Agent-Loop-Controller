@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -35,6 +36,370 @@ func TestRepositoryBaselineAdoptsExactlyOnceAndStartsUnknown(t *testing.T) {
 	drift := repositoryProfileFixture("owner/repo", "c", "d")
 	if err := store.AdoptRepositoryLifecycleBaseline(context.Background(), application.RepositoryBaselineInput{Profiles: []application.RepositoryProfileAuthority{drift}, AdoptedAt: at}); !errors.Is(err, application.ErrRepositoryLifecycleConflict) {
 		t.Fatalf("drift error=%v", err)
+	}
+}
+
+func TestRepositoryBaselineAdoptsEmptyAuthorityAndReplaysAfterAuthorityVersionAdvance(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "controller.db")
+	store, err := openAdmissionTestStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	authority, found, err := store.ConfigurationAuthority(ctx)
+	if err != nil || !found {
+		t.Fatalf("authority=%+v found=%t err=%v", authority, found, err)
+	}
+	now := time.Date(2026, 8, 31, 7, 0, 0, 0, time.UTC)
+	if err := store.AdoptRepositoryLifecycleBaseline(ctx, application.RepositoryBaselineInput{AdoptedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	var generationID, authorityVersion int64
+	var count int
+	var configurationDigest, profilesDigest string
+	if err := store.db.QueryRow(`SELECT configuration_generation_id,configuration_digest,configuration_authority_version,repository_count,profiles_digest FROM repository_lifecycle_baseline WHERE authority_id=1`).Scan(&generationID, &configurationDigest, &authorityVersion, &count, &profilesDigest); err != nil {
+		t.Fatal(err)
+	}
+	if generationID != authority.Desired.GenerationID || configurationDigest != authority.Desired.Digest || authorityVersion != authority.Version || count != 0 || profilesDigest != repositoryProfilesDigest(nil) {
+		t.Fatalf("baseline generation=%d digest=%s version=%d count=%d profiles=%s authority=%+v", generationID, configurationDigest, authorityVersion, count, profilesDigest, authority)
+	}
+	for _, table := range []string{"repository_lifecycles", "repository_readiness_snapshots", "repository_readiness_dimensions"} {
+		var rows int
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&rows); err != nil || rows != 0 {
+			t.Fatalf("table=%s rows=%d err=%v", table, rows, err)
+		}
+	}
+	changed, err := store.ObserveConfigurationDrift(ctx, application.ConfigurationDriftObservation{ExpectedGenerationID: authority.Desired.GenerationID, ExpectedDigest: authority.Desired.Digest, ObservedDigest: strings.Repeat("f", 64), Drifted: true, Reason: application.ConfigurationReasonExternalDrift, ObservedAt: now.Add(time.Second)})
+	advanced, found, authorityErr := store.ConfigurationAuthority(ctx)
+	if err != nil || !changed || authorityErr != nil || !found || advanced.Version <= authority.Version {
+		t.Fatalf("advanced=%+v changed=%t found=%t err=%v authority_err=%v", advanced, changed, found, err, authorityErr)
+	}
+	if err := store.AdoptRepositoryLifecycleBaseline(ctx, application.RepositoryBaselineInput{AdoptedAt: now.Add(2 * time.Second)}); err != nil {
+		t.Fatalf("same-generation authority-version replay failed: %v", err)
+	}
+	if changed, err := store.ObserveConfigurationDrift(ctx, application.ConfigurationDriftObservation{ExpectedGenerationID: advanced.Desired.GenerationID, ExpectedDigest: advanced.Desired.Digest, ObservedDigest: advanced.Desired.Digest, Drifted: false, ObservedAt: now.Add(2 * time.Second)}); err != nil || !changed {
+		t.Fatalf("drift clear changed=%t err=%v", changed, err)
+	}
+	advanced, found, err = store.ConfigurationAuthority(ctx)
+	if err != nil || !found {
+		t.Fatalf("advanced=%+v found=%t err=%v", advanced, found, err)
+	}
+	descendant, _ := beginRemovalConfigurationApply(t, ctx, store.Store, advanced, advanced.Desired.ConfiguredOperator, path, strings.Repeat("6", 64), now.Add(3*time.Second), "7")
+	if _, _, _, err := store.SettleConfigurationApply(ctx, application.ConfigurationApplySettlement{GenerationID: descendant.GenerationID, ParentID: descendant.ParentID, OperationID: descendant.OperationID, Outcome: application.ConfigurationApplyCommitted, Reason: application.ConfigurationReasonRestartRequired, EvidenceDigest: strings.Repeat("8", 64), SettledAt: now.Add(4 * time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdoptRepositoryLifecycleBaseline(ctx, application.RepositoryBaselineInput{AdoptedAt: now.Add(5 * time.Second)}); err != nil {
+		t.Fatalf("descendant-generation empty replay failed: %v", err)
+	}
+	var replayGenerationID, replayAuthorityVersion int64
+	var replayConfigurationDigest string
+	if err := store.db.QueryRow(`SELECT configuration_generation_id,configuration_digest,configuration_authority_version FROM repository_lifecycle_baseline WHERE authority_id=1`).Scan(&replayGenerationID, &replayConfigurationDigest, &replayAuthorityVersion); err != nil || replayGenerationID != generationID || replayConfigurationDigest != configurationDigest || replayAuthorityVersion != authorityVersion {
+		t.Fatalf("immutable anchor generation=%d digest=%s version=%d err=%v", replayGenerationID, replayConfigurationDigest, replayAuthorityVersion, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.AdoptRepositoryLifecycleBaseline(ctx, application.RepositoryBaselineInput{AdoptedAt: now.Add(6 * time.Second)}); err != nil {
+		t.Fatalf("restart replay failed: %v", err)
+	}
+}
+
+func TestRepositoryEmptyBaselineReplayRejectsCorruptionAndUnmatchedLifecycle(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *admissionTestStore)
+	}{
+		{name: "blank profiles digest", mutate: func(t *testing.T, store *admissionTestStore) {
+			_, err := store.db.Exec(`UPDATE repository_lifecycle_baseline SET profiles_digest=''`)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "blank configuration digest", mutate: func(t *testing.T, store *admissionTestStore) {
+			_, err := store.db.Exec(`UPDATE repository_lifecycle_baseline SET configuration_digest=''`)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "negative repository count", mutate: func(t *testing.T, store *admissionTestStore) {
+			rebuildMalformedRepositoryBaseline(t, store)
+			if _, err := store.db.Exec(`UPDATE repository_lifecycle_baseline SET repository_count=-1`); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "non-singleton baseline", mutate: func(t *testing.T, store *admissionTestStore) {
+			rebuildMalformedRepositoryBaseline(t, store)
+			if _, err := store.db.Exec(`INSERT INTO repository_lifecycle_baseline SELECT 2,configuration_generation_id,configuration_digest,configuration_authority_version,repository_count,profiles_digest,adopted_at FROM repository_lifecycle_baseline WHERE authority_id=1`); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "wrong profiles digest", mutate: func(t *testing.T, store *admissionTestStore) {
+			_, err := store.db.Exec(`UPDATE repository_lifecycle_baseline SET profiles_digest=?`, strings.Repeat("1", 64))
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "missing generation anchor", mutate: func(t *testing.T, store *admissionTestStore) {
+			_, err := store.db.Exec(`UPDATE repository_lifecycle_baseline SET configuration_generation_id=999`)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "generation digest mismatch", mutate: func(t *testing.T, store *admissionTestStore) {
+			_, err := store.db.Exec(`UPDATE repository_lifecycle_baseline SET configuration_digest=?`, strings.Repeat("2", 64))
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "future authority version", mutate: func(t *testing.T, store *admissionTestStore) {
+			_, err := store.db.Exec(`UPDATE repository_lifecycle_baseline SET configuration_authority_version=configuration_authority_version+100`)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "non-ancestral generation anchor", mutate: func(t *testing.T, store *admissionTestStore) {
+			now := formatTime(time.Date(2026, 8, 31, 7, 45, 0, 0, time.UTC))
+			result, err := store.db.Exec(`INSERT INTO configuration_generations(digest,target_size,schema_version,origin,configured_operator_login,configured_operator_database_id,configured_operator_node_id,configured_operator_actor_type,lifecycle,raw_retained,created_at,committed_at,effective_at,settled_at,reason_code) VALUES(?,1,5,'baseline','fixture-operator',1,'FIXTURE_USER_1','User','effective',1,?,?,?,?,'')`, strings.Repeat("5", 64), now, now, now, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			generationID, err := result.LastInsertId()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.db.Exec(`UPDATE repository_lifecycle_baseline SET configuration_generation_id=?,configuration_digest=?`, generationID, strings.Repeat("5", 64)); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "unmatched active lifecycle", mutate: func(t *testing.T, store *admissionTestStore) {
+			now := formatTime(time.Date(2026, 8, 31, 8, 0, 0, 0, time.UTC))
+			_, err := store.db.Exec(`INSERT INTO repository_lifecycles(incarnation_id,repository,profile_id,profile_digest,repository_binding_digest,intent,lifecycle_version,current_snapshot_id,updated_at) VALUES('incarnation-corrupt','owner/corrupt','profile-corrupt',?,?,'disabled',1,'',?)`, strings.Repeat("3", 64), strings.Repeat("4", 64), now)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			if err := store.AdoptRepositoryLifecycleBaseline(context.Background(), application.RepositoryBaselineInput{AdoptedAt: time.Date(2026, 8, 31, 7, 30, 0, 0, time.UTC)}); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, store)
+			if err := store.AdoptRepositoryLifecycleBaseline(context.Background(), application.RepositoryBaselineInput{}); !errors.Is(err, application.ErrRepositoryLifecycleConflict) {
+				t.Fatalf("corrupt replay error=%v", err)
+			}
+		})
+	}
+}
+
+func rebuildMalformedRepositoryBaseline(t *testing.T, store *admissionTestStore) {
+	t.Helper()
+	for _, statement := range []string{
+		`DROP TRIGGER integrity_track_repository_lifecycle_baseline_insert`,
+		`DROP TRIGGER integrity_track_repository_lifecycle_baseline_update`,
+		`DROP TRIGGER integrity_track_repository_lifecycle_baseline_delete`,
+		`ALTER TABLE repository_lifecycle_baseline RENAME TO repository_lifecycle_baseline_valid_fixture`,
+		`CREATE TABLE repository_lifecycle_baseline (authority_id INTEGER,configuration_generation_id INTEGER,configuration_digest TEXT,configuration_authority_version INTEGER,repository_count INTEGER,profiles_digest TEXT,adopted_at TEXT)`,
+		`INSERT INTO repository_lifecycle_baseline SELECT * FROM repository_lifecycle_baseline_valid_fixture`,
+		`DROP TABLE repository_lifecycle_baseline_valid_fixture`,
+	} {
+		if _, err := store.db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestRepositoryBaselineMigrationV47PreservesPositiveAuthorityAndAdoptsIncidentEmpty(t *testing.T) {
+	t.Run("positive baseline", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "controller.db")
+		store, err := openAdmissionTestStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		profile := repositoryProfileFixture("owner/migrated", "a", "b")
+		now := time.Date(2026, 8, 31, 9, 0, 0, 0, time.UTC)
+		ctx := context.Background()
+		if err := store.AdoptRepositoryLifecycleBaseline(ctx, application.RepositoryBaselineInput{Profiles: []application.RepositoryProfileAuthority{profile}, AdoptedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+		repositoryBefore, err := store.RepositoryOperationAuthority(ctx, profile.Authority.Repository)
+		if err != nil {
+			t.Fatal(err)
+		}
+		configuration, found, err := store.ConfigurationAuthority(ctx)
+		if err != nil || !found {
+			t.Fatalf("configuration=%+v found=%t err=%v", configuration, found, err)
+		}
+		onboardingInput := application.OnboardingOpenInput{OnboardingID: "onboarding-v46-preserved", Kind: domain.OnboardingExistingCheckout, CanonicalRepository: "owner/preserved", Requester: configuration.Desired.ConfiguredOperator, PrivateInputDigest: strings.Repeat("1", 64), SourcePathDigest: strings.Repeat("2", 64), SourceAncestorDigests: []string{strings.Repeat("2", 64)}, RequestDigest: strings.Repeat("3", 64), ConfigurationBaseGenerationID: configuration.Desired.GenerationID, ConfigurationBaseDigest: configuration.Desired.Digest, ConfigurationAuthorityVersion: configuration.Version, OpenedAt: now.Add(time.Second)}
+		onboardingBefore, created, err := store.OpenOnboarding(ctx, onboardingInput)
+		if err != nil || !created {
+			t.Fatalf("onboarding=%+v created=%t err=%v", onboardingBefore, created, err)
+		}
+		receiptInput := repositoryReceiptFixture(application.OperationDisableRepository, repositoryBefore, profile, now.Add(2*time.Second))
+		receiptBefore, created, err := store.BeginOperationReceipt(ctx, receiptInput)
+		if err != nil || !created {
+			t.Fatalf("receipt=%+v created=%t err=%v", receiptBefore, created, err)
+		}
+		var before string
+		if err := store.db.QueryRow(`SELECT printf('%d|%d|%s|%d|%d|%s|%s',authority_id,configuration_generation_id,configuration_digest,configuration_authority_version,repository_count,profiles_digest,adopted_at) FROM repository_lifecycle_baseline`).Scan(&before); err != nil {
+			t.Fatal(err)
+		}
+		var repositoryActivityBefore, registryBefore string
+		var repositoryRevisionBefore int64
+		if err := store.db.QueryRow(`SELECT COALESCE(group_concat(event_id,'|'),'') FROM (SELECT event_id FROM activity_events WHERE category='repository' ORDER BY event_id)`).Scan(&repositoryActivityBefore); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.db.QueryRow(`SELECT COALESCE(group_concat(family||':'||table_name,'|'),'') FROM (SELECT family,table_name FROM integrity_registry_sources ORDER BY family,table_name)`).Scan(&registryBefore); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.db.QueryRow(`SELECT revision_generation FROM controller_integrity_scope_revisions WHERE family='repository_onboarding' AND scope_kind='controller' AND scope_id='local-controller'`).Scan(&repositoryRevisionBefore); err != nil {
+			t.Fatal(err)
+		}
+		downgradeRepositoryBaselineToV46(t, store)
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		migrated, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer migrated.Close()
+		var after string
+		if err := migrated.db.QueryRow(`SELECT printf('%d|%d|%s|%d|%d|%s|%s',authority_id,configuration_generation_id,configuration_digest,configuration_authority_version,repository_count,profiles_digest,adopted_at) FROM repository_lifecycle_baseline`).Scan(&after); err != nil || after != before {
+			t.Fatalf("before=%q after=%q err=%v", before, after, err)
+		}
+		repositoryAfter, err := migrated.RepositoryOperationAuthority(ctx, profile.Authority.Repository)
+		if err != nil {
+			t.Fatal(err)
+		}
+		onboardingAfter, found, err := migrated.Onboarding(ctx, onboardingInput.OnboardingID)
+		if err != nil || !found {
+			t.Fatalf("onboarding=%+v found=%t err=%v", onboardingAfter, found, err)
+		}
+		receiptAfter, found, err := getOperationReceiptByIDQuery(ctx, migrated.db, receiptBefore.OperationID)
+		if err != nil || !found {
+			t.Fatalf("receipt=%+v found=%t err=%v", receiptAfter, found, err)
+		}
+		var repositoryActivityAfter, registryAfter string
+		var repositoryRevisionAfter int64
+		if err := migrated.db.QueryRow(`SELECT COALESCE(group_concat(event_id,'|'),'') FROM (SELECT event_id FROM activity_events WHERE category='repository' ORDER BY event_id)`).Scan(&repositoryActivityAfter); err != nil {
+			t.Fatal(err)
+		}
+		if err := migrated.db.QueryRow(`SELECT COALESCE(group_concat(family||':'||table_name,'|'),'') FROM (SELECT family,table_name FROM integrity_registry_sources ORDER BY family,table_name)`).Scan(&registryAfter); err != nil {
+			t.Fatal(err)
+		}
+		if err := migrated.db.QueryRow(`SELECT revision_generation FROM controller_integrity_scope_revisions WHERE family='repository_onboarding' AND scope_kind='controller' AND scope_id='local-controller'`).Scan(&repositoryRevisionAfter); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(repositoryAfter, repositoryBefore) || !reflect.DeepEqual(onboardingAfter, onboardingBefore) || !reflect.DeepEqual(receiptAfter, receiptBefore) || repositoryActivityAfter != repositoryActivityBefore || registryAfter != registryBefore || repositoryRevisionAfter != repositoryRevisionBefore {
+			t.Fatalf("related evidence changed: repository=%t onboarding=%t receipt=%t activity=%t registry=%t revision_before=%d revision_after=%d", reflect.DeepEqual(repositoryAfter, repositoryBefore), reflect.DeepEqual(onboardingAfter, onboardingBefore), reflect.DeepEqual(receiptAfter, receiptBefore), repositoryActivityAfter == repositoryActivityBefore, registryAfter == registryBefore, repositoryRevisionBefore, repositoryRevisionAfter)
+		}
+		var triggers, families, violations int
+		if err := migrated.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name IN ('integrity_track_repository_lifecycle_baseline_insert','integrity_track_repository_lifecycle_baseline_update','integrity_track_repository_lifecycle_baseline_delete')`).Scan(&triggers); err != nil {
+			t.Fatal(err)
+		}
+		if err := migrated.db.QueryRow(`SELECT COUNT(*) FROM integrity_registry_families`).Scan(&families); err != nil {
+			t.Fatal(err)
+		}
+		if err := migrated.db.QueryRow(`SELECT COUNT(*) FROM pragma_foreign_key_check`).Scan(&violations); err != nil || triggers != 3 || families != 7 || violations != 0 {
+			t.Fatalf("triggers=%d families=%d violations=%d err=%v", triggers, families, violations, err)
+		}
+	})
+
+	t.Run("v46 missing baseline incident", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "controller.db")
+		store, err := openAdmissionTestStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		downgradeRepositoryBaselineToV46(t, store)
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		migrated, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer migrated.Close()
+		var revisionBefore, revisionAfterInsert, revisionAfterUpdate, revisionAfterDelete int64
+		readRevision := func(target *int64) {
+			t.Helper()
+			if err := migrated.db.QueryRow(`SELECT revision_generation FROM controller_integrity_scope_revisions WHERE family='repository_onboarding' AND scope_kind='controller' AND scope_id='local-controller'`).Scan(target); err != nil {
+				t.Fatal(err)
+			}
+		}
+		readRevision(&revisionBefore)
+		if err := migrated.AdoptRepositoryLifecycleBaseline(context.Background(), application.RepositoryBaselineInput{AdoptedAt: time.Date(2026, 8, 31, 9, 30, 0, 0, time.UTC)}); err != nil {
+			t.Fatal(err)
+		}
+		readRevision(&revisionAfterInsert)
+		var count int
+		if err := migrated.db.QueryRow(`SELECT repository_count FROM repository_lifecycle_baseline WHERE authority_id=1`).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("count=%d err=%v", count, err)
+		}
+		if _, err := migrated.db.Exec(`UPDATE repository_lifecycle_baseline SET adopted_at=adopted_at WHERE authority_id=1`); err != nil {
+			t.Fatal(err)
+		}
+		readRevision(&revisionAfterUpdate)
+		if _, err := migrated.db.Exec(`DELETE FROM repository_lifecycle_baseline WHERE authority_id=1`); err != nil {
+			t.Fatal(err)
+		}
+		readRevision(&revisionAfterDelete)
+		if revisionAfterInsert <= revisionBefore || revisionAfterUpdate <= revisionAfterInsert || revisionAfterDelete <= revisionAfterUpdate {
+			t.Fatalf("repository_onboarding revisions before=%d insert=%d update=%d delete=%d", revisionBefore, revisionAfterInsert, revisionAfterUpdate, revisionAfterDelete)
+		}
+	})
+}
+
+func downgradeRepositoryBaselineToV46(t *testing.T, store *admissionTestStore) {
+	t.Helper()
+	tx, err := store.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	statements := []string{
+		`DROP TRIGGER integrity_track_repository_lifecycle_baseline_insert`,
+		`DROP TRIGGER integrity_track_repository_lifecycle_baseline_update`,
+		`DROP TRIGGER integrity_track_repository_lifecycle_baseline_delete`,
+		`ALTER TABLE repository_lifecycle_baseline RENAME TO repository_lifecycle_baseline_v47_fixture`,
+		`CREATE TABLE repository_lifecycle_baseline (
+			authority_id INTEGER PRIMARY KEY CHECK(authority_id=1),
+			configuration_generation_id INTEGER NOT NULL,
+			configuration_digest TEXT NOT NULL,
+			configuration_authority_version INTEGER NOT NULL CHECK(configuration_authority_version > 0),
+			repository_count INTEGER NOT NULL CHECK(repository_count > 0),
+			profiles_digest TEXT NOT NULL,
+			adopted_at TEXT NOT NULL
+		)`,
+		`INSERT INTO repository_lifecycle_baseline SELECT * FROM repository_lifecycle_baseline_v47_fixture`,
+		`DROP TABLE repository_lifecycle_baseline_v47_fixture`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, operation := range []string{"INSERT", "UPDATE", "DELETE"} {
+		if _, err := tx.Exec(repositoryLifecycleBaselineIntegrityTrigger(operation)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM schema_migrations WHERE version=47`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
 	}
 }
 

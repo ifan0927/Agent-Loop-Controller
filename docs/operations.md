@@ -512,6 +512,18 @@ source, initial revision/base, an already-created Linear label, and an applied
 configuration are retained and reconciled; there is no implicit destructive
 rollback.
 
+A fresh installation may intentionally begin with version-5
+`"repositories": []` while automatic admission is disabled. Start the worker
+first. It adopts the count-zero lifecycle baseline, publishes the normal
+schema-v3 heartbeat, and converges the same configuration authority without
+loading the normal-admission credential. Once that heartbeat is fresh, open and
+start the first onboarding normally. The worker may reopen after the
+configuration step because the exact onboarding, generation, committed apply
+receipt, and observed step evidence form a temporary bridge. The bridge does
+not create lifecycle authority; the later lifecycle step remains the only
+creator of the first disabled lifecycle and readiness snapshot. Never repair
+this flow with manual SQLite changes.
+
 Completion is `ready_disabled`, even when all readiness dimensions are ready.
 Inspect the repository projection and run `agentctl repository enable` with a
 new stable request ID only after deliberate operator approval.
@@ -1038,14 +1050,21 @@ When `automation.linear_todo_admission.enabled` is false, the worker still
 acquires the same process-lifetime lock, opens the managed store, publishes the
 same immediate and cadence-bound heartbeat for the exact loaded digest, and
 stays alive until cancellation or failure. Disabled mode has capacity one and
-uses only the existing onboarding dispatcher plus integrity maintenance. With
+uses only the existing onboarding dispatcher plus configuration convergence
+and integrity maintenance. With
 no runnable onboarding it records `no_candidate` and waits for the next bounded
 opportunity; it does not read/check the normal-admission credential, contact
 Linear for Todo admission, reserve or create a run, or invoke a normal-admission
 fallback. An already accepted onboarding may continue its existing authorized
 Linear label/readiness steps. Disabled `--once` performs exactly one serialized
-onboarding/integrity opportunity, reports `disabled: true`, and exits with
+onboarding/configuration/integrity opportunity, reports `disabled: true`, and exits with
 `stopped: once`.
+
+When the loaded repository set is empty, managed store open persists a real
+count-zero baseline rather than treating the baseline as absent. Repeated
+starts and idle cycles replay that same authority. Any active lifecycle row or
+corrupt/non-ancestral baseline anchor fails store open; an empty baseline does
+not authorize normal admission or mint a repository token.
 
 Integrity maintenance runs only after a bounded dispatch batch becomes
 quiescent. Once one dispatch finishes, the worker stops adding replacements,

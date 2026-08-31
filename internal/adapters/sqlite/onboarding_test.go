@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -320,7 +321,7 @@ func TestOnboardingSagaReplaysAndResumesAfterStoreRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.AdoptRepositoryLifecycleBaseline(ctx, application.RepositoryBaselineInput{Profiles: []application.RepositoryProfileAuthority{repositoryProfileFixture("owner/existing", "1", "2")}, AdoptedAt: now}); err != nil {
+	if err := store.AdoptRepositoryLifecycleBaseline(ctx, application.RepositoryBaselineInput{AdoptedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	openInput := application.OnboardingOpenInput{OnboardingID: "onboarding-restart-safe", Kind: domain.OnboardingExistingCheckout, CanonicalRepository: "owner/repository", Requester: requester, PrivateInputDigest: digest("a"), SourcePathDigest: digest("b"), SourceAncestorDigests: []string{digest("0"), digest("b")}, RequestDigest: digest("c"), ConfigurationBaseGenerationID: configuration.Desired.GenerationID, ConfigurationBaseDigest: configuration.Desired.Digest, ConfigurationAuthorityVersion: configuration.Version, OpenedAt: now}
@@ -408,7 +409,24 @@ func TestOnboardingSagaReplaysAndResumesAfterStoreRestart(t *testing.T) {
 		t.Fatalf("configuration begin changed=%t err=%v", changed, err)
 	}
 	candidate := application.ValidatedConfigurationCandidate{Digest: digest("4"), Size: 2, SchemaVersion: 5, DatabasePath: path, Operator: requester}
-	configurationReceipt := application.NewOperationReceipt(application.OperationReceiptInput{OperationType: application.OperationApplyConfiguration, Scope: application.ScopeController, TargetID: application.ConfigurationTargetID, Requester: requester, RequestDigest: candidate.Digest, ExpectedAuthorityDigest: configuration.Desired.Digest, OperationAnchorDigest: digest("5"), TargetBindingDigest: digest("6"), AcceptedAt: now.Add(8 * time.Second)})
+	authorizer, err := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: requester})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configured, err := authorizer.ResolveConfiguredRequester(application.Requester{ID: requester.Login, Kind: "github_login", DatabaseID: requester.DatabaseID, NodeID: requester.NodeID, ActorType: requester.ActorType})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopes, err := authorizer.ControllerScopes(configured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, ok := scopes.ControllerOperationTarget()
+	if !ok {
+		t.Fatal("controller operation target is unavailable")
+	}
+	configurationAnchor := application.ConfigurationEvidenceDigest("configuration-apply-v3", fmt.Sprint(configuration.Desired.GenerationID), configuration.Desired.Digest, candidate.Digest, string(application.ConfigurationApplyOnboarding), opened.OnboardingID, opened.RequestDigest)
+	configurationReceipt := application.NewOperationReceipt(application.OperationReceiptInput{OperationType: application.OperationApplyConfiguration, Scope: application.ScopeController, TargetID: target.TargetID, Requester: requester, RequestDigest: candidate.Digest, ExpectedAuthorityDigest: configuration.Desired.Digest, OperationAnchorDigest: configurationAnchor, TargetBindingDigest: target.TargetBindingDigest, AcceptedAt: now.Add(8 * time.Second)})
 	apply := application.ConfigurationApplyAcceptance{ExpectedGenerationID: configuration.Desired.GenerationID, ExpectedDigest: configuration.Desired.Digest, Candidate: candidate, Requester: requester, Receipt: configurationReceipt, Provenance: application.ConfigurationApplyProvenance{Kind: application.ConfigurationApplyOnboarding, OnboardingSourceID: opened.OnboardingID, OnboardingSourceDigest: opened.RequestDigest}, AcceptedAt: configurationReceipt.AcceptedAt}
 	normalReceipt := application.NewOperationReceipt(application.OperationReceiptInput{OperationType: application.OperationApplyConfiguration, Scope: application.ScopeController, TargetID: application.ConfigurationTargetID, Requester: requester, RequestDigest: candidate.Digest, ExpectedAuthorityDigest: configuration.Desired.Digest, OperationAnchorDigest: digest("0"), TargetBindingDigest: digest("6"), AcceptedAt: now.Add(8 * time.Second)})
 	normalApply := apply
@@ -423,7 +441,8 @@ func TestOnboardingSagaReplaysAndResumesAfterStoreRestart(t *testing.T) {
 	if replayed, _, replayChanged, replayErr := store.BeginConfigurationApply(ctx, apply); replayErr != nil || replayChanged || replayed.GenerationID != generation.GenerationID {
 		t.Fatalf("configuration replay=%+v changed=%t err=%v", replayed, replayChanged, replayErr)
 	}
-	configuration, _, _, err = store.SettleConfigurationApply(ctx, application.ConfigurationApplySettlement{GenerationID: generation.GenerationID, ParentID: generation.ParentID, OperationID: generation.OperationID, Outcome: application.ConfigurationApplyCommitted, Reason: application.ConfigurationReasonRestartRequired, EvidenceDigest: digest("7"), SettledAt: now.Add(9 * time.Second)})
+	var settledConfigurationReceipt application.OperationReceipt
+	configuration, settledConfigurationReceipt, _, err = store.SettleConfigurationApply(ctx, application.ConfigurationApplySettlement{GenerationID: generation.GenerationID, ParentID: generation.ParentID, OperationID: generation.OperationID, Outcome: application.ConfigurationApplyCommitted, Reason: application.ConfigurationReasonRestartRequired, EvidenceDigest: digest("7"), SettledAt: now.Add(9 * time.Second)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,9 +450,126 @@ func TestOnboardingSagaReplaysAndResumesAfterStoreRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	settled, err = store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: opened.OnboardingID, Step: domain.OnboardingStepConfigurationApplied, Observation: application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "configuration_applied", EvidenceDigest: digest("b"), ProfileID: profileAuthority.Profile.ProfileID, ProfileDigest: profileAuthority.Profile.ProfileDigest, RepositoryBindingDigest: profileAuthority.Profile.RepositoryBindingDigest, ConfigurationGenerationID: generation.GenerationID}, ObservedAt: now.Add(11 * time.Second)})
+	configurationEvidence := application.ConfigurationEvidenceDigest("onboarding-configuration-v1", opened.OnboardingID, generation.Digest, fmt.Sprint(generation.GenerationID), settledConfigurationReceipt.EvidenceDigest)
+	settled, err = store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: opened.OnboardingID, Step: domain.OnboardingStepConfigurationApplied, Observation: application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "configuration_applied", EvidenceDigest: configurationEvidence, ProfileID: profileAuthority.Profile.ProfileID, ProfileDigest: profileAuthority.Profile.ProfileDigest, RepositoryBindingDigest: profileAuthority.Profile.RepositoryBindingDigest, ConfigurationGenerationID: generation.GenerationID}, ObservedAt: now.Add(11 * time.Second)})
 	if err != nil || settled.ConfigurationGenerationID != generation.GenerationID {
 		t.Fatalf("configuration settled=%+v err=%v", settled, err)
+	}
+	profiles := []application.RepositoryProfileAuthority{profileAuthority}
+	if err := store.AdoptRepositoryLifecycleBaseline(ctx, application.RepositoryBaselineInput{Profiles: profiles, AdoptedAt: now.Add(11 * time.Second)}); err != nil {
+		t.Fatalf("running post-configuration bridge failed: %v", err)
+	}
+	if _, err := store.db.Exec(`UPDATE repository_onboardings SET status='waiting_for_operator',reason_code='worker_restart_required' WHERE onboarding_id=?`, opened.OnboardingID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdoptRepositoryLifecycleBaseline(ctx, application.RepositoryBaselineInput{Profiles: profiles, AdoptedAt: now.Add(11 * time.Second)}); err != nil {
+		t.Fatalf("waiting post-configuration bridge failed: %v", err)
+	}
+	if _, err := store.db.Exec(`UPDATE repository_onboardings SET status='running',reason_code='' WHERE onboarding_id=?`, opened.OnboardingID); err != nil {
+		t.Fatal(err)
+	}
+	expectBridgeConflict := func(label string) {
+		t.Helper()
+		if err := store.AdoptRepositoryLifecycleBaseline(ctx, application.RepositoryBaselineInput{Profiles: profiles, AdoptedAt: now.Add(11 * time.Second)}); !errors.Is(err, application.ErrRepositoryLifecycleConflict) {
+			t.Fatalf("%s bridge error=%v", label, err)
+		}
+	}
+	for _, status := range []string{"accepted", "conflict", "ready_disabled", "cancelled"} {
+		if _, err := store.db.Exec(`UPDATE repository_onboardings SET status=? WHERE onboarding_id=?`, status, opened.OnboardingID); err != nil {
+			t.Fatal(err)
+		}
+		expectBridgeConflict(status)
+		if _, err := store.db.Exec(`UPDATE repository_onboardings SET status='running' WHERE onboarding_id=?`, opened.OnboardingID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.db.Exec(`UPDATE repository_onboardings SET step_index=? WHERE onboarding_id=?`, onboardingStepOrder(opened.Kind, domain.OnboardingStepLifecycleCreated), opened.OnboardingID); err != nil {
+		t.Fatal(err)
+	}
+	expectBridgeConflict("later lifecycle step index")
+	if _, err := store.db.Exec(`UPDATE repository_onboardings SET step_index=? WHERE onboarding_id=?`, onboardingStepOrder(opened.Kind, domain.OnboardingStepConfigurationApplied), opened.OnboardingID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE repository_onboarding_steps SET reason_code='wrong_reason' WHERE onboarding_id=? AND step_name='configuration_applied'`, opened.OnboardingID); err != nil {
+		t.Fatal(err)
+	}
+	expectBridgeConflict("wrong step reason")
+	if _, err := store.db.Exec(`UPDATE repository_onboarding_steps SET reason_code='configuration_applied',evidence_digest=? WHERE onboarding_id=? AND step_name='configuration_applied'`, digest("0"), opened.OnboardingID); err != nil {
+		t.Fatal(err)
+	}
+	expectBridgeConflict("wrong step evidence")
+	if _, err := store.db.Exec(`UPDATE repository_onboarding_steps SET evidence_digest=? WHERE onboarding_id=? AND step_name='configuration_applied'`, configurationEvidence, opened.OnboardingID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE repository_onboardings SET profile_digest=? WHERE onboarding_id=?`, digest("0"), opened.OnboardingID); err != nil {
+		t.Fatal(err)
+	}
+	expectBridgeConflict("wrong profile digest")
+	if _, err := store.db.Exec(`UPDATE repository_onboardings SET profile_digest=? WHERE onboarding_id=?`, profileAuthority.Profile.ProfileDigest, opened.OnboardingID); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutation := range []struct {
+		label, column, value, restore string
+	}{
+		{"wrong profile id", "profile_id", "profile-wrong", profileAuthority.Profile.ProfileID},
+		{"wrong binding", "repository_binding_digest", digest("0"), profileAuthority.Profile.RepositoryBindingDigest},
+		{"zero generation", "configuration_generation_id", "0", fmt.Sprint(generation.GenerationID)},
+	} {
+		if _, err := store.db.Exec(`UPDATE repository_onboardings SET `+mutation.column+`=? WHERE onboarding_id=?`, mutation.value, opened.OnboardingID); err != nil {
+			t.Fatal(err)
+		}
+		expectBridgeConflict(mutation.label)
+		if _, err := store.db.Exec(`UPDATE repository_onboardings SET `+mutation.column+`=? WHERE onboarding_id=?`, mutation.restore, opened.OnboardingID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.db.Exec(`UPDATE repository_onboarding_steps SET status='intended',outcome='pending',reason_code='',evidence_digest='',observed_at='' WHERE onboarding_id=? AND step_name='configuration_applied'`, opened.OnboardingID); err != nil {
+		t.Fatal(err)
+	}
+	expectBridgeConflict("intended pending step")
+	for _, outcome := range []string{"failed", "ambiguous"} {
+		if _, err := store.db.Exec(`UPDATE repository_onboarding_steps SET status='observed',outcome=?,reason_code='configuration_applied',evidence_digest=?,observed_at=? WHERE onboarding_id=? AND step_name='configuration_applied'`, outcome, configurationEvidence, formatTime(now.Add(11*time.Second)), opened.OnboardingID); err != nil {
+			t.Fatal(err)
+		}
+		expectBridgeConflict(outcome + " step")
+	}
+	if _, err := store.db.Exec(`UPDATE repository_onboarding_steps SET status='observed',outcome='succeeded',reason_code='configuration_applied',evidence_digest=?,observed_at=? WHERE onboarding_id=? AND step_name='configuration_applied'`, configurationEvidence, formatTime(now.Add(11*time.Second)), opened.OnboardingID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE repository_onboardings SET base_digest=? WHERE onboarding_id=?`, digest("0"), opened.OnboardingID); err != nil {
+		t.Fatal(err)
+	}
+	expectBridgeConflict("wrong onboarding base")
+	if _, err := store.db.Exec(`UPDATE repository_onboardings SET base_digest=? WHERE onboarding_id=?`, opened.ConfigurationBaseDigest, opened.OnboardingID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE configuration_apply_intents SET parent_digest=? WHERE generation_id=?`, digest("0"), generation.GenerationID); err != nil {
+		t.Fatal(err)
+	}
+	expectBridgeConflict("wrong apply intent")
+	if _, err := store.db.Exec(`UPDATE configuration_apply_intents SET parent_digest=? WHERE generation_id=?`, baseline.Candidate.Digest, generation.GenerationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE operation_receipts SET outcome='failed' WHERE operation_id=?`, generation.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	expectBridgeConflict("wrong configuration receipt")
+	if _, err := store.db.Exec(`UPDATE operation_receipts SET outcome='succeeded' WHERE operation_id=?`, generation.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`DROP INDEX repository_onboarding_one_active_repository`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO repository_onboardings(onboarding_id,onboarding_kind,canonical_repository,private_input_digest,source_path_digest,request_digest,requester_login,requester_database_id,requester_node_id,requester_actor_type,base_generation_id,base_digest,configuration_authority_version,status,step_index,reason_code,preflight_digest,preflight_evidence_digest,preview_digest,operation_id,profile_id,profile_digest,repository_binding_digest,configuration_generation_id,incarnation_id,readiness_snapshot_id,linear_label_id,initial_revision_sha,accepted_at,created_at,updated_at,settled_at)
+		SELECT 'onboarding-duplicate-bridge',onboarding_kind,canonical_repository,private_input_digest,?, ?,requester_login,requester_database_id,requester_node_id,requester_actor_type,base_generation_id,base_digest,configuration_authority_version,status,step_index,reason_code,preflight_digest,preflight_evidence_digest,preview_digest,NULL,profile_id,profile_digest,repository_binding_digest,configuration_generation_id,incarnation_id,readiness_snapshot_id,linear_label_id,initial_revision_sha,accepted_at,created_at,updated_at,settled_at FROM repository_onboardings WHERE onboarding_id=?`, digest("8"), digest("9"), opened.OnboardingID); err != nil {
+		t.Fatal(err)
+	}
+	expectBridgeConflict("duplicate candidate")
+	if _, err := store.db.Exec(`DELETE FROM repository_onboardings WHERE onboarding_id='onboarding-duplicate-bridge'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`CREATE UNIQUE INDEX repository_onboarding_one_active_repository ON repository_onboardings(canonical_repository) WHERE status NOT IN ('cancelled','conflict','ready_disabled')`); err != nil {
+		t.Fatal(err)
 	}
 	convergenceIntent := application.OnboardingStepIntent{OnboardingID: opened.OnboardingID, Step: domain.OnboardingStepConfigurationConverged, IntentDigest: digest("c"), IntendedAt: now.Add(12 * time.Second)}
 	if changed, err := store.BeginOnboardingStep(ctx, convergenceIntent); err != nil || !changed {
@@ -453,6 +589,9 @@ func TestOnboardingSagaReplaysAndResumesAfterStoreRestart(t *testing.T) {
 	}
 	if replayed, changed, replayErr := store.CreateOnboardingRepositoryLifecycle(ctx, opened.OnboardingID, profileAuthority.Profile, now.Add(14*time.Second)); replayErr != nil || changed || replayed.Lifecycle.IncarnationID != projection.Lifecycle.IncarnationID {
 		t.Fatalf("lifecycle replay=%+v changed=%t err=%v", replayed, changed, replayErr)
+	}
+	if err := store.AdoptRepositoryLifecycleBaseline(ctx, application.RepositoryBaselineInput{Profiles: profiles, AdoptedAt: now.Add(15 * time.Second)}); err != nil {
+		t.Fatalf("post-lifecycle replay failed: %v", err)
 	}
 }
 

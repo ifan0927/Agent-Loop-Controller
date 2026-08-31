@@ -30,7 +30,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 46
+const schemaVersion = 47
 
 // SupportedSchemaVersion is the single maintained source for the newest
 // Controller database schema understood by this binary.
@@ -856,6 +856,8 @@ func migrateSQLiteGeneric(ctx context.Context, db sqliteTransactioner, supported
 			statements = migrationV45
 		case 46:
 			statements = migrationV46
+		case 47:
+			statements = migrationV47
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -2237,6 +2239,43 @@ var migrationV45 = cleanupSourceRecoveryMigrationV45()
 
 var migrationV46 = []string{
 	`ALTER TABLE repository_onboarding_steps ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 1 CHECK(attempt_number>0)`,
+}
+
+var migrationV47 = repositoryLifecycleBaselineMigrationV47()
+
+func repositoryLifecycleBaselineMigrationV47() []string {
+	statements := []string{
+		`PRAGMA legacy_alter_table = ON`,
+		`DROP TRIGGER integrity_track_repository_lifecycle_baseline_insert`,
+		`DROP TRIGGER integrity_track_repository_lifecycle_baseline_update`,
+		`DROP TRIGGER integrity_track_repository_lifecycle_baseline_delete`,
+		`CREATE TABLE repository_lifecycle_baseline_v47 (
+		authority_id INTEGER PRIMARY KEY CHECK(authority_id=1),
+		configuration_generation_id INTEGER NOT NULL,
+		configuration_digest TEXT NOT NULL,
+		configuration_authority_version INTEGER NOT NULL CHECK(configuration_authority_version > 0),
+		repository_count INTEGER NOT NULL CHECK(repository_count >= 0),
+		profiles_digest TEXT NOT NULL,
+		adopted_at TEXT NOT NULL
+	)`,
+		`INSERT INTO repository_lifecycle_baseline_v47(authority_id,configuration_generation_id,configuration_digest,configuration_authority_version,repository_count,profiles_digest,adopted_at)
+		SELECT authority_id,configuration_generation_id,configuration_digest,configuration_authority_version,repository_count,profiles_digest,adopted_at FROM repository_lifecycle_baseline`,
+		`DROP TABLE repository_lifecycle_baseline`,
+		`ALTER TABLE repository_lifecycle_baseline_v47 RENAME TO repository_lifecycle_baseline`,
+	}
+	for _, operation := range []string{"INSERT", "UPDATE", "DELETE"} {
+		statements = append(statements, repositoryLifecycleBaselineIntegrityTrigger(operation))
+	}
+	return append(statements, `PRAGMA legacy_alter_table = OFF`)
+}
+
+func repositoryLifecycleBaselineIntegrityTrigger(operation string) string {
+	return fmt.Sprintf(`CREATE TRIGGER integrity_track_repository_lifecycle_baseline_%s AFTER %s ON repository_lifecycle_baseline BEGIN
+		UPDATE controller_integrity_generation SET generation=generation+1,updated_at=CURRENT_TIMESTAMP WHERE singleton=1;
+		INSERT INTO controller_integrity_scope_revisions(family,scope_kind,scope_id,revision_generation,updated_at)
+		SELECT 'repository_onboarding','controller','local-controller',generation,CURRENT_TIMESTAMP FROM controller_integrity_generation WHERE singleton=1
+		ON CONFLICT(family,scope_kind,scope_id) DO UPDATE SET revision_generation=excluded.revision_generation,updated_at=excluded.updated_at;
+	END`, strings.ToLower(operation), operation)
 }
 
 func cleanupSourceRecoveryMigrationV45() []string {

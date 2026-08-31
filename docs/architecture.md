@@ -631,7 +631,13 @@ state and ordinary restart reconciliation remain recovery authority.
 Disabled automatic admission fences only the normal Linear Todo-admission
 path; it does not terminate the supervisor. The disabled worker retains the
 ordinary process lock, heartbeat, onboarding-only dispatcher, and quiescent
-integrity maintenance for an indefinite lifetime. It never constructs the
+configuration/integrity maintenance for an indefinite lifetime. A valid
+version-5 configuration with no repositories adopts one durable count-zero
+lifecycle baseline. That singleton binds the exact adoption-time configuration
+generation, digest, authority version, and deterministic empty profiles digest;
+it creates no repository lifecycle or readiness rows. The generation anchor is
+immutable and must remain a retained ancestor when configuration advances. It
+never constructs the
 normal admission fallback or reads/checks its credential. Idle dispatch returns
 the bounded no-candidate outcome. An already accepted onboarding may use its
 existing operator-authorized Linear label/readiness effects, but disabled mode
@@ -1281,7 +1287,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 46; migration history is code, not a
+inspection. The current schema is version 47; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees

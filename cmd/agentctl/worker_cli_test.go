@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"os"
@@ -166,6 +167,170 @@ func TestDisabledWorkerSerializesRunnableOnboardingWithoutAdmissionFallback(t *t
 	continuer.status = domain.OnboardingOpened
 	if _, err := dispatch(ctx); err == nil || err.Error() != "onboarding worker returned an invalid status" || fallbackCalls != 0 {
 		t.Fatalf("invalid status err=%v fallback_calls=%d", err, fallbackCalls)
+	}
+}
+
+func TestDisabledZeroRepositoryWorkerAdoptsBaselineAndPublishesHeartbeatWithoutAdmissionEffects(t *testing.T) {
+	root := resolvedTempDir(t)
+	configPath, databasePath := writeCurrentManagedDraftConfig(t, root)
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuredLoaded, err := bootstrap.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuredProfiles, err := configuredLoaded.Registry.ListRepositoryProfiles(context.Background())
+	if err != nil || len(configuredProfiles) != 1 {
+		t.Fatalf("configured profiles=%d err=%v", len(configuredProfiles), err)
+	}
+	var config map[string]any
+	if err := json.Unmarshal(raw, &config); err != nil {
+		t.Fatal(err)
+	}
+	config["repositories"] = []any{}
+	rewritten, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, rewritten, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("IFAN_LOOP_LINEAR_TOKEN", "")
+	loaded, err := loadManagedConfiguration(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profiles, err := loaded.Registry.ListRepositoryProfiles(context.Background())
+	if err != nil || len(profiles) != 0 || loaded.Automation.LinearTodoAdmission.Enabled {
+		t.Fatalf("loaded repositories=%d enabled=%t err=%v", len(profiles), loaded.Automation.LinearTodoAdmission.Enabled, err)
+	}
+	runtime, err := newAutomaticWorkerRuntime(loaded, "zero-repository-worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = runtime.store.Close()
+		}
+	}()
+	for cycle := 0; cycle < 2; cycle++ {
+		result, err := runtime.dispatch(context.Background())
+		if err != nil || result.Outcome != application.LinearTodoDispatchNoCandidate {
+			t.Fatalf("cycle=%d result=%+v err=%v", cycle, result, err)
+		}
+	}
+	reporter, err := newWorkerStatusReporter(configPath, "zero-repository-worker", version, loaded.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := runBoundedAdmissionWorkerWithHeartbeatAndMaintenance(context.Background(), true, time.Minute, automaticWorkerCapacity(loaded.Automation.LinearTodoAdmission, false), runtime.dispatch, runtime.maintenance, reporter, nil)
+	if err != nil || result.Stopped != "once" || result.LastOutcome != application.LinearTodoDispatchNoCandidate {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	heartbeat, state := readWorkerStatusEvidence(configPath, os.Getuid())
+	if state != application.RuntimeHeartbeatCurrent || heartbeat.SchemaVersion != workerStatusSchemaVersion || heartbeat.ConfigurationDigest != loaded.Digest || heartbeat.LastCycleOutcome != application.LinearTodoDispatchNoCandidate {
+		t.Fatalf("heartbeat=%+v state=%s", heartbeat, state)
+	}
+	cancelledContext, cancel := context.WithCancel(context.Background())
+	cancel()
+	cancelled, err := runBoundedAdmissionWorkerWithHeartbeatAndMaintenance(cancelledContext, false, time.Minute, automaticWorkerCapacity(loaded.Automation.LinearTodoAdmission, false), runtime.dispatch, runtime.maintenance, reporter, nil)
+	if err != nil || cancelled.Stopped != "canceled" {
+		t.Fatalf("cancelled=%+v err=%v", cancelled, err)
+	}
+	convergence, err := configuredConvergenceService(runtime.store, loaded, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := convergence.Initialize(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	decision, err := convergence.CheckNewAdmissionReadOnly(context.Background())
+	if err != nil || !decision.Allowed || decision.Authority.Digest != loaded.Digest {
+		t.Fatalf("decision=%+v err=%v", decision, err)
+	}
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	operator := loaded.Controller.Operator
+	onboardingID := "onboarding-zero-repository-bridge"
+	digest := func(value string) string {
+		return application.ConfigurationEvidenceDigest("zero-repository-bridge", value)
+	}
+	opened, created, err := runtime.store.OpenOnboarding(ctx, application.OnboardingOpenInput{OnboardingID: onboardingID, Kind: domain.OnboardingExistingCheckout, CanonicalRepository: configuredProfiles[0].Authority.Repository, Requester: operator, PrivateInputDigest: digest("private"), SourcePathDigest: digest("source"), SourceAncestorDigests: []string{digest("source")}, RequestDigest: digest("request"), ConfigurationBaseGenerationID: decision.Authority.GenerationID, ConfigurationBaseDigest: decision.Authority.Digest, ConfigurationAuthorityVersion: decision.Authority.AuthorityVersion, OpenedAt: now})
+	if err != nil || !created {
+		t.Fatalf("opened=%+v created=%t err=%v", opened, created, err)
+	}
+	ready, err := runtime.store.SaveOnboardingPreflight(ctx, application.OnboardingPreflightInput{OnboardingID: onboardingID, ExpectedStatus: domain.OnboardingOpened, PreflightDigest: digest("preflight"), EvidenceDigest: digest("preflight-evidence"), ObservedAt: now.Add(time.Second)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startReceipt := application.NewOperationReceipt(application.OperationReceiptInput{OperationType: application.OperationOnboardRepository, Scope: application.ScopeOnboarding, TargetID: onboardingID, Requester: operator, RequestDigest: opened.RequestDigest, ExpectedAuthorityDigest: opened.ConfigurationBaseDigest, OperationAnchorDigest: digest("start-anchor"), TargetBindingDigest: digest("start-binding"), AcceptedAt: now.Add(2 * time.Second)})
+	if _, _, _, err := runtime.store.StartOnboarding(ctx, application.OnboardingStartAcceptance{OnboardingID: onboardingID, Expected: ready, PreflightDigest: ready.PreflightDigest, PreviewDigest: digest("preview"), Profile: application.LocalRepository{CanonicalRepository: opened.CanonicalRepository}, Receipt: startReceipt, AcceptedAt: startReceipt.AcceptedAt}); err != nil {
+		t.Fatal(err)
+	}
+	for index, step := range []domain.OnboardingStep{domain.OnboardingStepRootsCreated, domain.OnboardingStepLinearLabelObserved} {
+		at := now.Add(time.Duration(3+index*2) * time.Second)
+		if _, err := runtime.store.BeginOnboardingStep(ctx, application.OnboardingStepIntent{OnboardingID: onboardingID, Step: step, IntentDigest: digest("intent-" + string(step)), IntendedAt: at}); err != nil {
+			t.Fatal(err)
+		}
+		observation := application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "fixture_ready", EvidenceDigest: digest("observed-" + string(step))}
+		if step == domain.OnboardingStepLinearLabelObserved {
+			observation.LinearLabelID = "label-zero-repository"
+		}
+		if _, err := runtime.store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: onboardingID, Step: step, Observation: observation, ObservedAt: at.Add(time.Second)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := runtime.store.BeginOnboardingStep(ctx, application.OnboardingStepIntent{OnboardingID: onboardingID, Step: domain.OnboardingStepConfigurationApplied, IntentDigest: digest("intent-configuration"), IntendedAt: now.Add(7 * time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	requester := application.Requester{ID: operator.Login, Kind: "github_login", DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, ActorType: operator.ActorType}
+	apply, err := convergence.Apply(ctx, application.ConfigurationApplyCommand{Requester: requester, ExpectedGenerationID: decision.Authority.GenerationID, ExpectedDigest: decision.Authority.Digest, ExpectedAuthorityVersion: decision.Authority.AuthorityVersion, Payload: raw, Provenance: application.ConfigurationApplyProvenance{Kind: application.ConfigurationApplyOnboarding, OnboardingSourceID: onboardingID, OnboardingSourceDigest: opened.RequestDigest}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := configuredProfiles[0]
+	configurationEvidence := application.ConfigurationEvidenceDigest("onboarding-configuration-v1", onboardingID, apply.Generation.Digest, strconv.FormatInt(apply.Generation.GenerationID, 10), apply.Receipt.EvidenceDigest)
+	if _, err := runtime.store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: onboardingID, Step: domain.OnboardingStepConfigurationApplied, Observation: application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "configuration_applied", EvidenceDigest: configurationEvidence, ProfileID: profile.Authority.ProfileID, ProfileDigest: profile.Profile.ProfileDigest, RepositoryBindingDigest: profile.Authority.BindingDigest, ConfigurationGenerationID: apply.Generation.GenerationID}, ObservedAt: now.Add(8 * time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	closed = true
+	updated, err := loadManagedConfiguration(configPath)
+	if err != nil || updated.Digest != apply.Generation.Digest {
+		t.Fatalf("updated digest=%s generation=%s err=%v", updated.Digest, apply.Generation.Digest, err)
+	}
+	bridgedStore, err := openManagedConfigurationStore(updated)
+	if err != nil {
+		t.Fatalf("managed bridge reopen failed: %v", err)
+	}
+	if err := bridgedStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var baselineCount, repositoryCount, snapshotCount, reservationCount, runCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM repository_lifecycle_baseline WHERE authority_id=1 AND repository_count=0`).Scan(&baselineCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM repository_lifecycles`).Scan(&repositoryCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM repository_readiness_snapshots`).Scan(&snapshotCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM linear_todo_admission_journal`).Scan(&reservationCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM runs`).Scan(&runCount); err != nil || baselineCount != 1 || repositoryCount != 0 || snapshotCount != 0 || reservationCount != 0 || runCount != 0 {
+		t.Fatalf("baseline=%d repositories=%d snapshots=%d reservations=%d runs=%d err=%v", baselineCount, repositoryCount, snapshotCount, reservationCount, runCount, err)
 	}
 }
 
