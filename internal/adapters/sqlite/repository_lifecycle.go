@@ -48,18 +48,36 @@ func (s *Store) AdoptRepositoryLifecycleBaseline(ctx context.Context, input appl
 		return err
 	}
 	profilesDigest := repositoryProfilesDigest(profiles)
-	var count int
-	var persistedDigest string
-	err = tx.QueryRowContext(ctx, `SELECT repository_count,profiles_digest FROM repository_lifecycle_baseline WHERE authority_id=1`).Scan(&count, &persistedDigest)
-	if err == nil {
-		_ = count
-		_ = persistedDigest
+	var baselineRows int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_lifecycle_baseline`).Scan(&baselineRows); err != nil {
+		return err
+	}
+	if baselineRows > 1 {
+		return application.ErrRepositoryLifecycleConflict
+	}
+	if baselineRows == 1 {
+		var baselineGenerationID, baselineAuthorityVersion int64
+		var baselineCount int
+		var baselineConfigurationDigest, baselineProfilesDigest, adoptedAt string
+		if err := tx.QueryRowContext(ctx, `SELECT configuration_generation_id,configuration_digest,configuration_authority_version,repository_count,profiles_digest,adopted_at FROM repository_lifecycle_baseline WHERE authority_id=1`).Scan(&baselineGenerationID, &baselineConfigurationDigest, &baselineAuthorityVersion, &baselineCount, &baselineProfilesDigest, &adoptedAt); err != nil {
+			return application.ErrRepositoryLifecycleConflict
+		}
+		if baselineGenerationID < 1 || !validRepositoryDigest(baselineConfigurationDigest) || baselineAuthorityVersion < 1 || baselineCount < 0 || !validRepositoryDigest(baselineProfilesDigest) || parseTime(adoptedAt).IsZero() {
+			return application.ErrRepositoryLifecycleConflict
+		}
+		if baselineCount == 0 {
+			if baselineProfilesDigest != repositoryProfilesDigest(nil) {
+				return application.ErrRepositoryLifecycleConflict
+			}
+			if err := validateEmptyRepositoryBaselineAnchorTx(ctx, tx, baselineGenerationID, baselineConfigurationDigest, baselineAuthorityVersion, configuration); err != nil {
+				return err
+			}
+		}
 		for _, profile := range profiles {
 			var profileID, profileDigest, bindingDigest string
 			lookupErr := tx.QueryRowContext(ctx, `SELECT profile_id,profile_digest,repository_binding_digest FROM repository_lifecycles WHERE repository=? AND retired_at=''`, profile.Authority.Repository).Scan(&profileID, &profileDigest, &bindingDigest)
 			if errors.Is(lookupErr, sql.ErrNoRows) {
-				var onboardingCount int
-				if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_onboardings o JOIN repository_onboarding_steps s ON s.onboarding_id=o.onboarding_id WHERE o.canonical_repository=? AND o.status IN ('accepted','running','waiting_for_operator') AND s.step_name='configuration_applied' AND s.status IN ('intended','observed')`, profile.Authority.Repository).Scan(&onboardingCount); err != nil || onboardingCount != 1 {
+				if !exactPostConfigurationOnboardingBridgeTx(ctx, tx, profile, configuration) {
 					return application.ErrRepositoryLifecycleConflict
 				}
 				// Post-baseline profiles are fenced until the accepted onboarding
@@ -75,19 +93,17 @@ func (s *Store) AdoptRepositoryLifecycleBaseline(ctx context.Context, input appl
 			}
 		}
 		var unmatched int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_lifecycles WHERE retired_at='' AND removal_state='' AND repository NOT IN (`+repositoryPlaceholders(len(profiles))+`)`, repositoryNames(profiles)...).Scan(&unmatched); err != nil {
+		if len(profiles) == 0 {
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_lifecycles WHERE retired_at='' AND removal_state=''`).Scan(&unmatched); err != nil {
+				return err
+			}
+		} else if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_lifecycles WHERE retired_at='' AND removal_state='' AND repository NOT IN (`+repositoryPlaceholders(len(profiles))+`)`, repositoryNames(profiles)...).Scan(&unmatched); err != nil {
 			return err
 		}
 		if unmatched != 0 {
 			return application.ErrRepositoryLifecycleConflict
 		}
 		return tx.Commit()
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-	if len(profiles) == 0 {
-		return errors.New("repository lifecycle baseline profiles are invalid")
 	}
 	for _, profile := range profiles {
 		incarnationID, err := nextRepositoryIncarnationIDTx(ctx, tx, profile.Authority.Repository, profile.Authority.BindingDigest, input.AdoptedAt)
@@ -103,6 +119,77 @@ func (s *Store) AdoptRepositoryLifecycleBaseline(ctx context.Context, input appl
 		return err
 	}
 	return tx.Commit()
+}
+
+func validateEmptyRepositoryBaselineAnchorTx(ctx context.Context, tx *sql.Tx, generationID int64, digest string, authorityVersion int64, current application.ConfigurationAdmissionAuthority) error {
+	var persistedDigest string
+	if err := tx.QueryRowContext(ctx, `SELECT digest FROM configuration_generations WHERE generation_id=?`, generationID).Scan(&persistedDigest); err != nil || persistedDigest != digest {
+		return application.ErrRepositoryLifecycleConflict
+	}
+	var ancestral int
+	if err := tx.QueryRowContext(ctx, `WITH RECURSIVE desired_ancestry(generation_id,parent_generation_id) AS (
+		SELECT generation_id,parent_generation_id FROM configuration_generations WHERE generation_id=?
+		UNION ALL
+		SELECT g.generation_id,g.parent_generation_id FROM configuration_generations g JOIN desired_ancestry a ON a.parent_generation_id=g.generation_id
+	) SELECT COUNT(*) FROM desired_ancestry WHERE generation_id=?`, current.GenerationID, generationID).Scan(&ancestral); err != nil || ancestral != 1 {
+		return application.ErrRepositoryLifecycleConflict
+	}
+	if (generationID == current.GenerationID && digest != current.Digest) || authorityVersion > current.AuthorityVersion {
+		return application.ErrRepositoryLifecycleConflict
+	}
+	return nil
+}
+
+func exactPostConfigurationOnboardingBridgeTx(ctx context.Context, tx *sql.Tx, profile application.RepositoryProfileAuthority, current application.ConfigurationAdmissionAuthority) bool {
+	var candidates int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_onboardings WHERE canonical_repository=? AND status NOT IN ('cancelled','conflict','ready_disabled')`, profile.Authority.Repository).Scan(&candidates); err != nil || candidates != 1 {
+		return false
+	}
+	var onboardingID, kind, status, profileID, profileDigest, bindingDigest, requestDigest, baseDigest, operationID string
+	var baseGenerationID, generationID, stepIndex int64
+	var requester domain.GitHubUserIdentity
+	if err := tx.QueryRowContext(ctx, `SELECT onboarding_id,onboarding_kind,status,profile_id,profile_digest,repository_binding_digest,request_digest,base_generation_id,base_digest,COALESCE(operation_id,''),configuration_generation_id,step_index,requester_login,requester_database_id,requester_node_id,requester_actor_type
+		FROM repository_onboardings WHERE canonical_repository=? AND status NOT IN ('cancelled','conflict','ready_disabled')`, profile.Authority.Repository).Scan(&onboardingID, &kind, &status, &profileID, &profileDigest, &bindingDigest, &requestDigest, &baseGenerationID, &baseDigest, &operationID, &generationID, &stepIndex, &requester.Login, &requester.DatabaseID, &requester.NodeID, &requester.ActorType); err != nil {
+		return false
+	}
+	if status != string(domain.OnboardingRunning) && status != string(domain.OnboardingWaitingForOperator) || profileID != profile.Authority.ProfileID || profileDigest != profile.Profile.ProfileDigest || bindingDigest != profile.Authority.BindingDigest || generationID != current.GenerationID || requester.Validate() != nil || !validRepositoryDigest(requestDigest) || operationID == "" {
+		return false
+	}
+	generation, err := scanConfigurationGeneration(tx.QueryRowContext(ctx, configurationGenerationSelect+` WHERE generation_id=?`, generationID))
+	if err != nil {
+		return false
+	}
+	generation, err = hydrateConfigurationApplyProvenance(ctx, tx, generation)
+	if err != nil || generation.Digest != current.Digest || generation.ParentID != baseGenerationID || generation.OperationID == "" || !generation.Requester.Equal(requester) {
+		return false
+	}
+	parent, err := scanConfigurationGeneration(tx.QueryRowContext(ctx, configurationGenerationSelect+` WHERE generation_id=?`, generation.ParentID))
+	if err != nil || parent.Digest != baseDigest {
+		return false
+	}
+	var intentParentID int64
+	var intentParentDigest, targetDigest, intentOperationID, intentStatus, acceptedAt, settledAt, reason, applyKind, migrationRequestID, migrationPreviewDigest string
+	if err := tx.QueryRowContext(ctx, `SELECT parent_generation_id,parent_digest,target_digest,operation_id,status,accepted_at,settled_at,reason_code,apply_kind,migration_request_id,migration_preview_digest FROM configuration_apply_intents WHERE generation_id=?`, generationID).Scan(&intentParentID, &intentParentDigest, &targetDigest, &intentOperationID, &intentStatus, &acceptedAt, &settledAt, &reason, &applyKind, &migrationRequestID, &migrationPreviewDigest); err != nil {
+		return false
+	}
+	if intentParentID != parent.GenerationID || intentParentDigest != parent.Digest || targetDigest != generation.Digest || intentOperationID != generation.OperationID || intentStatus != string(application.ConfigurationApplyCommitted) || !parseTime(acceptedAt).Equal(generation.CreatedAt) || !parseTime(settledAt).Equal(generation.CommittedAt) || reason != string(application.ConfigurationReasonRestartRequired) || applyKind != string(application.ConfigurationApplyNormal) || migrationRequestID != "" || migrationPreviewDigest != "" {
+		return false
+	}
+	receipt, found, err := getOperationReceiptByIDTx(ctx, tx, generation.OperationID)
+	if err != nil || !found || !application.ConfigurationApplyReceiptSettlesOnboardingGeneration(receipt, generation, parent, onboardingID, requestDigest) {
+		return false
+	}
+	step := domain.OnboardingStepConfigurationApplied
+	expectedOrder := onboardingStepOrder(domain.OnboardingKind(kind), step)
+	lifecycleOrder := onboardingStepOrder(domain.OnboardingKind(kind), domain.OnboardingStepLifecycleCreated)
+	var stepOrder, attempt int64
+	var stepStatus, outcome, stepReason, evidenceDigest, observedAt string
+	if expectedOrder == 0 || lifecycleOrder <= expectedOrder || tx.QueryRowContext(ctx, `SELECT step_order,status,outcome,reason_code,evidence_digest,observed_at,attempt_number FROM repository_onboarding_steps WHERE onboarding_id=? AND step_name='configuration_applied'`, onboardingID).Scan(&stepOrder, &stepStatus, &outcome, &stepReason, &evidenceDigest, &observedAt, &attempt) != nil {
+		return false
+	}
+	expectedEvidence := application.ConfigurationEvidenceDigest("onboarding-configuration-v1", onboardingID, generation.Digest, fmt.Sprint(generation.GenerationID), receipt.EvidenceDigest)
+	stepObservedAt := parseTime(observedAt)
+	return stepOrder == int64(expectedOrder) && stepIndex >= stepOrder && stepIndex < int64(lifecycleOrder) && attempt > 0 && stepStatus == "observed" && outcome == string(application.OperationOutcomeSucceeded) && stepReason == "configuration_applied" && evidenceDigest == expectedEvidence && !stepObservedAt.IsZero() && !stepObservedAt.Before(generation.CommittedAt)
 }
 
 func (s *Store) RepositoryOperationAuthority(ctx context.Context, repository string) (application.RepositoryOperationAuthority, error) {

@@ -731,6 +731,24 @@ func ConfigurationApplyReceiptSettlesGeneration(receipt OperationReceipt, genera
 	if !provenance.Valid() {
 		return false
 	}
+	return configurationApplyReceiptSettlesGeneration(receipt, generation, parent, provenance)
+}
+
+// ConfigurationApplyReceiptSettlesOnboardingGeneration proves the exact
+// onboarding-derived receipt identity that is intentionally not retained as a
+// separate column in historical configuration generation rows.
+func ConfigurationApplyReceiptSettlesOnboardingGeneration(receipt OperationReceipt, generation, parent ConfigurationGeneration, onboardingID, onboardingRequestDigest string) bool {
+	provenance := ConfigurationApplyProvenance{Kind: ConfigurationApplyOnboarding, OnboardingSourceID: onboardingID, OnboardingSourceDigest: onboardingRequestDigest}
+	if !provenance.Valid() {
+		return false
+	}
+	return configurationApplyReceiptSettlesGeneration(receipt, generation, parent, provenance)
+}
+
+func configurationApplyReceiptSettlesGeneration(receipt OperationReceipt, generation, parent ConfigurationGeneration, provenance ConfigurationApplyProvenance) bool {
+	if ValidateOperationReceipt(receipt) != nil || generation.Origin != ConfigurationOriginApply || generation.ParentID != parent.GenerationID || generation.Requester.Validate() != nil || generation.CreatedAt.IsZero() || generation.CommittedAt.IsZero() || !configurationGenerationMatchesApplyProvenance(generation, provenance) {
+		return false
+	}
 	configured := ConfiguredRequester{identity: generation.Requester}
 	scopes, err := newAuthorizedScopeSet(generation.Requester, AuthorityScope{Kind: ScopeController, ID: controllerScopeID, AuthorityDigest: identityDigest(generation.Requester)})
 	if err != nil {
@@ -757,6 +775,13 @@ func ConfigurationApplyReceiptSettlesGeneration(receipt OperationReceipt, genera
 		receipt.AcceptedAt.Equal(generation.CreatedAt) &&
 		receipt.AppliedAt.Equal(generation.CommittedAt) &&
 		receipt.SettledAt.Equal(generation.CommittedAt)
+}
+
+func configurationGenerationMatchesApplyProvenance(generation ConfigurationGeneration, provenance ConfigurationApplyProvenance) bool {
+	if provenance.Kind == ConfigurationApplyOnboarding {
+		return generation.ApplyKind == ConfigurationApplyNormal && generation.RollbackSourceGenerationID == 0 && generation.RollbackSourceDigest == "" && generation.MigrationRequestID == "" && generation.MigrationPreviewDigest == ""
+	}
+	return true
 }
 
 func normalizedConfigurationApplyProvenance(value ConfigurationApplyProvenance) (ConfigurationApplyProvenance, bool) {

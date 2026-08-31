@@ -276,7 +276,17 @@ func newAutomaticWorkerRuntime(loaded bootstrap.Bootstrap, instanceID string) (a
 			_ = store.Close()
 			return automaticWorkerRuntime{}, errors.New("onboarding worker is unavailable")
 		}
-		return automaticWorkerRuntime{store: store, dispatch: onboardingWorkerDispatch(store, onboarding, nil), maintenance: integrityWorkerMaintenance(store)}, nil
+		convergence, err := configuredConvergenceService(store, loaded, 0, false)
+		if err != nil {
+			_ = store.Close()
+			return automaticWorkerRuntime{}, errors.New("configuration convergence authority is unavailable")
+		}
+		integrityMaintenance := integrityWorkerMaintenance(store)
+		maintenance := func(ctx context.Context) {
+			_, _, _ = convergence.ReconcileRuntime(ctx, time.Now().UTC())
+			integrityMaintenance(ctx)
+		}
+		return automaticWorkerRuntime{store: store, dispatch: onboardingWorkerDispatch(store, onboarding, nil), maintenance: maintenance}, nil
 	}
 	credentials, err := linearCredentialSourceForRef(loaded, configured.CredentialSourceRef)
 	if err != nil {

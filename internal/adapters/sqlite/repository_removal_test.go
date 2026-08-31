@@ -121,6 +121,9 @@ func TestRepositoryRemovalPersistsIntentWaitsForObservationAndNeverResurrects(t 
 	if _, err := store.RepositoryOperationAuthority(ctx, profile.Authority.Repository); !errors.Is(err, application.ErrRepositoryLifecycleMissing) {
 		t.Fatalf("retired repository remained current: %v", err)
 	}
+	if err := store.AdoptRepositoryLifecycleBaseline(ctx, application.RepositoryBaselineInput{AdoptedAt: now.Add(13 * time.Second)}); err != nil {
+		t.Fatalf("return-to-zero baseline replay failed: %v", err)
+	}
 	draft, found, err := store.RepositoryRemovalDraft(ctx, draftID)
 	if err != nil || !found || draft.ReasonCode != "retired" || draft.Receipt == nil || draft.Receipt.Phase != application.OperationPhaseObserved || draft.Receipt.Outcome != application.OperationOutcomeSucceeded {
 		t.Fatalf("draft=%+v found=%t err=%v", draft, found, err)
