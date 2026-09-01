@@ -987,6 +987,7 @@ func TestMigratesLegacyCodeRabbitApprovalColumnWithoutLosingApproval(t *testing.
 func removeOnboardingV37(t *testing.T, db *sql.DB) {
 	t.Helper()
 	for _, statement := range []string{
+		`DELETE FROM integrity_registry_sources WHERE registry_version='v1' AND family='repository_onboarding' AND table_name='repository_onboarding_step_claims'`,
 		`DROP TRIGGER IF EXISTS repository_onboarding_configuration_exclusion`,
 		`DROP TRIGGER IF EXISTS configuration_draft_excludes_onboarding`,
 		`DROP TRIGGER IF EXISTS configuration_recovery_excludes_onboarding`,

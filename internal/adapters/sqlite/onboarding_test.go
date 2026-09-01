@@ -278,6 +278,50 @@ func TestOnboardingStepClaimDigestCorruptionIsDetectedByIntegrity(t *testing.T) 
 	}
 }
 
+func TestOnboardingStepClaimIntegrityFailsClosedWhenScanBoundIsExhausted(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 9, 1, 4, 30, 0, 0, time.UTC)
+	started, _ := startOnboardingRetryFixture(t, store, "onboarding-claim-integrity-bound", now)
+	intentDigest := application.ConfigurationEvidenceDigest("integrity-bound-intent")
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO repository_onboarding_steps(onboarding_id,step_name,step_order,intent_digest,status,outcome,intended_at,attempt_number) VALUES(?,?,1,?,'intended','pending',?,?)`, started.OnboardingID, string(domain.OnboardingStepRootsCreated), intentDigest, formatTime(now), application.IntegrityMaximumLimit+1); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 1; attempt <= application.IntegrityMaximumLimit+1; attempt++ {
+		status, settledAt := "settled", formatTime(now)
+		if attempt == application.IntegrityMaximumLimit+1 {
+			status, settledAt = "active", ""
+		}
+		supervisorID := fmt.Sprintf("worker-%03d", attempt)
+		executionNonce := fmt.Sprintf("execution-%03d", attempt)
+		claimDigest := onboardingStepClaimDigest(started.OnboardingID, domain.OnboardingStepRootsCreated, int64(attempt), intentDigest, supervisorID, executionNonce, 1)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO repository_onboarding_step_claims(onboarding_id,step_name,attempt_number,claim_version,supervisor_id,execution_nonce,intent_digest,claim_digest,status,claimed_at,settled_at) VALUES(?,?,?,1,?,?,?,?,?,?,?)`, started.OnboardingID, string(domain.OnboardingStepRootsCreated), attempt, supervisorID, executionNonce, intentDigest, claimDigest, status, formatTime(now), settledAt); err != nil {
+			tx.Rollback()
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	tx, err = store.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	result, findings, err := checkIntegrityFamilyTx(ctx, tx, application.IntegrityRepositoryOnboarding)
+	if err != nil || result.State != application.IntegrityUnknown || result.ReasonCode != "claim_scan_bound_exhausted" || result.CountComplete || result.CoverageComplete || len(findings) != 0 {
+		t.Fatalf("result=%+v findings=%+v err=%v", result, findings, err)
+	}
+}
+
 func TestOnboardingResumeAdvancesDurableAttemptsWithoutActivityConflict(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "controller.db")

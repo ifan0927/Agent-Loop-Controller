@@ -348,7 +348,9 @@ func checkIntegrityFamilyTx(ctx context.Context, tx *sql.Tx, family application.
 		if err != nil {
 			return result, nil, err
 		}
+		claimCount := 0
 		for claimRows.Next() {
+			claimCount++
 			var onboardingID, stepName, intentDigest, supervisorID, executionNonce, claimDigest string
 			var attempt, version int64
 			if err := claimRows.Scan(&onboardingID, &stepName, &attempt, &intentDigest, &supervisorID, &executionNonce, &version, &claimDigest); err != nil {
@@ -359,8 +361,18 @@ func checkIntegrityFamilyTx(ctx context.Context, tx *sql.Tx, family application.
 				addController("onboarding_claim_digest_violation", "onboarding_claim", fmt.Sprintf("%s:%s:%d:%d", onboardingID, stepName, attempt, version))
 			}
 		}
+		if err := claimRows.Err(); err != nil {
+			claimRows.Close()
+			return result, nil, err
+		}
 		if err := claimRows.Close(); err != nil {
 			return result, nil, err
+		}
+		if claimCount > application.IntegrityMaximumLimit {
+			result.CountComplete, result.CoverageComplete = false, false
+			if result.State != application.IntegrityConflict {
+				result.State, result.ReasonCode = application.IntegrityUnknown, "claim_scan_bound_exhausted"
+			}
 		}
 	case application.IntegritySchedulingAdmission:
 		if err := queryIDs(`SELECT s.run_id FROM repository_slots s JOIN runs r ON r.run_id=s.run_id WHERE r.repository_binding_digest<>s.repository_binding_digest ORDER BY s.run_id LIMIT ?`, "repository_slot_binding_violation", "run", application.ScopeRun); err != nil {
