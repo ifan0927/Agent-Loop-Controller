@@ -15,33 +15,39 @@ import (
 
 const heavyCapacityNamespace = "local_heavy_work"
 
-// AuthorizeHeavyPermitAdoption binds this store handle to the supervisor that
-// owns the database-directory process lock. Callers must acquire that lock
-// before invoking this method and retain it until the store is closed.
-func (s *Store) AuthorizeHeavyPermitAdoption(owner string) error {
+// BindWorkerSupervisor binds this store handle to the supervisor that owns the
+// database-directory process lock. Callers must acquire that lock before
+// invoking this method and retain it until the store is closed.
+func (s *Store) BindWorkerSupervisor(owner string) error {
 	if strings.TrimSpace(owner) == "" {
-		return errors.New("heavy permit supervisor owner is required")
+		return errors.New("worker supervisor owner is required")
 	}
-	s.heavySupervisorMu.Lock()
-	defer s.heavySupervisorMu.Unlock()
-	if s.heavySupervisorOwner != "" && s.heavySupervisorOwner != owner {
-		return errors.New("heavy permit supervisor owner is already bound")
+	s.supervisorMu.Lock()
+	defer s.supervisorMu.Unlock()
+	if s.supervisorOwner != "" && s.supervisorOwner != owner {
+		return errors.New("worker supervisor owner is already bound")
 	}
-	s.heavySupervisorOwner = owner
+	s.supervisorOwner = owner
 	return nil
 }
 
-func (s *Store) authorizedHeavyPermitOwner(owner string) bool {
-	s.heavySupervisorMu.RLock()
-	defer s.heavySupervisorMu.RUnlock()
-	return s.heavySupervisorOwner == owner && owner != ""
+// AuthorizeHeavyPermitAdoption is retained for manual run compositions that
+// already use the same process-lock-backed store-handle authority.
+func (s *Store) AuthorizeHeavyPermitAdoption(owner string) error {
+	return s.BindWorkerSupervisor(owner)
+}
+
+func (s *Store) authorizedSupervisorOwner(owner string) bool {
+	s.supervisorMu.RLock()
+	defer s.supervisorMu.RUnlock()
+	return s.supervisorOwner == owner && owner != ""
 }
 
 func (s *Store) defaultHeavyPermitOwner(runID string) string {
-	s.heavySupervisorMu.RLock()
-	defer s.heavySupervisorMu.RUnlock()
-	if s.heavySupervisorOwner != "" {
-		return s.heavySupervisorOwner
+	s.supervisorMu.RLock()
+	defer s.supervisorMu.RUnlock()
+	if s.supervisorOwner != "" {
+		return s.supervisorOwner
 	}
 	return "manual:" + runID
 }
@@ -417,7 +423,7 @@ func (s *Store) AcquireHeavyPermit(ctx context.Context, runID, owner string, now
 		if existing.OwnerNonce == owner {
 			return existing, true, tx.Commit()
 		}
-		if !s.authorizedHeavyPermitOwner(owner) {
+		if !s.authorizedSupervisorOwner(owner) {
 			return application.HeavyPermit{}, false, errors.New("heavy permit owner mismatch requires exclusive supervisor fencing")
 		}
 		var leaseOwner string
@@ -460,7 +466,7 @@ func (s *Store) AcquireHeavyPermit(ctx context.Context, runID, owner string, now
 		if leaseExpiry > now.UTC().UnixNano() {
 			return application.HeavyPermit{}, false, nil
 		}
-		if !s.authorizedHeavyPermitOwner(owner) {
+		if !s.authorizedSupervisorOwner(owner) {
 			return application.HeavyPermit{}, false, errors.New("started heavy work requires exclusive supervisor fencing")
 		}
 		return application.HeavyPermit{}, false, application.ErrHeavyPermitProcessReconciliationRequired

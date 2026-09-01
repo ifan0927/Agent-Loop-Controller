@@ -49,7 +49,7 @@ type automaticWorkerRuntime struct {
 }
 
 type onboardingContinuer interface {
-	Continue(context.Context, string) (application.Onboarding, error)
+	Continue(context.Context, string, application.OnboardingExecutionAuthority) (application.Onboarding, error)
 }
 
 var buildAutomaticWorkerRuntime = newAutomaticWorkerRuntime
@@ -271,6 +271,10 @@ func newAutomaticWorkerRuntime(loaded bootstrap.Bootstrap, instanceID string) (a
 		if err != nil {
 			return automaticWorkerRuntime{}, errors.New("automatic admission state store is unavailable")
 		}
+		if err := store.BindWorkerSupervisor(instanceID); err != nil {
+			_ = store.Close()
+			return automaticWorkerRuntime{}, errors.New("automatic admission supervisor fencing is unavailable")
+		}
 		onboarding, err := composeOnboardingService(loaded, store, true)
 		if err != nil {
 			_ = store.Close()
@@ -286,7 +290,7 @@ func newAutomaticWorkerRuntime(loaded bootstrap.Bootstrap, instanceID string) (a
 			_, _, _ = convergence.ReconcileRuntime(ctx, time.Now().UTC())
 			integrityMaintenance(ctx)
 		}
-		return automaticWorkerRuntime{store: store, dispatch: onboardingWorkerDispatch(store, onboarding, nil), maintenance: maintenance}, nil
+		return automaticWorkerRuntime{store: store, dispatch: onboardingWorkerDispatch(store, onboarding, nil, instanceID), maintenance: maintenance}, nil
 	}
 	credentials, err := linearCredentialSourceForRef(loaded, configured.CredentialSourceRef)
 	if err != nil {
@@ -306,7 +310,7 @@ func newAutomaticWorkerRuntime(loaded bootstrap.Bootstrap, instanceID string) (a
 	if err != nil {
 		return automaticWorkerRuntime{}, errors.New("automatic admission state store is unavailable")
 	}
-	if err := store.AuthorizeHeavyPermitAdoption(instanceID); err != nil {
+	if err := store.BindWorkerSupervisor(instanceID); err != nil {
 		_ = store.Close()
 		return automaticWorkerRuntime{}, errors.New("automatic admission supervisor fencing is unavailable")
 	}
@@ -350,10 +354,10 @@ func newAutomaticWorkerRuntime(loaded bootstrap.Bootstrap, instanceID string) (a
 		_ = store.Close()
 		return automaticWorkerRuntime{}, errors.New("onboarding worker is unavailable")
 	}
-	return automaticWorkerRuntime{store: store, dispatch: onboardingWorkerDispatch(store, onboarding, dispatcher.Dispatch), maintenance: integrityWorkerMaintenance(store)}, nil
+	return automaticWorkerRuntime{store: store, dispatch: onboardingWorkerDispatch(store, onboarding, dispatcher.Dispatch, instanceID), maintenance: integrityWorkerMaintenance(store)}, nil
 }
 
-func onboardingWorkerDispatch(store *sqlitestore.Store, onboarding onboardingContinuer, fallback admissionWorkerDispatch) admissionWorkerDispatch {
+func onboardingWorkerDispatch(store *sqlitestore.Store, onboarding onboardingContinuer, fallback admissionWorkerDispatch, supervisorID string) admissionWorkerDispatch {
 	return func(ctx context.Context) (application.LinearTodoDispatchResult, error) {
 		now := time.Now().UTC()
 		// Activity backfill is deliberately one bounded SQLite-only batch per
@@ -364,12 +368,16 @@ func onboardingWorkerDispatch(store *sqlitestore.Store, onboarding onboardingCon
 		} else {
 			_ = store.RecordActivityIndexingRecovery(ctx, "legacy_backfill", now)
 		}
-		ids, err := store.ListRunnableOnboardings(ctx, 1)
+		ids, err := store.ListRunnableOnboardings(ctx, application.MaxHeavyCapacity+1)
 		if err != nil {
 			return application.LinearTodoDispatchResult{}, errors.New("runnable onboarding discovery failed")
 		}
-		if len(ids) != 0 {
-			result, err := onboarding.Continue(ctx, ids[0])
+		execution := application.OnboardingExecutionAuthority{SupervisorID: supervisorID, ExecutionNonce: uuid.NewString()}
+		for _, onboardingID := range ids {
+			result, err := onboarding.Continue(ctx, onboardingID, execution)
+			if errors.Is(err, application.ErrOnboardingClaimBusy) {
+				continue
+			}
 			if err != nil {
 				return application.LinearTodoDispatchResult{}, err
 			}

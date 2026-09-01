@@ -14,8 +14,9 @@ import (
 )
 
 var (
-	ErrOnboardingNotFound = errors.New("onboarding not found")
-	ErrOnboardingConflict = errors.New("onboarding authority conflicts")
+	ErrOnboardingNotFound  = errors.New("onboarding not found")
+	ErrOnboardingConflict  = errors.New("onboarding authority conflicts")
+	ErrOnboardingClaimBusy = errors.New("onboarding step claim is busy")
 )
 
 type Onboarding struct {
@@ -170,9 +171,45 @@ type OnboardingStepIntent struct {
 	IntendedAt   time.Time
 }
 
+type OnboardingExecutionAuthority struct {
+	SupervisorID   string
+	ExecutionNonce string
+}
+
+type OnboardingStepClaimToken struct {
+	OnboardingID   string
+	Step           domain.OnboardingStep
+	AttemptNumber  int64
+	IntentDigest   string
+	SupervisorID   string
+	ExecutionNonce string
+	ClaimVersion   int64
+	ClaimDigest    string
+}
+
+type OnboardingStepClaimClassification string
+
+const (
+	OnboardingStepClaimAcquired OnboardingStepClaimClassification = "acquired"
+	OnboardingStepClaimReplayed OnboardingStepClaimClassification = "replayed"
+	OnboardingStepClaimAdopted  OnboardingStepClaimClassification = "adopted"
+	OnboardingStepClaimBusy     OnboardingStepClaimClassification = "busy"
+)
+
+type OnboardingStepClaimRequest struct {
+	Intent    OnboardingStepIntent
+	Authority OnboardingExecutionAuthority
+}
+
+type OnboardingStepClaimResult struct {
+	Classification OnboardingStepClaimClassification
+	Claim          OnboardingStepClaimToken
+}
+
 type OnboardingStepSettlement struct {
 	OnboardingID string
 	Step         domain.OnboardingStep
+	Claim        OnboardingStepClaimToken
 	Observation  OnboardingStepObservation
 	ObservedAt   time.Time
 }
@@ -184,7 +221,7 @@ type OnboardingStore interface {
 	SaveOnboardingPreflight(context.Context, OnboardingPreflightInput) (Onboarding, error)
 	StartOnboarding(context.Context, OnboardingStartAcceptance) (Onboarding, OperationReceipt, bool, error)
 	CancelOnboarding(context.Context, string, time.Time) (Onboarding, bool, error)
-	BeginOnboardingStep(context.Context, OnboardingStepIntent) (bool, error)
+	AcquireOnboardingStepClaim(context.Context, OnboardingStepClaimRequest) (OnboardingStepClaimResult, error)
 	SettleOnboardingStep(context.Context, OnboardingStepSettlement) (Onboarding, error)
 	ResumeOnboarding(context.Context, string, time.Time) (Onboarding, bool, error)
 	ListRunnableOnboardings(context.Context, int) ([]string, error)
@@ -464,7 +501,7 @@ func (s *OnboardingService) Resume(ctx context.Context, command OnboardingComman
 	return projectOnboarding(resumed), nil
 }
 
-func (s *OnboardingService) Continue(ctx context.Context, onboardingID string) (Onboarding, error) {
+func (s *OnboardingService) Continue(ctx context.Context, onboardingID string, authority OnboardingExecutionAuthority) (Onboarding, error) {
 	if s.executor == nil {
 		return Onboarding{}, serviceError(ErrorInternal, "onboarding worker is unavailable", nil)
 	}
@@ -502,8 +539,15 @@ func (s *OnboardingService) Continue(ctx context.Context, onboardingID string) (
 			intentParts += "\x00refs/heads/" + input.BaseBranch + "\x00" + onboarding.InitialRevisionSHA + "\x00empty-remote-v1"
 		}
 		intentDigest := digestText(intentParts)
-		if _, err := s.store.BeginOnboardingStep(ctx, OnboardingStepIntent{OnboardingID: onboarding.OnboardingID, Step: step, IntentDigest: intentDigest, IntendedAt: s.now().UTC()}); err != nil {
+		claim, err := s.store.AcquireOnboardingStepClaim(ctx, OnboardingStepClaimRequest{Intent: OnboardingStepIntent{OnboardingID: onboarding.OnboardingID, Step: step, IntentDigest: intentDigest, IntendedAt: s.now().UTC()}, Authority: authority})
+		if err != nil {
 			return Onboarding{}, classifyOnboardingError(err)
+		}
+		if claim.Classification == OnboardingStepClaimBusy {
+			return projectOnboarding(onboarding), ErrOnboardingClaimBusy
+		}
+		if claim.Classification != OnboardingStepClaimAcquired && claim.Classification != OnboardingStepClaimReplayed && claim.Classification != OnboardingStepClaimAdopted {
+			return Onboarding{}, serviceError(ErrorInternal, "onboarding claim classification is invalid", nil)
 		}
 		observation, err := s.executor.ExecuteOnboardingStep(ctx, onboarding, input, step)
 		if err != nil {
@@ -518,7 +562,7 @@ func (s *OnboardingService) Continue(ctx context.Context, onboardingID string) (
 		if !validAuthorityDigest(observation.EvidenceDigest) {
 			return Onboarding{}, serviceError(ErrorConflict, "onboarding step evidence is invalid", nil)
 		}
-		onboarding, err = s.store.SettleOnboardingStep(ctx, OnboardingStepSettlement{OnboardingID: onboarding.OnboardingID, Step: step, Observation: observation, ObservedAt: s.now().UTC()})
+		onboarding, err = s.store.SettleOnboardingStep(ctx, OnboardingStepSettlement{OnboardingID: onboarding.OnboardingID, Step: step, Claim: claim.Claim, Observation: observation, ObservedAt: s.now().UTC()})
 		if err != nil {
 			return Onboarding{}, classifyOnboardingError(err)
 		}

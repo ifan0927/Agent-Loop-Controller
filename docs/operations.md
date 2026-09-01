@@ -458,6 +458,12 @@ signal, or the diagnostic `controller run`/`controller drive --max-runtime`,
 and the persisted state remains a normal resumable state. Do not decompose the
 workflow into recovery-only commands merely because the process stopped.
 
+For interrupted onboarding, restart the same managed worker command. After it
+holds the database-directory process lock, the new worker adopts the durable
+step claim and reconciles the existing attempt before any retry. Claims do not
+expire, and there is no manual unlock, force-ready action, or supported SQL
+recovery procedure.
+
 ## 7. Command Reference
 
 All examples omit `--config` when using the default path. Durations use Go
@@ -549,6 +555,15 @@ unobservable outcome requires the bounded runbook. Partial roots, managed
 source, initial revision/base, an already-created Linear label, and an applied
 configuration are retained and reconciled; there is no implicit destructive
 rollback.
+
+Each external onboarding step is entered only after SQLite grants that dispatch
+an exact durable claim. Concurrent worker slots skip a busy onboarding and may
+advance another runnable onboarding. A replacement worker can adopt an
+interrupted claim only after obtaining the existing process lock; adoption
+retains the step attempt and still requires the normal provider observation or
+reconciliation. Claim owner, nonce, digest, and fencing version are private
+persistence authority and are intentionally absent from `show`, activity,
+attention, logs, and CLI JSON.
 
 A fresh installation may intentionally begin with version-5
 `"repositories": []` while automatic admission is disabled. Start the worker
@@ -1063,7 +1078,12 @@ which also fences restart-only permit adoption. While holding that lock,
 `linear start` and `controller run` act as the sole manual supervisor and
 publish their own process-bound heartbeat before checking new-admission
 convergence; heartbeat failure cancels their work and fails the command. The
-automatic worker reports bounded worker and queue-decision evidence;
+automatic worker binds that same process-lock authority to onboarding claims in
+both enabled and disabled admission modes. Every dispatch receives a fresh
+execution nonce; busy onboardings are skipped within a bounded deterministic
+candidate scan, while a restarted worker adopts an interrupted claim without a
+clock-expiry rule. The automatic worker reports bounded worker and
+queue-decision evidence;
 `status` is `running`, `driving`, `parked`, or `stopping`, and a stopping result
 includes `previous_status`. The active supervisor atomically replaces the private
 `<controller-config>.worker-status.json` heartbeat after initialization, on
