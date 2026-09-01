@@ -166,6 +166,7 @@ go build -o ./bin/agentctl ./cmd/agentctl
 ./bin/agentctl config inspect
 ./bin/agentctl config doctor
 ./bin/agentctl controller worker --once
+./bin/agentctl operator
 ```
 
 `config init` deliberately creates an incomplete starter. Follow
@@ -187,6 +188,12 @@ the next cycle without a separate drive command. Human review resolution and
 approval happen in GitHub; the driver observes them and continues
 automatically.
 
+For the routine local overview, run `agentctl operator`. It authenticates as
+the configured Controller operator, opens only the already-bound current
+configuration authority, and renders Controller health, repositories, runs,
+and operator attention without changing Controller state. It does not accept
+requester override flags and does not start or supervise the worker.
+
 Low-level `continue`, `push`, `open-pr`, `reconcile`, `merge`,
 `reconcile-linear`, and `cleanup` commands are recovery interfaces, not the
 normal workflow.
@@ -196,8 +203,7 @@ normal workflow.
 The production MVP and the automatic-admission, trusted-feedback, source-sync,
 recovery, headless supervision, bounded multi-repository scheduling, and second
 isolated live-E2E milestones are complete. The current product focus is the
-remaining Controller operator foundations followed by a local TUI operator
-console in this repository under
+local TUI operator console in this repository under
 [roadmap #99](https://github.com/ifan0927/Agent-Loop-Controller/issues/99).
 Local operator identity, application authorization, operation receipts, and
 legal-action offers are implemented. Activity-independent worker heartbeat,
@@ -222,8 +228,11 @@ the worker performs bounded restart-safe reconstruction of legacy evidence and
 reports explicit coverage limitations for history that was never persisted.
 Unsafe or ambiguous configuration repair remains out of scope. Controller-wide
 audit-integrity readiness and its explicit receipt-backed recheck are
-implemented, completing the presentation-independent operator foundation.
-The TUI and `agentctl operator` are planned, not current behavior. HTTP, a Web
+implemented, completing the presentation-independent operator foundation. The
+first read-only `agentctl operator` Overview is implemented with bounded
+responsive content-sized layouts, visible focus, background refresh,
+stale-result preservation, and configured-operator authorization. Additional
+TUI screens and legal actions remain planned. HTTP, a Web
 UI, outbound notifications, Hermes runtime integration, public API/webhook
 admission, and cross-repository transactions remain deferred or exploratory.
 

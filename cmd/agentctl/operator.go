@@ -1,0 +1,914 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"strings"
+	"time"
+
+	"charm.land/bubbles/v2/help"
+	"charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
+)
+
+const (
+	operatorMinimumWidth    = 80
+	operatorWideWidth       = 92
+	operatorMinimumHeight   = 24
+	operatorRefreshInterval = 10 * time.Second
+)
+
+type operatorPanel string
+
+const (
+	operatorRepositoriesPanel operatorPanel = "repositories"
+	operatorRunsPanel         operatorPanel = "runs"
+	operatorAttentionPanel    operatorPanel = "attention"
+)
+
+type operatorPanelState struct {
+	index int
+}
+
+type operatorSafeError struct {
+	Category application.ErrorCategory
+	Message  string
+}
+
+func (e operatorSafeError) String() string {
+	if e.Category == "" {
+		return e.Message
+	}
+	return string(e.Category) + ": " + e.Message
+}
+
+type operatorRefreshResultMsg struct {
+	generation int64
+	batch      operatorOverviewBatch
+	err        operatorSafeError
+}
+
+type operatorRefreshTickMsg struct{}
+
+type operatorKeyMap struct {
+	up, down, next, previous, refresh, help, quit key.Binding
+}
+
+func (k operatorKeyMap) ShortHelp() []key.Binding {
+	return []key.Binding{k.next, k.previous, k.up, k.down, k.refresh, k.help, k.quit}
+}
+
+func (k operatorKeyMap) FullHelp() [][]key.Binding {
+	return [][]key.Binding{{k.next, k.previous}, {k.up, k.down}, {k.refresh, k.help, k.quit}}
+}
+
+var operatorKeys = operatorKeyMap{
+	up:       key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
+	down:     key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
+	next:     key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "next panel")),
+	previous: key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("shift+tab", "previous panel")),
+	refresh:  key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
+	help:     key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
+	quit:     key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
+}
+
+type operatorModel struct {
+	ctx             context.Context
+	cancel          context.CancelFunc
+	loader          operatorOverviewLoader
+	now             func() time.Time
+	refreshInterval time.Duration
+	width           int
+	height          int
+	batch           *operatorOverviewBatch
+	initialError    *operatorSafeError
+	staleError      *operatorSafeError
+	refreshing      bool
+	generation      int64
+	tickerStarted   bool
+	help            help.Model
+	focus           operatorPanel
+	panels          map[operatorPanel]operatorPanelState
+}
+
+func newOperatorModel(parent context.Context, loader operatorOverviewLoader) operatorModel {
+	ctx, cancel := context.WithCancel(parent)
+	helpModel := help.New()
+	return operatorModel{
+		ctx:             ctx,
+		cancel:          cancel,
+		loader:          loader,
+		now:             func() time.Time { return time.Now().UTC() },
+		refreshInterval: operatorRefreshInterval,
+		refreshing:      true,
+		generation:      1,
+		help:            helpModel,
+		focus:           "",
+		panels: map[operatorPanel]operatorPanelState{
+			operatorRepositoriesPanel: {},
+			operatorRunsPanel:         {},
+			operatorAttentionPanel:    {},
+		},
+	}
+}
+
+func (m operatorModel) Init() tea.Cmd {
+	return m.loadCommand(m.generation)
+}
+
+func (m operatorModel) loadCommand(generation int64) tea.Cmd {
+	ctx, loader, observedAt := m.ctx, m.loader, m.now().UTC()
+	return func() tea.Msg {
+		batch, err := loader.Load(ctx, observedAt)
+		if err != nil {
+			return operatorRefreshResultMsg{generation: generation, err: safeOperatorError(err)}
+		}
+		return operatorRefreshResultMsg{generation: generation, batch: batch}
+	}
+}
+
+func (m operatorModel) tickCommand() tea.Cmd {
+	interval := m.refreshInterval
+	return tea.Tick(interval, func(time.Time) tea.Msg { return operatorRefreshTickMsg{} })
+}
+
+func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+		m.help.SetWidth(max(msg.Width-2, 1))
+		return m, nil
+	case operatorRefreshResultMsg:
+		if msg.generation != m.generation {
+			return m, nil
+		}
+		m.refreshing = false
+		if msg.err.Message != "" {
+			if m.batch == nil {
+				m.initialError = &msg.err
+			} else {
+				m.staleError = &msg.err
+			}
+			return m, nil
+		}
+		previous := m.selectedIdentities()
+		batch := msg.batch
+		m.batch = &batch
+		m.initialError, m.staleError = nil, nil
+		m.restoreSelections(previous)
+		m.normalizeFocus()
+		if !m.tickerStarted {
+			m.tickerStarted = true
+			return m, m.tickCommand()
+		}
+		return m, nil
+	case operatorRefreshTickMsg:
+		next := m.tickCommand()
+		if m.batch == nil || m.refreshing {
+			return m, next
+		}
+		m.generation++
+		m.refreshing = true
+		return m, tea.Batch(next, m.loadCommand(m.generation))
+	case tea.KeyPressMsg:
+		switch {
+		case key.Matches(msg, operatorKeys.quit):
+			m.cancel()
+			return m, tea.Quit
+		case m.batch == nil && key.Matches(msg, operatorKeys.refresh):
+			if m.refreshing {
+				return m, nil
+			}
+			m.initialError = nil
+			m.generation++
+			m.refreshing = true
+			return m, m.loadCommand(m.generation)
+		case m.batch == nil:
+			return m, nil
+		case key.Matches(msg, operatorKeys.refresh):
+			if m.refreshing {
+				return m, nil
+			}
+			m.generation++
+			m.refreshing = true
+			return m, m.loadCommand(m.generation)
+		case key.Matches(msg, operatorKeys.help):
+			m.help.ShowAll = !m.help.ShowAll
+			return m, nil
+		case key.Matches(msg, operatorKeys.next):
+			m.moveFocus(1)
+			return m, nil
+		case key.Matches(msg, operatorKeys.previous):
+			m.moveFocus(-1)
+			return m, nil
+		case key.Matches(msg, operatorKeys.up):
+			m.moveSelection(-1)
+			return m, nil
+		case key.Matches(msg, operatorKeys.down):
+			m.moveSelection(1)
+			return m, nil
+		}
+	}
+	return m, nil
+}
+
+func safeOperatorError(err error) operatorSafeError {
+	var safe *application.ServiceError
+	if errors.As(err, &safe) {
+		return operatorSafeError{Category: safe.Category, Message: safe.Message}
+	}
+	return operatorSafeError{Category: application.ErrorInternal, Message: "operator overview is unavailable"}
+}
+
+func (m operatorModel) selectablePanels() []operatorPanel {
+	if m.batch == nil {
+		return nil
+	}
+	var order []operatorPanel
+	if m.width >= operatorWideWidth {
+		order = []operatorPanel{operatorRepositoriesPanel, operatorRunsPanel, operatorAttentionPanel}
+	} else {
+		order = []operatorPanel{operatorAttentionPanel, operatorRepositoriesPanel, operatorRunsPanel}
+	}
+	result := order[:0]
+	for _, panel := range order {
+		if m.panelLength(panel) > 0 {
+			result = append(result, panel)
+		}
+	}
+	return result
+}
+
+func (m *operatorModel) normalizeFocus() {
+	panels := m.selectablePanels()
+	if len(panels) == 0 {
+		m.focus = ""
+		return
+	}
+	for _, panel := range panels {
+		if panel == m.focus {
+			return
+		}
+	}
+	m.focus = panels[0]
+}
+
+func (m *operatorModel) moveFocus(delta int) {
+	panels := m.selectablePanels()
+	if len(panels) == 0 {
+		m.focus = ""
+		return
+	}
+	current := 0
+	for i, panel := range panels {
+		if panel == m.focus {
+			current = i
+			break
+		}
+	}
+	next := (current + delta) % len(panels)
+	if next < 0 {
+		next += len(panels)
+	}
+	m.focus = panels[next]
+}
+
+func (m *operatorModel) moveSelection(delta int) {
+	length := m.panelLength(m.focus)
+	if length == 0 {
+		return
+	}
+	state := m.panels[m.focus]
+	state.index = clamp(state.index+delta, 0, length-1)
+	m.panels[m.focus] = state
+}
+
+func (m operatorModel) panelLength(panel operatorPanel) int {
+	if m.batch == nil {
+		return 0
+	}
+	switch panel {
+	case operatorRepositoriesPanel:
+		return len(m.batch.Repositories.Repositories)
+	case operatorRunsPanel:
+		return len(m.batch.Overview.Runs.ActiveRuns) + len(m.batch.Overview.Runs.RecentRuns)
+	case operatorAttentionPanel:
+		return len(m.batch.Overview.Actionable)
+	default:
+		return 0
+	}
+}
+
+func (m operatorModel) selectedIdentities() map[operatorPanel]string {
+	result := map[operatorPanel]string{}
+	if m.batch == nil {
+		return result
+	}
+	for _, panel := range []operatorPanel{operatorRepositoriesPanel, operatorRunsPanel, operatorAttentionPanel} {
+		rows := m.panelRows(panel)
+		index := m.panels[panel].index
+		if index >= 0 && index < len(rows) {
+			result[panel] = rows[index].id
+		}
+	}
+	return result
+}
+
+func (m *operatorModel) restoreSelections(previous map[operatorPanel]string) {
+	for _, panel := range []operatorPanel{operatorRepositoriesPanel, operatorRunsPanel, operatorAttentionPanel} {
+		rows := m.panelRows(panel)
+		state := m.panels[panel]
+		matched := false
+		for i, row := range rows {
+			if previous[panel] != "" && row.id == previous[panel] {
+				state.index, matched = i, true
+				break
+			}
+		}
+		if !matched {
+			state.index = clamp(state.index, 0, max(len(rows)-1, 0))
+		}
+		m.panels[panel] = state
+	}
+}
+
+type operatorRow struct {
+	id     string
+	name   string
+	status string
+	detail string
+	tone   string
+}
+
+func (m operatorModel) panelRows(panel operatorPanel) []operatorRow {
+	if m.batch == nil {
+		return nil
+	}
+	observedAt := m.batch.ObservedAt
+	switch panel {
+	case operatorRepositoriesPanel:
+		rows := make([]operatorRow, 0, len(m.batch.Repositories.Repositories))
+		for _, repository := range m.batch.Repositories.Repositories {
+			onboarding := "none"
+			if repository.Onboarding != nil {
+				onboarding = presentationLabel(string(repository.Onboarding.Status))
+			}
+			availability := "unavailable"
+			if repository.Available {
+				availability = "available"
+			}
+			detail := fmt.Sprintf("%s · %s · config %s · onboarding %s · %s", presentationLabel(string(repository.LifecycleIntent)), availability, presentationLabel(string(repository.ConfigurationConvergence)), onboarding, formatObservationAge(observedAt, repository.LastObservedAt))
+			if repository.ActiveRunID != "" {
+				detail += " · active run " + repository.ActiveRunID
+			}
+			rows = append(rows, operatorRow{
+				id: repository.Repository, name: repository.Repository,
+				status: presentationLabel(string(repository.Readiness)), detail: detail,
+				tone: repositoryRowTone(repository.Available, string(repository.Readiness)),
+			})
+		}
+		return rows
+	case operatorRunsPanel:
+		rows := make([]operatorRow, 0, len(m.batch.Overview.Runs.ActiveRuns)+len(m.batch.Overview.Runs.RecentRuns))
+		appendRuns := func(kind string, runs []application.RoutineRunSummary) {
+			for _, run := range runs {
+				attention := ""
+				if run.Attention {
+					attention = " · attention evidence"
+				}
+				identifier := run.LinearIdentifier
+				if identifier == "" {
+					identifier = run.RunID
+				} else {
+					identifier += " / " + run.RunID
+				}
+				rows = append(rows, operatorRow{
+					id: run.RunID, name: identifier + " · " + run.Repository,
+					status: presentationLabel(string(run.State)),
+					detail: kind + attention + " · " + formatObservationAge(observedAt, run.UpdatedAt),
+					tone:   runRowTone(string(run.State), run.Attention),
+				})
+			}
+		}
+		appendRuns("active", m.batch.Overview.Runs.ActiveRuns)
+		appendRuns("recent", m.batch.Overview.Runs.RecentRuns)
+		return rows
+	case operatorAttentionPanel:
+		rows := make([]operatorRow, 0, len(m.batch.Overview.Actionable))
+		for _, item := range m.batch.Overview.Actionable {
+			support := matchingAttentionEvidence(item, m.batch.Overview.Attention)
+			detail := fmt.Sprintf("%s · %s", presentationLabel(string(item.Scope)), formatObservationAge(observedAt, item.ObservedAt))
+			if support != "" {
+				detail += " · evidence " + support
+			}
+			rows = append(rows, operatorRow{
+				id: item.ItemID, name: m.attentionTargetLabel(item.TargetID) + " · " + reasonPresentation(item.ReasonCode),
+				status: presentationLabel(item.Severity), detail: detail, tone: severityTone(item.Severity),
+			})
+		}
+		return rows
+	default:
+		return nil
+	}
+}
+
+func repositoryRowTone(available bool, readiness string) string {
+	if !available || readiness == "not_ready" || readiness == "unavailable" {
+		return "danger"
+	}
+	if readiness == "ready" {
+		return "good"
+	}
+	return "warning"
+}
+
+func runRowTone(state string, attention bool) string {
+	if attention {
+		return "warning"
+	}
+	switch state {
+	case "completed":
+		return "good"
+	case "failed", "cancelled", "rejected":
+		return "danger"
+	default:
+		return "muted"
+	}
+}
+
+func severityTone(severity string) string {
+	switch strings.ToLower(severity) {
+	case "critical", "high", "error":
+		return "danger"
+	case "medium", "warning":
+		return "warning"
+	default:
+		return "muted"
+	}
+}
+
+func (m operatorModel) attentionTargetLabel(targetID string) string {
+	for _, run := range append(append([]application.RoutineRunSummary{}, m.batch.Overview.Runs.ActiveRuns...), m.batch.Overview.Runs.RecentRuns...) {
+		if run.RunID == targetID && run.LinearIdentifier != "" {
+			return run.LinearIdentifier
+		}
+	}
+	return targetID
+}
+
+var reasonPresentations = map[string]string{
+	"admission_authority_conflict": "admission authority conflict",
+	"cleanup_residue":              "cleanup residue",
+	"human_decision_required":      "human decision required",
+	"incomplete_authority":         "incomplete authority",
+	"lease_lost":                   "lease lost",
+	"legacy_ci_topology_drift":     "legacy CI topology drift",
+	"manual_intervention":          "manual intervention",
+	"manual_state":                 "manual state",
+	"terminal_failure":             "terminal failure",
+	"top_priority_tie":             "top priority tie",
+}
+
+func reasonPresentation(reason string) string {
+	if label, ok := reasonPresentations[reason]; ok {
+		return label
+	}
+	return reason
+}
+
+func matchingAttentionEvidence(item application.RoutineActionableItem, evidence []application.RoutineAttentionSummary) string {
+	for _, attention := range evidence {
+		if attention.Scope == item.Scope && attention.TargetID == item.TargetID && attention.ReasonCode == item.ReasonCode {
+			return presentationLabel(string(attention.State))
+		}
+	}
+	return ""
+}
+
+func (m operatorModel) View() tea.View {
+	content := m.render()
+	view := tea.NewView(content)
+	view.AltScreen = true
+	view.MouseMode = tea.MouseModeNone
+	view.WindowTitle = "Agent Loop Controller Overview"
+	return view
+}
+
+func (m operatorModel) render() string {
+	if m.width < operatorMinimumWidth || m.height < operatorMinimumHeight {
+		return lipgloss.NewStyle().Padding(1, 2).Render(fmt.Sprintf("Terminal too small\n\nCurrent: %dx%d\nRequired: 80x24 minimum\n\nq / Ctrl-C  quit", m.width, m.height))
+	}
+	if m.batch == nil {
+		if m.initialError != nil {
+			return lipgloss.NewStyle().Padding(1, 2).Render("Operator Overview unavailable\n\n" + m.initialError.String() + "\n\nr  retry    q / Ctrl-C  quit")
+		}
+		return lipgloss.NewStyle().Padding(1, 2).Render("Agent Loop Controller\n\nLoading operator overview…\n\nq / Ctrl-C  quit")
+	}
+	header := lipgloss.JoinVertical(lipgloss.Left, m.renderHeader(), m.renderHealth())
+	footer := m.renderHelp()
+	bodyHeight := max(m.height-lipgloss.Height(header)-lipgloss.Height(footer), 3)
+	var body string
+	if m.width >= operatorWideWidth {
+		body = m.renderWide(bodyHeight)
+	} else {
+		body = m.renderVertical(bodyHeight)
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+}
+
+var (
+	operatorAccentStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	operatorWarningStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	operatorDangerStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	operatorMutedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	operatorHeadingStyle = lipgloss.NewStyle().Bold(true)
+	operatorBorderColor  = lipgloss.Color("240")
+	operatorFocusColor   = lipgloss.Color("42")
+)
+
+func (m operatorModel) renderHeader() string {
+	left := operatorHeadingStyle.Render("Agent Loop Controller / Overview")
+	observation := "Observed " + m.batch.ObservedAt.Local().Format("15:04:05") + " · auto refresh " + m.refreshInterval.String()
+	if m.staleError != nil {
+		observation = operatorDangerStyle.Render("STALE · " + m.staleError.String())
+	} else if m.refreshing {
+		observation = operatorWarningStyle.Render("Refreshing…")
+	} else {
+		observation = operatorMutedStyle.Render(observation)
+	}
+	available := max(m.width-lipgloss.Width(left)-2, 0)
+	if available == 0 {
+		return truncateRunes(left, m.width)
+	}
+	observation = ansi.Truncate(observation, available, "…")
+	gap := max(m.width-lipgloss.Width(left)-lipgloss.Width(observation), 1)
+	return left + strings.Repeat(" ", gap) + observation
+}
+
+func (m operatorModel) renderHealth() string {
+	overview := m.batch.Overview
+	draining := ""
+	if overview.Capacity.Draining {
+		draining = " · draining"
+	}
+	admission := "disabled"
+	if overview.AdmissionEnabled {
+		admission = "enabled"
+	}
+	readiness := presentationLabel(string(overview.Readiness))
+	marker, tone := healthMarker(string(overview.Readiness))
+	status := tone.Bold(true).Render(marker + " " + readiness)
+	health := fmt.Sprintf("%s  ·  %s\nWorker %s/%s  ·  heartbeat %s\nCapacity %d/%d in use%s  ·  Admission %s  ·  Repositories %d total, %d ready, %d unavailable",
+		status,
+		healthSummary(string(overview.Readiness)),
+		presentationLabel(string(overview.Worker.Liveness)),
+		presentationLabel(string(overview.Worker.Activity)),
+		formatHeartbeatAge(overview.Worker),
+		overview.Capacity.InUse,
+		overview.Capacity.EffectiveCapacity,
+		draining,
+		admission,
+		overview.Repositories.Total,
+		overview.Repositories.Ready,
+		overview.Repositories.Unavailable,
+	)
+	return lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(operatorBorderColor).Padding(0, 1).Width(m.width).Render(health)
+}
+
+func (m operatorModel) renderWide(height int) string {
+	leftWidth := (m.width - 1) * 3 / 5
+	rightWidth := m.width - leftWidth - 1
+	leftHeights := m.allocatePanelHeights([]operatorPanel{operatorRepositoriesPanel, operatorRunsPanel}, height)
+	left := lipgloss.JoinVertical(lipgloss.Left,
+		m.renderPanel(operatorRepositoriesPanel, leftWidth, leftHeights[0]),
+		m.renderPanel(operatorRunsPanel, leftWidth, leftHeights[1]),
+	)
+	rightHeight := min(m.panelDesiredHeight(operatorAttentionPanel), height)
+	right := m.renderPanel(operatorAttentionPanel, rightWidth, rightHeight)
+	return lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
+}
+
+func (m operatorModel) renderVertical(height int) string {
+	panels := []operatorPanel{operatorAttentionPanel, operatorRepositoriesPanel, operatorRunsPanel}
+	heights := m.allocatePanelHeights(panels, height)
+	return lipgloss.JoinVertical(lipgloss.Left,
+		m.renderPanel(operatorAttentionPanel, m.width, heights[0]),
+		m.renderPanel(operatorRepositoriesPanel, m.width, heights[1]),
+		m.renderPanel(operatorRunsPanel, m.width, heights[2]),
+	)
+}
+
+func (m operatorModel) panelDesiredHeight(panel operatorPanel) int {
+	contentRows := len(m.panelRows(panel))
+	if contentRows == 0 {
+		contentRows = 1
+	}
+	return contentRows + 3
+}
+
+func (m operatorModel) allocatePanelHeights(panels []operatorPanel, available int) []int {
+	heights := make([]int, len(panels))
+	remaining := available
+	for index := range panels {
+		heights[index] = min(4, max(available-index*3, 1))
+		remaining -= heights[index]
+	}
+	for remaining > 0 {
+		advanced := false
+		for index, panel := range panels {
+			if remaining == 0 {
+				break
+			}
+			if heights[index] < m.panelDesiredHeight(panel) {
+				heights[index]++
+				remaining--
+				advanced = true
+			}
+		}
+		if !advanced {
+			break
+		}
+	}
+	return heights
+}
+
+func (m operatorModel) renderPanel(panel operatorPanel, width, height int) string {
+	rows := m.panelRows(panel)
+	title, empty, supporting := m.panelTitle(panel), m.panelEmpty(panel), ""
+	if panel == operatorAttentionPanel && len(rows) == 0 && len(m.batch.Overview.Attention) > 0 {
+		supporting = fmt.Sprintf("Supporting evidence only: %d active", len(m.batch.Overview.Attention))
+	}
+	innerWidth, innerHeight := max(width-2, 1), max(height-2, 1)
+	lines := []string{m.renderPanelHeader(title, m.panelSummary(panel), innerWidth)}
+	available := max(innerHeight-1, 0)
+	if len(rows) == 0 {
+		if supporting != "" {
+			lines = append(lines, truncateRunes(supporting, innerWidth))
+		} else if available > 0 {
+			lines = append(lines, truncateRunes(empty, innerWidth))
+		}
+	} else if available > 0 {
+		selected := clamp(m.panels[panel].index, 0, len(rows)-1)
+		start := clamp(selected-available+1, 0, max(len(rows)-available, 0))
+		end := min(start+available, len(rows))
+		for index := start; index < end; index++ {
+			active := m.focus == panel && index == selected
+			lines = append(lines, m.renderRow(rows[index], innerWidth, active))
+		}
+	}
+	style := lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(operatorBorderColor).Width(width).Height(height)
+	if m.focus == panel && len(rows) > 0 {
+		style = style.BorderForeground(operatorFocusColor)
+	}
+	return style.Render(strings.Join(lines, "\n"))
+}
+
+func (m operatorModel) panelTitle(panel operatorPanel) string {
+	switch panel {
+	case operatorRepositoriesPanel:
+		return "Repositories"
+	case operatorRunsPanel:
+		return "Runs"
+	case operatorAttentionPanel:
+		return "Attention"
+	default:
+		return ""
+	}
+}
+
+func collectionSummary(shown, total int, truncated bool) string {
+	if truncated || shown < total {
+		return fmt.Sprintf("%d of %d displayed", shown, total)
+	}
+	return fmt.Sprintf("%d total", total)
+}
+
+func (m operatorModel) panelSummary(panel operatorPanel) string {
+	switch panel {
+	case operatorRepositoriesPanel:
+		return collectionSummary(len(m.batch.Repositories.Repositories), m.batch.Repositories.Collection.Total, m.batch.Repositories.Collection.Truncated)
+	case operatorRunsPanel:
+		runs := m.batch.Overview.Runs
+		shown, total := len(runs.ActiveRuns)+len(runs.RecentRuns), runs.Active+runs.Recent
+		if runs.ActiveTruncated || runs.RecentTruncated || shown < total {
+			return collectionSummary(shown, total, true)
+		}
+		return fmt.Sprintf("%d active · %d recent", runs.Active, runs.Recent)
+	case operatorAttentionPanel:
+		return collectionSummary(len(m.batch.Overview.Actionable), m.batch.Overview.ActionableTotal, m.batch.Overview.ActionableTruncated)
+	default:
+		return ""
+	}
+}
+
+func (m operatorModel) renderPanelHeader(title, summary string, width int) string {
+	title = truncateRunes(title, width)
+	available := width - lipgloss.Width(title) - 1
+	if available <= 0 {
+		return operatorHeadingStyle.Render(title)
+	}
+	summary = truncateRunes(summary, available)
+	gap := max(width-lipgloss.Width(title)-lipgloss.Width(summary), 1)
+	return operatorHeadingStyle.Render(title) + strings.Repeat(" ", gap) + operatorMutedStyle.Render(summary)
+}
+
+func (m operatorModel) renderRow(row operatorRow, width int, active bool) string {
+	prefix := "  "
+	if active {
+		prefix = "> "
+	}
+	marker, statusStyle := rowMarker(row.tone)
+	status := marker + " " + row.status
+	if !active {
+		status = statusStyle.Render(status)
+	}
+	available := max(width-lipgloss.Width(prefix), 1)
+	var content string
+	if available >= 62 {
+		nameWidth := min(30, max(18, available/3))
+		name := truncateRunes(row.name, nameWidth)
+		content = lipgloss.NewStyle().Width(nameWidth).Render(name) + "  " + status + "  " + row.detail
+	} else {
+		content = row.name + "  " + status + " · " + row.detail
+	}
+	line := prefix + ansi.Truncate(content, available, "…")
+	if active {
+		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("28")).Width(width).Render(line)
+	}
+	return line
+}
+
+func rowMarker(tone string) (string, lipgloss.Style) {
+	switch tone {
+	case "good":
+		return "●", operatorAccentStyle
+	case "warning":
+		return "▲", operatorWarningStyle
+	case "danger":
+		return "●", operatorDangerStyle
+	default:
+		return "○", operatorMutedStyle
+	}
+}
+
+func healthMarker(readiness string) (string, lipgloss.Style) {
+	switch readiness {
+	case "ready":
+		return "●", operatorAccentStyle
+	case "degraded", "attention_required", "restart_required", "stale":
+		return "▲", operatorWarningStyle
+	case "offline", "conflict":
+		return "●", operatorDangerStyle
+	default:
+		return "○", operatorMutedStyle
+	}
+}
+
+func healthSummary(readiness string) string {
+	switch readiness {
+	case "ready":
+		return "Controller is ready"
+	case "degraded":
+		return "Controller is degraded"
+	case "attention_required":
+		return "Operator attention is required"
+	case "restart_required":
+		return "Worker restart is required"
+	case "stale":
+		return "Controller evidence is stale"
+	case "offline":
+		return "Controller worker is offline"
+	case "conflict":
+		return "Controller authority conflicts"
+	default:
+		return "Controller health is unknown"
+	}
+}
+
+func (m operatorModel) panelEmpty(panel operatorPanel) string {
+	switch panel {
+	case operatorRepositoriesPanel:
+		return "No registered repositories"
+	case operatorRunsPanel:
+		return "No active or recent runs"
+	case operatorAttentionPanel:
+		return "No operator attention"
+	default:
+		return ""
+	}
+}
+
+func (m operatorModel) renderHelp() string {
+	helpView := m.help
+	helpView.SetWidth(max(m.width-2, 1))
+	return lipgloss.NewStyle().Padding(0, 1).Width(max(m.width-2, 1)).Render(helpView.View(operatorKeys))
+}
+
+var presentationLabels = map[string]string{
+	"ready": "READY", "degraded": "DEGRADED", "attention_required": "ATTENTION REQUIRED",
+	"restart_required": "RESTART REQUIRED", "stale": "STALE", "offline": "OFFLINE",
+	"unknown": "UNKNOWN", "conflict": "CONFLICT", "fresh": "FRESH",
+	"running": "RUNNING", "driving": "DRIVING", "parked": "PARKED", "stopping": "STOPPING",
+	"enabled": "ENABLED", "disabled": "DISABLED", "available": "AVAILABLE",
+	"unavailable": "UNAVAILABLE", "active": "ACTIVE", "present": "PRESENT",
+	"none": "NONE", "controller": "CONTROLLER", "repository": "REPOSITORY",
+	"run": "RUN", "onboarding": "ONBOARDING", "critical": "CRITICAL",
+	"high": "HIGH", "medium": "MEDIUM", "low": "LOW", "info": "INFO",
+	"not_ready": "NOT READY", "not_applicable": "NOT APPLICABLE",
+	"opened": "OPENED", "preflight_ready": "PREFLIGHT READY", "cancelled": "CANCELLED",
+	"accepted": "ACCEPTED", "waiting_for_operator": "WAITING FOR OPERATOR",
+	"ready_disabled": "READY DISABLED", "received": "RECEIVED", "admitting": "ADMITTING",
+	"rejected": "REJECTED", "provisioning": "PROVISIONING", "executing": "EXECUTING",
+	"awaiting_human_decision": "AWAITING HUMAN DECISION", "verifying": "VERIFYING",
+	"fresh_review": "FRESH REVIEW", "approval_ready": "APPROVAL READY",
+	"pushing_branch": "PUSHING BRANCH", "branch_pushed": "BRANCH PUSHED",
+	"opening_pr": "OPENING PR", "repairing": "REPAIRING", "pr_open": "PR OPEN",
+	"reconciling_reviews": "RECONCILING REVIEWS", "replying_review_feedback": "REPLYING REVIEW FEEDBACK",
+	"awaiting_human_approval": "AWAITING HUMAN APPROVAL", "merging": "MERGING",
+	"awaiting_github_mergeability": "AWAITING GITHUB MERGEABILITY",
+	"awaiting_linear_completion":   "AWAITING LINEAR COMPLETION", "cleaning": "CLEANING",
+	"completed": "COMPLETED", "failed": "FAILED", "manual_intervention": "MANUAL INTERVENTION",
+}
+
+func presentationLabel(value string) string {
+	if label, ok := presentationLabels[value]; ok {
+		return label
+	}
+	if value == "" {
+		return "UNKNOWN"
+	}
+	return value
+}
+
+func formatHeartbeatAge(observation application.RuntimeObservation) string {
+	if observation.HeartbeatAgeSeconds == nil {
+		return "age unknown"
+	}
+	return formatAge(time.Duration(*observation.HeartbeatAgeSeconds) * time.Second)
+}
+
+func formatObservationAge(observedAt, value time.Time) string {
+	if value.IsZero() || observedAt.Before(value) {
+		return "age unknown"
+	}
+	return formatAge(observedAt.Sub(value))
+}
+
+func formatAge(age time.Duration) string {
+	if age < time.Minute {
+		return fmt.Sprintf("%ds ago", max(int(age/time.Second), 0))
+	}
+	if age < time.Hour {
+		return fmt.Sprintf("%dm ago", int(age/time.Minute))
+	}
+	if age < 24*time.Hour {
+		return fmt.Sprintf("%dh ago", int(age/time.Hour))
+	}
+	return fmt.Sprintf("%dd ago", int(age/(24*time.Hour)))
+}
+
+func truncateRunes(value string, width int) string {
+	if width < 1 {
+		return ""
+	}
+	return ansi.Truncate(value, width, "…")
+}
+
+func clamp(value, minimum, maximum int) int {
+	if value < minimum {
+		return minimum
+	}
+	if value > maximum {
+		return maximum
+	}
+	return value
+}
+
+var runOperatorProgram = func(model tea.Model) error {
+	_, err := tea.NewProgram(model).Run()
+	return err
+}
+
+func operatorCommand(args []string) error {
+	flags := flag.NewFlagSet("operator", flag.ContinueOnError)
+	configPath := configPathFlag(flags)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("usage: agentctl operator [--config <controller.json>]")
+	}
+	composition, err := composeOperatorOverview(context.Background(), *configPath)
+	if err != nil {
+		return err
+	}
+	defer composition.Close()
+	model := newOperatorModel(context.Background(), composition.loader)
+	defer model.cancel()
+	return runOperatorProgram(model)
+}
