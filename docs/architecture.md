@@ -1658,7 +1658,7 @@ application use cases and sanitized projections. It must not execute shell
 instructions, read Mac files directly, manufacture decisions/approval, or own
 workflow state.
 
-### Routine query and planned local operator interface boundary
+### Routine query and local operator interface boundary
 
 The implemented routine query family is a versioned, bounded application
 contract for Controller Overview, queue, compact runs and fixed delivery gates,
@@ -1789,7 +1789,7 @@ application contracts:
 ```text
 current CLI ----\
                  +--> Controller application services / projections
-planned TUI ----/                 |
+operator TUI ---/                 |
 future HTTP ----------------------/
                                   v
                          domain + persistence
@@ -1807,18 +1807,36 @@ authenticate, validate, bound, and render requests; it may not duplicate state
 transitions, authorization, scheduling, or external-write policy.
 
 The initial TUI belongs in this repository, Go module, and product binary. Its
-canonical planned entrypoint is `agentctl operator`; the worker's planned
-canonical entrypoint is `agentctl controller worker`. They run as separate
+canonical entrypoint is `agentctl operator`; the worker's canonical entrypoint
+is `agentctl controller worker`. They run as separate
 processes. The TUI does not start, stop, own, or supervise the worker, and its
 exit cannot stop Controller execution. Both processes rely on durable Controller
 state plus Controller-owned authorization, CAS, leases, idempotency, receipts,
 and reconciliation rather than shared in-memory authority.
 
-The TUI never accesses SQLite, Controller configuration, credentials, GitHub,
-Linear, worktrees, artifacts, raw logs, or arbitrary local paths to assemble
-workflow policy. It consumes bounded sanitized projections and only the legal
-actions offered by Controller application services. It is not a database
-administration tool, orchestrator, or second state machine.
+The implemented Overview composition opens only an existing exact-inode,
+mode-0600, current-schema SQLite/configuration binding in query-only mode. It
+does not create, migrate, baseline, reconcile, adopt, rewrite, or repair that
+authority. The TUI model receives one complete Overview projection followed by
+one limit-100 repository page at the same observation time; a failed second
+read discards the batch. Presentation never reads SQLite, configuration,
+credentials, GitHub, Linear, worktrees, artifacts, raw logs, or arbitrary local
+paths to assemble workflow policy. It consumes bounded sanitized projections
+and only legal actions offered by Controller application services. It is not a
+database administration tool, orchestrator, or second state machine.
+
+The Overview refreshes every ten seconds or on an explicit `r`, permits at most
+one active read, and ignores obsolete generations. After one successful batch,
+a later error preserves the last complete screen and marks it stale with only a
+sanitized service category and message. Controller aggregate readiness is
+rendered exactly as projected; capacity, repository readiness, availability,
+and freshness remain separate evidence and are never recomputed into health by
+the adapter. Widths at or above 92 columns place repositories and runs on the
+left and attention on the right. Widths from 80 through 91 stack health,
+attention, repositories, and runs. Anything below 80x24 renders only the size
+requirement and quit control. Panel height is content-driven within the
+available terminal budget; only the focused panel's current row is highlighted,
+and color is redundant presentation rather than authority.
 
 Repository onboarding is a persisted Controller saga. Each step row owns a
 positive durable attempt number. Resume atomically re-arms the current failed

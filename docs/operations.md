@@ -397,7 +397,31 @@ automatic Todo E2E trigger.
 
 ### Observe
 
-The start/worker output exposes a run ID. Use requester-authorized queries:
+For the configured operator's routine read-only view, start the separate local
+TUI:
+
+```sh
+agentctl operator [--config <controller.json>]
+```
+
+The command accepts no requester flags. It derives the complete immutable
+operator identity from the already-bound current configuration authority and
+fails closed if the locator, retained desired generation, exact database
+identity, mode, binding, or schema is unavailable or conflicting. It never
+initializes, migrates, reconciles, adopts, or writes configuration or SQLite.
+
+The Overview refreshes every ten seconds. Use `r` to refresh, `Tab` and
+`Shift+Tab` to move through non-empty panels, arrow keys or `j`/`k` to select,
+`?` for help, and `q` or `Ctrl-C` to quit. A refresh failure after a successful
+load leaves the last complete batch visible and marks it stale. At least 80x24
+is required; 92 columns enables the side-by-side layout. Closing the TUI does
+not stop the worker. The header shows the observation time and refresh state;
+the green border and highlighted row identify the one active panel selection.
+Panel height follows its bounded content instead of filling unused terminal
+space.
+
+The start/worker output exposes a run ID. Use requester-authorized detail
+queries:
 
 ```sh
 agentctl controller status '<run-id>' <requester flags>
@@ -440,6 +464,20 @@ All examples omit `--config` when using the default path. Durations use Go
 duration syntax such as `30s`, `15m`, and `24h`.
 
 ### Normal operator commands
+
+### `operator`
+
+```sh
+agentctl operator [--config <controller.json>]
+```
+
+Use this for the bounded read-only Controller Overview. It shows the projected
+aggregate health, separate worker/capacity/repository evidence, repositories in
+projection order, active runs before recent runs, and Controller-owned
+actionable attention with supporting attention evidence. Truncated collections
+always report displayed and total counts. Unknown future presentation codes
+remain visible instead of being silently classified. Status markers and color
+improve scanning but never replace the projected status text.
 
 ### `onboarding existing open`, `empty open`, `preflight`, `preview`, `start`, `show`, `cancel`, and `resume`
 

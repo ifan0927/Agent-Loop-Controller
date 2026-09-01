@@ -65,6 +65,72 @@ func OpenConfigurationAuthority(ctx context.Context, path, configPath string, ex
 	return openConfigurationAuthority(ctx, path, configPath, expected, allowUnbound, openPinnedStoreHooks{})
 }
 
+// OpenConfigurationAuthorityReadOnly proves an existing current
+// configuration/database binding and keeps every pooled connection in SQLite
+// query-only mode. It never creates, chmods, migrates, binds, or reconciles the
+// database.
+func OpenConfigurationAuthorityReadOnly(ctx context.Context, path, configPath string, expected application.DatabaseFileIdentity) (*Store, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || !filepath.IsAbs(configPath) || filepath.Clean(configPath) != configPath || !expected.Valid() {
+		return nil, errors.New("configuration database binding is invalid")
+	}
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, errors.New("configuration database binding is unsafe")
+	}
+	closeFile := true
+	defer func() {
+		if closeFile {
+			_ = file.Close()
+		}
+	}()
+	identity, err := safeDatabaseFileIdentity(file)
+	if err != nil || identity != expected {
+		return nil, errors.New("configuration database binding is unsafe")
+	}
+	if info, statErr := file.Stat(); statErr != nil || info.Mode().Perm() != 0o600 {
+		return nil, errors.New("configuration database binding is unsafe")
+	}
+
+	connector := &pinnedSQLiteConnector{driver: &moderncsqlite.Driver{}, dsn: pinnedSQLiteReadOnlyDSN(path), path: path, expected: identity}
+	db := sql.OpenDB(connector)
+	db.SetMaxOpenConns(1)
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		_ = db.Close()
+		return nil, errors.New("configuration authority store is unavailable")
+	}
+	closeDatabase := true
+	defer func() {
+		if closeDatabase {
+			_ = conn.Close()
+			_ = db.Close()
+		}
+	}()
+	if err := conn.QueryRowContext(ctx, `SELECT 1`).Scan(new(int)); err != nil {
+		return nil, errors.New("configuration authority store is unavailable")
+	}
+	connectionIdentity, err := sqliteConnectionFileIdentity(conn)
+	if err != nil || connectionIdentity != identity || !databasePathStillIdentifies(path, identity) {
+		return nil, errors.New("SQLite database identity changed while opening")
+	}
+	var version int
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil || version != schemaVersion {
+		return nil, errors.New("configuration authority schema is not current")
+	}
+	var boundConfig, boundDatabase string
+	if err := conn.QueryRowContext(ctx, `SELECT canonical_config_path,database_path FROM configuration_authority WHERE authority_id=1`).Scan(&boundConfig, &boundDatabase); err != nil || boundConfig != configPath || boundDatabase != path {
+		return nil, errors.New("configuration database binding conflicts")
+	}
+	if err := conn.Close(); err != nil {
+		return nil, err
+	}
+	if err := file.Close(); err != nil {
+		return nil, err
+	}
+	closeFile, closeDatabase = false, false
+	return &Store{db: db, databaseIdentity: identity}, nil
+}
+
 func openConfigurationAuthority(ctx context.Context, path, configPath string, expected application.DatabaseFileIdentity, allowUnbound bool, hooks openPinnedStoreHooks) (*Store, error) {
 	verify := func(db *sql.Conn) error {
 		var version int
@@ -576,6 +642,10 @@ func sqliteDSN(path string) string {
 
 func pinnedSQLiteDSN(path string) string {
 	return (&url.URL{Scheme: "file", Path: path}).String() + "?mode=rw&_pragma=query_only(1)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+}
+
+func pinnedSQLiteReadOnlyDSN(path string) string {
+	return (&url.URL{Scheme: "file", Path: path}).String() + "?mode=ro&_pragma=query_only(1)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
 }
 
 func safeDatabaseFileIdentity(file *os.File) (application.DatabaseFileIdentity, error) {
