@@ -75,6 +75,7 @@ func removeIntegrityV40(t *testing.T, db *sql.DB) {
 		}
 	}
 	for _, statement := range []string{
+		`DROP TABLE IF EXISTS repository_onboarding_step_claims`,
 		`DROP TABLE IF EXISTS cleanup_source_recovery_intents`,
 		`DROP TRIGGER IF EXISTS controller_integrity_finding_immutable_delete`,
 		`DROP TRIGGER IF EXISTS controller_integrity_finding_immutable_update`,
@@ -93,7 +94,7 @@ func removeIntegrityV40(t *testing.T, db *sql.DB) {
 		`DROP TABLE IF EXISTS integrity_registry_sources`,
 		`DROP TABLE IF EXISTS integrity_registry_families`,
 		`DROP TABLE IF EXISTS controller_integrity_generation`,
-		`DELETE FROM schema_migrations WHERE version IN (40,41,42,43,44,45,46,47)`,
+		`DELETE FROM schema_migrations WHERE version IN (40,41,42,43,44,45,46,47,48)`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			t.Fatal(err)

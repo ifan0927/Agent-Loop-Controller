@@ -291,7 +291,7 @@ func (s *Store) ResumeOnboarding(ctx context.Context, onboardingID string, at ti
 	if current.Status != domain.OnboardingWaitingForOperator {
 		return application.Onboarding{}, false, application.ErrOnboardingConflict
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE repository_onboarding_steps SET attempt_number=attempt_number+1,status='intended',outcome='pending',reason_code='',evidence_digest='',intended_at=?,observed_at='' WHERE onboarding_id=? AND step_order=? AND status='observed' AND outcome IN ('failed','pending')`, formatTime(at), onboardingID, currentStepIndex(ctx, tx, onboardingID)+1)
+	result, err := tx.ExecContext(ctx, `UPDATE repository_onboarding_steps SET attempt_number=attempt_number+1,status='intended',outcome='pending',reason_code='',evidence_digest='',intended_at=?,observed_at='' WHERE onboarding_id=? AND step_order=? AND status='observed' AND outcome IN ('failed','pending') AND NOT EXISTS(SELECT 1 FROM repository_onboarding_step_claims c WHERE c.onboarding_id=repository_onboarding_steps.onboarding_id AND c.step_name=repository_onboarding_steps.step_name AND c.attempt_number=repository_onboarding_steps.attempt_number AND c.status='active')`, formatTime(at), onboardingID, currentStepIndex(ctx, tx, onboardingID)+1)
 	if err != nil {
 		return application.Onboarding{}, false, err
 	}
@@ -309,50 +309,135 @@ func (s *Store) ResumeOnboarding(ctx context.Context, onboardingID string, at ti
 	return updated, true, commitOrError(tx, err)
 }
 
-func (s *Store) BeginOnboardingStep(ctx context.Context, input application.OnboardingStepIntent) (bool, error) {
-	if input.OnboardingID == "" || !validConfigurationDigest(input.IntentDigest) || input.IntendedAt.IsZero() {
-		return false, errors.New("onboarding step intent is invalid")
+func (s *Store) AcquireOnboardingStepClaim(ctx context.Context, request application.OnboardingStepClaimRequest) (application.OnboardingStepClaimResult, error) {
+	input, authority := request.Intent, request.Authority
+	if input.OnboardingID == "" || !validConfigurationDigest(input.IntentDigest) || input.IntendedAt.IsZero() || !validOnboardingClaimComponent(authority.SupervisorID) || !validOnboardingClaimComponent(authority.ExecutionNonce) {
+		return application.OnboardingStepClaimResult{}, errors.New("onboarding step claim request is invalid")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	if !s.authorizedSupervisorOwner(authority.SupervisorID) {
+		return application.OnboardingStepClaimResult{}, application.ErrOnboardingConflict
+	}
+	conn, err := s.db.Conn(ctx)
 	if err != nil {
-		return false, err
+		return application.OnboardingStepClaimResult{}, err
 	}
-	defer tx.Rollback()
-	current, found, err := onboardingByID(ctx, tx, input.OnboardingID)
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return application.OnboardingStepClaimResult{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		}
+	}()
+	commit := func(result application.OnboardingStepClaimResult) (application.OnboardingStepClaimResult, error) {
+		if _, commitErr := conn.ExecContext(ctx, `COMMIT`); commitErr != nil {
+			return application.OnboardingStepClaimResult{}, commitErr
+		}
+		committed = true
+		return result, nil
+	}
+	current, found, err := onboardingByID(ctx, conn, input.OnboardingID)
 	if err != nil || !found {
-		return false, application.ErrOnboardingNotFound
+		return application.OnboardingStepClaimResult{}, application.ErrOnboardingNotFound
 	}
 	order := onboardingStepOrder(current.Kind, input.Step)
-	if order == 0 {
-		return false, application.ErrOnboardingConflict
+	if order == 0 || current.Status != domain.OnboardingAccepted && current.Status != domain.OnboardingRunning || currentStepIndex(ctx, conn, input.OnboardingID)+1 != order {
+		return application.OnboardingStepClaimResult{}, application.ErrOnboardingConflict
 	}
-	if current.Status != domain.OnboardingAccepted && current.Status != domain.OnboardingRunning || currentStepIndex(ctx, tx, input.OnboardingID)+1 != order {
-		return false, application.ErrOnboardingConflict
-	}
-	var digest, status string
+	var intentDigest, stepStatus string
 	var attempt int64
-	err = tx.QueryRowContext(ctx, `SELECT intent_digest,status,attempt_number FROM repository_onboarding_steps WHERE onboarding_id=? AND step_name=?`, input.OnboardingID, string(input.Step)).Scan(&digest, &status, &attempt)
-	if err == nil {
-		if digest == input.IntentDigest && status == "intended" && attempt > 0 {
-			return false, tx.Commit()
+	err = conn.QueryRowContext(ctx, `SELECT intent_digest,status,attempt_number FROM repository_onboarding_steps WHERE onboarding_id=? AND step_name=?`, input.OnboardingID, string(input.Step)).Scan(&intentDigest, &stepStatus, &attempt)
+	if errors.Is(err, sql.ErrNoRows) {
+		attempt = 1
+		if _, err := conn.ExecContext(ctx, `INSERT INTO repository_onboarding_steps(onboarding_id,step_name,step_order,intent_digest,status,outcome,intended_at,attempt_number) VALUES(?,?,?,?,'intended','pending',?,?)`, input.OnboardingID, string(input.Step), order, input.IntentDigest, formatTime(input.IntendedAt), attempt); err != nil {
+			return application.OnboardingStepClaimResult{}, application.ErrOnboardingConflict
 		}
-		return false, application.ErrOnboardingConflict
+		if _, err := conn.ExecContext(ctx, `UPDATE repository_onboardings SET status='running',updated_at=? WHERE onboarding_id=?`, formatTime(input.IntendedAt), input.OnboardingID); err != nil {
+			return application.OnboardingStepClaimResult{}, err
+		}
+		intentDigest, stepStatus = input.IntentDigest, "intended"
+	} else if err != nil {
+		return application.OnboardingStepClaimResult{}, err
+	}
+	if intentDigest != input.IntentDigest || stepStatus != "intended" || attempt < 1 {
+		return application.OnboardingStepClaimResult{}, application.ErrOnboardingConflict
+	}
+
+	var active application.OnboardingStepClaimToken
+	var activeStatus string
+	err = conn.QueryRowContext(ctx, `SELECT onboarding_id,step_name,attempt_number,intent_digest,supervisor_id,execution_nonce,claim_version,claim_digest,status FROM repository_onboarding_step_claims WHERE onboarding_id=? AND step_name=? AND attempt_number=? AND status='active'`, input.OnboardingID, string(input.Step), attempt).Scan(&active.OnboardingID, &active.Step, &active.AttemptNumber, &active.IntentDigest, &active.SupervisorID, &active.ExecutionNonce, &active.ClaimVersion, &active.ClaimDigest, &activeStatus)
+	if err == nil {
+		expected := onboardingStepClaimDigest(active.OnboardingID, active.Step, active.AttemptNumber, active.IntentDigest, active.SupervisorID, active.ExecutionNonce, active.ClaimVersion)
+		if activeStatus != "active" || active.ClaimDigest != expected {
+			return application.OnboardingStepClaimResult{}, application.ErrOnboardingConflict
+		}
+		if active.SupervisorID == authority.SupervisorID {
+			if active.ExecutionNonce == authority.ExecutionNonce {
+				return commit(application.OnboardingStepClaimResult{Classification: application.OnboardingStepClaimReplayed, Claim: active})
+			}
+			return commit(application.OnboardingStepClaimResult{Classification: application.OnboardingStepClaimBusy})
+		}
+		claimedAt := formatTime(input.IntendedAt)
+		result, err := conn.ExecContext(ctx, `UPDATE repository_onboarding_step_claims SET status='superseded',superseded_at=? WHERE onboarding_id=? AND step_name=? AND attempt_number=? AND claim_version=? AND claim_digest=? AND status='active'`, claimedAt, active.OnboardingID, string(active.Step), active.AttemptNumber, active.ClaimVersion, active.ClaimDigest)
+		if err != nil {
+			return application.OnboardingStepClaimResult{}, err
+		}
+		if changed, _ := result.RowsAffected(); changed != 1 {
+			return application.OnboardingStepClaimResult{}, application.ErrOnboardingConflict
+		}
+		claim := newOnboardingStepClaim(input, authority, attempt, active.ClaimVersion+1)
+		if err := insertOnboardingStepClaim(ctx, conn, claim, claimedAt); err != nil {
+			return application.OnboardingStepClaimResult{}, err
+		}
+		return commit(application.OnboardingStepClaimResult{Classification: application.OnboardingStepClaimAdopted, Claim: claim})
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return false, err
+		return application.OnboardingStepClaimResult{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO repository_onboarding_steps(onboarding_id,step_name,step_order,intent_digest,status,outcome,intended_at,attempt_number) VALUES(?,?,?,?,'intended','pending',?,1)`, input.OnboardingID, string(input.Step), order, input.IntentDigest, formatTime(input.IntendedAt)); err != nil {
-		return false, application.ErrOnboardingConflict
+	var historical int64
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(MAX(claim_version),0) FROM repository_onboarding_step_claims WHERE onboarding_id=? AND step_name=? AND attempt_number=?`, input.OnboardingID, string(input.Step), attempt).Scan(&historical); err != nil {
+		return application.OnboardingStepClaimResult{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE repository_onboardings SET status='running',updated_at=? WHERE onboarding_id=?`, formatTime(input.IntendedAt), input.OnboardingID); err != nil {
-		return false, err
+	if historical != 0 {
+		return application.OnboardingStepClaimResult{}, application.ErrOnboardingConflict
 	}
-	return true, tx.Commit()
+	claim := newOnboardingStepClaim(input, authority, attempt, 1)
+	if err := insertOnboardingStepClaim(ctx, conn, claim, formatTime(input.IntendedAt)); err != nil {
+		return application.OnboardingStepClaimResult{}, err
+	}
+	return commit(application.OnboardingStepClaimResult{Classification: application.OnboardingStepClaimAcquired, Claim: claim})
+}
+
+func newOnboardingStepClaim(input application.OnboardingStepIntent, authority application.OnboardingExecutionAuthority, attempt, version int64) application.OnboardingStepClaimToken {
+	claim := application.OnboardingStepClaimToken{OnboardingID: input.OnboardingID, Step: input.Step, AttemptNumber: attempt, IntentDigest: input.IntentDigest, SupervisorID: authority.SupervisorID, ExecutionNonce: authority.ExecutionNonce, ClaimVersion: version}
+	claim.ClaimDigest = onboardingStepClaimDigest(claim.OnboardingID, claim.Step, claim.AttemptNumber, claim.IntentDigest, claim.SupervisorID, claim.ExecutionNonce, claim.ClaimVersion)
+	return claim
+}
+
+func insertOnboardingStepClaim(ctx context.Context, executor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, claim application.OnboardingStepClaimToken, claimedAt string) error {
+	_, err := executor.ExecContext(ctx, `INSERT INTO repository_onboarding_step_claims(onboarding_id,step_name,attempt_number,claim_version,supervisor_id,execution_nonce,intent_digest,claim_digest,status,claimed_at) VALUES(?,?,?,?,?,?,?,?,'active',?)`, claim.OnboardingID, string(claim.Step), claim.AttemptNumber, claim.ClaimVersion, claim.SupervisorID, claim.ExecutionNonce, claim.IntentDigest, claim.ClaimDigest, claimedAt)
+	return err
+}
+
+func onboardingStepClaimDigest(onboardingID string, step domain.OnboardingStep, attempt int64, intentDigest, supervisorID, executionNonce string, version int64) string {
+	return digestBytes([]byte(fmt.Sprintf("onboarding-step-claim-v1\x00%s\x00%s\x00%d\x00%s\x00%s\x00%s\x00%d", onboardingID, step, attempt, intentDigest, supervisorID, executionNonce, version)))
+}
+
+func validOnboardingClaimComponent(value string) bool {
+	return strings.TrimSpace(value) != "" && len(value) <= 128 && !strings.ContainsRune(value, '\x00')
 }
 
 func (s *Store) SettleOnboardingStep(ctx context.Context, input application.OnboardingStepSettlement) (application.Onboarding, error) {
-	if input.OnboardingID == "" || input.ObservedAt.IsZero() || !validConfigurationDigest(input.Observation.EvidenceDigest) || input.Observation.Outcome == application.OperationOutcomePending && input.Observation.ReasonCode == "" {
+	claim := input.Claim
+	if input.OnboardingID == "" || input.ObservedAt.IsZero() || !validConfigurationDigest(input.Observation.EvidenceDigest) || input.Observation.Outcome == application.OperationOutcomePending && input.Observation.ReasonCode == "" || claim.OnboardingID != input.OnboardingID || claim.Step != input.Step || claim.AttemptNumber < 1 || claim.ClaimVersion < 1 || !validConfigurationDigest(claim.IntentDigest) || !validConfigurationDigest(claim.ClaimDigest) || !validOnboardingClaimComponent(claim.SupervisorID) || !validOnboardingClaimComponent(claim.ExecutionNonce) {
 		return application.Onboarding{}, errors.New("onboarding step settlement is invalid")
+	}
+	if claim.ClaimDigest != onboardingStepClaimDigest(claim.OnboardingID, claim.Step, claim.AttemptNumber, claim.IntentDigest, claim.SupervisorID, claim.ExecutionNonce, claim.ClaimVersion) {
+		return application.Onboarding{}, application.ErrOnboardingConflict
 	}
 	if input.Observation.LinearLabelID != "" && (input.Step != domain.OnboardingStepLinearLabelObserved || len(input.Observation.LinearLabelID) > 128 || strings.ContainsRune(input.Observation.LinearLabelID, '\x00')) || input.Step == domain.OnboardingStepLinearLabelObserved && input.Observation.Outcome == application.OperationOutcomeSucceeded && input.Observation.LinearLabelID == "" {
 		return application.Onboarding{}, errors.New("onboarding label settlement is invalid")
@@ -376,21 +461,35 @@ func (s *Store) SettleOnboardingStep(ctx context.Context, input application.Onbo
 	if input.Step == domain.OnboardingStepInitialBasePublished && input.Observation.Outcome == application.OperationOutcomeSucceeded && !validOnboardingSHA(current.InitialRevisionSHA) {
 		return application.Onboarding{}, application.ErrOnboardingConflict
 	}
-	var status, outcome, evidence string
+	var status, outcome, evidence, intentDigest string
 	var attempt int64
-	if err := tx.QueryRowContext(ctx, `SELECT status,outcome,evidence_digest,attempt_number FROM repository_onboarding_steps WHERE onboarding_id=? AND step_name=? AND step_order=?`, input.OnboardingID, string(input.Step), order).Scan(&status, &outcome, &evidence, &attempt); err != nil || attempt < 1 {
+	if err := tx.QueryRowContext(ctx, `SELECT status,outcome,evidence_digest,attempt_number,intent_digest FROM repository_onboarding_steps WHERE onboarding_id=? AND step_name=? AND step_order=?`, input.OnboardingID, string(input.Step), order).Scan(&status, &outcome, &evidence, &attempt, &intentDigest); err != nil || attempt < 1 {
+		return application.Onboarding{}, application.ErrOnboardingConflict
+	}
+	if attempt != claim.AttemptNumber || intentDigest != claim.IntentDigest {
+		return application.Onboarding{}, application.ErrOnboardingConflict
+	}
+	var claimStatus, storedIntent, storedSupervisor, storedExecution, storedDigest string
+	if err := tx.QueryRowContext(ctx, `SELECT status,intent_digest,supervisor_id,execution_nonce,claim_digest FROM repository_onboarding_step_claims WHERE onboarding_id=? AND step_name=? AND attempt_number=? AND claim_version=?`, claim.OnboardingID, string(claim.Step), claim.AttemptNumber, claim.ClaimVersion).Scan(&claimStatus, &storedIntent, &storedSupervisor, &storedExecution, &storedDigest); err != nil || storedIntent != claim.IntentDigest || storedSupervisor != claim.SupervisorID || storedExecution != claim.ExecutionNonce || storedDigest != claim.ClaimDigest {
 		return application.Onboarding{}, application.ErrOnboardingConflict
 	}
 	if status == "observed" {
-		if outcome == string(input.Observation.Outcome) && evidence == input.Observation.EvidenceDigest {
+		if claimStatus == "settled" && outcome == string(input.Observation.Outcome) && evidence == input.Observation.EvidenceDigest {
 			return current, tx.Commit()
 		}
 		return application.Onboarding{}, application.ErrOnboardingConflict
 	}
-	if status != "intended" || currentStepIndex(ctx, tx, input.OnboardingID)+1 != order {
+	if status != "intended" || claimStatus != "active" || currentStepIndex(ctx, tx, input.OnboardingID)+1 != order {
 		return application.Onboarding{}, application.ErrOnboardingConflict
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE repository_onboarding_steps SET status='observed',outcome=?,reason_code=?,evidence_digest=?,observed_at=? WHERE onboarding_id=? AND step_name=? AND status='intended' AND attempt_number=?`, string(input.Observation.Outcome), input.Observation.ReasonCode, input.Observation.EvidenceDigest, formatTime(input.ObservedAt), input.OnboardingID, string(input.Step), attempt)
+	result, err := tx.ExecContext(ctx, `UPDATE repository_onboarding_steps SET status='observed',outcome=?,reason_code=?,evidence_digest=?,observed_at=? WHERE onboarding_id=? AND step_name=? AND status='intended' AND attempt_number=? AND intent_digest=?`, string(input.Observation.Outcome), input.Observation.ReasonCode, input.Observation.EvidenceDigest, formatTime(input.ObservedAt), input.OnboardingID, string(input.Step), attempt, claim.IntentDigest)
+	if err != nil {
+		return application.Onboarding{}, err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return application.Onboarding{}, application.ErrOnboardingConflict
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE repository_onboarding_step_claims SET status='settled',settled_at=? WHERE onboarding_id=? AND step_name=? AND attempt_number=? AND claim_version=? AND supervisor_id=? AND execution_nonce=? AND intent_digest=? AND claim_digest=? AND status='active'`, formatTime(input.ObservedAt), claim.OnboardingID, string(claim.Step), claim.AttemptNumber, claim.ClaimVersion, claim.SupervisorID, claim.ExecutionNonce, claim.IntentDigest, claim.ClaimDigest)
 	if err != nil {
 		return application.Onboarding{}, err
 	}

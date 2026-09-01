@@ -605,6 +605,15 @@ that the prior supervisor exited. The worker retains one
 admission/poll supervisor beyond heavy capacity so waiting runs cannot starve an
 idle repository.
 
+The same process-lock-backed store-handle binding fences onboarding execution.
+Every bounded dispatch invocation has one fresh execution nonce. Before an
+adapter runs, SQLite atomically persists the step intent and one active claim
+bound to the onboarding, step, attempt, intent digest, worker instance, nonce,
+and monotonic claim version. A sibling dispatch under the same live worker
+observes the active claim as busy and scans the next deterministic onboarding.
+Only a newly process-locked worker may supersede a prior worker's claim and
+adopt the same attempt; claims never expire by wall clock.
+
 Integrity maintenance is owned by the outer bounded worker, not by an
 individual concurrent dispatch. Once any member of the current bounded batch
 returns, the worker stops refilling, lets every existing sibling finish without
@@ -1852,6 +1861,17 @@ matching local checkout and GitHub origin without rewriting user-owned Git
 state. Partial progress is resumed or reconciled; external resources are not
 destructively rolled back by implication.
 
+Onboarding step-claim rows retain the complete fencing history as `active`,
+`superseded`, or `settled` evidence. Creating a new intent and its first claim
+is one transaction. Adapter settlement compares the complete active token and
+settles that claim in the same transaction as the step observation, onboarding
+state, activity event, and applicable operation receipt. A stale worker,
+execution nonce, claim version, attempt, step, or intent cannot settle. Restart
+adoption does not increment the attempt or assert that an external effect
+succeeded; the adopter must use the existing step-specific observation and
+reconciliation path. Only operator `resume` after a settled failed or pending
+observation advances the attempt.
+
 Both implemented kinds persist only sanitized path and observation digests in
 SQLite. Before configuration apply, an existing checkout path or derived
 managed source path remains only in a private Controller-owned, closed
@@ -1909,7 +1929,7 @@ around it. The principal table groups are:
 | configuration generation, authority, apply/recovery-intent, and convergence tables | Immutable desired/effective metadata, one Controller-wide CAS mutation authority, crash reconciliation state, optional immutable rollback-source identity, and meaningful sanitized transitions; raw desired bytes remain outside SQLite and external bytes are never stored |
 | `configuration_drafts` | At most one active Controller-wide normal or rollback-origin typed draft, revision/edit replay authority, immutable rollback source when applicable, sanitized validation/preview evidence, and generation/receipt settlement; no raw candidate, path, identity, or credential authority |
 | repository lifecycle, readiness, recheck, and removal tables | Immutable incarnation history, one current canonical/profile/binding authority, complete readiness evidence, exclusive source-bound removal draft and accepted/applied/observed settlement, and tombstone evidence; no external-resource deletion authority |
-| repository onboarding and onboarding-step tables | One active canonical repository/source-path digest, one of two closed kind-specific step plans, a positive durable current-step attempt, sanitized preflight/preview bindings and exact initial SHA, ordered intent-before-effect settlements, monotonic partial-progress recovery, and final disabled incarnation/readiness evidence; exact source paths and raw Git/remote output remain outside SQLite |
+| repository onboarding, onboarding-step, and step-claim tables | One active canonical repository/source-path digest, one of two closed kind-specific step plans, a positive durable current-step attempt, one active versioned execution claim per step attempt, retained supersession/settlement history, sanitized preflight/preview bindings and exact initial SHA, ordered intent-before-effect settlements, monotonic partial-progress recovery, and final disabled incarnation/readiness evidence; supervisor IDs, execution nonces, claim digests, exact source paths, and raw Git/remote output remain outside public projections |
 
 ### Current state versus evidence
 
@@ -1946,7 +1966,9 @@ override a newer failed/interrupted batch or later candidate.
 Run leases fence concurrent local controllers during long child processes. A
 short global lease serializes only admission decisions; repository slots fence
 nonterminal work per immutable binding, and heavy permits fence generic local
-execution capacity. Each authority has a separate version for CAS. Expected
+execution capacity. Onboarding step claims are non-expiring execution fences,
+not leases; process-lock-backed supervisor replacement is their only takeover
+authority. Each authority has a separate version for CAS. Expected
 state and idempotency keys provide application-level CAS. Unique side-effect,
 resource, PR, feedback, and reply identities make replay deterministic.
 
@@ -1959,6 +1981,10 @@ re-reads external state where necessary. It resumes only the same admitted run
 and implementation session. Missing, mutated, globally ambiguous, or
 contradictory evidence creates a fail-closed fence rather than reconstruction by
 guesswork.
+For onboarding, the newly process-locked supervisor adopts an interrupted
+active claim at the next fencing version and reconciles the existing intent on
+the same attempt. Claim adoption alone is never external-success evidence, and
+there is no manual unlock or time-expiry takeover.
 
 ## 11. Recovery and Idempotency
 

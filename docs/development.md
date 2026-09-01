@@ -441,6 +441,10 @@ controller process. Cover at least:
 - push, PR create/adopt, review reply, and merge intent/observation;
 - pending CI/approval/thread resolution polling;
 - Linear completion observation;
+- onboarding claim acquisition/replay, same-supervisor contention,
+  process-locked replacement adoption, external effect, and exact-token
+  settlement, including cuts before effect, after effect, before settlement,
+  and after settlement;
 - source sync and each cleanup resource.
 - terminal cleanup source relocation acceptance, operation-state rejection,
   worktree-link repair, post-repair proof, durable owned-worktree HEAD detach,
@@ -468,8 +472,16 @@ that bypass safety solely to make fault injection easier.
 ## Database Migrations
 
 SQLite migrations are ordered in `internal/adapters/sqlite/store.go`; the current
-schema version is 47. Opening a database applies missing forward migrations in a
+schema version is 48. Opening a database applies missing forward migrations in a
 transaction. A database newer than the binary fails closed.
+
+The v47-to-v48 migration adds history-retaining onboarding step claims without
+backfilling ownership for historical observations. An existing unobserved
+intent remains on its current attempt and is claimable by the first
+process-lock-bound worker. Fresh and migrated databases must enforce one active
+claim per step attempt, exact replay, same-supervisor contention, fenced
+adoption, exact-token settlement, integrity mutation tracking, and old-binary
+forward rejection.
 
 The v46-to-v47 fixture preserves every positive lifecycle-baseline column and
 all related evidence while rebuilding only the baseline count constraint and

@@ -30,7 +30,7 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-const schemaVersion = 47
+const schemaVersion = 48
 
 // SupportedSchemaVersion is the single maintained source for the newest
 // Controller database schema understood by this binary.
@@ -44,10 +44,10 @@ const (
 )
 
 type Store struct {
-	db                   *sql.DB
-	databaseIdentity     application.DatabaseFileIdentity
-	heavySupervisorMu    sync.RWMutex
-	heavySupervisorOwner string
+	db               *sql.DB
+	databaseIdentity application.DatabaseFileIdentity
+	supervisorMu     sync.RWMutex
+	supervisorOwner  string
 }
 
 func Open(path string) (*Store, error) {
@@ -928,6 +928,8 @@ func migrateSQLiteGeneric(ctx context.Context, db sqliteTransactioner, supported
 			statements = migrationV46
 		case 47:
 			statements = migrationV47
+		case 48:
+			statements = migrationV48
 		default:
 			return fmt.Errorf("missing migration version %d", version)
 		}
@@ -2144,7 +2146,7 @@ var integritySourceFamilies = map[application.IntegrityFamily][]string{
 		"repository_lifecycle_baseline", "repository_lifecycles", "repository_readiness_snapshots",
 		"repository_readiness_dimensions", "repository_recheck_attempts", "repository_recheck_observations",
 		"repository_removal_drafts", "repository_removal_intents", "repository_onboardings",
-		"repository_onboarding_path_claims", "repository_onboarding_steps",
+		"repository_onboarding_path_claims", "repository_onboarding_steps", "repository_onboarding_step_claims",
 	},
 	application.IntegritySchedulingAdmission: {
 		"linear_todo_admission_lease", "linear_todo_admission_journal", "heavy_capacity_authority",
@@ -2247,7 +2249,7 @@ func integrityMigrationV40() []string {
 			// This source is introduced by schema v45. Its registry row and
 			// mutation triggers are installed by that migration so fresh schema
 			// creation does not reference a future table while applying v40.
-			if table == "cleanup_source_recovery_intents" {
+			if table == "cleanup_source_recovery_intents" || table == "repository_onboarding_step_claims" {
 				continue
 			}
 			statements = append(statements, fmt.Sprintf(`INSERT INTO integrity_registry_sources(registry_version,family,table_name) VALUES('v1','%s','%s')`, family, table))
@@ -2312,6 +2314,51 @@ var migrationV46 = []string{
 }
 
 var migrationV47 = repositoryLifecycleBaselineMigrationV47()
+
+var migrationV48 = onboardingStepClaimsMigrationV48()
+
+func onboardingStepClaimsMigrationV48() []string {
+	statements := []string{
+		`CREATE TABLE repository_onboarding_step_claims (
+			onboarding_id TEXT NOT NULL,
+			step_name TEXT NOT NULL,
+			attempt_number INTEGER NOT NULL CHECK(attempt_number>0),
+			claim_version INTEGER NOT NULL CHECK(claim_version>0),
+			supervisor_id TEXT NOT NULL CHECK(length(supervisor_id) BETWEEN 1 AND 128 AND instr(supervisor_id,char(0))=0),
+			execution_nonce TEXT NOT NULL CHECK(length(execution_nonce) BETWEEN 1 AND 128 AND instr(execution_nonce,char(0))=0),
+			intent_digest TEXT NOT NULL CHECK(length(intent_digest)=64),
+			claim_digest TEXT NOT NULL CHECK(length(claim_digest)=64),
+			status TEXT NOT NULL CHECK(status IN ('active','superseded','settled')),
+			claimed_at TEXT NOT NULL,
+			superseded_at TEXT NOT NULL DEFAULT '',
+			settled_at TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY(onboarding_id,step_name,attempt_number,claim_version),
+			UNIQUE(onboarding_id,step_name,attempt_number,supervisor_id,execution_nonce),
+			FOREIGN KEY(onboarding_id,step_name) REFERENCES repository_onboarding_steps(onboarding_id,step_name),
+			CHECK((status='active' AND superseded_at='' AND settled_at='') OR
+				(status='superseded' AND superseded_at<>'' AND settled_at='') OR
+				(status='settled' AND superseded_at='' AND settled_at<>''))
+		)`,
+		`CREATE UNIQUE INDEX repository_onboarding_one_active_step_claim
+			ON repository_onboarding_step_claims(onboarding_id,step_name,attempt_number) WHERE status='active'`,
+		`CREATE TRIGGER repository_onboarding_step_claim_transition BEFORE UPDATE ON repository_onboarding_step_claims
+			WHEN OLD.onboarding_id<>NEW.onboarding_id OR OLD.step_name<>NEW.step_name OR OLD.attempt_number<>NEW.attempt_number OR OLD.claim_version<>NEW.claim_version OR OLD.supervisor_id<>NEW.supervisor_id OR OLD.execution_nonce<>NEW.execution_nonce OR OLD.intent_digest<>NEW.intent_digest OR OLD.claim_digest<>NEW.claim_digest OR OLD.claimed_at<>NEW.claimed_at OR OLD.status<>'active' OR NEW.status NOT IN ('superseded','settled')
+			BEGIN SELECT RAISE(ABORT,'onboarding step claim transition is invalid'); END`,
+		`CREATE TRIGGER repository_onboarding_step_claim_retain BEFORE DELETE ON repository_onboarding_step_claims
+			BEGIN SELECT RAISE(ABORT,'onboarding step claim history is immutable'); END`,
+		`INSERT INTO integrity_registry_sources(registry_version,family,table_name)
+			VALUES('v1','repository_onboarding','repository_onboarding_step_claims')`,
+	}
+	for _, operation := range []string{"INSERT", "UPDATE", "DELETE"} {
+		statements = append(statements, fmt.Sprintf(`CREATE TRIGGER integrity_track_repository_onboarding_step_claims_%s AFTER %s ON repository_onboarding_step_claims BEGIN
+			UPDATE controller_integrity_generation SET generation=generation+1,updated_at=CURRENT_TIMESTAMP WHERE singleton=1;
+			INSERT INTO controller_integrity_scope_revisions(family,scope_kind,scope_id,revision_generation,updated_at)
+			SELECT 'repository_onboarding','controller','local-controller',generation,CURRENT_TIMESTAMP FROM controller_integrity_generation WHERE singleton=1
+			ON CONFLICT(family,scope_kind,scope_id) DO UPDATE SET revision_generation=excluded.revision_generation,updated_at=excluded.updated_at;
+		END`, strings.ToLower(operation), operation))
+	}
+	return statements
+}
 
 func repositoryLifecycleBaselineMigrationV47() []string {
 	statements := []string{

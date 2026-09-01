@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -50,7 +51,7 @@ func TestWorkerDispatchLeavesIntegrityMaintenanceToBoundedBoundary(t *testing.T)
 	dispatch := onboardingWorkerDispatch(store, nil, func(context.Context) (application.LinearTodoDispatchResult, error) {
 		fallbackCalled = true
 		return application.LinearTodoDispatchResult{Outcome: application.LinearTodoDispatchNoCandidate, ScanDigest: strings.Repeat("a", 64)}, nil
-	})
+	}, "fixture-worker")
 	result, err := dispatch(context.Background())
 	if err != nil || !fallbackCalled || result.Outcome != application.LinearTodoDispatchNoCandidate {
 		t.Fatalf("result=%+v fallback=%t err=%v", result, fallbackCalled, err)
@@ -65,6 +66,70 @@ type countingOnboardingContinuer struct {
 	calls  int
 	id     string
 	status domain.OnboardingStatus
+}
+
+type scanningOnboardingContinuer struct {
+	mu          sync.Mutex
+	busyID      string
+	calls       []string
+	authorities []application.OnboardingExecutionAuthority
+}
+
+func (c *scanningOnboardingContinuer) Continue(_ context.Context, onboardingID string, authority application.OnboardingExecutionAuthority) (application.Onboarding, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls = append(c.calls, onboardingID)
+	c.authorities = append(c.authorities, authority)
+	if onboardingID == c.busyID {
+		return application.Onboarding{OnboardingID: onboardingID, Status: domain.OnboardingRunning}, application.ErrOnboardingClaimBusy
+	}
+	return application.Onboarding{OnboardingID: onboardingID, Status: domain.OnboardingRunning}, nil
+}
+
+type blockingOnboardingExecutor struct {
+	entered chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	calls   int
+}
+
+func (e *blockingOnboardingExecutor) ExecuteOnboardingStep(_ context.Context, onboarding application.Onboarding, _ domain.RepositoryOnboardingInput, step domain.OnboardingStep) (application.OnboardingStepObservation, error) {
+	e.mu.Lock()
+	e.calls++
+	e.mu.Unlock()
+	select {
+	case e.entered <- struct{}{}:
+	default:
+	}
+	<-e.release
+	return application.OnboardingStepObservation{Outcome: application.OperationOutcomePending, ReasonCode: "fixture_pending", EvidenceDigest: application.ConfigurationEvidenceDigest("blocking-onboarding", onboarding.OnboardingID, string(step))}, nil
+}
+
+func (e *blockingOnboardingExecutor) callCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls
+}
+
+func seedWorkerRunnableOnboarding(t *testing.T, store *sqlitestore.Store, id, repository string, requester domain.GitHubUserIdentity, at time.Time) application.Onboarding {
+	t.Helper()
+	digest := func(parts ...string) string {
+		return application.ConfigurationEvidenceDigest(append([]string{"worker-runnable-fixture"}, parts...)...)
+	}
+	opened, _, err := store.OpenOnboarding(context.Background(), application.OnboardingOpenInput{OnboardingID: id, Kind: domain.OnboardingExistingCheckout, CanonicalRepository: repository, Requester: requester, PrivateInputDigest: digest(id, "private"), SourcePathDigest: digest(id, "source"), SourceAncestorDigests: []string{digest(id, "source")}, RequestDigest: digest(id, "request"), ConfigurationBaseGenerationID: 1, ConfigurationBaseDigest: digest(id, "base"), ConfigurationAuthorityVersion: 1, OpenedAt: at})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := store.SaveOnboardingPreflight(context.Background(), application.OnboardingPreflightInput{OnboardingID: id, ExpectedStatus: opened.Status, PreflightDigest: digest(id, "preflight"), EvidenceDigest: digest(id, "preflight-evidence"), ObservedAt: at.Add(time.Second)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := application.NewOperationReceipt(application.OperationReceiptInput{OperationType: application.OperationOnboardRepository, Scope: application.ScopeOnboarding, TargetID: id, Requester: requester, RequestDigest: opened.RequestDigest, ExpectedAuthorityDigest: opened.ConfigurationBaseDigest, OperationAnchorDigest: digest(id, "anchor"), TargetBindingDigest: digest(id, "binding"), AcceptedAt: at.Add(2 * time.Second)})
+	started, _, _, err := store.StartOnboarding(context.Background(), application.OnboardingStartAcceptance{OnboardingID: id, Expected: ready, PreflightDigest: ready.PreflightDigest, PreviewDigest: digest(id, "preview"), Profile: application.LocalRepository{CanonicalRepository: repository}, Receipt: receipt, AcceptedAt: receipt.AcceptedAt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return started
 }
 
 type workerOnboardingPrivateStore struct {
@@ -100,7 +165,7 @@ func (e *workerOnboardingExecutor) ExecuteOnboardingStep(_ context.Context, _ ap
 	return application.OnboardingStepObservation{Outcome: outcome, ReasonCode: "fixture_external_observation", EvidenceDigest: application.ConfigurationEvidenceDigest("worker-onboarding-attempt", strconv.Itoa(e.calls))}, nil
 }
 
-func (c *countingOnboardingContinuer) Continue(_ context.Context, onboardingID string) (application.Onboarding, error) {
+func (c *countingOnboardingContinuer) Continue(_ context.Context, onboardingID string, _ application.OnboardingExecutionAuthority) (application.Onboarding, error) {
 	c.calls++
 	if onboardingID != c.id {
 		return application.Onboarding{}, errors.New("unexpected onboarding identity")
@@ -159,7 +224,7 @@ func TestDisabledWorkerSerializesRunnableOnboardingWithoutAdmissionFallback(t *t
 	dispatch := onboardingWorkerDispatch(store, continuer, func(context.Context) (application.LinearTodoDispatchResult, error) {
 		fallbackCalls++
 		return application.LinearTodoDispatchResult{}, errors.New("normal admission fallback was called")
-	})
+	}, "disabled-worker")
 	result, err := runBoundedAdmissionWorkerAtObserved(ctx, true, time.Minute, automaticWorkerCapacity(configured, false), dispatch, waitAdmissionWorker, func() time.Time { return now.Add(5 * time.Second) }, nil)
 	if err != nil || result.Stopped != "once" || result.LastOutcome != application.RuntimeCycleOnboardingRunning || continuer.calls != 1 || fallbackCalls != 0 {
 		t.Fatalf("result=%+v onboarding_calls=%d fallback_calls=%d err=%v", result, continuer.calls, fallbackCalls, err)
@@ -167,6 +232,90 @@ func TestDisabledWorkerSerializesRunnableOnboardingWithoutAdmissionFallback(t *t
 	continuer.status = domain.OnboardingOpened
 	if _, err := dispatch(ctx); err == nil || err.Error() != "onboarding worker returned an invalid status" || fallbackCalls != 0 {
 		t.Fatalf("invalid status err=%v fallback_calls=%d", err, fallbackCalls)
+	}
+}
+
+func TestWorkerDispatchSkipsBusyOnboardingAndUsesFreshInvocationNonce(t *testing.T) {
+	store, err := sqlitestore.Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	requester := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
+	now := time.Date(2026, 9, 1, 5, 0, 0, 0, time.UTC)
+	seedWorkerRunnableOnboarding(t, store, "onboarding-busy-first", "owner/busy", requester, now)
+	seedWorkerRunnableOnboarding(t, store, "onboarding-available-second", "owner/available", requester, now.Add(time.Minute))
+	continuer := &scanningOnboardingContinuer{busyID: "onboarding-busy-first"}
+	fallbackCalls := 0
+	dispatch := onboardingWorkerDispatch(store, continuer, func(context.Context) (application.LinearTodoDispatchResult, error) {
+		fallbackCalls++
+		return application.LinearTodoDispatchResult{}, errors.New("fallback should not run")
+	}, "scan-worker")
+	for invocation := 0; invocation < 2; invocation++ {
+		result, err := dispatch(context.Background())
+		if err != nil || result.Outcome != application.RuntimeCycleOnboardingRunning {
+			t.Fatalf("invocation=%d result=%+v err=%v", invocation, result, err)
+		}
+	}
+	continuer.mu.Lock()
+	defer continuer.mu.Unlock()
+	if fallbackCalls != 0 || len(continuer.calls) != 4 || continuer.calls[0] != "onboarding-busy-first" || continuer.calls[1] != "onboarding-available-second" || continuer.calls[2] != "onboarding-busy-first" || continuer.calls[3] != "onboarding-available-second" {
+		t.Fatalf("calls=%v fallback=%d", continuer.calls, fallbackCalls)
+	}
+	for _, pair := range [][2]int{{0, 1}, {2, 3}} {
+		first, second := continuer.authorities[pair[0]], continuer.authorities[pair[1]]
+		if first.SupervisorID != "scan-worker" || second.SupervisorID != "scan-worker" || first.ExecutionNonce == "" || first.ExecutionNonce != second.ExecutionNonce {
+			t.Fatalf("same invocation authorities=%+v %+v", first, second)
+		}
+	}
+	if continuer.authorities[0].ExecutionNonce == continuer.authorities[2].ExecutionNonce {
+		t.Fatalf("dispatch nonce was reused: %s", continuer.authorities[0].ExecutionNonce)
+	}
+}
+
+func TestOnboardingServiceBusyClaimCannotReachExecutor(t *testing.T) {
+	store, err := sqlitestore.Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.BindWorkerSupervisor("service-worker"); err != nil {
+		t.Fatal(err)
+	}
+	requester := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
+	started := seedWorkerRunnableOnboarding(t, store, "onboarding-service-race", "owner/service-race", requester, time.Date(2026, 9, 1, 6, 0, 0, 0, time.UTC))
+	authorizer, err := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: requester})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := domain.ExistingRepositoryOnboardingInput(domain.ExistingCheckoutOnboardingInput{SourcePath: "/fixture", CanonicalRepository: started.CanonicalRepository, GitHubAppProfileRef: "fixture", BaseBranch: "main", VerifierIDs: []string{"fixture"}, LinearLabelSlug: "service-race"})
+	executor := &blockingOnboardingExecutor{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	service, err := application.NewOnboardingService(store, workerOnboardingPrivateStore{input: input}, workerOnboardingPaths{}, authorizer, new(application.ConfigurationService), workerOnboardingPreflight{}, executor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := service.Continue(context.Background(), started.OnboardingID, application.OnboardingExecutionAuthority{SupervisorID: "service-worker", ExecutionNonce: "execution-owner"})
+		firstDone <- err
+	}()
+	select {
+	case <-executor.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("owner executor did not start")
+	}
+	if _, err := service.Continue(context.Background(), started.OnboardingID, application.OnboardingExecutionAuthority{SupervisorID: "service-worker", ExecutionNonce: "execution-contender"}); !errors.Is(err, application.ErrOnboardingClaimBusy) {
+		t.Fatalf("busy continuation error=%v", err)
+	}
+	if calls := executor.callCount(); calls != 1 {
+		t.Fatalf("executor calls while busy=%d", calls)
+	}
+	close(executor.release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("owner continuation error=%v", err)
+	}
+	if calls := executor.callCount(); calls != 1 {
+		t.Fatalf("executor calls=%d", calls)
 	}
 }
 
@@ -272,18 +421,20 @@ func TestDisabledZeroRepositoryWorkerAdoptsBaselineAndPublishesHeartbeatWithoutA
 	}
 	for index, step := range []domain.OnboardingStep{domain.OnboardingStepRootsCreated, domain.OnboardingStepLinearLabelObserved} {
 		at := now.Add(time.Duration(3+index*2) * time.Second)
-		if _, err := runtime.store.BeginOnboardingStep(ctx, application.OnboardingStepIntent{OnboardingID: onboardingID, Step: step, IntentDigest: digest("intent-" + string(step)), IntendedAt: at}); err != nil {
+		claimResult, err := runtime.store.AcquireOnboardingStepClaim(ctx, application.OnboardingStepClaimRequest{Intent: application.OnboardingStepIntent{OnboardingID: onboardingID, Step: step, IntentDigest: digest("intent-" + string(step)), IntendedAt: at}, Authority: application.OnboardingExecutionAuthority{SupervisorID: "zero-repository-worker", ExecutionNonce: "bridge-" + strconv.Itoa(index)}})
+		if err != nil {
 			t.Fatal(err)
 		}
 		observation := application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "fixture_ready", EvidenceDigest: digest("observed-" + string(step))}
 		if step == domain.OnboardingStepLinearLabelObserved {
 			observation.LinearLabelID = "label-zero-repository"
 		}
-		if _, err := runtime.store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: onboardingID, Step: step, Observation: observation, ObservedAt: at.Add(time.Second)}); err != nil {
+		if _, err := runtime.store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: onboardingID, Step: step, Claim: claimResult.Claim, Observation: observation, ObservedAt: at.Add(time.Second)}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := runtime.store.BeginOnboardingStep(ctx, application.OnboardingStepIntent{OnboardingID: onboardingID, Step: domain.OnboardingStepConfigurationApplied, IntentDigest: digest("intent-configuration"), IntendedAt: now.Add(7 * time.Second)}); err != nil {
+	configurationClaim, err := runtime.store.AcquireOnboardingStepClaim(ctx, application.OnboardingStepClaimRequest{Intent: application.OnboardingStepIntent{OnboardingID: onboardingID, Step: domain.OnboardingStepConfigurationApplied, IntentDigest: digest("intent-configuration"), IntendedAt: now.Add(7 * time.Second)}, Authority: application.OnboardingExecutionAuthority{SupervisorID: "zero-repository-worker", ExecutionNonce: "bridge-configuration"}})
+	if err != nil {
 		t.Fatal(err)
 	}
 	requester := application.Requester{ID: operator.Login, Kind: "github_login", DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, ActorType: operator.ActorType}
@@ -293,7 +444,7 @@ func TestDisabledZeroRepositoryWorkerAdoptsBaselineAndPublishesHeartbeatWithoutA
 	}
 	profile := configuredProfiles[0]
 	configurationEvidence := application.ConfigurationEvidenceDigest("onboarding-configuration-v1", onboardingID, apply.Generation.Digest, strconv.FormatInt(apply.Generation.GenerationID, 10), apply.Receipt.EvidenceDigest)
-	if _, err := runtime.store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: onboardingID, Step: domain.OnboardingStepConfigurationApplied, Observation: application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "configuration_applied", EvidenceDigest: configurationEvidence, ProfileID: profile.Authority.ProfileID, ProfileDigest: profile.Profile.ProfileDigest, RepositoryBindingDigest: profile.Authority.BindingDigest, ConfigurationGenerationID: apply.Generation.GenerationID}, ObservedAt: now.Add(8 * time.Second)}); err != nil {
+	if _, err := runtime.store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: onboardingID, Step: domain.OnboardingStepConfigurationApplied, Claim: configurationClaim.Claim, Observation: application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "configuration_applied", EvidenceDigest: configurationEvidence, ProfileID: profile.Authority.ProfileID, ProfileDigest: profile.Profile.ProfileDigest, RepositoryBindingDigest: profile.Authority.BindingDigest, ConfigurationGenerationID: apply.Generation.GenerationID}, ObservedAt: now.Add(8 * time.Second)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := runtime.store.Close(); err != nil {
@@ -378,10 +529,13 @@ func TestWorkerDispatchParksUnavailableOnboardingRetryAndContinuesAfterResume(t 
 		t.Fatal(err)
 	}
 	fallbackCalls := 0
+	if err := store.BindWorkerSupervisor("retry-worker"); err != nil {
+		t.Fatal(err)
+	}
 	dispatch := onboardingWorkerDispatch(store, service, func(context.Context) (application.LinearTodoDispatchResult, error) {
 		fallbackCalls++
 		return application.LinearTodoDispatchResult{}, errors.New("normal admission fallback was called")
-	})
+	}, "retry-worker")
 	requester := application.Requester{ID: operator.Login, Kind: "github_login", DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, ActorType: operator.ActorType}
 	reporter, err := newWorkerStatusReporter(filepath.Join(root, "controller.json"), "worker-onboarding-retry", version, digest("7"))
 	if err != nil {

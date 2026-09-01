@@ -369,6 +369,11 @@ func downgradeRepositoryBaselineToV46(t *testing.T, store *admissionTestStore) {
 	}
 	defer tx.Rollback()
 	statements := []string{
+		`DROP TRIGGER integrity_track_repository_onboarding_step_claims_insert`,
+		`DROP TRIGGER integrity_track_repository_onboarding_step_claims_update`,
+		`DROP TRIGGER integrity_track_repository_onboarding_step_claims_delete`,
+		`DROP TABLE repository_onboarding_step_claims`,
+		`DELETE FROM integrity_registry_sources WHERE table_name='repository_onboarding_step_claims'`,
 		`DROP TRIGGER integrity_track_repository_lifecycle_baseline_insert`,
 		`DROP TRIGGER integrity_track_repository_lifecycle_baseline_update`,
 		`DROP TRIGGER integrity_track_repository_lifecycle_baseline_delete`,
@@ -395,7 +400,7 @@ func downgradeRepositoryBaselineToV46(t *testing.T, store *admissionTestStore) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := tx.Exec(`DELETE FROM schema_migrations WHERE version=47`); err != nil {
+	if _, err := tx.Exec(`DELETE FROM schema_migrations WHERE version IN (47,48)`); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {

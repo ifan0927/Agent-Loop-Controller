@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
 const integrityLeaseDuration = 30 * time.Second
@@ -339,6 +340,39 @@ func checkIntegrityFamilyTx(ctx context.Context, tx *sql.Tx, family application.
 		}
 		if err := queryIDs(`SELECT l.repository FROM repository_lifecycles l WHERE l.current_snapshot_id<>'' AND NOT EXISTS(SELECT 1 FROM repository_readiness_snapshots s WHERE s.snapshot_id=l.current_snapshot_id AND s.incarnation_id=l.incarnation_id) ORDER BY l.repository LIMIT ?`, "readiness_pointer_violation", "repository", application.ScopeRepository); err != nil {
 			return result, nil, err
+		}
+		if err := queryIDs(`SELECT c.onboarding_id FROM repository_onboarding_step_claims c JOIN repository_onboarding_steps s ON s.onboarding_id=c.onboarding_id AND s.step_name=c.step_name JOIN repository_onboardings o ON o.onboarding_id=c.onboarding_id WHERE c.intent_digest<>s.intent_digest OR c.attempt_number>s.attempt_number OR (c.status='active' AND (c.attempt_number<>s.attempt_number OR s.status<>'intended' OR o.step_index+1<>s.step_order)) OR (c.status='settled' AND c.attempt_number=s.attempt_number AND s.status<>'observed') OR (c.status='superseded' AND NOT EXISTS(SELECT 1 FROM repository_onboarding_step_claims n WHERE n.onboarding_id=c.onboarding_id AND n.step_name=c.step_name AND n.attempt_number=c.attempt_number AND n.claim_version=c.claim_version+1)) OR c.claim_version<>(SELECT COUNT(*) FROM repository_onboarding_step_claims p WHERE p.onboarding_id=c.onboarding_id AND p.step_name=c.step_name AND p.attempt_number=c.attempt_number AND p.claim_version<=c.claim_version) ORDER BY c.onboarding_id,c.step_name,c.attempt_number,c.claim_version LIMIT ?`, "onboarding_claim_binding_violation", "onboarding_claim", application.ScopeOnboarding); err != nil {
+			return result, nil, err
+		}
+		claimRows, err := tx.QueryContext(ctx, `SELECT onboarding_id,step_name,attempt_number,intent_digest,supervisor_id,execution_nonce,claim_version,claim_digest FROM repository_onboarding_step_claims ORDER BY onboarding_id,step_name,attempt_number,claim_version LIMIT ?`, application.IntegrityMaximumLimit+1)
+		if err != nil {
+			return result, nil, err
+		}
+		claimCount := 0
+		for claimRows.Next() {
+			claimCount++
+			var onboardingID, stepName, intentDigest, supervisorID, executionNonce, claimDigest string
+			var attempt, version int64
+			if err := claimRows.Scan(&onboardingID, &stepName, &attempt, &intentDigest, &supervisorID, &executionNonce, &version, &claimDigest); err != nil {
+				claimRows.Close()
+				return result, nil, err
+			}
+			if claimDigest != onboardingStepClaimDigest(onboardingID, domain.OnboardingStep(stepName), attempt, intentDigest, supervisorID, executionNonce, version) {
+				addController("onboarding_claim_digest_violation", "onboarding_claim", fmt.Sprintf("%s:%s:%d:%d", onboardingID, stepName, attempt, version))
+			}
+		}
+		if err := claimRows.Err(); err != nil {
+			claimRows.Close()
+			return result, nil, err
+		}
+		if err := claimRows.Close(); err != nil {
+			return result, nil, err
+		}
+		if claimCount > application.IntegrityMaximumLimit {
+			result.CountComplete, result.CoverageComplete = false, false
+			if result.State != application.IntegrityConflict {
+				result.State, result.ReasonCode = application.IntegrityUnknown, "claim_scan_bound_exhausted"
+			}
 		}
 	case application.IntegritySchedulingAdmission:
 		if err := queryIDs(`SELECT s.run_id FROM repository_slots s JOIN runs r ON r.run_id=s.run_id WHERE r.repository_binding_digest<>s.repository_binding_digest ORDER BY s.run_id LIMIT ?`, "repository_slot_binding_violation", "run", application.ScopeRun); err != nil {

@@ -8,12 +8,319 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
+
+func acquireOnboardingStepClaimForTest(t *testing.T, store *Store, intent application.OnboardingStepIntent, supervisor, execution string) application.OnboardingStepClaimToken {
+	t.Helper()
+	if err := store.BindWorkerSupervisor(supervisor); err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.AcquireOnboardingStepClaim(context.Background(), application.OnboardingStepClaimRequest{Intent: intent, Authority: application.OnboardingExecutionAuthority{SupervisorID: supervisor, ExecutionNonce: execution}})
+	if err != nil || result.Classification == application.OnboardingStepClaimBusy {
+		t.Fatalf("claim=%+v err=%v", result, err)
+	}
+	return result.Claim
+}
+
+func TestOnboardingStepClaimsFenceReplayAdoptionSettlementAndAttemptAdvance(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "controller.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 1, 1, 0, 0, 0, time.UTC)
+	started, _ := startOnboardingRetryFixture(t, store, "onboarding-claim-fence", now)
+	intent := application.OnboardingStepIntent{OnboardingID: started.OnboardingID, Step: domain.OnboardingStepRootsCreated, IntentDigest: application.ConfigurationEvidenceDigest("claim-intent"), IntendedAt: now.Add(time.Second)}
+	request := application.OnboardingStepClaimRequest{Intent: intent, Authority: application.OnboardingExecutionAuthority{SupervisorID: "worker-a", ExecutionNonce: "execution-a"}}
+	if _, err := store.AcquireOnboardingStepClaim(ctx, request); !errors.Is(err, application.ErrOnboardingConflict) {
+		t.Fatalf("unbound acquisition error=%v", err)
+	}
+	if err := store.BindWorkerSupervisor("worker-a"); err != nil {
+		t.Fatal(err)
+	}
+	acquired, err := store.AcquireOnboardingStepClaim(ctx, request)
+	if err != nil || acquired.Classification != application.OnboardingStepClaimAcquired || acquired.Claim.ClaimVersion != 1 || acquired.Claim.AttemptNumber != 1 {
+		t.Fatalf("acquired=%+v err=%v", acquired, err)
+	}
+	replayed, err := store.AcquireOnboardingStepClaim(ctx, request)
+	if err != nil || replayed.Classification != application.OnboardingStepClaimReplayed || replayed.Claim != acquired.Claim {
+		t.Fatalf("replayed=%+v err=%v", replayed, err)
+	}
+	busyRequest := request
+	busyRequest.Authority.ExecutionNonce = "execution-b"
+	busy, err := store.AcquireOnboardingStepClaim(ctx, busyRequest)
+	if err != nil || busy.Classification != application.OnboardingStepClaimBusy || busy.Claim.OnboardingID != "" {
+		t.Fatalf("busy=%+v err=%v", busy, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	adoptRequest := request
+	adoptRequest.Authority = application.OnboardingExecutionAuthority{SupervisorID: "worker-b", ExecutionNonce: "execution-c"}
+	if _, err := store.AcquireOnboardingStepClaim(ctx, adoptRequest); !errors.Is(err, application.ErrOnboardingConflict) {
+		t.Fatalf("unbound adoption error=%v", err)
+	}
+	if err := store.BindWorkerSupervisor("worker-b"); err != nil {
+		t.Fatal(err)
+	}
+	adopted, err := store.AcquireOnboardingStepClaim(ctx, adoptRequest)
+	if err != nil || adopted.Classification != application.OnboardingStepClaimAdopted || adopted.Claim.ClaimVersion != 2 || adopted.Claim.AttemptNumber != 1 {
+		t.Fatalf("adopted=%+v err=%v", adopted, err)
+	}
+	var oldStatus, currentStatus string
+	if err := store.db.QueryRow(`SELECT status FROM repository_onboarding_step_claims WHERE onboarding_id=? AND step_name=? AND attempt_number=1 AND claim_version=1`, started.OnboardingID, string(intent.Step)).Scan(&oldStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT status FROM repository_onboarding_step_claims WHERE onboarding_id=? AND step_name=? AND attempt_number=1 AND claim_version=2`, started.OnboardingID, string(intent.Step)).Scan(&currentStatus); err != nil || oldStatus != "superseded" || currentStatus != "active" {
+		t.Fatalf("old=%s current=%s err=%v", oldStatus, currentStatus, err)
+	}
+
+	observation := application.OnboardingStepObservation{Outcome: application.OperationOutcomeFailed, ReasonCode: "fixture_failed", EvidenceDigest: application.ConfigurationEvidenceDigest("claim-failed")}
+	settlement := application.OnboardingStepSettlement{OnboardingID: started.OnboardingID, Step: intent.Step, Claim: adopted.Claim, Observation: observation, ObservedAt: now.Add(2 * time.Second)}
+	variants := []application.OnboardingStepClaimToken{acquired.Claim}
+	for _, mutate := range []func(*application.OnboardingStepClaimToken){
+		func(value *application.OnboardingStepClaimToken) { value.ClaimVersion++ },
+		func(value *application.OnboardingStepClaimToken) { value.AttemptNumber++ },
+		func(value *application.OnboardingStepClaimToken) { value.SupervisorID = "worker-c" },
+		func(value *application.OnboardingStepClaimToken) { value.ExecutionNonce = "execution-d" },
+		func(value *application.OnboardingStepClaimToken) {
+			value.IntentDigest = application.ConfigurationEvidenceDigest("wrong-intent")
+		},
+	} {
+		variant := adopted.Claim
+		mutate(&variant)
+		variant.ClaimDigest = onboardingStepClaimDigest(variant.OnboardingID, variant.Step, variant.AttemptNumber, variant.IntentDigest, variant.SupervisorID, variant.ExecutionNonce, variant.ClaimVersion)
+		variants = append(variants, variant)
+	}
+	for index, variant := range variants {
+		invalid := settlement
+		invalid.Claim = variant
+		if _, err := store.SettleOnboardingStep(ctx, invalid); !errors.Is(err, application.ErrOnboardingConflict) {
+			t.Fatalf("variant %d settlement error=%v", index, err)
+		}
+	}
+	failed, err := store.SettleOnboardingStep(ctx, settlement)
+	if err != nil || failed.Status != domain.OnboardingWaitingForOperator {
+		t.Fatalf("failed=%+v err=%v", failed, err)
+	}
+	if replay, err := store.SettleOnboardingStep(ctx, settlement); err != nil || replay.Status != domain.OnboardingWaitingForOperator {
+		t.Fatalf("settlement replay=%+v err=%v", replay, err)
+	}
+	if _, changed, err := store.ResumeOnboarding(ctx, started.OnboardingID, now.Add(3*time.Second)); err != nil || !changed {
+		t.Fatalf("resume changed=%t err=%v", changed, err)
+	}
+	attemptTwoRequest := adoptRequest
+	attemptTwoRequest.Intent.IntendedAt = now.Add(4 * time.Second)
+	attemptTwoRequest.Authority.ExecutionNonce = "execution-attempt-2"
+	attemptTwo, err := store.AcquireOnboardingStepClaim(ctx, attemptTwoRequest)
+	if err != nil || attemptTwo.Classification != application.OnboardingStepClaimAcquired || attemptTwo.Claim.AttemptNumber != 2 || attemptTwo.Claim.ClaimVersion != 1 {
+		t.Fatalf("attempt two=%+v err=%v", attemptTwo, err)
+	}
+	stale := settlement
+	stale.ObservedAt = now.Add(5 * time.Second)
+	if _, err := store.SettleOnboardingStep(ctx, stale); !errors.Is(err, application.ErrOnboardingConflict) {
+		t.Fatalf("prior attempt settlement error=%v", err)
+	}
+}
+
+func TestOnboardingStepClaimRaceProducesOneOwnerAndBusyContenders(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.BindWorkerSupervisor("race-worker"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 1, 2, 0, 0, 0, time.UTC)
+	started, _ := startOnboardingRetryFixture(t, store, "onboarding-claim-race", now)
+	intent := application.OnboardingStepIntent{OnboardingID: started.OnboardingID, Step: domain.OnboardingStepRootsCreated, IntentDigest: application.ConfigurationEvidenceDigest("race-intent"), IntendedAt: now.Add(time.Second)}
+	const contenders = 12
+	results := make(chan application.OnboardingStepClaimResult, contenders)
+	errorsSeen := make(chan error, contenders)
+	start := make(chan struct{})
+	var group sync.WaitGroup
+	for index := 0; index < contenders; index++ {
+		group.Add(1)
+		go func(index int) {
+			defer group.Done()
+			<-start
+			result, err := store.AcquireOnboardingStepClaim(ctx, application.OnboardingStepClaimRequest{Intent: intent, Authority: application.OnboardingExecutionAuthority{SupervisorID: "race-worker", ExecutionNonce: fmt.Sprintf("race-%02d", index)}})
+			if err != nil {
+				errorsSeen <- err
+				return
+			}
+			results <- result
+		}(index)
+	}
+	close(start)
+	group.Wait()
+	close(results)
+	close(errorsSeen)
+	for err := range errorsSeen {
+		t.Fatalf("race acquisition error=%v", err)
+	}
+	acquired, busy := 0, 0
+	for result := range results {
+		switch result.Classification {
+		case application.OnboardingStepClaimAcquired:
+			acquired++
+		case application.OnboardingStepClaimBusy:
+			busy++
+		default:
+			t.Fatalf("unexpected race result=%+v", result)
+		}
+	}
+	if acquired != 1 || busy != contenders-1 {
+		t.Fatalf("acquired=%d busy=%d", acquired, busy)
+	}
+	var active int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM repository_onboarding_step_claims WHERE onboarding_id=? AND status='active'`, started.OnboardingID).Scan(&active); err != nil || active != 1 {
+		t.Fatalf("active=%d err=%v", active, err)
+	}
+}
+
+func TestOnboardingStepClaimV48MigrationLeavesLegacyIntentUnclaimedAndClaimable(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "controller.db")
+	legacy, err := openWithSupportedSchema(path, 47)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 1, 3, 0, 0, 0, time.UTC)
+	started, _ := startOnboardingRetryFixture(t, legacy, "onboarding-claim-migration", now)
+	intent := application.OnboardingStepIntent{OnboardingID: started.OnboardingID, Step: domain.OnboardingStepRootsCreated, IntentDigest: application.ConfigurationEvidenceDigest("migrated-intent"), IntendedAt: now.Add(time.Second)}
+	if _, err := legacy.db.ExecContext(ctx, `INSERT INTO repository_onboarding_steps(onboarding_id,step_name,step_order,intent_digest,status,outcome,intended_at,attempt_number) VALUES(?,?,1,?,'intended','pending',?,1)`, intent.OnboardingID, string(intent.Step), intent.IntentDigest, formatTime(intent.IntendedAt)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.db.ExecContext(ctx, `UPDATE repository_onboardings SET status='running',updated_at=? WHERE onboarding_id=?`, formatTime(intent.IntendedAt), intent.OnboardingID); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var version, claims, registry, triggers int
+	if err := store.db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 48 {
+		t.Fatalf("version=%d err=%v", version, err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM repository_onboarding_step_claims`).Scan(&claims); err != nil || claims != 0 {
+		t.Fatalf("claims=%d err=%v", claims, err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM integrity_registry_sources WHERE family='repository_onboarding' AND table_name='repository_onboarding_step_claims'`).Scan(&registry); err != nil || registry != 1 {
+		t.Fatalf("registry=%d err=%v", registry, err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'integrity_track_repository_onboarding_step_claims_%'`).Scan(&triggers); err != nil || triggers != 3 {
+		t.Fatalf("triggers=%d err=%v", triggers, err)
+	}
+	claim := acquireOnboardingStepClaimForTest(t, store, intent, "migration-worker", "migration-execution")
+	if claim.AttemptNumber != 1 || claim.ClaimVersion != 1 {
+		t.Fatalf("claim=%+v", claim)
+	}
+	if older, err := openWithSupportedSchema(path, 47); err == nil || !strings.Contains(err.Error(), "database schema version 48 is newer than supported 47") {
+		if older != nil {
+			older.Close()
+		}
+		t.Fatalf("old binary compatibility error=%v", err)
+	}
+}
+
+func TestOnboardingStepClaimDigestCorruptionIsDetectedByIntegrity(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 9, 1, 4, 0, 0, 0, time.UTC)
+	started, _ := startOnboardingRetryFixture(t, store, "onboarding-claim-integrity", now)
+	intent := application.OnboardingStepIntent{OnboardingID: started.OnboardingID, Step: domain.OnboardingStepRootsCreated, IntentDigest: application.ConfigurationEvidenceDigest("integrity-intent"), IntendedAt: now.Add(time.Second)}
+	_ = acquireOnboardingStepClaimForTest(t, store, intent, "integrity-worker", "integrity-execution")
+	if _, err := store.db.Exec(`DROP TRIGGER repository_onboarding_step_claim_transition`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE repository_onboarding_step_claims SET claim_digest=? WHERE onboarding_id=?`, strings.Repeat("f", 64), started.OnboardingID); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	result, findings, err := checkIntegrityFamilyTx(ctx, tx, application.IntegrityRepositoryOnboarding)
+	if err != nil || result.State != application.IntegrityNotReady {
+		t.Fatalf("result=%+v findings=%+v err=%v", result, findings, err)
+	}
+	found := false
+	for _, finding := range findings {
+		found = found || finding.reason == "onboarding_claim_digest_violation"
+	}
+	if !found {
+		t.Fatalf("findings=%+v", findings)
+	}
+}
+
+func TestOnboardingStepClaimIntegrityFailsClosedWhenScanBoundIsExhausted(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 9, 1, 4, 30, 0, 0, time.UTC)
+	started, _ := startOnboardingRetryFixture(t, store, "onboarding-claim-integrity-bound", now)
+	intentDigest := application.ConfigurationEvidenceDigest("integrity-bound-intent")
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO repository_onboarding_steps(onboarding_id,step_name,step_order,intent_digest,status,outcome,intended_at,attempt_number) VALUES(?,?,1,?,'intended','pending',?,?)`, started.OnboardingID, string(domain.OnboardingStepRootsCreated), intentDigest, formatTime(now), application.IntegrityMaximumLimit+1); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 1; attempt <= application.IntegrityMaximumLimit+1; attempt++ {
+		status, settledAt := "settled", formatTime(now)
+		if attempt == application.IntegrityMaximumLimit+1 {
+			status, settledAt = "active", ""
+		}
+		supervisorID := fmt.Sprintf("worker-%03d", attempt)
+		executionNonce := fmt.Sprintf("execution-%03d", attempt)
+		claimDigest := onboardingStepClaimDigest(started.OnboardingID, domain.OnboardingStepRootsCreated, int64(attempt), intentDigest, supervisorID, executionNonce, 1)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO repository_onboarding_step_claims(onboarding_id,step_name,attempt_number,claim_version,supervisor_id,execution_nonce,intent_digest,claim_digest,status,claimed_at,settled_at) VALUES(?,?,?,1,?,?,?,?,?,?,?)`, started.OnboardingID, string(domain.OnboardingStepRootsCreated), attempt, supervisorID, executionNonce, intentDigest, claimDigest, status, formatTime(now), settledAt); err != nil {
+			tx.Rollback()
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	tx, err = store.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	result, findings, err := checkIntegrityFamilyTx(ctx, tx, application.IntegrityRepositoryOnboarding)
+	if err != nil || result.State != application.IntegrityUnknown || result.ReasonCode != "claim_scan_bound_exhausted" || result.CountComplete || result.CoverageComplete || len(findings) != 0 {
+		t.Fatalf("result=%+v findings=%+v err=%v", result, findings, err)
+	}
+}
 
 func TestOnboardingResumeAdvancesDurableAttemptsWithoutActivityConflict(t *testing.T) {
 	ctx := context.Background()
@@ -26,9 +333,7 @@ func TestOnboardingResumeAdvancesDurableAttemptsWithoutActivityConflict(t *testi
 	digest := func(value string) string { return strings.Repeat(value, 64) }
 	started, receipt := startOnboardingRetryFixture(t, store, "onboarding-attempts", now)
 	intent := application.OnboardingStepIntent{OnboardingID: started.OnboardingID, Step: domain.OnboardingStepRootsCreated, IntentDigest: digest("4"), IntendedAt: now.Add(time.Second)}
-	if changed, beginErr := store.BeginOnboardingStep(ctx, intent); beginErr != nil || !changed {
-		t.Fatalf("begin changed=%t err=%v", changed, beginErr)
-	}
+	claim := acquireOnboardingStepClaimForTest(t, store, intent, "attempt-worker", "attempt-1")
 
 	outcomes := []application.OperationOutcome{application.OperationOutcomeFailed, application.OperationOutcomePending, application.OperationOutcomeFailed, application.OperationOutcomeSucceeded}
 	for index, outcome := range outcomes {
@@ -41,16 +346,14 @@ func TestOnboardingResumeAdvancesDurableAttemptsWithoutActivityConflict(t *testi
 			if replayed, replayChanged, replayErr := store.ResumeOnboarding(ctx, started.OnboardingID, now.Add(time.Duration(index*3+1)*time.Second)); replayErr != nil || replayChanged || replayed.Status != domain.OnboardingRunning {
 				t.Fatalf("attempt %d replay=%+v changed=%t err=%v", attempt, replayed, replayChanged, replayErr)
 			}
-			if changed, beginErr := store.BeginOnboardingStep(ctx, intent); beginErr != nil || changed {
-				t.Fatalf("attempt %d begin replay changed=%t err=%v", attempt, changed, beginErr)
-			}
+			claim = acquireOnboardingStepClaimForTest(t, store, intent, "attempt-worker", fmt.Sprintf("attempt-%d", attempt))
 		}
 		var storedAttempt int64
 		if err := store.db.QueryRow(`SELECT attempt_number FROM repository_onboarding_steps WHERE onboarding_id=? AND step_name=?`, started.OnboardingID, string(intent.Step)).Scan(&storedAttempt); err != nil || storedAttempt != attempt {
 			t.Fatalf("attempt=%d stored=%d err=%v", attempt, storedAttempt, err)
 		}
 		observation := application.OnboardingStepObservation{Outcome: outcome, ReasonCode: "fixture_attempt", EvidenceDigest: digest(string(rune('5' + index)))}
-		settled, settleErr := store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: started.OnboardingID, Step: intent.Step, Observation: observation, ObservedAt: now.Add(time.Duration(index*3+2) * time.Second)})
+		settled, settleErr := store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: started.OnboardingID, Step: intent.Step, Claim: claim, Observation: observation, ObservedAt: now.Add(time.Duration(index*3+2) * time.Second)})
 		if settleErr != nil {
 			t.Fatalf("attempt %d settle: %v", attempt, settleErr)
 		}
@@ -189,7 +492,12 @@ func TestOnboardingV46MigratesOnlyExactInterruptedResumeAndContinues(t *testing.
 		(SELECT revision_generation FROM controller_integrity_scope_revisions WHERE family='operation_activity' AND scope_kind='controller' AND scope_id='local-controller')`).Scan(&repositoryRevisionBefore, &activityRevisionBefore); err != nil {
 		t.Fatal(err)
 	}
-	settled, err := store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: exactID, Step: domain.OnboardingStepLinearLabelObserved, Observation: application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "linear_label_ready", EvidenceDigest: strings.Repeat("9", 64), LinearLabelID: "label-recovered"}, ObservedAt: now.Add(10 * time.Minute)})
+	var exactIntent string
+	if err := store.db.QueryRow(`SELECT intent_digest FROM repository_onboarding_steps WHERE onboarding_id=? AND step_name='linear_label_observed'`, exactID).Scan(&exactIntent); err != nil {
+		t.Fatal(err)
+	}
+	claim := acquireOnboardingStepClaimForTest(t, store, application.OnboardingStepIntent{OnboardingID: exactID, Step: domain.OnboardingStepLinearLabelObserved, IntentDigest: exactIntent, IntendedAt: now.Add(9 * time.Minute)}, "migration-worker", "migration-recovery")
+	settled, err := store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: exactID, Step: domain.OnboardingStepLinearLabelObserved, Claim: claim, Observation: application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "linear_label_ready", EvidenceDigest: strings.Repeat("9", 64), LinearLabelID: "label-recovered"}, ObservedAt: now.Add(10 * time.Minute)})
 	if err != nil || settled.Status != domain.OnboardingRunning || !slices.Equal(settled.CompletedSteps, []domain.OnboardingStep{domain.OnboardingStepRootsCreated, domain.OnboardingStepLinearLabelObserved}) {
 		t.Fatalf("settled=%+v err=%v", settled, err)
 	}
@@ -376,9 +684,7 @@ func TestOnboardingSagaReplaysAndResumesAfterStoreRestart(t *testing.T) {
 		t.Fatalf("start replay=%+v receipt=%+v changed=%t err=%v", replayed, replayReceipt, replayChanged, replayErr)
 	}
 	intent := application.OnboardingStepIntent{OnboardingID: opened.OnboardingID, Step: domain.OnboardingStepRootsCreated, IntentDigest: digest("5"), IntendedAt: now.Add(3 * time.Second)}
-	if changed, err := store.BeginOnboardingStep(ctx, intent); err != nil || !changed {
-		t.Fatalf("begin changed=%t err=%v", changed, err)
-	}
+	rootsClaim := acquireOnboardingStepClaimForTest(t, store, intent, "onboarding-worker", "roots")
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -391,23 +697,19 @@ func TestOnboardingSagaReplaysAndResumesAfterStoreRestart(t *testing.T) {
 	if err != nil || len(runnable) != 1 || runnable[0] != opened.OnboardingID {
 		t.Fatalf("runnable=%v err=%v", runnable, err)
 	}
-	settled, err := store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: opened.OnboardingID, Step: domain.OnboardingStepRootsCreated, Observation: application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "roots_ready", EvidenceDigest: digest("6")}, ObservedAt: now.Add(4 * time.Second)})
+	settled, err := store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: opened.OnboardingID, Step: domain.OnboardingStepRootsCreated, Claim: rootsClaim, Observation: application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "roots_ready", EvidenceDigest: digest("6")}, ObservedAt: now.Add(4 * time.Second)})
 	if err != nil || settled.Status != domain.OnboardingRunning || len(settled.CompletedSteps) != 1 || settled.CompletedSteps[0] != domain.OnboardingStepRootsCreated {
 		t.Fatalf("settled=%+v err=%v", settled, err)
 	}
 	labelIntent := application.OnboardingStepIntent{OnboardingID: opened.OnboardingID, Step: domain.OnboardingStepLinearLabelObserved, IntentDigest: digest("8"), IntendedAt: now.Add(5 * time.Second)}
-	if changed, err := store.BeginOnboardingStep(ctx, labelIntent); err != nil || !changed {
-		t.Fatalf("label begin changed=%t err=%v", changed, err)
-	}
-	settled, err = store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: opened.OnboardingID, Step: domain.OnboardingStepLinearLabelObserved, Observation: application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "linear_label_ready", EvidenceDigest: digest("9"), LinearLabelID: "label-immutable-1"}, ObservedAt: now.Add(6 * time.Second)})
+	labelClaim := acquireOnboardingStepClaimForTest(t, store, labelIntent, "onboarding-worker", "label")
+	settled, err = store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: opened.OnboardingID, Step: domain.OnboardingStepLinearLabelObserved, Claim: labelClaim, Observation: application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "linear_label_ready", EvidenceDigest: digest("9"), LinearLabelID: "label-immutable-1"}, ObservedAt: now.Add(6 * time.Second)})
 	if err != nil || settled.LinearLabelID != "label-immutable-1" || len(settled.CompletedSteps) != 2 {
 		t.Fatalf("label settled=%+v err=%v", settled, err)
 	}
 	profileAuthority := repositoryProfileFixture(opened.CanonicalRepository, "e", "f")
 	configurationIntent := application.OnboardingStepIntent{OnboardingID: opened.OnboardingID, Step: domain.OnboardingStepConfigurationApplied, IntentDigest: digest("a"), IntendedAt: now.Add(7 * time.Second)}
-	if changed, err := store.BeginOnboardingStep(ctx, configurationIntent); err != nil || !changed {
-		t.Fatalf("configuration begin changed=%t err=%v", changed, err)
-	}
+	configurationClaim := acquireOnboardingStepClaimForTest(t, store, configurationIntent, "onboarding-worker", "configuration")
 	candidate := application.ValidatedConfigurationCandidate{Digest: digest("4"), Size: 2, SchemaVersion: 5, DatabasePath: path, Operator: requester}
 	authorizer, err := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: requester})
 	if err != nil {
@@ -451,7 +753,7 @@ func TestOnboardingSagaReplaysAndResumesAfterStoreRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	configurationEvidence := application.ConfigurationEvidenceDigest("onboarding-configuration-v1", opened.OnboardingID, generation.Digest, fmt.Sprint(generation.GenerationID), settledConfigurationReceipt.EvidenceDigest)
-	settled, err = store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: opened.OnboardingID, Step: domain.OnboardingStepConfigurationApplied, Observation: application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "configuration_applied", EvidenceDigest: configurationEvidence, ProfileID: profileAuthority.Profile.ProfileID, ProfileDigest: profileAuthority.Profile.ProfileDigest, RepositoryBindingDigest: profileAuthority.Profile.RepositoryBindingDigest, ConfigurationGenerationID: generation.GenerationID}, ObservedAt: now.Add(11 * time.Second)})
+	settled, err = store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: opened.OnboardingID, Step: domain.OnboardingStepConfigurationApplied, Claim: configurationClaim, Observation: application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "configuration_applied", EvidenceDigest: configurationEvidence, ProfileID: profileAuthority.Profile.ProfileID, ProfileDigest: profileAuthority.Profile.ProfileDigest, RepositoryBindingDigest: profileAuthority.Profile.RepositoryBindingDigest, ConfigurationGenerationID: generation.GenerationID}, ObservedAt: now.Add(11 * time.Second)})
 	if err != nil || settled.ConfigurationGenerationID != generation.GenerationID {
 		t.Fatalf("configuration settled=%+v err=%v", settled, err)
 	}
@@ -572,17 +874,13 @@ func TestOnboardingSagaReplaysAndResumesAfterStoreRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	convergenceIntent := application.OnboardingStepIntent{OnboardingID: opened.OnboardingID, Step: domain.OnboardingStepConfigurationConverged, IntentDigest: digest("c"), IntendedAt: now.Add(12 * time.Second)}
-	if changed, err := store.BeginOnboardingStep(ctx, convergenceIntent); err != nil || !changed {
-		t.Fatalf("convergence begin changed=%t err=%v", changed, err)
-	}
-	settled, err = store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: opened.OnboardingID, Step: domain.OnboardingStepConfigurationConverged, Observation: application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "configuration_converged", EvidenceDigest: digest("d")}, ObservedAt: now.Add(13 * time.Second)})
+	convergenceClaim := acquireOnboardingStepClaimForTest(t, store, convergenceIntent, "onboarding-worker", "convergence")
+	settled, err = store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: opened.OnboardingID, Step: domain.OnboardingStepConfigurationConverged, Claim: convergenceClaim, Observation: application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "configuration_converged", EvidenceDigest: digest("d")}, ObservedAt: now.Add(13 * time.Second)})
 	if err != nil || len(settled.CompletedSteps) != 4 {
 		t.Fatalf("convergence settled=%+v err=%v", settled, err)
 	}
 	lifecycleIntent := application.OnboardingStepIntent{OnboardingID: opened.OnboardingID, Step: domain.OnboardingStepLifecycleCreated, IntentDigest: digest("e"), IntendedAt: now.Add(14 * time.Second)}
-	if changed, err := store.BeginOnboardingStep(ctx, lifecycleIntent); err != nil || !changed {
-		t.Fatalf("lifecycle begin changed=%t err=%v", changed, err)
-	}
+	_ = acquireOnboardingStepClaimForTest(t, store, lifecycleIntent, "onboarding-worker", "lifecycle")
 	projection, created, err := store.CreateOnboardingRepositoryLifecycle(ctx, opened.OnboardingID, profileAuthority.Profile, now.Add(14*time.Second))
 	if err != nil || !created || projection.Lifecycle.Intent != application.RepositoryDisabled || projection.Readiness.Status != domain.RepositoryUnknown || projection.Readiness.ReasonCode != "initial_recheck_required" {
 		t.Fatalf("projection=%+v created=%t err=%v", projection, created, err)
@@ -648,19 +946,20 @@ func TestEmptyRepositoryOnboardingPersistsKindSpecificOrderAndInitialSHA(t *test
 	if err != nil || !started.AcceptedAt.Equal(receipt.AcceptedAt.UTC().Truncate(time.Second)) {
 		t.Fatalf("started=%+v err=%v", started, err)
 	}
-	if _, err := store.BeginOnboardingStep(ctx, application.OnboardingStepIntent{OnboardingID: opened.OnboardingID, Step: domain.OnboardingStepLinearLabelObserved, IntentDigest: digest("4"), IntendedAt: now.Add(3 * time.Second)}); !errors.Is(err, application.ErrOnboardingConflict) {
+	if err := store.BindWorkerSupervisor("empty-worker"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcquireOnboardingStepClaim(ctx, application.OnboardingStepClaimRequest{Intent: application.OnboardingStepIntent{OnboardingID: opened.OnboardingID, Step: domain.OnboardingStepLinearLabelObserved, IntentDigest: digest("4"), IntendedAt: now.Add(3 * time.Second)}, Authority: application.OnboardingExecutionAuthority{SupervisorID: "empty-worker", ExecutionNonce: "out-of-order"}}); !errors.Is(err, application.ErrOnboardingConflict) {
 		t.Fatalf("out-of-order step error=%v", err)
 	}
 	sha := strings.Repeat("1", 40)
 	for index, step := range domain.EmptyRepositoryOnboardingSteps[:4] {
-		if _, err := store.BeginOnboardingStep(ctx, application.OnboardingStepIntent{OnboardingID: opened.OnboardingID, Step: step, IntentDigest: digest(string(rune('5' + index))), IntendedAt: now.Add(time.Duration(3+index*2) * time.Second)}); err != nil {
-			t.Fatalf("begin %s: %v", step, err)
-		}
+		claim := acquireOnboardingStepClaimForTest(t, store, application.OnboardingStepIntent{OnboardingID: opened.OnboardingID, Step: step, IntentDigest: digest(string(rune('5' + index))), IntendedAt: now.Add(time.Duration(3+index*2) * time.Second)}, "empty-worker", fmt.Sprintf("empty-%d", index))
 		observation := application.OnboardingStepObservation{Outcome: application.OperationOutcomeSucceeded, ReasonCode: "step_ready", EvidenceDigest: digest(string(rune('a' + index)))}
 		if step == domain.OnboardingStepInitialRevisionCreated {
 			observation.InitialRevisionSHA = sha
 		}
-		started, err = store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: opened.OnboardingID, Step: step, Observation: observation, ObservedAt: now.Add(time.Duration(4+index*2) * time.Second)})
+		started, err = store.SettleOnboardingStep(ctx, application.OnboardingStepSettlement{OnboardingID: opened.OnboardingID, Step: step, Claim: claim, Observation: observation, ObservedAt: now.Add(time.Duration(4+index*2) * time.Second)})
 		if err != nil {
 			t.Fatalf("settle %s: %v", step, err)
 		}
