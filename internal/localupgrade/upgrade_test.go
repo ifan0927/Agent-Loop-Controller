@@ -2,12 +2,14 @@ package localupgrade
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -186,6 +188,128 @@ func seedBundle(t *testing.T, manager *Manager, completeReadiness bool) (journal
 		t.Fatal(err)
 	}
 	return j, bundle
+}
+
+func seedCleanupReady(t *testing.T, manager *Manager, rollback bool) (journal, string) {
+	t.Helper()
+	j, bundle := seedBundle(t, manager, false)
+	writeFixtureFile(t, filepath.Join(bundle, "snapshot.db"), "fixture snapshot", 0o600)
+	snapshotDigest, err := digestFile(filepath.Join(bundle, "snapshot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := manager.now()
+	j.SnapshotDigest, j.CompletedAt, j.UpdatedAt = snapshotDigest, &now, now
+	if rollback {
+		j.Phase = "rollback_healthy"
+	} else {
+		j.Phase, j.BootstrapIntentAt = "healthy", &now
+	}
+	if err := writeJournal(bundle, j, manager.uid); err != nil {
+		t.Fatal(err)
+	}
+	return j, bundle
+}
+
+func removeFixtureBundle(t *testing.T, manager *Manager, bundle string) {
+	t.Helper()
+	for _, name := range []string{"candidate-manifest.json", "candidate.bin", "previous.bin", "snapshot.db", "journal.json"} {
+		if err := os.Remove(filepath.Join(bundle, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Remove(bundle); err != nil || syncDirectory(manager.upgradeRoot()) != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeRetainedCleanupPredecessor(t *testing.T, manager *Manager, successor journal, idCharacter string, recovery bool) journal {
+	t.Helper()
+	now := manager.now()
+	predecessor := successor
+	predecessor.SchemaVersion = journalSchemaVersion
+	predecessor.UpgradeID = "upgrade-" + strings.Repeat(idCharacter, 32)
+	predecessor.Phase = "superseded"
+	predecessor.Revision = strings.Repeat(idCharacter, 40)
+	predecessor.FailureReason = "integrity_not_ready"
+	predecessor.PredecessorID = ""
+	predecessor.SuccessorID = successor.UpgradeID
+	predecessor.SuccessorRevision = successor.Revision
+	predecessor.BootstrapIntentAt = &now
+	predecessor.SupersededAt = &now
+	predecessor.UpdatedAt = now
+	predecessor.DatabaseRecovery = nil
+	build := fixtureBuild(predecessor.Revision)
+	build.BuildIdentity = "sha256:" + strings.Repeat(idCharacter, 64)
+	raw := binaryScript(build)
+	digest := sha256.Sum256([]byte(raw))
+	predecessor.Candidate = binaryEvidence{Digest: fmt.Sprintf("%x", digest), Size: int64(len(raw)), Mode: 0o755, Build: build, Structured: true}
+	if recovery {
+		oldDatabase := predecessor.Database
+		oldDatabase.Inode++
+		predecessor.DatabaseRecovery = &databaseRecoveryEvidence{
+			Version: databaseRecoveryEvidenceVersion, PreviewDigest: strings.Repeat("1", 64),
+			OldDatabase: oldDatabase, ReplacementDatabase: predecessor.Database,
+			Verification: replacementDatabaseVerification{
+				ContentDigest: strings.Repeat("2", 64), AuthorityDigest: strings.Repeat("3", 64), SchemaVersion: predecessor.Database.SchemaVersion,
+				IntegrityOK: true, ForeignKeysOK: true, BindingMatches: true, DesiredConfigurationMatch: true,
+				Readiness: recoveryReadinessVerification{Relationship: recoveryReadinessExactMatch, PredecessorReason: predecessor.FailureReason, ReplacementReason: predecessor.FailureReason, GenerationRelationship: integrityGenerationCurrent, CurrentGeneration: 1, PublishedGeneration: 1},
+			},
+			SuccessorRevision: successor.Revision, DatabaseRelocationConfirmed: true, FullBackupConfirmed: true, IntentAt: now, LocatorPublishedAt: &now,
+		}
+	}
+	bundle := manager.bundlePath(predecessor.UpgradeID)
+	if err := os.Mkdir(bundle, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJournal(bundle, predecessor, manager.uid); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateJournal(predecessor, predecessor.UpgradeID); err != nil {
+		t.Fatalf("retained predecessor fixture is invalid: %v", err)
+	}
+	return predecessor
+}
+
+func bindCleanupSuccessorToPredecessor(t *testing.T, manager *Manager, successor *journal, successorBundle string, predecessor journal) {
+	t.Helper()
+	previousRaw := binaryScript(predecessor.Candidate.Build)
+	if err := os.WriteFile(filepath.Join(successorBundle, "previous.bin"), []byte(previousRaw), 0o600); err != nil || os.Chmod(filepath.Join(successorBundle, "previous.bin"), 0o600) != nil {
+		t.Fatal("successor previous artifact fixture could not be replaced")
+	}
+	successor.Previous = predecessor.Candidate
+	manifest := candidateManifest{SchemaVersion: successor.SchemaVersion, Revision: successor.Revision, Candidate: successor.Candidate, Previous: successor.Previous, Database: successor.Database, ConfigDigest: successor.ConfigDigest, PreparedAt: successor.CreatedAt}
+	if err := writePrivateJSON(filepath.Join(successorBundle, "candidate-manifest.json"), manifest, manager.uid); err != nil || writeJournal(successorBundle, *successor, manager.uid) != nil {
+		t.Fatal("successor cleanup fixture could not be updated")
+	}
+}
+
+func fixtureTreeFingerprint(t *testing.T, root string) string {
+	t.Helper()
+	var records []string
+	err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		digest := "-"
+		if info.Mode().IsRegular() {
+			digest, err = digestFile(path)
+			if err != nil {
+				return err
+			}
+		}
+		records = append(records, fmt.Sprintf("%s|%o|%d|%d|%s", relative, info.Mode(), info.Size(), info.ModTime().UnixNano(), digest))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(records)
+	return strings.Join(records, "\n")
 }
 
 func commandOutput(t *testing.T, runner commandRunner, directory, name string, args ...string) string {
@@ -592,14 +716,8 @@ func TestObserveSeparatesPendingIntegrityFromHealthyCompletion(t *testing.T) {
 
 func TestCleanupRejectsUnownedBundleArtifacts(t *testing.T) {
 	manager := newFixtureManager(t, fixtureRunner{})
-	j, bundle := seedBundle(t, manager, false)
-	writeFixtureFile(t, filepath.Join(bundle, "snapshot.db"), "snapshot", 0o600)
+	j, bundle := seedCleanupReady(t, manager, false)
 	writeFixtureFile(t, filepath.Join(bundle, "unrelated"), "do not delete", 0o600)
-	now := manager.now()
-	j.Phase, j.CompletedAt, j.UpdatedAt = "healthy", &now, now
-	if err := writeJournal(bundle, j, manager.uid); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := manager.Cleanup(context.Background(), j.UpgradeID); err == nil || !strings.Contains(err.Error(), "unowned") {
 		t.Fatalf("cleanup err=%v", err)
 	}
@@ -610,13 +728,7 @@ func TestCleanupRejectsUnownedBundleArtifacts(t *testing.T) {
 
 func TestCleanupResumesAfterCurrentInstallationCommit(t *testing.T) {
 	manager := newFixtureManager(t, fixtureRunner{})
-	j, bundle := seedBundle(t, manager, false)
-	writeFixtureFile(t, filepath.Join(bundle, "snapshot.db"), "snapshot", 0o600)
-	now := manager.now()
-	j.Phase, j.BootstrapIntentAt, j.CompletedAt, j.UpdatedAt = "healthy", &now, &now, now
-	if err := writeJournal(bundle, j, manager.uid); err != nil {
-		t.Fatal(err)
-	}
+	j, bundle := seedCleanupReady(t, manager, false)
 	manager.fail = func(point string) error {
 		if point == "after_current_installation" {
 			return errors.New("injected cleanup interruption")
@@ -636,28 +748,258 @@ func TestCleanupResumesAfterCurrentInstallationCommit(t *testing.T) {
 	}
 }
 
-func TestCleanupResumesAfterJournalRemoval(t *testing.T) {
+func TestCleanupCommitAndReclamationResumeEveryDurableBoundary(t *testing.T) {
+	tests := []struct {
+		point              string
+		wantActive         bool
+		wantBundle         bool
+		wantArtifactCount  int
+		commitMustBeIntact bool
+	}{
+		{point: "after_cleanup_intent", wantActive: true, wantBundle: true, wantArtifactCount: 5, commitMustBeIntact: true},
+		{point: "after_current_installation", wantActive: true, wantBundle: true, wantArtifactCount: 5, commitMustBeIntact: true},
+		{point: "after_cleanup_active_unlink", wantBundle: true, wantArtifactCount: 5, commitMustBeIntact: true},
+		{point: "after_cleanup_active_sync", wantBundle: true, wantArtifactCount: 5, commitMustBeIntact: true},
+		{point: "after_cleanup_artifact_candidate_manifest", wantBundle: true, wantArtifactCount: 4},
+		{point: "after_cleanup_artifact_candidate", wantBundle: true, wantArtifactCount: 3},
+		{point: "after_cleanup_artifact_previous", wantBundle: true, wantArtifactCount: 2},
+		{point: "after_cleanup_artifact_snapshot", wantBundle: true, wantArtifactCount: 1},
+		{point: "after_cleanup_artifact_journal", wantBundle: true, wantArtifactCount: 0},
+		{point: "after_cleanup_bundle_removal"},
+	}
+	for _, test := range tests {
+		t.Run(test.point, func(t *testing.T) {
+			manager := newFixtureManager(t, fixtureRunner{})
+			j, bundle := seedCleanupReady(t, manager, false)
+			manager.fail = func(point string) error {
+				if point == test.point {
+					return errors.New("injected cleanup interruption")
+				}
+				return nil
+			}
+			if _, err := manager.Cleanup(context.Background(), j.UpgradeID); err == nil {
+				t.Fatal("injected cleanup interruption was ignored")
+			}
+			if exists(manager.activePath()) != test.wantActive || exists(bundle) != test.wantBundle {
+				t.Fatalf("active=%t bundle=%t", exists(manager.activePath()), exists(bundle))
+			}
+			if test.wantBundle {
+				entries, err := os.ReadDir(bundle)
+				if err != nil || len(entries) != test.wantArtifactCount {
+					t.Fatalf("artifact count=%d want=%d err=%v", len(entries), test.wantArtifactCount, err)
+				}
+			}
+			if test.commitMustBeIntact && test.wantArtifactCount != 5 {
+				t.Fatal("cleanup removed a bundle artifact before pointer commit")
+			}
+			manager.fail = nil
+			resumed, err := manager.Cleanup(context.Background(), j.UpgradeID)
+			if err != nil || resumed.State != "cleaned" || exists(manager.activePath()) || exists(bundle) {
+				t.Fatalf("resumed=%+v err=%v active=%t bundle=%t", resumed, err, exists(manager.activePath()), exists(bundle))
+			}
+		})
+	}
+}
+
+func TestPostCommitReclamationDoesNotReconstructRetainedLineage(t *testing.T) {
 	manager := newFixtureManager(t, fixtureRunner{})
-	j, bundle := seedBundle(t, manager, false)
-	writeFixtureFile(t, filepath.Join(bundle, "snapshot.db"), "snapshot", 0o600)
-	now := manager.now()
-	j.Phase, j.BootstrapIntentAt, j.CompletedAt, j.UpdatedAt = "cleanup_intent", &now, &now, now
-	if err := writeJournal(bundle, j, manager.uid); err != nil {
+	j, bundle := seedCleanupReady(t, manager, false)
+	manager.fail = func(point string) error {
+		if point == "after_cleanup_active_sync" {
+			return errors.New("injected post-commit interruption")
+		}
+		return nil
+	}
+	if _, err := manager.Cleanup(context.Background(), j.UpgradeID); err == nil || exists(manager.activePath()) || !exists(bundle) {
+		t.Fatalf("commit interruption err=%v active=%t bundle=%t", err, exists(manager.activePath()), exists(bundle))
+	}
+	writeFixtureFile(t, filepath.Join(bundle, "journal.json"), "invalid post-commit journal\n", 0o600)
+	invalidBundle := manager.bundlePath("upgrade-" + strings.Repeat("d", 32))
+	if err := os.Mkdir(invalidBundle, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	current := currentInstallation{SchemaVersion: 1, UpgradeID: j.UpgradeID, Supervisor: j.Supervisor, BinaryDigest: j.Candidate.Digest, BuildIdentity: j.Candidate.Build.BuildIdentity, VCSRevision: j.Revision, DatabaseSchema: 42, VerifiedAt: now}
+	writeFixtureFile(t, filepath.Join(invalidBundle, "journal.json"), "invalid retained evidence\n", 0o600)
+	manager.fail = nil
+	resumed, err := manager.Cleanup(context.Background(), j.UpgradeID)
+	if err != nil || resumed.State != "cleaned" || exists(bundle) || !exists(invalidBundle) {
+		t.Fatalf("resumed=%+v err=%v target=%t retained=%t", resumed, err, exists(bundle), exists(invalidBundle))
+	}
+}
+
+func TestRollbackCleanupCommitsPreviousInstallationBeforeReclamation(t *testing.T) {
+	manager := newFixtureManager(t, fixtureRunner{})
+	j, bundle := seedCleanupReady(t, manager, true)
+	result, err := manager.Cleanup(context.Background(), j.UpgradeID)
+	if err != nil || result.State != "cleaned" || exists(manager.activePath()) || exists(bundle) {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	current, err := manager.readCurrentInstallation(j.UpgradeID)
+	if err != nil || current != currentInstallationFor(j) || current.BinaryDigest != j.Previous.Digest || current.VCSRevision != "" {
+		t.Fatalf("current=%+v err=%v", current, err)
+	}
+}
+
+func TestHistoricalRecoverySuccessorCleanupRetainsExactPredecessor(t *testing.T) {
+	manager := newFixtureManager(t, fixtureRunner{})
+	successor, bundle := seedCleanupReady(t, manager, false)
+	successor.SchemaVersion = journalSchemaVersion
+	successor.PredecessorID = "upgrade-" + strings.Repeat("d", 32)
+	predecessor := writeRetainedCleanupPredecessor(t, manager, successor, "d", true)
+	bindCleanupSuccessorToPredecessor(t, manager, &successor, bundle, predecessor)
+	result, err := manager.Cleanup(context.Background(), successor.UpgradeID)
+	if err != nil || result.State != "cleaned" || exists(manager.activePath()) || exists(bundle) || !exists(manager.bundlePath(predecessor.UpgradeID)) {
+		t.Fatalf("result=%+v err=%v active=%t successor=%t predecessor=%t", result, err, exists(manager.activePath()), exists(bundle), exists(manager.bundlePath(predecessor.UpgradeID)))
+	}
+	persisted, _, err := manager.loadBundleJournal(predecessor.UpgradeID)
+	if err != nil || persisted.DatabaseRecovery == nil || persisted.SuccessorID != successor.UpgradeID {
+		t.Fatalf("predecessor=%+v err=%v", persisted, err)
+	}
+}
+
+func TestLiveCleanupRejectsContradictoryPredecessorBeforeMutation(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *Manager, *journal, *journal, string)
+	}{
+		{name: "successor revision conflicts", mutate: func(_ *testing.T, _ *Manager, _ *journal, predecessor *journal, _ string) {
+			predecessor.SuccessorRevision = strings.Repeat("e", 40)
+		}},
+		{name: "predecessor revision equals successor", mutate: func(_ *testing.T, _ *Manager, successor *journal, predecessor *journal, _ string) {
+			predecessor.Revision = successor.Revision
+			predecessor.Candidate.Build.VCSRevision = successor.Revision
+		}},
+		{name: "predecessor candidate equals successor", mutate: func(t *testing.T, manager *Manager, successor *journal, predecessor *journal, bundle string) {
+			predecessor.Candidate = successor.Candidate
+			bindCleanupSuccessorToPredecessor(t, manager, successor, bundle, *predecessor)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manager := newFixtureManager(t, fixtureRunner{})
+			successor, bundle := seedCleanupReady(t, manager, false)
+			successor.SchemaVersion = journalSchemaVersion
+			successor.PredecessorID = "upgrade-" + strings.Repeat("d", 32)
+			predecessor := writeRetainedCleanupPredecessor(t, manager, successor, "d", false)
+			bindCleanupSuccessorToPredecessor(t, manager, &successor, bundle, predecessor)
+			test.mutate(t, manager, &successor, &predecessor, bundle)
+			if err := writeJournal(manager.bundlePath(predecessor.UpgradeID), predecessor, manager.uid); err != nil {
+				t.Fatal(err)
+			}
+			before := fixtureTreeFingerprint(t, manager.controllerRoot())
+			if _, err := manager.Cleanup(context.Background(), successor.UpgradeID); err == nil {
+				t.Fatal("contradictory predecessor lineage was accepted")
+			}
+			after := fixtureTreeFingerprint(t, manager.controllerRoot())
+			if before != after || !exists(manager.activePath()) || !exists(bundle) {
+				t.Fatal("contradictory predecessor cleanup changed durable evidence")
+			}
+		})
+	}
+}
+
+func TestLegacyBundleMissingCleanupCompletesOnlyAfterCurrentInstallationValidation(t *testing.T) {
+	manager := newFixtureManager(t, fixtureRunner{})
+	j, bundle := seedCleanupReady(t, manager, false)
+	current := currentInstallationFor(j)
 	if err := writePrivateJSON(filepath.Join(manager.controllerRoot(), "current-installation.json"), current, manager.uid); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(filepath.Join(bundle, "candidate.bin")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(filepath.Join(bundle, "journal.json")); err != nil {
-		t.Fatal(err)
-	}
+	removeFixtureBundle(t, manager, bundle)
 	result, err := manager.Cleanup(context.Background(), j.UpgradeID)
 	if err != nil || result.State != "cleaned" || exists(bundle) || exists(manager.activePath()) {
 		t.Fatalf("result=%+v err=%v bundle=%t active=%t", result, err, exists(bundle), exists(manager.activePath()))
+	}
+}
+
+func TestLegacyBundleMissingOrdinarySuccessorCleanupIsUnambiguous(t *testing.T) {
+	manager := newFixtureManager(t, fixtureRunner{})
+	j, bundle := seedCleanupReady(t, manager, false)
+	current := currentInstallationFor(j)
+	if err := writePrivateJSON(filepath.Join(manager.controllerRoot(), "current-installation.json"), current, manager.uid); err != nil {
+		t.Fatal(err)
+	}
+	removeFixtureBundle(t, manager, bundle)
+	predecessor := writeRetainedCleanupPredecessor(t, manager, j, "d", false)
+	result, err := manager.Cleanup(context.Background(), j.UpgradeID)
+	if err != nil || result.State != "cleaned" || exists(manager.activePath()) || !exists(manager.bundlePath(predecessor.UpgradeID)) {
+		t.Fatalf("result=%+v err=%v active=%t predecessor=%t", result, err, exists(manager.activePath()), exists(manager.bundlePath(predecessor.UpgradeID)))
+	}
+}
+
+func TestLegacyBundleMissingUnsafeEvidenceFailsWithoutMutation(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *Manager, journal)
+	}{
+		{name: "invalid retained journal", mutate: func(t *testing.T, manager *Manager, _ journal) {
+			bundle := manager.bundlePath("upgrade-" + strings.Repeat("d", 32))
+			if err := os.Mkdir(bundle, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			writeFixtureFile(t, filepath.Join(bundle, "journal.json"), "not-json\n", 0o600)
+		}},
+		{name: "multiple ordinary claims", mutate: func(t *testing.T, manager *Manager, successor journal) {
+			writeRetainedCleanupPredecessor(t, manager, successor, "d", false)
+			writeRetainedCleanupPredecessor(t, manager, successor, "e", false)
+		}},
+		{name: "recovery-bearing retained journal", mutate: func(t *testing.T, manager *Manager, successor journal) {
+			predecessor := writeRetainedCleanupPredecessor(t, manager, successor, "d", true)
+			predecessor.SuccessorID = "upgrade-" + strings.Repeat("e", 32)
+			predecessor.SuccessorRevision = strings.Repeat("e", 40)
+			predecessor.DatabaseRecovery.SuccessorRevision = predecessor.SuccessorRevision
+			if err := writeJournal(manager.bundlePath(predecessor.UpgradeID), predecessor, manager.uid); err != nil || validateJournal(predecessor, predecessor.UpgradeID) != nil {
+				t.Fatalf("recovery fixture err=%v", err)
+			}
+		}},
+		{name: "unproven ordinary relation", mutate: func(t *testing.T, manager *Manager, successor journal) {
+			predecessor := writeRetainedCleanupPredecessor(t, manager, successor, "d", false)
+			predecessor.SuccessorRevision = strings.Repeat("e", 40)
+			if err := writeJournal(manager.bundlePath(predecessor.UpgradeID), predecessor, manager.uid); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "same predecessor and successor revision", mutate: func(t *testing.T, manager *Manager, successor journal) {
+			predecessor := writeRetainedCleanupPredecessor(t, manager, successor, "d", false)
+			predecessor.Revision = successor.Revision
+			predecessor.Candidate.Build.VCSRevision = successor.Revision
+			if err := writeJournal(manager.bundlePath(predecessor.UpgradeID), predecessor, manager.uid); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "same predecessor and installed candidate", mutate: func(t *testing.T, manager *Manager, successor journal) {
+			predecessor := writeRetainedCleanupPredecessor(t, manager, successor, "d", false)
+			predecessor.Candidate = successor.Candidate
+			if err := writeJournal(manager.bundlePath(predecessor.UpgradeID), predecessor, manager.uid); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "invalid current installation", mutate: func(t *testing.T, manager *Manager, successor journal) {
+			current := currentInstallationFor(successor)
+			current.DatabaseSchema = 0
+			if err := writePrivateJSON(filepath.Join(manager.controllerRoot(), "current-installation.json"), current, manager.uid); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manager := newFixtureManager(t, fixtureRunner{})
+			j, bundle := seedCleanupReady(t, manager, false)
+			current := currentInstallationFor(j)
+			if err := writePrivateJSON(filepath.Join(manager.controllerRoot(), "current-installation.json"), current, manager.uid); err != nil {
+				t.Fatal(err)
+			}
+			removeFixtureBundle(t, manager, bundle)
+			test.mutate(t, manager, j)
+			before := fixtureTreeFingerprint(t, manager.controllerRoot())
+			if _, err := manager.Cleanup(context.Background(), j.UpgradeID); err == nil {
+				t.Fatal("unsafe legacy cleanup evidence was accepted")
+			}
+			after := fixtureTreeFingerprint(t, manager.controllerRoot())
+			if before != after || !exists(manager.activePath()) {
+				t.Fatal("rejected legacy cleanup changed bytes or metadata")
+			}
+		})
 	}
 }
 

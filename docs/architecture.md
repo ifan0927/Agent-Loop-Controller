@@ -1490,8 +1490,16 @@ database rollback is allowed: missing launchd responses, worker identity
 conflicts, or readiness failures preserve the bundle for attention. Cleanup is
 authorized only by an exact candidate/heartbeat/configuration/schema/supervisor
 match plus healthy Controller readiness, or by an equally verified pre-intent
-rollback. It writes one current-installation manifest and removes only the
-closed set of artifacts owned by that completed bundle.
+rollback. Cleanup keeps the complete bundle and any exact retained predecessor
+lineage while it durably records `cleanup_intent` and the schema-v1 current-
+installation manifest. Exact active-pointer unlink followed by upgrade-root
+synchronization is the cleanup commit. Only after that commit may cleanup
+reclaim the closed set of artifacts owned by the completed bundle. A restart
+with the exact current installation and no active pointer performs one-way
+artifact reclamation only and never recreates active authority. Compatibility
+cleanup for the former bundle-missing/active-present ordering inspects retained
+journals read-only and proceeds only for unambiguous ordinary lineage; invalid,
+unproven, or recovery-bearing evidence fails closed without mutation.
 
 An active post-bootstrap attention may create one managed successor only when
 the installed candidate, selected running supervisor, worker process identity,

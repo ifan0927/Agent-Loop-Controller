@@ -3185,6 +3185,20 @@ enters attention and preserves the bundle. Cleanup is allowed only after a
 healthy upgrade with ready Controller state. Machine output keeps these axes
 separate as `upgrade_health` and `controller_readiness`.
 
+Cleanup first validates the complete exact bundle, current installation, and
+any retained predecessor lineage. Its commit is removal of the exact active
+pointer followed by synchronization of the upgrade root; bundle artifacts are
+reclaimed only after that boundary. If cleanup is interrupted after the commit,
+rerun the same `cleanup --upgrade-id` command to resume one-way reclamation.
+Never recreate `active.json` or edit, move, or selectively preserve bundle
+files. A pre-fix installation with the active pointer still present but its
+bundle absent is completed only when all retained journals prove unambiguous
+ordinary lineage. Invalid, conflicting, unproven, or recovery-bearing retained
+evidence requires stopping supervision, proving workers, children, leases, and
+external effects absent, then replacing the complete disposable runtime through
+normal installation and onboarding; do not repair, reset, force, import, adopt,
+or rebind the partial installation.
+
 An attention result whose `upgrade_health` is `healthy` and whose
 `controller_readiness` is `not_ready` may be eligible for one verified managed
 successor. Eligibility is limited to `configuration_not_converged`,
@@ -3326,7 +3340,10 @@ Rollback restores only the exact previous binary. It never restores the SQLite
 snapshot, downgrades schema, or starts a worker. Interrupted
 `replacement_intent`, `rollback_intent`, `bootstrap_intent`, and
 `cleanup_intent` are deterministic: rerun `status`, then only its stated next
-action. Never delete or edit the active bundle or journal manually.
+action. During cleanup, an absent active pointer with an exact current-
+installation manifest means the authority commit is complete even if some or
+all bundle artifacts remain; rerun cleanup to reclaim only those exact owned
+artifacts. Never delete or edit the active bundle or journal manually.
 
 ### Unsupported root-owned binary fallback
 
