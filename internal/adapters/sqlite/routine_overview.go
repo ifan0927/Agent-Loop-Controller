@@ -241,27 +241,15 @@ func projectOverviewOnboarding(value application.Onboarding) application.Routine
 }
 
 func readRoutineOverviewAttention(ctx context.Context, tx *sql.Tx, limit int, result *application.RoutinePersistedOverviewSnapshot) error {
-	const currentAttention = `SELECT event_key,payload_digest,schema_version,event_type,run_id,linear_identifier,repository_profile_id,repository_profile_name,controller_state,severity,reason_code,allowed_actions_json,evidence_digest,occurred_at,observed_at,legacy_payload_digest,legacy_delivery_status,retry_failure_class FROM (
-		SELECT event_key,payload_digest,schema_version,event_type,run_id,linear_identifier,repository_profile_id,repository_profile_name,controller_state,severity,reason_code,allowed_actions_json,evidence_digest,occurred_at,observed_at,legacy_payload_digest,legacy_delivery_status,retry_failure_class,
-		ROW_NUMBER() OVER (PARTITION BY event_type,run_id,linear_identifier,repository_profile_id ORDER BY occurred_at DESC,event_key DESC) AS routine_rank
-		FROM operator_attention_outbox
-	) WHERE routine_rank=1`
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM (`+currentAttention+`)`).Scan(&result.AttentionTotal); err != nil {
-		return err
-	}
-	result.AttentionTruncated = result.AttentionTotal > limit
-	result.ActionableTotal = result.AttentionTotal
-	result.ActionableTruncated = result.AttentionTruncated
-	rows, err := tx.QueryContext(ctx, currentAttention+` ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'error' THEN 1 WHEN 'warning' THEN 2 WHEN 'info' THEN 3 ELSE 4 END,occurred_at,event_key LIMIT ?`, limit)
+	current, err := readCurrentOperatorAttentionFamilies(ctx, tx, currentOperatorAttentionFamilyRead{Filter: currentOperatorAttentionFamilyAll, Limit: limit, SeverityOrder: true, Count: true})
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		event, err := scanOperatorAttention(rows)
-		if err != nil {
-			return err
-		}
+	result.AttentionTotal = current.Total
+	result.AttentionTruncated = result.AttentionTotal > limit
+	result.ActionableTotal = result.AttentionTotal
+	result.ActionableTruncated = result.AttentionTruncated
+	for _, event := range current.Events {
 		scope, target := application.ScopeController, "controller"
 		if event.RunID != "" {
 			scope, target = application.ScopeRun, event.RunID
@@ -283,7 +271,7 @@ func readRoutineOverviewAttention(ctx context.Context, tx *sql.Tx, limit int, re
 			result.QueueAttention = &application.RoutineQueueAttention{OccurredAt: event.OccurredAt.UTC(), Degraded: event.Severity == "critical" || event.Severity == "error", ReasonCode: reason}
 		}
 	}
-	return rows.Err()
+	return nil
 }
 
 func readRoutineOverviewConfiguration(ctx context.Context, tx *sql.Tx, requester domain.GitHubUserIdentity, observedAt time.Time, result *application.RoutinePersistedOverviewSnapshot) error {

@@ -35,8 +35,13 @@ type RoutineAttentionCandidateQuery struct {
 	Limit               int
 }
 
-type RoutineAttentionCandidateStore interface {
+type RoutineAttentionTargetCandidateStore interface {
 	ListRoutineAttentionCandidates(context.Context, RoutineAttentionCandidateQuery) ([]OperatorAttentionEvent, error)
+}
+
+type RoutineAttentionCandidateStore interface {
+	RoutineAttentionTargetCandidateStore
+	ControllerAttentionCandidateStore
 }
 
 type ControllerAttentionCandidateQuery struct {
@@ -112,11 +117,7 @@ func NewRoutineAttentionQueryService(store RoutineAttentionCandidateStore, queri
 	if store == nil || queries == nil || authorizer == nil || repositories == nil {
 		return nil, errors.New("routine attention dependencies are required")
 	}
-	actionStore, ok := queries.(LegalActionStore)
-	if !ok {
-		return nil, errors.New("routine attention requires current legal-action authority")
-	}
-	actions, err := NewLegalActionService(actionStore, authorizer)
+	actions, err := NewLegalActionService(queries, authorizer)
 	if err != nil {
 		return nil, err
 	}
@@ -170,8 +171,7 @@ func (s *RoutineAttentionQueryService) ListController(ctx context.Context, autho
 	if limit == 0 {
 		limit = RoutineQueryDefaultLimit
 	}
-	store, ok := s.store.(ControllerAttentionCandidateStore)
-	if !ok || !authority.Valid() {
+	if !authority.Valid() {
 		return RoutineAttentionPage{}, serviceError(ErrorInternal, "controller attention authority is unavailable", nil)
 	}
 	if query.Scope != ScopeController || query.TargetID != "" && query.TargetID != controllerScopeID || limit < 1 || limit > RoutineQueryMaximumLimit || len(query.Cursor) > 1024 {
@@ -185,7 +185,7 @@ func (s *RoutineAttentionQueryService) ListController(ctx context.Context, autho
 	if query.Cursor != "" && (cursor.AuthorityDigest != authority.Digest() || cursor.Scope != ScopeController || cursor.TargetID != query.TargetID) {
 		return RoutineAttentionPage{}, serviceError(ErrorInvalidInput, "cursor is invalid", nil)
 	}
-	candidates, err := store.ListControllerAttentionCandidates(ctx, ControllerAttentionCandidateQuery{Authority: authority, Limit: maximumRoutineAttentionCandidates + 1})
+	candidates, err := s.store.ListControllerAttentionCandidates(ctx, ControllerAttentionCandidateQuery{Authority: authority, Limit: maximumRoutineAttentionCandidates + 1})
 	if err != nil {
 		return RoutineAttentionPage{}, classifyServiceError(err)
 	}
@@ -278,14 +278,13 @@ func (s *RoutineAttentionQueryService) projectPage(ctx context.Context, query Ro
 		last := result.Items[len(result.Items)-1]
 		result.Collection.NextCursor = encodeRoutineAttentionCursor(routineAttentionCursor{Version: routineAttentionCursorVersion, AuthorityDigest: authorityDigest, Scope: query.Scope, TargetID: query.TargetID, Severity: routineSeverityRank(last.Severity), OccurredAt: last.OccurredAt, EventID: last.EventID})
 	}
-	current, currentStore := s.queries.(CurrentOperatorAttentionQuery)
 	for index := range result.Items {
 		item := &result.Items[index]
 		event := eventsByID[item.EventID]
-		if event.RunID == "" || item.AttentionState == RoutineAttentionConflict || !currentStore {
+		if event.RunID == "" || item.AttentionState == RoutineAttentionConflict {
 			continue
 		}
-		currentEvent, found, currentErr := current.CurrentOperatorAttention(ctx, event.RunID)
+		currentEvent, found, currentErr := s.queries.CurrentOperatorAttention(ctx, event.RunID)
 		if currentErr != nil {
 			return RoutineAttentionPage{}, classifyServiceError(currentErr)
 		}

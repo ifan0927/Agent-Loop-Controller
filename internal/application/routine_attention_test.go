@@ -19,6 +19,12 @@ type routineAttentionStoreFixture struct {
 	controllerQuery ControllerAttentionCandidateQuery
 }
 
+var (
+	_ RoutineAttentionTargetCandidateStore = (*routineAttentionStoreFixture)(nil)
+	_ ControllerAttentionCandidateStore    = (*routineAttentionStoreFixture)(nil)
+	_ RoutineAttentionCandidateStore       = (*routineAttentionStoreFixture)(nil)
+)
+
 func (s *routineAttentionStoreFixture) ListControllerAttentionCandidates(_ context.Context, query ControllerAttentionCandidateQuery) ([]OperatorAttentionEvent, error) {
 	s.controllerQuery = query
 	return append([]OperatorAttentionEvent(nil), s.candidates...), nil
@@ -30,6 +36,10 @@ func (s *routineAttentionStoreFixture) ListRoutineAttentionCandidates(_ context.
 }
 
 func (s *routineAttentionStoreFixture) ListAuthorizedRuns(context.Context, AuthorizedRunQuery) (AuthorizedRunPage, error) {
+	return AuthorizedRunPage{}, nil
+}
+
+func (s *routineAttentionStoreFixture) ListControllerRuns(context.Context, ControllerRunQuery) (AuthorizedRunPage, error) {
 	return AuthorizedRunPage{}, nil
 }
 

@@ -12,12 +12,22 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 )
 
+var (
+	_ application.OperatorAttentionPublisher           = (*Store)(nil)
+	_ application.OperatorAttentionQuery               = (*Store)(nil)
+	_ application.CurrentOperatorAttentionQuery        = (*Store)(nil)
+	_ application.RoutineAttentionTargetCandidateStore = (*Store)(nil)
+	_ application.ControllerAttentionCandidateStore    = (*Store)(nil)
+	_ application.RoutineAttentionCandidateStore       = (*Store)(nil)
+	_ application.ControllerRunCollectionStore         = (*Store)(nil)
+	_ application.QueryStore                           = (*Store)(nil)
+)
+
 func (s *Store) ListRoutineAttentionCandidates(ctx context.Context, input application.RoutineAttentionCandidateQuery) ([]application.OperatorAttentionEvent, error) {
 	if input.Scopes.Empty() || input.Limit < 1 || input.Limit > 1001 {
 		return nil, errors.New("routine attention candidate query is invalid")
 	}
-	where := "1=1"
-	args := []any{}
+	read := currentOperatorAttentionFamilyRead{Limit: input.Limit}
 	switch input.Scope {
 	case application.ScopeController:
 		return nil, errors.New("routine attention controller scope requires collection read authority")
@@ -25,8 +35,8 @@ func (s *Store) ListRoutineAttentionCandidates(ctx context.Context, input applic
 		if input.TargetID == "" || input.RepositoryProfileID == "" || len(input.Scopes.RepositoryBindingDigests()) != 1 {
 			return nil, errors.New("routine attention repository scope is invalid")
 		}
-		where = "repository_profile_id=?"
-		args = append(args, input.RepositoryProfileID)
+		read.Filter = currentOperatorAttentionFamilyRepository
+		read.Target = input.RepositoryProfileID
 	case application.ScopeRun:
 		if input.TargetID == "" {
 			return nil, errors.New("routine attention run scope is invalid")
@@ -35,12 +45,13 @@ func (s *Store) ListRoutineAttentionCandidates(ctx context.Context, input applic
 		if err := s.db.QueryRowContext(ctx, `SELECT repository_binding_digest FROM runs WHERE run_id=?`, input.TargetID).Scan(&binding); err != nil || !input.Scopes.AllowsRun(input.TargetID, binding) {
 			return nil, application.ErrRunNotFound
 		}
-		where = "run_id=?"
-		args = append(args, input.TargetID)
+		read.Filter = currentOperatorAttentionFamilyRun
+		read.Target = input.TargetID
 	default:
 		return nil, errors.New("routine attention scope is invalid")
 	}
-	return s.listRoutineAttentionCandidates(ctx, where, args, input.Limit)
+	result, err := readCurrentOperatorAttentionFamilies(ctx, s.db, read)
+	return result.Events, err
 }
 
 // ListControllerAttentionCandidates reads the Controller-owned inbox without
@@ -50,28 +61,91 @@ func (s *Store) ListControllerAttentionCandidates(ctx context.Context, input app
 	if !input.Authority.Valid() || input.Limit < 1 || input.Limit > 1001 {
 		return nil, errors.New("controller attention candidate query is invalid")
 	}
-	return s.listRoutineAttentionCandidates(ctx, "1=1", nil, input.Limit)
+	result, err := readCurrentOperatorAttentionFamilies(ctx, s.db, currentOperatorAttentionFamilyRead{Filter: currentOperatorAttentionFamilyAll, Limit: input.Limit})
+	return result.Events, err
 }
 
-func (s *Store) listRoutineAttentionCandidates(ctx context.Context, where string, args []any, limit int) ([]application.OperatorAttentionEvent, error) {
-	args = append(args, limit)
-	query := `SELECT event_key,payload_digest,schema_version,event_type,run_id,linear_identifier,repository_profile_id,repository_profile_name,controller_state,severity,reason_code,allowed_actions_json,evidence_digest,occurred_at,observed_at,legacy_payload_digest,legacy_delivery_status,retry_failure_class FROM (
-		SELECT event_key,payload_digest,schema_version,event_type,run_id,linear_identifier,repository_profile_id,repository_profile_name,controller_state,severity,reason_code,allowed_actions_json,evidence_digest,occurred_at,observed_at,legacy_payload_digest,legacy_delivery_status,retry_failure_class,
-		ROW_NUMBER() OVER (PARTITION BY event_type,run_id,linear_identifier,repository_profile_id ORDER BY occurred_at DESC,event_key DESC) AS routine_rank
-		FROM operator_attention_outbox WHERE ` + where + `
-	) WHERE routine_rank=1 LIMIT ?`
-	rows, err := s.db.QueryContext(ctx, query, args...)
+// currentOperatorAttentionFamilyQueryer is the narrow DB/transaction read
+// capability for the routine presentation window. Exact-current action and
+// mutation authority must continue to use CurrentOperatorAttention and the
+// transaction-time created_at/rowid checks instead.
+type currentOperatorAttentionFamilyQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+var _ currentOperatorAttentionFamilyQueryer = (*sql.DB)(nil)
+var _ currentOperatorAttentionFamilyQueryer = (*sql.Tx)(nil)
+
+type currentOperatorAttentionFamilyFilter uint8
+
+const (
+	currentOperatorAttentionFamilyAll currentOperatorAttentionFamilyFilter = iota
+	currentOperatorAttentionFamilyRepository
+	currentOperatorAttentionFamilyRun
+)
+
+type currentOperatorAttentionFamilyRead struct {
+	Filter        currentOperatorAttentionFamilyFilter
+	Target        string
+	Limit         int
+	SeverityOrder bool
+	Count         bool
+}
+
+type currentOperatorAttentionFamilyResult struct {
+	Events []application.OperatorAttentionEvent
+	Total  int
+}
+
+func readCurrentOperatorAttentionFamilies(ctx context.Context, queryer currentOperatorAttentionFamilyQueryer, input currentOperatorAttentionFamilyRead) (currentOperatorAttentionFamilyResult, error) {
+	if queryer == nil || input.Limit < 1 || input.Limit > 1001 {
+		return currentOperatorAttentionFamilyResult{}, errors.New("current operator attention family read is invalid")
+	}
+	where := ""
+	args := []any{}
+	switch input.Filter {
+	case currentOperatorAttentionFamilyAll:
+		if input.Target != "" {
+			return currentOperatorAttentionFamilyResult{}, errors.New("current operator attention family read is invalid")
+		}
+	case currentOperatorAttentionFamilyRepository:
+		if input.Target == "" {
+			return currentOperatorAttentionFamilyResult{}, errors.New("current operator attention family read is invalid")
+		}
+		where = ` WHERE repository_profile_id=?`
+		args = append(args, input.Target)
+	case currentOperatorAttentionFamilyRun:
+		if input.Target == "" {
+			return currentOperatorAttentionFamilyResult{}, errors.New("current operator attention family read is invalid")
+		}
+		where = ` WHERE run_id=?`
+		args = append(args, input.Target)
+	default:
+		return currentOperatorAttentionFamilyResult{}, errors.New("current operator attention family read is invalid")
+	}
+	query := currentOperatorAttentionFamilyWindowPrefix + where + currentOperatorAttentionFamilyWindowSuffix
+	result := currentOperatorAttentionFamilyResult{}
+	if input.Count {
+		if err := queryer.QueryRowContext(ctx, `SELECT COUNT(*) FROM (`+query+`)`, args...).Scan(&result.Total); err != nil {
+			return currentOperatorAttentionFamilyResult{}, err
+		}
+	}
+	if input.SeverityOrder {
+		query += ` ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'error' THEN 1 WHEN 'warning' THEN 2 WHEN 'info' THEN 3 ELSE 4 END,occurred_at,event_key`
+	}
+	queryArgs := append(append([]any(nil), args...), input.Limit)
+	rows, err := queryer.QueryContext(ctx, query+` LIMIT ?`, queryArgs...)
 	if err != nil {
-		return nil, err
+		return currentOperatorAttentionFamilyResult{}, err
 	}
 	defer rows.Close()
-	var result []application.OperatorAttentionEvent
 	for rows.Next() {
 		event, err := scanOperatorAttention(rows)
 		if err != nil {
-			return nil, err
+			return currentOperatorAttentionFamilyResult{}, err
 		}
-		result = append(result, event)
+		result.Events = append(result.Events, event)
 	}
 	return result, rows.Err()
 }
@@ -187,7 +261,10 @@ func (s *Store) listOperatorAttention(ctx context.Context, runID string, limit i
 	return result, rows.Err()
 }
 
-const operatorAttentionSelect = `SELECT event_key,payload_digest,schema_version,event_type,run_id,linear_identifier,repository_profile_id,repository_profile_name,controller_state,severity,reason_code,allowed_actions_json,evidence_digest,occurred_at,observed_at,legacy_payload_digest,legacy_delivery_status,retry_failure_class FROM operator_attention_outbox`
+const operatorAttentionColumns = `event_key,payload_digest,schema_version,event_type,run_id,linear_identifier,repository_profile_id,repository_profile_name,controller_state,severity,reason_code,allowed_actions_json,evidence_digest,occurred_at,observed_at,legacy_payload_digest,legacy_delivery_status,retry_failure_class`
+const operatorAttentionSelect = `SELECT ` + operatorAttentionColumns + ` FROM operator_attention_outbox`
+const currentOperatorAttentionFamilyWindowPrefix = `SELECT ` + operatorAttentionColumns + ` FROM (SELECT ` + operatorAttentionColumns + `,ROW_NUMBER() OVER (PARTITION BY event_type,run_id,linear_identifier,repository_profile_id ORDER BY occurred_at DESC,event_key DESC) AS routine_rank FROM operator_attention_outbox`
+const currentOperatorAttentionFamilyWindowSuffix = `) WHERE routine_rank=1`
 
 func scanOperatorAttention(row rowScanner) (application.OperatorAttentionEvent, error) {
 	var event application.OperatorAttentionEvent

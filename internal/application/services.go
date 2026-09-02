@@ -481,6 +481,8 @@ type QueryStore interface {
 	ListAuthorizedRuns(context.Context, AuthorizedRunQuery) (AuthorizedRunPage, error)
 	Inspect(context.Context, string) (RunInspection, error)
 	OperatorAttentionQuery
+	CurrentOperatorAttentionQuery
+	ControllerRunCollectionStore
 }
 
 type QueryService struct {
@@ -519,19 +521,17 @@ func (s QueryService) inspectAuthorized(ctx context.Context, runID string) (Insp
 		return InspectionResult{}, classifyServiceError(err)
 	}
 	currentAttentionKey := ""
-	if currentStore, ok := s.store.(CurrentOperatorAttentionQuery); ok {
-		current, found, currentErr := currentStore.CurrentOperatorAttention(ctx, runID)
-		if currentErr != nil {
-			return InspectionResult{}, classifyServiceError(currentErr)
-		}
-		if found {
-			currentAttentionKey = current.EventKey
-			if !slices.ContainsFunc(attention, func(event OperatorAttentionEvent) bool { return event.EventKey == current.EventKey }) {
-				if len(attention) >= maxOperatorAttentionProjection {
-					attention = attention[1:]
-				}
-				attention = append(attention, current)
+	current, found, currentErr := s.store.CurrentOperatorAttention(ctx, runID)
+	if currentErr != nil {
+		return InspectionResult{}, classifyServiceError(currentErr)
+	}
+	if found {
+		currentAttentionKey = current.EventKey
+		if !slices.ContainsFunc(attention, func(event OperatorAttentionEvent) bool { return event.EventKey == current.EventKey }) {
+			if len(attention) >= maxOperatorAttentionProjection {
+				attention = attention[1:]
 			}
+			attention = append(attention, current)
 		}
 	}
 	inspection.OperatorAttention = attention
@@ -607,8 +607,7 @@ func (s QueryService) ListRunSummaries(ctx context.Context, query RunSummaryQuer
 // Controller-owned Runs collection. Repository is a canonical identity filter,
 // not mutable profile or frozen binding authority.
 func (s QueryService) ListControllerRunSummaries(ctx context.Context, authority ControllerReadAuthority, query RunSummaryQuery) (RunSummaryPage, error) {
-	store, ok := s.store.(ControllerRunCollectionStore)
-	if !ok || !authority.Valid() {
+	if !authority.Valid() {
 		return RunSummaryPage{}, serviceError(ErrorInternal, "controller run collection authority is unavailable", nil)
 	}
 	limit := query.Limit
@@ -629,7 +628,7 @@ func (s QueryService) ListControllerRunSummaries(ctx context.Context, authority 
 	if query.Cursor != "" && (cursor.Repository != query.Repository || cursor.Lifecycle != lifecycle || cursor.ReaderDigest != authority.Digest()) {
 		return RunSummaryPage{}, serviceError(ErrorInvalidInput, "cursor is invalid", nil)
 	}
-	stored, err := store.ListControllerRuns(ctx, ControllerRunQuery{Authority: authority, CanonicalRepository: query.Repository, Lifecycle: lifecycle, BeforeUpdatedAt: cursor.UpdatedAt, BeforeRunID: cursor.RunID, Limit: limit + 1})
+	stored, err := s.store.ListControllerRuns(ctx, ControllerRunQuery{Authority: authority, CanonicalRepository: query.Repository, Lifecycle: lifecycle, BeforeUpdatedAt: cursor.UpdatedAt, BeforeRunID: cursor.RunID, Limit: limit + 1})
 	if err != nil {
 		return RunSummaryPage{}, classifyServiceError(err)
 	}
