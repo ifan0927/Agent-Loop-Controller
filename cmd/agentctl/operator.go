@@ -36,6 +36,7 @@ type operatorRoute string
 const (
 	operatorOverviewRoute  operatorRoute = "overview"
 	operatorRunsRoute      operatorRoute = "runs"
+	operatorAttentionRoute operatorRoute = "attention"
 	operatorRunDetailRoute operatorRoute = "run_detail"
 )
 
@@ -82,6 +83,39 @@ type operatorRunDetailResultMsg struct {
 	err        operatorSafeError
 }
 
+type operatorAttentionRequest struct {
+	cursor   string
+	previous []string
+}
+
+type operatorAttentionResultMsg struct {
+	generation int64
+	request    operatorAttentionRequest
+	page       application.RoutineAttentionPage
+	err        operatorSafeError
+}
+
+type operatorAttentionFocus string
+
+const (
+	operatorAttentionListFocus    operatorAttentionFocus = "list"
+	operatorAttentionSummaryFocus operatorAttentionFocus = "summary"
+)
+
+type operatorAttentionState struct {
+	page            *application.RoutineAttentionPage
+	request         operatorAttentionRequest
+	pending         *operatorAttentionRequest
+	initialError    *operatorSafeError
+	staleError      *operatorSafeError
+	refreshing      bool
+	generation      int64
+	index           int
+	selectedEventID string
+	focus           operatorAttentionFocus
+	summaryOffset   int
+}
+
 type operatorRunsState struct {
 	page              *application.RoutineRunPage
 	request           operatorRunsRequest
@@ -110,16 +144,16 @@ type operatorRunDetailState struct {
 type operatorRefreshTickMsg struct{}
 
 type operatorKeyMap struct {
-	up, down, next, previous, refresh, help, quit                             key.Binding
-	overview, runs, open, back, lifecycle, repository, nextPage, previousPage key.Binding
+	up, down, next, previous, refresh, help, quit                                        key.Binding
+	overview, runs, attention, open, back, lifecycle, repository, nextPage, previousPage key.Binding
 }
 
 func (k operatorKeyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.overview, k.runs, k.next, k.previous, k.up, k.down, k.refresh, k.help, k.quit}
+	return []key.Binding{k.overview, k.runs, k.attention, k.next, k.previous, k.up, k.down, k.refresh, k.help, k.quit}
 }
 
 func (k operatorKeyMap) FullHelp() [][]key.Binding {
-	return [][]key.Binding{{k.overview, k.runs}, {k.next, k.previous}, {k.up, k.down}, {k.open, k.back}, {k.lifecycle, k.repository}, {k.nextPage, k.previousPage}, {k.refresh, k.help, k.quit}}
+	return [][]key.Binding{{k.overview, k.runs, k.attention}, {k.next, k.previous}, {k.up, k.down}, {k.open, k.back}, {k.lifecycle, k.repository}, {k.nextPage, k.previousPage}, {k.refresh, k.help, k.quit}}
 }
 
 var operatorKeys = operatorKeyMap{
@@ -132,6 +166,7 @@ var operatorKeys = operatorKeyMap{
 	quit:         key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 	overview:     key.NewBinding(key.WithKeys("1"), key.WithHelp("1", "overview")),
 	runs:         key.NewBinding(key.WithKeys("2"), key.WithHelp("2", "runs")),
+	attention:    key.NewBinding(key.WithKeys("3"), key.WithHelp("3", "attention")),
 	open:         key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "open run")),
 	back:         key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "back")),
 	lifecycle:    key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "lifecycle filter")),
@@ -159,6 +194,7 @@ type operatorModel struct {
 	panels          map[operatorPanel]operatorPanelState
 	route           operatorRoute
 	runs            operatorRunsState
+	attention       operatorAttentionState
 	detail          operatorRunDetailState
 }
 
@@ -180,8 +216,9 @@ func newOperatorModel(parent context.Context, loader operatorLoader) operatorMod
 			operatorRunsPanel:         {},
 			operatorAttentionPanel:    {},
 		},
-		route: operatorOverviewRoute,
-		runs:  operatorRunsState{request: operatorRunsRequest{lifecycle: application.RunLifecycleActive}},
+		route:     operatorOverviewRoute,
+		runs:      operatorRunsState{request: operatorRunsRequest{lifecycle: application.RunLifecycleActive}},
+		attention: operatorAttentionState{focus: operatorAttentionListFocus},
 	}
 }
 
@@ -220,6 +257,18 @@ func (m operatorModel) detailLoadCommand(generation int64, runID string) tea.Cmd
 			return operatorRunDetailResultMsg{generation: generation, runID: runID, err: safeOperatorError(err)}
 		}
 		return operatorRunDetailResultMsg{generation: generation, runID: runID, detail: detail}
+	}
+}
+
+func (m operatorModel) attentionLoadCommand(generation int64, request operatorAttentionRequest) tea.Cmd {
+	ctx, loader, observedAt := m.ctx, m.loader, m.now().UTC()
+	request.previous = append([]string(nil), request.previous...)
+	return func() tea.Msg {
+		page, err := loader.LoadAttention(ctx, request.cursor, observedAt)
+		if err != nil {
+			return operatorAttentionResultMsg{generation: generation, request: request, err: safeOperatorError(err)}
+		}
+		return operatorAttentionResultMsg{generation: generation, request: request, page: page}
 	}
 }
 
@@ -307,6 +356,30 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.tickCommand()
 		}
 		return m, nil
+	case operatorAttentionResultMsg:
+		if msg.generation != m.attention.generation {
+			return m, nil
+		}
+		m.attention.refreshing, m.attention.pending = false, nil
+		if msg.err.Message != "" {
+			if m.attention.page == nil {
+				m.attention.request = msg.request
+				m.attention.initialError = &msg.err
+			} else {
+				m.attention.staleError = &msg.err
+			}
+			return m, nil
+		}
+		selected := m.selectedAttentionEventID()
+		page := msg.page
+		m.attention.page, m.attention.request = &page, msg.request
+		m.attention.initialError, m.attention.staleError = nil, nil
+		m.restoreAttentionSelection(selected)
+		if !m.tickerStarted {
+			m.tickerStarted = true
+			return m, m.tickCommand()
+		}
+		return m, nil
 	case operatorRefreshTickMsg:
 		next := m.tickCommand()
 		switch m.route {
@@ -317,6 +390,10 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case operatorRunsRoute:
 			if m.runs.page != nil && !m.runs.refreshing {
 				return m, tea.Batch(next, m.startRunsRefresh(m.runs.request))
+			}
+		case operatorAttentionRoute:
+			if m.attention.page != nil && !m.attention.refreshing {
+				return m, tea.Batch(next, m.startAttentionRefresh(m.attention.request))
 			}
 		case operatorRunDetailRoute:
 			if m.detail.detail != nil && !m.detail.refreshing {
@@ -348,6 +425,12 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.startRunsRefresh(m.runs.request)
 			}
 			return m, nil
+		case key.Matches(msg, operatorKeys.attention):
+			m.route = operatorAttentionRoute
+			if !m.attention.refreshing {
+				return m, m.startAttentionRefresh(m.attention.request)
+			}
+			return m, nil
 		case m.route == operatorRunDetailRoute && key.Matches(msg, operatorKeys.back):
 			m.route = m.detail.returnRoute
 			return m, nil
@@ -360,6 +443,10 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case operatorRunsRoute:
 				if !m.runs.refreshing {
 					return m, m.startRunsRefresh(m.runs.request)
+				}
+			case operatorAttentionRoute:
+				if !m.attention.refreshing {
+					return m, m.startAttentionRefresh(m.attention.request)
 				}
 			case operatorRunDetailRoute:
 				if !m.detail.refreshing {
@@ -420,6 +507,40 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.startRunsRefresh(request)
 			}
 			return m, nil
+		case m.route == operatorAttentionRoute && m.attention.page != nil && key.Matches(msg, operatorKeys.next):
+			m.toggleAttentionFocus(1)
+			return m, nil
+		case m.route == operatorAttentionRoute && m.attention.page != nil && key.Matches(msg, operatorKeys.previous):
+			m.toggleAttentionFocus(-1)
+			return m, nil
+		case m.route == operatorAttentionRoute && m.attention.page != nil && key.Matches(msg, operatorKeys.up):
+			m.moveAttention(-1)
+			return m, nil
+		case m.route == operatorAttentionRoute && m.attention.page != nil && key.Matches(msg, operatorKeys.down):
+			m.moveAttention(1)
+			return m, nil
+		case m.route == operatorAttentionRoute && m.attention.page != nil && key.Matches(msg, operatorKeys.open):
+			item, ok := m.selectedAttentionItem()
+			if ok && item.Navigation == application.RoutineAttentionNavigationRunDetail {
+				return m.openRunDetail(item.RunID, operatorAttentionRoute)
+			}
+			return m, nil
+		case m.route == operatorAttentionRoute && m.attention.page != nil && key.Matches(msg, operatorKeys.nextPage):
+			if m.attention.page.Collection.NextCursor != "" {
+				request := m.attention.request
+				request.previous = append(append([]string(nil), request.previous...), request.cursor)
+				request.cursor = m.attention.page.Collection.NextCursor
+				return m, m.startAttentionRefresh(request)
+			}
+			return m, nil
+		case m.route == operatorAttentionRoute && m.attention.page != nil && key.Matches(msg, operatorKeys.previousPage):
+			if len(m.attention.request.previous) != 0 {
+				request := m.attention.request
+				request.cursor = request.previous[len(request.previous)-1]
+				request.previous = append([]string(nil), request.previous[:len(request.previous)-1]...)
+				return m, m.startAttentionRefresh(request)
+			}
+			return m, nil
 		case m.route == operatorRunDetailRoute && m.detail.detail != nil && key.Matches(msg, operatorKeys.up):
 			m.detail.gateIndex = clamp(m.detail.gateIndex-1, 0, max(len(m.detail.detail.Gates)-1, 0))
 			return m, nil
@@ -449,6 +570,19 @@ func (m *operatorModel) startRunsRefresh(request operatorRunsRequest) tea.Cmd {
 	copy.previous = append([]string(nil), request.previous...)
 	m.runs.pending = &copy
 	return m.runsLoadCommand(m.runs.generation, copy)
+}
+
+func (m *operatorModel) startAttentionRefresh(request operatorAttentionRequest) tea.Cmd {
+	if m.attention.refreshing {
+		return nil
+	}
+	m.attention.initialError = nil
+	m.attention.generation++
+	m.attention.refreshing = true
+	copy := request
+	copy.previous = append([]string(nil), request.previous...)
+	m.attention.pending = &copy
+	return m.attentionLoadCommand(m.attention.generation, copy)
 }
 
 func (m *operatorModel) startDetailRefresh() tea.Cmd {
@@ -563,6 +697,60 @@ func (m *operatorModel) moveRunsSelection(delta int) {
 	}
 	m.runs.index = clamp(m.runs.index+delta, 0, len(m.runs.page.Runs)-1)
 	m.runs.selectedRunID = m.selectedRunsID()
+}
+
+func (m operatorModel) selectedAttentionEventID() string {
+	item, ok := m.selectedAttentionItem()
+	if !ok {
+		return ""
+	}
+	return item.EventID
+}
+
+func (m operatorModel) selectedAttentionItem() (application.RoutineAttentionItem, bool) {
+	if m.attention.page == nil || len(m.attention.page.Items) == 0 {
+		return application.RoutineAttentionItem{}, false
+	}
+	return m.attention.page.Items[clamp(m.attention.index, 0, len(m.attention.page.Items)-1)], true
+}
+
+func (m *operatorModel) restoreAttentionSelection(eventID string) {
+	if m.attention.page == nil {
+		return
+	}
+	m.attention.index = clamp(m.attention.index, 0, max(len(m.attention.page.Items)-1, 0))
+	for index, item := range m.attention.page.Items {
+		if eventID != "" && item.EventID == eventID {
+			m.attention.index = index
+			break
+		}
+	}
+	m.attention.selectedEventID = m.selectedAttentionEventID()
+	m.attention.summaryOffset = 0
+	if len(m.attention.page.Items) == 0 {
+		m.attention.focus = operatorAttentionListFocus
+	}
+}
+
+func (m *operatorModel) toggleAttentionFocus(_ int) {
+	if m.attention.focus == operatorAttentionListFocus {
+		m.attention.focus = operatorAttentionSummaryFocus
+	} else {
+		m.attention.focus = operatorAttentionListFocus
+	}
+}
+
+func (m *operatorModel) moveAttention(delta int) {
+	if m.attention.focus == operatorAttentionSummaryFocus {
+		m.attention.summaryOffset = max(m.attention.summaryOffset+delta, 0)
+		return
+	}
+	if m.attention.page == nil || len(m.attention.page.Items) == 0 {
+		return
+	}
+	m.attention.index = clamp(m.attention.index+delta, 0, len(m.attention.page.Items)-1)
+	m.attention.selectedEventID = m.selectedAttentionEventID()
+	m.attention.summaryOffset = 0
 }
 
 func safeOperatorError(err error) operatorSafeError {
@@ -849,7 +1037,7 @@ func (m operatorModel) View() tea.View {
 
 func (m operatorModel) render() string {
 	if m.width < operatorMinimumWidth || m.height < operatorMinimumHeight {
-		navigation := "1 Overview  ·  2 Runs"
+		navigation := "1 Overview  ·  2 Runs  ·  3 Attention"
 		if m.route == operatorRunDetailRoute {
 			navigation += "  ·  Esc back"
 		}
@@ -858,6 +1046,8 @@ func (m operatorModel) render() string {
 	switch m.route {
 	case operatorRunsRoute:
 		return m.renderRunsScreen()
+	case operatorAttentionRoute:
+		return m.renderAttentionScreen()
 	case operatorRunDetailRoute:
 		return m.renderRunDetailScreen()
 	default:
@@ -868,9 +1058,9 @@ func (m operatorModel) render() string {
 func (m operatorModel) renderOverviewScreen() string {
 	if m.batch == nil {
 		if m.initialError != nil {
-			return lipgloss.NewStyle().Padding(1, 2).Render("Operator Overview unavailable\n\n" + m.initialError.String() + "\n\nr retry · 2 Runs · q / Ctrl-C quit")
+			return lipgloss.NewStyle().Padding(1, 2).Render("Operator Overview unavailable\n\n" + m.initialError.String() + "\n\nr retry · 2 Runs · 3 Attention · q / Ctrl-C quit")
 		}
-		return lipgloss.NewStyle().Padding(1, 2).Render("Agent Loop Controller\n\nLoading operator overview…\n\n2 Runs · q / Ctrl-C quit")
+		return lipgloss.NewStyle().Padding(1, 2).Render("Agent Loop Controller\n\nLoading operator overview…\n\n2 Runs · 3 Attention · q / Ctrl-C quit")
 	}
 	header := lipgloss.JoinVertical(lipgloss.Left, m.renderHeader(), m.renderHealth())
 	footer := m.renderHelp()
@@ -1346,20 +1536,30 @@ func (m operatorModel) renderHelp() string {
 		if m.runs.repositoryEditing {
 			value = "type exact owner/repository · enter apply · esc cancel"
 		} else if m.help.ShowAll {
-			value = "1 overview · 2 runs · ↑/↓ select · enter open · f lifecycle · / repository · n/p page · r refresh · ? help · q quit"
+			value = "1 overview · 2 runs · 3 attention · ↑/↓ select · enter open · f lifecycle · / repository · n/p page · r refresh · ? help · q quit"
 		} else {
-			value = "1/2 navigate · ↑/↓ select · enter open · f filter · / repository · n/p page · r refresh · ? · q"
+			value = "1/2/3 navigate · ↑/↓ select · enter open · f filter · / repository · n/p page · r refresh · ? · q"
+		}
+	case operatorAttentionRoute:
+		open := ""
+		if item, ok := m.selectedAttentionItem(); ok && item.Navigation == application.RoutineAttentionNavigationRunDetail {
+			open = " · enter open run"
+		}
+		if m.help.ShowAll {
+			value = "1 overview · 2 runs · 3 attention · tab list/summary · ↑/↓ select or scroll" + open + " · n/p page · r refresh · ? help · q quit"
+		} else {
+			value = "1/2/3 navigate · tab region · ↑/↓ select/scroll" + open + " · n/p page · r refresh · ? · q"
 		}
 	case operatorRunDetailRoute:
-		value = "esc back · ↑/↓ delivery gates · r refresh · ? help · q quit"
+		value = "1/2/3 navigate · esc back · ↑/↓ delivery gates · r refresh · ? help · q quit"
 	default:
 		if m.help.ShowAll {
-			value = "1 overview · 2 runs · tab/shift+tab panels · ↑/↓ or j/k select · r refresh · ? help · q quit"
+			value = "1 overview · 2 runs · 3 attention · tab/shift+tab panels · ↑/↓ or j/k select · r refresh · ? help · q quit"
 		} else {
-			value = "1/2 navigate · tab panels · ↑/↓ select · r refresh · ? · q"
+			value = "1/2/3 navigate · tab panels · ↑/↓ select · r refresh · ? · q"
 		}
 		if m.focus == operatorRunsPanel && m.batch != nil && len(m.panelRows(operatorRunsPanel)) != 0 {
-			value = "1/2 navigate · tab panels · ↑/↓ select · enter open run · r refresh · ? · q"
+			value = "1/2/3 navigate · tab panels · ↑/↓ select · enter open run · r refresh · ? · q"
 		}
 	}
 	return " " + ansi.Truncate(value, max(m.width-2, 1), "…") + " "
@@ -1397,6 +1597,7 @@ var presentationLabels = map[string]string{
 	"approval": "APPROVAL", "merge": "MERGE", "cleanup": "CLEANUP", "independent_review": "INDEPENDENT REVIEW",
 	"branch_publication": "BRANCH PUBLICATION", "required_checks": "REQUIRED CHECKS", "review_conversations": "REVIEW CONVERSATIONS",
 	"source_checkout": "SOURCE CHECKOUT", "pending": "PENDING", "passed": "PASSED", "blocked": "BLOCKED",
+	"run_detail": "RUN DETAIL", "warning": "WARNING", "error": "ERROR",
 }
 
 func presentationLabel(value string) string {

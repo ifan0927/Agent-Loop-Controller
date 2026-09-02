@@ -50,6 +50,9 @@ func (inertOperatorLoader) LoadOverview(context.Context, time.Time) (operatorOve
 func (inertOperatorLoader) LoadRuns(context.Context, application.RunLifecycleFilter, string, string, time.Time) (application.RoutineRunPage, error) {
 	return application.RoutineRunPage{}, errors.New("not used")
 }
+func (inertOperatorLoader) LoadAttention(context.Context, string, time.Time) (application.RoutineAttentionPage, error) {
+	return application.RoutineAttentionPage{}, errors.New("not used")
+}
 func (inertOperatorLoader) LoadRunDetail(context.Context, string, time.Time) (application.RoutineRunDetail, error) {
 	return application.RoutineRunDetail{}, errors.New("not used")
 }
@@ -176,7 +179,7 @@ func TestOperatorLayoutsAreBoundedAndPrioritized(t *testing.T) {
 func TestOperatorTooSmallAndEmptyStates(t *testing.T) {
 	model := loadedOperatorModel(79, 24)
 	tooSmall := ansi.Strip(model.render())
-	if !strings.Contains(tooSmall, "Terminal too small") || !strings.Contains(tooSmall, "79x24") || strings.Contains(tooSmall, "Attention") {
+	if !strings.Contains(tooSmall, "Terminal too small") || !strings.Contains(tooSmall, "79x24") || !strings.Contains(tooSmall, "3 Attention") {
 		t.Fatalf("too-small output:\n%s", tooSmall)
 	}
 	model.width, model.height = 80, 23
@@ -330,6 +333,110 @@ func TestOperatorRoutesRunsFiltersPaginationAndReturnState(t *testing.T) {
 	}
 }
 
+func TestOperatorAttentionRoutePagingNavigationRefreshAndRendering(t *testing.T) {
+	model := loadedOperatorModel(80, 24)
+	updated, load := model.Update(keyMessage('3'))
+	model = updated.(operatorModel)
+	if load == nil || model.route != operatorAttentionRoute || !model.attention.refreshing {
+		t.Fatalf("attention route=%q state=%+v", model.route, model.attention)
+	}
+	now := time.Date(2026, 9, 2, 5, 0, 0, 0, time.UTC)
+	page := application.RoutineAttentionPage{
+		Metadata:   application.RoutineProjectionMetadata{SchemaVersion: application.RoutineAttentionSchemaVersion, ObservedAt: now},
+		Collection: application.RoutineCollectionMetadata{Total: 3, Truncated: true, NextCursor: "next-attention"},
+		Scope:      application.ScopeController,
+		Items: []application.RoutineAttentionItem{
+			{EventID: "event-controller", EventType: application.OperatorAttentionCandidateScan, Scope: application.ScopeController, TargetID: "local-controller", ControllerState: "scan", AttentionState: application.RoutineAttentionActive, Severity: "warning", ReasonCode: "truncated", OccurredAt: now.Add(-time.Hour), ObservedAt: now.Add(-time.Minute), Offers: []application.RoutineAttentionOfferSummary{}, Navigation: application.RoutineAttentionNavigationNone},
+			{EventID: "event-run", EventType: application.OperatorAttentionHumanDecision, Scope: application.ScopeRun, TargetID: "run-attention", RunID: "run-attention", LinearIdentifier: "IFAN-177", Repository: "owner/repo", ControllerState: string(domain.StateAwaitingHumanDecision), AttentionState: application.RoutineAttentionActive, Severity: "warning", ReasonCode: "human_decision_required", OccurredAt: now.Add(-30 * time.Minute), ObservedAt: now, Offers: []application.RoutineAttentionOfferSummary{{OfferID: "opaque", Action: application.OperationDecide, Reason: "human_decision_required", Confirmation: application.LegalActionConfirmationInput, InputKind: application.LegalActionInputDecision, Consequence: application.LegalActionConsequenceResumeExecution}}, Navigation: application.RoutineAttentionNavigationRunDetail},
+		},
+	}
+	updated, _ = model.Update(operatorAttentionResultMsg{generation: model.attention.generation, request: *model.attention.pending, page: page})
+	model = updated.(operatorModel)
+	plain := ansi.Strip(model.render())
+	for _, phrase := range []string{"Agent Loop Controller / Attention", "Inbox · page 1 · 2 of 3 displayed", "No Controller action offered", "candidate_scan_incomplete", "WARNING/ACTIVE"} {
+		if !strings.Contains(plain, phrase) {
+			t.Fatalf("compact Attention missing %q:\n%s", phrase, plain)
+		}
+	}
+	if commandModel, command := model.Update(keySpecial(tea.KeyEnter, 0)); command != nil || commandModel.(operatorModel).route != operatorAttentionRoute {
+		t.Fatal("non-run Attention item exposed Enter navigation")
+	}
+	updated, _ = model.Update(keyMessage('j'))
+	model = updated.(operatorModel)
+	if model.attention.index != 1 || !strings.Contains(strings.ToLower(model.renderHelp()), "enter open run") {
+		t.Fatalf("run selection/help state=%+v help=%q", model.attention, model.renderHelp())
+	}
+	updated, detailCommand := model.Update(keySpecial(tea.KeyEnter, 0))
+	model = updated.(operatorModel)
+	if detailCommand == nil || model.route != operatorRunDetailRoute || model.detail.runID != "run-attention" || model.detail.returnRoute != operatorAttentionRoute {
+		t.Fatalf("detail state=%+v", model.detail)
+	}
+	updated, _ = model.Update(keySpecial(tea.KeyEscape, 0))
+	model = updated.(operatorModel)
+	if model.route != operatorAttentionRoute || model.attention.index != 1 || model.attention.selectedEventID != "event-run" {
+		t.Fatalf("Attention return state=%+v", model.attention)
+	}
+	updated, next := model.Update(keyMessage('n'))
+	model = updated.(operatorModel)
+	if next == nil || model.attention.pending.cursor != "next-attention" || len(model.attention.pending.previous) != 1 {
+		t.Fatalf("next request=%+v", model.attention.pending)
+	}
+	second := page
+	second.Collection = application.RoutineCollectionMetadata{Total: 3}
+	second.Items = []application.RoutineAttentionItem{{EventID: "event-last", EventType: application.OperatorAttentionSchedulerLease, Scope: application.ScopeController, TargetID: "local-controller", ControllerState: "scheduler", AttentionState: application.RoutineAttentionUnknown, Severity: "info", ReasonCode: "lease_lost", OccurredAt: now, ObservedAt: now, Offers: []application.RoutineAttentionOfferSummary{}, Navigation: application.RoutineAttentionNavigationNone}}
+	updated, _ = model.Update(operatorAttentionResultMsg{generation: model.attention.generation, request: *model.attention.pending, page: second})
+	model = updated.(operatorModel)
+	updated, previous := model.Update(keyMessage('p'))
+	model = updated.(operatorModel)
+	if previous == nil || model.attention.pending.cursor != "" || len(model.attention.pending.previous) != 0 {
+		t.Fatalf("previous request=%+v", model.attention.pending)
+	}
+	updated, _ = model.Update(operatorAttentionResultMsg{generation: model.attention.generation - 1, request: operatorAttentionRequest{}, page: application.RoutineAttentionPage{}})
+	model = updated.(operatorModel)
+	if model.attention.page == nil || model.attention.page.Items[0].EventID != "event-last" {
+		t.Fatal("late Attention result replaced the current page")
+	}
+	updated, _ = model.Update(operatorAttentionResultMsg{generation: model.attention.generation, request: *model.attention.pending, err: operatorSafeError{Category: application.ErrorUnavailable, Message: "refresh unavailable"}})
+	model = updated.(operatorModel)
+	if model.attention.staleError == nil || model.attention.page == nil {
+		t.Fatalf("stale Attention state=%+v", model.attention)
+	}
+	model.width = 92
+	if output := model.render(); lipgloss.Width(output) > 92 || lipgloss.Height(output) > 24 {
+		t.Fatalf("wide Attention exceeded bounds:\n%s", ansi.Strip(output))
+	}
+}
+
+func TestOperatorAttentionInitialFailureAndDuplicateRefreshAreSafe(t *testing.T) {
+	model := loadedOperatorModel(80, 24)
+	updated, firstLoad := model.Update(keyMessage('3'))
+	model = updated.(operatorModel)
+	if firstLoad == nil || model.attention.pending == nil {
+		t.Fatalf("initial Attention request=%+v command=%v", model.attention, firstLoad)
+	}
+	request := *model.attention.pending
+	updated, duplicate := model.Update(keyMessage('r'))
+	model = updated.(operatorModel)
+	if duplicate != nil || model.attention.generation != 1 {
+		t.Fatalf("duplicate refresh generation=%d command=%v", model.attention.generation, duplicate)
+	}
+	updated, _ = model.Update(operatorAttentionResultMsg{generation: 1, request: request, err: operatorSafeError{Category: application.ErrorUnavailable, Message: "initial unavailable"}})
+	model = updated.(operatorModel)
+	if model.attention.page != nil || model.attention.initialError == nil || model.attention.refreshing {
+		t.Fatalf("initial failure state=%+v", model.attention)
+	}
+	updated, retry := model.Update(keyMessage('r'))
+	model = updated.(operatorModel)
+	if retry == nil || model.attention.generation != 2 || model.attention.initialError != nil || !model.attention.refreshing {
+		t.Fatalf("retry state=%+v command=%v", model.attention, retry)
+	}
+	updated, duplicate = model.Update(keyMessage('r'))
+	model = updated.(operatorModel)
+	if duplicate != nil || model.attention.generation != 2 {
+		t.Fatalf("duplicate retry generation=%d command=%v", model.attention.generation, duplicate)
+	}
+}
+
 func TestOperatorExactRepositoryFilterAndSharedRunDetailRendering(t *testing.T) {
 	model := loadedOperatorModel(80, 24)
 	model.route = operatorRunsRoute
@@ -465,10 +572,11 @@ func TestComposeOperatorReadsBoundAuthorityWithoutMutation(t *testing.T) {
 	observedAt := time.Date(2026, 9, 1, 4, 5, 6, 0, time.UTC)
 	batch, loadErr := composition.loader.LoadOverview(context.Background(), observedAt)
 	runs, runsErr := composition.loader.LoadRuns(context.Background(), application.RunLifecycleActive, "", "", observedAt)
+	attention, attentionErr := composition.loader.LoadAttention(context.Background(), "", observedAt)
 	detail, detailErr := composition.loader.LoadRunDetail(context.Background(), run.ID, observedAt)
 	closeErr := composition.Close()
-	if loadErr != nil || runsErr != nil || detailErr != nil || closeErr != nil {
-		t.Fatalf("overview=%v runs=%v detail=%v close=%v", loadErr, runsErr, detailErr, closeErr)
+	if loadErr != nil || runsErr != nil || attentionErr != nil || detailErr != nil || closeErr != nil {
+		t.Fatalf("overview=%v runs=%v attention=%v detail=%v close=%v", loadErr, runsErr, attentionErr, detailErr, closeErr)
 	}
 	if batch.ObservedAt != observedAt || batch.Overview.Metadata.ObservedAt != observedAt || batch.Repositories.Metadata.ObservedAt != observedAt {
 		t.Fatalf("observed times batch=%s overview=%s repositories=%s", batch.ObservedAt, batch.Overview.Metadata.ObservedAt, batch.Repositories.Metadata.ObservedAt)
@@ -478,6 +586,9 @@ func TestComposeOperatorReadsBoundAuthorityWithoutMutation(t *testing.T) {
 	}
 	if runs.Collection.Total != 1 || len(runs.Runs) != 1 || runs.Runs[0].RunID != run.ID || detail.Run.RunID != run.ID || len(detail.Gates) != 11 {
 		t.Fatalf("runs=%+v detail=%+v", runs, detail)
+	}
+	if attention.Collection.Total != 0 || len(attention.Items) != 0 || attention.Metadata.SchemaVersion != application.RoutineAttentionSchemaVersion {
+		t.Fatalf("attention=%+v", attention)
 	}
 	afterConfig, err := os.ReadFile(configPath)
 	if err != nil {

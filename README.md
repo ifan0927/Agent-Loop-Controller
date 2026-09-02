@@ -190,9 +190,10 @@ automatically.
 
 For the routine local operator, run `agentctl operator`. It authenticates as
 the configured Controller operator, opens only the already-bound current
-configuration authority, and provides Overview plus filtered, cursor-paginated
-Runs and a shared compact run detail with Controller-owned progress, wait
-assessment, attention, pull-request summary, and all eleven delivery gates.
+configuration authority, and provides Overview, filtered cursor-paginated Runs,
+a complete cursor-paginated read-only Attention inbox, and a shared compact run
+detail with Controller-owned progress, wait assessment, attention, pull-request
+summary, and all eleven delivery gates.
 It changes no Controller state, accepts no requester override flags, and does
 not start or supervise the worker.
 
@@ -231,12 +232,13 @@ reports explicit coverage limitations for history that was never persisted.
 Unsafe or ambiguous configuration repair remains out of scope. Controller-wide
 audit-integrity readiness and its explicit receipt-backed recheck are
 implemented, completing the presentation-independent operator foundation. The
-read-only `agentctl operator` Overview, Runs collection, and shared Run detail
-are implemented with bounded responsive layouts, visible selection,
-filter-safe updated-time pagination, background refresh, stale-result
-preservation, and configured-operator authorization. This completes the R04,
-R05, and R06 read journey; mutations and the remaining TUI destinations remain
-planned. HTTP, a Web
+read-only `agentctl operator` Overview, Runs collection, complete Attention
+inbox, and shared Run detail are implemented with bounded responsive layouts,
+visible selection, authorization-safe opaque pagination, background refresh,
+stale-result preservation, exact item-bound offer summaries, and
+configured-operator authorization. This completes the R04-R06 read journey and
+the read-only Attention prerequisite for R07; Attention mutations and the
+remaining TUI destinations remain planned. HTTP, a Web
 UI, outbound notifications, Hermes runtime integration, public API/webhook
 admission, and cross-repository transactions remain deferred or exploratory.
 

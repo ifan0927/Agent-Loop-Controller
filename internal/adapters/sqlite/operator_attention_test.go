@@ -117,6 +117,86 @@ func TestOperatorAttentionOutboxConcurrentInsertAndSanitizedProjectionParity(t *
 	}
 }
 
+func TestRoutineAttentionCandidatesFilterAuthorityBeforeCollectionShape(t *testing.T) {
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 9, 2, 3, 0, 0, 0, time.UTC)
+	operator := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
+	other := domain.GitHubUserIdentity{Login: "other", DatabaseID: 8, NodeID: "USER_8", ActorType: "User"}
+	makeRun := func(id, repository, profile string, user domain.GitHubUserIdentity) application.Run {
+		config, _ := json.Marshal(application.LocalRepository{ProfileID: profile, CanonicalRepository: repository, AllowedOperatorLogins: []string{user.Login}, TrustedOperatorActors: []application.TrustedActorIdentity{{Login: user.Login, DatabaseID: user.DatabaseID, NodeID: user.NodeID, Type: user.ActorType}}})
+		issue := "IFAN-177"
+		if strings.Contains(id, "hidden") {
+			issue = "IFAN-178"
+		}
+		return application.Run{ID: id, IssueID: issue, IdempotencyKey: "key-" + id, SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: repository, RepositoryConfigJSON: string(config), ProfileID: profile, BaseBranch: "main", WorkingBranch: "ifan/177", ArtifactRoot: "/tmp/" + id, ImplementationModel: "model", ReviewModel: "review", State: domain.StateReceived}
+	}
+	visibleRun := makeRun("run-visible-attention", "owner/visible", "profile-visible", operator)
+	hiddenRun := makeRun("run-hidden-attention", "owner/hidden", "profile-hidden", other)
+	for _, run := range []application.Run{visibleRun, hiddenRun} {
+		if _, created, createErr := store.CreateRun(ctx, application.CreateRunInput{Run: run}); createErr != nil || !created {
+			t.Fatalf("create %s created=%t err=%v", run.ID, created, createErr)
+		}
+	}
+	visibleAuthority, err := store.GetRunScopeAuthority(ctx, visibleRun.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hiddenAuthority, err := store.GetRunScopeAuthority(ctx, hiddenRun.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	visibleRun.RepositoryBindingDigest = visibleAuthority.PersistenceBindingValue
+	hiddenRun.RepositoryBindingDigest = hiddenAuthority.PersistenceBindingValue
+	attentionForRun := func(run application.Run, marker string) application.OperatorAttentionEvent {
+		schedule := application.RetrySchedule{RunID: run.ID, Phase: application.AutomaticRetryPhaseForRun(run), ControllerState: string(run.State), AttemptCount: 4, MaxAttempts: 3, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: application.RetryFailureProcessStart, FailureEvidenceRef: marker, ReasonCode: application.RetryReasonBudgetExhausted, Status: application.RetryScheduleAttention, AttentionAt: now, CreatedAt: now.Add(-time.Minute), UpdatedAt: now}
+		event, eventErr := application.AutomaticRetryAttentionEvent(run, schedule)
+		if eventErr != nil {
+			t.Fatal(eventErr)
+		}
+		return event
+	}
+	visibleEvent := attentionForRun(visibleRun, "attempt:1")
+	hiddenEvent := attentionForRun(hiddenRun, "attempt:2")
+	visibleRepositoryEvent := candidateAttention(t, "visible-repository", strings.Repeat("e", 64), now.Add(time.Second))
+	visibleRepositoryEvent.RepositoryProfileID, visibleRepositoryEvent.RepositoryProfileName = "profile-visible", "owner/visible"
+	visibleRepositoryEvent.PayloadDigest = application.OperatorAttentionPayloadDigest(visibleRepositoryEvent)
+	hiddenRepositoryEvent := candidateAttention(t, "hidden-repository", strings.Repeat("f", 64), now.Add(time.Second))
+	hiddenRepositoryEvent.RepositoryProfileID, hiddenRepositoryEvent.RepositoryProfileName = "profile-hidden", "owner/hidden"
+	hiddenRepositoryEvent.PayloadDigest = application.OperatorAttentionPayloadDigest(hiddenRepositoryEvent)
+	controllerEvent, err := application.CandidateScanIncompleteAttentionEvent("controller-scan", application.OperatorAttentionProfile{ID: "automation", Name: "linear-todo-admission"}, "truncated", strings.Repeat("a", 64), now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []application.OperatorAttentionEvent{visibleEvent, hiddenEvent, visibleRepositoryEvent, hiddenRepositoryEvent, controllerEvent} {
+		if _, appendErr := store.AppendOperatorAttention(ctx, event); appendErr != nil {
+			t.Fatal(appendErr)
+		}
+	}
+	authorizer, _ := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: operator})
+	configured, _ := authorizer.ResolveConfiguredRequester(application.Requester{ID: operator.Login, Kind: "github_login", DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, ActorType: operator.ActorType})
+	repositoryAuthority := application.RepositoryAuthority{Repository: "owner/visible", ProfileID: "profile-visible", BindingDigest: visibleAuthority.BindingDigest, AllowedLogins: []string{operator.Login}, TrustedOperators: []domain.GitHubUserIdentity{operator}}
+	scopes, err := authorizer.ControllerAttentionScopes(configured, []application.RepositoryAuthority{repositoryAuthority}, []application.RunScopeAuthority{visibleAuthority, hiddenAuthority})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.ListRoutineAttentionCandidates(ctx, application.RoutineAttentionCandidateQuery{Scopes: scopes, Scope: application.ScopeController, RepositoryProfiles: map[string]string{"profile-visible": "owner/visible"}, Limit: 1001})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]bool{}
+	for _, event := range events {
+		ids[event.EventKey] = true
+	}
+	if len(events) != 3 || !ids[visibleEvent.EventKey] || !ids[visibleRepositoryEvent.EventKey] || !ids[controllerEvent.EventKey] || ids[hiddenEvent.EventKey] || ids[hiddenRepositoryEvent.EventKey] {
+		t.Fatalf("authorized candidates=%+v", events)
+	}
+}
+
 func TestOperatorAttentionMigrationPreservesLegacyEvidenceAndNormalizesEnvelope(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
 	store, err := openAdmissionTestStore(path)

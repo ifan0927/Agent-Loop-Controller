@@ -263,6 +263,28 @@ func (s *AuthorizationService) ControllerRunScopes(requester ConfiguredRequester
 	return newAuthorizedScopeSet(requester.identity, scopes...)
 }
 
+// ControllerAttentionScopes derives the complete set of narrower authorities
+// that may contribute rows to the configured operator's Controller-wide
+// Attention inbox. Invalid or unauthorized sibling authority stays hidden and
+// therefore cannot affect collection metadata or cursors.
+func (s *AuthorizationService) ControllerAttentionScopes(requester ConfiguredRequester, repositories []RepositoryAuthority, runs []RunScopeAuthority) (AuthorizedScopeSet, error) {
+	if s == nil || !s.operator.User.Equal(requester.identity) {
+		return AuthorizedScopeSet{}, serviceError(ErrorConflict, "requester is not authorized for controller attention", nil)
+	}
+	scopes := []AuthorityScope{{Kind: ScopeController, ID: controllerScopeID, AuthorityDigest: identityDigest(s.operator.User)}}
+	for _, authority := range repositories {
+		if authority.Validate() == nil && repositoryAllows(authority, requester.identity) {
+			scopes = append(scopes, AuthorityScope{Kind: ScopeRepository, ID: authority.Repository, AuthorityDigest: authority.BindingDigest})
+		}
+	}
+	for _, authority := range runs {
+		if authority.Validate() == nil && runAuthorityAllows(authority, requester.identity) {
+			scopes = append(scopes, AuthorityScope{Kind: ScopeRun, ID: authority.RunID, AuthorityDigest: authority.BindingDigest, TargetBindingDigest: authority.targetBindingValue()})
+		}
+	}
+	return newAuthorizedScopeSet(requester.identity, scopes...)
+}
+
 // RunScopes derives one frozen-run grant for the configured operator. The
 // caller must obtain the authority through the narrow target-authority port;
 // the complete run aggregate is not needed to make this decision.

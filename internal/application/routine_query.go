@@ -466,7 +466,7 @@ func routineAttentionTarget(event OperatorAttentionEvent) string {
 	if event.RunID != "" {
 		return event.RunID
 	}
-	if event.RepositoryProfileID != "" {
+	if event.RepositoryProfileID != "" && event.RepositoryProfileID != "automation" {
 		return event.RepositoryProfileID
 	}
 	return controllerScopeID
