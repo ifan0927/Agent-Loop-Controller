@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"reflect"
@@ -46,6 +47,40 @@ type authorityFirstStore struct {
 	authorityReads int
 	aggregateReads int
 	legacyReads    int
+}
+
+type controllerRunCollectionFixture struct {
+	serviceStore
+	runs           []Run
+	authorityScans int
+}
+
+func (s *controllerRunCollectionFixture) ListRunScopeAuthorities(context.Context) ([]RunScopeAuthority, error) {
+	s.authorityScans++
+	return nil, errors.New("controller collection must not scan frozen authorities")
+}
+
+func (s *controllerRunCollectionFixture) ListControllerRuns(_ context.Context, input ControllerRunQuery) (AuthorizedRunPage, error) {
+	filtered := make([]Run, 0, len(s.runs))
+	for _, run := range s.runs {
+		lifecycleMatch := input.Lifecycle == RunLifecycleAll || input.Lifecycle == RunLifecycleActive && !TerminalRunState(run.State) || input.Lifecycle == RunLifecycleEnded && TerminalRunState(run.State)
+		repositoryMatch := input.CanonicalRepository == "" || input.CanonicalRepository == run.Repository
+		keysetMatch := input.BeforeUpdatedAt.IsZero() || run.UpdatedAt.Before(input.BeforeUpdatedAt) || run.UpdatedAt.Equal(input.BeforeUpdatedAt) && run.ID < input.BeforeRunID
+		if lifecycleMatch && repositoryMatch && keysetMatch {
+			filtered = append(filtered, run)
+		}
+	}
+	total := 0
+	for _, run := range s.runs {
+		lifecycleMatch := input.Lifecycle == RunLifecycleAll || input.Lifecycle == RunLifecycleActive && !TerminalRunState(run.State) || input.Lifecycle == RunLifecycleEnded && TerminalRunState(run.State)
+		if lifecycleMatch && (input.CanonicalRepository == "" || input.CanonicalRepository == run.Repository) {
+			total++
+		}
+	}
+	if len(filtered) > input.Limit {
+		filtered = filtered[:input.Limit]
+	}
+	return AuthorizedRunPage{Runs: filtered, TotalCount: total}, nil
 }
 
 func (s *authorityFirstStore) GetRun(ctx context.Context, id string) (Run, error) {
@@ -658,20 +693,78 @@ func TestRunCollectionUnknownAndUnauthorizedFiltersAreNonDisclosing(t *testing.T
 	}
 }
 
-func TestControllerRunCollectionDerivesFrozenRunScopesBeforePagination(t *testing.T) {
+func TestControllerRunCollectionUsesStableReaderAcrossMembershipAndBindings(t *testing.T) {
 	operator := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "U_7", ActorType: "User"}
-	other := domain.GitHubUserIdentity{Login: "other", DatabaseID: 8, NodeID: "U_8", ActorType: "User"}
-	makeRun := func(id string, user domain.GitHubUserIdentity, binding byte) Run {
-		repository := LocalRepository{CanonicalRepository: "repository/" + id, AllowedOperatorLogins: []string{user.Login}, TrustedOperatorActors: []TrustedActorIdentity{{Login: user.Login, DatabaseID: user.DatabaseID, NodeID: user.NodeID, Type: user.ActorType}}}
-		raw, _ := json.Marshal(repository)
-		return Run{ID: id, Repository: repository.CanonicalRepository, RepositoryConfigJSON: string(raw), RepositoryBindingDigest: strings.Repeat(string(binding), 64), CreatedAt: time.Now().UTC()}
+	now := time.Now().UTC().Round(0)
+	frozen := func(repository, binding string) string {
+		raw, err := json.Marshal(LocalRepository{CanonicalRepository: repository, RepositoryBindingDigest: binding, AllowedOperatorLogins: []string{operator.Login}, TrustedOperatorActors: []TrustedActorIdentity{{Login: operator.Login, DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, Type: operator.ActorType}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
 	}
-	store := serviceStore{runs: []Run{makeRun("hidden-before", other, 'b'), makeRun("visible-2", operator, 'c'), makeRun("hidden-within", other, 'd'), makeRun("visible-1", operator, 'e')}}
+	newBinding, oldBinding := strings.Repeat("b", 64), strings.Repeat("a", 64)
+	store := &controllerRunCollectionFixture{runs: []Run{
+		{ID: "run-new-binding", Repository: "owner/repo", RepositoryConfigJSON: frozen("owner/repo", newBinding), RepositoryBindingDigest: newBinding, State: domain.StateReceived, CreatedAt: now, UpdatedAt: now},
+		{ID: "run-old-binding", Repository: "owner/repo", RepositoryConfigJSON: frozen("owner/repo", oldBinding), RepositoryBindingDigest: oldBinding, State: domain.StateReceived, CreatedAt: now.Add(-time.Minute), UpdatedAt: now.Add(-time.Minute)},
+		{ID: "run-corrupt-unselected", Repository: "owner/repo", RepositoryConfigJSON: "{private-corrupt-row", RepositoryBindingDigest: strings.Repeat("c", 64), State: domain.StateReceived, CreatedAt: now.Add(-2 * time.Minute), UpdatedAt: now.Add(-2 * time.Minute)},
+	}}
 	authorizer, _ := NewAuthorizationService(ConfiguredOperatorIdentity{User: operator})
+	configured, _ := authorizer.ResolveConfiguredRequester(requesterForUser(operator))
+	reader, _ := authorizer.ControllerReadCollectionAuthority(configured)
 	queries, _ := NewScopedQueryService(store, authorizer, serviceRepositoryAuthorities{})
-	page, err := queries.ListRunSummaries(context.Background(), RunSummaryQuery{Requester: requesterForUser(operator), Limit: 10})
-	if err != nil || page.TotalCount != 2 || len(page.Runs) != 2 || page.Runs[0].RunID != "visible-2" || page.Runs[1].RunID != "visible-1" {
-		t.Fatalf("page=%+v err=%v", page, err)
+	first, err := queries.ListControllerRunSummaries(context.Background(), reader, RunSummaryQuery{Repository: "owner/repo", Limit: 1})
+	if err != nil || first.TotalCount != 3 || len(first.Runs) != 1 || first.Runs[0].RunID != "run-new-binding" || first.NextCursor == "" {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	store.runs = append(store.runs, Run{ID: "unrelated-added", Repository: "owner/other", RepositoryConfigJSON: frozen("owner/other", strings.Repeat("d", 64)), RepositoryBindingDigest: strings.Repeat("d", 64), State: domain.StateReceived, CreatedAt: now.Add(time.Second), UpdatedAt: now.Add(time.Second)})
+	second, err := queries.ListControllerRunSummaries(context.Background(), reader, RunSummaryQuery{Repository: "owner/repo", Limit: 1, Cursor: first.NextCursor})
+	if err != nil || second.TotalCount != 3 || len(second.Runs) != 1 || second.Runs[0].RunID != "run-old-binding" || second.NextCursor == "" || store.authorityScans != 0 {
+		t.Fatalf("second=%+v scans=%d err=%v", second, store.authorityScans, err)
+	}
+	if _, err := queries.ListControllerRunSummaries(context.Background(), reader, RunSummaryQuery{Repository: "owner/repo", Limit: 1, Cursor: second.NextCursor}); err == nil || strings.Contains(err.Error(), "private-corrupt-row") {
+		t.Fatalf("selected corrupt row did not fail safely: %v", err)
+	}
+	legacyRaw, _ := json.Marshal(runSummaryCursor{Version: querySchemaVersion, Repository: "owner/repo", Lifecycle: RunLifecycleAll, ScopeDigest: reader.Digest(), UpdatedAt: now, RunID: "run-new-binding"})
+	legacyCursor := base64.RawURLEncoding.EncodeToString(legacyRaw)
+	if _, err := queries.ListControllerRunSummaries(context.Background(), reader, RunSummaryQuery{Repository: "owner/repo", Cursor: legacyCursor}); err == nil {
+		t.Fatal("pre-v2 Controller Runs cursor was accepted")
+	}
+	if _, err := queries.ListControllerRunSummaries(context.Background(), reader, RunSummaryQuery{Repository: "owner/other", Limit: 1, Cursor: first.NextCursor}); err == nil {
+		t.Fatal("repository-filter-drifted Controller Runs cursor was accepted")
+	}
+	if _, err := queries.ListControllerRunSummaries(context.Background(), reader, RunSummaryQuery{Repository: "owner/repo", Lifecycle: RunLifecycleEnded, Limit: 1, Cursor: first.NextCursor}); err == nil {
+		t.Fatal("lifecycle-drifted Controller Runs cursor was accepted")
+	}
+}
+
+func TestControllerRunCollectionRejectsSelectedFrozenAuthorityContradictions(t *testing.T) {
+	operator := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "U_7", ActorType: "User"}
+	authorizer, _ := NewAuthorizationService(ConfiguredOperatorIdentity{User: operator})
+	configured, _ := authorizer.ResolveConfiguredRequester(requesterForUser(operator))
+	reader, _ := authorizer.ControllerReadCollectionAuthority(configured)
+	binding := strings.Repeat("a", 64)
+	validFrozen := func(repository, frozenBinding string) string {
+		raw, _ := json.Marshal(LocalRepository{CanonicalRepository: repository, RepositoryBindingDigest: frozenBinding, AllowedOperatorLogins: []string{operator.Login}, TrustedOperatorActors: []TrustedActorIdentity{{Login: operator.Login, DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, Type: operator.ActorType}}})
+		return string(raw)
+	}
+	for _, test := range []struct {
+		name, raw string
+	}{
+		{name: "malformed", raw: "{private-malformed-authority"},
+		{name: "canonical repository mismatch", raw: validFrozen("owner/other", binding)},
+		{name: "binding mismatch", raw: validFrozen("owner/repo", strings.Repeat("b", 64))},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Now().UTC().Round(0)
+			store := &controllerRunCollectionFixture{runs: []Run{{ID: "selected-conflict", Repository: "owner/repo", RepositoryConfigJSON: test.raw, RepositoryBindingDigest: binding, State: domain.StateReceived, CreatedAt: now, UpdatedAt: now}}}
+			queries, _ := NewScopedQueryService(store, authorizer, serviceRepositoryAuthorities{})
+			_, err := queries.ListControllerRunSummaries(context.Background(), reader, RunSummaryQuery{Limit: 1})
+			var serviceErr *ServiceError
+			if !errors.As(err, &serviceErr) || serviceErr.Category != ErrorInternal || serviceErr.Message != "controller run authority conflicts" || strings.Contains(err.Error(), "private-") || strings.Contains(err.Error(), "owner/other") {
+				t.Fatalf("unsafe conflict result: %v", err)
+			}
+		})
 	}
 }
 

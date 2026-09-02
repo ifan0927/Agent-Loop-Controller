@@ -338,15 +338,30 @@ func (s *RoutineRunQueryService) List(ctx context.Context, query RunSummaryQuery
 	if err != nil {
 		return RoutineRunPage{}, err
 	}
+	return s.projectRunPage(ctx, page, observedAt)
+}
+
+func (s *RoutineRunQueryService) ListController(ctx context.Context, authority ControllerReadAuthority, query RunSummaryQuery, observedAt time.Time) (RoutineRunPage, error) {
+	if s == nil {
+		return RoutineRunPage{}, serviceError(ErrorInternal, "routine run query is unavailable", nil)
+	}
+	page, err := s.queries.ListControllerRunSummaries(ctx, authority, query)
+	if err != nil {
+		return RoutineRunPage{}, err
+	}
+	return s.projectRunPage(ctx, page, observedAt)
+}
+
+func (s *RoutineRunQueryService) projectRunPage(ctx context.Context, page RunSummaryPage, observedAt time.Time) (RoutineRunPage, error) {
 	result := RoutineRunPage{Metadata: RoutineProjectionMetadata{SchemaVersion: RoutineQuerySchemaVersion, ObservedAt: observedAt.UTC()}, Collection: RoutineCollectionMetadata{Total: page.TotalCount, Truncated: page.HasMore, NextCursor: page.NextCursor}, Repository: page.Repository, Lifecycle: page.Lifecycle, Runs: make([]RoutineRunSummary, 0, len(page.Runs))}
 	for _, run := range page.Runs {
 		attention := false
 		if current, ok := s.store.(CurrentOperatorAttentionQuery); ok {
-			var event OperatorAttentionEvent
-			event, attention, err = current.CurrentOperatorAttention(ctx, run.RunID)
-			if err != nil {
-				return RoutineRunPage{}, classifyServiceError(err)
+			event, currentAttention, currentErr := current.CurrentOperatorAttention(ctx, run.RunID)
+			if currentErr != nil {
+				return RoutineRunPage{}, classifyServiceError(currentErr)
 			}
+			attention = currentAttention
 			if attention {
 				inspection, inspectErr := s.store.Inspect(ctx, run.RunID)
 				if inspectErr != nil {

@@ -14,8 +14,14 @@ import (
 
 type routineAttentionStoreFixture struct {
 	*legalActionStoreFixture
-	candidates []OperatorAttentionEvent
-	query      RoutineAttentionCandidateQuery
+	candidates      []OperatorAttentionEvent
+	query           RoutineAttentionCandidateQuery
+	controllerQuery ControllerAttentionCandidateQuery
+}
+
+func (s *routineAttentionStoreFixture) ListControllerAttentionCandidates(_ context.Context, query ControllerAttentionCandidateQuery) ([]OperatorAttentionEvent, error) {
+	s.controllerQuery = query
+	return append([]OperatorAttentionEvent(nil), s.candidates...), nil
 }
 
 func (s *routineAttentionStoreFixture) ListRoutineAttentionCandidates(_ context.Context, query RoutineAttentionCandidateQuery) ([]OperatorAttentionEvent, error) {
@@ -32,6 +38,19 @@ func (s *routineAttentionStoreFixture) ListOperatorAttention(context.Context, Op
 }
 
 type routineAttentionProfiles struct{ profile RepositoryProfileAuthority }
+
+func controllerReadAuthority(t *testing.T, authorizer *AuthorizationService, requester Requester) ControllerReadAuthority {
+	t.Helper()
+	configured, err := authorizer.ResolveConfiguredRequester(requester)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, err := authorizer.ControllerReadCollectionAuthority(configured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return authority
+}
 
 func (s routineAttentionProfiles) RepositoryProfile(_ context.Context, repository string) (RepositoryProfileAuthority, bool, error) {
 	return s.profile, repository == s.profile.Authority.Repository, nil
@@ -66,15 +85,15 @@ func TestRoutineAttentionBindsSanitizedOffersToExactTypedItem(t *testing.T) {
 		t.Fatal(err)
 	}
 	observedAt := current.ObservedAt.Add(time.Minute)
-	page, err := service.List(context.Background(), RoutineAttentionQuery{Requester: requester, Scope: ScopeController, Limit: 10}, observedAt)
+	page, err := service.ListController(context.Background(), controllerReadAuthority(t, authorizer, requester), RoutineAttentionQuery{Requester: requester, Scope: ScopeController, Limit: 10}, observedAt)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if page.Metadata.SchemaVersion != RoutineAttentionSchemaVersion || page.Collection.Total != 2 || len(page.Items) != 2 || page.Metadata.Digest == "" {
 		t.Fatalf("page=%+v", page)
 	}
-	if !store.query.Scopes.HasController() || !store.query.Scopes.AllowsRun(legal.run.ID, legal.run.RepositoryBindingDigest) || store.query.RepositoryProfiles[legal.run.ProfileID] != legal.run.Repository {
-		t.Fatalf("candidate query did not carry complete authority: %+v", store.query)
+	if !store.controllerQuery.Authority.Valid() || store.controllerQuery.Limit != maximumRoutineAttentionCandidates+1 || !store.query.Scopes.Empty() {
+		t.Fatalf("candidate query did not use stable collection authority: controller=%+v scoped=%+v", store.controllerQuery, store.query)
 	}
 	byID := map[string]RoutineAttentionItem{}
 	for _, item := range page.Items {
@@ -107,18 +126,33 @@ func TestRoutineAttentionPaginationAndCursorVersionAreStable(t *testing.T) {
 	store := &routineAttentionStoreFixture{legalActionStoreFixture: legal, candidates: []OperatorAttentionEvent{current, older}}
 	profile := RepositoryProfileAuthority{Authority: RepositoryAuthority{Repository: legal.run.Repository, ProfileID: legal.run.ProfileID, BindingDigest: legal.run.RepositoryBindingDigest, AllowedLogins: legal.authority.AllowedLogins, TrustedOperators: legal.authority.TrustedOperators}}
 	service, _ := NewRoutineAttentionQueryService(store, store, authorizer, routineAttentionProfiles{profile: profile})
-	first, err := service.List(context.Background(), RoutineAttentionQuery{Requester: requester, Scope: ScopeController, Limit: 1}, time.Now().UTC())
+	reader := controllerReadAuthority(t, authorizer, requester)
+	first, err := service.ListController(context.Background(), reader, RoutineAttentionQuery{Requester: requester, Scope: ScopeController, Limit: 1}, time.Now().UTC())
 	if err != nil || len(first.Items) != 1 || first.Collection.NextCursor == "" || first.Collection.Total != 2 {
 		t.Fatalf("first=%+v err=%v", first, err)
 	}
-	second, err := service.List(context.Background(), RoutineAttentionQuery{Requester: requester, Scope: ScopeController, Limit: 1, Cursor: first.Collection.NextCursor}, time.Now().UTC())
-	if err != nil || len(second.Items) != 1 || second.Items[0].EventID == first.Items[0].EventID || second.Collection.Total != 2 {
+	added, err := CandidateScanIncompleteAttentionEvent("new-unrelated-repository", OperatorAttentionProfile{ID: "repository-profile:owner/other", Name: "owner/other"}, "truncated", strings.Repeat("a", 64), current.OccurredAt.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.candidates = append(store.candidates, added)
+	second, err := service.ListController(context.Background(), reader, RoutineAttentionQuery{Requester: requester, Scope: ScopeController, Limit: 1, Cursor: first.Collection.NextCursor}, time.Now().UTC())
+	if err != nil || len(second.Items) != 1 || second.Items[0].EventID == first.Items[0].EventID || second.Collection.Total != 3 {
 		t.Fatalf("second=%+v err=%v", second, err)
 	}
-	legacyRaw, _ := json.Marshal(routineAttentionCursor{Version: RoutineQuerySchemaVersion, ScopeDigest: store.query.Scopes.Digest(), Scope: ScopeController, Severity: 2, OccurredAt: current.OccurredAt, EventID: current.EventKey})
+	legacyRaw, _ := json.Marshal(routineAttentionCursor{Version: RoutineAttentionSchemaVersion, AuthorityDigest: reader.Digest(), Scope: ScopeController, Severity: 2, OccurredAt: current.OccurredAt, EventID: current.EventKey})
 	legacy := base64.RawURLEncoding.EncodeToString(legacyRaw)
-	if _, err := service.List(context.Background(), RoutineAttentionQuery{Requester: requester, Scope: ScopeController, Cursor: legacy}, time.Now().UTC()); err == nil {
-		t.Fatal("pre-v2 Attention cursor was accepted")
+	if _, err := service.ListController(context.Background(), reader, RoutineAttentionQuery{Requester: requester, Scope: ScopeController, Cursor: legacy}, time.Now().UTC()); err == nil {
+		t.Fatal("pre-v3 Attention cursor was accepted")
+	}
+	if _, err := service.ListController(context.Background(), reader, RoutineAttentionQuery{Requester: requester, Scope: ScopeController, TargetID: controllerScopeID, Cursor: first.Collection.NextCursor}, time.Now().UTC()); err == nil {
+		t.Fatal("target-drifted Attention cursor was accepted")
+	}
+	other := domain.GitHubUserIdentity{Login: "other", DatabaseID: 8, NodeID: "U_8", ActorType: "User"}
+	otherAuthorizer, _ := NewAuthorizationService(ConfiguredOperatorIdentity{User: other})
+	otherReader := controllerReadAuthority(t, otherAuthorizer, requesterForUser(other))
+	if _, err := service.ListController(context.Background(), otherReader, RoutineAttentionQuery{Requester: requester, Scope: ScopeController, Cursor: first.Collection.NextCursor}, time.Now().UTC()); err == nil {
+		t.Fatal("reader-drifted Attention cursor was accepted")
 	}
 }
 
@@ -131,7 +165,7 @@ func TestRoutineAttentionCandidateBoundFailsSafely(t *testing.T) {
 	store := &routineAttentionStoreFixture{legalActionStoreFixture: legal, candidates: candidates}
 	profile := RepositoryProfileAuthority{Authority: RepositoryAuthority{Repository: legal.run.Repository, ProfileID: legal.run.ProfileID, BindingDigest: legal.run.RepositoryBindingDigest, AllowedLogins: legal.authority.AllowedLogins, TrustedOperators: legal.authority.TrustedOperators}}
 	service, _ := NewRoutineAttentionQueryService(store, store, authorizer, routineAttentionProfiles{profile: profile})
-	if _, err := service.List(context.Background(), RoutineAttentionQuery{Requester: requester, Scope: ScopeController}, time.Now().UTC()); err == nil {
+	if _, err := service.ListController(context.Background(), controllerReadAuthority(t, authorizer, requester), RoutineAttentionQuery{Requester: requester, Scope: ScopeController}, time.Now().UTC()); err == nil {
 		t.Fatal("candidate safety bound silently truncated the inbox")
 	}
 }
@@ -156,7 +190,7 @@ func TestRoutineAttentionPreservesConflictUnknownUnfamiliarAndResolvedConclusion
 	store := &routineAttentionStoreFixture{legalActionStoreFixture: legal, candidates: []OperatorAttentionEvent{current, invalid, resolved, unfamiliar}}
 	profile := RepositoryProfileAuthority{Authority: RepositoryAuthority{Repository: legal.run.Repository, ProfileID: legal.run.ProfileID, BindingDigest: legal.run.RepositoryBindingDigest, AllowedLogins: legal.authority.AllowedLogins, TrustedOperators: legal.authority.TrustedOperators}}
 	service, _ := NewRoutineAttentionQueryService(store, store, authorizer, routineAttentionProfiles{profile: profile})
-	page, err := service.List(context.Background(), RoutineAttentionQuery{Requester: requester, Scope: ScopeController, Limit: 10}, unfamiliar.ObservedAt.Add(time.Minute))
+	page, err := service.ListController(context.Background(), controllerReadAuthority(t, authorizer, requester), RoutineAttentionQuery{Requester: requester, Scope: ScopeController, Limit: 10}, unfamiliar.ObservedAt.Add(time.Minute))
 	if err != nil || page.Collection.Total != 3 || len(page.Items) != 3 {
 		t.Fatalf("page=%+v err=%v", page, err)
 	}
@@ -243,7 +277,7 @@ func TestRoutineAttentionProjectsCompleteElevenFamilyInventory(t *testing.T) {
 	store := &routineAttentionStoreFixture{legalActionStoreFixture: legal, candidates: events}
 	profileAuthority := RepositoryProfileAuthority{Authority: RepositoryAuthority{Repository: legal.run.Repository, ProfileID: legal.run.ProfileID, BindingDigest: legal.run.RepositoryBindingDigest, AllowedLogins: legal.authority.AllowedLogins, TrustedOperators: legal.authority.TrustedOperators}}
 	service, _ := NewRoutineAttentionQueryService(store, store, authorizer, routineAttentionProfiles{profile: profileAuthority})
-	page, err := service.List(context.Background(), RoutineAttentionQuery{Requester: requester, Scope: ScopeController, Limit: 25}, now.Add(time.Minute))
+	page, err := service.ListController(context.Background(), controllerReadAuthority(t, authorizer, requester), RoutineAttentionQuery{Requester: requester, Scope: ScopeController, Limit: 25}, now.Add(time.Minute))
 	if err != nil || len(page.Items) != len(cases) || page.Collection.Total != len(cases) {
 		t.Fatalf("items=%d total=%d err=%v", len(page.Items), page.Collection.Total, err)
 	}

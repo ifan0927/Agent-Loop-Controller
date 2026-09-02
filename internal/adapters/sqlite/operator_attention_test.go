@@ -117,7 +117,7 @@ func TestOperatorAttentionOutboxConcurrentInsertAndSanitizedProjectionParity(t *
 	}
 }
 
-func TestRoutineAttentionCandidatesFilterAuthorityBeforeCollectionShape(t *testing.T) {
+func TestControllerAttentionCandidatesUseStableReaderWithoutVisibilityPredicates(t *testing.T) {
 	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -179,12 +179,14 @@ func TestRoutineAttentionCandidatesFilterAuthorityBeforeCollectionShape(t *testi
 	}
 	authorizer, _ := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: operator})
 	configured, _ := authorizer.ResolveConfiguredRequester(application.Requester{ID: operator.Login, Kind: "github_login", DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, ActorType: operator.ActorType})
-	repositoryAuthority := application.RepositoryAuthority{Repository: "owner/visible", ProfileID: "profile-visible", BindingDigest: visibleAuthority.BindingDigest, AllowedLogins: []string{operator.Login}, TrustedOperators: []domain.GitHubUserIdentity{operator}}
-	scopes, err := authorizer.ControllerAttentionScopes(configured, []application.RepositoryAuthority{repositoryAuthority}, []application.RunScopeAuthority{visibleAuthority, hiddenAuthority})
+	reader, err := authorizer.ControllerReadCollectionAuthority(configured)
 	if err != nil {
 		t.Fatal(err)
 	}
-	events, err := store.ListRoutineAttentionCandidates(ctx, application.RoutineAttentionCandidateQuery{Scopes: scopes, Scope: application.ScopeController, RepositoryProfiles: map[string]string{"profile-visible": "owner/visible"}, Limit: 1001})
+	if _, err := store.db.ExecContext(ctx, `UPDATE runs SET repository_config_json='not-json'`); err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.ListControllerAttentionCandidates(ctx, application.ControllerAttentionCandidateQuery{Authority: reader, Limit: 1001})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,8 +194,8 @@ func TestRoutineAttentionCandidatesFilterAuthorityBeforeCollectionShape(t *testi
 	for _, event := range events {
 		ids[event.EventKey] = true
 	}
-	if len(events) != 3 || !ids[visibleEvent.EventKey] || !ids[visibleRepositoryEvent.EventKey] || !ids[controllerEvent.EventKey] || ids[hiddenEvent.EventKey] || ids[hiddenRepositoryEvent.EventKey] {
-		t.Fatalf("authorized candidates=%+v", events)
+	if len(events) != 5 || !ids[visibleEvent.EventKey] || !ids[hiddenEvent.EventKey] || !ids[visibleRepositoryEvent.EventKey] || !ids[hiddenRepositoryEvent.EventKey] || !ids[controllerEvent.EventKey] {
+		t.Fatalf("controller candidates=%+v", events)
 	}
 }
 

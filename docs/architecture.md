@@ -115,7 +115,8 @@ roles or a generic permission language:
 - `onboarding` derives from the configured operator before repository binding
   and from the resulting repository authority after binding.
 
-Collection authorization follows one order:
+Repository-, run-, and onboarding-scoped collection authorization follows one
+order:
 
 ```text
 resolve configured requester
@@ -126,12 +127,23 @@ resolve configured requester
   -> sanitize and project
 ```
 
-SQLite run and scheduling collection ports require an application-produced
-scope set. Hidden rows cannot affect totals, page gaps, `has_more`, or cursor
-position. Run cursors bind the query filter and current scope digest, so
-authority drift requires a new first-page query. Repository/run scheduling
-projections expose only their own wait/supervisor state; controller capacity and
-sibling identities require controller scope.
+The production local operator resolves the configured identity once and derives
+a distinct stable Controller-read collection authority for only its
+Controller-wide Runs and Attention collections. That type is not an authorized
+scope set and is not accepted by mutation, receipt-target, legal-action,
+repository, or frozen-run authorization ports. These two collections bind their
+cursors to the stable reader, family cursor version, filters or scope/target,
+and complete keyset position. Adding a normal repository or run therefore does
+not invalidate an issued cursor. Runs exact-repository selection compares the
+canonical repository identity stored with each run, so historical frozen
+binding generations remain in the same collection without changing their
+detail or mutation authority.
+
+Other SQLite run and scheduling collection ports require an
+application-produced scope set. Hidden rows cannot affect totals, page gaps,
+`has_more`, or cursor position. Repository/run scheduling projections expose
+only their own wait/supervisor state; controller capacity and sibling identities
+require controller scope.
 
 Direct unknown and unauthorized run or repository targets return the same
 sanitized application `not_found` result. Visibility of an attention event,
@@ -1671,12 +1683,14 @@ workflow state.
 
 The implemented routine query family is a versioned, bounded application
 contract for Controller Overview, queue, compact runs and fixed delivery gates,
-active attention, repositories, onboarding, and settings. Every query first
-authenticates the complete configured operator, applies scope before collection
-shape, and returns only allowlisted typed fields with sanitized response
-digests. Routine reads do not reconcile, refresh external systems, acknowledge
-attention, or advance workflow authority. The activity/history contracts
-extend this same presentation-independent boundary.
+active attention, repositories, onboarding, and settings. Production
+composition validates the complete configured operator before deriving its
+stable Runs/Controller-Attention collection reader; target-specific and all
+other queries retain their documented scope authorization. Every query applies
+its authority before collection shape and returns only allowlisted typed fields
+with sanitized response digests. Routine reads do not reconcile, refresh
+external systems, acknowledge attention, or advance workflow authority. The
+activity/history contracts extend this same presentation-independent boundary.
 
 The implemented activity family is a separate append-only explanatory
 projection. It uses deterministic identities over schema version, private

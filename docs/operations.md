@@ -497,7 +497,11 @@ inbox retains every authorized unresolved candidate, including rows without
 current Controller actions, and shows the selected item's safe typed evidence
 and exact item-bound offer summaries without mutation controls. Runs defaults to
 Active, supports Active/Ended/All plus one exact repository filter, and uses
-opaque next/previous cursor navigation ordered by most recent update. Run detail
+opaque next/previous cursor navigation ordered by most recent update. Runs and
+Controller Attention cursors remain usable as normal repositories and runs are
+added; upgrades that change their opaque cursor versions require returning to
+the first page once. The exact repository filter includes historical runs under
+older frozen binding generations of the same canonical repository. Run detail
 shows the application-owned phase and wait assessment, latest transition,
 compact pull request, active attention, and all eleven Controller-owned delivery
 gates. It exposes no mutation controls. Truncated collections always report

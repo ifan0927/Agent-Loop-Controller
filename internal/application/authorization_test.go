@@ -22,6 +22,10 @@ func TestAuthorizationServiceUsesExactConfiguredOperatorAndClosedScopes(t *testi
 	if err != nil || !controller.HasController() || controller.Empty() {
 		t.Fatalf("controller scopes=%+v err=%v", controller, err)
 	}
+	reader, err := service.ControllerReadCollectionAuthority(requester)
+	if err != nil || !reader.Valid() || reader.Digest() == controller.Digest() || (ControllerReadAuthority{}).Valid() {
+		t.Fatalf("controller reader=%+v controller=%+v err=%v", reader, controller, err)
+	}
 	repository := repositoryAuthority(operator, false)
 	repositoryScopes, err := service.RepositoryScopes(requester, repository)
 	if err != nil || !repositoryScopes.AllowsRepositoryBinding(repository.BindingDigest) || repositoryScopes.HasController() {

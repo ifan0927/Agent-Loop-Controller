@@ -7,8 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"sort"
-	"strings"
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
@@ -22,35 +20,7 @@ func (s *Store) ListRoutineAttentionCandidates(ctx context.Context, input applic
 	args := []any{}
 	switch input.Scope {
 	case application.ScopeController:
-		if !input.Scopes.HasController() {
-			return nil, errors.New("routine attention controller scope is invalid")
-		}
-		predicates := []string{"(run_id='' AND repository_profile_id IN ('','automation'))"}
-		if len(input.RepositoryProfiles) != 0 {
-			placeholders := ""
-			profileIDs := make([]string, 0, len(input.RepositoryProfiles))
-			for profileID := range input.RepositoryProfiles {
-				profileIDs = append(profileIDs, profileID)
-			}
-			sort.Strings(profileIDs)
-			for _, profileID := range profileIDs {
-				repository := input.RepositoryProfiles[profileID]
-				if profileID == "" || repository == "" {
-					return nil, errors.New("routine attention repository authority is invalid")
-				}
-				if placeholders != "" {
-					placeholders += ","
-				}
-				placeholders += "?"
-				args = append(args, profileID)
-			}
-			predicates = append(predicates, "(run_id='' AND repository_profile_id IN ("+placeholders+"))")
-		}
-		for _, predicate := range input.Scopes.RunPredicates() {
-			predicates = append(predicates, "(run_id=? AND EXISTS (SELECT 1 FROM runs WHERE runs.run_id=operator_attention_outbox.run_id AND runs.repository_binding_digest=?))")
-			args = append(args, predicate.RunID, predicate.BindingDigest)
-		}
-		where = "(" + strings.Join(predicates, " OR ") + ")"
+		return nil, errors.New("routine attention controller scope requires collection read authority")
 	case application.ScopeRepository:
 		if input.TargetID == "" || input.RepositoryProfileID == "" || len(input.Scopes.RepositoryBindingDigests()) != 1 {
 			return nil, errors.New("routine attention repository scope is invalid")
@@ -70,7 +40,21 @@ func (s *Store) ListRoutineAttentionCandidates(ctx context.Context, input applic
 	default:
 		return nil, errors.New("routine attention scope is invalid")
 	}
-	args = append(args, input.Limit)
+	return s.listRoutineAttentionCandidates(ctx, where, args, input.Limit)
+}
+
+// ListControllerAttentionCandidates reads the Controller-owned inbox without
+// repository or run visibility predicates. The distinct application type
+// cannot be supplied to mutation or target-specific authorization paths.
+func (s *Store) ListControllerAttentionCandidates(ctx context.Context, input application.ControllerAttentionCandidateQuery) ([]application.OperatorAttentionEvent, error) {
+	if !input.Authority.Valid() || input.Limit < 1 || input.Limit > 1001 {
+		return nil, errors.New("controller attention candidate query is invalid")
+	}
+	return s.listRoutineAttentionCandidates(ctx, "1=1", nil, input.Limit)
+}
+
+func (s *Store) listRoutineAttentionCandidates(ctx context.Context, where string, args []any, limit int) ([]application.OperatorAttentionEvent, error) {
+	args = append(args, limit)
 	query := `SELECT event_key,payload_digest,schema_version,event_type,run_id,linear_identifier,repository_profile_id,repository_profile_name,controller_state,severity,reason_code,allowed_actions_json,evidence_digest,occurred_at,observed_at,legacy_payload_digest,legacy_delivery_status,retry_failure_class FROM (
 		SELECT event_key,payload_digest,schema_version,event_type,run_id,linear_identifier,repository_profile_id,repository_profile_name,controller_state,severity,reason_code,allowed_actions_json,evidence_digest,occurred_at,observed_at,legacy_payload_digest,legacy_delivery_status,retry_failure_class,
 		ROW_NUMBER() OVER (PARTITION BY event_type,run_id,linear_identifier,repository_profile_id ORDER BY occurred_at DESC,event_key DESC) AS routine_rank
