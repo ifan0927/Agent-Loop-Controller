@@ -30,6 +30,9 @@ type heartbeatEvidence struct {
 
 func (m *Manager) Observe(ctx context.Context, id string) (result Result, finalErr error) {
 	err := m.withActiveLock(id, func() error {
+		if err := m.admitHistoricalRecoveryMutation(id, historicalRecoveryLifecycle); err != nil {
+			return err
+		}
 		j, bundle, err := m.loadJournal(id)
 		if err != nil {
 			return err

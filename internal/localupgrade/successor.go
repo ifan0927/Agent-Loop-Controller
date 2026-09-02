@@ -15,6 +15,9 @@ func (m *Manager) PrepareSuccessor(ctx context.Context, request SuccessorPrepare
 		return Result{}, errors.New("successor-prepare requires a predecessor upgrade identifier and exact revision")
 	}
 	err := m.withActiveLock(request.PredecessorUpgradeID, func() error {
+		if err := m.admitHistoricalRecoveryMutation(request.PredecessorUpgradeID, historicalRecoveryNewUpgrade); err != nil {
+			return err
+		}
 		predecessor, predecessorBundle, err := m.loadBundleJournal(request.PredecessorUpgradeID)
 		if err != nil {
 			return err
@@ -24,9 +27,6 @@ func (m *Manager) PrepareSuccessor(ctx context.Context, request SuccessorPrepare
 			return err
 		}
 		if predecessor.Phase == "superseded" {
-			if predecessor.DatabaseRecovery != nil {
-				return errors.New("recovered successor activation requires successor-recover-prepare replay")
-			}
 			return m.resumeSuccessorActivation(predecessor, request.Revision, active, &result)
 		}
 		if active.UpgradeID != predecessor.UpgradeID {

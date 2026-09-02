@@ -1033,66 +1033,6 @@ func (f *Files) PublishLocator(databasePath string) error {
 	return nil
 }
 
-// RebindLocatorDatabaseIdentity performs the one narrow authority transfer
-// allowed after an operator-confirmed database file relocation. The caller
-// must hold AcquireMutation for the complete operation. Paths remain fixed;
-// only the exact expected database identity may change.
-func (f *Files) RebindLocatorDatabaseIdentity(expected AuthorityLocator, replacement application.DatabaseFileIdentity) error {
-	if expected.Version != locatorVersion || expected.ConfigPath != f.configPath || !filepath.IsAbs(expected.DatabasePath) || filepath.Clean(expected.DatabasePath) != expected.DatabasePath || !expected.DatabaseIdentity.Valid() || !replacement.Valid() || expected.DatabaseIdentity == replacement {
-		return errors.New("configuration authority locator rebind is invalid")
-	}
-	database, err := os.OpenFile(expected.DatabasePath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return errors.New("configuration authority replacement database is unavailable")
-	}
-	defer database.Close()
-	opened, err := database.Stat()
-	if err != nil || !privateRegularInfoSafe(opened, f.uid, true) || fileIdentity(opened) != replacement {
-		return errors.New("configuration authority replacement database is unsafe")
-	}
-	currentDatabase, err := os.Lstat(expected.DatabasePath)
-	if err != nil || !os.SameFile(opened, currentDatabase) || !privateRegularInfoSafe(currentDatabase, f.uid, true) {
-		return errors.New("configuration authority replacement database changed")
-	}
-	directories, err := f.captureAuthorityDirectories(false)
-	if err != nil {
-		return errors.New("configuration authority directory is unsafe")
-	}
-	locatorPath := filepath.Join(f.root, "locator.json")
-	payload, err := f.readAuthorityLeaf(locatorPath, 4096, directories)
-	if err != nil {
-		return errors.New("configuration authority locator is unsafe")
-	}
-	current, err := decodeLocator(payload)
-	if err != nil || current != expected {
-		return errors.New("configuration authority locator changed before rebind")
-	}
-	next := expected
-	next.DatabaseIdentity = replacement
-	nextPayload, err := json.Marshal(next)
-	if err != nil {
-		return errors.New("configuration authority locator rebind is invalid")
-	}
-	nextPayload = append(nextPayload, '\n')
-	openedAfter, openedErr := database.Stat()
-	currentDatabase, currentErr := os.Lstat(expected.DatabasePath)
-	if openedErr != nil || currentErr != nil || !os.SameFile(opened, openedAfter) || !os.SameFile(opened, currentDatabase) || !privateRegularInfoSafe(openedAfter, f.uid, true) || !privateRegularInfoSafe(currentDatabase, f.uid, true) || fileIdentity(openedAfter) != replacement {
-		return errors.New("configuration authority replacement database changed before rebind")
-	}
-	syncAuthority := func(string) error { return f.syncAuthorityDirectories(directories) }
-	if err := atomicPrivateWrite(locatorPath, nextPayload, f.uid, false, syncAuthority); err != nil {
-		return errors.New("configuration authority locator rebind could not be published")
-	}
-	verifiedPayload, err := f.readAuthorityLeaf(locatorPath, 4096, directories)
-	verified, decodeErr := decodeLocator(verifiedPayload)
-	openedAfter, openedErr = database.Stat()
-	currentDatabase, currentErr = os.Lstat(expected.DatabasePath)
-	if err != nil || decodeErr != nil || verified != next || openedErr != nil || currentErr != nil || !os.SameFile(opened, openedAfter) || !os.SameFile(opened, currentDatabase) || fileIdentity(openedAfter) != replacement {
-		return errors.New("configuration authority locator rebind verification failed")
-	}
-	return nil
-}
-
 func fileIdentity(info os.FileInfo) application.DatabaseFileIdentity {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {

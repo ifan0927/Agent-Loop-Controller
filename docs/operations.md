@@ -3249,62 +3249,31 @@ supports schema v43 or newer. One ready publication, a generic stale pointer,
 generic `integrity_pending`, incomplete coverage, a malformed family or scan,
 or unrelated readiness evidence remains ineligible.
 
-If an operator-confirmed local file relocation replaced the Controller database
-inode at the same canonical path before an ordinary successor could be
-prepared, first boot out the selected supervisor and prove the selected,
-opposite, and legacy supervisors are absent. Do not edit the private locator,
-SQLite, or the predecessor journal. Create a new encrypted full backup of the
-Controller root and every external credential file, then run the read-only
-preview:
+If the Controller database inode changes at the canonical path, managed-upgrade
+database relocation recovery is unavailable. The two former successor-recovery
+commands are retired and rejected before manager composition or bundle access.
+`status` reports `database_relocation_recovery_retired` with
+`next_action=preserve_bundle` for unresolved historical evidence and never
+offers an executable recovery action.
 
-```sh
-FAILED_UPGRADE_ID="$UPGRADE_ID"
-SUCCESSOR_REVISION="$(git rev-parse HEAD)" # intended different full clean commit
+Treat the installation as fail-stop. Stop supervision and independently prove
+that workers, managed children, leases, and unresolved external effects are
+absent. Inspect any external branch or pull request, then replace the complete
+private runtime through normal fresh installation and repository onboarding.
+Do not edit SQLite, the locator, journals, the active pointer, or bundle files;
+do not reset, import, adopt, rebind, force, or preserve selected runtime parts.
 
-./scripts/local-agentctl-upgrade.sh successor-recovery-preview \
-  --upgrade-id "$FAILED_UPGRADE_ID" \
-  --revision "$SUCCESSOR_REVISION"
-```
+Historical journal schemas 1 through 3 and database-recovery evidence versions
+1 and 2 remain strict read-only evidence. An ordinary successor whose exact
+transfer had already completed may continue only through the normal lifecycle
+below. Its journal contains no recovery evidence, and cleanup retains the
+historical predecessor unchanged. Incomplete, missing, corrupt, conflicting,
+or recovery-bearing linkage remains fail-stop.
 
-The preview verifies the unchanged canonical binding, exact installed
-predecessor, replacement database safety, supported schema, SQLite and
-foreign-key integrity, configuration authority/readiness, stable database/WAL
-content, supervisor absence, and successor revision. Its JSON is sanitized and
-returns a `preview_digest`; it never returns paths, device/inode values, locator
-bytes, observation identities, integrity generation values, configuration
-digests, database contents, or credentials. Readiness normally must exactly
-match the predecessor's recorded failure. One narrow case also accepts a
-recorded `integrity_conflict` when later Controller activity advanced the
-integrity generation beyond a still-valid published observation, making the
-stopped replacement derive `integrity_pending`; this is not general
-`integrity_pending` successor eligibility. Preview does not migrate SQLite,
-run an integrity recheck, change the locator, create a successor, start a
-worker, or move the active pointer.
-
-After independently confirming both the relocation and encrypted full backup,
-use the exact preview digest:
-
-```sh
-./scripts/local-agentctl-upgrade.sh successor-recover-prepare \
-  --upgrade-id "$FAILED_UPGRADE_ID" \
-  --revision "$SUCCESSOR_REVISION" \
-  --preview-digest "$PREVIEW_DIGEST" \
-  --database-relocation-confirmed \
-  --full-backup-confirmed
-
-UPGRADE_ID="$SUCCESSOR_UPGRADE_ID" # returned by the command
-```
-
-Prepare reruns every preview check, verifies the successor through the normal
-independent-clone gate, durably records recovery intent, atomically rebinds only
-the exact locator database identity, and activates one verified successor.
-Identical retries resume the same recovery and successor after response loss.
-Any integrity generation, current observation, database/WAL content, schema,
-binding, configuration, binary, supervisor, preview, locator, or third-identity
-drift fails closed. `status` reports `successor-recover-prepare` while recovery
-or recovered successor preparation is interrupted. Never substitute a new
-preview after durable recovery intent; resume with the same predecessor ID,
-revision, digest, and confirmations.
+After that exact successor completes cleanup, do not start `prepare` or
+`successor-prepare` again in the retained installation. The immutable recovery-
+bearing predecessor remains a global managed-upgrade fence; replace the
+complete disposable runtime before another managed upgrade.
 
 After successor preparation, boot out the selected supervisor, create a new
 encrypted full backup of the Controller root and external credentials, and use
@@ -3395,7 +3364,7 @@ topology:
 | LaunchDaemon not running | Run LaunchDaemon `status`, verify the root-owned exact plist and worker-owned assets, then bootstrap or kickstart only when the sanitized next action permits it. |
 | Supervisor conflict | Boot out and prove absence of the current service, preserve its plist under a non-`.plist` rollback name, and retry the selected supervisor preflight. Never load both. |
 | Worker already running | Inspect both launchd domains and the process-lifetime lock owner. Do not remove the lock file or bypass the scheduler lease while a worker may still be alive. |
-| Managed upgrade database identity changed after an authorized relocation | Keep every supervisor absent and run `successor-recovery-preview` for the failed post-bootstrap upgrade and intended successor revision. After a new encrypted full backup, use the exact digest with `successor-recover-prepare` and both confirmations. Never edit the locator, SQLite, journal, inode evidence, or active pointer manually; binding, content, schema, supervisor, or third-identity drift must remain fail-closed. |
+| Managed upgrade database identity changed at the canonical path | Treat the private runtime as fail-stop. Stop supervision; independently prove workers, managed children, leases, and external effects absent; inspect external branches and pull requests; then replace the complete runtime through normal installation and onboarding. No preview, recovery prepare, locator rebind, reset, import, force, or partial preservation path exists. |
 | Managed upgrade remains pending after a pre-v43 integrity convergence exhaustion | Keep the selected worker running and rerun `observe`. Only an exact `integrity_convergence_exhausted` attention permits ordinary `successor-prepare` with a v43-or-newer revision. Generic `integrity_pending` is not eligible; never edit SQLite, the current pointer, scan evidence, or the upgrade journal. |
 
 When evidence remains unclear, stop external writes and preserve sanitized

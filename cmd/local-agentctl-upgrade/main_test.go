@@ -12,20 +12,8 @@ import (
 
 type fakeUpgradeManager struct {
 	successorRequest localupgrade.SuccessorPrepareRequest
-	previewRequest   localupgrade.SuccessorRecoveryPreviewRequest
-	recoveryRequest  localupgrade.SuccessorRecoverPrepareRequest
 	replaceID        string
 	replaceConfirmed bool
-}
-
-func (f *fakeUpgradeManager) PreviewSuccessorRecovery(_ context.Context, request localupgrade.SuccessorRecoveryPreviewRequest) (localupgrade.SuccessorRecoveryPreview, error) {
-	f.previewRequest = request
-	return localupgrade.SuccessorRecoveryPreview{UpgradeID: request.PredecessorUpgradeID, State: "eligible", Reason: "authorized_database_relocation_verified", SuccessorRevision: request.Revision, PreviewDigest: strings.Repeat("b", 64), RequiredConfirmations: []string{"database_relocation_confirmed", "full_backup_confirmed"}}, nil
-}
-
-func (f *fakeUpgradeManager) RecoverPrepareSuccessor(_ context.Context, request localupgrade.SuccessorRecoverPrepareRequest) (localupgrade.Result, error) {
-	f.recoveryRequest = request
-	return localupgrade.Result{UpgradeID: "upgrade-22222222222222222222222222222222", State: "prepared", Reason: "verified_recovered_successor_activated", NextAction: "replace", UpgradeHealth: "pending", ControllerReadiness: "unknown", PredecessorUpgradeID: request.PredecessorUpgradeID}, nil
 }
 
 func (f *fakeUpgradeManager) Prepare(context.Context, localupgrade.PrepareRequest) (localupgrade.Result, error) {
@@ -95,41 +83,14 @@ func TestSuccessorPrepareCLIRejectsMissingOrExpandedArguments(t *testing.T) {
 	}
 }
 
-func TestSuccessorRecoveryCLIRequiresDigestAndBothConfirmations(t *testing.T) {
-	predecessor := "upgrade-11111111111111111111111111111111"
-	revision := strings.Repeat("a", 40)
-	digest := strings.Repeat("b", 64)
-	manager := &fakeUpgradeManager{}
-	var previewOutput bytes.Buffer
-	if err := runWithManager(context.Background(), []string{"successor-recovery-preview", "--upgrade-id", predecessor, "--revision", revision}, manager, &previewOutput); err != nil {
-		t.Fatal(err)
-	}
-	if manager.previewRequest.PredecessorUpgradeID != predecessor || manager.previewRequest.Revision != revision || !strings.Contains(previewOutput.String(), `"preview_digest":"`+digest+`"`) || strings.Contains(previewOutput.String(), "/private/") {
-		t.Fatalf("request=%+v output=%s", manager.previewRequest, previewOutput.String())
-	}
-	for _, args := range [][]string{
-		{"successor-recover-prepare", "--upgrade-id", predecessor, "--revision", revision, "--preview-digest", digest, "--full-backup-confirmed"},
-		{"successor-recover-prepare", "--upgrade-id", predecessor, "--revision", revision, "--preview-digest", digest, "--database-relocation-confirmed"},
-		{"successor-recover-prepare", "--upgrade-id", predecessor, "--revision", revision, "--preview-digest", digest, "--database-relocation-confirmed", "--full-backup-confirmed", "--database", "/private/controller.db"},
-	} {
-		candidate := &fakeUpgradeManager{}
-		if err := runWithManager(context.Background(), args, candidate, &bytes.Buffer{}); err == nil {
-			t.Fatalf("args=%v", args)
+func TestRetiredSuccessorRecoveryCommandsRejectBeforeManagerComposition(t *testing.T) {
+	for _, name := range []string{"successor-recovery-preview", "successor-recover-prepare"} {
+		if err := run([]string{name}); err == nil || !strings.Contains(err.Error(), "recovery is retired") {
+			t.Fatalf("command=%s err=%v", name, err)
 		}
-		if candidate.recoveryRequest != (localupgrade.SuccessorRecoverPrepareRequest{}) {
-			t.Fatalf("invalid arguments reached manager: %+v", candidate.recoveryRequest)
+		if err := runWithManager(context.Background(), []string{name}, &fakeUpgradeManager{}, &bytes.Buffer{}); err == nil {
+			t.Fatalf("retired command %s reached command dispatch", name)
 		}
-	}
-	var output bytes.Buffer
-	args := []string{"successor-recover-prepare", "--upgrade-id", predecessor, "--revision", revision, "--preview-digest", digest, "--database-relocation-confirmed", "--full-backup-confirmed"}
-	if err := runWithManager(context.Background(), args, manager, &output); err != nil {
-		t.Fatal(err)
-	}
-	if manager.recoveryRequest.PredecessorUpgradeID != predecessor || manager.recoveryRequest.Revision != revision || manager.recoveryRequest.PreviewDigest != digest || !manager.recoveryRequest.DatabaseRelocationConfirmed || !manager.recoveryRequest.FullBackupConfirmed {
-		t.Fatalf("request=%+v", manager.recoveryRequest)
-	}
-	if strings.Contains(output.String(), "/private/") || !strings.Contains(output.String(), `"reason":"verified_recovered_successor_activated"`) {
-		t.Fatalf("output=%s", output.String())
 	}
 }
 

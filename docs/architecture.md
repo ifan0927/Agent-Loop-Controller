@@ -1544,46 +1544,27 @@ candidate; after the successor's own `bootstrap_intent`, rollback is again
 permanently forbidden. Successful successor cleanup removes only the successor
 bundle and active pointer while retaining the terminal predecessor lineage.
 
-One narrower recovery precedes successor preparation when an operator-confirmed
-local file relocation changed the database inode at the unchanged canonical
-path. It is available only for the same post-bootstrap Controller-readiness
-attention reasons as an ordinary managed successor, but requires the selected,
-opposite, and legacy supervisors to be absent and the installed binary to remain
-the exact predecessor candidate. Ordinary startup remains bound to the existing
-locator and continues to reject the replacement inode.
+An out-of-band database inode change at the canonical path is an installation-
+level authority conflict. There is no preview, locator rebind, recovered-
+successor preparation, or replay path. Historical schema-v3 relocation phases
+and database-recovery evidence versions 1 and 2 remain strictly readable but
+immutable. Unresolved, incomplete, corrupt, or conflicting historical linkage
+reports attention with `database_relocation_recovery_retired`, advertises only
+bundle preservation, and blocks every managed-upgrade mutation.
 
-The read-only recovery preview derives the old locator identity from the
-predecessor journal and private authority locator. A query-only verifier pins
-the replacement file's owner, private mode, single link, canonical path,
-schema, SQLite and foreign-key integrity, internal configuration paths, desired
-configuration authority, readiness reason, and stable database/WAL content.
-Readiness normally remains an exact match with the predecessor's durable
-failure reason. The sole additional relationship is a durable predecessor
-`integrity_conflict` followed by `integrity_pending` when a valid current
-published observation is older than a strictly newer integrity generation.
-That stale observation cannot assert current Controller readiness. The typed
-relationship, both generations, observation consistency, predecessor failure,
-replacement readiness, predecessor binary, supervisor absence, and exact
-successor revision are all bound into the private preview evidence and digest.
-Only the digest and required confirmation names are rendered; paths,
-device/inode values, observation identities, generation values, locator bytes,
-configuration digests, database contents, and credentials remain private.
-
-Prepare requires explicit relocation and encrypted-full-backup confirmations,
-revalidates the complete preview around candidate verification, and durably
-records one recovery intent and successor identity before locator mutation. The
-configuration filesystem adapter holds its stable mutation lock, pins the
-replacement database descriptor, accepts only the exact old or already-
-recovered locator, and atomically changes only the locator's database identity
-with directory synchronization. The journal then binds the observed
-replacement identity and publication before the existing independent-clone
-successor staging and active-pointer transfer. Restart distinguishes the old
-locator, the exact recovered locator, and every unexpected third identity;
-identical replay resumes one successor while generation, observation,
-configuration, content, binary, supervisor, or locator drift preserves all
-evidence.
-Successful successor cleanup retains the failed predecessor's complete recovery
-record.
+One compatibility boundary remains read-only: a historical predecessor whose
+exact ordinary successor transfer had already completed may prove that
+successor's normal lifecycle through strict journals, exact bidirectional IDs,
+the complete successor bundle, and the active pointer. The successor journal
+contains no recovery authority. It may replace, roll back before bootstrap,
+authorize bootstrap, observe, and clean up only through the ordinary gates.
+Cleanup retains the predecessor unchanged. After the cleanup commit, exact-
+owned reclamation uses only the current-installation evidence and never parses
+the target journal or reconstructs retained lineage. A fully completed cleanup
+may present the sanitized terminal predecessor history, but the retained
+recovery-bearing predecessor fences both `prepare` and `successor-prepare`.
+The complete disposable runtime must be replaced before any later managed
+upgrade.
 
 ### Operator-attention boundary
 
