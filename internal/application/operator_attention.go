@@ -25,9 +25,11 @@ const (
 type OperatorAttentionActionID string
 
 const (
-	OperatorAttentionActionRetry               OperatorAttentionActionID = "retry"
-	OperatorAttentionActionAbandon             OperatorAttentionActionID = "abandon"
-	OperatorAttentionActionDecide              OperatorAttentionActionID = "decide"
+	OperatorAttentionActionRetry   OperatorAttentionActionID = "retry"
+	OperatorAttentionActionAbandon OperatorAttentionActionID = "abandon"
+	OperatorAttentionActionDecide  OperatorAttentionActionID = "decide"
+	// OperatorAttentionActionRecoverCIWait is retained only to validate
+	// immutable historical schema-1 and schema-2 payloads.
 	OperatorAttentionActionRecoverCIWait       OperatorAttentionActionID = "recover_ci_wait"
 	OperatorAttentionActionRecoverOwnedPush    OperatorAttentionActionID = "recover_owned_push"
 	OperatorAttentionActionAcceptExternalMerge OperatorAttentionActionID = "accept_external_merge"
@@ -44,8 +46,10 @@ const (
 	OperatorAttentionManualIntervention    = "manual_intervention_attention"
 	OperatorAttentionHumanDecision         = "human_decision_attention"
 	OperatorAttentionCISlow                = "ci_wait_slow"
-	OperatorAttentionCIWaitRecovery        = "ci_wait_recovery"
-	operatorAttentionUnknown               = "unknown"
+	// OperatorAttentionCIWaitRecovery is retained only for decoding and
+	// projecting historical compatibility evidence.
+	OperatorAttentionCIWaitRecovery = "ci_wait_recovery"
+	operatorAttentionUnknown        = "unknown"
 )
 
 // OperatorAttentionEvent is the complete, sanitized transport-neutral payload.
@@ -217,18 +221,6 @@ func CISlowAttentionEvent(run Run, wait CIWaitEvidence) (OperatorAttentionEvent,
 		Profile: profile, State: run.State, Severity: "warning", ReasonCode: "ci_wait_slow",
 		EvidenceDigest: hex.EncodeToString(digest[:]), OccurredAt: wait.WarningAt, ObservedAt: wait.WarningAt,
 	})
-}
-
-func CIWaitRecoveryAttentionEvent(run Run, schedule RetrySchedule) (OperatorAttentionEvent, error) {
-	if (run.State != domain.StatePROpen && run.State != domain.StateReconcilingReviews) || schedule.RunID != run.ID || schedule.Phase != AutomaticRetryPhaseForRun(run) || schedule.Status != RetryScheduleAttention || schedule.FailureClass != RetryFailureTerminal || schedule.ReasonCode != RetryReasonTerminal || schedule.AttentionAt.IsZero() {
-		return OperatorAttentionEvent{}, errors.New("CI wait recovery attention evidence is invalid")
-	}
-	profile, err := operatorAttentionProfileForRun(run)
-	if err != nil {
-		return OperatorAttentionEvent{}, err
-	}
-	evidence := retryAttentionDigest(schedule)
-	return newOperatorAttentionEvent(operatorAttentionEventInput{ScopeID: run.ID, RunID: run.ID, EventType: OperatorAttentionCIWaitRecovery, Profile: profile, State: run.State, Severity: "warning", ReasonCode: "legacy_ci_topology_drift", EvidenceDigest: evidence, OccurredAt: schedule.AttentionAt, ObservedAt: schedule.AttentionAt})
 }
 
 // ManualInterventionAttentionEvent maps one persisted manual stop. Its key and

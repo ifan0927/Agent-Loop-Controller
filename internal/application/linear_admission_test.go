@@ -44,6 +44,11 @@ type admissionStore struct {
 	lookupCount  int
 	lateIssue    *Run
 	idempotency  *Run
+	progress     RunProgressEvidence
+}
+
+func (s *admissionStore) ReadRunProgressEvidence(context.Context, string) (RunProgressEvidence, error) {
+	return s.progress, nil
 }
 
 func (s *admissionStore) GetRunByIdempotency(ctx context.Context, key string) (Run, bool, error) {
@@ -403,67 +408,6 @@ func TestLinearRevalidateAllowsUnchangedStartedStateDuringRepairExecution(t *tes
 	}
 	if _, err := service.RevalidateForOperatorRetry(context.Background(), LinearRevalidateCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: existing.ID, Repository: existing.Repository, ExpectedState: existing.State, IdempotencyKey: existing.IdempotencyKey}); err == nil || store.marked {
 		t.Fatalf("operator retry accepted progressed Linear source: err=%v marked=%t", err, store.marked)
-	}
-}
-
-func TestLinearCIWaitRecoveryReadOnlyRevalidationAllowsOnlyStableStartedProgress(t *testing.T) {
-	repository := LocalRepository{CanonicalRepository: "owner/repo", BaseBranch: "main", VerifierIDs: []string{"fixture-go-test"}, AllowedOperatorLogins: []string{"operator"}}
-	resolver := admissionResolver{repositories: map[string]LocalRepository{"owner/repo": repository}}
-	original := validLinearSource()
-	snapshot, _, err := admitLinearTask(original, resolver)
-	if err != nil {
-		t.Fatal(err)
-	}
-	repositoryJSON, err := json.Marshal(repository)
-	if err != nil {
-		t.Fatal(err)
-	}
-	existing := Run{ID: snapshot.Task.RunID, IssueID: original.Identifier, IdempotencyKey: snapshot.IdempotencyKey, SourceRevision: snapshot.Task.SourceRevision, RawIssueJSON: string(snapshot.RawJSON), RawIssueHash: snapshot.RawHash, Repository: repository.CanonicalRepository, RepositoryConfigJSON: string(repositoryJSON), WorkingBranch: snapshot.Task.WorkingBranch, TaskHash: snapshot.TaskHash, NormalizedTaskJSON: mustJSON(t, snapshot.Task), CandidateHead: "candidate", State: domain.StatePROpen}
-	command := LinearRevalidateCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: existing.ID, Repository: existing.Repository, ExpectedState: existing.State, IdempotencyKey: existing.IdempotencyKey}
-
-	tests := []struct {
-		name   string
-		mutate func(*LinearTaskSource)
-		pass   bool
-	}{
-		{"Todo to In Progress", func(source *LinearTaskSource) {
-			source.State = LinearState{ID: "started", Name: "In Progress", Type: "started"}
-			source.SourceRevision = "2026-07-13T00:00:00Z"
-		}, true},
-		{"completed", func(source *LinearTaskSource) {
-			source.State = LinearState{ID: "done", Name: "Done", Type: "completed"}
-			source.SourceRevision = "2026-07-13T00:00:00Z"
-		}, false},
-		{"canceled", func(source *LinearTaskSource) {
-			source.State = LinearState{ID: "canceled", Name: "Canceled", Type: "canceled"}
-			source.SourceRevision = "2026-07-13T00:00:00Z"
-		}, false},
-		{"started task drift", func(source *LinearTaskSource) {
-			source.State = LinearState{ID: "started", Name: "In Progress", Type: "started"}
-			source.SourceRevision = "2026-07-13T00:00:00Z"
-			source.Description += "\n\nMaterial task drift."
-		}, false},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			source := original
-			test.mutate(&source)
-			store := &admissionStore{serviceStore: serviceStore{run: existing}}
-			service, err := NewLinearAdmissionService(&admissionReader{source: source}, resolver, store, &admissionController{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			got, err := service.RevalidateForCIWaitRecovery(context.Background(), command)
-			if test.pass && (err != nil || got.ID != existing.ID) {
-				t.Fatalf("run=%+v err=%v", got, err)
-			}
-			if !test.pass && err == nil {
-				t.Fatal("unsafe Linear state/task drift was accepted")
-			}
-			if store.marked {
-				t.Fatal("read-only recovery revalidation marked a Linear drift mutation")
-			}
-		})
 	}
 }
 

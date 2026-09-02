@@ -271,6 +271,13 @@ func TestControllerRejectsRetiredCleanupSourceRecoveryCommand(t *testing.T) {
 	}
 }
 
+func TestControllerRejectsRetiredCIWaitRecoveryCommandBeforeComposition(t *testing.T) {
+	err := controller([]string{"recover-ci-wait", "run-1"})
+	if err == nil || !strings.Contains(err.Error(), "unknown controller command") {
+		t.Fatalf("retired CI-wait recovery command error=%v", err)
+	}
+}
+
 func TestControllerAbandonRequiresRunAndRequesterIdentity(t *testing.T) {
 	err := controller([]string{"abandon"})
 	if err == nil || !strings.Contains(err.Error(), "run ID and complete requester identity") {

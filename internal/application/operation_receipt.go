@@ -18,9 +18,11 @@ var (
 type OperationType string
 
 const (
-	OperationDecide              OperationType = "decide"
-	OperationRetry               OperationType = "retry"
-	OperationAbandon             OperationType = "abandon"
+	OperationDecide  OperationType = "decide"
+	OperationRetry   OperationType = "retry"
+	OperationAbandon OperationType = "abandon"
+	// OperationRecoverCIWait is retained only for reading historical receipts
+	// written before the incident-specific CI-wait recovery was retired.
 	OperationRecoverCIWait       OperationType = "recover_ci_wait"
 	OperationRecoverOwnedPush    OperationType = "recover_owned_push"
 	OperationAcceptExternalMerge OperationType = "accept_external_merge"
@@ -231,7 +233,7 @@ func NewOperationReceiptService(store OperationReceiptStore) (*OperationReceiptS
 }
 
 func (s *OperationReceiptService) Accept(ctx context.Context, input OperationReceiptInput) (OperationReceipt, bool, error) {
-	if input.OperationType == OperationRecoverCleanupSource || input.OperationType == OperationRestoreConfiguration {
+	if retiredOperationType(input.OperationType) {
 		return OperationReceipt{}, false, serviceError(ErrorInvalidInput, "operation type is retired", nil)
 	}
 	if input.AcceptedAt.IsZero() {
@@ -370,6 +372,10 @@ func validOperationType(value OperationType) bool {
 	default:
 		return false
 	}
+}
+
+func retiredOperationType(value OperationType) bool {
+	return value == OperationRecoverCIWait || value == OperationRestoreConfiguration || value == OperationRecoverCleanupSource
 }
 
 func validOperationScope(value AuthorityScopeKind) bool {

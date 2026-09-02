@@ -104,6 +104,7 @@ type linearTodoDispatchStore interface {
 	LinearTodoAdmissionStore
 	linearIssueStartStore
 	OperatorAttentionPublisher
+	RunProgressEvidenceStore
 	RetryScheduleStore
 	InactiveCIWaitCloser
 }
@@ -224,6 +225,11 @@ func validateLinearTodoDispatchPolicy(policy LinearTodoDispatchPolicy) error {
 // conflict.
 func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatchResult, error) {
 	now := d.clock()
+	if result, blocked, err := d.blockedRunProgress(ctx); err != nil {
+		return LinearTodoDispatchResult{}, err
+	} else if blocked {
+		return withQueueDecision(result, queueDecision(LinearTodoQueueDecisionActiveRun, 0, true)), nil
+	}
 	// Observe configuration convergence before selecting existing work. A
 	// conflict fences only new authority below; compatible persisted runs must
 	// still be allowed to progress under their frozen authority.
@@ -298,6 +304,18 @@ func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatch
 				return withQueueDecision(result, queueDecision(LinearTodoQueueDecisionActiveRun, 0, true)), nil
 			}
 		} else {
+			admission, admissionErr := EvaluateRunProgressAdmission(ctx, d.store, run)
+			if admissionErr != nil {
+				return LinearTodoDispatchResult{}, classifyServiceError(admissionErr)
+			}
+			if !admission.Allowed {
+				phase := AutomaticRetryPhaseForRun(run)
+				schedule, found, scheduleErr := d.store.GetRetrySchedule(ctx, run.ID, phase)
+				if scheduleErr != nil {
+					return LinearTodoDispatchResult{}, classifyServiceError(scheduleErr)
+				}
+				return withQueueDecision(retiredCIWaitRecoveryStop(run, schedule, found), queueDecision(LinearTodoQueueDecisionActiveRun, 0, true)), nil
+			}
 			if !d.claimRun(run.ID) {
 				return withQueueDecision(LinearTodoDispatchResult{Outcome: LinearTodoDispatchWaiting}, queueDecision(LinearTodoQueueDecisionActiveRun, 0, true)), nil
 			}
@@ -450,6 +468,33 @@ func (d *LinearTodoDispatcher) Dispatch(ctx context.Context) (LinearTodoDispatch
 	return result, nil
 }
 
+// blockedRunProgress is deliberately evaluated before the admission lease,
+// CI-wait settlement, scheduling reconciliation, or any external work. An
+// unresolved retired recovery must be a zero-mutation stop even when the
+// dispatcher is the entrypoint.
+func (d *LinearTodoDispatcher) blockedRunProgress(ctx context.Context) (LinearTodoDispatchResult, bool, error) {
+	runs, err := d.store.ListNonterminalRuns(ctx)
+	if err != nil {
+		return LinearTodoDispatchResult{}, false, classifyServiceError(err)
+	}
+	for _, run := range runs {
+		admission, admissionErr := EvaluateRunProgressAdmission(ctx, d.store, run)
+		if admissionErr != nil {
+			return LinearTodoDispatchResult{}, false, classifyServiceError(admissionErr)
+		}
+		if admission.Allowed {
+			continue
+		}
+		phase := AutomaticRetryPhaseForRun(run)
+		schedule, found, scheduleErr := d.store.GetRetrySchedule(ctx, run.ID, phase)
+		if scheduleErr != nil {
+			return LinearTodoDispatchResult{}, false, classifyServiceError(scheduleErr)
+		}
+		return retiredCIWaitRecoveryStop(run, schedule, found), true, nil
+	}
+	return LinearTodoDispatchResult{}, false, nil
+}
+
 func earlierRunnableAt(left, right time.Time) time.Time {
 	if left.IsZero() || !right.IsZero() && right.Before(left) {
 		return right
@@ -490,7 +535,22 @@ func (d *LinearTodoDispatcher) dispatchExistingRunWithoutAdmissionLease(ctx cont
 		// can use remaining capacity.
 		return LinearTodoDispatchResult{}, false, nil
 	}
-	if !found || !d.claimRun(run.ID) {
+	if !found {
+		return LinearTodoDispatchResult{}, false, nil
+	}
+	admission, admissionErr := EvaluateRunProgressAdmission(ctx, d.store, run)
+	if admissionErr != nil {
+		return LinearTodoDispatchResult{}, true, classifyServiceError(admissionErr)
+	}
+	if !admission.Allowed {
+		phase := AutomaticRetryPhaseForRun(run)
+		schedule, scheduleFound, scheduleErr := d.store.GetRetrySchedule(ctx, run.ID, phase)
+		if scheduleErr != nil {
+			return LinearTodoDispatchResult{}, true, classifyServiceError(scheduleErr)
+		}
+		return withQueueDecision(retiredCIWaitRecoveryStop(run, schedule, scheduleFound), queueDecision(LinearTodoQueueDecisionActiveRun, 0, true)), true, nil
+	}
+	if !d.claimRun(run.ID) {
 		return LinearTodoDispatchResult{}, false, nil
 	}
 	defer d.releaseRunClaim(run.ID)
@@ -1463,6 +1523,13 @@ func (d *LinearTodoDispatcher) blockingRetry(ctx context.Context) (LinearTodoDis
 		if runErr != nil {
 			return LinearTodoDispatchResult{}, false, classifyServiceError(runErr)
 		}
+		admission, admissionErr := EvaluateRunProgressAdmission(ctx, d.store, run)
+		if admissionErr != nil {
+			return LinearTodoDispatchResult{}, false, classifyServiceError(admissionErr)
+		}
+		if !admission.Allowed {
+			return retiredCIWaitRecoveryStop(run, schedule, true), true, nil
+		}
 		if run.State == domain.StateManualIntervention {
 			result, attentionErr := d.manualInterventionAttention(ctx, run)
 			return result, true, attentionErr
@@ -1494,6 +1561,14 @@ func (d *LinearTodoDispatcher) blockingRetry(ctx context.Context) (LinearTodoDis
 		}
 	}
 	return LinearTodoDispatchResult{}, false, nil
+}
+
+func retiredCIWaitRecoveryStop(run Run, schedule RetrySchedule, found bool) LinearTodoDispatchResult {
+	result := LinearTodoDispatchResult{Outcome: LinearTodoDispatchAttention, Run: projectRunResult(run)}
+	if found {
+		result.Retry = &schedule
+	}
+	return result
 }
 
 func (d *LinearTodoDispatcher) markRetryAttention(ctx context.Context, run Run, current RetrySchedule, class RetryFailureClass, reason string) (LinearTodoDispatchResult, error) {

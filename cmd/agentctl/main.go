@@ -90,7 +90,7 @@ func versionCommand(args []string) error {
 
 func controller(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: agentctl controller <integrity|start|run|drive|worker|launchagent|launchdaemon|status|inspect|continue|retry|recover-ci-wait|recover-owned-push|accept-external-merge|abandon|push|open-pr|reconcile|merge|reconcile-linear|cleanup> ...")
+		return errors.New("usage: agentctl controller <integrity|start|run|drive|worker|launchagent|launchdaemon|status|inspect|continue|retry|recover-owned-push|accept-external-merge|abandon|push|open-pr|reconcile|merge|reconcile-linear|cleanup> ...")
 	}
 	switch args[0] {
 	case "integrity":
@@ -113,8 +113,6 @@ func controller(args []string) error {
 		return controllerContinue(args[1:])
 	case "retry":
 		return controllerRetry(args[1:])
-	case "recover-ci-wait":
-		return controllerRecoverCIWait(args[1:])
 	case "recover-owned-push":
 		return controllerRecoverOwnedPush(args[1:])
 	case "accept-external-merge":

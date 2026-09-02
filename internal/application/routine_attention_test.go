@@ -216,7 +216,7 @@ func TestRoutineAttentionPreservesConflictUnknownUnfamiliarAndResolvedConclusion
 	}
 }
 
-func TestRoutineAttentionSanitizesAllSixLegalActionTypes(t *testing.T) {
+func TestRoutineAttentionSanitizesAllFiveLegalActionTypes(t *testing.T) {
 	cases := []struct {
 		action      OperationType
 		consequence LegalActionConsequence
@@ -224,7 +224,6 @@ func TestRoutineAttentionSanitizesAllSixLegalActionTypes(t *testing.T) {
 		{OperationDecide, LegalActionConsequenceResumeExecution},
 		{OperationRetry, LegalActionConsequenceScheduleRetry},
 		{OperationAbandon, LegalActionConsequenceTerminateRun},
-		{OperationRecoverCIWait, LegalActionConsequenceRefreshCIEvidence},
 		{OperationRecoverOwnedPush, LegalActionConsequenceReturnToPushGate},
 		{OperationAcceptExternalMerge, LegalActionConsequenceAcceptExistingMerge},
 	}

@@ -111,8 +111,8 @@ the state machine.
   authorization scopes; scope-aware run and scheduler collections filter before
   counting, ordering, and pagination, and detail reads do not distinguish an
   unknown target from an unauthorized one.
-- Persisted-state legal-action offers for decision, retry, abandon, CI-wait,
-  owned-push, and external-merge recovery, backed by a scope-neutral operation
+- Persisted-state legal-action offers for decision, retry, abandon, owned-push,
+  and external-merge recovery, backed by a scope-neutral operation
   receipt lifecycle that survives reconnects and controller restarts.
 - Automatic Controller-wide SQLite audit-integrity observations over a closed
   seven-family registry, with transactionally enforced source generations,

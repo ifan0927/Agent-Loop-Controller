@@ -20,9 +20,13 @@ type driverRunReader struct {
 	ciAt          time.Time
 	ciEvaluated   time.Time
 	ciWarnWhenDue bool
+	progress      RunProgressEvidence
 }
 
 func (r *driverRunReader) GetRun(context.Context, string) (Run, error) { return r.run, nil }
+func (r *driverRunReader) ReadRunProgressEvidence(context.Context, string) (RunProgressEvidence, error) {
+	return r.progress, nil
+}
 func (r *driverRunReader) Inspect(context.Context, string) (RunInspection, error) {
 	inspection := RunInspection{Run: r.run, PullRequest: r.pr, GitHubEvidence: r.evidence}
 	if r.run.State == domain.StateManualIntervention {

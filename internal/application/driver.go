@@ -13,6 +13,7 @@ import (
 // it re-reads this persisted state after every side effect.
 type ProductionRunReader interface {
 	GetRun(context.Context, string) (Run, error)
+	RunProgressEvidenceStore
 }
 
 // ProductionAttentionEvidenceReader supplies the transition timeline needed
@@ -181,6 +182,13 @@ func (d *ProductionDriver) Drive(ctx context.Context, command ProductionDriveCom
 		run, err := d.runs.GetRun(ctx, command.RunID)
 		if err != nil {
 			return ProductionDriveResult{}, classifyServiceError(err)
+		}
+		admission, err := EvaluateRunProgressAdmission(ctx, d.runs, run)
+		if err != nil {
+			return ProductionDriveResult{}, classifyServiceError(err)
+		}
+		if !admission.Allowed {
+			return ProductionDriveResult{}, serviceError(ErrorConflict, "run progress is blocked by unresolved historical recovery evidence", nil)
 		}
 		if run.Repository != command.Repository || run.IdempotencyKey != command.IdempotencyKey {
 			return ProductionDriveResult{}, serviceError(ErrorConflict, "run authority changed before automatic delivery", nil)

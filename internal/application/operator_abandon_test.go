@@ -92,6 +92,10 @@ func (s *abandonCoordinatorStore) BeginOperatorAction(_ context.Context, record 
 	return record, true, nil
 }
 
+func (s *abandonCoordinatorStore) GetOperatorAction(_ context.Context, actionID string) (OperatorActionRecord, bool, error) {
+	return s.action, s.action.ActionID == actionID, nil
+}
+
 func (s *abandonCoordinatorStore) ApplyOperatorActionResult(_ context.Context, result OperatorActionMutationResult) (OperatorActionRecord, bool, error) {
 	if s.action.Status != result.ExpectedStatus {
 		return s.action, false, nil
@@ -114,6 +118,24 @@ func (s *abandonCoordinatorStore) ObserveOperatorActionResult(_ context.Context,
 	s.action.OutcomeDigest = result.EvidenceDigest
 	s.action.ObservedAt = result.At
 	return s.action, true, nil
+}
+
+func TestOperatorActionServiceRejectsRetiredCIWaitMutations(t *testing.T) {
+	now := time.Date(2026, 9, 2, 1, 0, 0, 0, time.UTC)
+	store := &abandonCoordinatorStore{pushTestStore: &pushTestStore{}, action: OperatorActionRecord{ActionID: "historical-ci-wait", ActionType: OperatorActionRecoverCIWait, Status: OperatorActionStatusValidated}}
+	service, err := NewOperatorActionService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied := OperatorActionMutationResult{ActionID: store.action.ActionID, ExpectedStatus: OperatorActionStatusValidated, ResultStatus: OperatorActionResultApplied, ResultingState: domain.StatePROpen, ResultingTransitionSequence: 1, EvidenceDigest: strings.Repeat("a", 64), At: now}
+	if _, _, err := service.RecordApplied(context.Background(), applied); err == nil || store.action.Status != OperatorActionStatusValidated {
+		t.Fatalf("retired applied mutation status=%s err=%v", store.action.Status, err)
+	}
+	store.action.Status = OperatorActionStatusApplied
+	observed := OperatorActionMutationResult{ActionID: store.action.ActionID, ExpectedStatus: OperatorActionStatusApplied, ResultStatus: OperatorActionResultSucceeded, ResultingState: domain.StatePROpen, ResultingTransitionSequence: 1, EvidenceDigest: strings.Repeat("b", 64), At: now.Add(time.Second)}
+	if _, _, err := service.RecordObserved(context.Background(), observed); err == nil || store.action.Status != OperatorActionStatusApplied {
+		t.Fatalf("retired observed mutation status=%s err=%v", store.action.Status, err)
+	}
 }
 
 func (s *abandonCoordinatorStore) StopAutomaticAdmissionAttempts(_ context.Context, runID, _ string, stoppedAt time.Time) (int64, error) {

@@ -90,6 +90,11 @@ This milestone is recorded by the closed
   while recovery proceeds by normal fresh installation and onboarding.
 - Typed exhausted-retry recovery with durable operator intent and automatic
   worker resume through the normal driver.
+- Retired pre-fix CI-wait compatibility recovery: historical action, receipt,
+  schedule, attention, observation, Activity, and integrity evidence remains
+  readable, while unresolved installations fail-stop and recover only through
+  complete disposable-runtime replacement. Normal exact-head CI polling and
+  slow-CI attention remain unchanged.
 - Deterministic continuous-supervisor restart/fault matrix with a sanitized,
   machine-readable evidence summary for these boundaries.
 - Controller-owned configuration baseline generations, private bounded raw

@@ -523,10 +523,14 @@ When adding a migration:
 CI wait tests distinguish required-check startup from review/approval waiting:
 absent -> queued -> in-progress -> success retains one exact-head first-seen
 timestamp across restart, emits at most one slow warning, and closes without a
-warning when checks are already green. Compatibility-recovery tests use the
-exact pre-fix sanitized operation sequence and reject shortened, extended,
-reordered, non-2xx, authority-drifted, or response-digest-fingerprint-drifted
-traces.
+warning when checks are already green. Historical compatibility fixtures must
+cover accepted, applied, and settled `recover_ci_wait` evidence across close
+and reopen. Assert action, receipt, schedule, attention, GitHub observations,
+Activity, and integrity reads; zero live legal offers; no mutation or worker
+progress for unresolved evidence; normal resume only for already observed
+success; and rejection at every common application and SQLite producer or
+mutator boundary. Do not recreate the retired fingerprint, recovery reader, or
+executor in tests.
 
 Polling-policy tests keep the worker's idle Linear admission interval separate
 from the production driver's delivery interval. Cover the legacy version-3

@@ -209,7 +209,6 @@ func TestAllLegalActionOffersHaveStablePresentationSemantics(t *testing.T) {
 		{OperatorAttentionActionDecide, LegalActionConfirmationInput, LegalActionInputDecision, LegalActionConsequenceResumeExecution},
 		{OperatorAttentionActionRetry, LegalActionConfirmationNone, LegalActionInputNone, LegalActionConsequenceScheduleRetry},
 		{OperatorAttentionActionAbandon, LegalActionConfirmationDanger, LegalActionInputNone, LegalActionConsequenceTerminateRun},
-		{OperatorAttentionActionRecoverCIWait, LegalActionConfirmationConfirm, LegalActionInputNone, LegalActionConsequenceRefreshCIEvidence},
 		{OperatorAttentionActionRecoverOwnedPush, LegalActionConfirmationConfirm, LegalActionInputNone, LegalActionConsequenceReturnToPushGate},
 		{OperatorAttentionActionAcceptExternalMerge, LegalActionConfirmationConfirm, LegalActionInputNone, LegalActionConsequenceAcceptExistingMerge},
 	}
