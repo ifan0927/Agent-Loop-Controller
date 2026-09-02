@@ -188,11 +188,13 @@ the next cycle without a separate drive command. Human review resolution and
 approval happen in GitHub; the driver observes them and continues
 automatically.
 
-For the routine local overview, run `agentctl operator`. It authenticates as
+For the routine local operator, run `agentctl operator`. It authenticates as
 the configured Controller operator, opens only the already-bound current
-configuration authority, and renders Controller health, repositories, runs,
-and operator attention without changing Controller state. It does not accept
-requester override flags and does not start or supervise the worker.
+configuration authority, and provides Overview plus filtered, cursor-paginated
+Runs and a shared compact run detail with Controller-owned progress, wait
+assessment, attention, pull-request summary, and all eleven delivery gates.
+It changes no Controller state, accepts no requester override flags, and does
+not start or supervise the worker.
 
 Low-level `continue`, `push`, `open-pr`, `reconcile`, `merge`,
 `reconcile-linear`, and `cleanup` commands are recovery interfaces, not the
@@ -229,10 +231,12 @@ reports explicit coverage limitations for history that was never persisted.
 Unsafe or ambiguous configuration repair remains out of scope. Controller-wide
 audit-integrity readiness and its explicit receipt-backed recheck are
 implemented, completing the presentation-independent operator foundation. The
-first read-only `agentctl operator` Overview is implemented with bounded
-responsive content-sized layouts, visible focus, background refresh,
-stale-result preservation, and configured-operator authorization. Additional
-TUI screens and legal actions remain planned. HTTP, a Web
+read-only `agentctl operator` Overview, Runs collection, and shared Run detail
+are implemented with bounded responsive layouts, visible selection,
+filter-safe updated-time pagination, background refresh, stale-result
+preservation, and configured-operator authorization. This completes the R04,
+R05, and R06 read journey; mutations and the remaining TUI destinations remain
+planned. HTTP, a Web
 UI, outbound notifications, Hermes runtime integration, public API/webhook
 admission, and cross-repository transactions remain deferred or exploratory.
 

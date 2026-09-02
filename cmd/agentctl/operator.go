@@ -31,6 +31,14 @@ const (
 	operatorAttentionPanel    operatorPanel = "attention"
 )
 
+type operatorRoute string
+
+const (
+	operatorOverviewRoute  operatorRoute = "overview"
+	operatorRunsRoute      operatorRoute = "runs"
+	operatorRunDetailRoute operatorRoute = "run_detail"
+)
+
 type operatorPanelState struct {
 	index int
 }
@@ -53,34 +61,89 @@ type operatorRefreshResultMsg struct {
 	err        operatorSafeError
 }
 
+type operatorRunsRequest struct {
+	lifecycle  application.RunLifecycleFilter
+	repository string
+	cursor     string
+	previous   []string
+}
+
+type operatorRunsResultMsg struct {
+	generation int64
+	request    operatorRunsRequest
+	page       application.RoutineRunPage
+	err        operatorSafeError
+}
+
+type operatorRunDetailResultMsg struct {
+	generation int64
+	runID      string
+	detail     application.RoutineRunDetail
+	err        operatorSafeError
+}
+
+type operatorRunsState struct {
+	page              *application.RoutineRunPage
+	request           operatorRunsRequest
+	pending           *operatorRunsRequest
+	initialError      *operatorSafeError
+	staleError        *operatorSafeError
+	refreshing        bool
+	generation        int64
+	index             int
+	selectedRunID     string
+	repositoryEditing bool
+	repositoryInput   string
+}
+
+type operatorRunDetailState struct {
+	detail       *application.RoutineRunDetail
+	runID        string
+	returnRoute  operatorRoute
+	initialError *operatorSafeError
+	staleError   *operatorSafeError
+	refreshing   bool
+	generation   int64
+	gateIndex    int
+}
+
 type operatorRefreshTickMsg struct{}
 
 type operatorKeyMap struct {
-	up, down, next, previous, refresh, help, quit key.Binding
+	up, down, next, previous, refresh, help, quit                             key.Binding
+	overview, runs, open, back, lifecycle, repository, nextPage, previousPage key.Binding
 }
 
 func (k operatorKeyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.next, k.previous, k.up, k.down, k.refresh, k.help, k.quit}
+	return []key.Binding{k.overview, k.runs, k.next, k.previous, k.up, k.down, k.refresh, k.help, k.quit}
 }
 
 func (k operatorKeyMap) FullHelp() [][]key.Binding {
-	return [][]key.Binding{{k.next, k.previous}, {k.up, k.down}, {k.refresh, k.help, k.quit}}
+	return [][]key.Binding{{k.overview, k.runs}, {k.next, k.previous}, {k.up, k.down}, {k.open, k.back}, {k.lifecycle, k.repository}, {k.nextPage, k.previousPage}, {k.refresh, k.help, k.quit}}
 }
 
 var operatorKeys = operatorKeyMap{
-	up:       key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
-	down:     key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
-	next:     key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "next panel")),
-	previous: key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("shift+tab", "previous panel")),
-	refresh:  key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
-	help:     key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
-	quit:     key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
+	up:           key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
+	down:         key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
+	next:         key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "next panel")),
+	previous:     key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("shift+tab", "previous panel")),
+	refresh:      key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
+	help:         key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
+	quit:         key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
+	overview:     key.NewBinding(key.WithKeys("1"), key.WithHelp("1", "overview")),
+	runs:         key.NewBinding(key.WithKeys("2"), key.WithHelp("2", "runs")),
+	open:         key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "open run")),
+	back:         key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "back")),
+	lifecycle:    key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "lifecycle filter")),
+	repository:   key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "repository filter")),
+	nextPage:     key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "next page")),
+	previousPage: key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "previous page")),
 }
 
 type operatorModel struct {
 	ctx             context.Context
 	cancel          context.CancelFunc
-	loader          operatorOverviewLoader
+	loader          operatorLoader
 	now             func() time.Time
 	refreshInterval time.Duration
 	width           int
@@ -94,9 +157,12 @@ type operatorModel struct {
 	help            help.Model
 	focus           operatorPanel
 	panels          map[operatorPanel]operatorPanelState
+	route           operatorRoute
+	runs            operatorRunsState
+	detail          operatorRunDetailState
 }
 
-func newOperatorModel(parent context.Context, loader operatorOverviewLoader) operatorModel {
+func newOperatorModel(parent context.Context, loader operatorLoader) operatorModel {
 	ctx, cancel := context.WithCancel(parent)
 	helpModel := help.New()
 	return operatorModel{
@@ -114,21 +180,46 @@ func newOperatorModel(parent context.Context, loader operatorOverviewLoader) ope
 			operatorRunsPanel:         {},
 			operatorAttentionPanel:    {},
 		},
+		route: operatorOverviewRoute,
+		runs:  operatorRunsState{request: operatorRunsRequest{lifecycle: application.RunLifecycleActive}},
 	}
 }
 
 func (m operatorModel) Init() tea.Cmd {
-	return m.loadCommand(m.generation)
+	return m.overviewLoadCommand(m.generation)
 }
 
-func (m operatorModel) loadCommand(generation int64) tea.Cmd {
+func (m operatorModel) overviewLoadCommand(generation int64) tea.Cmd {
 	ctx, loader, observedAt := m.ctx, m.loader, m.now().UTC()
 	return func() tea.Msg {
-		batch, err := loader.Load(ctx, observedAt)
+		batch, err := loader.LoadOverview(ctx, observedAt)
 		if err != nil {
 			return operatorRefreshResultMsg{generation: generation, err: safeOperatorError(err)}
 		}
 		return operatorRefreshResultMsg{generation: generation, batch: batch}
+	}
+}
+
+func (m operatorModel) runsLoadCommand(generation int64, request operatorRunsRequest) tea.Cmd {
+	ctx, loader, observedAt := m.ctx, m.loader, m.now().UTC()
+	request.previous = append([]string(nil), request.previous...)
+	return func() tea.Msg {
+		page, err := loader.LoadRuns(ctx, request.lifecycle, request.repository, request.cursor, observedAt)
+		if err != nil {
+			return operatorRunsResultMsg{generation: generation, request: request, err: safeOperatorError(err)}
+		}
+		return operatorRunsResultMsg{generation: generation, request: request, page: page}
+	}
+}
+
+func (m operatorModel) detailLoadCommand(generation int64, runID string) tea.Cmd {
+	ctx, loader, observedAt := m.ctx, m.loader, m.now().UTC()
+	return func() tea.Msg {
+		detail, err := loader.LoadRunDetail(ctx, runID, observedAt)
+		if err != nil {
+			return operatorRunDetailResultMsg{generation: generation, runID: runID, err: safeOperatorError(err)}
+		}
+		return operatorRunDetailResultMsg{generation: generation, runID: runID, detail: detail}
 	}
 }
 
@@ -141,6 +232,9 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		if msg.Width < operatorMinimumWidth || msg.Height < operatorMinimumHeight {
+			m.runs.repositoryEditing = false
+		}
 		m.help.SetWidth(max(msg.Width-2, 1))
 		return m, nil
 	case operatorRefreshResultMsg:
@@ -167,54 +261,308 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.tickCommand()
 		}
 		return m, nil
+	case operatorRunsResultMsg:
+		if msg.generation != m.runs.generation {
+			return m, nil
+		}
+		m.runs.refreshing, m.runs.pending = false, nil
+		if msg.err.Message != "" {
+			if m.runs.page == nil {
+				m.runs.request = msg.request
+				m.runs.initialError = &msg.err
+			} else {
+				m.runs.staleError = &msg.err
+			}
+			return m, nil
+		}
+		selected := m.selectedRunsID()
+		page := msg.page
+		m.runs.page, m.runs.request = &page, msg.request
+		m.runs.initialError, m.runs.staleError = nil, nil
+		m.restoreRunsSelection(selected)
+		if !m.tickerStarted {
+			m.tickerStarted = true
+			return m, m.tickCommand()
+		}
+		return m, nil
+	case operatorRunDetailResultMsg:
+		if msg.generation != m.detail.generation || msg.runID != m.detail.runID {
+			return m, nil
+		}
+		m.detail.refreshing = false
+		if msg.err.Message != "" {
+			if m.detail.detail == nil {
+				m.detail.initialError = &msg.err
+			} else {
+				m.detail.staleError = &msg.err
+			}
+			return m, nil
+		}
+		detail := msg.detail
+		m.detail.detail = &detail
+		m.detail.initialError, m.detail.staleError = nil, nil
+		m.detail.gateIndex = clamp(m.detail.gateIndex, 0, max(len(detail.Gates)-1, 0))
+		if !m.tickerStarted {
+			m.tickerStarted = true
+			return m, m.tickCommand()
+		}
+		return m, nil
 	case operatorRefreshTickMsg:
 		next := m.tickCommand()
-		if m.batch == nil || m.refreshing {
-			return m, next
+		switch m.route {
+		case operatorOverviewRoute:
+			if m.batch != nil && !m.refreshing {
+				return m, tea.Batch(next, m.startOverviewRefresh())
+			}
+		case operatorRunsRoute:
+			if m.runs.page != nil && !m.runs.refreshing {
+				return m, tea.Batch(next, m.startRunsRefresh(m.runs.request))
+			}
+		case operatorRunDetailRoute:
+			if m.detail.detail != nil && !m.detail.refreshing {
+				return m, tea.Batch(next, m.startDetailRefresh())
+			}
 		}
-		m.generation++
-		m.refreshing = true
-		return m, tea.Batch(next, m.loadCommand(m.generation))
+		return m, next
 	case tea.KeyPressMsg:
+		if msg.Code == 'c' && msg.Mod&tea.ModCtrl != 0 {
+			m.cancel()
+			return m, tea.Quit
+		}
+		if m.route == operatorRunsRoute && m.runs.repositoryEditing {
+			return m.updateRepositoryEditor(msg)
+		}
 		switch {
 		case key.Matches(msg, operatorKeys.quit):
 			m.cancel()
 			return m, tea.Quit
-		case m.batch == nil && key.Matches(msg, operatorKeys.refresh):
-			if m.refreshing {
-				return m, nil
+		case key.Matches(msg, operatorKeys.overview):
+			m.route = operatorOverviewRoute
+			if !m.refreshing {
+				return m, m.startOverviewRefresh()
 			}
-			m.initialError = nil
-			m.generation++
-			m.refreshing = true
-			return m, m.loadCommand(m.generation)
-		case m.batch == nil:
+			return m, nil
+		case key.Matches(msg, operatorKeys.runs):
+			m.route = operatorRunsRoute
+			if !m.runs.refreshing {
+				return m, m.startRunsRefresh(m.runs.request)
+			}
+			return m, nil
+		case m.route == operatorRunDetailRoute && key.Matches(msg, operatorKeys.back):
+			m.route = m.detail.returnRoute
 			return m, nil
 		case key.Matches(msg, operatorKeys.refresh):
-			if m.refreshing {
-				return m, nil
+			switch m.route {
+			case operatorOverviewRoute:
+				if !m.refreshing {
+					return m, m.startOverviewRefresh()
+				}
+			case operatorRunsRoute:
+				if !m.runs.refreshing {
+					return m, m.startRunsRefresh(m.runs.request)
+				}
+			case operatorRunDetailRoute:
+				if !m.detail.refreshing {
+					return m, m.startDetailRefresh()
+				}
 			}
-			m.generation++
-			m.refreshing = true
-			return m, m.loadCommand(m.generation)
+			return m, nil
 		case key.Matches(msg, operatorKeys.help):
 			m.help.ShowAll = !m.help.ShowAll
 			return m, nil
-		case key.Matches(msg, operatorKeys.next):
+		case m.route == operatorOverviewRoute && m.batch != nil && key.Matches(msg, operatorKeys.next):
 			m.moveFocus(1)
 			return m, nil
-		case key.Matches(msg, operatorKeys.previous):
+		case m.route == operatorOverviewRoute && m.batch != nil && key.Matches(msg, operatorKeys.previous):
 			m.moveFocus(-1)
 			return m, nil
-		case key.Matches(msg, operatorKeys.up):
+		case m.route == operatorOverviewRoute && m.batch != nil && key.Matches(msg, operatorKeys.up):
 			m.moveSelection(-1)
 			return m, nil
-		case key.Matches(msg, operatorKeys.down):
+		case m.route == operatorOverviewRoute && m.batch != nil && key.Matches(msg, operatorKeys.down):
 			m.moveSelection(1)
+			return m, nil
+		case m.route == operatorOverviewRoute && m.batch != nil && key.Matches(msg, operatorKeys.open):
+			if m.focus == operatorRunsPanel {
+				return m.openRunDetail(m.selectedOverviewRunID(), operatorOverviewRoute)
+			}
+			return m, nil
+		case m.route == operatorRunsRoute && m.runs.page != nil && key.Matches(msg, operatorKeys.up):
+			m.moveRunsSelection(-1)
+			return m, nil
+		case m.route == operatorRunsRoute && m.runs.page != nil && key.Matches(msg, operatorKeys.down):
+			m.moveRunsSelection(1)
+			return m, nil
+		case m.route == operatorRunsRoute && m.runs.page != nil && key.Matches(msg, operatorKeys.open):
+			return m.openRunDetail(m.selectedRunsID(), operatorRunsRoute)
+		case m.route == operatorRunsRoute && key.Matches(msg, operatorKeys.lifecycle):
+			request := m.runs.request
+			request.lifecycle = nextRunLifecycle(request.lifecycle)
+			request.cursor, request.previous = "", nil
+			return m, m.startRunsRefresh(request)
+		case m.route == operatorRunsRoute && key.Matches(msg, operatorKeys.repository):
+			m.runs.repositoryEditing = true
+			m.runs.repositoryInput = m.runs.request.repository
+			return m, nil
+		case m.route == operatorRunsRoute && m.runs.page != nil && key.Matches(msg, operatorKeys.nextPage):
+			if m.runs.page.Collection.NextCursor != "" {
+				request := m.runs.request
+				request.previous = append(append([]string(nil), request.previous...), request.cursor)
+				request.cursor = m.runs.page.Collection.NextCursor
+				return m, m.startRunsRefresh(request)
+			}
+			return m, nil
+		case m.route == operatorRunsRoute && m.runs.page != nil && key.Matches(msg, operatorKeys.previousPage):
+			if len(m.runs.request.previous) != 0 {
+				request := m.runs.request
+				request.cursor = request.previous[len(request.previous)-1]
+				request.previous = append([]string(nil), request.previous[:len(request.previous)-1]...)
+				return m, m.startRunsRefresh(request)
+			}
+			return m, nil
+		case m.route == operatorRunDetailRoute && m.detail.detail != nil && key.Matches(msg, operatorKeys.up):
+			m.detail.gateIndex = clamp(m.detail.gateIndex-1, 0, max(len(m.detail.detail.Gates)-1, 0))
+			return m, nil
+		case m.route == operatorRunDetailRoute && m.detail.detail != nil && key.Matches(msg, operatorKeys.down):
+			m.detail.gateIndex = clamp(m.detail.gateIndex+1, 0, max(len(m.detail.detail.Gates)-1, 0))
 			return m, nil
 		}
 	}
 	return m, nil
+}
+
+func (m *operatorModel) startOverviewRefresh() tea.Cmd {
+	m.initialError = nil
+	m.generation++
+	m.refreshing = true
+	return m.overviewLoadCommand(m.generation)
+}
+
+func (m *operatorModel) startRunsRefresh(request operatorRunsRequest) tea.Cmd {
+	if m.runs.refreshing {
+		return nil
+	}
+	m.runs.initialError = nil
+	m.runs.generation++
+	m.runs.refreshing = true
+	copy := request
+	copy.previous = append([]string(nil), request.previous...)
+	m.runs.pending = &copy
+	return m.runsLoadCommand(m.runs.generation, copy)
+}
+
+func (m *operatorModel) startDetailRefresh() tea.Cmd {
+	if m.detail.refreshing || m.detail.runID == "" {
+		return nil
+	}
+	m.detail.initialError = nil
+	m.detail.generation++
+	m.detail.refreshing = true
+	return m.detailLoadCommand(m.detail.generation, m.detail.runID)
+}
+
+func (m operatorModel) openRunDetail(runID string, returnRoute operatorRoute) (tea.Model, tea.Cmd) {
+	if runID == "" {
+		return m, nil
+	}
+	if m.detail.runID != runID {
+		m.detail = operatorRunDetailState{runID: runID, returnRoute: returnRoute}
+	} else {
+		m.detail.returnRoute = returnRoute
+	}
+	m.route = operatorRunDetailRoute
+	return m, m.startDetailRefresh()
+}
+
+func (m operatorModel) updateRepositoryEditor(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if msg.Code == tea.KeyEscape {
+		m.runs.repositoryEditing = false
+		return m, nil
+	}
+	if msg.Code == tea.KeyEnter {
+		value := strings.TrimSpace(m.runs.repositoryInput)
+		if value != "" && !validOperatorRepositoryFilter(value) {
+			return m, nil
+		}
+		m.runs.repositoryEditing = false
+		request := m.runs.request
+		request.repository, request.cursor, request.previous = value, "", nil
+		return m, m.startRunsRefresh(request)
+	}
+	if msg.Code == tea.KeyBackspace {
+		runes := []rune(m.runs.repositoryInput)
+		if len(runes) != 0 {
+			m.runs.repositoryInput = string(runes[:len(runes)-1])
+		}
+		return m, nil
+	}
+	if msg.Text != "" && len([]rune(m.runs.repositoryInput+msg.Text)) <= 128 {
+		m.runs.repositoryInput += msg.Text
+	}
+	return m, nil
+}
+
+func validOperatorRepositoryFilter(value string) bool {
+	parts := strings.Split(value, "/")
+	if len(parts) != 2 || len(parts[0]) == 0 || len(parts[1]) == 0 || len(value) > 128 || strings.ToLower(value) != value {
+		return false
+	}
+	for index, part := range parts {
+		for _, char := range part {
+			valid := char >= 'a' && char <= 'z' || char >= '0' && char <= '9' || char == '-' || index == 1 && (char == '_' || char == '.')
+			if !valid {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func nextRunLifecycle(current application.RunLifecycleFilter) application.RunLifecycleFilter {
+	switch current {
+	case application.RunLifecycleActive:
+		return application.RunLifecycleEnded
+	case application.RunLifecycleEnded:
+		return application.RunLifecycleAll
+	default:
+		return application.RunLifecycleActive
+	}
+}
+
+func (m operatorModel) selectedOverviewRunID() string {
+	rows := m.panelRows(operatorRunsPanel)
+	if len(rows) == 0 {
+		return ""
+	}
+	return rows[clamp(m.panels[operatorRunsPanel].index, 0, len(rows)-1)].id
+}
+
+func (m operatorModel) selectedRunsID() string {
+	if m.runs.page == nil || len(m.runs.page.Runs) == 0 {
+		return ""
+	}
+	return m.runs.page.Runs[clamp(m.runs.index, 0, len(m.runs.page.Runs)-1)].RunID
+}
+
+func (m *operatorModel) restoreRunsSelection(runID string) {
+	m.runs.index = clamp(m.runs.index, 0, max(len(m.runs.page.Runs)-1, 0))
+	if runID != "" {
+		for index, run := range m.runs.page.Runs {
+			if run.RunID == runID {
+				m.runs.index = index
+				break
+			}
+		}
+	}
+	m.runs.selectedRunID = m.selectedRunsID()
+}
+
+func (m *operatorModel) moveRunsSelection(delta int) {
+	if m.runs.page == nil || len(m.runs.page.Runs) == 0 {
+		return
+	}
+	m.runs.index = clamp(m.runs.index+delta, 0, len(m.runs.page.Runs)-1)
+	m.runs.selectedRunID = m.selectedRunsID()
 }
 
 func safeOperatorError(err error) operatorSafeError {
@@ -222,7 +570,7 @@ func safeOperatorError(err error) operatorSafeError {
 	if errors.As(err, &safe) {
 		return operatorSafeError{Category: safe.Category, Message: safe.Message}
 	}
-	return operatorSafeError{Category: application.ErrorInternal, Message: "operator overview is unavailable"}
+	return operatorSafeError{Category: application.ErrorInternal, Message: "operator view is unavailable"}
 }
 
 func (m operatorModel) selectablePanels() []operatorPanel {
@@ -396,7 +744,7 @@ func (m operatorModel) panelRows(panel operatorPanel) []operatorRow {
 			}
 		}
 		appendRuns("active", m.batch.Overview.Runs.ActiveRuns)
-		appendRuns("recent", m.batch.Overview.Runs.RecentRuns)
+		appendRuns("recently ended", m.batch.Overview.Runs.RecentRuns)
 		return rows
 	case operatorAttentionPanel:
 		rows := make([]operatorRow, 0, len(m.batch.Overview.Actionable))
@@ -495,19 +843,34 @@ func (m operatorModel) View() tea.View {
 	view := tea.NewView(content)
 	view.AltScreen = true
 	view.MouseMode = tea.MouseModeNone
-	view.WindowTitle = "Agent Loop Controller Overview"
+	view.WindowTitle = "Agent Loop Controller Operator"
 	return view
 }
 
 func (m operatorModel) render() string {
 	if m.width < operatorMinimumWidth || m.height < operatorMinimumHeight {
-		return lipgloss.NewStyle().Padding(1, 2).Render(fmt.Sprintf("Terminal too small\n\nCurrent: %dx%d\nRequired: 80x24 minimum\n\nq / Ctrl-C  quit", m.width, m.height))
+		navigation := "1 Overview  ·  2 Runs"
+		if m.route == operatorRunDetailRoute {
+			navigation += "  ·  Esc back"
+		}
+		return lipgloss.NewStyle().Padding(1, 2).Render(fmt.Sprintf("Terminal too small\n\nCurrent: %dx%d\nRequired: 80x24 minimum\n\n%s  ·  q / Ctrl-C quit", m.width, m.height, navigation))
 	}
+	switch m.route {
+	case operatorRunsRoute:
+		return m.renderRunsScreen()
+	case operatorRunDetailRoute:
+		return m.renderRunDetailScreen()
+	default:
+		return m.renderOverviewScreen()
+	}
+}
+
+func (m operatorModel) renderOverviewScreen() string {
 	if m.batch == nil {
 		if m.initialError != nil {
-			return lipgloss.NewStyle().Padding(1, 2).Render("Operator Overview unavailable\n\n" + m.initialError.String() + "\n\nr  retry    q / Ctrl-C  quit")
+			return lipgloss.NewStyle().Padding(1, 2).Render("Operator Overview unavailable\n\n" + m.initialError.String() + "\n\nr retry · 2 Runs · q / Ctrl-C quit")
 		}
-		return lipgloss.NewStyle().Padding(1, 2).Render("Agent Loop Controller\n\nLoading operator overview…\n\nq / Ctrl-C  quit")
+		return lipgloss.NewStyle().Padding(1, 2).Render("Agent Loop Controller\n\nLoading operator overview…\n\n2 Runs · q / Ctrl-C quit")
 	}
 	header := lipgloss.JoinVertical(lipgloss.Left, m.renderHeader(), m.renderHealth())
 	footer := m.renderHelp()
@@ -519,6 +882,179 @@ func (m operatorModel) render() string {
 		body = m.renderVertical(bodyHeight)
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+}
+
+func (m operatorModel) renderRunsScreen() string {
+	footer := m.renderHelp()
+	if m.runs.page == nil {
+		if m.runs.initialError != nil {
+			return boundedLines(m.width, m.height, []string{"Agent Loop Controller / Runs", "", "Runs unavailable", m.runs.initialError.String(), "", "r retry · 1 overview · q quit"})
+		}
+		return boundedLines(m.width, m.height, []string{"Agent Loop Controller / Runs", "", "Loading authorized runs…", "", "1 overview · q quit"})
+	}
+	header := m.renderRouteHeader("Runs", m.runs.page.Metadata.ObservedAt, m.runs.refreshing, m.runs.staleError)
+	repository := m.runs.request.repository
+	if repository == "" {
+		repository = "All repositories"
+	}
+	pageNumber := len(m.runs.request.previous) + 1
+	filter := fmt.Sprintf("Lifecycle %s  ·  Repository %s  ·  Page %d  ·  %d of %d displayed",
+		presentationLabel(string(m.runs.request.lifecycle)), repository, pageNumber, len(m.runs.page.Runs), m.runs.page.Collection.Total)
+	if m.runs.repositoryEditing {
+		filter = "Repository filter (owner/repository, blank for All): " + m.runs.repositoryInput + "█"
+	}
+	bodyHeight := max(m.height-lipgloss.Height(header)-lipgloss.Height(footer)-2, 1)
+	lines := []string{truncateRunes(filter, m.width)}
+	if len(m.runs.page.Runs) == 0 {
+		lines = append(lines, "", fmt.Sprintf("No runs for lifecycle %s and repository %s", presentationLabel(string(m.runs.request.lifecycle)), repository))
+	} else {
+		available := max(bodyHeight-1, 1)
+		selected := clamp(m.runs.index, 0, len(m.runs.page.Runs)-1)
+		start := clamp(selected-available+1, 0, max(len(m.runs.page.Runs)-available, 0))
+		end := min(start+available, len(m.runs.page.Runs))
+		for index := start; index < end; index++ {
+			run := m.runs.page.Runs[index]
+			identifier := run.LinearIdentifier
+			if identifier == "" {
+				identifier = run.RunID
+			} else {
+				identifier += " / " + run.RunID
+			}
+			detail := run.Repository + " · " + formatObservationAge(m.runs.page.Metadata.ObservedAt, run.UpdatedAt)
+			if run.Attention {
+				detail += " · attention"
+			}
+			if run.CandidateHead != "" && m.width >= operatorWideWidth {
+				detail += " · head " + run.CandidateHead
+			}
+			lines = append(lines, m.renderRow(operatorRow{id: run.RunID, name: identifier, status: presentationLabel(string(run.State)), detail: detail, tone: runRowTone(string(run.State), run.Attention)}, m.width, index == selected))
+		}
+	}
+	body := lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(operatorBorderColor).Width(m.width).Height(bodyHeight).Render(strings.Join(lines, "\n"))
+	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+}
+
+func (m operatorModel) renderRunDetailScreen() string {
+	footer := m.renderHelp()
+	if m.detail.detail == nil {
+		if m.detail.initialError != nil {
+			return boundedLines(m.width, m.height, []string{"Agent Loop Controller / Run detail", "", "Run detail unavailable", m.detail.initialError.String(), "", "r retry · esc back · q quit"})
+		}
+		return boundedLines(m.width, m.height, []string{"Agent Loop Controller / Run detail", "", "Loading run " + m.detail.runID + "…", "", "esc back · q quit"})
+	}
+	detail := m.detail.detail
+	header := m.renderRouteHeader("Run detail", detail.Metadata.ObservedAt, m.detail.refreshing, m.detail.staleError)
+	identifier := detail.Run.LinearIdentifier
+	if identifier == "" {
+		identifier = detail.Run.RunID
+	} else {
+		identifier += " / " + detail.Run.RunID
+	}
+	head := detail.Run.CandidateHead
+	if head == "" {
+		head = "not established"
+	}
+	lines := []string{
+		fmt.Sprintf("%s · %s", detail.Run.Repository, identifier),
+		fmt.Sprintf("State %s · Phase %s", presentationLabel(string(detail.Run.State)), presentationLabel(string(detail.Phase))),
+		"Candidate exact head " + head,
+		fmt.Sprintf("Wait %s · Kind %s · updated %s", presentationLabel(string(detail.WaitAssessment)), presentationLabel(string(detail.Wait)), formatObservationAge(detail.Metadata.ObservedAt, detail.Run.UpdatedAt)),
+	}
+	if len(detail.Attention) != 0 {
+		attention := detail.Attention[0]
+		lines = append(lines, fmt.Sprintf("ATTENTION %s · %s · %s · %s", presentationLabel(attention.Severity), presentationLabel(string(attention.State)), attention.ReasonCode, formatObservationAge(detail.Metadata.ObservedAt, attention.ObservedAt)))
+	} else {
+		lines = append(lines, "Attention none")
+	}
+	if detail.LatestTransition != nil {
+		transition := detail.LatestTransition
+		lines = append(lines, fmt.Sprintf("Progress %s → %s · %s · %s", presentationLabel(string(transition.From)), presentationLabel(string(transition.To)), transition.ReasonCode, formatObservationAge(detail.Metadata.ObservedAt, transition.ObservedAt)))
+		if transition.BoundHead != "" {
+			lines = append(lines, "Transition bound head "+transition.BoundHead)
+		}
+	} else {
+		lines = append(lines, "Progress no meaningful transition recorded")
+	}
+	if detail.PullRequest != nil {
+		pr := detail.PullRequest
+		lines = append(lines, fmt.Sprintf("Pull request #%d · %s · head %s · merged %t", pr.Number, presentationLabel(pr.State), pr.HeadSHA, pr.Merged))
+	} else {
+		lines = append(lines, "Pull request not established")
+	}
+	lines = append(lines, "Delivery gates (Controller order)")
+	gateSlots := max(m.height-lipgloss.Height(header)-lipgloss.Height(footer)-len(lines)-2, 1)
+	selected := clamp(m.detail.gateIndex, 0, max(len(detail.Gates)-1, 0))
+	start := clamp(selected-gateSlots+1, 0, max(len(detail.Gates)-gateSlots, 0))
+	end := min(start+gateSlots, len(detail.Gates))
+	for index := start; index < end; index++ {
+		gate := detail.Gates[index]
+		marker, tone := gateMarker(gate.Status)
+		status := marker + " " + presentationLabel(string(gate.Status))
+		if index != selected {
+			status = tone.Render(status)
+		}
+		line := fmt.Sprintf("  %-28s %s", presentationLabel(string(gate.Name)), status)
+		if index == selected {
+			line = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("28")).Width(m.width).Render("> " + line[2:])
+		}
+		lines = append(lines, line)
+	}
+	if len(detail.Gates) != 0 {
+		gate := detail.Gates[selected]
+		evidence := fmt.Sprintf("Selected reason %s · evidence %d", gate.ReasonCode, gate.EvidenceCount)
+		if gate.EvidenceTruncated {
+			evidence += " (truncated)"
+		}
+		bound := gate.BoundHead
+		if bound == "" {
+			bound = "not supplied"
+		}
+		observation := "not supplied"
+		if gate.ObservedAt != nil {
+			observation = gate.ObservedAt.UTC().Format(time.RFC3339)
+		}
+		lines = append(lines, evidence, "Selected head "+bound+" · observed "+observation)
+	}
+	for index := range lines {
+		lines[index] = ansi.Truncate(lines[index], m.width, "…")
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, header, strings.Join(lines, "\n"), footer)
+}
+
+func (m operatorModel) renderRouteHeader(title string, observedAt time.Time, refreshing bool, stale *operatorSafeError) string {
+	left := operatorHeadingStyle.Render("Agent Loop Controller / " + title)
+	right := operatorMutedStyle.Render("Observed " + observedAt.Local().Format("15:04:05") + " · auto refresh " + m.refreshInterval.String())
+	if stale != nil {
+		right = operatorDangerStyle.Render("STALE · " + stale.String())
+	} else if refreshing {
+		right = operatorWarningStyle.Render("Refreshing…")
+	}
+	right = ansi.Truncate(right, max(m.width-lipgloss.Width(left)-2, 1), "…")
+	gap := max(m.width-lipgloss.Width(left)-lipgloss.Width(right), 1)
+	return left + strings.Repeat(" ", gap) + right
+}
+
+func boundedLines(width, height int, lines []string) string {
+	for index := range lines {
+		lines[index] = truncateRunes(lines[index], width)
+	}
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func gateMarker(status application.DeliveryGateStatus) (string, lipgloss.Style) {
+	switch status {
+	case application.GatePassed:
+		return "✓", operatorAccentStyle
+	case application.GatePending, application.GateRunning, application.GateBlocked:
+		return "…", operatorWarningStyle
+	case application.GateFailed, application.GateConflict:
+		return "✕", operatorDangerStyle
+	default:
+		return "○", operatorMutedStyle
+	}
 }
 
 var (
@@ -698,7 +1234,7 @@ func (m operatorModel) panelSummary(panel operatorPanel) string {
 		if runs.ActiveTruncated || runs.RecentTruncated || shown < total {
 			return collectionSummary(shown, total, true)
 		}
-		return fmt.Sprintf("%d active · %d recent", runs.Active, runs.Recent)
+		return fmt.Sprintf("%d active · %d recently ended", runs.Active, runs.Recent)
 	case operatorAttentionPanel:
 		return collectionSummary(len(m.batch.Overview.Actionable), m.batch.Overview.ActionableTotal, m.batch.Overview.ActionableTruncated)
 	default:
@@ -795,7 +1331,7 @@ func (m operatorModel) panelEmpty(panel operatorPanel) string {
 	case operatorRepositoriesPanel:
 		return "No registered repositories"
 	case operatorRunsPanel:
-		return "No active or recent runs"
+		return "No active or recently ended runs"
 	case operatorAttentionPanel:
 		return "No operator attention"
 	default:
@@ -804,9 +1340,29 @@ func (m operatorModel) panelEmpty(panel operatorPanel) string {
 }
 
 func (m operatorModel) renderHelp() string {
-	helpView := m.help
-	helpView.SetWidth(max(m.width-2, 1))
-	return lipgloss.NewStyle().Padding(0, 1).Width(max(m.width-2, 1)).Render(helpView.View(operatorKeys))
+	var value string
+	switch m.route {
+	case operatorRunsRoute:
+		if m.runs.repositoryEditing {
+			value = "type exact owner/repository · enter apply · esc cancel"
+		} else if m.help.ShowAll {
+			value = "1 overview · 2 runs · ↑/↓ select · enter open · f lifecycle · / repository · n/p page · r refresh · ? help · q quit"
+		} else {
+			value = "1/2 navigate · ↑/↓ select · enter open · f filter · / repository · n/p page · r refresh · ? · q"
+		}
+	case operatorRunDetailRoute:
+		value = "esc back · ↑/↓ delivery gates · r refresh · ? help · q quit"
+	default:
+		if m.help.ShowAll {
+			value = "1 overview · 2 runs · tab/shift+tab panels · ↑/↓ or j/k select · r refresh · ? help · q quit"
+		} else {
+			value = "1/2 navigate · tab panels · ↑/↓ select · r refresh · ? · q"
+		}
+		if m.focus == operatorRunsPanel && m.batch != nil && len(m.panelRows(operatorRunsPanel)) != 0 {
+			value = "1/2 navigate · tab panels · ↑/↓ select · enter open run · r refresh · ? · q"
+		}
+	}
+	return " " + ansi.Truncate(value, max(m.width-2, 1), "…") + " "
 }
 
 var presentationLabels = map[string]string{
@@ -820,7 +1376,7 @@ var presentationLabels = map[string]string{
 	"run": "RUN", "onboarding": "ONBOARDING", "critical": "CRITICAL",
 	"high": "HIGH", "medium": "MEDIUM", "low": "LOW", "info": "INFO",
 	"not_ready": "NOT READY", "not_applicable": "NOT APPLICABLE",
-	"opened": "OPENED", "preflight_ready": "PREFLIGHT READY", "cancelled": "CANCELLED",
+	"open": "OPEN", "closed": "CLOSED", "merged": "MERGED", "opened": "OPENED", "preflight_ready": "PREFLIGHT READY", "cancelled": "CANCELLED",
 	"accepted": "ACCEPTED", "waiting_for_operator": "WAITING FOR OPERATOR",
 	"ready_disabled": "READY DISABLED", "received": "RECEIVED", "admitting": "ADMITTING",
 	"rejected": "REJECTED", "provisioning": "PROVISIONING", "executing": "EXECUTING",
@@ -833,6 +1389,14 @@ var presentationLabels = map[string]string{
 	"awaiting_github_mergeability": "AWAITING GITHUB MERGEABILITY",
 	"awaiting_linear_completion":   "AWAITING LINEAR COMPLETION", "cleaning": "CLEANING",
 	"completed": "COMPLETED", "failed": "FAILED", "manual_intervention": "MANUAL INTERVENTION",
+	"all": "ALL", "ended": "ENDED", "progressing": "PROGRESSING", "normal_wait": "NORMAL WAIT",
+	"abnormal_wait": "ABNORMAL WAIT", "human_decision": "HUMAN DECISION", "human_approval": "HUMAN APPROVAL",
+	"external_checks": "EXTERNAL CHECKS", "mergeability": "MERGEABILITY", "linear_completion": "LINEAR COMPLETION",
+	"terminal": "TERMINAL", "admission": "ADMISSION", "workspace": "WORKSPACE", "implementation": "IMPLEMENTATION",
+	"verification": "VERIFICATION", "review": "INDEPENDENT REVIEW", "publication": "PUBLICATION", "pull_request": "PULL REQUEST",
+	"approval": "APPROVAL", "merge": "MERGE", "cleanup": "CLEANUP", "independent_review": "INDEPENDENT REVIEW",
+	"branch_publication": "BRANCH PUBLICATION", "required_checks": "REQUIRED CHECKS", "review_conversations": "REVIEW CONVERSATIONS",
+	"source_checkout": "SOURCE CHECKOUT", "pending": "PENDING", "passed": "PASSED", "blocked": "BLOCKED",
 }
 
 func presentationLabel(value string) string {
@@ -903,7 +1467,7 @@ func operatorCommand(args []string) error {
 	if flags.NArg() != 0 {
 		return errors.New("usage: agentctl operator [--config <controller.json>]")
 	}
-	composition, err := composeOperatorOverview(context.Background(), *configPath)
+	composition, err := composeOperator(context.Background(), *configPath)
 	if err != nil {
 		return err
 	}

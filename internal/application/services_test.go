@@ -31,8 +31,9 @@ type serviceStore struct {
 }
 
 type runListCall struct {
-	limit  int
-	before runSummaryCursor
+	limit     int
+	before    runSummaryCursor
+	lifecycle RunLifecycleFilter
 }
 
 type serviceRepositoryAuthorities struct {
@@ -144,11 +145,12 @@ func (s serviceStore) AppendOperatorAttention(_ context.Context, event OperatorA
 }
 func (s serviceStore) ListAuthorizedRuns(_ context.Context, input AuthorizedRunQuery) (AuthorizedRunPage, error) {
 	if s.listCall != nil {
-		s.listCall.limit, s.listCall.before = input.Limit, runSummaryCursor{CreatedAt: input.BeforeCreatedAt, RunID: input.BeforeRunID}
+		s.listCall.limit, s.listCall.lifecycle, s.listCall.before = input.Limit, input.Lifecycle, runSummaryCursor{UpdatedAt: input.BeforeUpdatedAt, RunID: input.BeforeRunID}
 	}
 	filtered := make([]Run, 0, len(s.runs))
 	for _, run := range s.runs {
-		if (input.Repository == "" || input.Repository == run.Repository) && input.Scopes.AllowsRun(run.ID, run.RepositoryBindingDigest) {
+		lifecycleMatch := input.Lifecycle == RunLifecycleAll || input.Lifecycle == RunLifecycleActive && !TerminalRunState(run.State) || input.Lifecycle == RunLifecycleEnded && TerminalRunState(run.State)
+		if lifecycleMatch && (input.Repository == "" || input.Repository == run.Repository) && input.Scopes.AllowsRun(run.ID, run.RepositoryBindingDigest) {
 			filtered = append(filtered, run)
 		}
 	}
@@ -542,8 +544,11 @@ func TestQueryServiceListsBoundedSummariesWithOpaqueCursor(t *testing.T) {
 		t.Fatalf("page=%+v limit=%d", page, call.limit)
 	}
 	cursor, err := decodeRunSummaryCursor(page.NextCursor)
-	if err != nil || cursor.RunID != "run-2" || !cursor.CreatedAt.Equal(now.Add(-time.Second)) {
+	if err != nil || cursor.RunID != "run-2" || !cursor.UpdatedAt.Equal(now) || cursor.Lifecycle != RunLifecycleAll {
 		t.Fatalf("cursor=%+v err=%v", cursor, err)
+	}
+	if _, err := queries.ListRunSummaries(context.Background(), RunSummaryQuery{Requester: requester, Repository: "owner/repo", Lifecycle: RunLifecycleActive, Cursor: page.NextCursor}); err == nil || !strings.Contains(err.Error(), "cursor is invalid") {
+		t.Fatalf("lifecycle-drifted cursor error=%v", err)
 	}
 	if _, err := queries.ListRunSummaries(context.Background(), RunSummaryQuery{Requester: requester, Repository: "owner/repo", Limit: 101}); err == nil {
 		t.Fatal("limit above the bounded maximum was accepted")
