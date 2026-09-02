@@ -59,16 +59,22 @@ func (r ConfiguredRequester) Identity() domain.GitHubUserIdentity { return r.ide
 
 // ControllerReadAuthority is a closed grant for Controller-owned collection
 // reads. It is deliberately not an AuthorizedScopeSet, so it cannot satisfy
-// mutation, operation-receipt, repository, or frozen-run authorization ports.
+// mutation, operation-receipt, repository-target, or frozen-run authorization
+// ports.
 // Only AuthorizationService can construct a non-empty value.
 type ControllerReadAuthority struct {
 	readerDigest string
+	requester    domain.GitHubUserIdentity
 }
 
 func (a ControllerReadAuthority) Digest() string { return a.readerDigest }
 
 func (a ControllerReadAuthority) Valid() bool {
-	return validAuthorityDigest(a.readerDigest)
+	return validAuthorityDigest(a.readerDigest) && a.requester.Validate() == nil
+}
+
+func (a ControllerReadAuthority) MatchesRequester(requester domain.GitHubUserIdentity) bool {
+	return a.Valid() && a.requester.Equal(requester)
 }
 
 type RepositoryAuthority struct {
@@ -259,14 +265,14 @@ func (s *AuthorizationService) ControllerScopes(requester ConfiguredRequester) (
 }
 
 // ControllerReadCollectionAuthority derives the stable local reader used by
-// Controller-wide Runs and Attention collections. The versioned domain
-// separator prevents the digest from being confused with a Controller scope
-// digest accepted by existing target-specific contracts.
+// Controller-wide Runs, Attention, Repository, and Onboarding collections. The
+// versioned domain separator prevents the digest from being confused with a
+// Controller scope digest accepted by existing target-specific contracts.
 func (s *AuthorizationService) ControllerReadCollectionAuthority(requester ConfiguredRequester) (ControllerReadAuthority, error) {
 	if s == nil || !s.operator.User.Equal(requester.identity) {
 		return ControllerReadAuthority{}, serviceError(ErrorConflict, "requester is not authorized for controller collections", nil)
 	}
-	return ControllerReadAuthority{readerDigest: digestText("controller-read-collections:v1\x00" + identityDigest(s.operator.User))}, nil
+	return ControllerReadAuthority{readerDigest: digestText("controller-read-collections:v1\x00" + identityDigest(s.operator.User)), requester: s.operator.User}, nil
 }
 
 func (s *AuthorizationService) ControllerRunScopes(requester ConfiguredRequester, authorities []RunScopeAuthority) (AuthorizedScopeSet, error) {

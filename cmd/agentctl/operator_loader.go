@@ -30,7 +30,7 @@ type operatorOverviewProjectionSource interface {
 }
 
 type operatorRepositoryProjectionSource interface {
-	List(context.Context, application.Requester, int, string, time.Time) (application.RoutineRepositoryPage, error)
+	ListController(context.Context, application.ControllerReadAuthority, int, string, time.Time) (application.RoutineRepositoryPage, error)
 }
 
 type productionOperatorLoader struct {
@@ -48,7 +48,7 @@ func (l *productionOperatorLoader) LoadOverview(ctx context.Context, observedAt 
 	if err != nil {
 		return operatorOverviewBatch{}, err
 	}
-	repositories, err := l.repositories.List(ctx, l.requester, application.RoutineQueryMaximumLimit, "", observedAt)
+	repositories, err := l.repositories.ListController(ctx, l.reader, application.RoutineQueryMaximumLimit, "", observedAt)
 	if err != nil {
 		return operatorOverviewBatch{}, err
 	}

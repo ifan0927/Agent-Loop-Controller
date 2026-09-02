@@ -4,9 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
-	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -267,55 +265,49 @@ func (s *Store) RepositoryConfigurationAuthority(ctx context.Context) (applicati
 	return authority, tx.Commit()
 }
 
-func (s *Store) ListAuthorizedRepositories(ctx context.Context, scopes application.AuthorizedScopeSet, limit int, cursor string) (application.RepositoryListPage, error) {
-	if scopes.Empty() || limit < 1 || limit > 100 {
-		return application.RepositoryListPage{}, errors.New("authorized repository collection is invalid")
-	}
-	last, err := decodeRepositoryCursor(cursor, scopes.Digest())
-	if err != nil {
-		return application.RepositoryListPage{}, err
+func (s *Store) ListControllerRepositories(ctx context.Context, input application.ControllerRepositoryQuery) (application.RepositoryListPage, error) {
+	if !input.Authority.Valid() || input.Limit < 1 || input.Limit > 101 || input.AfterRepository != "" && !validControllerRepositoryKey(input.AfterRepository) {
+		return application.RepositoryListPage{}, errors.New("controller repository collection is invalid")
 	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return application.RepositoryListPage{}, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT repository,repository_binding_digest FROM repository_lifecycles WHERE retired_at='' ORDER BY repository`)
+	var total int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_lifecycles WHERE retired_at=''`).Scan(&total); err != nil {
+		return application.RepositoryListPage{}, err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT repository FROM repository_lifecycles WHERE retired_at='' AND repository>? ORDER BY repository LIMIT ?`, input.AfterRepository, input.Limit)
 	if err != nil {
 		return application.RepositoryListPage{}, err
 	}
-	var authorized []string
+	var repositories []string
 	for rows.Next() {
-		var repository, binding string
-		if err := rows.Scan(&repository, &binding); err != nil {
+		var repository string
+		if err := rows.Scan(&repository); err != nil {
 			rows.Close()
 			return application.RepositoryListPage{}, err
 		}
-		if scopes.AllowsRepositoryBinding(binding) {
-			authorized = append(authorized, repository)
-		}
+		repositories = append(repositories, repository)
 	}
 	if err := rows.Close(); err != nil {
 		return application.RepositoryListPage{}, err
 	}
-	page := application.RepositoryListPage{Total: len(authorized)}
-	start := sort.SearchStrings(authorized, last)
-	if last != "" && start < len(authorized) && authorized[start] == last {
-		start++
-	}
-	end := min(start+limit, len(authorized))
-	for _, repository := range authorized[start:end] {
+	page := application.RepositoryListPage{Total: total}
+	for _, repository := range repositories {
 		projection, err := repositoryProjectionTx(ctx, tx, repository)
 		if err != nil {
 			return application.RepositoryListPage{}, err
 		}
 		page.Repositories = append(page.Repositories, projection)
 	}
-	page.HasMore = end < len(authorized)
-	if page.HasMore && len(page.Repositories) != 0 {
-		page.NextCursor = encodeRepositoryCursor(scopes.Digest(), page.Repositories[len(page.Repositories)-1].Lifecycle.Repository)
-	}
 	return page, tx.Commit()
+}
+
+func validControllerRepositoryKey(value string) bool {
+	parts := strings.Split(value, "/")
+	return value == strings.TrimSpace(value) && value == strings.ToLower(value) && !strings.ContainsRune(value, '\x00') && len(parts) == 2 && parts[0] != "" && parts[1] != ""
 }
 
 func (s *Store) GetAuthorizedRepository(ctx context.Context, repository string, scopes application.AuthorizedScopeSet) (application.RepositoryProjection, error) {
@@ -1090,24 +1082,4 @@ func repositorySnapshotReason(results []domain.RepositoryDimensionResult, overal
 		}
 	}
 	return "unknown"
-}
-
-func encodeRepositoryCursor(scopeDigest, repository string) string {
-	payload, _ := json.Marshal(struct{ Scope, Repository string }{scopeDigest, repository})
-	return base64.RawURLEncoding.EncodeToString(payload)
-}
-
-func decodeRepositoryCursor(cursor, scopeDigest string) (string, error) {
-	if cursor == "" {
-		return "", nil
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(cursor)
-	if err != nil {
-		return "", errors.New("repository cursor is invalid")
-	}
-	var value struct{ Scope, Repository string }
-	if json.Unmarshal(payload, &value) != nil || value.Scope != scopeDigest || strings.TrimSpace(value.Repository) == "" {
-		return "", errors.New("repository cursor authority changed")
-	}
-	return value.Repository, nil
 }

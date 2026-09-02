@@ -16,32 +16,24 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-func (s *Store) ListAuthorizedOnboardings(ctx context.Context, input application.AuthorizedOnboardingQuery) (application.AuthorizedOnboardingPage, error) {
-	if input.Requester.Validate() != nil || input.Scopes.Empty() || input.Limit < 1 || input.Limit > application.RoutineQueryMaximumLimit+1 || input.BeforeUpdatedAt.IsZero() != (input.BeforeOnboardingID == "") {
-		return application.AuthorizedOnboardingPage{}, errors.New("authorized onboarding collection is invalid")
+func (s *Store) ListControllerOnboardings(ctx context.Context, input application.ControllerOnboardingQuery) (application.ControllerOnboardingPage, error) {
+	if !input.Authority.MatchesRequester(input.ConfiguredRequester) || input.Limit < 1 || input.Limit > application.RoutineQueryMaximumLimit+1 || input.BeforeUpdatedAt.IsZero() != (input.BeforeOnboardingID == "") || input.BeforeOnboardingID != "" && (strings.TrimSpace(input.BeforeOnboardingID) != input.BeforeOnboardingID || strings.ContainsRune(input.BeforeOnboardingID, '\x00')) || input.CanonicalRepository != "" && !validControllerOnboardingRepository(input.CanonicalRepository) {
+		return application.ControllerOnboardingPage{}, errors.New("controller onboarding collection is invalid")
 	}
-	bindings := input.Scopes.RepositoryBindingDigests()
-	where := `(repository_binding_digest='' AND lower(requester_login)=lower(?) AND requester_database_id=? AND requester_node_id=? AND requester_actor_type=?)`
-	args := []any{input.Requester.Login, input.Requester.DatabaseID, input.Requester.NodeID, input.Requester.ActorType}
-	if len(bindings) != 0 {
-		where += ` OR repository_binding_digest IN (` + strings.TrimSuffix(strings.Repeat("?,", len(bindings)), ",") + `)`
-		for _, binding := range bindings {
-			args = append(args, binding)
-		}
-	}
-	where = `(` + where + `)`
-	if input.Repository != "" {
+	where := `(status IN ('accepted','running','waiting_for_operator','conflict','ready_disabled') OR repository_binding_digest<>'' OR (status IN ('opened','preflight_ready','cancelled') AND lower(requester_login)=lower(?) AND requester_database_id=? AND requester_node_id=? AND requester_actor_type=?))`
+	args := []any{input.ConfiguredRequester.Login, input.ConfiguredRequester.DatabaseID, input.ConfiguredRequester.NodeID, input.ConfiguredRequester.ActorType}
+	if input.CanonicalRepository != "" {
 		where += ` AND canonical_repository=?`
-		args = append(args, input.Repository)
+		args = append(args, input.CanonicalRepository)
 	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return application.AuthorizedOnboardingPage{}, err
+		return application.ControllerOnboardingPage{}, err
 	}
 	defer tx.Rollback()
 	var total int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_onboardings WHERE `+where, args...).Scan(&total); err != nil {
-		return application.AuthorizedOnboardingPage{}, err
+		return application.ControllerOnboardingPage{}, err
 	}
 	pageWhere := where
 	pageArgs := append([]any(nil), args...)
@@ -53,33 +45,77 @@ func (s *Store) ListAuthorizedOnboardings(ctx context.Context, input application
 	pageArgs = append(pageArgs, input.Limit)
 	rows, err := tx.QueryContext(ctx, `SELECT onboarding_id FROM repository_onboardings WHERE `+pageWhere+` ORDER BY updated_at DESC,onboarding_id DESC LIMIT ?`, pageArgs...)
 	if err != nil {
-		return application.AuthorizedOnboardingPage{}, err
+		return application.ControllerOnboardingPage{}, err
 	}
 	var ids []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			rows.Close()
-			return application.AuthorizedOnboardingPage{}, err
+			return application.ControllerOnboardingPage{}, err
 		}
 		ids = append(ids, id)
 	}
 	if err := rows.Close(); err != nil {
-		return application.AuthorizedOnboardingPage{}, err
+		return application.ControllerOnboardingPage{}, err
 	}
-	page := application.AuthorizedOnboardingPage{Total: total}
+	page := application.ControllerOnboardingPage{Total: total}
 	for _, id := range ids {
 		value, found, err := onboardingByID(ctx, tx, id)
 		if err != nil || !found {
-			return application.AuthorizedOnboardingPage{}, fmt.Errorf("authorized onboarding snapshot conflicts")
+			return application.ControllerOnboardingPage{}, fmt.Errorf("controller onboarding snapshot conflicts")
 		}
 		value.CompletedSteps, err = onboardingCompletedSteps(ctx, tx, id)
 		if err != nil {
-			return application.AuthorizedOnboardingPage{}, err
+			return application.ControllerOnboardingPage{}, err
+		}
+		if !validControllerOnboardingRow(ctx, tx, value, input.ConfiguredRequester) {
+			return application.ControllerOnboardingPage{}, errors.New("controller onboarding snapshot conflicts")
 		}
 		page.Onboardings = append(page.Onboardings, value)
 	}
 	return page, tx.Commit()
+}
+
+func validControllerOnboardingRepository(value string) bool {
+	parts := strings.Split(value, "/")
+	return value == strings.TrimSpace(value) && value == strings.ToLower(value) && !strings.ContainsRune(value, '\x00') && len(parts) == 2 && parts[0] != "" && parts[1] != ""
+}
+
+func validControllerOnboardingRow(ctx context.Context, tx *sql.Tx, value application.Onboarding, configured domain.GitHubUserIdentity) bool {
+	if strings.TrimSpace(value.OnboardingID) == "" || strings.TrimSpace(value.CanonicalRepository) == "" || !application.ControllerOnboardingCollectionLifecycleValid(value, configured) {
+		return false
+	}
+	switch value.Status {
+	case domain.OnboardingOpened, domain.OnboardingPreflightReady, domain.OnboardingCancelled:
+		return true
+	}
+	receipt, found, err := getOperationReceiptByIDTx(ctx, tx, value.OperationID)
+	if err != nil || !found || !receipt.AcceptedAt.UTC().Truncate(time.Second).Equal(value.AcceptedAt) {
+		return false
+	}
+	targetBinding := onboardingV46IdentityDigest(value.Requester)
+	for _, step := range value.CompletedSteps {
+		if step == domain.OnboardingStepConfigurationApplied {
+			targetBinding = value.RepositoryBindingDigest
+			break
+		}
+	}
+	anchor := digestBytes([]byte("onboarding-start-v1\x00" + value.OnboardingID + "\x00" + value.PreflightDigest + "\x00" + value.PreviewDigest))
+	expected := application.NewOperationReceipt(application.OperationReceiptInput{OperationType: application.OperationOnboardRepository, Scope: application.ScopeOnboarding, TargetID: value.OnboardingID, Requester: value.Requester, RequestDigest: value.RequestDigest, ExpectedAuthorityDigest: value.ConfigurationBaseDigest, OperationAnchorDigest: anchor, TargetBindingDigest: targetBinding, AcceptedAt: value.AcceptedAt})
+	if !sameAcceptedOperationReceipt(receipt, expected) {
+		return false
+	}
+	switch value.Status {
+	case domain.OnboardingAccepted, domain.OnboardingRunning, domain.OnboardingWaitingForOperator:
+		return receipt.Phase == application.OperationPhaseAccepted && receipt.Outcome == application.OperationOutcomePending && receipt.ResultingAuthorityDigest == "" && receipt.ResultingState == "" && receipt.ResultingVersion == 0 && receipt.EvidenceDigest == "" && receipt.ResultDigest == "" && receipt.AppliedAt.IsZero() && receipt.SettledAt.IsZero()
+	case domain.OnboardingConflict:
+		return receipt.Phase == application.OperationPhaseObserved && receipt.Outcome == application.OperationOutcomeConflict && receipt.ResultingAuthorityDigest == value.RepositoryBindingDigest && receipt.ResultingState == string(domain.OnboardingConflict) && receipt.ResultingVersion == int64(len(value.CompletedSteps)) && validConfigurationDigest(receipt.EvidenceDigest) && receipt.ResultDigest == receipt.EvidenceDigest && receipt.AppliedAt.Equal(value.SettledAt) && receipt.SettledAt.Equal(value.SettledAt)
+	case domain.OnboardingReadyDisabled:
+		return receipt.Phase == application.OperationPhaseObserved && receipt.Outcome == application.OperationOutcomeSucceeded && receipt.ResultingAuthorityDigest == value.RepositoryBindingDigest && receipt.ResultingState == string(domain.OnboardingReadyDisabled) && receipt.ResultingVersion == int64(len(value.CompletedSteps)) && validConfigurationDigest(receipt.EvidenceDigest) && receipt.ResultDigest == receipt.EvidenceDigest && receipt.AppliedAt.Equal(value.SettledAt) && receipt.SettledAt.Equal(value.SettledAt)
+	default:
+		return false
+	}
 }
 
 func (s *Store) CurrentRepositoryOnboarding(ctx context.Context, repository string) (application.Onboarding, bool, error) {

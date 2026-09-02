@@ -2,6 +2,8 @@ package application
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -22,10 +24,15 @@ func (s *repositoryServiceProfileSource) RepositoryProfile(context.Context, stri
 }
 
 func (s *repositoryServiceProfileSource) ListRepositoryProfiles(context.Context) ([]RepositoryProfileAuthority, error) {
+	s.calls++
 	return []RepositoryProfileAuthority{s.profile}, nil
 }
 
-type repositoryServiceStore struct{ inspectErr error }
+type repositoryServiceStore struct {
+	inspectErr       error
+	repositories     []RepositoryProjection
+	collectionInputs []ControllerRepositoryQuery
+}
 
 func (*repositoryServiceStore) BeginOperationReceipt(context.Context, OperationReceipt) (OperationReceipt, bool, error) {
 	panic("not used")
@@ -45,8 +52,51 @@ func (*repositoryServiceStore) AdoptRepositoryLifecycleBaseline(context.Context,
 func (*repositoryServiceStore) RepositoryOperationAuthority(context.Context, string) (RepositoryOperationAuthority, error) {
 	panic("not used")
 }
-func (*repositoryServiceStore) ListAuthorizedRepositories(context.Context, AuthorizedScopeSet, int, string) (RepositoryListPage, error) {
-	panic("not used")
+func (s *repositoryServiceStore) ListControllerRepositories(_ context.Context, input ControllerRepositoryQuery) (RepositoryListPage, error) {
+	s.collectionInputs = append(s.collectionInputs, input)
+	page := RepositoryListPage{Total: len(s.repositories)}
+	for _, repository := range s.repositories {
+		if repository.Lifecycle.Repository > input.AfterRepository {
+			page.Repositories = append(page.Repositories, repository)
+		}
+		if len(page.Repositories) == input.Limit {
+			break
+		}
+	}
+	return page, nil
+}
+
+func TestRepositoryCollectionUsesStableReaderWithoutProfileEnumeration(t *testing.T) {
+	identity := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
+	authorizer, _ := NewAuthorizationService(ConfiguredOperatorIdentity{User: identity})
+	profiles := &repositoryServiceProfileSource{}
+	lifecycle := func(repository, marker string) RepositoryProjection {
+		return RepositoryProjection{Lifecycle: RepositoryLifecycle{IncarnationID: "repository-incarnation-" + strings.Repeat(marker, 32), Repository: repository, ProfileID: "profile-" + marker, ProfileDigest: strings.Repeat(marker, 64), RepositoryBindingDigest: strings.Repeat(marker, 64), Intent: RepositoryEnabled, Version: 1, UpdatedAt: time.Date(2026, 9, 2, 1, 0, 0, 0, time.UTC)}}
+	}
+	store := &repositoryServiceStore{repositories: []RepositoryProjection{lifecycle("owner/b", "b"), lifecycle("owner/c", "c")}}
+	service, err := NewRepositoryService(store, authorizer, profiles, RepositoryObservers{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requester := requesterForUser(identity)
+	configured, _ := authorizer.ResolveConfiguredRequester(requester)
+	reader, _ := authorizer.ControllerReadCollectionAuthority(configured)
+	first, err := service.List(context.Background(), requester, 1, "")
+	if err != nil || len(first.Repositories) != 1 || first.Repositories[0].Lifecycle.Repository != "owner/b" || first.Total != 2 || first.NextCursor == "" {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	store.repositories = append([]RepositoryProjection{lifecycle("owner/a", "a")}, store.repositories...)
+	second, err := service.ListController(context.Background(), reader, 1, first.NextCursor)
+	if err != nil || len(second.Repositories) != 1 || second.Repositories[0].Lifecycle.Repository != "owner/c" || second.Total != 3 || second.HasMore {
+		t.Fatalf("second=%+v err=%v", second, err)
+	}
+	if profiles.calls != 0 || len(store.collectionInputs) != 2 || store.collectionInputs[1].Authority.Digest() != reader.Digest() || store.collectionInputs[1].AfterRepository != "owner/b" {
+		t.Fatalf("profiles=%d inputs=%+v", profiles.calls, store.collectionInputs)
+	}
+	legacyRaw, _ := json.Marshal(struct{ Scope, Repository string }{reader.Digest(), "owner/b"})
+	if _, err := service.ListController(context.Background(), reader, 1, base64.RawURLEncoding.EncodeToString(legacyRaw)); err == nil {
+		t.Fatal("legacy dynamic-scope repository cursor was accepted")
+	}
 }
 func (s *repositoryServiceStore) GetAuthorizedRepository(context.Context, string, AuthorizedScopeSet) (RepositoryProjection, error) {
 	return RepositoryProjection{}, s.inspectErr

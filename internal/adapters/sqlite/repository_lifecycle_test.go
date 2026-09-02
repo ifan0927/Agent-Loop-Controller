@@ -39,6 +39,38 @@ func TestRepositoryBaselineAdoptsExactlyOnceAndStartsUnknown(t *testing.T) {
 	}
 }
 
+func TestControllerRepositoryCollectionUsesCanonicalKeysetWithoutBindingScan(t *testing.T) {
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	profiles := []application.RepositoryProfileAuthority{
+		repositoryProfileFixture("owner/a", "a", "b"),
+		repositoryProfileFixture("owner/b", "c", "d"),
+		repositoryProfileFixture("owner/c", "e", "f"),
+	}
+	if err := store.AdoptRepositoryLifecycleBaseline(ctx, application.RepositoryBaselineInput{Profiles: profiles, AdoptedAt: time.Date(2026, 9, 2, 1, 0, 0, 0, time.UTC)}); err != nil {
+		t.Fatal(err)
+	}
+	operator := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
+	authorizer, _ := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: operator})
+	configured, _ := authorizer.ResolveConfiguredRequester(application.Requester{ID: operator.Login, Kind: "github_login", DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, ActorType: operator.ActorType})
+	reader, _ := authorizer.ControllerReadCollectionAuthority(configured)
+	first, err := store.ListControllerRepositories(ctx, application.ControllerRepositoryQuery{Authority: reader, Limit: 2})
+	if err != nil || first.Total != 3 || len(first.Repositories) != 2 || first.Repositories[0].Lifecycle.Repository != "owner/a" || first.Repositories[1].Lifecycle.Repository != "owner/b" {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	second, err := store.ListControllerRepositories(ctx, application.ControllerRepositoryQuery{Authority: reader, AfterRepository: "owner/b", Limit: 2})
+	if err != nil || second.Total != 3 || len(second.Repositories) != 1 || second.Repositories[0].Lifecycle.Repository != "owner/c" {
+		t.Fatalf("second=%+v err=%v", second, err)
+	}
+	if _, err := store.ListControllerRepositories(ctx, application.ControllerRepositoryQuery{Limit: 1}); err == nil {
+		t.Fatal("zero Controller reader was accepted")
+	}
+}
+
 func TestRepositoryBaselineAdoptsEmptyAuthorityAndReplaysAfterAuthorityVersionAdvance(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "controller.db")
 	store, err := openAdmissionTestStore(path)
