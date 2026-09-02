@@ -2991,8 +2991,8 @@ complete observation and immediately after a registered source generation
 advances. Detail is bounded to 50 findings by default and 100 maximum, uses an
 observation- and authorization-bound cursor, and exposes no SQL, table or row
 identity, path, URL, credential, payload, log, or arbitrary error. Existing
-`controller status` and `controller inspect` JSON remain unchanged. Explicit
-receipt-backed recheck and TUI rendering remain follow-up work.
+`controller status` and `controller inspect` JSON remain unchanged. TUI
+rendering remains follow-up work.
 
 Important fields in the safe inspection projection include:
 

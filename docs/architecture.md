@@ -35,7 +35,7 @@ verification stages, or automatically loaded runtime context. Production ALC
 does not require or read the variable and behaves identically when it is unset.
 
 ```text
-Current CLI / automatic worker / future local TUI or adapter
+Current CLI / automatic worker / future admission adapter
                            |
                     admission signal
                            v
@@ -2069,8 +2069,7 @@ resolution is not approval, and an approval for an old head is stale.
 - GitHub API writes require a narrowly permissioned selected-repository App;
   empty-repository base publication is the separate guarded host-SSH Git
   transport described above.
-- In-place external configuration recovery, explicit integrity recheck,
-  the local TUI, optional HTTP/Web adapters,
+- In-place external configuration recovery, optional HTTP/Web adapters,
   notification transport, Hermes runtime integration, public API, webhooks,
   and multi-tenant authorization are not implemented.
 - External live E2E acceptance remains restricted to isolated fixture
