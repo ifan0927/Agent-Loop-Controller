@@ -194,16 +194,17 @@ actions. Closing or crashing the TUI must not stop Controller execution.
 The read-only Overview, Runs, complete Attention inbox, and shared Run detail are implemented with Bubble
 Tea v2, Bubbles v2, and Lip Gloss v2. Overview presents projected health,
 repositories, active-before-recently-ended runs, and actionable attention.
-Runs provides authorization-safe Active/Ended/All and exact-repository filters,
-updated-time cursor pagination, and the compact R04 collection. Run detail
+Runs provides stable local Controller-reader Active/Ended/All and canonical
+exact-repository filters across frozen binding generations, updated-time cursor
+pagination that is not invalidated by normal collection growth, and the compact R04 collection. Run detail
 provides the application-owned R05 progress/wait conclusion and R06 fixed
 delivery-gate result without mutation controls. The TUI uses bounded responsive
 layouts and preserves the last complete screen across sanitized refresh
 failures. Its
 observation header, projected health card, content-sized panels, explicit focus,
 and redundant status markers make the same bounded evidence easier to scan. It
-has no mutation actions. Attention adds authorization-first severity/time/event
-pagination, item-bound safe summaries of current offers, explicit no-offer
+has no mutation actions. Attention adds stable local Controller-reader
+severity/time/event pagination, item-bound safe summaries of current offers, explicit no-offer
 rows, and application-owned Run-detail navigation without completing the later
 R07 decision mutation. The remaining navigation surface is Queue,
 Repositories, Onboarding, Settings, and System/Audit, but stable

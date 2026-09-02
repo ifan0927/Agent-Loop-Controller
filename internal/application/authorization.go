@@ -57,6 +57,20 @@ type ConfiguredRequester struct {
 
 func (r ConfiguredRequester) Identity() domain.GitHubUserIdentity { return r.identity }
 
+// ControllerReadAuthority is a closed grant for Controller-owned collection
+// reads. It is deliberately not an AuthorizedScopeSet, so it cannot satisfy
+// mutation, operation-receipt, repository, or frozen-run authorization ports.
+// Only AuthorizationService can construct a non-empty value.
+type ControllerReadAuthority struct {
+	readerDigest string
+}
+
+func (a ControllerReadAuthority) Digest() string { return a.readerDigest }
+
+func (a ControllerReadAuthority) Valid() bool {
+	return validAuthorityDigest(a.readerDigest)
+}
+
 type RepositoryAuthority struct {
 	Repository       string
 	ProfileID        string
@@ -244,6 +258,17 @@ func (s *AuthorizationService) ControllerScopes(requester ConfiguredRequester) (
 	return newAuthorizedScopeSet(requester.identity, AuthorityScope{Kind: ScopeController, ID: controllerScopeID, AuthorityDigest: digest})
 }
 
+// ControllerReadCollectionAuthority derives the stable local reader used by
+// Controller-wide Runs and Attention collections. The versioned domain
+// separator prevents the digest from being confused with a Controller scope
+// digest accepted by existing target-specific contracts.
+func (s *AuthorizationService) ControllerReadCollectionAuthority(requester ConfiguredRequester) (ControllerReadAuthority, error) {
+	if s == nil || !s.operator.User.Equal(requester.identity) {
+		return ControllerReadAuthority{}, serviceError(ErrorConflict, "requester is not authorized for controller collections", nil)
+	}
+	return ControllerReadAuthority{readerDigest: digestText("controller-read-collections:v1\x00" + identityDigest(s.operator.User))}, nil
+}
+
 func (s *AuthorizationService) ControllerRunScopes(requester ConfiguredRequester, authorities []RunScopeAuthority) (AuthorizedScopeSet, error) {
 	if s == nil || !s.operator.User.Equal(requester.identity) {
 		return AuthorizedScopeSet{}, serviceError(ErrorConflict, "requester is not authorized for the controller", nil)
@@ -257,28 +282,6 @@ func (s *AuthorizationService) ControllerRunScopes(requester ConfiguredRequester
 			continue
 		}
 		if runAuthorityAllows(authority, requester.identity) {
-			scopes = append(scopes, AuthorityScope{Kind: ScopeRun, ID: authority.RunID, AuthorityDigest: authority.BindingDigest, TargetBindingDigest: authority.targetBindingValue()})
-		}
-	}
-	return newAuthorizedScopeSet(requester.identity, scopes...)
-}
-
-// ControllerAttentionScopes derives the complete set of narrower authorities
-// that may contribute rows to the configured operator's Controller-wide
-// Attention inbox. Invalid or unauthorized sibling authority stays hidden and
-// therefore cannot affect collection metadata or cursors.
-func (s *AuthorizationService) ControllerAttentionScopes(requester ConfiguredRequester, repositories []RepositoryAuthority, runs []RunScopeAuthority) (AuthorizedScopeSet, error) {
-	if s == nil || !s.operator.User.Equal(requester.identity) {
-		return AuthorizedScopeSet{}, serviceError(ErrorConflict, "requester is not authorized for controller attention", nil)
-	}
-	scopes := []AuthorityScope{{Kind: ScopeController, ID: controllerScopeID, AuthorityDigest: identityDigest(s.operator.User)}}
-	for _, authority := range repositories {
-		if authority.Validate() == nil && repositoryAllows(authority, requester.identity) {
-			scopes = append(scopes, AuthorityScope{Kind: ScopeRepository, ID: authority.Repository, AuthorityDigest: authority.BindingDigest})
-		}
-	}
-	for _, authority := range runs {
-		if authority.Validate() == nil && runAuthorityAllows(authority, requester.identity) {
 			scopes = append(scopes, AuthorityScope{Kind: ScopeRun, ID: authority.RunID, AuthorityDigest: authority.BindingDigest, TargetBindingDigest: authority.targetBindingValue()})
 		}
 	}

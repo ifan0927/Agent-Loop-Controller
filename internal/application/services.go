@@ -373,8 +373,9 @@ func (s CommandService) enterHeavyWork(ctx context.Context, run Run) (context.Co
 }
 
 const (
-	querySchemaVersion      = "v1"
-	inspectionSchemaVersion = "v2"
+	querySchemaVersion         = "v1"
+	inspectionSchemaVersion    = "v2"
+	controllerRunCursorVersion = "v2"
 )
 
 const (
@@ -388,9 +389,9 @@ type QueryInput struct {
 	Repository string    `json:"repository"`
 }
 
-// RunSummaryQuery is a bounded authorized read request. An empty repository
-// selects the configured operator's controller-wide frozen-run scopes. Cursor
-// is an opaque value issued by a previous RunSummaryPage.
+// RunSummaryQuery is a bounded authorized read request. Generic scoped reads
+// require a repository; the local Controller collection uses the distinct
+// ControllerReadAuthority path. Cursor is opaque.
 type RunSummaryQuery struct {
 	Requester  Requester          `json:"requester"`
 	Repository string             `json:"repository"`
@@ -433,6 +434,15 @@ type runSummaryCursor struct {
 	RunID       string             `json:"run_id"`
 }
 
+type controllerRunSummaryCursor struct {
+	Version      string             `json:"version"`
+	Repository   string             `json:"repository,omitempty"`
+	Lifecycle    RunLifecycleFilter `json:"lifecycle"`
+	ReaderDigest string             `json:"reader_digest"`
+	UpdatedAt    time.Time          `json:"updated_at"`
+	RunID        string             `json:"run_id"`
+}
+
 type AuthorizedRunQuery struct {
 	Scopes          AuthorizedScopeSet
 	Repository      string
@@ -445,6 +455,19 @@ type AuthorizedRunQuery struct {
 type AuthorizedRunPage struct {
 	Runs       []Run
 	TotalCount int
+}
+
+type ControllerRunQuery struct {
+	Authority           ControllerReadAuthority
+	CanonicalRepository string
+	Lifecycle           RunLifecycleFilter
+	BeforeUpdatedAt     time.Time
+	BeforeRunID         string
+	Limit               int
+}
+
+type ControllerRunCollectionStore interface {
+	ListControllerRuns(context.Context, ControllerRunQuery) (AuthorizedRunPage, error)
 }
 
 type RepositoryAuthoritySource interface {
@@ -535,7 +558,7 @@ func (s QueryService) ListRunSummaries(ctx context.Context, query RunSummaryQuer
 	if limit == 0 {
 		limit = defaultRunSummaryLimit
 	}
-	if limit < 1 || limit > maximumRunSummaryLimit {
+	if limit < 1 || limit > maximumRunSummaryLimit || strings.TrimSpace(query.Repository) == "" {
 		return RunSummaryPage{}, serviceError(ErrorInvalidInput, "limit must be between 1 and 100", nil)
 	}
 	lifecycle, err := normalizeRunLifecycleFilter(query.Lifecycle)
@@ -580,6 +603,75 @@ func (s QueryService) ListRunSummaries(ctx context.Context, query RunSummaryQuer
 	return page, nil
 }
 
+// ListControllerRunSummaries uses the stable configured local reader for the
+// Controller-owned Runs collection. Repository is a canonical identity filter,
+// not mutable profile or frozen binding authority.
+func (s QueryService) ListControllerRunSummaries(ctx context.Context, authority ControllerReadAuthority, query RunSummaryQuery) (RunSummaryPage, error) {
+	store, ok := s.store.(ControllerRunCollectionStore)
+	if !ok || !authority.Valid() {
+		return RunSummaryPage{}, serviceError(ErrorInternal, "controller run collection authority is unavailable", nil)
+	}
+	limit := query.Limit
+	if limit == 0 {
+		limit = defaultRunSummaryLimit
+	}
+	if limit < 1 || limit > maximumRunSummaryLimit || strings.TrimSpace(query.Repository) != query.Repository || strings.ContainsRune(query.Repository, '\x00') {
+		return RunSummaryPage{}, serviceError(ErrorInvalidInput, "run collection bounds are invalid", nil)
+	}
+	lifecycle, err := normalizeRunLifecycleFilter(query.Lifecycle)
+	if err != nil {
+		return RunSummaryPage{}, err
+	}
+	cursor, err := decodeControllerRunSummaryCursor(query.Cursor)
+	if err != nil {
+		return RunSummaryPage{}, err
+	}
+	if query.Cursor != "" && (cursor.Repository != query.Repository || cursor.Lifecycle != lifecycle || cursor.ReaderDigest != authority.Digest()) {
+		return RunSummaryPage{}, serviceError(ErrorInvalidInput, "cursor is invalid", nil)
+	}
+	stored, err := store.ListControllerRuns(ctx, ControllerRunQuery{Authority: authority, CanonicalRepository: query.Repository, Lifecycle: lifecycle, BeforeUpdatedAt: cursor.UpdatedAt, BeforeRunID: cursor.RunID, Limit: limit + 1})
+	if err != nil {
+		return RunSummaryPage{}, classifyServiceError(err)
+	}
+	page := RunSummaryPage{SchemaVersion: querySchemaVersion, Repository: query.Repository, Lifecycle: lifecycle, TotalCount: stored.TotalCount}
+	runs := stored.Runs
+	if len(runs) > limit {
+		page.HasMore = true
+		runs = runs[:limit]
+	}
+	for _, run := range runs {
+		if query.Repository != "" && run.Repository != query.Repository {
+			return RunSummaryPage{}, serviceError(ErrorInternal, "run list repository mismatch", nil)
+		}
+		if err := validateControllerRunCollectionRow(run); err != nil {
+			return RunSummaryPage{}, serviceError(ErrorInternal, "controller run authority conflicts", nil)
+		}
+		page.Runs = append(page.Runs, projectRunSummary(run))
+	}
+	if page.HasMore && len(runs) > 0 {
+		page.NextCursor = encodeControllerRunSummaryCursor(controllerRunSummaryCursor{Version: controllerRunCursorVersion, Repository: query.Repository, Lifecycle: lifecycle, ReaderDigest: authority.Digest(), UpdatedAt: runs[len(runs)-1].UpdatedAt, RunID: runs[len(runs)-1].ID})
+	}
+	return page, nil
+}
+
+func validateControllerRunCollectionRow(run Run) error {
+	var frozen LocalRepository
+	if json.Unmarshal([]byte(run.RepositoryConfigJSON), &frozen) != nil || frozen.CanonicalRepository != run.Repository {
+		return errors.New("frozen run repository authority conflicts")
+	}
+	if (run.RepositoryBindingDigest != "" && !validAuthorityDigest(run.RepositoryBindingDigest)) || (frozen.RepositoryBindingDigest != "" && !validAuthorityDigest(frozen.RepositoryBindingDigest)) {
+		return errors.New("frozen run binding authority is invalid")
+	}
+	if frozen.RepositoryBindingDigest != "" && frozen.RepositoryBindingDigest != run.RepositoryBindingDigest {
+		return errors.New("frozen run binding authority conflicts")
+	}
+	authority, err := frozenRunScopeAuthority(run)
+	if err != nil || authority.Validate() != nil {
+		return errors.New("frozen run authority is invalid")
+	}
+	return nil
+}
+
 func (s QueryService) runCollectionScopes(ctx context.Context, query RunSummaryQuery) (AuthorizedScopeSet, error) {
 	if s.authorizer == nil || s.repositories == nil {
 		return AuthorizedScopeSet{}, serviceError(ErrorInternal, "scoped run query authority is unavailable", nil)
@@ -587,13 +679,6 @@ func (s QueryService) runCollectionScopes(ctx context.Context, query RunSummaryQ
 	requester, err := s.authorizer.ResolveConfiguredRequester(query.Requester)
 	if err != nil {
 		return AuthorizedScopeSet{}, hiddenTargetError()
-	}
-	if query.Repository == "" {
-		authorities, err := s.store.ListRunScopeAuthorities(ctx)
-		if err != nil {
-			return AuthorizedScopeSet{}, classifyServiceError(err)
-		}
-		return s.authorizer.ControllerRunScopes(requester, authorities)
 	}
 	authority, found, err := s.repositories.RepositoryAuthority(ctx, query.Repository)
 	if err != nil {
@@ -628,6 +713,29 @@ func decodeRunSummaryCursor(value string) (runSummaryCursor, error) {
 }
 
 func encodeRunSummaryCursor(cursor runSummaryCursor) string {
+	raw, _ := json.Marshal(cursor)
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+func decodeControllerRunSummaryCursor(value string) (controllerRunSummaryCursor, error) {
+	if value == "" {
+		return controllerRunSummaryCursor{}, nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return controllerRunSummaryCursor{}, serviceError(ErrorInvalidInput, "cursor is invalid", nil)
+	}
+	var cursor controllerRunSummaryCursor
+	if json.Unmarshal(raw, &cursor) != nil || cursor.Version != controllerRunCursorVersion || !validAuthorityDigest(cursor.ReaderDigest) || cursor.UpdatedAt.IsZero() || strings.TrimSpace(cursor.RunID) == "" {
+		return controllerRunSummaryCursor{}, serviceError(ErrorInvalidInput, "cursor is invalid", nil)
+	}
+	if _, err := normalizeRunLifecycleFilter(cursor.Lifecycle); err != nil || cursor.Lifecycle == "" {
+		return controllerRunSummaryCursor{}, serviceError(ErrorInvalidInput, "cursor is invalid", nil)
+	}
+	return cursor, nil
+}
+
+func encodeControllerRunSummaryCursor(cursor controllerRunSummaryCursor) string {
 	raw, _ := json.Marshal(cursor)
 	return base64.RawURLEncoding.EncodeToString(raw)
 }

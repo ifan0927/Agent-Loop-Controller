@@ -312,6 +312,18 @@ func TestOperatorRoutesRunsFiltersPaginationAndReturnState(t *testing.T) {
 	second.Runs = []application.RoutineRunSummary{{RunID: "run-0", Repository: "owner/repo", State: domain.StateExecuting}}
 	updated, _ = model.Update(operatorRunsResultMsg{generation: model.runs.generation, request: *model.runs.pending, page: second})
 	model = updated.(operatorModel)
+	updated, refreshLaterPage := model.Update(keyMessage('r'))
+	model = updated.(operatorModel)
+	if refreshLaterPage == nil || model.runs.pending.cursor != "next" {
+		t.Fatalf("later-page refresh lost cursor: %+v", model.runs.pending)
+	}
+	grownSecond := second
+	grownSecond.Collection.Total = 3
+	updated, _ = model.Update(operatorRunsResultMsg{generation: model.runs.generation, request: *model.runs.pending, page: grownSecond})
+	model = updated.(operatorModel)
+	if model.runs.page == nil || model.runs.page.Collection.Total != 3 || model.runs.staleError != nil {
+		t.Fatalf("later-page growth became stale: %+v", model.runs)
+	}
 	updated, previousPage := model.Update(keyMessage('p'))
 	model = updated.(operatorModel)
 	if previousPage == nil || model.runs.pending.cursor != "" || len(model.runs.pending.previous) != 0 {
@@ -386,6 +398,18 @@ func TestOperatorAttentionRoutePagingNavigationRefreshAndRendering(t *testing.T)
 	second.Items = []application.RoutineAttentionItem{{EventID: "event-last", EventType: application.OperatorAttentionSchedulerLease, Scope: application.ScopeController, TargetID: "local-controller", ControllerState: "scheduler", AttentionState: application.RoutineAttentionUnknown, Severity: "info", ReasonCode: "lease_lost", OccurredAt: now, ObservedAt: now, Offers: []application.RoutineAttentionOfferSummary{}, Navigation: application.RoutineAttentionNavigationNone}}
 	updated, _ = model.Update(operatorAttentionResultMsg{generation: model.attention.generation, request: *model.attention.pending, page: second})
 	model = updated.(operatorModel)
+	updated, refreshLaterPage := model.Update(keyMessage('r'))
+	model = updated.(operatorModel)
+	if refreshLaterPage == nil || model.attention.pending.cursor != "next-attention" {
+		t.Fatalf("later Attention refresh lost cursor: %+v", model.attention.pending)
+	}
+	grownSecond := second
+	grownSecond.Collection.Total = 4
+	updated, _ = model.Update(operatorAttentionResultMsg{generation: model.attention.generation, request: *model.attention.pending, page: grownSecond})
+	model = updated.(operatorModel)
+	if model.attention.page == nil || model.attention.page.Collection.Total != 4 || model.attention.staleError != nil {
+		t.Fatalf("later Attention growth became stale: %+v", model.attention)
+	}
 	updated, previous := model.Update(keyMessage('p'))
 	model = updated.(operatorModel)
 	if previous == nil || model.attention.pending.cursor != "" || len(model.attention.pending.previous) != 0 {

@@ -39,6 +39,7 @@ type productionOperatorLoader struct {
 	runs         *application.RoutineRunQueryService
 	attention    *application.RoutineAttentionQueryService
 	requester    application.Requester
+	reader       application.ControllerReadAuthority
 }
 
 func (l *productionOperatorLoader) LoadOverview(ctx context.Context, observedAt time.Time) (operatorOverviewBatch, error) {
@@ -55,7 +56,7 @@ func (l *productionOperatorLoader) LoadOverview(ctx context.Context, observedAt 
 }
 
 func (l *productionOperatorLoader) LoadRuns(ctx context.Context, lifecycle application.RunLifecycleFilter, repository, cursor string, observedAt time.Time) (application.RoutineRunPage, error) {
-	return l.runs.List(ctx, application.RunSummaryQuery{Requester: l.requester, Repository: repository, Lifecycle: lifecycle, Limit: application.RoutineQueryDefaultLimit, Cursor: cursor}, observedAt.UTC())
+	return l.runs.ListController(ctx, l.reader, application.RunSummaryQuery{Repository: repository, Lifecycle: lifecycle, Limit: application.RoutineQueryDefaultLimit, Cursor: cursor}, observedAt.UTC())
 }
 
 func (l *productionOperatorLoader) LoadRunDetail(ctx context.Context, runID string, observedAt time.Time) (application.RoutineRunDetail, error) {
@@ -63,7 +64,7 @@ func (l *productionOperatorLoader) LoadRunDetail(ctx context.Context, runID stri
 }
 
 func (l *productionOperatorLoader) LoadAttention(ctx context.Context, cursor string, observedAt time.Time) (application.RoutineAttentionPage, error) {
-	return l.attention.List(ctx, application.RoutineAttentionQuery{Requester: l.requester, Scope: application.ScopeController, Limit: application.RoutineQueryDefaultLimit, Cursor: cursor}, observedAt.UTC())
+	return l.attention.ListController(ctx, l.reader, application.RoutineAttentionQuery{Requester: l.requester, Scope: application.ScopeController, Limit: application.RoutineQueryDefaultLimit, Cursor: cursor}, observedAt.UTC())
 }
 
 type operatorComposition struct {
@@ -133,6 +134,16 @@ func composeOperator(ctx context.Context, configOverride string) (*operatorCompo
 	if err != nil {
 		return closeWith(errors.New("configured operator authority is unavailable"))
 	}
+	operator := loaded.Controller.Operator
+	requester := application.Requester{ID: operator.Login, Kind: "github_login", DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, ActorType: operator.ActorType}
+	configured, err := authorizer.ResolveConfiguredRequester(requester)
+	if err != nil {
+		return closeWith(errors.New("configured operator authority is unavailable"))
+	}
+	reader, err := authorizer.ControllerReadCollectionAuthority(configured)
+	if err != nil {
+		return closeWith(errors.New("controller read authority is unavailable"))
+	}
 	runtime, err := application.NewRuntimeObservationService(
 		workerHeartbeatReader{configPath: loaded.Path, expectedUID: os.Getuid()},
 		workerProcessIdentityObserver{},
@@ -169,10 +180,8 @@ func composeOperator(ctx context.Context, configOverride string) (*operatorCompo
 	if err != nil {
 		return closeWith(errors.New("attention projection service is unavailable"))
 	}
-	operator := loaded.Controller.Operator
-	requester := application.Requester{ID: operator.Login, Kind: "github_login", DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, ActorType: operator.ActorType}
 	return &operatorComposition{
-		loader: &productionOperatorLoader{overview: overview, repositories: repositories, runs: runs, attention: attention, requester: requester},
+		loader: &productionOperatorLoader{overview: overview, repositories: repositories, runs: runs, attention: attention, requester: requester, reader: reader},
 		store:  store,
 	}, nil
 }

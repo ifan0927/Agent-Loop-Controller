@@ -702,6 +702,47 @@ func TestListRunsUsesRepositoryScopedDeterministicCursor(t *testing.T) {
 	}
 }
 
+func TestControllerRunsFilterCanonicalRepositoryAcrossFrozenBindings(t *testing.T) {
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	base := time.Date(2026, 9, 2, 8, 0, 0, 0, time.UTC)
+	operator := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "U_7", ActorType: "User"}
+	for index, fixture := range []struct {
+		id, repository, binding string
+	}{
+		{"same-repository-new-binding", "owner/repo", strings.Repeat("b", 64)},
+		{"same-repository-old-binding", "owner/repo", strings.Repeat("a", 64)},
+		{"other-repository", "owner/other", strings.Repeat("c", 64)},
+	} {
+		frozen, err := json.Marshal(application.LocalRepository{CanonicalRepository: fixture.repository, RepositoryBindingDigest: fixture.binding, AllowedOperatorLogins: []string{operator.Login}, TrustedOperatorActors: []application.TrustedActorIdentity{{Login: operator.Login, DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, Type: operator.ActorType}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		run := application.Run{ID: fixture.id, IssueID: fmt.Sprintf("IFAN-179-%d", index), IdempotencyKey: "key-" + fixture.id, SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: fixture.repository, RepositoryConfigJSON: string(frozen), RepositoryBindingDigest: fixture.binding, BaseBranch: "main", WorkingBranch: "ifan/179"}
+		if _, _, err := store.CreateRun(ctx, application.CreateRunInput{Run: run}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.db.ExecContext(ctx, `UPDATE runs SET current_state='completed',updated_at=? WHERE run_id=?`, formatTime(base.Add(time.Duration(index)*time.Second)), fixture.id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	authorizer, _ := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: operator})
+	configured, _ := authorizer.ResolveConfiguredRequester(application.Requester{ID: operator.Login, Kind: "github_login", DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, ActorType: operator.ActorType})
+	reader, _ := authorizer.ControllerReadCollectionAuthority(configured)
+	first, err := store.ListControllerRuns(ctx, application.ControllerRunQuery{Authority: reader, CanonicalRepository: "owner/repo", Lifecycle: application.RunLifecycleAll, Limit: 1})
+	if err != nil || first.TotalCount != 2 || len(first.Runs) != 1 || first.Runs[0].ID != "same-repository-old-binding" {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	next, err := store.ListControllerRuns(ctx, application.ControllerRunQuery{Authority: reader, CanonicalRepository: "owner/repo", Lifecycle: application.RunLifecycleAll, BeforeUpdatedAt: first.Runs[0].UpdatedAt, BeforeRunID: first.Runs[0].ID, Limit: 2})
+	if err != nil || next.TotalCount != 2 || len(next.Runs) != 1 || next.Runs[0].ID != "same-repository-new-binding" {
+		t.Fatalf("next=%+v err=%v", next, err)
+	}
+}
+
 func TestAuthorizedRunPaginationIgnoresHiddenSentinels(t *testing.T) {
 	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
