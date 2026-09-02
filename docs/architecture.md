@@ -1287,7 +1287,7 @@ adoption.
 `internal/adapters/sqlite` is the durable store and migration owner. It enforces
 foreign keys, busy timeout, expected-state CAS, unique ownership/idempotency
 constraints, leases, atomic evidence/transition handoffs, and sanitized
-inspection. The current schema is version 47; migration history is code, not a
+inspection. The current schema is version 48; migration history is code, not a
 human workflow API.
 
 ### Git and worktrees
