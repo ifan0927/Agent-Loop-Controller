@@ -202,7 +202,7 @@ func TestControllerAttentionCandidatesUseStableReaderWithoutVisibilityPredicates
 	}
 }
 
-func TestOperatorAttentionCurrentFamilyReaderPreservesWinnersFiltersAndExactCurrentAuthority(t *testing.T) {
+func TestOperatorAttentionCurrentFamilyReaderPreservesWinnersAndExactCurrentAuthority(t *testing.T) {
 	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -236,18 +236,9 @@ func TestOperatorAttentionCurrentFamilyReaderPreservesWinnersFiltersAndExactCurr
 	if err != nil {
 		t.Fatal(err)
 	}
-	runScopes, err := authorizer.RunScopes(configured, runAuthority)
-	if err != nil {
-		t.Fatal(err)
-	}
-	repositoryScopes, err := authorizer.RepositoryScopes(configured, application.RepositoryAuthority{Repository: run.Repository, ProfileID: profileID, BindingDigest: runAuthority.BindingDigest, AllowedLogins: []string{operator.Login}, TrustedOperators: []domain.GitHubUserIdentity{operator}})
-	if err != nil {
-		t.Fatal(err)
-	}
 	if _, err := store.db.ExecContext(ctx, `INSERT INTO repository_lifecycles(incarnation_id,repository,profile_id,profile_digest,repository_binding_digest,intent,lifecycle_version,current_snapshot_id,updated_at) VALUES(?,?,?,?,?,'enabled',1,'',?),(?,?,?,?,?,'enabled',1,'',?)`, "incarnation-one", run.Repository, profileID, strings.Repeat("7", 64), runAuthority.BindingDigest, formatTime(now), "incarnation-two", "owner/two", "repository-profile:owner/two", strings.Repeat("8", 64), strings.Repeat("9", 64), formatTime(now)); err != nil {
 		t.Fatal(err)
 	}
-
 	newerRun, err := application.SourceCheckoutSkippedAttentionEvent(run, 0, string(application.SourceSyncReasonDirtySource), strings.Repeat("a", 64), now.Add(2*time.Minute))
 	if err != nil {
 		t.Fatal(err)
@@ -287,28 +278,6 @@ func TestOperatorAttentionCurrentFamilyReaderPreservesWinnersFiltersAndExactCurr
 		if !wantController[event.EventKey] {
 			t.Fatalf("unexpected controller winner=%s", event.EventKey)
 		}
-	}
-
-	repositoryCandidates, err := store.ListRoutineAttentionCandidates(ctx, application.RoutineAttentionCandidateQuery{Scopes: repositoryScopes, Scope: application.ScopeRepository, TargetID: run.Repository, RepositoryProfileID: profileID, Limit: 1001})
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantRepository := map[string]bool{newerRun.EventKey: true, newerRepository.EventKey: true, distinctFamily.EventKey: true}
-	if len(repositoryCandidates) != len(wantRepository) {
-		t.Fatalf("repository candidates=%+v", repositoryCandidates)
-	}
-	for _, event := range repositoryCandidates {
-		if !wantRepository[event.EventKey] {
-			t.Fatalf("repository filter leaked=%s", event.EventKey)
-		}
-	}
-
-	runCandidates, err := store.ListRoutineAttentionCandidates(ctx, application.RoutineAttentionCandidateQuery{Scopes: runScopes, Scope: application.ScopeRun, TargetID: run.ID, Limit: 1001})
-	if err != nil || len(runCandidates) != 1 || runCandidates[0].EventKey != newerRun.EventKey {
-		t.Fatalf("run candidates=%+v err=%v", runCandidates, err)
-	}
-	if _, err := store.ListRoutineAttentionCandidates(ctx, application.RoutineAttentionCandidateQuery{Scopes: repositoryScopes, Scope: application.ScopeController, Limit: 1001}); err == nil {
-		t.Fatal("target-specific candidate path accepted Controller scope")
 	}
 
 	exact, found, err := store.CurrentOperatorAttention(ctx, run.ID)
@@ -392,7 +361,7 @@ func TestOperatorAttentionCurrentFamilyReaderValidatesHistoricalSchemasAndCorrup
 	if _, err := store.AppendOperatorAttention(ctx, current); err != nil {
 		t.Fatal(err)
 	}
-	read, err := readCurrentOperatorAttentionFamilies(ctx, store.db, currentOperatorAttentionFamilyRead{Filter: currentOperatorAttentionFamilyAll, Limit: 10, Count: true})
+	read, err := readCurrentOperatorAttentionFamilies(ctx, store.db, currentOperatorAttentionFamilyRead{Limit: 10, Count: true})
 	if err != nil || read.Total != 3 || len(read.Events) != 3 {
 		t.Fatalf("historical read=%+v err=%v", read, err)
 	}
@@ -406,7 +375,7 @@ func TestOperatorAttentionCurrentFamilyReaderValidatesHistoricalSchemasAndCorrup
 	if _, err := store.db.ExecContext(ctx, `UPDATE operator_attention_outbox SET payload_digest=? WHERE event_key=?`, strings.Repeat("0", 64), previous.EventKey); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readCurrentOperatorAttentionFamilies(ctx, store.db, currentOperatorAttentionFamilyRead{Filter: currentOperatorAttentionFamilyAll, Limit: 10}); err == nil || !strings.Contains(err.Error(), "corrupt") {
+	if _, err := readCurrentOperatorAttentionFamilies(ctx, store.db, currentOperatorAttentionFamilyRead{Limit: 10}); err == nil || !strings.Contains(err.Error(), "corrupt") {
 		t.Fatalf("corrupt historical row error=%v", err)
 	}
 }

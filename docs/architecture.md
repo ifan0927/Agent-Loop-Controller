@@ -115,8 +115,8 @@ roles or a generic permission language:
 - `onboarding` derives from the configured operator before repository binding
   and from the resulting repository authority after binding.
 
-Target-specific repository-, run-, and onboarding-scoped collection
-authorization follows one order:
+Remaining target-scoped activity and receipt collection authorization follows
+one order:
 
 ```text
 resolve configured requester
@@ -144,11 +144,11 @@ selection compares the canonical repository identity stored with each run, so
 historical frozen binding generations remain in the same collection without
 changing their detail or mutation authority.
 
-Other SQLite run and scheduling collection ports require an
-application-produced scope set. Hidden rows cannot affect totals, page gaps,
-`has_more`, or cursor position. Repository/run scheduling projections expose
-only their own wait/supervisor state; controller capacity and sibling identities
-require controller scope.
+SQLite scheduling collection ports still require an application-produced scope
+set. Hidden rows cannot affect totals, page gaps, `has_more`, or cursor
+position. Repository/run scheduling projections expose only their own
+wait/supervisor state; controller capacity and sibling identities require
+controller scope.
 
 Direct unknown and unauthorized run or repository targets return the same
 sanitized application `not_found` result. Visibility of an attention event,
@@ -1674,10 +1674,10 @@ contract for Controller Overview, queue, compact runs and fixed delivery gates,
 active attention, repositories, onboarding, and settings. Production
 composition validates the complete configured operator before deriving its
 stable Controller collection reader for Runs, Attention, Repository, and
-Onboarding; target-specific queries retain their documented scope
-authorization. Every query applies
-its authority before collection shape and returns only allowlisted typed fields
-with sanitized response digests. Routine reads do not reconcile, refresh
+Onboarding; target-specific detail, scheduling, activity, receipt, legal-action,
+and mutation queries retain their documented scope authorization. Every query
+applies its authority before collection shape and returns only allowlisted typed
+fields with sanitized response digests. Routine reads do not reconcile, refresh
 external systems, acknowledge attention, or advance workflow authority. The
 activity/history contracts extend this same presentation-independent boundary.
 
