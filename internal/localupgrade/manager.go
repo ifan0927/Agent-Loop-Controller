@@ -149,6 +149,9 @@ func (m *Manager) Prepare(ctx context.Context, request PrepareRequest) (result R
 		if exists(m.activePath()) {
 			return errors.New("an active managed upgrade already exists")
 		}
+		if err := m.admitHistoricalRecoveryMutation("", historicalRecoveryNewUpgrade); err != nil {
+			return err
+		}
 		loaded, err := bootstrap.Load(request.ConfigPath)
 		if err != nil || loaded.Path != request.ConfigPath {
 			return errors.New("configuration evidence is unavailable")

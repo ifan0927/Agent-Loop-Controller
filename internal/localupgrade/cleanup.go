@@ -24,6 +24,9 @@ var cleanupArtifacts = map[string]bool{"journal.json": true, "candidate-manifest
 
 func (m *Manager) Cleanup(_ context.Context, id string) (result Result, finalErr error) {
 	err := m.withActiveLock(id, func() error {
+		if err := m.admitHistoricalRecoveryMutation(id, historicalRecoveryCleanup); err != nil {
+			return err
+		}
 		active, err := m.cleanupActivePresent(id)
 		if err != nil {
 			return err

@@ -95,6 +95,12 @@ This milestone is recorded by the closed
   readable, while unresolved installations fail-stop and recover only through
   complete disposable-runtime replacement. Normal exact-head CI polling and
   slow-CI attention remain unchanged.
+- Retired managed-upgrade database-relocation recovery: journal schemas 1
+  through 3 and recovery evidence versions 1 and 2 remain strict read-only
+  history, unresolved installations fail-stop, and only an already-complete
+  exact transfer may continue through its ordinary successor lifecycle. Any
+  retained recovery-bearing predecessor requires complete runtime replacement
+  before a later managed upgrade.
 - Deterministic continuous-supervisor restart/fault matrix with a sanitized,
   machine-readable evidence summary for these boundaries.
 - Controller-owned configuration baseline generations, private bounded raw

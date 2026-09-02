@@ -25,31 +25,6 @@ type SuccessorPrepareRequest struct {
 	Revision             string
 }
 
-type SuccessorRecoveryPreviewRequest struct {
-	PredecessorUpgradeID string
-	Revision             string
-}
-
-type SuccessorRecoverPrepareRequest struct {
-	PredecessorUpgradeID        string
-	Revision                    string
-	PreviewDigest               string
-	DatabaseRelocationConfirmed bool
-	FullBackupConfirmed         bool
-}
-
-// SuccessorRecoveryPreview is deliberately narrower than the private recovery
-// evidence. Filesystem identities, paths, configuration digests, and database
-// contents never cross the local-upgrade presentation boundary.
-type SuccessorRecoveryPreview struct {
-	UpgradeID             string   `json:"upgrade_id"`
-	State                 string   `json:"state"`
-	Reason                string   `json:"reason"`
-	SuccessorRevision     string   `json:"successor_revision"`
-	PreviewDigest         string   `json:"preview_digest"`
-	RequiredConfirmations []string `json:"required_confirmations"`
-}
-
 type Result struct {
 	UpgradeID            string   `json:"upgrade_id"`
 	State                string   `json:"state"`
@@ -137,6 +112,8 @@ type databaseRecoveryEvidence struct {
 	IntentAt                    time.Time                       `json:"intent_at"`
 	LocatorPublishedAt          *time.Time                      `json:"locator_published_at,omitempty"`
 }
+
+const databaseRecoveryEvidenceVersion = 2
 
 type candidateManifest struct {
 	SchemaVersion int              `json:"schema_version"`

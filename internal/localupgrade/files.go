@@ -159,6 +159,9 @@ func syncDirectory(path string) error {
 }
 
 func writeJournal(bundle string, value journal, uid int) error {
+	if value.Phase == "successor_recovery_intent" || value.DatabaseRecovery != nil {
+		return errors.New("historical database relocation recovery evidence is read-only")
+	}
 	value.UpdatedAt = value.UpdatedAt.UTC()
 	return writePrivateJSON(filepath.Join(bundle, "journal.json"), value, uid)
 }
@@ -327,6 +330,25 @@ func validReplacementVerification(value replacementDatabaseVerification, reason 
 		return readiness.ReplacementReason == reason
 	case recoveryReadinessIntegrityConflictPending:
 		return reason == "integrity_conflict" && readiness.ReplacementReason == "integrity_pending" && readiness.GenerationRelationship == integrityGenerationAdvanced && readiness.CurrentGeneration > readiness.PublishedGeneration && readiness.CurrentObservationValid && validIntegrityReadiness(readiness.ObservationReadiness)
+	default:
+		return false
+	}
+}
+
+func classifyIntegrityGeneration(current, published int64) integrityGenerationRelationship {
+	if current == published {
+		return integrityGenerationCurrent
+	}
+	if current > published {
+		return integrityGenerationAdvanced
+	}
+	return integrityGenerationPublishedAhead
+}
+
+func validIntegrityReadiness(value string) bool {
+	switch value {
+	case "ready", "not_ready", "unknown", "conflict":
+		return true
 	default:
 		return false
 	}
