@@ -8,15 +8,19 @@ import (
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
 
-type integrityQueryStoreStub struct{ calls int }
+type integrityQueryStoreStub struct {
+	calls int
+	query IntegrityFindingStoreQuery
+}
 
 func (s *integrityQueryStoreStub) IntegritySummary(context.Context, AuthorizedScopeSet) (IntegritySummary, error) {
 	s.calls++
 	return IntegritySummary{Readiness: IntegrityUnknown, ReasonCode: "initial_scan_required"}, nil
 }
 
-func (s *integrityQueryStoreStub) ListIntegrityFindings(context.Context, AuthorizedScopeSet, IntegrityFindingQuery) (IntegrityFindingPage, error) {
+func (s *integrityQueryStoreStub) ListIntegrityFindings(_ context.Context, _ AuthorizedScopeSet, query IntegrityFindingStoreQuery) (IntegrityFindingPage, error) {
 	s.calls++
+	s.query = query
 	return IntegrityFindingPage{}, nil
 }
 
@@ -80,14 +84,27 @@ func TestIntegrityQueriesAuthorizeBeforePersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	unauthorized := Requester{ID: operator.Login, Kind: "github_login", DatabaseID: 8, NodeID: operator.NodeID, ActorType: operator.ActorType}
-	if _, err := service.Summary(context.Background(), unauthorized); err == nil || store.calls != 0 {
-		t.Fatalf("summary err=%v calls=%d", err, store.calls)
+	_, summaryErr := service.Summary(context.Background(), unauthorized)
+	if summaryErr == nil || store.calls != 0 {
+		t.Fatalf("summary err=%v calls=%d", summaryErr, store.calls)
 	}
-	if _, err := service.Findings(context.Background(), IntegrityFindingQuery{Requester: unauthorized, TargetID: "hidden"}); err == nil || store.calls != 0 {
-		t.Fatalf("findings err=%v calls=%d", err, store.calls)
+	_, findingsErr := service.Findings(context.Background(), IntegrityFindingQuery{Requester: unauthorized, Family: "invalid", TargetID: "hidden"})
+	if findingsErr == nil || findingsErr.Error() != summaryErr.Error() || store.calls != 0 {
+		t.Fatalf("findings err=%v summary_err=%v calls=%d", findingsErr, summaryErr, store.calls)
 	}
 	authorized := Requester{ID: operator.Login, Kind: "github_login", DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, ActorType: operator.ActorType}
 	if _, err := service.Summary(context.Background(), authorized); err != nil || store.calls != 1 {
 		t.Fatalf("authorized err=%v calls=%d", err, store.calls)
+	}
+	if _, err := service.Findings(context.Background(), IntegrityFindingQuery{Requester: authorized, Family: "invalid"}); err == nil || store.calls != 1 {
+		t.Fatalf("invalid err=%v calls=%d", err, store.calls)
+	}
+	input := IntegrityFindingQuery{Requester: authorized, Family: IntegrityRunDelivery, Scope: ScopeRun, TargetID: "run-1", Cursor: "cursor"}
+	if _, err := service.Findings(context.Background(), input); err != nil || store.calls != 2 {
+		t.Fatalf("findings err=%v calls=%d", err, store.calls)
+	}
+	want := IntegrityFindingStoreQuery{Family: input.Family, Scope: input.Scope, TargetID: input.TargetID, Limit: IntegrityDefaultLimit, Cursor: input.Cursor}
+	if store.query != want {
+		t.Fatalf("store query=%+v want=%+v", store.query, want)
 	}
 }

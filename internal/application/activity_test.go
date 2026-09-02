@@ -1,11 +1,32 @@
 package application
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 )
+
+type priorCollectionMetadata struct {
+	Total      int    `json:"total"`
+	Truncated  bool   `json:"truncated"`
+	NextCursor string `json:"next_cursor,omitempty"`
+}
+
+type priorActivityPage struct {
+	Metadata   RoutineProjectionMetadata `json:"metadata"`
+	Collection priorCollectionMetadata   `json:"collection"`
+	Coverage   ActivityCoverage          `json:"coverage"`
+	Events     []ActivityEvent           `json:"events"`
+}
+
+type priorOperationHistoryPage struct {
+	Metadata   RoutineProjectionMetadata `json:"metadata"`
+	Collection priorCollectionMetadata   `json:"collection"`
+	Receipts   []OperationReceipt        `json:"receipts"`
+}
 
 func TestActivityEventIdentityIsDeterministicImmutableAndSanitized(t *testing.T) {
 	now := time.Date(2026, 8, 26, 1, 2, 3, 0, time.UTC)
@@ -90,5 +111,64 @@ func TestActivityAndOperationHistoryCursorBindingRejectsDrift(t *testing.T) {
 	historyB := operationHistoryFilterDigest(OperationHistoryFilter{Phase: OperationPhaseObserved})
 	if historyA == historyB {
 		t.Fatal("operation filter drift did not change binding")
+	}
+}
+
+func TestSharedCollectionMetadataPreservesExactActivityAndOperationHistoryBytes(t *testing.T) {
+	observedAt := time.Date(2026, 8, 29, 1, 2, 3, 4, time.UTC)
+	collection := RoutineCollectionMetadata{Total: 7, Truncated: true, NextCursor: "next-page"}
+	priorCollection := priorCollectionMetadata(collection)
+	coverage := ActivityCoverage{State: ActivityCoverageComplete, ReasonCode: "complete", LegacyLimitations: []string{}, BackfillSourcesComplete: 6, BackfillSourcesTotal: 6}
+
+	activity := ActivityPage{Metadata: RoutineProjectionMetadata{SchemaVersion: ActivitySchemaVersion, ObservedAt: observedAt}, Collection: collection, Coverage: coverage, Events: []ActivityEvent{}}
+	priorActivity := priorActivityPage{Metadata: activity.Metadata, Collection: priorCollection, Coverage: coverage, Events: []ActivityEvent{}}
+	activityDigest := activityProjectionDigest(activity)
+	priorActivityRaw, err := json.Marshal(priorActivity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := digestText("activity-projection-v1\x00" + string(priorActivityRaw)); activityDigest != want {
+		t.Fatalf("activity digest=%s want=%s", activityDigest, want)
+	}
+	activity.Metadata.Digest, priorActivity.Metadata.Digest = activityDigest, activityDigest
+	assertExactProjectionJSON(t, activity, priorActivity)
+
+	history := OperationHistoryPage{Metadata: RoutineProjectionMetadata{SchemaVersion: ActivitySchemaVersion, ObservedAt: observedAt}, Collection: collection, Receipts: []OperationReceipt{}}
+	priorHistory := priorOperationHistoryPage{Metadata: history.Metadata, Collection: priorCollection, Receipts: []OperationReceipt{}}
+	historyDigest := operationHistoryProjectionDigest(history)
+	priorHistoryRaw, err := json.Marshal(priorHistory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := digestText("operation-history-projection-v1\x00" + string(priorHistoryRaw)); historyDigest != want {
+		t.Fatalf("operation history digest=%s want=%s", historyDigest, want)
+	}
+	history.Metadata.Digest, priorHistory.Metadata.Digest = historyDigest, historyDigest
+	assertExactProjectionJSON(t, history, priorHistory)
+
+	activityCursor := ActivityCursor{Version: ActivitySchemaVersion, ScopeDigest: strings.Repeat("a", 64), FilterDigest: strings.Repeat("b", 64), OccurredAt: observedAt, EventID: "activity-1", IngestionWatermark: 9}
+	activityCursorJSON := `{"v":"v1","s":"` + activityCursor.ScopeDigest + `","f":"` + activityCursor.FilterDigest + `","o":"2026-08-29T01:02:03.000000004Z","e":"activity-1","w":9}`
+	if got, want := encodeActivityCursor(activityCursor), base64.RawURLEncoding.EncodeToString([]byte(activityCursorJSON)); got != want {
+		t.Fatalf("activity cursor=%s want=%s", got, want)
+	}
+	historyCursor := OperationHistoryCursor{Version: ActivitySchemaVersion, ScopeDigest: strings.Repeat("c", 64), FilterDigest: strings.Repeat("d", 64), AcceptedAt: observedAt, OperationID: "operation-1", WatermarkAcceptedAt: observedAt.Add(time.Minute), WatermarkOperation: "operation-2"}
+	historyCursorJSON := `{"v":"v1","s":"` + historyCursor.ScopeDigest + `","f":"` + historyCursor.FilterDigest + `","a":"2026-08-29T01:02:03.000000004Z","o":"operation-1","wa":"2026-08-29T01:03:03.000000004Z","wo":"operation-2"}`
+	if got, want := encodeOperationHistoryCursor(historyCursor), base64.RawURLEncoding.EncodeToString([]byte(historyCursorJSON)); got != want {
+		t.Fatalf("operation history cursor=%s want=%s", got, want)
+	}
+}
+
+func assertExactProjectionJSON(t *testing.T, current, prior any) {
+	t.Helper()
+	currentRaw, err := json.Marshal(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	priorRaw, err := json.Marshal(prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(currentRaw, priorRaw) {
+		t.Fatalf("current=%s prior=%s", currentRaw, priorRaw)
 	}
 }
