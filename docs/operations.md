@@ -410,10 +410,15 @@ fails closed if the locator, retained desired generation, exact database
 identity, mode, binding, or schema is unavailable or conflicting. It never
 initializes, migrates, reconciles, adopts, or writes configuration or SQLite.
 
-The Overview refreshes every ten seconds. Use `r` to refresh, `Tab` and
-`Shift+Tab` to move through non-empty panels, arrow keys or `j`/`k` to select,
-`?` for help, and `q` or `Ctrl-C` to quit. A refresh failure after a successful
-load leaves the last complete batch visible and marks it stale. At least 80x24
+Overview, Runs, and Run detail refresh every ten seconds. Use `1` and `2` for
+Overview and Runs, `Enter` on a run to open the shared detail, and `Escape` to
+return with the previous screen state preserved. On Runs, `f` cycles Active,
+Ended, and All; `/` accepts an exact lowercase `owner/repository` filter; and
+`n`/`p` move through bounded cursor pages. Use `r` to refresh, arrow keys or
+`j`/`k` to select or scroll, `?` for current help, and `q` or `Ctrl-C` to quit.
+Overview also uses `Tab` and `Shift+Tab` between non-empty panels. A refresh
+failure after a successful load leaves the last complete screen visible and
+marks it stale. At least 80x24
 is required; 92 columns enables the side-by-side layout. Closing the TUI does
 not stop the worker. The header shows the observation time and refresh state;
 the green border and highlighted row identify the one active panel selection.
@@ -477,13 +482,19 @@ duration syntax such as `30s`, `15m`, and `24h`.
 agentctl operator [--config <controller.json>]
 ```
 
-Use this for the bounded read-only Controller Overview. It shows the projected
-aggregate health, separate worker/capacity/repository evidence, repositories in
-projection order, active runs before recent runs, and Controller-owned
-actionable attention with supporting attention evidence. Truncated collections
-always report displayed and total counts. Unknown future presentation codes
-remain visible instead of being silently classified. Status markers and color
-improve scanning but never replace the projected status text.
+Use this for the bounded read-only Controller Overview and Runs journey. It
+shows the projected aggregate health, separate worker/capacity/repository
+evidence, repositories in projection order, active runs before recently ended
+runs, and Controller-owned
+actionable attention with supporting attention evidence. Runs defaults to
+Active, supports Active/Ended/All plus one exact repository filter, and uses
+opaque next/previous cursor navigation ordered by most recent update. Run detail
+shows the application-owned phase and wait assessment, latest transition,
+compact pull request, active attention, and all eleven Controller-owned delivery
+gates. It exposes no mutation controls. Truncated collections always report
+displayed and total counts. Unknown future presentation codes remain visible
+instead of being silently classified. Status markers and color improve scanning
+but never replace the projected status text.
 
 ### `onboarding existing open`, `empty open`, `preflight`, `preview`, `start`, `show`, `cancel`, and `resume`
 
@@ -2666,8 +2677,9 @@ be `fresh`; workload activity is not runtime readiness.
 
 No controller run state change.
 
-Routine application queries are currently library contracts for the planned
-local operator adapter; they do not add public CLI routes. They read persisted
+Routine application queries are the typed boundary used by the local operator
+adapter; only the implemented Overview, Runs, and Run detail are public through
+that TUI. The queries read persisted
 queue, run, attention, repository, onboarding, and configuration evidence only.
 They never trigger Linear, GitHub, Git, verifier, credential, or readiness
 refreshes, and the settings convergence path performs no reconciliation or

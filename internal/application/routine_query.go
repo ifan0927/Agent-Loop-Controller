@@ -85,6 +85,7 @@ type RoutineRunPage struct {
 	Metadata   RoutineProjectionMetadata `json:"metadata"`
 	Collection RoutineCollectionMetadata `json:"collection"`
 	Repository string                    `json:"repository,omitempty"`
+	Lifecycle  RunLifecycleFilter        `json:"lifecycle"`
 	Runs       []RoutineRunSummary       `json:"runs"`
 }
 
@@ -135,6 +136,69 @@ func ClassifyRoutineWait(state domain.State) RoutineWaitClassification {
 		return RoutineWaitUnknown
 	}
 }
+
+type RoutineRunPhase string
+
+const (
+	RoutinePhaseAdmission        RoutineRunPhase = "admission"
+	RoutinePhaseWorkspace        RoutineRunPhase = "workspace"
+	RoutinePhaseImplementation   RoutineRunPhase = "implementation"
+	RoutinePhaseVerification     RoutineRunPhase = "verification"
+	RoutinePhaseReview           RoutineRunPhase = "review"
+	RoutinePhasePublication      RoutineRunPhase = "publication"
+	RoutinePhasePullRequest      RoutineRunPhase = "pull_request"
+	RoutinePhaseApproval         RoutineRunPhase = "approval"
+	RoutinePhaseMerge            RoutineRunPhase = "merge"
+	RoutinePhaseLinearCompletion RoutineRunPhase = "linear_completion"
+	RoutinePhaseCleanup          RoutineRunPhase = "cleanup"
+	RoutinePhaseManual           RoutineRunPhase = "manual_intervention"
+	RoutinePhaseEnded            RoutineRunPhase = "ended"
+	RoutinePhaseUnknown          RoutineRunPhase = "unknown"
+)
+
+func ClassifyRoutineRunPhase(state domain.State) RoutineRunPhase {
+	switch state {
+	case domain.StateReceived, domain.StateAdmitting:
+		return RoutinePhaseAdmission
+	case domain.StateProvisioning:
+		return RoutinePhaseWorkspace
+	case domain.StateExecuting, domain.StateAwaitingHumanDecision, domain.StateRepairing:
+		return RoutinePhaseImplementation
+	case domain.StateVerifying:
+		return RoutinePhaseVerification
+	case domain.StateFreshReview:
+		return RoutinePhaseReview
+	case domain.StateApprovalReady, domain.StatePushingBranch, domain.StateBranchPushed:
+		return RoutinePhasePublication
+	case domain.StateOpeningPR, domain.StatePROpen, domain.StateReconcilingReviews, domain.StateReplyingReviewFeedback:
+		return RoutinePhasePullRequest
+	case domain.StateAwaitingHumanApproval:
+		return RoutinePhaseApproval
+	case domain.StateMerging, domain.StateAwaitingGitHubMergeability:
+		return RoutinePhaseMerge
+	case domain.StateAwaitingLinearCompletion:
+		return RoutinePhaseLinearCompletion
+	case domain.StateCleaning:
+		return RoutinePhaseCleanup
+	case domain.StateManualIntervention:
+		return RoutinePhaseManual
+	case domain.StateCompleted, domain.StateFailed, domain.StateRejected:
+		return RoutinePhaseEnded
+	default:
+		return RoutinePhaseUnknown
+	}
+}
+
+type RoutineWaitAssessment string
+
+const (
+	RoutineAssessmentProgressing  RoutineWaitAssessment = "progressing"
+	RoutineAssessmentNormalWait   RoutineWaitAssessment = "normal_wait"
+	RoutineAssessmentAbnormalWait RoutineWaitAssessment = "abnormal_wait"
+	RoutineAssessmentUnknown      RoutineWaitAssessment = "unknown"
+	RoutineAssessmentConflict     RoutineWaitAssessment = "conflict"
+	RoutineAssessmentEnded        RoutineWaitAssessment = "ended"
+)
 
 type DeliveryGateName string
 
@@ -234,7 +298,9 @@ type RoutineRunDetail struct {
 	Metadata         RoutineProjectionMetadata  `json:"metadata"`
 	Run              RoutineRunSummary          `json:"run"`
 	LatestTransition *RoutineTransition         `json:"latest_transition,omitempty"`
+	Phase            RoutineRunPhase            `json:"phase"`
 	Wait             RoutineWaitClassification  `json:"wait"`
+	WaitAssessment   RoutineWaitAssessment      `json:"wait_assessment"`
 	PullRequest      *RoutinePullRequestSummary `json:"pull_request,omitempty"`
 	Gates            []RoutineDeliveryGate      `json:"gates"`
 	Attention        []RoutineAttentionSummary  `json:"active_attention"`
@@ -272,7 +338,7 @@ func (s *RoutineRunQueryService) List(ctx context.Context, query RunSummaryQuery
 	if err != nil {
 		return RoutineRunPage{}, err
 	}
-	result := RoutineRunPage{Metadata: RoutineProjectionMetadata{SchemaVersion: RoutineQuerySchemaVersion, ObservedAt: observedAt.UTC()}, Collection: RoutineCollectionMetadata{Total: page.TotalCount, Truncated: page.HasMore, NextCursor: page.NextCursor}, Repository: page.Repository, Runs: make([]RoutineRunSummary, 0, len(page.Runs))}
+	result := RoutineRunPage{Metadata: RoutineProjectionMetadata{SchemaVersion: RoutineQuerySchemaVersion, ObservedAt: observedAt.UTC()}, Collection: RoutineCollectionMetadata{Total: page.TotalCount, Truncated: page.HasMore, NextCursor: page.NextCursor}, Repository: page.Repository, Lifecycle: page.Lifecycle, Runs: make([]RoutineRunSummary, 0, len(page.Runs))}
 	for _, run := range page.Runs {
 		attention := false
 		if current, ok := s.store.(CurrentOperatorAttentionQuery); ok {
@@ -324,6 +390,7 @@ func projectRoutineRunDetail(inspection RunInspection, offers []LegalActionOffer
 	result := RoutineRunDetail{
 		Metadata: RoutineProjectionMetadata{SchemaVersion: RoutineQuerySchemaVersion, ObservedAt: observedAt},
 		Run:      RoutineRunSummary{RunID: run.ID, LinearIdentifier: run.IssueID, Repository: run.Repository, State: run.State, CandidateHead: run.CandidateHead, CreatedAt: run.CreatedAt, UpdatedAt: run.UpdatedAt},
+		Phase:    ClassifyRoutineRunPhase(run.State),
 		Wait:     ClassifyRoutineWait(run.State),
 		Gates:    ClassifyRoutineDeliveryGates(inspection),
 		Offers:   append([]LegalActionOffer(nil), offers...),
@@ -351,10 +418,31 @@ func projectRoutineRunDetail(inspection RunInspection, offers []LegalActionOffer
 		result.Attention = append(result.Attention, RoutineAttentionSummary{EventID: event.EventKey, Scope: routineAttentionScope(event), TargetID: routineAttentionTarget(event), Severity: event.Severity, ReasonCode: event.ReasonCode, State: state, OccurredAt: event.OccurredAt.UTC(), ObservedAt: event.ObservedAt.UTC()})
 	}
 	result.Run.Attention = len(result.Attention) != 0
+	result.WaitAssessment = classifyRoutineWaitAssessment(result.Wait, result.Attention, result.Gates)
 	if run.State == domain.StateAwaitingHumanDecision && slices.ContainsFunc(offers, func(offer LegalActionOffer) bool { return offer.Action == OperationDecide }) {
 		result.Decision = projectRoutineDecisionRequest(inspection)
 	}
 	return result
+}
+
+func classifyRoutineWaitAssessment(wait RoutineWaitClassification, attention []RoutineAttentionSummary, gates []RoutineDeliveryGate) RoutineWaitAssessment {
+	if wait == RoutineWaitTerminal {
+		return RoutineAssessmentEnded
+	}
+	if slices.ContainsFunc(attention, func(item RoutineAttentionSummary) bool { return item.State == RoutineAttentionConflict }) ||
+		slices.ContainsFunc(gates, func(gate RoutineDeliveryGate) bool { return gate.Status == GateConflict }) {
+		return RoutineAssessmentConflict
+	}
+	if wait == RoutineWaitUnknown || slices.ContainsFunc(attention, func(item RoutineAttentionSummary) bool { return item.State == RoutineAttentionUnknown }) {
+		return RoutineAssessmentUnknown
+	}
+	if wait == RoutineWaitManual || slices.ContainsFunc(attention, func(item RoutineAttentionSummary) bool { return item.State == RoutineAttentionActive }) {
+		return RoutineAssessmentAbnormalWait
+	}
+	if wait == RoutineWaitNone {
+		return RoutineAssessmentProgressing
+	}
+	return RoutineAssessmentNormalWait
 }
 
 func routineTransitionReason(transition Transition) string {

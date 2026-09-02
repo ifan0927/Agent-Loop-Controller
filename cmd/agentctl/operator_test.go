@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"os"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
+	sqlitestore "github.com/ifan0927/Agent-Loop-Controller/internal/adapters/sqlite"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
@@ -42,17 +44,23 @@ func (s *recordingRepositorySource) List(_ context.Context, _ application.Reques
 
 type inertOperatorLoader struct{}
 
-func (inertOperatorLoader) Load(context.Context, time.Time) (operatorOverviewBatch, error) {
+func (inertOperatorLoader) LoadOverview(context.Context, time.Time) (operatorOverviewBatch, error) {
 	return operatorOverviewBatch{}, errors.New("not used")
+}
+func (inertOperatorLoader) LoadRuns(context.Context, application.RunLifecycleFilter, string, string, time.Time) (application.RoutineRunPage, error) {
+	return application.RoutineRunPage{}, errors.New("not used")
+}
+func (inertOperatorLoader) LoadRunDetail(context.Context, string, time.Time) (application.RoutineRunDetail, error) {
+	return application.RoutineRunDetail{}, errors.New("not used")
 }
 
 func TestProductionOperatorOverviewLoaderUsesOneObservedTimeAndBoundedRepositoryPage(t *testing.T) {
 	observedAt := time.Date(2026, 9, 1, 2, 3, 4, 0, time.FixedZone("fixture", 8*60*60))
 	overview := &recordingOverviewSource{projection: application.RoutineOverviewProjection{Readiness: application.AggregateReady}}
 	repositories := &recordingRepositorySource{page: application.RoutineRepositoryPage{Collection: application.RoutineCollectionMetadata{Total: 101, Truncated: true}}}
-	loader := productionOperatorOverviewLoader{overview: overview, repositories: repositories}
+	loader := productionOperatorLoader{overview: overview, repositories: repositories}
 
-	batch, err := loader.Load(context.Background(), observedAt)
+	batch, err := loader.LoadOverview(context.Background(), observedAt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +73,7 @@ func TestProductionOperatorOverviewLoaderUsesOneObservedTimeAndBoundedRepository
 	}
 
 	repositories.err = errors.New("repository projection failed")
-	if partial, err := loader.Load(context.Background(), observedAt); err == nil || partial.Overview.Readiness != "" {
+	if partial, err := loader.LoadOverview(context.Background(), observedAt); err == nil || partial.Overview.Readiness != "" {
 		t.Fatalf("partial=%+v err=%v", partial, err)
 	}
 }
@@ -184,7 +192,7 @@ func TestOperatorTooSmallAndEmptyStates(t *testing.T) {
 	model.width, model.height, model.batch = 80, 24, &empty
 	model.normalizeFocus()
 	output := ansi.Strip(model.render())
-	for _, phrase := range []string{"No registered repositories", "No active or recent runs", "No operator attention"} {
+	for _, phrase := range []string{"No registered repositories", "No active or recently ended runs", "No operator attention"} {
 		if !strings.Contains(output, phrase) {
 			t.Fatalf("missing %q in:\n%s", phrase, output)
 		}
@@ -264,13 +272,133 @@ func TestOperatorSelectedRowUsesOneUninterruptedHighlight(t *testing.T) {
 	}
 }
 
+func TestOperatorRoutesRunsFiltersPaginationAndReturnState(t *testing.T) {
+	model := loadedOperatorModel(92, 24)
+	model.focus = operatorRunsPanel
+	model.panels[operatorRunsPanel] = operatorPanelState{index: 1}
+	selected := model.selectedOverviewRunID()
+	updated, detailCommand := model.Update(keySpecial(tea.KeyEnter, 0))
+	model = updated.(operatorModel)
+	if detailCommand == nil || model.route != operatorRunDetailRoute || model.detail.runID != selected || model.detail.returnRoute != operatorOverviewRoute {
+		t.Fatalf("detail route=%q state=%+v", model.route, model.detail)
+	}
+	detail := operatorFixtureRunDetail(selected)
+	updated, _ = model.Update(operatorRunDetailResultMsg{generation: model.detail.generation, runID: selected, detail: detail})
+	model = updated.(operatorModel)
+	updated, _ = model.Update(keySpecial(tea.KeyEscape, 0))
+	model = updated.(operatorModel)
+	if model.route != operatorOverviewRoute || model.panels[operatorRunsPanel].index != 1 {
+		t.Fatalf("overview return route=%q selection=%d", model.route, model.panels[operatorRunsPanel].index)
+	}
+
+	updated, loadRuns := model.Update(keyMessage('2'))
+	model = updated.(operatorModel)
+	if loadRuns == nil || model.route != operatorRunsRoute || !model.runs.refreshing || model.runs.pending.lifecycle != application.RunLifecycleActive {
+		t.Fatalf("runs route=%q state=%+v", model.route, model.runs)
+	}
+	page := application.RoutineRunPage{Metadata: application.RoutineProjectionMetadata{ObservedAt: time.Now().UTC()}, Lifecycle: application.RunLifecycleActive, Collection: application.RoutineCollectionMetadata{Total: 2, Truncated: true, NextCursor: "next"}, Runs: []application.RoutineRunSummary{{RunID: "run-2", Repository: "owner/repo", State: domain.StateExecuting}, {RunID: "run-1", Repository: "owner/repo", State: domain.StateVerifying}}}
+	updated, _ = model.Update(operatorRunsResultMsg{generation: model.runs.generation, request: *model.runs.pending, page: page})
+	model = updated.(operatorModel)
+	updated, nextPage := model.Update(keyMessage('n'))
+	model = updated.(operatorModel)
+	if nextPage == nil || model.runs.pending.cursor != "next" || len(model.runs.pending.previous) != 1 {
+		t.Fatalf("next pending=%+v", model.runs.pending)
+	}
+	second := page
+	second.Collection = application.RoutineCollectionMetadata{Total: 2}
+	second.Runs = []application.RoutineRunSummary{{RunID: "run-0", Repository: "owner/repo", State: domain.StateExecuting}}
+	updated, _ = model.Update(operatorRunsResultMsg{generation: model.runs.generation, request: *model.runs.pending, page: second})
+	model = updated.(operatorModel)
+	updated, previousPage := model.Update(keyMessage('p'))
+	model = updated.(operatorModel)
+	if previousPage == nil || model.runs.pending.cursor != "" || len(model.runs.pending.previous) != 0 {
+		t.Fatalf("previous pending=%+v", model.runs.pending)
+	}
+	updated, _ = model.Update(operatorRunsResultMsg{generation: model.runs.generation, request: *model.runs.pending, page: page})
+	model = updated.(operatorModel)
+	updated, filterCommand := model.Update(keyMessage('f'))
+	model = updated.(operatorModel)
+	if filterCommand == nil || model.runs.pending.lifecycle != application.RunLifecycleEnded || model.runs.pending.cursor != "" || len(model.runs.pending.previous) != 0 {
+		t.Fatalf("filter pending=%+v", model.runs.pending)
+	}
+	obsolete := page
+	obsolete.Runs = nil
+	updated, _ = model.Update(operatorRunsResultMsg{generation: model.runs.generation - 1, request: operatorRunsRequest{lifecycle: application.RunLifecycleActive}, page: obsolete})
+	model = updated.(operatorModel)
+	if model.runs.page == nil || len(model.runs.page.Runs) != 2 {
+		t.Fatal("obsolete Runs generation replaced the complete page")
+	}
+}
+
+func TestOperatorExactRepositoryFilterAndSharedRunDetailRendering(t *testing.T) {
+	model := loadedOperatorModel(80, 24)
+	model.route = operatorRunsRoute
+	page := application.RoutineRunPage{Metadata: application.RoutineProjectionMetadata{ObservedAt: time.Now().UTC()}, Lifecycle: application.RunLifecycleActive, Runs: []application.RoutineRunSummary{{RunID: "run-detail", Repository: "owner/repo", State: domain.StateAwaitingHumanApproval}}}
+	model.runs.page, model.runs.request = &page, operatorRunsRequest{lifecycle: application.RunLifecycleActive}
+	updated, _ := model.Update(keyMessage('/'))
+	model = updated.(operatorModel)
+	for _, value := range "owner/repo" {
+		updated, _ = model.Update(keyMessage(value))
+		model = updated.(operatorModel)
+	}
+	updated, applyFilter := model.Update(keySpecial(tea.KeyEnter, 0))
+	model = updated.(operatorModel)
+	if applyFilter == nil || model.runs.pending.repository != "owner/repo" || model.runs.pending.cursor != "" {
+		t.Fatalf("repository pending=%+v", model.runs.pending)
+	}
+	filtered := page
+	filtered.Repository = "owner/repo"
+	updated, _ = model.Update(operatorRunsResultMsg{generation: model.runs.generation, request: *model.runs.pending, page: filtered})
+	model = updated.(operatorModel)
+	updated, detailCommand := model.Update(keySpecial(tea.KeyEnter, 0))
+	model = updated.(operatorModel)
+	if detailCommand == nil || model.route != operatorRunDetailRoute || model.detail.returnRoute != operatorRunsRoute {
+		t.Fatalf("detail route=%q state=%+v", model.route, model.detail)
+	}
+	detail := operatorFixtureRunDetail("run-detail")
+	updated, _ = model.Update(operatorRunDetailResultMsg{generation: model.detail.generation, runID: "run-detail", detail: detail})
+	model = updated.(operatorModel)
+	plain := ansi.Strip(model.render())
+	for _, phrase := range []string{"Run detail", "Wait ABNORMAL WAIT", "ATTENTION", "Delivery gates", "VERIFICATION", "NOT APPLICABLE", "CONFLICT"} {
+		if !strings.Contains(plain, phrase) {
+			t.Fatalf("missing %q in:\n%s", phrase, plain)
+		}
+	}
+	if strings.Contains(strings.ToLower(plain), "legal action") || strings.Contains(strings.ToLower(plain), "decision option") {
+		t.Fatalf("read-only detail exposed mutation affordances:\n%s", plain)
+	}
+	if lipgloss.Width(model.render()) > model.width || lipgloss.Height(model.render()) > model.height {
+		t.Fatalf("detail exceeded 80x24:\n%s", plain)
+	}
+}
+
+func operatorFixtureRunDetail(runID string) application.RoutineRunDetail {
+	now := time.Now().UTC()
+	statuses := []application.DeliveryGateStatus{application.GatePassed, application.GateRunning, application.GateFailed, application.GateUnknown, application.GateConflict, application.GateNotApplicable, application.GateBlocked, application.GatePending, application.GatePassed, application.GatePassed, application.GatePassed}
+	names := []application.DeliveryGateName{application.GateVerification, application.GateIndependentReview, application.GateBranchPublication, application.GatePullRequest, application.GateRequiredChecks, application.GateReviewConversations, application.GateHumanApproval, application.GateMerge, application.GateLinearCompletion, application.GateSourceCheckout, application.GateCleanup}
+	gates := make([]application.RoutineDeliveryGate, 0, len(names))
+	for index, name := range names {
+		observed := now.Add(-time.Duration(index) * time.Minute)
+		gates = append(gates, application.RoutineDeliveryGate{Name: name, Status: statuses[index], ReasonCode: "fixture_reason", BoundHead: "candidate-head", ObservedAt: &observed, EvidenceCount: index + 1, EvidenceTruncated: index == 3})
+	}
+	return application.RoutineRunDetail{
+		Metadata: application.RoutineProjectionMetadata{ObservedAt: now},
+		Run:      application.RoutineRunSummary{RunID: runID, LinearIdentifier: "IFAN-175", Repository: "owner/repo", State: domain.StateAwaitingHumanApproval, CandidateHead: "candidate-head", UpdatedAt: now.Add(-time.Minute), Attention: true},
+		Phase:    application.RoutinePhaseApproval, Wait: application.RoutineWaitHumanApproval, WaitAssessment: application.RoutineAssessmentAbnormalWait,
+		LatestTransition: &application.RoutineTransition{From: domain.StateReconcilingReviews, To: domain.StateAwaitingHumanApproval, ReasonCode: "ready_for_human_approval", BoundHead: "candidate-head", ObservedAt: now.Add(-time.Minute)},
+		PullRequest:      &application.RoutinePullRequestSummary{Number: 175, State: "open", HeadSHA: "candidate-head"},
+		Attention:        []application.RoutineAttentionSummary{{Severity: "warning", State: application.RoutineAttentionActive, ReasonCode: "human_approval_required", ObservedAt: now.Add(-time.Minute)}},
+		Gates:            gates,
+	}
+}
+
 func TestSafeOperatorErrorOnlyExposesServiceErrors(t *testing.T) {
 	service := safeOperatorError(&application.ServiceError{Category: application.ErrorConflict, Message: "safe conflict"})
 	if service.String() != "conflict: safe conflict" {
 		t.Fatalf("service error=%q", service.String())
 	}
 	unsafe := safeOperatorError(errors.New("/private/path secret-token"))
-	if unsafe.Category != application.ErrorInternal || unsafe.Message != "operator overview is unavailable" {
+	if unsafe.Category != application.ErrorInternal || unsafe.Message != "operator view is unavailable" {
 		t.Fatalf("unsafe error=%+v", unsafe)
 	}
 }
@@ -291,11 +419,34 @@ func TestOperatorCommandHasNoRequesterFlags(t *testing.T) {
 	}
 }
 
-func TestComposeOperatorOverviewReadsBoundAuthorityWithoutMutation(t *testing.T) {
+func TestComposeOperatorReadsBoundAuthorityWithoutMutation(t *testing.T) {
 	root := resolvedTempDir(t)
 	configPath, databasePath := writeCurrentManagedDraftConfig(t, root)
 	loaded, err := loadManagedConfiguration(configPath)
 	if err != nil {
+		t.Fatal(err)
+	}
+	bindings := loaded.Registry.Bindings()
+	if len(bindings) == 0 {
+		t.Fatal("fixture registry has no repository")
+	}
+	binding := bindings[0]
+	repository := application.LocalRepository{CanonicalRepository: binding.CanonicalRepository, AllowedOperatorLogins: []string{"ifan0927"}, TrustedOperatorActors: []application.TrustedActorIdentity{{DatabaseID: 33, NodeID: "MDQ6VXNlcjMz", Login: "ifan0927", Type: "User"}}}
+	repositoryRaw, err := json.Marshal(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writable, err := sqlitestore.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := application.Run{ID: "operator-read-run", IssueID: "IFAN-175", IdempotencyKey: "operator-read-key", SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: binding.CanonicalRepository, RepositoryConfigJSON: string(repositoryRaw), BaseBranch: binding.BaseBranch, WorkingBranch: "ifan/ifan-175", State: domain.StateReceived}
+	authority := testExistingNewAdmissionGate(t, writable).Decision.Authority
+	if _, created, createErr := writable.CreateRun(context.Background(), application.CreateRunInput{Run: run, ConfigurationAuthority: authority}); createErr != nil || !created {
+		_ = writable.Close()
+		t.Fatalf("create fixture run created=%t err=%v", created, createErr)
+	}
+	if err := writable.Close(); err != nil {
 		t.Fatal(err)
 	}
 	beforeConfig, err := os.ReadFile(configPath)
@@ -307,21 +458,26 @@ func TestComposeOperatorOverviewReadsBoundAuthorityWithoutMutation(t *testing.T)
 		t.Fatal(err)
 	}
 
-	composition, err := composeOperatorOverview(context.Background(), configPath)
+	composition, err := composeOperator(context.Background(), configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	observedAt := time.Date(2026, 9, 1, 4, 5, 6, 0, time.UTC)
-	batch, loadErr := composition.loader.Load(context.Background(), observedAt)
+	batch, loadErr := composition.loader.LoadOverview(context.Background(), observedAt)
+	runs, runsErr := composition.loader.LoadRuns(context.Background(), application.RunLifecycleActive, "", "", observedAt)
+	detail, detailErr := composition.loader.LoadRunDetail(context.Background(), run.ID, observedAt)
 	closeErr := composition.Close()
-	if loadErr != nil || closeErr != nil {
-		t.Fatalf("load=%v close=%v", loadErr, closeErr)
+	if loadErr != nil || runsErr != nil || detailErr != nil || closeErr != nil {
+		t.Fatalf("overview=%v runs=%v detail=%v close=%v", loadErr, runsErr, detailErr, closeErr)
 	}
 	if batch.ObservedAt != observedAt || batch.Overview.Metadata.ObservedAt != observedAt || batch.Repositories.Metadata.ObservedAt != observedAt {
 		t.Fatalf("observed times batch=%s overview=%s repositories=%s", batch.ObservedAt, batch.Overview.Metadata.ObservedAt, batch.Repositories.Metadata.ObservedAt)
 	}
 	if batch.Overview.Settings.DesiredDigest != loaded.Digest || batch.Repositories.Collection.Total < len(batch.Repositories.Repositories) {
 		t.Fatalf("overview digest=%q repositories=%d", batch.Overview.Settings.DesiredDigest, batch.Repositories.Collection.Total)
+	}
+	if runs.Collection.Total != 1 || len(runs.Runs) != 1 || runs.Runs[0].RunID != run.ID || detail.Run.RunID != run.ID || len(detail.Gates) != 11 {
+		t.Fatalf("runs=%+v detail=%+v", runs, detail)
 	}
 	afterConfig, err := os.ReadFile(configPath)
 	if err != nil {

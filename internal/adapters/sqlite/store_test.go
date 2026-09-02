@@ -684,20 +684,20 @@ func TestListRunsUsesRepositoryScopedDeterministicCursor(t *testing.T) {
 		if _, _, err := store.CreateRun(ctx, input); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.db.ExecContext(ctx, `UPDATE runs SET created_at=? WHERE run_id=?`, formatTime(base.Add(time.Duration(index)*time.Second)), id); err != nil {
+		if _, err := store.db.ExecContext(ctx, `UPDATE runs SET updated_at=? WHERE run_id=?`, formatTime(base.Add(time.Duration(index)*time.Second)), id); err != nil {
 			t.Fatal(err)
 		}
 	}
 	scopes := repositoryRunScopes(t, bindingDigest)
-	page, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Repository: "owner/repo", Limit: 2})
+	page, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Repository: "owner/repo", Lifecycle: application.RunLifecycleAll, Limit: 2})
 	if err != nil || page.TotalCount != 3 || len(page.Runs) != 2 || page.Runs[0].ID != "run-c" || page.Runs[1].ID != "run-b" {
 		t.Fatalf("first page=%+v err=%v", page, err)
 	}
-	next, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Repository: "owner/repo", BeforeCreatedAt: page.Runs[1].CreatedAt, BeforeRunID: page.Runs[1].ID, Limit: 2})
+	next, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Repository: "owner/repo", Lifecycle: application.RunLifecycleAll, BeforeUpdatedAt: page.Runs[1].UpdatedAt, BeforeRunID: page.Runs[1].ID, Limit: 2})
 	if err != nil || next.TotalCount != 3 || len(next.Runs) != 1 || next.Runs[0].ID != "run-a" {
 		t.Fatalf("next page=%+v err=%v", next, err)
 	}
-	if _, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Repository: "owner/repo", Limit: 102}); err == nil {
+	if _, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Repository: "owner/repo", Lifecycle: application.RunLifecycleAll, Limit: 102}); err == nil {
 		t.Fatal("unbounded list limit was accepted")
 	}
 }
@@ -728,13 +728,13 @@ func TestAuthorizedRunPaginationIgnoresHiddenSentinels(t *testing.T) {
 		if _, _, err := store.CreateRun(ctx, input); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.db.ExecContext(ctx, `UPDATE runs SET created_at=? WHERE run_id=?`, formatTime(base.Add(time.Duration(fixture.second)*time.Second)), fixture.id); err != nil {
+		if _, err := store.db.ExecContext(ctx, `UPDATE runs SET updated_at=? WHERE run_id=?`, formatTime(base.Add(time.Duration(fixture.second)*time.Second)), fixture.id); err != nil {
 			t.Fatal(err)
 		}
 	}
 	bindingHash := sha256.Sum256([]byte("legacy-repository-binding:owner/repo"))
 	scopes := repositoryRunScopes(t, hex.EncodeToString(bindingHash[:]))
-	first, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Limit: 2})
+	first, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Lifecycle: application.RunLifecycleAll, Limit: 2})
 	if err != nil || first.TotalCount != 3 || len(first.Runs) != 2 {
 		t.Fatalf("first=%+v err=%v", first, err)
 	}
@@ -749,8 +749,62 @@ func TestAuthorizedRunPaginationIgnoresHiddenSentinels(t *testing.T) {
 	if _, err := store.GetAuthorizedRun(ctx, "hidden-within-1", scopes); !errors.Is(err, application.ErrRunNotFound) {
 		t.Fatalf("hidden lookup error=%v", err)
 	}
-	second, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, BeforeCreatedAt: first.Runs[1].CreatedAt, BeforeRunID: first.Runs[1].ID, Limit: 3})
+	second, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Lifecycle: application.RunLifecycleAll, BeforeUpdatedAt: first.Runs[1].UpdatedAt, BeforeRunID: first.Runs[1].ID, Limit: 3})
 	if err != nil || second.TotalCount != 3 || len(second.Runs) != 1 || second.Runs[0].ID != "authorized-1" {
+		t.Fatalf("second=%+v err=%v", second, err)
+	}
+}
+
+func TestAuthorizedRunLifecycleFilteringPrecedesCountOrderingAndPagination(t *testing.T) {
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	base := time.Date(2026, 8, 14, 0, 0, 0, 0, time.UTC)
+	fixtures := []struct {
+		id, repository, state string
+		updated               time.Time
+	}{
+		{id: "active-newer", repository: "owner/repo", state: "executing", updated: base.Add(4 * time.Second)},
+		{id: "ended-between", repository: "owner/repo", state: "completed", updated: base.Add(3 * time.Second)},
+		{id: "active-tie-z", repository: "owner/repo", state: "verifying", updated: base.Add(2 * time.Second)},
+		{id: "active-tie-a", repository: "owner/repo", state: "future_state", updated: base.Add(2 * time.Second)},
+		{id: "ended-older", repository: "owner/repo", state: "failed", updated: base.Add(time.Second)},
+		{id: "hidden-active", repository: "sibling/private", state: "executing", updated: base.Add(5 * time.Second)},
+		{id: "hidden-ended", repository: "sibling/private", state: "rejected", updated: base.Add(6 * time.Second)},
+	}
+	for index, fixture := range fixtures {
+		input := application.CreateRunInput{Run: application.Run{ID: fixture.id, IssueID: fmt.Sprintf("ISSUE-LIFECYCLE-%d", index), IdempotencyKey: fmt.Sprintf("lifecycle-key-%d", index), SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: fixture.repository, RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "ifan/test"}}
+		if _, _, err := store.CreateRun(ctx, input); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.db.ExecContext(ctx, `UPDATE runs SET current_state=?,updated_at=? WHERE run_id=?`, fixture.state, formatTime(fixture.updated), fixture.id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bindingHash := sha256.Sum256([]byte("legacy-repository-binding:owner/repo"))
+	scopes := repositoryRunScopes(t, hex.EncodeToString(bindingHash[:]))
+	active, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Lifecycle: application.RunLifecycleActive, Limit: 3})
+	if err != nil || active.TotalCount != 3 || len(active.Runs) != 3 {
+		t.Fatalf("active=%+v err=%v", active, err)
+	}
+	for index, want := range []string{"active-newer", "active-tie-z", "active-tie-a"} {
+		if active.Runs[index].ID != want {
+			t.Fatalf("active order=%+v", active.Runs)
+		}
+	}
+	ended, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Lifecycle: application.RunLifecycleEnded, Limit: 3})
+	if err != nil || ended.TotalCount != 2 || len(ended.Runs) != 2 || ended.Runs[0].ID != "ended-between" || ended.Runs[1].ID != "ended-older" {
+		t.Fatalf("ended=%+v err=%v", ended, err)
+	}
+	first, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Lifecycle: application.RunLifecycleAll, Limit: 2})
+	if err != nil || first.TotalCount != 5 || len(first.Runs) != 2 || first.Runs[0].ID != "active-newer" || first.Runs[1].ID != "ended-between" {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	second, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Lifecycle: application.RunLifecycleAll, BeforeUpdatedAt: first.Runs[1].UpdatedAt, BeforeRunID: first.Runs[1].ID, Limit: 3})
+	if err != nil || len(second.Runs) != 3 || second.Runs[0].ID != "active-tie-z" || second.Runs[1].ID != "active-tie-a" || second.Runs[2].ID != "ended-older" {
 		t.Fatalf("second=%+v err=%v", second, err)
 	}
 }

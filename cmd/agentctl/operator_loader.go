@@ -18,8 +18,10 @@ type operatorOverviewBatch struct {
 	Repositories application.RoutineRepositoryPage
 }
 
-type operatorOverviewLoader interface {
-	Load(context.Context, time.Time) (operatorOverviewBatch, error)
+type operatorLoader interface {
+	LoadOverview(context.Context, time.Time) (operatorOverviewBatch, error)
+	LoadRuns(context.Context, application.RunLifecycleFilter, string, string, time.Time) (application.RoutineRunPage, error)
+	LoadRunDetail(context.Context, string, time.Time) (application.RoutineRunDetail, error)
 }
 
 type operatorOverviewProjectionSource interface {
@@ -30,13 +32,14 @@ type operatorRepositoryProjectionSource interface {
 	List(context.Context, application.Requester, int, string, time.Time) (application.RoutineRepositoryPage, error)
 }
 
-type productionOperatorOverviewLoader struct {
+type productionOperatorLoader struct {
 	overview     operatorOverviewProjectionSource
 	repositories operatorRepositoryProjectionSource
+	runs         *application.RoutineRunQueryService
 	requester    application.Requester
 }
 
-func (l *productionOperatorOverviewLoader) Load(ctx context.Context, observedAt time.Time) (operatorOverviewBatch, error) {
+func (l *productionOperatorLoader) LoadOverview(ctx context.Context, observedAt time.Time) (operatorOverviewBatch, error) {
 	observedAt = observedAt.UTC()
 	overview, err := l.overview.Get(ctx, l.requester, observedAt)
 	if err != nil {
@@ -49,8 +52,16 @@ func (l *productionOperatorOverviewLoader) Load(ctx context.Context, observedAt 
 	return operatorOverviewBatch{ObservedAt: observedAt, Overview: overview, Repositories: repositories}, nil
 }
 
+func (l *productionOperatorLoader) LoadRuns(ctx context.Context, lifecycle application.RunLifecycleFilter, repository, cursor string, observedAt time.Time) (application.RoutineRunPage, error) {
+	return l.runs.List(ctx, application.RunSummaryQuery{Requester: l.requester, Repository: repository, Lifecycle: lifecycle, Limit: application.RoutineQueryDefaultLimit, Cursor: cursor}, observedAt.UTC())
+}
+
+func (l *productionOperatorLoader) LoadRunDetail(ctx context.Context, runID string, observedAt time.Time) (application.RoutineRunDetail, error) {
+	return l.runs.Detail(ctx, application.RunDetailQuery{Requester: l.requester, RunID: runID}, observedAt.UTC())
+}
+
 type operatorComposition struct {
-	loader operatorOverviewLoader
+	loader operatorLoader
 	store  *sqlitestore.Store
 }
 
@@ -99,7 +110,7 @@ func loadOperatorConfigurationReadOnly(ctx context.Context, path string) (bootst
 	return loaded, files, store, nil
 }
 
-func composeOperatorOverview(ctx context.Context, configOverride string) (*operatorComposition, error) {
+func composeOperator(ctx context.Context, configOverride string) (*operatorComposition, error) {
 	path, err := resolveConfigPath(configOverride)
 	if err != nil {
 		return nil, err
@@ -144,10 +155,14 @@ func composeOperatorOverview(ctx context.Context, configOverride string) (*opera
 	if err != nil {
 		return closeWith(errors.New("repository projection service is unavailable"))
 	}
+	runs, err := application.NewRoutineRunQueryService(store, authorizer, loaded.Registry)
+	if err != nil {
+		return closeWith(errors.New("run projection service is unavailable"))
+	}
 	operator := loaded.Controller.Operator
 	requester := application.Requester{ID: operator.Login, Kind: "github_login", DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, ActorType: operator.ActorType}
 	return &operatorComposition{
-		loader: &productionOperatorOverviewLoader{overview: overview, repositories: repositories, requester: requester},
+		loader: &productionOperatorLoader{overview: overview, repositories: repositories, runs: runs, requester: requester},
 		store:  store,
 	}, nil
 }

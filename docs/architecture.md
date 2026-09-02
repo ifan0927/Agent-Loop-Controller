@@ -1792,7 +1792,7 @@ change existing workflow or external effects. The receipt-backed recheck is
 implemented through the same application boundary; presentation adapters
 remain follow-up work.
 
-The planned local operator interface is a TUI over these Controller-owned
+The local operator interface is an implemented TUI over these Controller-owned
 application contracts:
 
 ```text
@@ -1823,7 +1823,7 @@ exit cannot stop Controller execution. Both processes rely on durable Controller
 state plus Controller-owned authorization, CAS, leases, idempotency, receipts,
 and reconciliation rather than shared in-memory authority.
 
-The implemented Overview composition opens only an existing exact-inode,
+The implemented operator composition opens only an existing exact-inode,
 mode-0600, current-schema SQLite/configuration binding in query-only mode. It
 does not create, migrate, baseline, reconcile, adopt, rewrite, or repair that
 authority. The TUI model receives one complete Overview projection followed by
@@ -1834,10 +1834,23 @@ paths to assemble workflow policy. It consumes bounded sanitized projections
 and only legal actions offered by Controller application services. It is not a
 database administration tool, orchestrator, or second state machine.
 
-The Overview refreshes every ten seconds or on an explicit `r`, permits at most
-one active read, and ignores obsolete generations. After one successful batch,
-a later error preserves the last complete screen and marks it stale with only a
-sanitized service category and message. Controller aggregate readiness is
+Overview, Runs, and Run detail each refresh every ten seconds or on an explicit
+`r`, permit at most one visible active read, and fence obsolete route and refresh
+generations. After one successful load, a later error preserves the last
+complete screen and marks it stale with only a sanitized service category and
+message. Runs applies configured-operator authorization, optional exact
+repository scope, and the closed Active/Ended/All lifecycle filter before
+counting, `updated_at DESC, run_id DESC` ordering, cursor construction, and
+pagination. Its opaque cursor binds authorization scope, repository, lifecycle,
+updated time, and run identity; the TUI retains only the bounded prior-cursor
+stack required for Previous.
+
+Run detail is the same projection whether opened from Overview or Runs. The
+application owns current phase, exact wait kind, normal/abnormal/unknown/
+conflict/ended assessment, latest meaningful transition, active attention,
+pull-request summary, and the fixed eleven delivery gates. The TUI does not
+derive those conclusions or render legal-action offers or decision controls in
+this read-only slice. Controller aggregate readiness is
 rendered exactly as projected; capacity, repository readiness, availability,
 and freshness remain separate evidence and are never recomputed into health by
 the adapter. Widths at or above 92 columns place repositories and runs on the

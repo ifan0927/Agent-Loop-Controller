@@ -392,10 +392,31 @@ type QueryInput struct {
 // selects the configured operator's controller-wide frozen-run scopes. Cursor
 // is an opaque value issued by a previous RunSummaryPage.
 type RunSummaryQuery struct {
-	Requester  Requester `json:"requester"`
-	Repository string    `json:"repository"`
-	Limit      int       `json:"limit,omitempty"`
-	Cursor     string    `json:"cursor,omitempty"`
+	Requester  Requester          `json:"requester"`
+	Repository string             `json:"repository"`
+	Lifecycle  RunLifecycleFilter `json:"lifecycle"`
+	Limit      int                `json:"limit,omitempty"`
+	Cursor     string             `json:"cursor,omitempty"`
+}
+
+type RunLifecycleFilter string
+
+const (
+	RunLifecycleActive RunLifecycleFilter = "active"
+	RunLifecycleEnded  RunLifecycleFilter = "ended"
+	RunLifecycleAll    RunLifecycleFilter = "all"
+)
+
+func normalizeRunLifecycleFilter(filter RunLifecycleFilter) (RunLifecycleFilter, error) {
+	if filter == "" {
+		return RunLifecycleAll, nil
+	}
+	switch filter {
+	case RunLifecycleActive, RunLifecycleEnded, RunLifecycleAll:
+		return filter, nil
+	default:
+		return "", serviceError(ErrorInvalidInput, "run lifecycle filter is invalid", nil)
+	}
 }
 
 type RunDetailQuery struct {
@@ -404,17 +425,19 @@ type RunDetailQuery struct {
 }
 
 type runSummaryCursor struct {
-	Version     string    `json:"version"`
-	Repository  string    `json:"repository,omitempty"`
-	ScopeDigest string    `json:"scope_digest"`
-	CreatedAt   time.Time `json:"created_at"`
-	RunID       string    `json:"run_id"`
+	Version     string             `json:"version"`
+	Repository  string             `json:"repository,omitempty"`
+	Lifecycle   RunLifecycleFilter `json:"lifecycle"`
+	ScopeDigest string             `json:"scope_digest"`
+	UpdatedAt   time.Time          `json:"updated_at"`
+	RunID       string             `json:"run_id"`
 }
 
 type AuthorizedRunQuery struct {
 	Scopes          AuthorizedScopeSet
 	Repository      string
-	BeforeCreatedAt time.Time
+	Lifecycle       RunLifecycleFilter
+	BeforeUpdatedAt time.Time
 	BeforeRunID     string
 	Limit           int
 }
@@ -515,6 +538,10 @@ func (s QueryService) ListRunSummaries(ctx context.Context, query RunSummaryQuer
 	if limit < 1 || limit > maximumRunSummaryLimit {
 		return RunSummaryPage{}, serviceError(ErrorInvalidInput, "limit must be between 1 and 100", nil)
 	}
+	lifecycle, err := normalizeRunLifecycleFilter(query.Lifecycle)
+	if err != nil {
+		return RunSummaryPage{}, err
+	}
 	scopes, err := s.runCollectionScopes(ctx, query)
 	if err != nil {
 		return RunSummaryPage{}, err
@@ -523,10 +550,10 @@ func (s QueryService) ListRunSummaries(ctx context.Context, query RunSummaryQuer
 	if err != nil {
 		return RunSummaryPage{}, err
 	}
-	if query.Cursor != "" && (cursor.Repository != query.Repository || cursor.ScopeDigest != scopes.Digest()) {
+	if query.Cursor != "" && (cursor.Repository != query.Repository || cursor.Lifecycle != lifecycle || cursor.ScopeDigest != scopes.Digest()) {
 		return RunSummaryPage{}, serviceError(ErrorInvalidInput, "cursor is invalid", nil)
 	}
-	stored, err := s.store.ListAuthorizedRuns(ctx, AuthorizedRunQuery{Scopes: scopes, Repository: query.Repository, BeforeCreatedAt: cursor.CreatedAt, BeforeRunID: cursor.RunID, Limit: limit + 1})
+	stored, err := s.store.ListAuthorizedRuns(ctx, AuthorizedRunQuery{Scopes: scopes, Repository: query.Repository, Lifecycle: lifecycle, BeforeUpdatedAt: cursor.UpdatedAt, BeforeRunID: cursor.RunID, Limit: limit + 1})
 	if err != nil {
 		return RunSummaryPage{}, classifyServiceError(err)
 	}
@@ -538,7 +565,7 @@ func (s QueryService) ListRunSummaries(ctx context.Context, query RunSummaryQuer
 			return RunSummaryPage{}, serviceError(ErrorInternal, "run list scope mismatch", nil)
 		}
 	}
-	page := RunSummaryPage{SchemaVersion: querySchemaVersion, Repository: query.Repository, TotalCount: stored.TotalCount}
+	page := RunSummaryPage{SchemaVersion: querySchemaVersion, Repository: query.Repository, Lifecycle: lifecycle, TotalCount: stored.TotalCount}
 	runs := stored.Runs
 	if len(runs) > limit {
 		page.HasMore = true
@@ -548,7 +575,7 @@ func (s QueryService) ListRunSummaries(ctx context.Context, query RunSummaryQuer
 		page.Runs = append(page.Runs, projectRunSummary(run))
 	}
 	if page.HasMore && len(runs) > 0 {
-		page.NextCursor = encodeRunSummaryCursor(runSummaryCursor{Version: querySchemaVersion, Repository: query.Repository, ScopeDigest: scopes.Digest(), CreatedAt: runs[len(runs)-1].CreatedAt, RunID: runs[len(runs)-1].ID})
+		page.NextCursor = encodeRunSummaryCursor(runSummaryCursor{Version: querySchemaVersion, Repository: query.Repository, Lifecycle: lifecycle, ScopeDigest: scopes.Digest(), UpdatedAt: runs[len(runs)-1].UpdatedAt, RunID: runs[len(runs)-1].ID})
 	}
 	return page, nil
 }
@@ -591,7 +618,10 @@ func decodeRunSummaryCursor(value string) (runSummaryCursor, error) {
 		return runSummaryCursor{}, serviceError(ErrorInvalidInput, "cursor is invalid", nil)
 	}
 	var cursor runSummaryCursor
-	if err := json.Unmarshal(raw, &cursor); err != nil || cursor.Version != querySchemaVersion || !validAuthorityDigest(cursor.ScopeDigest) || cursor.CreatedAt.IsZero() || cursor.RunID == "" {
+	if err := json.Unmarshal(raw, &cursor); err != nil || cursor.Version != querySchemaVersion || !validAuthorityDigest(cursor.ScopeDigest) || cursor.UpdatedAt.IsZero() || cursor.RunID == "" {
+		return runSummaryCursor{}, serviceError(ErrorInvalidInput, "cursor is invalid", nil)
+	}
+	if _, err := normalizeRunLifecycleFilter(cursor.Lifecycle); err != nil || cursor.Lifecycle == "" {
 		return runSummaryCursor{}, serviceError(ErrorInvalidInput, "cursor is invalid", nil)
 	}
 	return cursor, nil
@@ -691,12 +721,13 @@ type InspectionResult struct {
 	Telemetry                        []TelemetryResult               `json:"unknown_telemetry"`
 }
 type RunSummaryPage struct {
-	SchemaVersion string       `json:"schema_version"`
-	Repository    string       `json:"repository"`
-	Runs          []RunSummary `json:"runs"`
-	TotalCount    int          `json:"total_count"`
-	NextCursor    string       `json:"next_cursor,omitempty"`
-	HasMore       bool         `json:"has_more"`
+	SchemaVersion string             `json:"schema_version"`
+	Repository    string             `json:"repository"`
+	Lifecycle     RunLifecycleFilter `json:"lifecycle"`
+	Runs          []RunSummary       `json:"runs"`
+	TotalCount    int                `json:"total_count"`
+	NextCursor    string             `json:"next_cursor,omitempty"`
+	HasMore       bool               `json:"has_more"`
 }
 type RunSummary struct {
 	RunID                  string       `json:"run_id"`

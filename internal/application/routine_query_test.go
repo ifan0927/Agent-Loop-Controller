@@ -108,6 +108,37 @@ func TestRoutineDeliveryGateNeverPassesStaleHeadEvidence(t *testing.T) {
 	}
 }
 
+func TestRoutineRunPhaseAndWaitAssessmentRemainApplicationOwned(t *testing.T) {
+	tests := []struct {
+		name       string
+		state      domain.State
+		attention  []RoutineAttentionSummary
+		gates      []RoutineDeliveryGate
+		wantPhase  RoutineRunPhase
+		wantWait   RoutineWaitClassification
+		assessment RoutineWaitAssessment
+	}{
+		{name: "working", state: domain.StateExecuting, wantPhase: RoutinePhaseImplementation, wantWait: RoutineWaitNone, assessment: RoutineAssessmentProgressing},
+		{name: "normal wait", state: domain.StateAwaitingHumanApproval, wantPhase: RoutinePhaseApproval, wantWait: RoutineWaitHumanApproval, assessment: RoutineAssessmentNormalWait},
+		{name: "abnormal attention", state: domain.StatePROpen, attention: []RoutineAttentionSummary{{State: RoutineAttentionActive}}, wantPhase: RoutinePhasePullRequest, wantWait: RoutineWaitExternalChecks, assessment: RoutineAssessmentAbnormalWait},
+		{name: "manual", state: domain.StateManualIntervention, wantPhase: RoutinePhaseManual, wantWait: RoutineWaitManual, assessment: RoutineAssessmentAbnormalWait},
+		{name: "unknown", state: domain.State("future_state"), wantPhase: RoutinePhaseUnknown, wantWait: RoutineWaitUnknown, assessment: RoutineAssessmentUnknown},
+		{name: "conflict", state: domain.StateVerifying, gates: []RoutineDeliveryGate{{Status: GateConflict}}, wantPhase: RoutinePhaseVerification, wantWait: RoutineWaitNone, assessment: RoutineAssessmentConflict},
+		{name: "ended", state: domain.StateCompleted, gates: []RoutineDeliveryGate{{Status: GateConflict}}, wantPhase: RoutinePhaseEnded, wantWait: RoutineWaitTerminal, assessment: RoutineAssessmentEnded},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			wait := ClassifyRoutineWait(test.state)
+			if phase := ClassifyRoutineRunPhase(test.state); phase != test.wantPhase || wait != test.wantWait {
+				t.Fatalf("phase=%q wait=%q", phase, wait)
+			}
+			if got := classifyRoutineWaitAssessment(wait, test.attention, test.gates); got != test.assessment {
+				t.Fatalf("assessment=%q want=%q", got, test.assessment)
+			}
+		})
+	}
+}
+
 type routineQueueStoreFixture struct{ snapshot QueueSnapshot }
 
 func (f routineQueueStoreFixture) LatestQueueSnapshot(context.Context) (QueueSnapshot, bool, error) {

@@ -137,10 +137,10 @@ completed controller, bounded-concurrency, and authorization foundation
 ```
 
 `agentctl` is the implemented canonical executable. The worker entrypoint is
-`agentctl controller worker`; the first read-only Overview is available through
-`agentctl operator`. New launchd installations use the neutral service
-identity, and legacy installations have a bounded reversible migration rather
-than a second runtime path.
+`agentctl controller worker`; the read-only Overview, Runs, and Run detail are
+available through `agentctl operator`. New launchd installations use the
+neutral service identity, and legacy installations have a bounded reversible
+migration rather than a second runtime path.
 
 Implementation work is created one dependency-ready issue at a time. Local
 operator identity, application authorization, operation receipts, and
@@ -158,7 +158,7 @@ repair remains deliberately out of scope. Automatic Controller-wide
 audit-integrity observations, structural mutation generations, bounded
 restart-safe scanning, authorized sanitized queries, and the receipt-backed
 explicit Controller-wide integrity recheck are complete. Phase 1's
-presentation-independent foundations and the first Phase 2 Overview slice are
+presentation-independent foundations and the Phase 2 R04-R06 read journey are
 complete. Do not create speculative HTTP or frontend slices before a
 demonstrated consumer exists.
 
@@ -191,14 +191,19 @@ runs as a separate process from the worker, reads durable Controller state
 through typed application projections, and invokes only Controller-owned legal
 actions. Closing or crashing the TUI must not stop Controller execution.
 
-The first read-only Overview slice is implemented with Bubble Tea v2, Bubbles
-v2, and Lip Gloss v2. It presents projected health, repositories, active-before-
-recent runs, and actionable attention; it uses bounded responsive layouts and
-preserves the last complete batch across sanitized refresh failures. Its
+The read-only Overview, Runs, and shared Run detail are implemented with Bubble
+Tea v2, Bubbles v2, and Lip Gloss v2. Overview presents projected health,
+repositories, active-before-recently-ended runs, and actionable attention.
+Runs provides authorization-safe Active/Ended/All and exact-repository filters,
+updated-time cursor pagination, and the compact R04 collection. Run detail
+provides the application-owned R05 progress/wait conclusion and R06 fixed
+delivery-gate result without mutation controls. The TUI uses bounded responsive
+layouts and preserves the last complete screen across sanitized refresh
+failures. Its
 observation header, projected health card, content-sized panels, explicit focus,
 and redundant status markers make the same bounded evidence easier to scan. It
-has no mutation actions. The remaining navigation surface is Runs, Queue,
-Attention, Repositories, Onboarding, Settings, and System/Audit, but stable
+has no mutation actions. The remaining navigation surface is Queue, Attention,
+Repositories, Onboarding, Settings, and System/Audit, but stable
 Controller projections determine screen details.
 
 The fixed product metric remains ten complete operator-intent scenarios from
