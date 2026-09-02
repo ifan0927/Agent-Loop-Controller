@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"slices"
 	"strings"
 	"time"
@@ -319,11 +318,7 @@ func NewRoutineRunQueryService(store QueryStore, authorizer *AuthorizationServic
 	if err != nil {
 		return nil, err
 	}
-	actionStore, ok := store.(LegalActionStore)
-	if !ok {
-		return nil, errors.New("routine run query requires current legal-action authority")
-	}
-	actions, err := NewLegalActionService(actionStore, authorizer)
+	actions, err := NewLegalActionService(store, authorizer)
 	if err != nil {
 		return nil, err
 	}
@@ -355,20 +350,16 @@ func (s *RoutineRunQueryService) ListController(ctx context.Context, authority C
 func (s *RoutineRunQueryService) projectRunPage(ctx context.Context, page RunSummaryPage, observedAt time.Time) (RoutineRunPage, error) {
 	result := RoutineRunPage{Metadata: RoutineProjectionMetadata{SchemaVersion: RoutineQuerySchemaVersion, ObservedAt: observedAt.UTC()}, Collection: RoutineCollectionMetadata{Total: page.TotalCount, Truncated: page.HasMore, NextCursor: page.NextCursor}, Repository: page.Repository, Lifecycle: page.Lifecycle, Runs: make([]RoutineRunSummary, 0, len(page.Runs))}
 	for _, run := range page.Runs {
-		attention := false
-		if current, ok := s.store.(CurrentOperatorAttentionQuery); ok {
-			event, currentAttention, currentErr := current.CurrentOperatorAttention(ctx, run.RunID)
-			if currentErr != nil {
-				return RoutineRunPage{}, classifyServiceError(currentErr)
+		event, attention, currentErr := s.store.CurrentOperatorAttention(ctx, run.RunID)
+		if currentErr != nil {
+			return RoutineRunPage{}, classifyServiceError(currentErr)
+		}
+		if attention {
+			inspection, inspectErr := s.store.Inspect(ctx, run.RunID)
+			if inspectErr != nil {
+				return RoutineRunPage{}, classifyServiceError(inspectErr)
 			}
-			attention = currentAttention
-			if attention {
-				inspection, inspectErr := s.store.Inspect(ctx, run.RunID)
-				if inspectErr != nil {
-					return RoutineRunPage{}, classifyServiceError(inspectErr)
-				}
-				attention = classifyRoutineAttention(inspection, event) != ""
-			}
+			attention = classifyRoutineAttention(inspection, event) != ""
 		}
 		result.Runs = append(result.Runs, RoutineRunSummary{RunID: run.RunID, LinearIdentifier: run.IssueID, Repository: run.Repository, State: run.State, CandidateHead: run.CandidateHead, Attention: attention, CreatedAt: run.CreatedAt, UpdatedAt: run.UpdatedAt})
 	}

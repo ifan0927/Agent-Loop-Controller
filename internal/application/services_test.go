@@ -164,6 +164,15 @@ func (s serviceStore) ListOperatorAttention(_ context.Context, input OperatorAtt
 	}
 	return append([]OperatorAttentionEvent(nil), s.inspection.OperatorAttention...), nil
 }
+func (s serviceStore) CurrentOperatorAttention(_ context.Context, runID string) (OperatorAttentionEvent, bool, error) {
+	events := s.inspection.OperatorAttention
+	for index := len(events) - 1; index >= 0; index-- {
+		if events[index].RunID == runID {
+			return events[index], true, nil
+		}
+	}
+	return OperatorAttentionEvent{}, false, nil
+}
 func (s serviceStore) AppendOperatorAttention(_ context.Context, event OperatorAttentionEvent) (bool, error) {
 	if s.attentionErr != nil {
 		return false, s.attentionErr
@@ -190,6 +199,28 @@ func (s serviceStore) ListAuthorizedRuns(_ context.Context, input AuthorizedRunQ
 		}
 	}
 	total := len(filtered)
+	if len(filtered) > input.Limit {
+		filtered = filtered[:input.Limit]
+	}
+	return AuthorizedRunPage{Runs: filtered, TotalCount: total}, nil
+}
+func (s serviceStore) ListControllerRuns(_ context.Context, input ControllerRunQuery) (AuthorizedRunPage, error) {
+	if !input.Authority.Valid() {
+		return AuthorizedRunPage{}, errors.New("controller read authority is invalid")
+	}
+	filtered := make([]Run, 0, len(s.runs))
+	total := 0
+	for _, run := range s.runs {
+		lifecycleMatch := input.Lifecycle == RunLifecycleAll || input.Lifecycle == RunLifecycleActive && !TerminalRunState(run.State) || input.Lifecycle == RunLifecycleEnded && TerminalRunState(run.State)
+		repositoryMatch := input.CanonicalRepository == "" || input.CanonicalRepository == run.Repository
+		if lifecycleMatch && repositoryMatch {
+			total++
+		}
+		keysetMatch := input.BeforeUpdatedAt.IsZero() || run.UpdatedAt.Before(input.BeforeUpdatedAt) || run.UpdatedAt.Equal(input.BeforeUpdatedAt) && run.ID < input.BeforeRunID
+		if lifecycleMatch && repositoryMatch && keysetMatch {
+			filtered = append(filtered, run)
+		}
+	}
 	if len(filtered) > input.Limit {
 		filtered = filtered[:input.Limit]
 	}
