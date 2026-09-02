@@ -59,11 +59,11 @@ func loadManagedConfiguration(path string) (bootstrap.Bootstrap, error) {
 		if authority.CanonicalConfigPath != path || authority.DatabasePath != locator.DatabasePath {
 			return bootstrap.Bootstrap{}, errors.New("configuration authority locator conflicts")
 		}
-		// Reconciliation may deliberately return conflict after durably marking
-		// ambiguous evidence. The retained desired generation still supplies the
-		// only safe composition input, while the gate remains closed.
+		// An ambiguous apply may deliberately return conflict after durably
+		// recording its terminal evidence. Unresolved historical recovery evidence
+		// is never composable and requires replacing the disposable runtime.
 		initialized, initializeErr := service.Initialize(context.Background())
-		if initializeErr != nil && (initialized.Incomplete == nil || initialized.Incomplete.State != application.ConfigurationApplyAmbiguous) && (initialized.IncompleteRecovery == nil || initialized.IncompleteRecovery.State != application.ConfigurationRecoveryAmbiguous) {
+		if initializeErr != nil && (initialized.Incomplete == nil || initialized.Incomplete.State != application.ConfigurationApplyAmbiguous) {
 			return bootstrap.Bootstrap{}, errors.New("configuration authority reconciliation failed")
 		}
 		authority, found, err = store.ConfigurationAuthority(context.Background())

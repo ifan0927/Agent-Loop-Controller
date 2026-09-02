@@ -3,10 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -478,11 +479,22 @@ func TestManagedConfigDraftCLIIsolatedTypedApplyAndConvergence(t *testing.T) {
 	}
 }
 
-func TestManagedConfigRecoveryCLIProjectsAndRestoresExactDesiredBytes(t *testing.T) {
+func TestManagedConfigRecoveryCLIIsRetiredBeforeComposition(t *testing.T) {
+	root := resolvedTempDir(t)
+	configPath := filepath.Join(root, "missing-controller.json")
+	err := configCommand([]string{"recover", "restore", "--config", configPath})
+	if err == nil || !strings.Contains(err.Error(), "usage: agentctl config") {
+		t.Fatalf("retired recovery command err=%v", err)
+	}
+	if _, statErr := os.Stat(configPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("retired command composed configuration: %v", statErr)
+	}
+}
+
+func TestManagedConfigStatusReportsDriftWithoutRecoveryAuthorityOrMutation(t *testing.T) {
 	root := resolvedTempDir(t)
 	configPath, databasePath := writeCurrentManagedDraftConfig(t, root)
-	baseline, err := loadManagedConfiguration(configPath)
-	if err != nil {
+	if _, err := loadManagedConfiguration(configPath); err != nil {
 		t.Fatal(err)
 	}
 	desired, err := os.ReadFile(configPath)
@@ -501,81 +513,41 @@ func TestManagedConfigRecoveryCLIProjectsAndRestoresExactDesiredBytes(t *testing
 	if err := os.WriteFile(configPath, drift, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	requester := managedDraftRequesterArgs(configPath)
-	if _, err := captureConfigOutput(func() error {
-		return configCommand(append([]string{"status"}, []string{"--config", configPath, "--requester", "intruder", "--requester-database-id", "44", "--requester-node-id", "USER_44", "--requester-type", "User"}...))
-	}); err == nil || !strings.Contains(err.Error(), "not_found") {
-		t.Fatalf("unauthorized status err=%v", err)
-	}
-	statusOutput, err := captureConfigOutput(func() error { return configCommand(append([]string{"status"}, requester...)) })
+	output, err := captureConfigOutput(func() error {
+		return configCommand(append([]string{"status"}, managedDraftRequesterArgs(configPath)...))
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var status application.ManagedConfigurationStatus
-	if err := json.Unmarshal([]byte(statusOutput), &status); err != nil || status.Recovery == nil || status.Recovery.Action != application.ConfigurationRecoveryActionRestore || status.Recovery.ExpectedGenerationID != 1 || status.Recovery.ExpectedDigest != baseline.Digest {
-		t.Fatalf("status=%+v output=%s err=%v", status, statusOutput, err)
+	if err := json.Unmarshal([]byte(output), &status); err != nil || status.Convergence.State != application.ConfigurationConflict || status.Convergence.Reason != application.ConfigurationReasonExternalDrift || status.Convergence.NextAction != application.ConfigurationActionRecoverAuthority {
+		t.Fatalf("status=%+v output=%s err=%v", status, output, err)
 	}
-	recoveryArgs := append([]string{"recover", "restore"}, requester...)
-	recoveryArgs = append(recoveryArgs,
-		"--expected-generation-id", "1",
-		"--expected-digest", status.Recovery.ExpectedDigest,
-		"--expected-authority-version", strconv.FormatInt(status.Recovery.ExpectedAuthorityVersion, 10),
-		"--observed-digest", status.Recovery.ObservedDigest,
-	)
-	recoveryOutput, err := captureConfigOutput(func() error { return configCommand(recoveryArgs) })
+	if strings.Contains(output, `"recovery"`) || strings.Contains(output, "observed_digest") {
+		t.Fatalf("status projected retired recovery authority: %s", output)
+	}
+	if live, err := os.ReadFile(configPath); err != nil || !bytes.Equal(live, drift) {
+		t.Fatalf("drifted live configuration changed: %q err=%v", live, err)
+	}
+	db, err := sql.Open("sqlite", databasePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var recovered application.ConfigurationRecoveryResult
-	if err := json.Unmarshal([]byte(recoveryOutput), &recovered); err != nil || recovered.Recovery.State != application.ConfigurationRecoveryCommitted || recovered.Receipt.OperationType != application.OperationRestoreConfiguration || recovered.Receipt.Outcome != application.OperationOutcomeSucceeded {
-		t.Fatalf("recovered=%+v output=%s err=%v", recovered, recoveryOutput, err)
-	}
-	if live, err := os.ReadFile(configPath); err != nil || !bytes.Equal(live, desired) {
-		t.Fatalf("live differs from desired: live=%q err=%v", live, err)
-	}
-	replayOutput, err := captureConfigOutput(func() error { return configCommand(recoveryArgs) })
-	if err != nil {
+	defer db.Close()
+	var intents, receipts int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM configuration_recovery_intents`).Scan(&intents); err != nil {
 		t.Fatal(err)
 	}
-	var replayed application.ConfigurationRecoveryResult
-	if err := json.Unmarshal([]byte(replayOutput), &replayed); err != nil || replayed.Receipt.OperationID != recovered.Receipt.OperationID || replayed.Recovery.AcceptedAt != recovered.Recovery.AcceptedAt {
-		t.Fatalf("replay=%+v output=%s err=%v", replayed, replayOutput, err)
-	}
-	store, err := sqlitestore.Open(databasePath)
-	if err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM operation_receipts WHERE operation_type='restore_configuration'`).Scan(&receipts); err != nil {
 		t.Fatal(err)
 	}
-	if generations, err := store.ListConfigurationGenerations(context.Background()); err != nil || len(generations) != 1 {
-		store.Close()
-		t.Fatalf("generations=%+v err=%v", generations, err)
-	}
-	_ = store.Close()
-
-	if err := os.WriteFile(configPath, drift, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	secondStatusOutput, err := captureConfigOutput(func() error { return configCommand(append([]string{"status"}, requester...)) })
-	if err != nil {
-		t.Fatal(err)
-	}
-	var secondStatus application.ManagedConfigurationStatus
-	if err := json.Unmarshal([]byte(secondStatusOutput), &secondStatus); err != nil || secondStatus.Recovery == nil || secondStatus.Recovery.ObservedDigest != status.Recovery.ObservedDigest || secondStatus.Recovery.ExpectedAuthorityVersion <= status.Recovery.ExpectedAuthorityVersion {
-		t.Fatalf("second status=%+v output=%s err=%v", secondStatus, secondStatusOutput, err)
-	}
-	if _, err := captureConfigOutput(func() error { return configCommand(recoveryArgs) }); err == nil || !strings.Contains(err.Error(), "conflict") {
-		t.Fatalf("old occurrence replay err=%v", err)
-	}
-	for _, output := range []string{statusOutput, recoveryOutput, replayOutput, secondStatusOutput} {
-		for _, sensitive := range []string{root, databasePath, string(desired), string(drift), "private-key-material", "secret://"} {
-			if strings.Contains(output, sensitive) {
-				t.Fatalf("recovery output leaked %q: %s", sensitive, output)
-			}
-		}
+	if intents != 0 || receipts != 0 {
+		t.Fatalf("retired recovery persistence intents=%d receipts=%d", intents, receipts)
 	}
 }
 
 func TestManagedConfigDraftCLIRequiresCompleteRequesterForEveryOperation(t *testing.T) {
-	for _, args := range [][]string{{"status"}, {"recover", "restore", "--expected-generation-id", "1", "--expected-digest", strings.Repeat("a", 64), "--expected-authority-version", "2", "--observed-digest", strings.Repeat("b", 64)}, {"rollback", "sources"}, {"rollback", "open", "--source-generation-id", "1", "--source-digest", strings.Repeat("a", 64), "--expected-generation-id", "2", "--expected-digest", strings.Repeat("b", 64)}, {"draft", "open"}, {"draft", "show", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1"}, {"draft", "set", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1", "--heavy-capacity", "2"}, {"draft", "validate", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1"}, {"draft", "preview", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1"}, {"draft", "apply", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1"}, {"draft", "discard", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1"}} {
+	for _, args := range [][]string{{"status"}, {"rollback", "sources"}, {"rollback", "open", "--source-generation-id", "1", "--source-digest", strings.Repeat("a", 64), "--expected-generation-id", "2", "--expected-digest", strings.Repeat("b", 64)}, {"draft", "open"}, {"draft", "show", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1"}, {"draft", "set", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1", "--heavy-capacity", "2"}, {"draft", "validate", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1"}, {"draft", "preview", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1"}, {"draft", "apply", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1"}, {"draft", "discard", "--draft-id", "configuration-draft-00000000000000000000000000000001", "--revision", "1"}} {
 		if err := configCommand(args); err == nil || !strings.Contains(err.Error(), "complete requester") {
 			t.Fatalf("args=%v err=%v", args, err)
 		}

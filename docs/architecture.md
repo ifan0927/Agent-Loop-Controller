@@ -759,28 +759,30 @@ The resulting finite projection is
 `ready`, `restart_required`, `starting`, `stale`, `offline`, `unknown`, or
 `conflict`, separate from worker activity and capacity.
 
-Safely readable external drift has one narrower recovery action. After
-Controller authorization, status may expose only the current desired
-generation/digest, configuration authority version, and exact observed live
-digest needed for `restore_configuration` compare-and-swap. The command
-reauthorizes and recomputes that evidence immediately before atomically
-persisting one recovery intent and generic Controller-scope receipt. Apply and
-restore acceptance are mutually exclusive in SQLite and share the stable
-filesystem-root mutation lock. Restore exchanges the exact accepted observed
-file for the retained exact desired bytes; it neither creates a generation nor
-adopts or retains external bytes. Startup and every pre-mutation reconciliation
-resume only an already-accepted observed digest under the same operation ID.
-Exact desired evidence settles success; a third digest or unsafe or
-contradictory stage settles ambiguous, preserves the required private evidence,
-and keeps admission fenced. Successful settlement records one
-`drift_cleared` transition, advances configuration authority version, and then
-reuses the ordinary runtime convergence projection. A later recurrence must
-first establish newer drift authority and cannot replay the earlier receipt.
+External configuration drift has no in-place recovery action. Safely readable
+drift remains a sanitized `external_config_drift` conflict with
+`recover_configuration_authority` as the non-executable operator direction;
+unsafe drift remains fail-closed. Neither status nor another application port
+projects restore authority, and the Controller never restores, adopts, imports,
+rebinds, or overwrites the live file. New admission and configuration or
+repository-topology mutation remain fenced. The supported response for this
+single-user local installation is to stop and replace the complete disposable
+runtime through normal fresh installation and onboarding.
+
+Schema-v34 recovery intents and `restore_configuration` receipts remain
+immutable historical evidence. Committed evidence stays readable through
+receipt/history, activity backfill, configuration history, and integrity.
+Accepted or ambiguous historical evidence remains an unresolved authority
+blocker: production composition fails before filesystem replacement or
+persistence settlement, while read and integrity paths remain available.
+Current application and SQLite producer/mutator boundaries reject the retired
+receipt type. No migration rewrites or deletes the historical table, triggers,
+constraints, registry membership, or rows.
 
 The typed lifecycle adapter adds one Controller-wide durable normal or
 rollback-origin scalar draft without adding another configuration transaction.
 Repository removal uses an exclusive source-bound draft lane and cannot overlap
-that scalar draft, apply, or recovery authority. Controller authorization happens
+that scalar draft, apply, or unresolved historical recovery authority. Controller authorization happens
 before every draft lookup. Revision compare-and-swap plus the last closed edit
 digest provides exact lost-response replay, while a different edit at the same
 revision conflicts. SQLite stores only the nine allowlisted timeout/admission
@@ -1947,7 +1949,7 @@ around it. The principal table groups are:
 | `operation_receipts` | Scope-neutral accepted/applied/observed operation identity, outcome, and sanitized result evidence; legacy operator actions are backfilled and mirrored here |
 | `activity_events`, operation links, backfill progress, and runtime classification state | Immutable sanitized activity snapshots, one-primary-event receipt correlation, stable ingestion watermarks, bounded restart progress, and explicit coverage evidence; never workflow authority |
 | integrity registry, generation/revision, scan, explicit-recheck binding/active/guard, checked-family, finding, observation, and current-pointer tables | Closed SQLite-only invariant registry, semantic mutation coverage with a freshness-only runtime-state exception, one restart-safe bounded scan lane plus a single transaction-fenced full-family convergence fallback, receipt-bound post-acceptance rechecks, exact transaction-only finalization suppression, immutable mutation-fenced observations, and sanitized explanatory findings; never workflow or repair authority |
-| configuration generation, authority, apply/recovery-intent, and convergence tables | Immutable desired/effective metadata, one Controller-wide CAS mutation authority, crash reconciliation state, optional immutable rollback-source identity, and meaningful sanitized transitions; raw desired bytes remain outside SQLite and external bytes are never stored |
+| configuration generation, authority, apply/recovery-intent, and convergence tables | Immutable desired/effective metadata, one Controller-wide CAS mutation authority, apply crash reconciliation state, optional immutable rollback-source identity, and meaningful sanitized transitions; the recovery-intent table is read-only historical compatibility evidence and unresolved rows remain blockers; raw desired bytes remain outside SQLite and external bytes are never stored |
 | `configuration_drafts` | At most one active Controller-wide normal or rollback-origin typed draft, revision/edit replay authority, immutable rollback source when applicable, sanitized validation/preview evidence, and generation/receipt settlement; no raw candidate, path, identity, or credential authority |
 | repository lifecycle, readiness, recheck, and removal tables | Immutable incarnation history, one current canonical/profile/binding authority, complete readiness evidence, exclusive source-bound removal draft and accepted/applied/observed settlement, and tombstone evidence; no external-resource deletion authority |
 | repository onboarding, onboarding-step, and step-claim tables | One active canonical repository/source-path digest, one of two closed kind-specific step plans, a positive durable current-step attempt, one active versioned execution claim per step attempt, retained supersession/settlement history, sanitized preflight/preview bindings and exact initial SHA, ordered intent-before-effect settlements, monotonic partial-progress recovery, and final disabled incarnation/readiness evidence; supervisor IDs, execution nonces, claim digests, exact source paths, and raw Git/remote output remain outside public projections |
@@ -2067,7 +2069,7 @@ resolution is not approval, and an approval for an old head is stale.
 - GitHub API writes require a narrowly permissioned selected-repository App;
   empty-repository base publication is the separate guarded host-SSH Git
   transport described above.
-- Unsafe or ambiguous configuration recovery, explicit integrity recheck,
+- In-place external configuration recovery, explicit integrity recheck,
   the local TUI, optional HTTP/Web adapters,
   notification transport, Hermes runtime integration, public API, webhooks,
   and multi-tenant authorization are not implemented.

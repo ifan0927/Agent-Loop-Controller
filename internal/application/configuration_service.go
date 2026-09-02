@@ -19,19 +19,17 @@ type configurationPersistence interface {
 }
 
 type ConfigurationService struct {
-	store         configurationPersistence
-	recoveryStore ConfigurationRecoveryStore
-	files         ConfigurationFileAuthority
-	runtime       ConfigurationRuntimeObserver
-	now           func() time.Time
+	store   configurationPersistence
+	files   ConfigurationFileAuthority
+	runtime ConfigurationRuntimeObserver
+	now     func() time.Time
 }
 
 func NewConfigurationService(store configurationPersistence, files ConfigurationFileAuthority, runtime ConfigurationRuntimeObserver) (*ConfigurationService, error) {
 	if store == nil || files == nil {
 		return nil, errors.New("configuration authority dependencies are required")
 	}
-	recoveryStore, _ := store.(ConfigurationRecoveryStore)
-	return &ConfigurationService{store: store, recoveryStore: recoveryStore, files: files, runtime: runtime, now: func() time.Time { return time.Now().UTC() }}, nil
+	return &ConfigurationService{store: store, files: files, runtime: runtime, now: func() time.Time { return time.Now().UTC() }}, nil
 }
 
 // Initialize adopts one valid unmanaged live configuration or reconciles the
@@ -127,7 +125,7 @@ func (s *ConfigurationService) Reconcile(ctx context.Context) (ConfigurationAuth
 		return authority, nil
 	}
 	if authority.IncompleteRecovery != nil {
-		return s.reconcileRecovery(ctx, authority, *authority.IncompleteRecovery)
+		return authority, serviceError(ErrorConflict, "configuration recovery evidence requires runtime replacement", nil)
 	}
 	intent := *authority.Incomplete
 	if intent.State == ConfigurationApplyAmbiguous {

@@ -300,31 +300,6 @@ type ConfigurationNoOpSettlement struct {
 	SettledAt            time.Time
 }
 
-type ConfigurationRecoveryAcceptance struct {
-	DesiredGenerationID int64
-	DesiredDigest       string
-	AuthorityVersion    int64
-	ObservedDigest      string
-	Requester           domain.GitHubUserIdentity
-	Receipt             OperationReceipt
-	AcceptedAt          time.Time
-}
-
-type ConfigurationRecoverySettlement struct {
-	OperationID    string
-	Outcome        ConfigurationRecoveryState
-	Reason         ConfigurationReason
-	EvidenceDigest string
-	SettledAt      time.Time
-}
-
-type ConfigurationRecoveryStore interface {
-	ConfigurationRecoveryIntent(context.Context, string) (ConfigurationRecoveryIntent, bool, error)
-	ConfigurationRecoveryIsLatest(context.Context, string, int64) (bool, error)
-	BeginConfigurationRecovery(context.Context, ConfigurationRecoveryAcceptance) (ConfigurationRecoveryIntent, OperationReceipt, bool, error)
-	SettleConfigurationRecovery(context.Context, ConfigurationRecoverySettlement) (ConfigurationAuthority, ConfigurationRecoveryIntent, OperationReceipt, bool, error)
-}
-
 type ConfigurationGenerationStore interface {
 	ConfigurationAuthority(context.Context) (ConfigurationAuthority, bool, error)
 	PrepareConfigurationBaseline(context.Context, ConfigurationBaselineInput) error
@@ -355,23 +330,9 @@ type ConfigurationFileAuthority interface {
 	AcquireReplacement(string) (ConfigurationReplacementLock, bool, error)
 	ReplaceLive(string, []byte, []byte) error
 	ReconcileReplacement(string, []byte, []byte) ([]byte, ValidatedConfigurationCandidate, error)
-	ReconcileRestore(string, string, []byte) (ConfigurationRestoreFileObservation, error)
 	RemoveRaw(string) error
 	ListRawDigests() ([]string, error)
 	PublishLocator(string) error
-}
-
-type ConfigurationRestoreFileState string
-
-const (
-	ConfigurationRestoreFileDesired ConfigurationRestoreFileState = "desired"
-	ConfigurationRestoreFileThird   ConfigurationRestoreFileState = "third_digest"
-	ConfigurationRestoreFileUnsafe  ConfigurationRestoreFileState = "unsafe"
-)
-
-type ConfigurationRestoreFileObservation struct {
-	State  ConfigurationRestoreFileState
-	Digest string
 }
 
 type ConfigurationReplacementLock interface {
@@ -395,35 +356,6 @@ type ConfigurationApplyResult struct {
 	Generation ConfigurationGeneration `json:"generation"`
 	Receipt    OperationReceipt        `json:"receipt"`
 	NoOp       bool                    `json:"no_op"`
-}
-
-type ConfigurationRecoveryAction string
-
-const ConfigurationRecoveryActionRestore ConfigurationRecoveryAction = "restore"
-
-type ConfigurationRecoveryOffer struct {
-	State                    string                      `json:"state"`
-	Reason                   ConfigurationReason         `json:"reason"`
-	Action                   ConfigurationRecoveryAction `json:"action"`
-	ExpectedGenerationID     int64                       `json:"expected_generation_id"`
-	ExpectedDigest           string                      `json:"expected_digest"`
-	ExpectedAuthorityVersion int64                       `json:"expected_authority_version"`
-	ObservedDigest           string                      `json:"observed_digest"`
-	ObservedAt               time.Time                   `json:"observed_at"`
-}
-
-type ConfigurationRecoveryCommand struct {
-	Requester                Requester
-	ExpectedGenerationID     int64
-	ExpectedDigest           string
-	ExpectedAuthorityVersion int64
-	ObservedDigest           string
-}
-
-type ConfigurationRecoveryResult struct {
-	Recovery    ConfigurationRecoveryIntent        `json:"recovery"`
-	Receipt     OperationReceipt                   `json:"receipt"`
-	Convergence ConfigurationConvergenceProjection `json:"convergence"`
 }
 
 type ConfigurationConvergenceProjection struct {

@@ -213,8 +213,9 @@ legal-action offers are implemented. Activity-independent worker heartbeat,
 controller-authorized runtime observation, configuration generation/CAS, and
 desired/effective convergence fencing are also implemented, together with the
 normal typed-change draft/preview/apply slice and Controller-owned forward
-rollback, plus exact safe external-drift recovery with durable receipt replay
-and no new generation. Repository lifecycle, readiness, guarded retirement,
+rollback. External configuration drift now fails closed and requires replacing
+the complete disposable local runtime; no in-place restore command remains.
+Repository lifecycle, readiness, guarded retirement,
 zero-repository disabled-admission operation, admission fencing, and the
 restart-safe existing-checkout onboarding saga and restart-safe empty-repository
 initialization are also implemented. The latter derives a Controller-owned

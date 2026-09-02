@@ -107,18 +107,20 @@ func TestOperationReceiptSeparatesPhaseFromOutcome(t *testing.T) {
 	}
 }
 
-func TestOperationReceiptServiceRejectsRetiredCleanupSourceProducer(t *testing.T) {
-	store := &retiredOperationReceiptStore{}
-	service, err := NewOperationReceiptService(store)
-	if err != nil {
-		t.Fatal(err)
-	}
-	input := OperationReceiptInput{OperationType: OperationRecoverCleanupSource, Scope: ScopeRun, TargetID: "run", Requester: domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}, RequestDigest: strings.Repeat("a", 64), ExpectedAuthorityDigest: strings.Repeat("b", 64), OperationAnchorDigest: strings.Repeat("d", 64), TargetBindingDigest: strings.Repeat("c", 64), AcceptedAt: time.Date(2026, 8, 31, 1, 0, 0, 0, time.UTC)}
-	if _, _, err := service.Accept(context.Background(), input); err == nil || store.began {
-		t.Fatalf("retired operation accepted=%t err=%v", store.began, err)
-	}
-	if err := ValidateOperationReceipt(NewOperationReceipt(input)); err != nil {
-		t.Fatalf("historical receipt is no longer readable: %v", err)
+func TestOperationReceiptServiceRejectsRetiredProducersButValidatesHistory(t *testing.T) {
+	for _, operationType := range []OperationType{OperationRecoverCleanupSource, OperationRestoreConfiguration} {
+		store := &retiredOperationReceiptStore{}
+		service, err := NewOperationReceiptService(store)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := OperationReceiptInput{OperationType: operationType, Scope: ScopeRun, TargetID: "run", Requester: domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}, RequestDigest: strings.Repeat("a", 64), ExpectedAuthorityDigest: strings.Repeat("b", 64), OperationAnchorDigest: strings.Repeat("d", 64), TargetBindingDigest: strings.Repeat("c", 64), AcceptedAt: time.Date(2026, 8, 31, 1, 0, 0, 0, time.UTC)}
+		if _, _, err := service.Accept(context.Background(), input); err == nil || store.began {
+			t.Fatalf("retired operation=%s accepted=%t err=%v", operationType, store.began, err)
+		}
+		if err := ValidateOperationReceipt(NewOperationReceipt(input)); err != nil {
+			t.Fatalf("historical operation=%s is no longer readable: %v", operationType, err)
+		}
 	}
 }
 

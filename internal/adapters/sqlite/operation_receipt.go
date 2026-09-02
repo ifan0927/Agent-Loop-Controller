@@ -13,7 +13,7 @@ import (
 const operationReceiptSelect = `SELECT operation_id,authority_key,operation_anchor_digest,operation_type,scope_kind,target_id,requester_login,requester_database_id,requester_node_id,requester_actor_type,request_digest,expected_authority_digest,target_binding_digest,phase,outcome,resulting_authority_digest,resulting_state,resulting_version,evidence_digest,result_digest,accepted_at,applied_at,settled_at FROM operation_receipts`
 
 func (s *Store) BeginOperationReceipt(ctx context.Context, receipt application.OperationReceipt) (application.OperationReceipt, bool, error) {
-	if receipt.OperationType == application.OperationRecoverCleanupSource {
+	if receipt.OperationType == application.OperationRecoverCleanupSource || receipt.OperationType == application.OperationRestoreConfiguration {
 		return application.OperationReceipt{}, false, errors.New("retired operation receipt is read-only")
 	}
 	if err := application.ValidateOperationReceipt(receipt); err != nil {
@@ -47,7 +47,7 @@ func (s *Store) BeginOperationReceipt(ctx context.Context, receipt application.O
 }
 
 func insertOperationReceiptTx(ctx context.Context, tx *sql.Tx, receipt application.OperationReceipt, sourceActionID string) error {
-	if receipt.OperationType == application.OperationRecoverCleanupSource {
+	if receipt.OperationType == application.OperationRecoverCleanupSource || receipt.OperationType == application.OperationRestoreConfiguration {
 		return errors.New("retired operation receipt is read-only")
 	}
 	if err := application.ValidateOperationReceipt(receipt); err != nil {
@@ -74,7 +74,7 @@ func (s *Store) AdvanceOperationReceipt(ctx context.Context, mutation applicatio
 		}
 		return application.OperationReceipt{}, false, err
 	}
-	if receipt.OperationType == application.OperationRecoverCleanupSource {
+	if receipt.OperationType == application.OperationRecoverCleanupSource || receipt.OperationType == application.OperationRestoreConfiguration {
 		return application.OperationReceipt{}, false, errors.New("retired operation receipt is read-only")
 	}
 	if sameOperationReceiptMutation(receipt, mutation) {
