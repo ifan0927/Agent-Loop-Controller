@@ -112,7 +112,7 @@ func TestOperationReceiptSeparatesPhaseFromOutcome(t *testing.T) {
 }
 
 func TestOperationReceiptServiceRejectsRetiredProducersButValidatesHistory(t *testing.T) {
-	for _, operationType := range []OperationType{OperationRecoverCleanupSource, OperationRestoreConfiguration} {
+	for _, operationType := range []OperationType{OperationRecoverCIWait, OperationRecoverCleanupSource, OperationRestoreConfiguration} {
 		store := &retiredOperationReceiptStore{}
 		service, err := NewOperationReceiptService(store)
 		if err != nil {
@@ -128,12 +128,12 @@ func TestOperationReceiptServiceRejectsRetiredProducersButValidatesHistory(t *te
 	}
 }
 
-func TestEveryLegalOperatorActionProjectsToTheCommonReceiptContract(t *testing.T) {
+func TestEveryLiveOperatorActionProjectsToTheCommonReceiptContract(t *testing.T) {
 	requester := Requester{ID: "operator", Kind: "github_login", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
 	authority := strings.Repeat("b", 64)
 	binding := strings.Repeat("c", 64)
 	now := time.Date(2026, 8, 13, 1, 0, 0, 0, time.UTC)
-	for _, operationType := range []OperationType{OperationDecide, OperationRetry, OperationAbandon, OperationRecoverCIWait, OperationRecoverOwnedPush, OperationAcceptExternalMerge} {
+	for _, operationType := range []OperationType{OperationDecide, OperationRetry, OperationAbandon, OperationRecoverOwnedPush, OperationAcceptExternalMerge} {
 		action := newOperatorActionRecord(OperatorActionInput{Requester: requester, RunID: "run", Repository: "owner/repo", ExpectedState: domain.StateManualIntervention, RunIdempotencyKey: "run-key", TransitionSequence: 9, ActionType: OperatorActionType(operationType), ReasonCode: "operator_attention", AttentionEventKey: "attention-key", RequestDigest: NoOperationInputDigest(), ExpectedAuthorityDigest: authority}, now)
 		receipt, err := OperationReceiptForOperatorAction(action, binding)
 		if err != nil || receipt.OperationType != operationType || receipt.Scope != ScopeRun || receipt.TargetID != action.RunID || receipt.Phase != OperationPhaseAccepted || receipt.Outcome != OperationOutcomePending {

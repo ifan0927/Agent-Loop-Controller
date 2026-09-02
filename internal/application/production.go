@@ -57,6 +57,7 @@ type ProductionCoordinator struct {
 	controller        LocalRunController
 	commands          CommandService
 	store             RunStore
+	progress          RunProgressEvidenceStore
 	publisher         OperatorAttentionPublisher
 	abandonCleanupTTL time.Duration
 }
@@ -64,6 +65,7 @@ type ProductionCoordinator struct {
 type productionStore interface {
 	RunStore
 	OperatorAttentionPublisher
+	RunProgressEvidenceStore
 }
 
 type findingRepairController interface {
@@ -78,7 +80,7 @@ func NewProductionCoordinator(admission *LinearAdmissionService, controller Loca
 	if admission == nil || controller == nil || store == nil {
 		return nil, errors.New("production coordinator dependencies are required")
 	}
-	return &ProductionCoordinator{admission: admission, controller: controller, commands: NewCommandService(controller, store), store: store, publisher: store}, nil
+	return &ProductionCoordinator{admission: admission, controller: controller, commands: NewCommandService(controller, store), store: store, progress: store, publisher: store}, nil
 }
 
 func (c *ProductionCoordinator) ReconcileInterruptedRun(ctx context.Context, runID string) error {
@@ -90,6 +92,9 @@ func (c *ProductionCoordinator) ReconcileInterruptedRun(ctx context.Context, run
 }
 
 func (c *ProductionCoordinator) Continue(ctx context.Context, command ProductionContinueCommand) (_result ProductionResult, _err error) {
+	if err := c.requireRunProgressAdmission(ctx, command.RunID); err != nil {
+		return ProductionResult{}, err
+	}
 	defer c.publishManualInterventionOnReturn(ctx, command.RunID, &_err)
 	var cancelAction context.CancelFunc = func() {}
 	defer func() { cancelAction() }()
@@ -178,6 +183,9 @@ func (c *ProductionCoordinator) Continue(ctx context.Context, command Production
 }
 
 func (c *ProductionCoordinator) ReconcileGitHub(ctx context.Context, command ProductionReconcileCommand, reader GitHubReadPort) (_result ProductionResult, _err error) {
+	if err := c.requireRunProgressAdmission(ctx, command.RunID); err != nil {
+		return ProductionResult{}, err
+	}
 	defer c.publishManualInterventionOnReturn(ctx, command.RunID, &_err)
 	run, linearCompleted, err := c.admission.RevalidateForGitHubReconcile(ctx, LinearRevalidateCommand{Requester: command.Requester, RunID: command.RunID, Repository: command.Repository, ExpectedState: command.ExpectedState, IdempotencyKey: command.IdempotencyKey})
 	if err != nil {
@@ -207,6 +215,27 @@ func (c *ProductionCoordinator) ReconcileGitHub(ctx context.Context, command Pro
 		reason = result.Reason
 	}
 	return ProductionResult{Action: next, Run: projectRunResult(run), Head: result.Head, Reason: reason}, nil
+}
+
+func (c *ProductionCoordinator) requireRunProgressAdmission(ctx context.Context, runID string) error {
+	if runID == "" {
+		return nil
+	}
+	run, err := c.store.GetRun(ctx, runID)
+	if err != nil {
+		return classifyServiceError(err)
+	}
+	if c.progress == nil {
+		return serviceError(ErrorInternal, "run progress evidence is unavailable", nil)
+	}
+	admission, err := EvaluateRunProgressAdmission(ctx, c.progress, run)
+	if err != nil {
+		return classifyServiceError(err)
+	}
+	if !admission.Allowed {
+		return serviceError(ErrorConflict, "run progress is blocked by unresolved historical recovery evidence", nil)
+	}
+	return nil
 }
 
 func (c *ProductionCoordinator) publishManualInterventionOnReturn(ctx context.Context, runID string, resultErr *error) {

@@ -33,7 +33,6 @@ const (
 	LegalActionConsequenceResumeExecution     LegalActionConsequence = "resume_execution"
 	LegalActionConsequenceScheduleRetry       LegalActionConsequence = "schedule_retry"
 	LegalActionConsequenceTerminateRun        LegalActionConsequence = "terminate_run"
-	LegalActionConsequenceRefreshCIEvidence   LegalActionConsequence = "refresh_ci_evidence"
 	LegalActionConsequenceReturnToPushGate    LegalActionConsequence = "return_to_push_gate"
 	LegalActionConsequenceAcceptExistingMerge LegalActionConsequence = "accept_existing_merge"
 )
@@ -286,31 +285,6 @@ func (s *LegalActionService) ExecuteAbandon(ctx context.Context, command LegalAc
 	return s.receiptForRunAction(ctx, run.ID, OperatorActionAbandon)
 }
 
-func (s *LegalActionService) ExecuteCIWaitRecovery(ctx context.Context, command LegalActionExecutionCommand, revalidator CIWaitRecoveryLinearRevalidator, reader GitHubReadPort, local CIWaitLocalAuthorityPort) (OperationReceipt, error) {
-	offer, run, err := s.ResolveLegalActionOffer(ctx, command.Requester, command.OfferID, OperationRecoverCIWait)
-	if err != nil {
-		return OperationReceipt{}, err
-	}
-	ctx = withLegalActionExecutionAuthority(ctx, offer)
-	if receipt, action, found, lookupErr := s.actionReceiptForOffer(ctx, run, offer); lookupErr != nil {
-		return OperationReceipt{}, lookupErr
-	} else if found && action.Status == OperatorActionStatusObserved {
-		return receipt, nil
-	}
-	store, ok := s.store.(CIWaitRecoveryStore)
-	if !ok {
-		return OperationReceipt{}, serviceError(ErrorInternal, "CI wait recovery store is unavailable", nil)
-	}
-	service, err := NewCIWaitRecoveryService(store, revalidator)
-	if err != nil {
-		return OperationReceipt{}, serviceError(ErrorInternal, "CI wait recovery is unavailable", err)
-	}
-	if _, err := service.Recover(ctx, CIWaitRecoveryCommand{Requester: command.Requester, RunID: run.ID}, reader, local); err != nil {
-		return OperationReceipt{}, err
-	}
-	return s.receiptForRunAction(ctx, run.ID, OperatorActionRecoverCIWait)
-}
-
 func (s *LegalActionService) ExecuteOwnedPushRecovery(ctx context.Context, command LegalActionExecutionCommand, coordinator *ProductionCoordinator) (OperationReceipt, error) {
 	if coordinator == nil {
 		return OperationReceipt{}, serviceError(ErrorInternal, "owned push recovery is unavailable", nil)
@@ -473,9 +447,6 @@ func legalActionIDsForInspection(run Run, inspection RunInspection, event Operat
 		return []OperatorAttentionActionID{}
 	}
 	candidates := allowedOperatorAttentionActionsFor(event.EventType, event.ControllerState, event.ReasonCode, event.RetryFailureClass)
-	if schedule, found := retryScheduleForPhase(inspection.RetrySchedules, AutomaticRetryPhaseForRun(run)); found && validateLegacyCIWaitRecovery(inspection, schedule) == nil {
-		candidates = append(candidates, OperatorAttentionActionRecoverCIWait)
-	}
 	if event.EventType == OperatorAttentionManualIntervention && run.State == domain.StateManualIntervention {
 		if validOwnedPushRecoveryOffer(run, inspection) {
 			candidates = append(candidates, OperatorAttentionActionRecoverOwnedPush)
@@ -502,13 +473,6 @@ func legalActionIDsForInspection(run Run, inspection RunInspection, event Operat
 			transition, err := latestHumanDecisionTransition(inspection)
 			if err != nil || transition.Sequence != latestTransitionSequence(inspection.Timeline) || transition.To != run.State {
 				continue
-			}
-		case OperatorAttentionActionRecoverCIWait:
-			if event.EventType != OperatorAttentionCIWaitRecovery || !slices.Contains(event.AllowedActions, OperatorAttentionActionRecoverCIWait) {
-				schedule, found := retryScheduleForPhase(inspection.RetrySchedules, AutomaticRetryPhaseForRun(run))
-				if !found || validateLegacyCIWaitRecovery(inspection, schedule) != nil {
-					continue
-				}
 			}
 		case OperatorAttentionActionRecoverOwnedPush:
 			if !validOwnedPushRecoveryOffer(run, inspection) {
@@ -567,8 +531,6 @@ func legalActionOfferFor(action OperatorAttentionActionID, run Run, event Operat
 		offer.Reason, offer.Confirmation, offer.Consequence = "retry_budget_exhausted", LegalActionConfirmationNone, LegalActionConsequenceScheduleRetry
 	case OperatorAttentionActionAbandon:
 		offer.Reason, offer.Confirmation, offer.Consequence = "graceful_abandon", LegalActionConfirmationDanger, LegalActionConsequenceTerminateRun
-	case OperatorAttentionActionRecoverCIWait:
-		offer.Reason, offer.Confirmation, offer.Consequence = "legacy_ci_topology_drift", LegalActionConfirmationConfirm, LegalActionConsequenceRefreshCIEvidence
 	case OperatorAttentionActionRecoverOwnedPush:
 		offer.Reason, offer.Confirmation, offer.Consequence = "owned_push_recovery", LegalActionConfirmationConfirm, LegalActionConsequenceReturnToPushGate
 	case OperatorAttentionActionAcceptExternalMerge:
@@ -620,7 +582,7 @@ func validateLegalActionOffer(offer LegalActionOffer) error {
 	if !strings.HasPrefix(offer.OfferID, "legal-offer-") || !validOperationType(offer.Action) || offer.Scope != ScopeRun || strings.TrimSpace(offer.TargetID) == "" || strings.TrimSpace(offer.RepositoryProfileID) == "" || !validAuthorityDigest(offer.AuthorityDigest) || !validAuthorityDigest(offer.EvidenceDigest) {
 		return errors.New("legal action offer authority is invalid")
 	}
-	if !slices.Contains([]LegalActionConfirmation{LegalActionConfirmationNone, LegalActionConfirmationInput, LegalActionConfirmationConfirm, LegalActionConfirmationDanger}, offer.Confirmation) || !slices.Contains([]LegalActionInputKind{LegalActionInputNone, LegalActionInputDecision}, offer.InputKind) || !slices.Contains([]LegalActionConsequence{LegalActionConsequenceResumeExecution, LegalActionConsequenceScheduleRetry, LegalActionConsequenceTerminateRun, LegalActionConsequenceRefreshCIEvidence, LegalActionConsequenceReturnToPushGate, LegalActionConsequenceAcceptExistingMerge}, offer.Consequence) {
+	if !slices.Contains([]LegalActionConfirmation{LegalActionConfirmationNone, LegalActionConfirmationInput, LegalActionConfirmationConfirm, LegalActionConfirmationDanger}, offer.Confirmation) || !slices.Contains([]LegalActionInputKind{LegalActionInputNone, LegalActionInputDecision}, offer.InputKind) || !slices.Contains([]LegalActionConsequence{LegalActionConsequenceResumeExecution, LegalActionConsequenceScheduleRetry, LegalActionConsequenceTerminateRun, LegalActionConsequenceReturnToPushGate, LegalActionConsequenceAcceptExistingMerge}, offer.Consequence) {
 		return errors.New("legal action offer presentation semantics are invalid")
 	}
 	return nil

@@ -301,6 +301,7 @@ type dispatchStore struct {
 	side                   SideEffectRecord
 	attempts               []Attempt
 	attention              []OperatorAttentionEvent
+	operatorActions        []OperatorActionRecord
 	retrySchedules         []RetrySchedule
 	leaseLost              bool
 	renewCalls             int
@@ -323,6 +324,41 @@ type dispatchStore struct {
 	ciWaitClosed           int
 	ciWaitClosedAt         time.Time
 	attentionBeforeCIClose bool
+	progressEvidence       *RunProgressEvidence
+}
+
+func (s *dispatchStore) ReadRunProgressEvidence(_ context.Context, runID string) (RunProgressEvidence, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if runID != s.run.ID {
+		return RunProgressEvidence{}, nil
+	}
+	if s.progressEvidence != nil {
+		return *s.progressEvidence, nil
+	}
+	var result RunProgressEvidence
+	for index := range s.attention {
+		if s.attention[index].EventType == OperatorAttentionCIWaitRecovery {
+			result.CIWaitRecoveryAttentionCount++
+			result.CIWaitRecoveryAttention = &s.attention[index]
+		}
+	}
+	for index := range s.operatorActions {
+		if s.operatorActions[index].ActionType == OperatorActionRecoverCIWait {
+			result.CIWaitRecoveryActionCount++
+			result.CIWaitRecoveryAction = &s.operatorActions[index]
+		}
+	}
+	if result.CIWaitRecoveryActionCount == 1 {
+		phase := AutomaticRetryPhaseForRun(Run{State: result.CIWaitRecoveryAction.ExpectedState})
+		for index := range s.retrySchedules {
+			if s.retrySchedules[index].RunID == runID && s.retrySchedules[index].Phase == phase {
+				copy := s.retrySchedules[index]
+				result.RetrySchedule = &copy
+			}
+		}
+	}
+	return result, nil
 }
 
 func (s *dispatchStore) CloseInactiveCIWaits(_ context.Context, at time.Time) error {
@@ -334,6 +370,15 @@ func (s *dispatchStore) CloseInactiveCIWaits(_ context.Context, at time.Time) er
 		s.ciWaitClosedAt = at
 	}
 	return nil
+}
+
+func (s *dispatchStore) CurrentOperatorAttention(_ context.Context, runID string) (OperatorAttentionEvent, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if runID != s.run.ID || len(s.attention) == 0 {
+		return OperatorAttentionEvent{}, false, nil
+	}
+	return s.attention[len(s.attention)-1], true, nil
 }
 
 func (s *dispatchStore) AcquireLinearTodoAdmissionLease(_ context.Context, owner string, ttl time.Duration, now time.Time) (LinearTodoAdmissionLease, bool, error) {
@@ -502,7 +547,12 @@ func (s *dispatchStore) Inspect(_ context.Context, runID string) (RunInspection,
 	if s.run.ID != runID {
 		return RunInspection{}, ErrRunNotFound
 	}
-	inspection := RunInspection{Run: s.run, Attempts: append([]Attempt(nil), s.attempts...)}
+	inspection := RunInspection{
+		Run: s.run, Attempts: append([]Attempt(nil), s.attempts...),
+		RetrySchedules:    append([]RetrySchedule(nil), s.retrySchedules...),
+		OperatorAttention: append([]OperatorAttentionEvent(nil), s.attention...),
+		OperatorActions:   append([]OperatorActionRecord(nil), s.operatorActions...),
+	}
 	if s.run.State == domain.StateManualIntervention {
 		inspection.Timeline = []Transition{{Sequence: 2, From: domain.StateReceived, To: domain.StateManualIntervention, Reason: "operator decision required", EvidenceReference: "linear_issue_start", CreatedAt: s.run.UpdatedAt}}
 	} else if s.run.State == domain.StateAwaitingHumanDecision && !s.omitDecisionTransition {
@@ -668,6 +718,17 @@ func dispatchAuthority() LinearTodoCandidateAuthority {
 func dispatchStartAuthority() LinearIssueStartAuthority {
 	authority := dispatchAuthority()
 	return LinearIssueStartAuthority{TeamID: authority.TeamID, TeamKey: authority.TeamKey, TodoState: authority.TodoState, InProgressState: authority.InProgressState}
+}
+
+type dispatchAdmissionGate struct {
+	calls   int
+	mutated bool
+}
+
+func (g *dispatchAdmissionGate) CheckNewAdmission(context.Context) (NewAdmissionDecision, error) {
+	g.calls++
+	g.mutated = true
+	return AllowNewAdmissionForTest().CheckNewAdmission(context.Background())
 }
 
 func newDispatchLab(t *testing.T, candidates ...LinearTodoCandidate) (*LinearTodoDispatcher, *dispatchStore, *dispatchScanner, *dispatchReader, *dispatchStarter, *dispatchDriver) {
@@ -1175,15 +1236,55 @@ func TestLinearTodoDispatcherScansNextCandidateAfterAbandonedRunWithRetainedRetr
 	}
 }
 
-func TestLinearTodoDispatcherAutomaticallyResumesRunWithSupersededCIWaitSchedule(t *testing.T) {
-	candidate := dispatchCandidate("ci-resume", "IFAN-77", 1)
+func TestLinearTodoDispatcherFencesUnresolvedHistoricalCIWaitRecovery(t *testing.T) {
+	for _, status := range []string{"attention_only", OperatorActionStatusValidated, OperatorActionStatusApplied} {
+		t.Run(status, func(t *testing.T) {
+			candidate := dispatchCandidate("ci-retired", "IFAN-77", 1)
+			dispatcher, store, scanner, _, _, driver := newDispatchLab(t, candidate)
+			gate := &dispatchAdmissionGate{}
+			dispatcher.policy.AdmissionGate = gate
+			store.run = authorizeDispatchRun(Run{ID: "run-ci-retired", IssueID: candidate.Identifier, IdempotencyKey: "ci-retired-key", Repository: "owner/repo", State: domain.StatePROpen})
+			store.ciWaitActive = true
+			now := store.now
+			store.retrySchedules = []RetrySchedule{{RunID: store.run.ID, Phase: AutomaticRetryPhaseForRun(store.run), ControllerState: string(store.run.State), AttemptCount: 1, MaxAttempts: 3, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: RetryFailureTerminal, ReasonCode: RetryReasonTerminal, Status: RetryScheduleSuperseded, AttentionAt: now, CreatedAt: now.Add(-time.Minute), UpdatedAt: now}}
+			store.attention = []OperatorAttentionEvent{{EventType: OperatorAttentionCIWaitRecovery}}
+			if status != "attention_only" {
+				store.operatorActions = []OperatorActionRecord{{ActionType: OperatorActionRecoverCIWait, Status: status, ResultStatus: map[string]string{OperatorActionStatusValidated: OperatorActionResultPending, OperatorActionStatusApplied: OperatorActionResultApplied}[status]}}
+			}
+			result, err := dispatcher.Dispatch(context.Background())
+			if err != nil || scanner.calls != 0 || len(driver.calls) != 0 || result.Outcome != LinearTodoDispatchAttention || len(store.attention) != 1 || result.Retry == nil || result.Retry.Status != RetryScheduleSuperseded || store.ciWaitClosed != 0 || !store.ciWaitActive || gate.calls != 0 || gate.mutated {
+				t.Fatalf("result=%+v scanner=%d driver=%+v attention=%+v ciClosed=%d ciActive=%t gateCalls=%d gateMutated=%t err=%v", result, scanner.calls, driver.calls, store.attention, store.ciWaitClosed, store.ciWaitActive, gate.calls, gate.mutated, err)
+			}
+		})
+	}
+}
+
+func TestLinearTodoDispatcherChecksAdmissionOnceForNormalNoHistory(t *testing.T) {
+	candidate := dispatchCandidate("normal-admission", "IFAN-79", 1)
 	dispatcher, store, scanner, _, _, driver := newDispatchLab(t, candidate)
-	store.run = authorizeDispatchRun(Run{ID: "run-ci-resume", IssueID: candidate.Identifier, IdempotencyKey: "ci-resume-key", Repository: "owner/repo", State: domain.StatePROpen})
-	now := store.now
-	store.retrySchedules = []RetrySchedule{{RunID: store.run.ID, Phase: AutomaticRetryPhaseForRun(store.run), ControllerState: string(store.run.State), AttemptCount: 1, MaxAttempts: 3, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: RetryFailureTerminal, ReasonCode: RetryReasonTerminal, Status: RetryScheduleSuperseded, AttentionAt: now, CreatedAt: now.Add(-time.Minute), UpdatedAt: now}}
+	gate := &dispatchAdmissionGate{}
+	dispatcher.policy.AdmissionGate = gate
+	store.run = authorizeDispatchRun(Run{ID: "run-normal-admission", IssueID: candidate.Identifier, IdempotencyKey: "normal-admission-key", Repository: "owner/repo", State: domain.StatePROpen})
 	result, err := dispatcher.Dispatch(context.Background())
-	if err != nil || scanner.calls != 0 || len(driver.calls) != 1 || result.Outcome != LinearTodoDispatchDriven {
-		t.Fatalf("result=%+v scanner=%d driver=%+v err=%v", result, scanner.calls, driver.calls, err)
+	if err != nil || result.Outcome != LinearTodoDispatchDriven || scanner.calls != 0 || len(driver.calls) != 1 || gate.calls != 1 || !gate.mutated {
+		t.Fatalf("result=%+v scanner=%d driver=%+v gateCalls=%d gateMutated=%t err=%v", result, scanner.calls, driver.calls, gate.calls, gate.mutated, err)
+	}
+}
+
+func TestLinearTodoDispatcherMayResumeAfterSettledHistoricalCIWaitRecovery(t *testing.T) {
+	candidate := dispatchCandidate("ci-settled", "IFAN-78", 1)
+	dispatcher, store, scanner, _, _, driver := newDispatchLab(t, candidate)
+	gate := &dispatchAdmissionGate{}
+	dispatcher.policy.AdmissionGate = gate
+	run, evidence := settledCIWaitRecoveryEvidence(t)
+	run.IssueID = candidate.Identifier
+	store.run = authorizeDispatchRun(run)
+	evidence.CIWaitRecoveryAttention.RepositoryProfileID = store.run.ProfileID
+	store.progressEvidence = &evidence
+	store.retrySchedules = []RetrySchedule{*evidence.RetrySchedule}
+	result, err := dispatcher.Dispatch(context.Background())
+	if err != nil || scanner.calls != 0 || len(driver.calls) != 1 || result.Outcome != LinearTodoDispatchDriven || gate.calls != 1 || !gate.mutated {
+		t.Fatalf("result=%+v scanner=%d driver=%+v gateCalls=%d gateMutated=%t err=%v", result, scanner.calls, driver.calls, gate.calls, gate.mutated, err)
 	}
 }
 

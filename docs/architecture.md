@@ -171,7 +171,7 @@ authorization: execution resolves the configured immutable operator again,
 loads only the encoded target, re-reads its frozen authority, and recomputes the
 current offer before entering the existing action-specific service.
 
-The six current actions are `decide`, `retry`, `abandon`, `recover_ci_wait`,
+The five current actions are `decide`, `retry`, `abandon`,
 `recover_owned_push`, and `accept_external_merge`. Attention `allowed_actions`
 and offered legal actions use the same eligibility predicates. Each typed
 executor retains its own revalidation and safety gates; there is no generic
@@ -907,6 +907,20 @@ candidate head, or leaving review reconciliation closes the matching wait.
 Check topology may advance during one bounded read; the later complete snapshot
 is accepted only while repository, PR, head/base, protection, pagination, and
 review authority remain unchanged.
+
+The pre-fix `legacy_ci_topology_drift` compatibility incident is retired. Its
+`recover_ci_wait` operation, action, receipt, attention, retry schedule, and
+GitHub observation rows remain immutable historical evidence and continue to
+open, validate, project, backfill Activity, and participate in integrity
+checks. Current application and SQLite create, insert, apply, observe, and
+advance boundaries reject that type, and historical attention advertises no
+live legal action. An accepted or applied incident stops worker progress
+without settling evidence or changing retry eligibility. The supported
+response is to stop and replace the complete disposable runtime through normal
+fresh installation and onboarding after independently proving that workers,
+managed children, leases, and unresolved external effects are absent and
+inspecting any external branch or pull request. Ordinary exact-head pending-CI
+polling, slow-CI attention, and typed retry behavior are unchanged.
 
 **Key invariants**
 

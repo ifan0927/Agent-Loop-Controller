@@ -176,6 +176,9 @@ func (s *Store) LatestQueueAttention(ctx context.Context, scopes application.Aut
 // AppendOperatorAttention inserts immutable local-only evidence. A repeated
 // key is safe only when its complete sanitized payload digest is identical.
 func (s *Store) AppendOperatorAttention(ctx context.Context, event application.OperatorAttentionEvent) (bool, error) {
+	if event.EventType == application.OperatorAttentionCIWaitRecovery {
+		return false, errors.New("retired operator attention is read-only")
+	}
 	if err := application.ValidateOperatorAttentionEvent(event); err != nil {
 		return false, err
 	}

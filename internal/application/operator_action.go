@@ -18,9 +18,11 @@ var ErrOperatorActionConflict = errors.New("operator action authority conflicts"
 type OperatorActionType string
 
 const (
-	OperatorActionDecide              OperatorActionType = "decide"
-	OperatorActionRetry               OperatorActionType = "retry"
-	OperatorActionAbandon             OperatorActionType = "abandon"
+	OperatorActionDecide  OperatorActionType = "decide"
+	OperatorActionRetry   OperatorActionType = "retry"
+	OperatorActionAbandon OperatorActionType = "abandon"
+	// OperatorActionRecoverCIWait is retained only for reading historical
+	// action provenance written before live CI-wait recovery was retired.
 	OperatorActionRecoverCIWait       OperatorActionType = "recover_ci_wait"
 	OperatorActionRecoverOwnedPush    OperatorActionType = "recover_owned_push"
 	OperatorActionAcceptExternalMerge OperatorActionType = "accept_external_merge"
@@ -109,6 +111,7 @@ type OperatorActionMutationResult struct {
 type OperatorActionStore interface {
 	RunStore
 	CurrentOperatorAttentionQuery
+	GetOperatorAction(context.Context, string) (OperatorActionRecord, bool, error)
 	BeginOperatorAction(context.Context, OperatorActionRecord) (OperatorActionRecord, bool, error)
 	ApplyOperatorActionResult(context.Context, OperatorActionMutationResult) (OperatorActionRecord, bool, error)
 	ObserveOperatorActionResult(context.Context, OperatorActionMutationResult) (OperatorActionRecord, bool, error)
@@ -127,6 +130,9 @@ func NewOperatorActionService(store OperatorActionStore) (*OperatorActionService
 }
 
 func (s *OperatorActionService) Prepare(ctx context.Context, input OperatorActionInput) (OperatorActionRecord, bool, error) {
+	if retiredOperatorActionType(input.ActionType) {
+		return OperatorActionRecord{}, false, serviceError(ErrorInvalidInput, "operator action type is retired", nil)
+	}
 	if authority, ok := ctx.Value(legalActionAuthorityContextKey{}).(legalActionExecutionAuthority); ok && authority.RunID == input.RunID && authority.Action == input.ActionType && validAuthorityDigest(authority.AuthorityDigest) {
 		input.ExpectedAuthorityDigest = authority.AuthorityDigest
 	}
@@ -173,6 +179,10 @@ func (s *OperatorActionService) Prepare(ctx context.Context, input OperatorActio
 	return persisted, created, nil
 }
 
+func retiredOperatorActionType(value OperatorActionType) bool {
+	return value == OperatorActionRecoverCIWait
+}
+
 func replayOperatorAction(records []OperatorActionRecord, expected OperatorActionRecord) (OperatorActionRecord, bool, bool) {
 	for _, record := range records {
 		if legacyOperatorActionMatches(record, expected) {
@@ -200,6 +210,9 @@ func (s *OperatorActionService) RecordApplied(ctx context.Context, result Operat
 	if err := ValidateOperatorActionMutationResult(result, false); err != nil {
 		return OperatorActionRecord{}, false, serviceError(ErrorInvalidInput, "operator action applied result is invalid", err)
 	}
+	if err := s.rejectRetiredMutation(ctx, result.ActionID); err != nil {
+		return OperatorActionRecord{}, false, err
+	}
 	record, changed, err := s.store.ApplyOperatorActionResult(ctx, result)
 	if err != nil {
 		return OperatorActionRecord{}, false, classifyServiceError(err)
@@ -211,11 +224,25 @@ func (s *OperatorActionService) RecordObserved(ctx context.Context, result Opera
 	if err := ValidateOperatorActionMutationResult(result, true); err != nil {
 		return OperatorActionRecord{}, false, serviceError(ErrorInvalidInput, "operator action observed result is invalid", err)
 	}
+	if err := s.rejectRetiredMutation(ctx, result.ActionID); err != nil {
+		return OperatorActionRecord{}, false, err
+	}
 	record, changed, err := s.store.ObserveOperatorActionResult(ctx, result)
 	if err != nil {
 		return OperatorActionRecord{}, false, classifyServiceError(err)
 	}
 	return record, changed, nil
+}
+
+func (s *OperatorActionService) rejectRetiredMutation(ctx context.Context, actionID string) error {
+	record, found, err := s.store.GetOperatorAction(ctx, actionID)
+	if err != nil {
+		return classifyServiceError(err)
+	}
+	if found && retiredOperatorActionType(record.ActionType) {
+		return serviceError(ErrorInvalidInput, "operator action type is retired", nil)
+	}
+	return nil
 }
 
 func newOperatorActionRecord(input OperatorActionInput, received time.Time) OperatorActionRecord {

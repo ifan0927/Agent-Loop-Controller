@@ -1630,25 +1630,25 @@ states. Exact replay returns the same journaled result.
 
 `controller inspect`, `controller worker`, `controller drive`.
 
-### `controller recover-ci-wait`
+### Retired legacy CI-wait incident
 
-This one-purpose compatibility recovery applies only to a pre-fix run parked at
-`pr_open` or `reconciling_reviews` by the historical check-topology-drift read.
+The pre-fix `legacy_ci_topology_drift` compatibility incident has no live
+command or legal action. Do not use it for ordinary absent, queued, or
+in-progress required checks: those remain normal exact-head polling and may
+emit only the configured slow-CI warning.
 
-```sh
-agentctl controller recover-ci-wait '<run-id>' [--config <file>] \
-  --requester '<login>' --requester-database-id '<id>' \
-  --requester-node-id '<node-id>' --requester-type User
-```
-
-It requires the exact 13-observation incident fingerprint (including token
-mint), successful read transport, unchanged Linear/requester/profile/App/PR/
-head/base/local ownership, and no unresolved side-effect intent. Fresh GitHub
-evidence must contain complete required-check authority. It performs fresh
-read-only Linear and GitHub validation, records typed operator-action provenance,
-supersedes only the matching terminal schedule, and lets the running worker
-resume on its next poll. It never pushes, opens or adopts a PR, replies,
-approves, resolves, merges, or invokes the driver.
+If `controller inspect` shows historical `ci_wait_recovery` attention or an
+unresolved `recover_ci_wait` action/receipt, stop the selected supervisor and
+independently prove that no worker or managed child remains, no lease or
+scheduling authority is active, and no Controller-owned external effect is
+pending or ambiguous. Inspect any external branch and pull request separately.
+Then discard the complete private runtime installation and create a fresh
+runtime root, configuration, database, and resource roots through normal
+installation and repository onboarding. Do not reset, force, import, rebind,
+partially preserve the old runtime, edit SQLite, or add an automated in-place
+replacement path. Historical action, receipt, schedule, attention,
+observations, Activity, and integrity evidence remain readable only while the
+old runtime is retained for inspection.
 
 ### `controller continue`
 
@@ -3044,10 +3044,12 @@ times. It never exposes the action or run
 idempotency key, raw CLI arguments, paths, prose, or credentials. An entry is
 human-action provenance; ordinary timeline transitions and external side
 effects remain automatic/controller evidence. Decision, retry, abandon,
-CI-wait recovery, owned-push recovery, and external-merge acceptance all bind
-this action-specific journal to the common scope-neutral operation receipt
-before controller mutation. The presentation-independent legal-action and
-single-receipt application queries are not new CLI mutation commands. The
+owned-push recovery, and external-merge acceptance bind this action-specific
+journal to the common scope-neutral operation receipt before controller
+mutation. Historical CI-wait recovery rows remain readable but advertise no
+legal action and cannot be created or advanced. The presentation-independent
+legal-action and single-receipt application queries are not new CLI mutation
+commands. The
 bounded operation-history application query returns these same sanitized
 receipt fields ordered by immutable `accepted_at` and operation identity. It
 does not expose authority keys, operation anchors, raw requests, command
@@ -3352,6 +3354,7 @@ topology:
 | Configuration restart required | Use the existing supervised worker restart procedure, then wait for a fresh matching heartbeat and durable effective observation. Do not edit SQLite or the private locator. |
 | Safely readable configuration drift | Stop new admission and replace the complete disposable runtime through normal fresh installation and onboarding. Status returns no recovery offer. Do not restore, adopt, import, rebind, force overwrite, partially reset, or automate replacement in place. |
 | Unsafe configuration drift or ambiguous apply/historical recovery | Stop new admission and replace the complete disposable runtime. Do not rebaseline, edit SQLite or the locator, remove a private stage, copy desired bytes over live state, or preserve only selected runtime parts. |
+| Historical `legacy_ci_topology_drift` attention or unresolved `recover_ci_wait` action/receipt | Do not treat this as normal pending CI and do not attempt run-local recovery. Stop supervision, prove workers, children, leases, and unresolved effects absent, inspect external branches/PRs, then replace the complete disposable runtime through normal installation and onboarding. Do not reset, force, import, partially preserve, or edit SQLite. |
 | Unauthorized requester | Use the immutable GitHub `User` identity configured and frozen for the run. A matching login alone is insufficient. |
 | Linear source drift | Inspect the source revision and changed task/branch/repository facts. Resolve the human/manual gate; do not overwrite the snapshot. |
 | Repository/profile drift | Restore the exact frozen authority or deliberately terminate/recover through supported policy. Unrelated config edits must not retarget the run. |
