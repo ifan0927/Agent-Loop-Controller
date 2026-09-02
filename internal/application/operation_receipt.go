@@ -32,6 +32,8 @@ const (
 	OperationRemoveRepository     OperationType = "remove_repository"
 	OperationOnboardRepository    OperationType = "onboard_repository"
 	OperationRecheckIntegrity     OperationType = "recheck_integrity"
+	// OperationRecoverCleanupSource is retained only for reading historical
+	// receipts written before in-place cleanup-source recovery was retired.
 	OperationRecoverCleanupSource OperationType = "recover_cleanup_source"
 )
 
@@ -226,6 +228,9 @@ func NewOperationReceiptService(store OperationReceiptStore) (*OperationReceiptS
 }
 
 func (s *OperationReceiptService) Accept(ctx context.Context, input OperationReceiptInput) (OperationReceipt, bool, error) {
+	if input.OperationType == OperationRecoverCleanupSource {
+		return OperationReceipt{}, false, serviceError(ErrorInvalidInput, "operation type is retired", nil)
+	}
 	if input.AcceptedAt.IsZero() {
 		input.AcceptedAt = s.now().UTC()
 	}

@@ -390,47 +390,24 @@ records intent/result independently, and refuses base branches, dirty or changed
 resources, user-owned paths, and ownership conflicts. Artifacts and audit
 evidence remain unless a specific owned-resource policy says otherwise.
 
-A terminal abandoned run has one narrower operator recovery when its frozen
-source checkout was relocated and ordinary cleanup can no longer reach the
-registered worktree. The current configured controller operator is authorized
-before any run or receipt lookup, then must also satisfy the frozen run's exact
-trusted-operator scope. A read-only preview proves the exact current
-cleanup-residue attention, observed abandon action, absence of execution
-authority, frozen-source unavailability, and one canonical same-UID
-replacement checkout whose common directory still registers the exact owned
-worktree, branch, and candidate head. Apply atomically records a common run
-receipt and schema-v45 recovery intent before any Git write. The caller-supplied
-replacement path is never persisted or rendered; only digests and stable local
-identity evidence are durable.
+If a frozen source checkout is relocated before ordinary cleanup settles, the
+terminal cleanup residue is fail-stop. The Controller keeps the sanitized
+attention and unresolved ownership/cleanup evidence, offers no workflow action,
+and continues to block repository removal. It does not repair Git worktree
+registration, detach a worktree, remove it through a replacement checkout, or
+retarget the frozen run.
 
-Recovery is eligible only after ordinary evidence already marks the local
-branch ownership and cleanup deleted and the local ref is absent. Its closed,
-argv-only sequence repairs the exact worktree link, proves the persisted
-candidate object and exact symbolic worktree HEAD, compares index, tracked,
-untracked, and ignored state to the candidate, and rejects any per-worktree
-merge, cherry-pick, revert, rebase, sequencer, bisect, autostash, or unexpected
-administration state. External filter configuration and submodule index entries
-are also ineligible, so read-only proof cannot start configured filter or nested
-Git processes. The safe topology has a locally available commit in a safe
-`ORIG_HEAD`; its bytes and optional safe `COMMIT_EDITMSG` bytes are digest-bound
-across preview, effects, and replay. Recovery durably authorizes detaching only
-that owned worktree HEAD to the candidate, then removes the exact clean
-worktree without force.
-Every Git invocation disables hooks, filesystem monitoring, promisor lazy
-fetch, and replacement-object semantics; it never mutates a local or remote
-branch ref. Every intent/effect boundary is monotonic and replayable.
-Before and after each effect, and again before settlement, the application
-re-observes and compares the persisted replacement-path, filesystem-identity,
-origin, registration, branch, head, and clean-status digests. An absent owned
-worktree is adopted only after the replacement common directory proves its
-registration absent while the branch ref remains absent. Remote refs, pull
-requests,
-artifacts, source contents, configuration, lifecycle, and frozen run authority
-are outside this recovery. Success updates the normal ownership and cleanup
-rows to `deleted`, so repository-removal validation clears through its existing
-guard rather than a bypass. The schema-v45 recovery intent is an
-`owned_resource_cleanup` integrity-registry source; every insert, stage update,
-or delete advances the Controller integrity generation.
+Because the supported deployment is a disposable single-user local runtime,
+the recovery boundary is the entire private installation rather than one
+historical run. The operator first stops supervision and independently proves
+that the worker, managed children, leases, and external effects are absent;
+then separately inspects any external branch, pull request, and remaining Git
+worktree before discarding the private runtime and installing a fresh root,
+configuration, database, and resource roots through normal setup/onboarding.
+The schema-v45 `cleanup_source_recovery_intents` table, immutable-authority
+trigger, integrity registry/triggers, and `recover_cleanup_source` operation
+type remain only so already-written evidence can migrate, open, and project.
+Current code has no producer or mutator for that historical intent family.
 
 ## 7. Workflow State Machine
 
@@ -1291,10 +1268,12 @@ Safe fast-forward and deletion of eligible owned worktree/local/remote branch.
 **Failure and recovery behavior**
 
 Partial progress is persisted and only unfinished resources retry. Unsafe dirty
-source state remains untouched and produces sanitized attention. For the
-single source-relocation topology described under cleanup ownership, the worker
-never guesses a replacement path; only an explicit typed operator preview/apply
-can resume the local cleanup.
+source state remains untouched and produces sanitized attention. If the frozen
+source checkout is relocated before cleanup settles, the terminal residue is
+fail-stop: the Controller offers no live recovery action, performs no Git
+repair through a replacement checkout, and continues to block repository
+removal. Recovery is the whole-private-runtime replacement procedure described
+under cleanup ownership and operations, not a run-local recovery path.
 
 **Key invariants**
 
@@ -1316,9 +1295,8 @@ human workflow API.
 `internal/adapters/git` provisions and validates isolated worktrees, observes
 branch/base/head/status, creates controller-authored commits, publishes explicit
 refspecs, verifies accepted external merges, synchronizes source checkouts,
-cleans resources, and performs the exact source-relocation worktree repair
-recovery. Commands are argv-only through the managed process adapter;
-there is no shell interpolation.
+and cleans exact proven controller-owned resources. Commands are argv-only
+through the managed process adapter; there is no shell interpolation.
 
 ### Codex process
 
@@ -1954,7 +1932,7 @@ around it. The principal table groups are:
 | --- | --- |
 | `runs`, `transitions` | Current run snapshot, requester/profile/task authority, lease, candidate, and ordered state history |
 | `attempts`, `verifications`, `reviews` | Codex sessions/process results and exact-head automated evidence |
-| `owned_resources`, `cleanup_results`, `cleanup_source_recovery_intents` | Resource ownership, per-resource cleanup progress, and the path-private monotonic authority for exact abandoned-run recovery after a source relocation |
+| `owned_resources`, `cleanup_results`, `cleanup_source_recovery_intents` | Resource ownership and per-resource cleanup progress; the recovery-intent table is immutable historical evidence retained for migration, integrity, and read compatibility only |
 | `side_effects` | Persisted external intent, claim, attempt, and observed result |
 | `pull_requests`, `poll_observations`, `review_findings` | Owned PR and normalized GitHub/CI reconciliation evidence |
 | `github_installations`, `github_request_observations`, `github_read_evidence` | Direct App/repository authority and sanitized transport observations |

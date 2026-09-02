@@ -42,6 +42,25 @@ type operationReceiptAuthorityFixture struct {
 	onboarding OnboardingAuthority
 }
 
+type retiredOperationReceiptStore struct{ began bool }
+
+func (s *retiredOperationReceiptStore) BeginOperationReceipt(context.Context, OperationReceipt) (OperationReceipt, bool, error) {
+	s.began = true
+	return OperationReceipt{}, false, nil
+}
+
+func (*retiredOperationReceiptStore) AdvanceOperationReceipt(context.Context, OperationReceiptMutation) (OperationReceipt, bool, error) {
+	return OperationReceipt{}, false, nil
+}
+
+func (*retiredOperationReceiptStore) GetOperationReceiptTarget(context.Context, string) (OperationReceiptTarget, error) {
+	return OperationReceiptTarget{}, ErrOperationReceiptNotFound
+}
+
+func (*retiredOperationReceiptStore) GetAuthorizedOperationReceipt(context.Context, string, AuthorizedScopeSet) (OperationReceipt, error) {
+	return OperationReceipt{}, ErrOperationReceiptNotFound
+}
+
 func (s operationReceiptAuthorityFixture) RepositoryAuthority(_ context.Context, repository string) (RepositoryAuthority, bool, error) {
 	return s.repository, repository == s.repository.Repository, nil
 }
@@ -85,6 +104,21 @@ func TestOperationReceiptSeparatesPhaseFromOutcome(t *testing.T) {
 	receipt.Phase = OperationPhaseObserved
 	if err := ValidateOperationReceipt(receipt); err == nil {
 		t.Fatal("observed receipt without applied timestamp was accepted")
+	}
+}
+
+func TestOperationReceiptServiceRejectsRetiredCleanupSourceProducer(t *testing.T) {
+	store := &retiredOperationReceiptStore{}
+	service, err := NewOperationReceiptService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := OperationReceiptInput{OperationType: OperationRecoverCleanupSource, Scope: ScopeRun, TargetID: "run", Requester: domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}, RequestDigest: strings.Repeat("a", 64), ExpectedAuthorityDigest: strings.Repeat("b", 64), OperationAnchorDigest: strings.Repeat("d", 64), TargetBindingDigest: strings.Repeat("c", 64), AcceptedAt: time.Date(2026, 8, 31, 1, 0, 0, 0, time.UTC)}
+	if _, _, err := service.Accept(context.Background(), input); err == nil || store.began {
+		t.Fatalf("retired operation accepted=%t err=%v", store.began, err)
+	}
+	if err := ValidateOperationReceipt(NewOperationReceipt(input)); err != nil {
+		t.Fatalf("historical receipt is no longer readable: %v", err)
 	}
 }
 
