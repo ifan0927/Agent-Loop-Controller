@@ -37,6 +37,10 @@ func (s operationReceiptQueryFixture) GetRunScopeAuthority(_ context.Context, ru
 	return s.runAuthority, nil
 }
 
+func (s operationReceiptQueryFixture) ListAuthorizedOperationReceipts(context.Context, OperationHistoryStoreQuery) (OperationHistoryStorePage, error) {
+	return OperationHistoryStorePage{Receipts: []OperationReceipt{s.receipt}, Total: 1}, nil
+}
+
 type operationReceiptAuthorityFixture struct {
 	repository RepositoryAuthority
 	onboarding OnboardingAuthority

@@ -42,10 +42,6 @@ type OperationHistoryStorePage struct {
 	WatermarkOperationID string
 }
 
-type OperationReceiptHistoryStore interface {
-	ListAuthorizedOperationReceipts(context.Context, OperationHistoryStoreQuery) (OperationHistoryStorePage, error)
-}
-
 type OperationHistoryQuery struct {
 	Requester Requester
 	Filter    OperationHistoryFilter
@@ -54,16 +50,12 @@ type OperationHistoryQuery struct {
 }
 
 type OperationHistoryPage struct {
-	Metadata   RoutineProjectionMetadata  `json:"metadata"`
-	Collection ActivityCollectionMetadata `json:"collection"`
-	Receipts   []OperationReceipt         `json:"receipts"`
+	Metadata   RoutineProjectionMetadata `json:"metadata"`
+	Collection RoutineCollectionMetadata `json:"collection"`
+	Receipts   []OperationReceipt        `json:"receipts"`
 }
 
 func (s *OperationReceiptQueryService) List(ctx context.Context, query OperationHistoryQuery, observedAt time.Time) (OperationHistoryPage, error) {
-	store, ok := s.store.(OperationReceiptHistoryStore)
-	if !ok {
-		return OperationHistoryPage{}, serviceError(ErrorInternal, "operation history is unavailable", nil)
-	}
 	configured, err := s.authorizer.ResolveConfiguredRequester(query.Requester)
 	if err != nil {
 		return OperationHistoryPage{}, hiddenTargetError()
@@ -91,13 +83,13 @@ func (s *OperationReceiptQueryService) List(ctx context.Context, query Operation
 		}
 		cursor = &decoded
 	}
-	page, err := store.ListAuthorizedOperationReceipts(ctx, OperationHistoryStoreQuery{Scopes: scopes, Filter: query.Filter, Limit: limit, Cursor: cursor})
+	page, err := s.store.ListAuthorizedOperationReceipts(ctx, OperationHistoryStoreQuery{Scopes: scopes, Filter: query.Filter, Limit: limit, Cursor: cursor})
 	if err != nil {
 		return OperationHistoryPage{}, classifyServiceError(err)
 	}
 	result := OperationHistoryPage{
 		Metadata:   RoutineProjectionMetadata{SchemaVersion: ActivitySchemaVersion, ObservedAt: observedAt.UTC()},
-		Collection: ActivityCollectionMetadata{Total: page.Total, Truncated: page.HasMore},
+		Collection: RoutineCollectionMetadata{Total: page.Total, Truncated: page.HasMore},
 		Receipts:   page.Receipts,
 	}
 	if page.HasMore && len(page.Receipts) != 0 {

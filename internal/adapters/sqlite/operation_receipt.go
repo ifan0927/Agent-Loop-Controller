@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
@@ -146,6 +147,88 @@ func (s *Store) GetAuthorizedOperationReceipt(ctx context.Context, operationID s
 		return application.OperationReceipt{}, application.ErrOperationReceiptNotFound
 	}
 	return receipt, nil
+}
+
+func (s *Store) ListAuthorizedOperationReceipts(ctx context.Context, query application.OperationHistoryStoreQuery) (application.OperationHistoryStorePage, error) {
+	if !query.Scopes.HasController() || query.Limit < 1 || query.Limit > application.OperationHistoryMaximumLimit {
+		return application.OperationHistoryStorePage{}, errors.New("authorized operation history query is invalid")
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return application.OperationHistoryStorePage{}, err
+	}
+	defer tx.Rollback()
+	page := application.OperationHistoryStorePage{}
+	if query.Cursor != nil {
+		page.WatermarkAcceptedAt, page.WatermarkOperationID = query.Cursor.WatermarkAcceptedAt, query.Cursor.WatermarkOperation
+	} else {
+		var accepted string
+		err := tx.QueryRowContext(ctx, `SELECT accepted_at,operation_id FROM operation_receipts ORDER BY accepted_at DESC,operation_id DESC LIMIT 1`).Scan(&accepted, &page.WatermarkOperationID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return page, tx.Commit()
+		}
+		if err != nil {
+			return application.OperationHistoryStorePage{}, err
+		}
+		page.WatermarkAcceptedAt = parseTime(accepted)
+	}
+	where, args := operationHistoryWhere(query.Filter, page.WatermarkAcceptedAt, page.WatermarkOperationID)
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM operation_receipts WHERE `+where, args...).Scan(&page.Total); err != nil {
+		return application.OperationHistoryStorePage{}, err
+	}
+	if query.Cursor != nil {
+		position := formatTime(query.Cursor.AcceptedAt)
+		where += ` AND (accepted_at<? OR (accepted_at=? AND operation_id<?))`
+		args = append(args, position, position, query.Cursor.OperationID)
+	}
+	args = append(args, query.Limit+1)
+	rows, err := tx.QueryContext(ctx, operationReceiptSelect+` WHERE `+where+` ORDER BY accepted_at DESC,operation_id DESC LIMIT ?`, args...)
+	if err != nil {
+		return application.OperationHistoryStorePage{}, err
+	}
+	for rows.Next() {
+		receipt, scanErr := scanOperationReceipt(rows)
+		if scanErr != nil {
+			rows.Close()
+			return application.OperationHistoryStorePage{}, scanErr
+		}
+		page.Receipts = append(page.Receipts, receipt)
+	}
+	if err := rows.Close(); err != nil {
+		return application.OperationHistoryStorePage{}, err
+	}
+	page.HasMore = len(page.Receipts) > query.Limit
+	if page.HasMore {
+		page.Receipts = page.Receipts[:query.Limit]
+	}
+	return page, tx.Commit()
+}
+
+func operationHistoryWhere(filter application.OperationHistoryFilter, watermarkAt time.Time, watermarkID string) (string, []any) {
+	watermark := formatTime(watermarkAt)
+	where := `(accepted_at<? OR (accepted_at=? AND operation_id<=?))`
+	args := []any{watermark, watermark, watermarkID}
+	if filter.Scope != "" {
+		where += ` AND scope_kind=?`
+		args = append(args, string(filter.Scope))
+	}
+	if filter.TargetID != "" {
+		where += ` AND target_id=?`
+		args = append(args, filter.TargetID)
+	}
+	if filter.OperationType != "" {
+		where += ` AND operation_type=?`
+		args = append(args, string(filter.OperationType))
+	}
+	if filter.Phase != "" {
+		where += ` AND phase=?`
+		args = append(args, string(filter.Phase))
+	}
+	if filter.Outcome != "" {
+		where += ` AND outcome=?`
+		args = append(args, string(filter.Outcome))
+	}
+	return where, args
 }
 
 func getOperationReceiptByIDTx(ctx context.Context, tx *sql.Tx, operationID string) (application.OperationReceipt, bool, error) {

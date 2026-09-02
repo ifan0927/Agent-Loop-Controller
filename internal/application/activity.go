@@ -353,16 +353,11 @@ type ActivityDetailQuery struct {
 	Requester Requester
 	EventID   string
 }
-type ActivityCollectionMetadata struct {
-	Total      int    `json:"total"`
-	Truncated  bool   `json:"truncated"`
-	NextCursor string `json:"next_cursor,omitempty"`
-}
 type ActivityPage struct {
-	Metadata   RoutineProjectionMetadata  `json:"metadata"`
-	Collection ActivityCollectionMetadata `json:"collection"`
-	Coverage   ActivityCoverage           `json:"coverage"`
-	Events     []ActivityEvent            `json:"events"`
+	Metadata   RoutineProjectionMetadata `json:"metadata"`
+	Collection RoutineCollectionMetadata `json:"collection"`
+	Coverage   ActivityCoverage          `json:"coverage"`
+	Events     []ActivityEvent           `json:"events"`
 }
 type ActivityDetail struct {
 	Metadata RoutineProjectionMetadata `json:"metadata"`
@@ -415,7 +410,7 @@ func (s *ActivityQueryService) List(ctx context.Context, query ActivityListQuery
 	if err != nil {
 		return ActivityPage{}, classifyServiceError(err)
 	}
-	result := ActivityPage{Metadata: RoutineProjectionMetadata{SchemaVersion: ActivitySchemaVersion, ObservedAt: observedAt.UTC()}, Collection: ActivityCollectionMetadata{Total: page.Total, Truncated: page.HasMore}, Coverage: page.Coverage, Events: page.Events}
+	result := ActivityPage{Metadata: RoutineProjectionMetadata{SchemaVersion: ActivitySchemaVersion, ObservedAt: observedAt.UTC()}, Collection: RoutineCollectionMetadata{Total: page.Total, Truncated: page.HasMore}, Coverage: page.Coverage, Events: page.Events}
 	if page.HasMore && len(page.Events) != 0 {
 		last := page.Events[len(page.Events)-1]
 		result.Collection.NextCursor = encodeActivityCursor(ActivityCursor{Version: ActivitySchemaVersion, ScopeDigest: scopes.Digest(), FilterDigest: filterDigest, OccurredAt: last.OccurredAt, EventID: last.EventID, IngestionWatermark: page.IngestionWatermark})

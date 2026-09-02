@@ -155,6 +155,14 @@ type IntegrityFindingQuery struct {
 	Cursor    string
 }
 
+type IntegrityFindingStoreQuery struct {
+	Family   IntegrityFamily
+	Scope    AuthorityScopeKind
+	TargetID string
+	Limit    int
+	Cursor   string
+}
+
 type IntegrityFindingPage struct {
 	ObservationID     string             `json:"observation_id"`
 	ObservationDigest string             `json:"observation_digest"`
@@ -166,7 +174,7 @@ type IntegrityFindingPage struct {
 
 type IntegrityQueryStore interface {
 	IntegritySummary(context.Context, AuthorizedScopeSet) (IntegritySummary, error)
-	ListIntegrityFindings(context.Context, AuthorizedScopeSet, IntegrityFindingQuery) (IntegrityFindingPage, error)
+	ListIntegrityFindings(context.Context, AuthorizedScopeSet, IntegrityFindingStoreQuery) (IntegrityFindingPage, error)
 }
 
 type IntegrityQueryService struct {
@@ -208,7 +216,7 @@ func (s *IntegrityQueryService) Findings(ctx context.Context, query IntegrityFin
 	if query.Limit == 0 {
 		query.Limit = IntegrityDefaultLimit
 	}
-	return s.store.ListIntegrityFindings(ctx, scopes, query)
+	return s.store.ListIntegrityFindings(ctx, scopes, IntegrityFindingStoreQuery{Family: query.Family, Scope: query.Scope, TargetID: query.TargetID, Limit: query.Limit, Cursor: query.Cursor})
 }
 
 type IntegrityMaintenanceResult struct {

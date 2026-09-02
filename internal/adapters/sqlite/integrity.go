@@ -611,7 +611,7 @@ type integrityCursor struct {
 	Seal              string `json:"seal"`
 }
 
-func (s *Store) ListIntegrityFindings(ctx context.Context, scopes application.AuthorizedScopeSet, query application.IntegrityFindingQuery) (application.IntegrityFindingPage, error) {
+func (s *Store) ListIntegrityFindings(ctx context.Context, scopes application.AuthorizedScopeSet, query application.IntegrityFindingStoreQuery) (application.IntegrityFindingPage, error) {
 	if scopes.Empty() || !scopes.HasController() {
 		return application.IntegrityFindingPage{}, errors.New("integrity findings are not found")
 	}

@@ -128,6 +128,7 @@ type OperationReceiptQueryStore interface {
 	GetOperationReceiptTarget(context.Context, string) (OperationReceiptTarget, error)
 	GetAuthorizedOperationReceipt(context.Context, string, AuthorizedScopeSet) (OperationReceipt, error)
 	GetRunScopeAuthority(context.Context, string) (RunScopeAuthority, error)
+	ListAuthorizedOperationReceipts(context.Context, OperationHistoryStoreQuery) (OperationHistoryStorePage, error)
 }
 
 type OnboardingAuthoritySource interface {
