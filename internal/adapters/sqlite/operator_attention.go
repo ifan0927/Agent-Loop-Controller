@@ -13,46 +13,14 @@ import (
 )
 
 var (
-	_ application.OperatorAttentionPublisher           = (*Store)(nil)
-	_ application.OperatorAttentionQuery               = (*Store)(nil)
-	_ application.CurrentOperatorAttentionQuery        = (*Store)(nil)
-	_ application.RoutineAttentionTargetCandidateStore = (*Store)(nil)
-	_ application.ControllerAttentionCandidateStore    = (*Store)(nil)
-	_ application.RoutineAttentionCandidateStore       = (*Store)(nil)
-	_ application.ControllerRunCollectionStore         = (*Store)(nil)
-	_ application.QueryStore                           = (*Store)(nil)
+	_ application.OperatorAttentionPublisher        = (*Store)(nil)
+	_ application.OperatorAttentionQuery            = (*Store)(nil)
+	_ application.CurrentOperatorAttentionQuery     = (*Store)(nil)
+	_ application.ControllerAttentionCandidateStore = (*Store)(nil)
+	_ application.RoutineAttentionCandidateStore    = (*Store)(nil)
+	_ application.ControllerRunCollectionStore      = (*Store)(nil)
+	_ application.QueryStore                        = (*Store)(nil)
 )
-
-func (s *Store) ListRoutineAttentionCandidates(ctx context.Context, input application.RoutineAttentionCandidateQuery) ([]application.OperatorAttentionEvent, error) {
-	if input.Scopes.Empty() || input.Limit < 1 || input.Limit > 1001 {
-		return nil, errors.New("routine attention candidate query is invalid")
-	}
-	read := currentOperatorAttentionFamilyRead{Limit: input.Limit}
-	switch input.Scope {
-	case application.ScopeController:
-		return nil, errors.New("routine attention controller scope requires collection read authority")
-	case application.ScopeRepository:
-		if input.TargetID == "" || input.RepositoryProfileID == "" || len(input.Scopes.RepositoryBindingDigests()) != 1 {
-			return nil, errors.New("routine attention repository scope is invalid")
-		}
-		read.Filter = currentOperatorAttentionFamilyRepository
-		read.Target = input.RepositoryProfileID
-	case application.ScopeRun:
-		if input.TargetID == "" {
-			return nil, errors.New("routine attention run scope is invalid")
-		}
-		var binding string
-		if err := s.db.QueryRowContext(ctx, `SELECT repository_binding_digest FROM runs WHERE run_id=?`, input.TargetID).Scan(&binding); err != nil || !input.Scopes.AllowsRun(input.TargetID, binding) {
-			return nil, application.ErrRunNotFound
-		}
-		read.Filter = currentOperatorAttentionFamilyRun
-		read.Target = input.TargetID
-	default:
-		return nil, errors.New("routine attention scope is invalid")
-	}
-	result, err := readCurrentOperatorAttentionFamilies(ctx, s.db, read)
-	return result.Events, err
-}
 
 // ListControllerAttentionCandidates reads the Controller-owned inbox without
 // repository or run visibility predicates. The distinct application type
@@ -61,7 +29,7 @@ func (s *Store) ListControllerAttentionCandidates(ctx context.Context, input app
 	if !input.Authority.Valid() || input.Limit < 1 || input.Limit > 1001 {
 		return nil, errors.New("controller attention candidate query is invalid")
 	}
-	result, err := readCurrentOperatorAttentionFamilies(ctx, s.db, currentOperatorAttentionFamilyRead{Filter: currentOperatorAttentionFamilyAll, Limit: input.Limit})
+	result, err := readCurrentOperatorAttentionFamilies(ctx, s.db, currentOperatorAttentionFamilyRead{Limit: input.Limit})
 	return result.Events, err
 }
 
@@ -77,17 +45,7 @@ type currentOperatorAttentionFamilyQueryer interface {
 var _ currentOperatorAttentionFamilyQueryer = (*sql.DB)(nil)
 var _ currentOperatorAttentionFamilyQueryer = (*sql.Tx)(nil)
 
-type currentOperatorAttentionFamilyFilter uint8
-
-const (
-	currentOperatorAttentionFamilyAll currentOperatorAttentionFamilyFilter = iota
-	currentOperatorAttentionFamilyRepository
-	currentOperatorAttentionFamilyRun
-)
-
 type currentOperatorAttentionFamilyRead struct {
-	Filter        currentOperatorAttentionFamilyFilter
-	Target        string
 	Limit         int
 	SeverityOrder bool
 	Count         bool
@@ -102,40 +60,17 @@ func readCurrentOperatorAttentionFamilies(ctx context.Context, queryer currentOp
 	if queryer == nil || input.Limit < 1 || input.Limit > 1001 {
 		return currentOperatorAttentionFamilyResult{}, errors.New("current operator attention family read is invalid")
 	}
-	where := ""
-	args := []any{}
-	switch input.Filter {
-	case currentOperatorAttentionFamilyAll:
-		if input.Target != "" {
-			return currentOperatorAttentionFamilyResult{}, errors.New("current operator attention family read is invalid")
-		}
-	case currentOperatorAttentionFamilyRepository:
-		if input.Target == "" {
-			return currentOperatorAttentionFamilyResult{}, errors.New("current operator attention family read is invalid")
-		}
-		where = ` WHERE repository_profile_id=?`
-		args = append(args, input.Target)
-	case currentOperatorAttentionFamilyRun:
-		if input.Target == "" {
-			return currentOperatorAttentionFamilyResult{}, errors.New("current operator attention family read is invalid")
-		}
-		where = ` WHERE run_id=?`
-		args = append(args, input.Target)
-	default:
-		return currentOperatorAttentionFamilyResult{}, errors.New("current operator attention family read is invalid")
-	}
-	query := currentOperatorAttentionFamilyWindowPrefix + where + currentOperatorAttentionFamilyWindowSuffix
+	query := currentOperatorAttentionFamilyWindowPrefix + currentOperatorAttentionFamilyWindowSuffix
 	result := currentOperatorAttentionFamilyResult{}
 	if input.Count {
-		if err := queryer.QueryRowContext(ctx, `SELECT COUNT(*) FROM (`+query+`)`, args...).Scan(&result.Total); err != nil {
+		if err := queryer.QueryRowContext(ctx, `SELECT COUNT(*) FROM (`+query+`)`).Scan(&result.Total); err != nil {
 			return currentOperatorAttentionFamilyResult{}, err
 		}
 	}
 	if input.SeverityOrder {
 		query += ` ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'error' THEN 1 WHEN 'warning' THEN 2 WHEN 'info' THEN 3 ELSE 4 END,occurred_at,event_key`
 	}
-	queryArgs := append(append([]any(nil), args...), input.Limit)
-	rows, err := queryer.QueryContext(ctx, query+` LIMIT ?`, queryArgs...)
+	rows, err := queryer.QueryContext(ctx, query+` LIMIT ?`, input.Limit)
 	if err != nil {
 		return currentOperatorAttentionFamilyResult{}, err
 	}

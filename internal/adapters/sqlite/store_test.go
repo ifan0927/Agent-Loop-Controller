@@ -669,39 +669,6 @@ func TestMigrationAndRunIdempotency(t *testing.T) {
 	}
 }
 
-func TestListRunsUsesRepositoryScopedDeterministicCursor(t *testing.T) {
-	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	ctx := context.Background()
-	base := time.Date(2026, 7, 13, 0, 0, 0, 0, time.UTC)
-	bindingHash := sha256.Sum256([]byte("legacy-repository-binding:owner/repo"))
-	bindingDigest := hex.EncodeToString(bindingHash[:])
-	for index, id := range []string{"run-a", "run-b", "run-c"} {
-		input := application.CreateRunInput{Run: application.Run{ID: id, IssueID: fmt.Sprintf("ISSUE-%d", index), IdempotencyKey: fmt.Sprintf("key-%d", index), SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: "owner/repo", RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "ifan/test"}}
-		if _, _, err := store.CreateRun(ctx, input); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := store.db.ExecContext(ctx, `UPDATE runs SET updated_at=? WHERE run_id=?`, formatTime(base.Add(time.Duration(index)*time.Second)), id); err != nil {
-			t.Fatal(err)
-		}
-	}
-	scopes := repositoryRunScopes(t, bindingDigest)
-	page, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Repository: "owner/repo", Lifecycle: application.RunLifecycleAll, Limit: 2})
-	if err != nil || page.TotalCount != 3 || len(page.Runs) != 2 || page.Runs[0].ID != "run-c" || page.Runs[1].ID != "run-b" {
-		t.Fatalf("first page=%+v err=%v", page, err)
-	}
-	next, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Repository: "owner/repo", Lifecycle: application.RunLifecycleAll, BeforeUpdatedAt: page.Runs[1].UpdatedAt, BeforeRunID: page.Runs[1].ID, Limit: 2})
-	if err != nil || next.TotalCount != 3 || len(next.Runs) != 1 || next.Runs[0].ID != "run-a" {
-		t.Fatalf("next page=%+v err=%v", next, err)
-	}
-	if _, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Repository: "owner/repo", Lifecycle: application.RunLifecycleAll, Limit: 102}); err == nil {
-		t.Fatal("unbounded list limit was accepted")
-	}
-}
-
 func TestControllerRunsFilterCanonicalRepositoryAcrossFrozenBindings(t *testing.T) {
 	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
@@ -743,60 +710,7 @@ func TestControllerRunsFilterCanonicalRepositoryAcrossFrozenBindings(t *testing.
 	}
 }
 
-func TestAuthorizedRunPaginationIgnoresHiddenSentinels(t *testing.T) {
-	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	ctx := context.Background()
-	base := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
-	type fixture struct {
-		id, repository string
-		second         int
-	}
-	fixtures := []fixture{
-		{"hidden-after", "sibling/private", 0},
-		{"authorized-1", "owner/repo", 1},
-		{"hidden-within-1", "sibling/private", 2},
-		{"authorized-2", "owner/repo", 3},
-		{"hidden-within-2", "sibling/private", 4},
-		{"authorized-3", "owner/repo", 5},
-		{"hidden-before", "sibling/private", 6},
-	}
-	for index, fixture := range fixtures {
-		input := application.CreateRunInput{Run: application.Run{ID: fixture.id, IssueID: fmt.Sprintf("ISSUE-SENTINEL-%d", index), IdempotencyKey: fmt.Sprintf("sentinel-key-%d", index), SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: fixture.repository, RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "ifan/test"}}
-		if _, _, err := store.CreateRun(ctx, input); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := store.db.ExecContext(ctx, `UPDATE runs SET updated_at=? WHERE run_id=?`, formatTime(base.Add(time.Duration(fixture.second)*time.Second)), fixture.id); err != nil {
-			t.Fatal(err)
-		}
-	}
-	bindingHash := sha256.Sum256([]byte("legacy-repository-binding:owner/repo"))
-	scopes := repositoryRunScopes(t, hex.EncodeToString(bindingHash[:]))
-	first, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Lifecycle: application.RunLifecycleAll, Limit: 2})
-	if err != nil || first.TotalCount != 3 || len(first.Runs) != 2 {
-		t.Fatalf("first=%+v err=%v", first, err)
-	}
-	for index, want := range []string{"authorized-3", "authorized-2"} {
-		if first.Runs[index].ID != want {
-			t.Fatalf("authorized order=%+v", first.Runs)
-		}
-	}
-	if run, err := store.GetAuthorizedRun(ctx, "authorized-2", scopes); err != nil || run.ID != "authorized-2" {
-		t.Fatalf("authorized lookup run=%+v err=%v", run, err)
-	}
-	if _, err := store.GetAuthorizedRun(ctx, "hidden-within-1", scopes); !errors.Is(err, application.ErrRunNotFound) {
-		t.Fatalf("hidden lookup error=%v", err)
-	}
-	second, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Lifecycle: application.RunLifecycleAll, BeforeUpdatedAt: first.Runs[1].UpdatedAt, BeforeRunID: first.Runs[1].ID, Limit: 3})
-	if err != nil || second.TotalCount != 3 || len(second.Runs) != 1 || second.Runs[0].ID != "authorized-1" {
-		t.Fatalf("second=%+v err=%v", second, err)
-	}
-}
-
-func TestAuthorizedRunLifecycleFilteringPrecedesCountOrderingAndPagination(t *testing.T) {
+func TestControllerRunLifecycleFilteringPrecedesCountOrderingAndPagination(t *testing.T) {
 	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -813,8 +727,7 @@ func TestAuthorizedRunLifecycleFilteringPrecedesCountOrderingAndPagination(t *te
 		{id: "active-tie-z", repository: "owner/repo", state: "verifying", updated: base.Add(2 * time.Second)},
 		{id: "active-tie-a", repository: "owner/repo", state: "future_state", updated: base.Add(2 * time.Second)},
 		{id: "ended-older", repository: "owner/repo", state: "failed", updated: base.Add(time.Second)},
-		{id: "hidden-active", repository: "sibling/private", state: "executing", updated: base.Add(5 * time.Second)},
-		{id: "hidden-ended", repository: "sibling/private", state: "rejected", updated: base.Add(6 * time.Second)},
+		{id: "other-active", repository: "sibling/private", state: "executing", updated: base.Add(5 * time.Second)},
 	}
 	for index, fixture := range fixtures {
 		input := application.CreateRunInput{Run: application.Run{ID: fixture.id, IssueID: fmt.Sprintf("ISSUE-LIFECYCLE-%d", index), IdempotencyKey: fmt.Sprintf("lifecycle-key-%d", index), SourceRevision: "v1", RawIssueJSON: "{}", RawIssueHash: "raw", NormalizedTaskJSON: "{}", TaskHash: "task", Repository: fixture.repository, RepositoryConfigJSON: "{}", BaseBranch: "main", WorkingBranch: "ifan/test"}}
@@ -825,26 +738,26 @@ func TestAuthorizedRunLifecycleFilteringPrecedesCountOrderingAndPagination(t *te
 			t.Fatal(err)
 		}
 	}
-	bindingHash := sha256.Sum256([]byte("legacy-repository-binding:owner/repo"))
-	scopes := repositoryRunScopes(t, hex.EncodeToString(bindingHash[:]))
-	active, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Lifecycle: application.RunLifecycleActive, Limit: 3})
-	if err != nil || active.TotalCount != 3 || len(active.Runs) != 3 {
+	user := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "U_7", ActorType: "User"}
+	authorizer, _ := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: user})
+	configured, _ := authorizer.ResolveConfiguredRequester(application.Requester{ID: user.Login, Kind: "github_login", DatabaseID: user.DatabaseID, NodeID: user.NodeID, ActorType: user.ActorType})
+	reader, _ := authorizer.ControllerReadCollectionAuthority(configured)
+	query := func(lifecycle application.RunLifecycleFilter, limit int, before time.Time, beforeID string) (application.AuthorizedRunPage, error) {
+		return store.ListControllerRuns(ctx, application.ControllerRunQuery{Authority: reader, CanonicalRepository: "owner/repo", Lifecycle: lifecycle, BeforeUpdatedAt: before, BeforeRunID: beforeID, Limit: limit})
+	}
+	active, err := query(application.RunLifecycleActive, 3, time.Time{}, "")
+	if err != nil || active.TotalCount != 3 || len(active.Runs) != 3 || active.Runs[0].ID != "active-newer" || active.Runs[1].ID != "active-tie-z" || active.Runs[2].ID != "active-tie-a" {
 		t.Fatalf("active=%+v err=%v", active, err)
 	}
-	for index, want := range []string{"active-newer", "active-tie-z", "active-tie-a"} {
-		if active.Runs[index].ID != want {
-			t.Fatalf("active order=%+v", active.Runs)
-		}
-	}
-	ended, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Lifecycle: application.RunLifecycleEnded, Limit: 3})
+	ended, err := query(application.RunLifecycleEnded, 3, time.Time{}, "")
 	if err != nil || ended.TotalCount != 2 || len(ended.Runs) != 2 || ended.Runs[0].ID != "ended-between" || ended.Runs[1].ID != "ended-older" {
 		t.Fatalf("ended=%+v err=%v", ended, err)
 	}
-	first, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Lifecycle: application.RunLifecycleAll, Limit: 2})
+	first, err := query(application.RunLifecycleAll, 2, time.Time{}, "")
 	if err != nil || first.TotalCount != 5 || len(first.Runs) != 2 || first.Runs[0].ID != "active-newer" || first.Runs[1].ID != "ended-between" {
 		t.Fatalf("first=%+v err=%v", first, err)
 	}
-	second, err := store.ListAuthorizedRuns(ctx, application.AuthorizedRunQuery{Scopes: scopes, Lifecycle: application.RunLifecycleAll, BeforeUpdatedAt: first.Runs[1].UpdatedAt, BeforeRunID: first.Runs[1].ID, Limit: 3})
+	second, err := query(application.RunLifecycleAll, 3, first.Runs[1].UpdatedAt, first.Runs[1].ID)
 	if err != nil || len(second.Runs) != 3 || second.Runs[0].ID != "active-tie-z" || second.Runs[1].ID != "active-tie-a" || second.Runs[2].ID != "ended-older" {
 		t.Fatalf("second=%+v err=%v", second, err)
 	}
@@ -876,24 +789,6 @@ func TestAuthorizedRunLookupBindsFrozenRunIDAndAuthorityDigest(t *testing.T) {
 	}
 }
 
-func repositoryRunScopes(t *testing.T, bindingDigest string) application.AuthorizedScopeSet {
-	t.Helper()
-	user := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "U_7", ActorType: "User"}
-	authorizer, err := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: user})
-	if err != nil {
-		t.Fatal(err)
-	}
-	requester, err := authorizer.ResolveConfiguredRequester(application.Requester{ID: user.Login, Kind: "github_login", DatabaseID: user.DatabaseID, NodeID: user.NodeID, ActorType: user.ActorType})
-	if err != nil {
-		t.Fatal(err)
-	}
-	scopes, err := authorizer.RepositoryScopes(requester, application.RepositoryAuthority{Repository: "owner/repo", ProfileID: "repository-profile:owner/repo", BindingDigest: bindingDigest, AllowedLogins: []string{user.Login}, TrustedOperators: []domain.GitHubUserIdentity{user}, Enabled: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return scopes
-}
-
 func controllerRunScopes(t *testing.T) application.AuthorizedScopeSet {
 	t.Helper()
 	user := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "U_7", ActorType: "User"}
@@ -906,6 +801,24 @@ func controllerRunScopes(t *testing.T) application.AuthorizedScopeSet {
 		t.Fatal(err)
 	}
 	scopes, err := authorizer.ControllerScopes(requester)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return scopes
+}
+
+func repositoryRunScopes(t *testing.T, bindingDigest string) application.AuthorizedScopeSet {
+	t.Helper()
+	user := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "U_7", ActorType: "User"}
+	authorizer, err := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: user})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requester, err := authorizer.ResolveConfiguredRequester(application.Requester{ID: user.Login, Kind: "github_login", DatabaseID: user.DatabaseID, NodeID: user.NodeID, ActorType: user.ActorType})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopes, err := authorizer.RepositoryScopes(requester, application.RepositoryAuthority{Repository: "owner/repo", ProfileID: "repository-profile:owner/repo", BindingDigest: bindingDigest, AllowedLogins: []string{user.Login}, TrustedOperators: []domain.GitHubUserIdentity{user}, Enabled: true})
 	if err != nil {
 		t.Fatal(err)
 	}

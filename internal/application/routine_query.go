@@ -313,8 +313,8 @@ type RoutineRunQueryService struct {
 	actions *LegalActionService
 }
 
-func NewRoutineRunQueryService(store QueryStore, authorizer *AuthorizationService, repositories RepositoryAuthoritySource) (*RoutineRunQueryService, error) {
-	queries, err := NewScopedQueryService(store, authorizer, repositories)
+func NewRoutineRunQueryService(store QueryStore, authorizer *AuthorizationService) (*RoutineRunQueryService, error) {
+	queries, err := NewScopedQueryService(store, authorizer)
 	if err != nil {
 		return nil, err
 	}
@@ -323,17 +323,6 @@ func NewRoutineRunQueryService(store QueryStore, authorizer *AuthorizationServic
 		return nil, err
 	}
 	return &RoutineRunQueryService{queries: queries, store: store, actions: actions}, nil
-}
-
-func (s *RoutineRunQueryService) List(ctx context.Context, query RunSummaryQuery, observedAt time.Time) (RoutineRunPage, error) {
-	if s == nil {
-		return RoutineRunPage{}, serviceError(ErrorInternal, "routine run query is unavailable", nil)
-	}
-	page, err := s.queries.ListRunSummaries(ctx, query)
-	if err != nil {
-		return RoutineRunPage{}, err
-	}
-	return s.projectRunPage(ctx, page, observedAt)
 }
 
 func (s *RoutineRunQueryService) ListController(ctx context.Context, authority ControllerReadAuthority, query RunSummaryQuery, observedAt time.Time) (RoutineRunPage, error) {

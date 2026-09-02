@@ -172,11 +172,11 @@ func composeOperator(ctx context.Context, configOverride string) (*operatorCompo
 	if err != nil {
 		return closeWith(errors.New("repository projection service is unavailable"))
 	}
-	runs, err := application.NewRoutineRunQueryService(store, authorizer, loaded.Registry)
+	runs, err := application.NewRoutineRunQueryService(store, authorizer)
 	if err != nil {
 		return closeWith(errors.New("run projection service is unavailable"))
 	}
-	attention, err := application.NewRoutineAttentionQueryService(store, store, authorizer, loaded.Registry)
+	attention, err := application.NewRoutineAttentionQueryService(store, store, authorizer)
 	if err != nil {
 		return closeWith(errors.New("attention projection service is unavailable"))
 	}

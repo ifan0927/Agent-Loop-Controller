@@ -546,7 +546,7 @@ func configuredQueryService(loaded bootstrap.Bootstrap, store application.QueryS
 	if err != nil {
 		return application.QueryService{}, err
 	}
-	return application.NewScopedQueryService(store, authorizer, loaded.Registry)
+	return application.NewScopedQueryService(store, authorizer)
 }
 
 func controllerContinue(args []string) error {

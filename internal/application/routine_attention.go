@@ -26,21 +26,7 @@ type RoutineAttentionQuery struct {
 	Cursor    string             `json:"cursor,omitempty"`
 }
 
-type RoutineAttentionCandidateQuery struct {
-	Scopes              AuthorizedScopeSet
-	Scope               AuthorityScopeKind
-	TargetID            string
-	RepositoryProfileID string
-	RepositoryProfiles  map[string]string
-	Limit               int
-}
-
-type RoutineAttentionTargetCandidateStore interface {
-	ListRoutineAttentionCandidates(context.Context, RoutineAttentionCandidateQuery) ([]OperatorAttentionEvent, error)
-}
-
 type RoutineAttentionCandidateStore interface {
-	RoutineAttentionTargetCandidateStore
 	ControllerAttentionCandidateStore
 }
 
@@ -106,58 +92,20 @@ type routineAttentionCursor struct {
 }
 
 type RoutineAttentionQueryService struct {
-	store        RoutineAttentionCandidateStore
-	queries      QueryStore
-	authorizer   *AuthorizationService
-	repositories RepositoryProfileSource
-	actions      *LegalActionService
+	store   RoutineAttentionCandidateStore
+	queries QueryStore
+	actions *LegalActionService
 }
 
-func NewRoutineAttentionQueryService(store RoutineAttentionCandidateStore, queries QueryStore, authorizer *AuthorizationService, repositories RepositoryProfileSource) (*RoutineAttentionQueryService, error) {
-	if store == nil || queries == nil || authorizer == nil || repositories == nil {
+func NewRoutineAttentionQueryService(store RoutineAttentionCandidateStore, queries QueryStore, authorizer *AuthorizationService) (*RoutineAttentionQueryService, error) {
+	if store == nil || queries == nil || authorizer == nil {
 		return nil, errors.New("routine attention dependencies are required")
 	}
 	actions, err := NewLegalActionService(queries, authorizer)
 	if err != nil {
 		return nil, err
 	}
-	return &RoutineAttentionQueryService{store: store, queries: queries, authorizer: authorizer, repositories: repositories, actions: actions}, nil
-}
-
-func (s *RoutineAttentionQueryService) List(ctx context.Context, query RoutineAttentionQuery, observedAt time.Time) (RoutineAttentionPage, error) {
-	limit := query.Limit
-	if limit == 0 {
-		limit = RoutineQueryDefaultLimit
-	}
-	if limit < 1 || limit > RoutineQueryMaximumLimit || len(query.Cursor) > 1024 {
-		return RoutineAttentionPage{}, serviceError(ErrorInvalidInput, "attention collection bounds are invalid", nil)
-	}
-	configured, err := s.authorizer.ResolveConfiguredRequester(query.Requester)
-	if err != nil {
-		return RoutineAttentionPage{}, hiddenTargetError()
-	}
-	if query.Scope == ScopeController {
-		return RoutineAttentionPage{}, serviceError(ErrorInternal, "controller attention requires stable read authority", nil)
-	}
-	scopes, profileID, repositoryTargets, err := s.attentionScopes(ctx, configured, query.Scope, query.TargetID)
-	if err != nil {
-		return RoutineAttentionPage{}, err
-	}
-	cursor, err := decodeRoutineAttentionCursor(query.Cursor)
-	if err != nil {
-		return RoutineAttentionPage{}, err
-	}
-	if query.Cursor != "" && (cursor.AuthorityDigest != scopes.Digest() || cursor.Scope != query.Scope || cursor.TargetID != query.TargetID) {
-		return RoutineAttentionPage{}, serviceError(ErrorInvalidInput, "cursor is invalid", nil)
-	}
-	candidates, err := s.store.ListRoutineAttentionCandidates(ctx, RoutineAttentionCandidateQuery{Scopes: scopes, Scope: query.Scope, TargetID: query.TargetID, RepositoryProfileID: profileID, RepositoryProfiles: repositoryTargets, Limit: maximumRoutineAttentionCandidates + 1})
-	if err != nil {
-		return RoutineAttentionPage{}, classifyServiceError(err)
-	}
-	if len(candidates) > maximumRoutineAttentionCandidates {
-		return RoutineAttentionPage{}, serviceError(ErrorInternal, "active attention candidate bound exceeded", nil)
-	}
-	return s.projectPage(ctx, query, observedAt, scopes.Digest(), candidates, repositoryTargets)
+	return &RoutineAttentionQueryService{store: store, queries: queries, actions: actions}, nil
 }
 
 // ListController reads the complete local Controller Attention collection with
@@ -192,10 +140,10 @@ func (s *RoutineAttentionQueryService) ListController(ctx context.Context, autho
 	if len(candidates) > maximumRoutineAttentionCandidates {
 		return RoutineAttentionPage{}, serviceError(ErrorInternal, "active attention candidate bound exceeded", nil)
 	}
-	return s.projectPage(ctx, query, observedAt, authority.Digest(), candidates, nil)
+	return s.projectPage(ctx, query, observedAt, authority.Digest(), candidates)
 }
 
-func (s *RoutineAttentionQueryService) projectPage(ctx context.Context, query RoutineAttentionQuery, observedAt time.Time, authorityDigest string, candidates []OperatorAttentionEvent, repositoryTargets map[string]string) (RoutineAttentionPage, error) {
+func (s *RoutineAttentionQueryService) projectPage(ctx context.Context, query RoutineAttentionQuery, observedAt time.Time, authorityDigest string, candidates []OperatorAttentionEvent) (RoutineAttentionPage, error) {
 	limit := query.Limit
 	if limit == 0 {
 		limit = RoutineQueryDefaultLimit
@@ -209,10 +157,7 @@ func (s *RoutineAttentionQueryService) projectPage(ctx context.Context, query Ro
 	for _, event := range candidates {
 		state := RoutineAttentionUnknown
 		navigation := RoutineAttentionNavigationNone
-		repository := repositoryTargets[event.RepositoryProfileID]
-		if query.Scope == ScopeController && repository == "" {
-			repository = event.RepositoryProfileName
-		}
+		repository := event.RepositoryProfileName
 		linearIdentifier := event.LinearIdentifier
 		if event.RunID != "" {
 			inspection, inspectErr := s.queries.Inspect(ctx, event.RunID)
@@ -235,12 +180,7 @@ func (s *RoutineAttentionQueryService) projectPage(ctx context.Context, query Ro
 			state = RoutineAttentionConflict
 		}
 		scope, target := routineAttentionScope(event), routineAttentionTarget(event)
-		if query.Scope == ScopeRepository {
-			scope, target = ScopeRepository, query.TargetID
-			repository = query.TargetID
-		} else if query.Scope == ScopeRun {
-			scope, target = ScopeRun, query.TargetID
-		} else if scope == ScopeRepository {
+		if scope == ScopeRepository {
 			if repository != "" {
 				target = repository
 			} else {
@@ -311,36 +251,6 @@ func routineAttentionOfferSummary(offer LegalActionOffer) RoutineAttentionOfferS
 func routineAttentionEventID(eventKey string) string {
 	digest := sha256.Sum256([]byte("routine-attention-item:" + eventKey))
 	return "attention-" + hex.EncodeToString(digest[:])
-}
-
-func (s *RoutineAttentionQueryService) attentionScopes(ctx context.Context, configured ConfiguredRequester, scope AuthorityScopeKind, target string) (AuthorizedScopeSet, string, map[string]string, error) {
-	switch scope {
-	case ScopeRepository:
-		profile, found, err := s.repositories.RepositoryProfile(ctx, target)
-		if err != nil {
-			return AuthorizedScopeSet{}, "", nil, classifyServiceError(err)
-		}
-		if !found || profile.Authority.Repository != target {
-			return AuthorizedScopeSet{}, "", nil, hiddenTargetError()
-		}
-		scopes, err := s.authorizer.RepositoryScopes(configured, profile.Authority)
-		if err != nil {
-			return AuthorizedScopeSet{}, "", nil, hiddenTargetError()
-		}
-		return scopes, profile.Authority.ProfileID, map[string]string{profile.Authority.ProfileID: profile.Authority.Repository}, nil
-	case ScopeRun:
-		authority, err := s.queries.GetRunScopeAuthority(ctx, target)
-		if err != nil {
-			return AuthorizedScopeSet{}, "", nil, hiddenTargetError()
-		}
-		scopes, err := s.authorizer.RunScopes(configured, authority)
-		if err != nil {
-			return AuthorizedScopeSet{}, "", nil, hiddenTargetError()
-		}
-		return scopes, "", nil, nil
-	default:
-		return AuthorizedScopeSet{}, "", nil, serviceError(ErrorInvalidInput, "attention scope is invalid", nil)
-	}
 }
 
 func routineAttentionAfter(value RoutineAttentionItem, cursor routineAttentionCursor) bool {

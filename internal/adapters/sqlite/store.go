@@ -3268,58 +3268,6 @@ func decodeRunScopeAuthority(runID, repository, bindingDigest, raw string) (appl
 		AllowedLogins: append([]string(nil), configured.AllowedOperatorLogins...), TrustedOperators: trusted}, nil
 }
 
-// ListAuthorizedRuns applies authority, repository, and lifecycle filters
-// before counting, ordering, and pagination. Hidden or excluded rows therefore
-// cannot influence page shape or cursors.
-func (s *Store) ListAuthorizedRuns(ctx context.Context, input application.AuthorizedRunQuery) (application.AuthorizedRunPage, error) {
-	if input.Limit < 1 || input.Limit > 101 || input.Scopes.Empty() {
-		return application.AuthorizedRunPage{}, errors.New("authorized run list query is invalid")
-	}
-	where, args, err := authorizedRunWhere(input.Scopes, input.Repository)
-	if err != nil {
-		return application.AuthorizedRunPage{}, err
-	}
-	switch input.Lifecycle {
-	case application.RunLifecycleActive:
-		where += ` AND current_state NOT IN ('rejected','failed','completed')`
-	case application.RunLifecycleEnded:
-		where += ` AND current_state IN ('rejected','failed','completed')`
-	case application.RunLifecycleAll:
-	default:
-		return application.AuthorizedRunPage{}, errors.New("authorized run lifecycle filter is invalid")
-	}
-	var total int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE `+where, args...).Scan(&total); err != nil {
-		return application.AuthorizedRunPage{}, err
-	}
-	query := runSelect + ` WHERE ` + where
-	pageArgs := append([]any(nil), args...)
-	if !input.BeforeUpdatedAt.IsZero() {
-		query += ` AND (updated_at < ? OR (updated_at = ? AND run_id < ?))`
-		before := formatTime(input.BeforeUpdatedAt)
-		pageArgs = append(pageArgs, before, before, input.BeforeRunID)
-	}
-	query += ` ORDER BY updated_at DESC, run_id DESC LIMIT ?`
-	pageArgs = append(pageArgs, input.Limit)
-	rows, err := s.db.QueryContext(ctx, query, pageArgs...)
-	if err != nil {
-		return application.AuthorizedRunPage{}, err
-	}
-	defer rows.Close()
-	runs := []application.Run{}
-	for rows.Next() {
-		run, err := scanRun(rows)
-		if err != nil {
-			return application.AuthorizedRunPage{}, err
-		}
-		runs = append(runs, run)
-	}
-	if err := rows.Err(); err != nil {
-		return application.AuthorizedRunPage{}, err
-	}
-	return application.AuthorizedRunPage{Runs: runs, TotalCount: total}, nil
-}
-
 // ListControllerRuns reads the local Controller-owned Runs collection through
 // its dedicated read authority. It intentionally does not decode frozen
 // repository configuration or construct per-run visibility predicates.

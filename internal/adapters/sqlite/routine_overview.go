@@ -241,7 +241,7 @@ func projectOverviewOnboarding(value application.Onboarding) application.Routine
 }
 
 func readRoutineOverviewAttention(ctx context.Context, tx *sql.Tx, limit int, result *application.RoutinePersistedOverviewSnapshot) error {
-	current, err := readCurrentOperatorAttentionFamilies(ctx, tx, currentOperatorAttentionFamilyRead{Filter: currentOperatorAttentionFamilyAll, Limit: limit, SeverityOrder: true, Count: true})
+	current, err := readCurrentOperatorAttentionFamilies(ctx, tx, currentOperatorAttentionFamilyRead{Limit: limit, SeverityOrder: true, Count: true})
 	if err != nil {
 		return err
 	}
