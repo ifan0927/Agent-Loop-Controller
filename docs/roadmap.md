@@ -85,6 +85,9 @@ This milestone is recorded by the closed
   local/remote ownership cleanup,
   terminal residue attention, repository-slot release, owned repair-push recovery,
   and verified external merge acceptance.
+- Relocated frozen-source cleanup residue is intentionally fail-stop for the
+  disposable single-user runtime; historical recovery evidence remains readable,
+  while recovery proceeds by normal fresh installation and onboarding.
 - Typed exhausted-retry recovery with durable operator intent and automatic
   worker resume through the normal driver.
 - Deterministic continuous-supervisor restart/fault matrix with a sanitized,

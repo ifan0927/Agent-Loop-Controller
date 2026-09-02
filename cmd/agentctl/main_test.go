@@ -263,6 +263,13 @@ func TestControllerDriveRequiresRunAndRequesterIdentity(t *testing.T) {
 	}
 }
 
+func TestControllerRejectsRetiredCleanupSourceRecoveryCommand(t *testing.T) {
+	err := controller([]string{"recover-cleanup-source", "preview", "run-1"})
+	if err == nil || !strings.Contains(err.Error(), "unknown controller command") {
+		t.Fatalf("retired cleanup-source recovery command error=%v", err)
+	}
+}
+
 func TestControllerAbandonRequiresRunAndRequesterIdentity(t *testing.T) {
 	err := controller([]string{"abandon"})
 	if err == nil || !strings.Contains(err.Error(), "run ID and complete requester identity") {
