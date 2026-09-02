@@ -21,6 +21,7 @@ type operatorOverviewBatch struct {
 type operatorLoader interface {
 	LoadOverview(context.Context, time.Time) (operatorOverviewBatch, error)
 	LoadRuns(context.Context, application.RunLifecycleFilter, string, string, time.Time) (application.RoutineRunPage, error)
+	LoadAttention(context.Context, string, time.Time) (application.RoutineAttentionPage, error)
 	LoadRunDetail(context.Context, string, time.Time) (application.RoutineRunDetail, error)
 }
 
@@ -36,6 +37,7 @@ type productionOperatorLoader struct {
 	overview     operatorOverviewProjectionSource
 	repositories operatorRepositoryProjectionSource
 	runs         *application.RoutineRunQueryService
+	attention    *application.RoutineAttentionQueryService
 	requester    application.Requester
 }
 
@@ -58,6 +60,10 @@ func (l *productionOperatorLoader) LoadRuns(ctx context.Context, lifecycle appli
 
 func (l *productionOperatorLoader) LoadRunDetail(ctx context.Context, runID string, observedAt time.Time) (application.RoutineRunDetail, error) {
 	return l.runs.Detail(ctx, application.RunDetailQuery{Requester: l.requester, RunID: runID}, observedAt.UTC())
+}
+
+func (l *productionOperatorLoader) LoadAttention(ctx context.Context, cursor string, observedAt time.Time) (application.RoutineAttentionPage, error) {
+	return l.attention.List(ctx, application.RoutineAttentionQuery{Requester: l.requester, Scope: application.ScopeController, Limit: application.RoutineQueryDefaultLimit, Cursor: cursor}, observedAt.UTC())
 }
 
 type operatorComposition struct {
@@ -159,10 +165,14 @@ func composeOperator(ctx context.Context, configOverride string) (*operatorCompo
 	if err != nil {
 		return closeWith(errors.New("run projection service is unavailable"))
 	}
+	attention, err := application.NewRoutineAttentionQueryService(store, store, authorizer, loaded.Registry)
+	if err != nil {
+		return closeWith(errors.New("attention projection service is unavailable"))
+	}
 	operator := loaded.Controller.Operator
 	requester := application.Requester{ID: operator.Login, Kind: "github_login", DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, ActorType: operator.ActorType}
 	return &operatorComposition{
-		loader: &productionOperatorLoader{overview: overview, repositories: repositories, runs: runs, requester: requester},
+		loader: &productionOperatorLoader{overview: overview, repositories: repositories, runs: runs, attention: attention, requester: requester},
 		store:  store,
 	}, nil
 }

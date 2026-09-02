@@ -137,8 +137,8 @@ completed controller, bounded-concurrency, and authorization foundation
 ```
 
 `agentctl` is the implemented canonical executable. The worker entrypoint is
-`agentctl controller worker`; the read-only Overview, Runs, and Run detail are
-available through `agentctl operator`. New launchd installations use the
+`agentctl controller worker`; the read-only Overview, Runs, complete Attention
+inbox, and shared Run detail are available through `agentctl operator`. New launchd installations use the
 neutral service identity, and legacy installations have a bounded reversible
 migration rather than a second runtime path.
 
@@ -191,7 +191,7 @@ runs as a separate process from the worker, reads durable Controller state
 through typed application projections, and invokes only Controller-owned legal
 actions. Closing or crashing the TUI must not stop Controller execution.
 
-The read-only Overview, Runs, and shared Run detail are implemented with Bubble
+The read-only Overview, Runs, complete Attention inbox, and shared Run detail are implemented with Bubble
 Tea v2, Bubbles v2, and Lip Gloss v2. Overview presents projected health,
 repositories, active-before-recently-ended runs, and actionable attention.
 Runs provides authorization-safe Active/Ended/All and exact-repository filters,
@@ -202,7 +202,10 @@ layouts and preserves the last complete screen across sanitized refresh
 failures. Its
 observation header, projected health card, content-sized panels, explicit focus,
 and redundant status markers make the same bounded evidence easier to scan. It
-has no mutation actions. The remaining navigation surface is Queue, Attention,
+has no mutation actions. Attention adds authorization-first severity/time/event
+pagination, item-bound safe summaries of current offers, explicit no-offer
+rows, and application-owned Run-detail navigation without completing the later
+R07 decision mutation. The remaining navigation surface is Queue,
 Repositories, Onboarding, Settings, and System/Audit, but stable
 Controller projections determine screen details.
 

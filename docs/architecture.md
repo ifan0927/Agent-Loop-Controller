@@ -1834,9 +1834,9 @@ paths to assemble workflow policy. It consumes bounded sanitized projections
 and only legal actions offered by Controller application services. It is not a
 database administration tool, orchestrator, or second state machine.
 
-Overview, Runs, and Run detail each refresh every ten seconds or on an explicit
-`r`, permit at most one visible active read, and fence obsolete route and refresh
-generations. After one successful load, a later error preserves the last
+Overview, Runs, Attention, and Run detail each refresh every ten seconds or on
+an explicit `r`, permit at most one visible active read per active route, and
+fence obsolete route and refresh generations. After one successful load, a later error preserves the last
 complete screen and marks it stale with only a sanitized service category and
 message. Runs applies configured-operator authorization, optional exact
 repository scope, and the closed Active/Ended/All lifecycle filter before
@@ -1845,7 +1845,21 @@ pagination. Its opaque cursor binds authorization scope, repository, lifecycle,
 updated time, and run identity; the TUI retains only the bounded prior-cursor
 stack required for Previous.
 
-Run detail is the same projection whether opened from Overview or Runs. The
+Attention is a Controller-scope, authorization-first collection over every
+current unresolved operator-attention family, including retained legacy
+priority-tie evidence. The application projects one versioned typed item per
+candidate with safe event, scope, target, repository, Linear, Controller state,
+Attention state, severity, reason, time, and closed navigation conclusions.
+Only `run_detail` and `none` are navigation values. Current legal-action offers
+are sanitized and bound inside the exact item whose current persisted attention
+authority produced them; authority/evidence digests and page-level joins never
+reach presentation. Rows without offers remain visible. Severity, occurrence
+time, and event identity define the keyset order, and the opaque cursor binds
+the Attention projection version, authorization scope, query target, and full
+position. The TUI keeps only a bounded prior-cursor stack.
+
+Run detail is the same projection whether opened from Overview, Runs, or an
+Attention item with an application-projected `run_detail` destination. The
 application owns current phase, exact wait kind, normal/abnormal/unknown/
 conflict/ended assessment, latest meaningful transition, active attention,
 pull-request summary, and the fixed eleven delivery gates. The TUI does not
@@ -1854,8 +1868,10 @@ this read-only slice. Controller aggregate readiness is
 rendered exactly as projected; capacity, repository readiness, availability,
 and freshness remain separate evidence and are never recomputed into health by
 the adapter. Widths at or above 92 columns place repositories and runs on the
-left and attention on the right. Widths from 80 through 91 stack health,
-attention, repositories, and runs. Anything below 80x24 renders only the size
+left and bounded Overview attention on the right; the Attention route places
+its selectable inbox and selected summary side by side. Widths from 80 through
+91 stack Overview panels and place the Attention list above its summary.
+Anything below 80x24 renders only the size
 requirement and quit control. Panel height is content-driven within the
 available terminal budget; only the focused panel's current row is highlighted,
 and color is redundant presentation rather than authority.

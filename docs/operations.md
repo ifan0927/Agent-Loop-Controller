@@ -410,11 +410,16 @@ fails closed if the locator, retained desired generation, exact database
 identity, mode, binding, or schema is unavailable or conflicting. It never
 initializes, migrates, reconciles, adopts, or writes configuration or SQLite.
 
-Overview, Runs, and Run detail refresh every ten seconds. Use `1` and `2` for
-Overview and Runs, `Enter` on a run to open the shared detail, and `Escape` to
-return with the previous screen state preserved. On Runs, `f` cycles Active,
+Overview, Runs, Attention, and Run detail refresh every ten seconds. Use `1`,
+`2`, and `3` for Overview, Runs, and Attention. `Enter` opens the shared Run
+detail from a run or only from an Attention item whose projected navigation is
+Run detail; `Escape` returns with the previous screen state preserved. On Runs, `f` cycles Active,
 Ended, and All; `/` accepts an exact lowercase `owner/repository` filter; and
-`n`/`p` move through bounded cursor pages. Use `r` to refresh, arrow keys or
+`n`/`p` move through bounded cursor pages. Attention uses `Tab` between its list
+and selected-item summary, arrow keys to select or scroll, and the same `n`/`p`
+pagination. Items without a current offer explicitly show `No Controller action
+offered`; offers are informational and cannot be executed in this read-only
+route. Use `r` to refresh, arrow keys or
 `j`/`k` to select or scroll, `?` for current help, and `q` or `Ctrl-C` to quit.
 Overview also uses `Tab` and `Shift+Tab` between non-empty panels. A refresh
 failure after a successful load leaves the last complete screen visible and
@@ -482,11 +487,15 @@ duration syntax such as `30s`, `15m`, and `24h`.
 agentctl operator [--config <controller.json>]
 ```
 
-Use this for the bounded read-only Controller Overview and Runs journey. It
+Use this for the bounded read-only Controller Overview, Runs, and Attention
+journey. It
 shows the projected aggregate health, separate worker/capacity/repository
 evidence, repositories in projection order, active runs before recently ended
 runs, and Controller-owned
-actionable attention with supporting attention evidence. Runs defaults to
+actionable attention with supporting attention evidence. The complete Attention
+inbox retains every authorized unresolved candidate, including rows without
+current Controller actions, and shows the selected item's safe typed evidence
+and exact item-bound offer summaries without mutation controls. Runs defaults to
 Active, supports Active/Ended/All plus one exact repository filter, and uses
 opaque next/previous cursor navigation ordered by most recent update. Run detail
 shows the application-owned phase and wait assessment, latest transition,
@@ -2678,8 +2687,8 @@ be `fresh`; workload activity is not runtime readiness.
 No controller run state change.
 
 Routine application queries are the typed boundary used by the local operator
-adapter; only the implemented Overview, Runs, and Run detail are public through
-that TUI. The queries read persisted
+adapter; only the implemented Overview, Runs, Attention, and shared Run detail
+are public through that TUI. The queries read persisted
 queue, run, attention, repository, onboarding, and configuration evidence only.
 They never trigger Linear, GitHub, Git, verifier, credential, or readiness
 refreshes, and the settings convergence path performs no reconciliation or

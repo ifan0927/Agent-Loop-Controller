@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
@@ -23,6 +25,32 @@ func (s *Store) ListRoutineAttentionCandidates(ctx context.Context, input applic
 		if !input.Scopes.HasController() {
 			return nil, errors.New("routine attention controller scope is invalid")
 		}
+		predicates := []string{"(run_id='' AND repository_profile_id IN ('','automation'))"}
+		if len(input.RepositoryProfiles) != 0 {
+			placeholders := ""
+			profileIDs := make([]string, 0, len(input.RepositoryProfiles))
+			for profileID := range input.RepositoryProfiles {
+				profileIDs = append(profileIDs, profileID)
+			}
+			sort.Strings(profileIDs)
+			for _, profileID := range profileIDs {
+				repository := input.RepositoryProfiles[profileID]
+				if profileID == "" || repository == "" {
+					return nil, errors.New("routine attention repository authority is invalid")
+				}
+				if placeholders != "" {
+					placeholders += ","
+				}
+				placeholders += "?"
+				args = append(args, profileID)
+			}
+			predicates = append(predicates, "(run_id='' AND repository_profile_id IN ("+placeholders+"))")
+		}
+		for _, predicate := range input.Scopes.RunPredicates() {
+			predicates = append(predicates, "(run_id=? AND EXISTS (SELECT 1 FROM runs WHERE runs.run_id=operator_attention_outbox.run_id AND runs.repository_binding_digest=?))")
+			args = append(args, predicate.RunID, predicate.BindingDigest)
+		}
+		where = "(" + strings.Join(predicates, " OR ") + ")"
 	case application.ScopeRepository:
 		if input.TargetID == "" || input.RepositoryProfileID == "" || len(input.Scopes.RepositoryBindingDigests()) != 1 {
 			return nil, errors.New("routine attention repository scope is invalid")

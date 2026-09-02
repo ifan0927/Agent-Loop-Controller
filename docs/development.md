@@ -592,11 +592,16 @@ golden tests, and a bounded set of VHS critical-flow terminal acceptance tests.
 VHS is development tooling, not a runtime dependency or a gate for every small
 change.
 
-Route tests must fence late refresh results, preserve Overview/Runs return state,
-and prove the same Run detail projection opens from both sources. Runs tests
+Route tests must fence late refresh results, preserve Overview/Runs/Attention
+return state, and prove the same Run detail projection opens from every
+application-projected source. Runs tests
 cover lifecycle and exact-repository filter resets, next/previous cursor stacks,
 selection restoration by run ID, stale-screen preservation, and 80x24 gate
 scrolling without rendering mutation offers.
+Attention tests cover exact event selection restoration, list/summary focus and
+scrolling, next/previous cursor stacks, no-op Enter for `none`, shared Run detail
+return, item-bound sanitized offer summaries, stale-screen preservation, safe
+initial failures, and compact/wide bounded rendering.
 
 ## Documentation Governance
 
