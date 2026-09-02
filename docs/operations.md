@@ -640,6 +640,12 @@ disable remains legal while work is active and blocks only new
 admission. Readiness remains separate from enabled/disabled intent, while any
 profile or configuration authority change requires a fresh recheck.
 
+`list` uses the configured operator's stable Controller collection reader.
+Its opaque cursor is bound to the Repository family and canonical repository
+keyset, so adding or rebinding an unrelated repository does not invalidate an
+in-progress page sequence. The cursor never authorizes `inspect`, `recheck`, or
+any lifecycle mutation.
+
 If a recheck is interrupted, restart any managed command once to reconcile it
 to `ambiguous`, then use a new request ID for a deliberate fresh observation.
 Exact replay of a settled request returns its persisted receipt.

@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -9,6 +10,8 @@ import (
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/domain"
 )
+
+const controllerRepositoryCursorVersion = "v2"
 
 var (
 	ErrRepositoryLifecycleConflict = errors.New("repository lifecycle authority conflicts")
@@ -110,6 +113,22 @@ type RepositoryListPage struct {
 	Total        int                    `json:"total"`
 }
 
+type ControllerRepositoryQuery struct {
+	Authority       ControllerReadAuthority
+	AfterRepository string
+	Limit           int
+}
+
+type ControllerRepositoryCollectionStore interface {
+	ListControllerRepositories(context.Context, ControllerRepositoryQuery) (RepositoryListPage, error)
+}
+
+type controllerRepositoryCursor struct {
+	Version      string `json:"version"`
+	ReaderDigest string `json:"reader_digest"`
+	Repository   string `json:"repository"`
+}
+
 type RepositoryProfileAuthority struct {
 	Authority RepositoryAuthority
 	Profile   LocalRepository
@@ -200,9 +219,9 @@ type RepositoryLifecycleFailure struct {
 
 type RepositoryLifecycleStore interface {
 	OperationReceiptStore
+	ControllerRepositoryCollectionStore
 	AdoptRepositoryLifecycleBaseline(context.Context, RepositoryBaselineInput) error
 	RepositoryOperationAuthority(context.Context, string) (RepositoryOperationAuthority, error)
-	ListAuthorizedRepositories(context.Context, AuthorizedScopeSet, int, string) (RepositoryListPage, error)
 	GetAuthorizedRepository(context.Context, string, AuthorizedScopeSet) (RepositoryProjection, error)
 	BeginRepositoryRecheck(context.Context, RepositoryRecheckStart) (RepositoryRecheckState, bool, error)
 	SaveRepositoryRecheckObservation(context.Context, string, domain.RepositoryDimensionResult) error
@@ -261,34 +280,87 @@ func (s *RepositoryService) List(ctx context.Context, requester Requester, limit
 	if err != nil {
 		return RepositoryListPage{}, hiddenTargetError()
 	}
-	profiles, err := s.profiles.ListRepositoryProfiles(ctx)
+	reader, err := s.authorizer.ControllerReadCollectionAuthority(configured)
 	if err != nil {
-		return RepositoryListPage{}, classifyServiceError(err)
+		return RepositoryListPage{}, hiddenTargetError()
 	}
-	if len(profiles) == 0 {
-		return RepositoryListPage{Repositories: []RepositoryProjection{}}, nil
-	}
-	scopes := AuthorizedScopeSet{}
-	for _, profile := range profiles {
-		candidate, scopeErr := s.authorizer.RepositoryScopes(configured, profile.Authority)
-		if scopeErr != nil {
-			continue
-		}
-		scopes.scopes = append(scopes.scopes, candidate.scopes...)
-	}
-	if len(scopes.scopes) != 0 {
-		scopes, err = newAuthorizedScopeSet(configured.Identity(), scopes.scopes...)
-		if err != nil {
-			return RepositoryListPage{}, classifyServiceError(err)
-		}
-	}
+	return s.ListController(ctx, reader, limit, cursor)
+}
+
+// ListController reads the current local Repository collection through the
+// collection-only Controller reader. Direct repository inspection and every
+// mutation continue to resolve the current target authority separately.
+func (s *RepositoryService) ListController(ctx context.Context, authority ControllerReadAuthority, limit int, cursor string) (RepositoryListPage, error) {
 	if limit == 0 {
 		limit = 50
+	}
+	if !authority.Valid() {
+		return RepositoryListPage{}, serviceError(ErrorInternal, "controller repository collection authority is unavailable", nil)
 	}
 	if limit < 1 || limit > 100 || len(cursor) > 512 {
 		return RepositoryListPage{}, serviceError(ErrorInvalidInput, "repository collection bounds are invalid", nil)
 	}
-	return s.store.ListAuthorizedRepositories(ctx, scopes, limit, cursor)
+	position, err := decodeControllerRepositoryCursor(cursor)
+	if err != nil {
+		return RepositoryListPage{}, err
+	}
+	if cursor != "" && position.ReaderDigest != authority.Digest() {
+		return RepositoryListPage{}, serviceError(ErrorInvalidInput, "cursor is invalid", nil)
+	}
+	stored, err := s.store.ListControllerRepositories(ctx, ControllerRepositoryQuery{Authority: authority, AfterRepository: position.Repository, Limit: limit + 1})
+	if err != nil {
+		return RepositoryListPage{}, classifyServiceError(err)
+	}
+	if stored.Total < len(stored.Repositories) || len(stored.Repositories) > limit+1 {
+		return RepositoryListPage{}, serviceError(ErrorInternal, "controller repository authority conflicts", nil)
+	}
+	values := stored.Repositories
+	page := RepositoryListPage{Repositories: make([]RepositoryProjection, 0, min(len(values), limit)), Total: stored.Total}
+	if len(values) > limit {
+		page.HasMore = true
+		values = values[:limit]
+	}
+	last := position.Repository
+	for _, projection := range values {
+		if projection.Lifecycle.Repository > last && validCanonicalRepositoryFilter(projection.Lifecycle.Repository) && projection.Lifecycle.RetiredAt.IsZero() && projection.Lifecycle.Validate() == nil {
+			page.Repositories = append(page.Repositories, projection)
+			last = projection.Lifecycle.Repository
+			continue
+		}
+		return RepositoryListPage{}, serviceError(ErrorInternal, "controller repository authority conflicts", nil)
+	}
+	if page.HasMore && len(values) != 0 {
+		page.NextCursor = encodeControllerRepositoryCursor(controllerRepositoryCursor{Version: controllerRepositoryCursorVersion, ReaderDigest: authority.Digest(), Repository: values[len(values)-1].Lifecycle.Repository})
+	}
+	return page, nil
+}
+
+func decodeControllerRepositoryCursor(value string) (controllerRepositoryCursor, error) {
+	if value == "" {
+		return controllerRepositoryCursor{}, nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return controllerRepositoryCursor{}, serviceError(ErrorInvalidInput, "cursor is invalid", nil)
+	}
+	var cursor controllerRepositoryCursor
+	if json.Unmarshal(raw, &cursor) != nil || cursor.Version != controllerRepositoryCursorVersion || !validAuthorityDigest(cursor.ReaderDigest) || !validCanonicalRepositoryFilter(cursor.Repository) {
+		return controllerRepositoryCursor{}, serviceError(ErrorInvalidInput, "cursor is invalid", nil)
+	}
+	return cursor, nil
+}
+
+func encodeControllerRepositoryCursor(cursor controllerRepositoryCursor) string {
+	raw, _ := json.Marshal(cursor)
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+func validCanonicalRepositoryFilter(value string) bool {
+	if value == "" || value != strings.TrimSpace(value) || value != strings.ToLower(value) || strings.ContainsRune(value, '\x00') {
+		return false
+	}
+	parts := strings.Split(value, "/")
+	return len(parts) == 2 && parts[0] != "" && parts[1] != ""
 }
 
 func (s *RepositoryService) Inspect(ctx context.Context, requester Requester, repository string) (RepositoryProjection, error) {

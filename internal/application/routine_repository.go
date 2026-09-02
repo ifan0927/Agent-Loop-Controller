@@ -58,10 +58,22 @@ func NewRoutineRepositoryQueryService(repositories *RepositoryService, onboardin
 }
 
 func (s *RoutineRepositoryQueryService) List(ctx context.Context, requester Requester, limit int, cursor string, observedAt time.Time) (RoutineRepositoryPage, error) {
+	configured, err := s.repositories.authorizer.ResolveConfiguredRequester(requester)
+	if err != nil {
+		return RoutineRepositoryPage{}, hiddenTargetError()
+	}
+	reader, err := s.repositories.authorizer.ControllerReadCollectionAuthority(configured)
+	if err != nil {
+		return RoutineRepositoryPage{}, hiddenTargetError()
+	}
+	return s.ListController(ctx, reader, limit, cursor, observedAt)
+}
+
+func (s *RoutineRepositoryQueryService) ListController(ctx context.Context, authority ControllerReadAuthority, limit int, cursor string, observedAt time.Time) (RoutineRepositoryPage, error) {
 	if limit == 0 {
 		limit = RoutineQueryDefaultLimit
 	}
-	page, err := s.repositories.List(ctx, requester, limit, cursor)
+	page, err := s.repositories.ListController(ctx, authority, limit, cursor)
 	if err != nil {
 		return RoutineRepositoryPage{}, err
 	}

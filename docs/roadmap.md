@@ -209,9 +209,11 @@ and redundant status markers make the same bounded evidence easier to scan. It
 has no mutation actions. Attention adds stable local Controller-reader
 severity/time/event pagination, item-bound safe summaries of current offers, explicit no-offer
 rows, and application-owned Run-detail navigation without completing the later
-R07 decision mutation. The remaining navigation surface is Queue,
-Repositories, Onboarding, Settings, and System/Audit, but stable
-Controller projections determine screen details.
+R07 decision mutation. Repository and Onboarding application collections now
+use the same stable local Controller reader with family-specific pagination,
+while detail and mutation authority remains target-specific. The remaining
+navigation surface is Queue, Repositories, Onboarding, Settings, and
+System/Audit, but stable Controller projections determine screen details.
 
 The fixed product metric remains ten complete operator-intent scenarios from
 [#100](https://github.com/ifan0927/Agent-Loop-Controller/issues/100), worth ten

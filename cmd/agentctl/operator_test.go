@@ -31,14 +31,15 @@ func (s *recordingOverviewSource) Get(_ context.Context, _ application.Requester
 
 type recordingRepositorySource struct {
 	observedAt time.Time
+	reader     application.ControllerReadAuthority
 	limit      int
 	cursor     string
 	page       application.RoutineRepositoryPage
 	err        error
 }
 
-func (s *recordingRepositorySource) List(_ context.Context, _ application.Requester, limit int, cursor string, observedAt time.Time) (application.RoutineRepositoryPage, error) {
-	s.observedAt, s.limit, s.cursor = observedAt, limit, cursor
+func (s *recordingRepositorySource) ListController(_ context.Context, reader application.ControllerReadAuthority, limit int, cursor string, observedAt time.Time) (application.RoutineRepositoryPage, error) {
+	s.observedAt, s.reader, s.limit, s.cursor = observedAt, reader, limit, cursor
 	return s.page, s.err
 }
 
@@ -59,9 +60,13 @@ func (inertOperatorLoader) LoadRunDetail(context.Context, string, time.Time) (ap
 
 func TestProductionOperatorOverviewLoaderUsesOneObservedTimeAndBoundedRepositoryPage(t *testing.T) {
 	observedAt := time.Date(2026, 9, 1, 2, 3, 4, 0, time.FixedZone("fixture", 8*60*60))
+	operator := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "U_7", ActorType: "User"}
+	authorizer, _ := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: operator})
+	configured, _ := authorizer.ResolveConfiguredRequester(application.Requester{ID: operator.Login, Kind: "github_login", DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, ActorType: operator.ActorType})
+	reader, _ := authorizer.ControllerReadCollectionAuthority(configured)
 	overview := &recordingOverviewSource{projection: application.RoutineOverviewProjection{Readiness: application.AggregateReady}}
 	repositories := &recordingRepositorySource{page: application.RoutineRepositoryPage{Collection: application.RoutineCollectionMetadata{Total: 101, Truncated: true}}}
-	loader := productionOperatorLoader{overview: overview, repositories: repositories}
+	loader := productionOperatorLoader{overview: overview, repositories: repositories, reader: reader}
 
 	batch, err := loader.LoadOverview(context.Background(), observedAt)
 	if err != nil {
@@ -71,7 +76,7 @@ func TestProductionOperatorOverviewLoaderUsesOneObservedTimeAndBoundedRepository
 	if batch.ObservedAt != want || overview.observedAt != want || repositories.observedAt != want {
 		t.Fatalf("batch=%s overview=%s repositories=%s", batch.ObservedAt, overview.observedAt, repositories.observedAt)
 	}
-	if repositories.limit != application.RoutineQueryMaximumLimit || repositories.cursor != "" || batch.Repositories.Collection.Total != 101 {
+	if repositories.reader.Digest() != reader.Digest() || repositories.limit != application.RoutineQueryMaximumLimit || repositories.cursor != "" || batch.Repositories.Collection.Total != 101 {
 		t.Fatalf("limit=%d cursor=%q batch=%+v", repositories.limit, repositories.cursor, batch.Repositories.Collection)
 	}
 
