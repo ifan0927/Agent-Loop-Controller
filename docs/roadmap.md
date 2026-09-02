@@ -102,9 +102,9 @@ This milestone is recorded by the closed
 - Controller-owned forward rollback with bounded eligible-source discovery,
   schema-1-through-5 typed projection, source-bound draft/preview/apply identity,
   immutable resulting-generation provenance, and no parallel mutation path.
-- Exact safe external-drift recovery with authorized bounded offers, durable
-  intent/receipt replay, no-generation desired-byte restoration, atomic
-  concurrent-edit preservation, and admission fencing for ambiguity.
+- External configuration drift fail-stop for disposable runtimes, with no
+  in-place restore authority and schema-v34 historical evidence remaining
+  readable while unresolved evidence continues to fence admission.
 
 The implementation child work under the
 [automatic-admission roadmap](https://github.com/ifan0927/Agent-Loop-Controller/issues/21)
@@ -150,7 +150,7 @@ operator identity, application authorization, operation receipts, and
 legal-action offers are complete. Activity-independent worker heartbeat,
 controller-authorized runtime observation, configuration generations/CAS,
 desired/effective convergence fencing, the first normal typed-change slice, and
-forward rollback, exact safe external-drift recovery, repository lifecycle,
+forward rollback, external-drift fail-stop for disposable runtimes, repository lifecycle,
 readiness, guarded retirement, zero-repository disabled-admission operation,
 admission fencing, restart-safe existing-checkout onboarding, guarded
 empty-repository initialization, and the bounded routine Controller projection
@@ -170,7 +170,7 @@ demonstrated consumer exists.
 Bounded multi-repository concurrency, local operator authorization, operation
 receipts, legal-action offers, worker runtime observation, and configuration
 transaction/convergence authority, normal typed-change drafts, forward rollback,
-exact safe external-drift recovery, repository lifecycle/readiness, guarded
+external-drift fail-stop for disposable runtimes, repository lifecycle/readiness, guarded
 retirement, zero-repository disabled-admission operation, restart-safe
 existing-checkout onboarding, guarded empty-repository initialization, and
 routine Controller projections, the activity/history foundation, automatic

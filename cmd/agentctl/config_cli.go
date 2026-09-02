@@ -47,7 +47,7 @@ func resolveConfigPath(override string) (string, error) {
 
 func configCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: agentctl config <init|path|validate|inspect|doctor|status|draft|rollback|recover|migrate> [options]")
+		return errors.New("usage: agentctl config <init|path|validate|inspect|doctor|status|draft|rollback|migrate> [options]")
 	}
 	switch args[0] {
 	case "init":
@@ -64,12 +64,10 @@ func configCommand(args []string) error {
 		return managedConfigDraft(args[1:])
 	case "rollback":
 		return managedConfigRollback(args[1:])
-	case "recover":
-		return managedConfigRecover(args[1:])
 	case "migrate":
 		return managedConfigMigrate(args[1:])
 	default:
-		return errors.New("usage: agentctl config <init|path|validate|inspect|doctor|status|draft|rollback|recover|migrate> [options]")
+		return errors.New("usage: agentctl config <init|path|validate|inspect|doctor|status|draft|rollback|migrate> [options]")
 	}
 }
 

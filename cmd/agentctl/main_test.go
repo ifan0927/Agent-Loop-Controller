@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -509,6 +510,122 @@ func TestManagedConfigurationUsesTrustedLocatorAfterLiveDrift(t *testing.T) {
 	authority, found, err := store.ConfigurationAuthority(context.Background())
 	if err != nil || !found || authority.Desired.Digest != baseline.Digest || authority.CanonicalConfigPath != configPath {
 		t.Fatalf("authority=%+v found=%t err=%v", authority, found, err)
+	}
+}
+
+func TestHistoricalConfigurationRecoveryFailsCompositionWithoutMutation(t *testing.T) {
+	for _, state := range []application.ConfigurationRecoveryState{application.ConfigurationRecoveryAccepted, application.ConfigurationRecoveryAmbiguous} {
+		t.Run(string(state), func(t *testing.T) {
+			root := resolvedTempDir(t)
+			configPath, databasePath := writeControllerStatusConfig(t, root)
+			if _, err := loadManagedConfiguration(configPath); err != nil {
+				t.Fatal(err)
+			}
+			store, err := sqlitestore.Open(databasePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			authority, found, err := store.ConfigurationAuthority(context.Background())
+			if err != nil || !found {
+				_ = store.Close()
+				t.Fatalf("authority=%+v found=%t err=%v", authority, found, err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			acceptedAt := time.Date(2026, 8, 29, 2, 0, 0, 0, time.UTC)
+			operator := domain.GitHubUserIdentity{Login: "ifan0927", DatabaseID: 33, NodeID: "MDQ6VXNlcjMz", ActorType: "User"}
+			receipt := application.NewOperationReceipt(application.OperationReceiptInput{OperationType: application.OperationRestoreConfiguration, Scope: application.ScopeController, TargetID: application.ConfigurationTargetID, Requester: operator, RequestDigest: strings.Repeat("1", 64), ExpectedAuthorityDigest: strings.Repeat("2", 64), OperationAnchorDigest: strings.Repeat("3", 64), TargetBindingDigest: strings.Repeat("4", 64), AcceptedAt: acceptedAt})
+			if state == application.ConfigurationRecoveryAmbiguous {
+				receipt.Phase = application.OperationPhaseObserved
+				receipt.Outcome = application.OperationOutcomeAmbiguous
+				receipt.ResultingAuthorityDigest = authority.Desired.Digest
+				receipt.ResultingState = string(authority.Desired.State)
+				receipt.ResultingVersion = authority.Desired.GenerationID
+				receipt.EvidenceDigest = strings.Repeat("5", 64)
+				receipt.ResultDigest = strings.Repeat("6", 64)
+				receipt.AppliedAt = acceptedAt.Add(time.Minute)
+				receipt.SettledAt = acceptedAt.Add(2 * time.Minute)
+			}
+			if err := application.ValidateOperationReceipt(receipt); err != nil {
+				t.Fatal(err)
+			}
+			appliedAt, receiptSettledAt := "", ""
+			if !receipt.AppliedAt.IsZero() {
+				appliedAt = receipt.AppliedAt.Format(time.RFC3339Nano)
+			}
+			if !receipt.SettledAt.IsZero() {
+				receiptSettledAt = receipt.SettledAt.Format(time.RFC3339Nano)
+			}
+			db, err := sql.Open("sqlite", databasePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`INSERT INTO operation_receipts(operation_id,authority_key,operation_anchor_digest,operation_type,scope_kind,target_id,requester_login,requester_database_id,requester_node_id,requester_actor_type,request_digest,expected_authority_digest,target_binding_digest,phase,outcome,resulting_authority_digest,resulting_state,resulting_version,evidence_digest,result_digest,accepted_at,applied_at,settled_at,source_action_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, receipt.OperationID, receipt.AuthorityKey, receipt.OperationAnchorDigest, string(receipt.OperationType), string(receipt.Scope), receipt.TargetID, receipt.Requester.Login, receipt.Requester.DatabaseID, receipt.Requester.NodeID, receipt.Requester.ActorType, receipt.RequestDigest, receipt.ExpectedAuthorityDigest, receipt.TargetBindingDigest, string(receipt.Phase), string(receipt.Outcome), receipt.ResultingAuthorityDigest, receipt.ResultingState, receipt.ResultingVersion, receipt.EvidenceDigest, receipt.ResultDigest, receipt.AcceptedAt.Format(time.RFC3339Nano), appliedAt, receiptSettledAt, ""); err != nil {
+				_ = db.Close()
+				t.Fatal(err)
+			}
+			reason, evidence, settled := "", "", ""
+			if state == application.ConfigurationRecoveryAmbiguous {
+				reason, evidence, settled = string(application.ConfigurationReasonRecoveryAmbiguous), receipt.EvidenceDigest, receipt.SettledAt.Format(time.RFC3339Nano)
+			}
+			if _, err := db.Exec(`INSERT INTO configuration_recovery_intents(operation_id,desired_generation_id,desired_digest,authority_version,observed_digest,requester_login,requester_database_id,requester_node_id,requester_actor_type,status,accepted_at,settled_at,reason_code,evidence_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, receipt.OperationID, authority.Desired.GenerationID, authority.Desired.Digest, authority.Version, strings.Repeat("b", 64), operator.Login, operator.DatabaseID, operator.NodeID, operator.ActorType, string(state), receipt.AcceptedAt.Format(time.RFC3339Nano), settled, reason, evidence); err != nil {
+				_ = db.Close()
+				t.Fatal(err)
+			}
+			var eventsBefore, activitiesBefore int
+			var integrityBefore int64
+			if err := db.QueryRow(`SELECT COUNT(*) FROM configuration_convergence_events`).Scan(&eventsBefore); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow(`SELECT COUNT(*) FROM activity_events`).Scan(&activitiesBefore); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow(`SELECT generation FROM controller_integrity_generation WHERE singleton=1`).Scan(&integrityBefore); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			liveBefore, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := loadManagedConfiguration(configPath); err == nil || !strings.Contains(err.Error(), "configuration authority reconciliation failed") {
+				t.Fatalf("historical recovery composition err=%v", err)
+			}
+			liveAfter, err := os.ReadFile(configPath)
+			if err != nil || !slices.Equal(liveAfter, liveBefore) {
+				t.Fatalf("live configuration changed err=%v", err)
+			}
+			db, err = sql.Open("sqlite", databasePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			var persistedState, persistedPhase, persistedOutcome string
+			var version, eventsAfter, activitiesAfter, integrityAfter int64
+			if err := db.QueryRow(`SELECT status FROM configuration_recovery_intents WHERE operation_id=?`, receipt.OperationID).Scan(&persistedState); err != nil || persistedState != string(state) {
+				t.Fatalf("intent state=%s err=%v", persistedState, err)
+			}
+			if err := db.QueryRow(`SELECT phase,outcome FROM operation_receipts WHERE operation_id=?`, receipt.OperationID).Scan(&persistedPhase, &persistedOutcome); err != nil || persistedPhase != string(receipt.Phase) || persistedOutcome != string(receipt.Outcome) {
+				t.Fatalf("receipt phase=%s outcome=%s err=%v", persistedPhase, persistedOutcome, err)
+			}
+			if err := db.QueryRow(`SELECT authority_version FROM configuration_authority WHERE authority_id=1`).Scan(&version); err != nil || version != authority.Version {
+				t.Fatalf("authority version=%d want=%d err=%v", version, authority.Version, err)
+			}
+			if err := db.QueryRow(`SELECT COUNT(*) FROM configuration_convergence_events`).Scan(&eventsAfter); err != nil || int64(eventsBefore) != eventsAfter {
+				t.Fatalf("convergence events before=%d after=%d err=%v", eventsBefore, eventsAfter, err)
+			}
+			if err := db.QueryRow(`SELECT COUNT(*) FROM activity_events`).Scan(&activitiesAfter); err != nil || int64(activitiesBefore) != activitiesAfter {
+				t.Fatalf("activity events before=%d after=%d err=%v", activitiesBefore, activitiesAfter, err)
+			}
+			if err := db.QueryRow(`SELECT generation FROM controller_integrity_generation WHERE singleton=1`).Scan(&integrityAfter); err != nil || integrityAfter != integrityBefore {
+				t.Fatalf("integrity generation before=%d after=%d err=%v", integrityBefore, integrityAfter, err)
+			}
+		})
 	}
 }
 

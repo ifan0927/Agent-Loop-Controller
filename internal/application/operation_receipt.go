@@ -18,13 +18,15 @@ var (
 type OperationType string
 
 const (
-	OperationDecide               OperationType = "decide"
-	OperationRetry                OperationType = "retry"
-	OperationAbandon              OperationType = "abandon"
-	OperationRecoverCIWait        OperationType = "recover_ci_wait"
-	OperationRecoverOwnedPush     OperationType = "recover_owned_push"
-	OperationAcceptExternalMerge  OperationType = "accept_external_merge"
-	OperationApplyConfiguration   OperationType = "apply_configuration"
+	OperationDecide              OperationType = "decide"
+	OperationRetry               OperationType = "retry"
+	OperationAbandon             OperationType = "abandon"
+	OperationRecoverCIWait       OperationType = "recover_ci_wait"
+	OperationRecoverOwnedPush    OperationType = "recover_owned_push"
+	OperationAcceptExternalMerge OperationType = "accept_external_merge"
+	OperationApplyConfiguration  OperationType = "apply_configuration"
+	// OperationRestoreConfiguration is retained only for reading historical
+	// receipts written before in-place configuration restore was retired.
 	OperationRestoreConfiguration OperationType = "restore_configuration"
 	OperationRecheckRepository    OperationType = "recheck_repository"
 	OperationEnableRepository     OperationType = "enable_repository"
@@ -228,7 +230,7 @@ func NewOperationReceiptService(store OperationReceiptStore) (*OperationReceiptS
 }
 
 func (s *OperationReceiptService) Accept(ctx context.Context, input OperationReceiptInput) (OperationReceipt, bool, error) {
-	if input.OperationType == OperationRecoverCleanupSource {
+	if input.OperationType == OperationRecoverCleanupSource || input.OperationType == OperationRestoreConfiguration {
 		return OperationReceipt{}, false, serviceError(ErrorInvalidInput, "operation type is retired", nil)
 	}
 	if input.AcceptedAt.IsZero() {

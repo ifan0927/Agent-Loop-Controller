@@ -36,7 +36,6 @@ type configurationFilesFixture struct {
 	replaceStarted chan struct{}
 	replaceRelease chan struct{}
 	replaceCalls   int
-	beforeRestore  func()
 	removeBlock    sync.Once
 	removeStarted  chan string
 	removeRelease  chan struct{}
@@ -303,24 +302,6 @@ func TestConcurrentExactConfigurationReplayHasOneFilesystemMutation(t *testing.T
 func (f *configurationFilesFixture) ReconcileReplacement(_ string, _, _ []byte) ([]byte, application.ValidatedConfigurationCandidate, error) {
 	return f.ReadLive()
 }
-func (f *configurationFilesFixture) ReconcileRestore(_ string, expectedObservedDigest string, desired []byte) (application.ConfigurationRestoreFileObservation, error) {
-	if f.beforeRestore != nil {
-		f.beforeRestore()
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	liveDigest := configurationTestDigest(f.live)
-	desiredDigest := configurationTestDigest(desired)
-	switch liveDigest {
-	case desiredDigest:
-		return application.ConfigurationRestoreFileObservation{State: application.ConfigurationRestoreFileDesired, Digest: desiredDigest}, nil
-	case expectedObservedDigest:
-		f.live = append([]byte(nil), desired...)
-		return application.ConfigurationRestoreFileObservation{State: application.ConfigurationRestoreFileDesired, Digest: desiredDigest}, nil
-	default:
-		return application.ConfigurationRestoreFileObservation{State: application.ConfigurationRestoreFileThird, Digest: liveDigest}, nil
-	}
-}
 func (f *configurationFilesFixture) RemoveRaw(digest string) error {
 	if f.replacementMu.TryLock() {
 		f.replacementMu.Unlock()
@@ -362,12 +343,10 @@ type configurationRuntimeFixture struct {
 
 type configurationFaultStore struct {
 	*sqlitestore.Store
-	failBegin               bool
-	failSettle              bool
-	failBeginAfter          bool
-	failSettleAfter         bool
-	failRecoveryBeginAfter  bool
-	failRecoverySettleAfter bool
+	failBegin       bool
+	failSettle      bool
+	failBeginAfter  bool
+	failSettleAfter bool
 }
 
 type configurationMigrationGuardStore struct {
@@ -428,24 +407,6 @@ func (s *configurationFaultStore) SettleConfigurationApply(ctx context.Context, 
 		return application.ConfigurationAuthority{}, application.OperationReceipt{}, false, errors.New("injected apply response loss after settlement")
 	}
 	return authority, receipt, changed, err
-}
-
-func (s *configurationFaultStore) BeginConfigurationRecovery(ctx context.Context, input application.ConfigurationRecoveryAcceptance) (application.ConfigurationRecoveryIntent, application.OperationReceipt, bool, error) {
-	intent, receipt, created, err := s.Store.BeginConfigurationRecovery(ctx, input)
-	if err == nil && created && s.failRecoveryBeginAfter {
-		s.failRecoveryBeginAfter = false
-		return application.ConfigurationRecoveryIntent{}, application.OperationReceipt{}, false, errors.New("injected recovery response loss after intent")
-	}
-	return intent, receipt, created, err
-}
-
-func (s *configurationFaultStore) SettleConfigurationRecovery(ctx context.Context, input application.ConfigurationRecoverySettlement) (application.ConfigurationAuthority, application.ConfigurationRecoveryIntent, application.OperationReceipt, bool, error) {
-	authority, intent, receipt, changed, err := s.Store.SettleConfigurationRecovery(ctx, input)
-	if err == nil && changed && s.failRecoverySettleAfter {
-		s.failRecoverySettleAfter = false
-		return application.ConfigurationAuthority{}, application.ConfigurationRecoveryIntent{}, application.OperationReceipt{}, false, errors.New("injected recovery response loss after settlement")
-	}
-	return authority, intent, receipt, changed, err
 }
 
 func (f *configurationRuntimeFixture) ObserveConfigurationRuntime(context.Context, time.Time) (application.RuntimeObservation, error) {
@@ -1243,223 +1204,6 @@ func TestConfigurationProjectionAndHistoryNeverExposeRawOrPrivatePaths(t *testin
 		if strings.Contains(output, secret) {
 			t.Fatalf("configuration output leaked private evidence %q: %s", secret, output)
 		}
-	}
-}
-
-func TestConfigurationRecoveryRestoresExactDesiredWithoutGenerationAndRejectsOldOccurrenceReplay(t *testing.T) {
-	service, store, files, runtime, requester := configurationServiceFixture(t)
-	authority, err := service.Initialize(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now().UTC()
-	runtime.observation = freshConfigurationRuntime(authority.Desired.Digest, now)
-	files.mu.Lock()
-	drift := []byte("safe external drift")
-	files.live = append([]byte(nil), drift...)
-	files.mu.Unlock()
-
-	if _, found, err := service.RecoveryOffer(context.Background(), application.Requester{ID: "other", Kind: "github_login", DatabaseID: 8, NodeID: "USER_8", ActorType: "User"}); err == nil || found || !strings.Contains(err.Error(), "not_found") {
-		t.Fatalf("unauthorized offer found=%t err=%v", found, err)
-	}
-	offer, found, err := service.RecoveryOffer(context.Background(), requester)
-	if err != nil || !found || offer.Action != application.ConfigurationRecoveryActionRestore || offer.ExpectedGenerationID != authority.Desired.GenerationID || offer.ExpectedDigest != authority.Desired.Digest || offer.ObservedDigest != configurationTestDigest(drift) || offer.ExpectedAuthorityVersion <= authority.Version {
-		t.Fatalf("offer=%+v found=%t err=%v", offer, found, err)
-	}
-	command := application.ConfigurationRecoveryCommand{Requester: requester, ExpectedGenerationID: offer.ExpectedGenerationID, ExpectedDigest: offer.ExpectedDigest, ExpectedAuthorityVersion: offer.ExpectedAuthorityVersion, ObservedDigest: offer.ObservedDigest}
-	unauthorized := command
-	unauthorized.Requester = application.Requester{ID: "other", Kind: "github_login", DatabaseID: 8, NodeID: "USER_8", ActorType: "User"}
-	if _, err := service.RecoverRestore(context.Background(), unauthorized); err == nil || !strings.Contains(err.Error(), "not_found") {
-		t.Fatalf("unauthorized recovery err=%v", err)
-	}
-	files.mu.Lock()
-	unchangedDrift := append([]byte(nil), files.live...)
-	files.mu.Unlock()
-	if !bytes.Equal(unchangedDrift, drift) {
-		t.Fatalf("unauthorized recovery mutated live=%q", unchangedDrift)
-	}
-	result, err := service.RecoverRestore(context.Background(), command)
-	if err != nil || result.Recovery.State != application.ConfigurationRecoveryCommitted || result.Receipt.OperationType != application.OperationRestoreConfiguration || result.Receipt.Outcome != application.OperationOutcomeSucceeded || result.Convergence.State != application.ConfigurationReady {
-		t.Fatalf("result=%+v err=%v", result, err)
-	}
-	files.mu.Lock()
-	live := append([]byte(nil), files.live...)
-	files.mu.Unlock()
-	if !bytes.Equal(live, []byte("baseline configuration")) {
-		t.Fatalf("restored live=%q", live)
-	}
-	if generations, err := store.ListConfigurationGenerations(context.Background()); err != nil || len(generations) != 1 || generations[0].GenerationID != authority.Desired.GenerationID {
-		t.Fatalf("generations=%+v err=%v", generations, err)
-	}
-	replayed, err := service.RecoverRestore(context.Background(), command)
-	if err != nil || replayed.Receipt.OperationID != result.Receipt.OperationID || replayed.Recovery.AcceptedAt != result.Recovery.AcceptedAt {
-		t.Fatalf("replay=%+v err=%v", replayed, err)
-	}
-
-	files.mu.Lock()
-	files.live = append([]byte(nil), drift...)
-	files.mu.Unlock()
-	if _, err := service.RecoverRestore(context.Background(), command); err == nil || !strings.Contains(err.Error(), "conflict") {
-		t.Fatalf("older recovery replay before drift projection err=%v", err)
-	}
-	secondOffer, found, err := service.RecoveryOffer(context.Background(), requester)
-	if err != nil || !found || secondOffer.ObservedDigest != offer.ObservedDigest || secondOffer.ExpectedAuthorityVersion <= offer.ExpectedAuthorityVersion {
-		t.Fatalf("second offer=%+v found=%t err=%v", secondOffer, found, err)
-	}
-	second, err := service.RecoverRestore(context.Background(), application.ConfigurationRecoveryCommand{Requester: requester, ExpectedGenerationID: secondOffer.ExpectedGenerationID, ExpectedDigest: secondOffer.ExpectedDigest, ExpectedAuthorityVersion: secondOffer.ExpectedAuthorityVersion, ObservedDigest: secondOffer.ObservedDigest})
-	if err != nil || second.Receipt.OperationID == result.Receipt.OperationID {
-		t.Fatalf("second=%+v err=%v", second, err)
-	}
-}
-
-func TestConfigurationRecoveryThirdDigestSettlesAmbiguousAndFencesAdmission(t *testing.T) {
-	service, store, files, runtime, requester := configurationServiceFixture(t)
-	authority, err := service.Initialize(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now().UTC()
-	runtime.observation = freshConfigurationRuntime(authority.Desired.Digest, now)
-	drift := []byte("accepted external drift")
-	files.mu.Lock()
-	files.live = append([]byte(nil), drift...)
-	files.mu.Unlock()
-	offer, found, err := service.RecoveryOffer(context.Background(), requester)
-	if err != nil || !found {
-		t.Fatalf("offer=%+v found=%t err=%v", offer, found, err)
-	}
-	files.beforeRestore = func() {
-		files.mu.Lock()
-		files.live = []byte("concurrent third digest")
-		files.mu.Unlock()
-		files.beforeRestore = nil
-	}
-	result, err := service.RecoverRestore(context.Background(), application.ConfigurationRecoveryCommand{Requester: requester, ExpectedGenerationID: offer.ExpectedGenerationID, ExpectedDigest: offer.ExpectedDigest, ExpectedAuthorityVersion: offer.ExpectedAuthorityVersion, ObservedDigest: offer.ObservedDigest})
-	if err == nil || result.Recovery.State != application.ConfigurationRecoveryAmbiguous || result.Receipt.Outcome != application.OperationOutcomeAmbiguous {
-		t.Fatalf("result=%+v err=%v", result, err)
-	}
-	current, found, loadErr := store.ConfigurationAuthority(context.Background())
-	if loadErr != nil || !found || current.IncompleteRecovery == nil || current.IncompleteRecovery.State != application.ConfigurationRecoveryAmbiguous || current.Desired.GenerationID != authority.Desired.GenerationID {
-		t.Fatalf("authority=%+v found=%t err=%v", current, found, loadErr)
-	}
-	decision, gateErr := service.CheckNewAdmission(context.Background())
-	if gateErr != nil || decision.Allowed || decision.Reason != application.ConfigurationReasonRecoveryAmbiguous {
-		t.Fatalf("decision=%+v err=%v", decision, gateErr)
-	}
-}
-
-func TestConfigurationRecoveryRejectsStaleAuthorityWithoutMutation(t *testing.T) {
-	for _, test := range []struct {
-		name   string
-		change func(*application.ConfigurationRecoveryCommand, *configurationFilesFixture)
-	}{
-		{name: "generation", change: func(command *application.ConfigurationRecoveryCommand, _ *configurationFilesFixture) {
-			command.ExpectedGenerationID++
-		}},
-		{name: "desired_digest", change: func(command *application.ConfigurationRecoveryCommand, _ *configurationFilesFixture) {
-			command.ExpectedDigest = strings.Repeat("c", 64)
-		}},
-		{name: "authority_version", change: func(command *application.ConfigurationRecoveryCommand, _ *configurationFilesFixture) {
-			command.ExpectedAuthorityVersion++
-		}},
-		{name: "observed_digest", change: func(command *application.ConfigurationRecoveryCommand, _ *configurationFilesFixture) {
-			command.ObservedDigest = strings.Repeat("d", 64)
-		}},
-		{name: "changed_live", change: func(_ *application.ConfigurationRecoveryCommand, files *configurationFilesFixture) {
-			files.mu.Lock()
-			files.live = []byte("new external drift")
-			files.mu.Unlock()
-		}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			service, _, files, _, requester := configurationServiceFixture(t)
-			if _, err := service.Initialize(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-			drift := []byte("accepted external drift")
-			files.mu.Lock()
-			files.live = append([]byte(nil), drift...)
-			files.mu.Unlock()
-			offer, found, err := service.RecoveryOffer(context.Background(), requester)
-			if err != nil || !found {
-				t.Fatalf("offer=%+v found=%t err=%v", offer, found, err)
-			}
-			command := application.ConfigurationRecoveryCommand{Requester: requester, ExpectedGenerationID: offer.ExpectedGenerationID, ExpectedDigest: offer.ExpectedDigest, ExpectedAuthorityVersion: offer.ExpectedAuthorityVersion, ObservedDigest: offer.ObservedDigest}
-			test.change(&command, files)
-			files.mu.Lock()
-			expectedLive := append([]byte(nil), files.live...)
-			files.mu.Unlock()
-			if _, err := service.RecoverRestore(context.Background(), command); err == nil || !strings.Contains(err.Error(), "conflict") {
-				t.Fatalf("recovery err=%v", err)
-			}
-			files.mu.Lock()
-			live := append([]byte(nil), files.live...)
-			files.mu.Unlock()
-			if !bytes.Equal(live, expectedLive) {
-				t.Fatalf("stale recovery mutated live=%q want=%q", live, expectedLive)
-			}
-		})
-	}
-}
-
-func TestConfigurationRecoveryOfferIsHiddenWhenDesiredRawIsMissing(t *testing.T) {
-	service, _, files, _, requester := configurationServiceFixture(t)
-	authority, err := service.Initialize(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	files.mu.Lock()
-	files.live = []byte("safe external drift")
-	delete(files.raw, authority.Desired.Digest)
-	files.mu.Unlock()
-	if offer, found, err := service.RecoveryOffer(context.Background(), requester); err != nil || found {
-		t.Fatalf("offer=%+v found=%t err=%v", offer, found, err)
-	}
-}
-
-func TestConfigurationRecoveryRestartAndResponseLossReplaySameIntent(t *testing.T) {
-	for _, boundary := range []string{"after_intent", "after_settlement"} {
-		t.Run(boundary, func(t *testing.T) {
-			service, store, files, runtime, requester := configurationServiceFixture(t)
-			authority, err := service.Initialize(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
-			runtime.observation = freshConfigurationRuntime(authority.Desired.Digest, time.Now().UTC())
-			files.mu.Lock()
-			files.live = []byte("recoverable drift")
-			files.mu.Unlock()
-			offer, found, err := service.RecoveryOffer(context.Background(), requester)
-			if err != nil || !found {
-				t.Fatalf("offer=%+v found=%t err=%v", offer, found, err)
-			}
-			faults := &configurationFaultStore{Store: store, failRecoveryBeginAfter: boundary == "after_intent", failRecoverySettleAfter: boundary == "after_settlement"}
-			faulty, err := application.NewConfigurationService(faults, files, runtime)
-			if err != nil {
-				t.Fatal(err)
-			}
-			command := application.ConfigurationRecoveryCommand{Requester: requester, ExpectedGenerationID: offer.ExpectedGenerationID, ExpectedDigest: offer.ExpectedDigest, ExpectedAuthorityVersion: offer.ExpectedAuthorityVersion, ObservedDigest: offer.ObservedDigest}
-			if _, err := faulty.RecoverRestore(context.Background(), command); err == nil {
-				t.Fatal("injected response loss was reported as success")
-			}
-			restarted, err := application.NewConfigurationService(store, files, runtime)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if boundary == "after_intent" {
-				if _, err := restarted.Initialize(context.Background()); err != nil {
-					t.Fatalf("startup reconciliation err=%v", err)
-				}
-			}
-			replayed, err := restarted.RecoverRestore(context.Background(), command)
-			if err != nil || replayed.Recovery.State != application.ConfigurationRecoveryCommitted || replayed.Receipt.Outcome != application.OperationOutcomeSucceeded {
-				t.Fatalf("replayed=%+v err=%v", replayed, err)
-			}
-			intent, found, err := store.ConfigurationRecoveryIntent(context.Background(), replayed.Receipt.OperationID)
-			if err != nil || !found || !intent.AcceptedAt.Equal(replayed.Recovery.AcceptedAt) {
-				t.Fatalf("intent=%+v found=%t err=%v", intent, found, err)
-			}
-		})
 	}
 }
 

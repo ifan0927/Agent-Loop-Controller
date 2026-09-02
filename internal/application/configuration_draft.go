@@ -346,7 +346,6 @@ type ConfigurationDraftApplyResult struct {
 
 type ManagedConfigurationStatus struct {
 	Convergence ConfigurationConvergenceProjection `json:"convergence"`
-	Recovery    *ConfigurationRecoveryOffer        `json:"recovery,omitempty"`
 	ActiveDraft *ConfigurationDraft                `json:"active_draft,omitempty"`
 }
 
@@ -679,11 +678,6 @@ func (s *ConfigurationDraftService) Status(ctx context.Context, requester Reques
 		return ManagedConfigurationStatus{}, serviceError(ErrorInternal, "configuration draft status is unavailable", nil)
 	}
 	status := ManagedConfigurationStatus{Convergence: projection}
-	if offer, eligible, offerErr := s.configuration.RecoveryOffer(ctx, requester); offerErr != nil {
-		return ManagedConfigurationStatus{}, offerErr
-	} else if eligible {
-		status.Recovery = &offer
-	}
 	if found {
 		status.ActiveDraft = &draft
 	}
