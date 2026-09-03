@@ -1040,11 +1040,18 @@ func (r linearRegistryResolver) ResolveLinearAdmissionRepository(label string) (
 	if !found || canonical == "" {
 		return application.LocalRepository{}, false
 	}
-	repository, err := r.registry.ResolveLinearLabel(canonical)
-	if err != nil {
+	configured, configuredErr := r.registry.ResolveLinearLabel(label)
+	legacy, legacyErr := r.registry.ResolveLinearLabel(canonical)
+	if configuredErr == nil && legacyErr == nil && configured.RepositoryBindingDigest != legacy.RepositoryBindingDigest {
 		return application.LocalRepository{}, false
 	}
-	return localRepository(repository), true
+	if configuredErr == nil {
+		return localRepository(configured), true
+	}
+	if legacyErr == nil {
+		return localRepository(legacy), true
+	}
+	return application.LocalRepository{}, false
 }
 
 func githubRead(args []string) error {

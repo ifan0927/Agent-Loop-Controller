@@ -14,8 +14,9 @@ import (
 
 const (
 	maximumRoutineAttentionCandidates = 1000
-	RoutineAttentionSchemaVersion     = "v2"
-	routineAttentionCursorVersion     = "v3"
+	maximumRoutineHandledItems        = 5
+	RoutineAttentionSchemaVersion     = "v3"
+	routineAttentionCursorVersion     = "v4"
 )
 
 type RoutineAttentionQuery struct {
@@ -28,6 +29,7 @@ type RoutineAttentionQuery struct {
 
 type RoutineAttentionCandidateStore interface {
 	ControllerAttentionCandidateStore
+	RoutineQueueStore
 }
 
 type ControllerAttentionCandidateQuery struct {
@@ -73,12 +75,20 @@ type RoutineAttentionItem struct {
 	Navigation       RoutineAttentionNavigation     `json:"navigation"`
 }
 
+type RoutineHandledAttentionItem struct {
+	Action           RoutineOperatorActionSummary `json:"action"`
+	RunID            string                       `json:"run_id"`
+	LinearIdentifier string                       `json:"linear_identifier,omitempty"`
+	Repository       string                       `json:"repository,omitempty"`
+}
+
 type RoutineAttentionPage struct {
-	Metadata   RoutineProjectionMetadata `json:"metadata"`
-	Collection RoutineCollectionMetadata `json:"collection"`
-	Scope      AuthorityScopeKind        `json:"scope"`
-	TargetID   string                    `json:"target_id,omitempty"`
-	Items      []RoutineAttentionItem    `json:"items"`
+	Metadata        RoutineProjectionMetadata     `json:"metadata"`
+	Collection      RoutineCollectionMetadata     `json:"collection"`
+	Scope           AuthorityScopeKind            `json:"scope"`
+	TargetID        string                        `json:"target_id,omitempty"`
+	Items           []RoutineAttentionItem        `json:"items"`
+	RecentlyHandled []RoutineHandledAttentionItem `json:"recently_handled"`
 }
 
 type routineAttentionCursor struct {
@@ -140,10 +150,14 @@ func (s *RoutineAttentionQueryService) ListController(ctx context.Context, autho
 	if len(candidates) > maximumRoutineAttentionCandidates {
 		return RoutineAttentionPage{}, serviceError(ErrorInternal, "active attention candidate bound exceeded", nil)
 	}
-	return s.projectPage(ctx, query, observedAt, authority.Digest(), candidates)
+	queueSnapshot, queueSnapshotFound, err := s.store.LatestQueueSnapshot(ctx)
+	if err != nil {
+		return RoutineAttentionPage{}, classifyServiceError(err)
+	}
+	return s.projectPage(ctx, query, observedAt, authority.Digest(), candidates, queueSnapshot, queueSnapshotFound)
 }
 
-func (s *RoutineAttentionQueryService) projectPage(ctx context.Context, query RoutineAttentionQuery, observedAt time.Time, authorityDigest string, candidates []OperatorAttentionEvent) (RoutineAttentionPage, error) {
+func (s *RoutineAttentionQueryService) projectPage(ctx context.Context, query RoutineAttentionQuery, observedAt time.Time, authorityDigest string, candidates []OperatorAttentionEvent, queueSnapshot QueueSnapshot, queueSnapshotFound bool) (RoutineAttentionPage, error) {
 	limit := query.Limit
 	if limit == 0 {
 		limit = RoutineQueryDefaultLimit
@@ -153,6 +167,7 @@ func (s *RoutineAttentionQueryService) projectPage(ctx context.Context, query Ro
 		return RoutineAttentionPage{}, err
 	}
 	var active []RoutineAttentionItem
+	var handled []RoutineHandledAttentionItem
 	eventsByID := make(map[string]OperatorAttentionEvent, len(candidates))
 	for _, event := range candidates {
 		state := RoutineAttentionUnknown
@@ -166,6 +181,9 @@ func (s *RoutineAttentionQueryService) projectPage(ctx context.Context, query Ro
 			} else {
 				state = classifyRoutineAttention(inspection, event)
 				if state == "" {
+					if action, found := routineHandledAttentionAction(inspection, event); found {
+						handled = append(handled, RoutineHandledAttentionItem{Action: action, RunID: inspection.Run.ID, LinearIdentifier: inspection.Run.IssueID, Repository: inspection.Run.Repository})
+					}
 					continue
 				}
 				navigation = RoutineAttentionNavigationRunDetail
@@ -175,7 +193,10 @@ func (s *RoutineAttentionQueryService) projectPage(ctx context.Context, query Ro
 				}
 			}
 		} else if ValidateOperatorAttentionEvent(event) == nil || ValidatePreviousOperatorAttentionEvent(event) == nil || ValidateLegacyOperatorAttentionEvent(event) == nil {
-			state = RoutineAttentionActive
+			state = ClassifyRoutineControllerAttentionCurrent(event, queueSnapshot, queueSnapshotFound)
+			if state == "" {
+				continue
+			}
 		} else {
 			state = RoutineAttentionConflict
 		}
@@ -201,13 +222,22 @@ func (s *RoutineAttentionQueryService) projectPage(ctx context.Context, query Ro
 		}
 		return active[i].EventID < active[j].EventID
 	})
+	sort.Slice(handled, func(i, j int) bool {
+		if !handled[i].Action.ObservedAt.Equal(handled[j].Action.ObservedAt) {
+			return handled[i].Action.ObservedAt.After(handled[j].Action.ObservedAt)
+		}
+		return handled[i].Action.ActionID < handled[j].Action.ActionID
+	})
+	if len(handled) > maximumRoutineHandledItems {
+		handled = handled[:maximumRoutineHandledItems]
+	}
 	start := 0
 	if query.Cursor != "" {
 		for start < len(active) && !routineAttentionAfter(active[start], cursor) {
 			start++
 		}
 	}
-	result := RoutineAttentionPage{Metadata: RoutineProjectionMetadata{SchemaVersion: RoutineAttentionSchemaVersion, ObservedAt: observedAt.UTC()}, Collection: RoutineCollectionMetadata{Total: len(active)}, Scope: query.Scope, TargetID: query.TargetID}
+	result := RoutineAttentionPage{Metadata: RoutineProjectionMetadata{SchemaVersion: RoutineAttentionSchemaVersion, ObservedAt: observedAt.UTC()}, Collection: RoutineCollectionMetadata{Total: len(active)}, Scope: query.Scope, TargetID: query.TargetID, RecentlyHandled: handled}
 	end := start + limit
 	if end > len(active) {
 		end = len(active)
@@ -242,6 +272,34 @@ func (s *RoutineAttentionQueryService) projectPage(ctx context.Context, query Ro
 	}
 	result.Metadata.Digest = routineProjectionDigest(result)
 	return result, nil
+}
+
+// ClassifyRoutineControllerAttentionCurrent resolves transient scheduler scan
+// evidence only after a later complete queue snapshot proves that the same
+// admission path recovered. Other Controller and repository families remain
+// conservatively active.
+func ClassifyRoutineControllerAttentionCurrent(event OperatorAttentionEvent, queueSnapshot QueueSnapshot, queueSnapshotFound bool) RoutineAttentionState {
+	if event.EventType != OperatorAttentionCandidateScan && event.EventType != OperatorAttentionSchedulerLease {
+		return RoutineAttentionActive
+	}
+	if queueSnapshotFound && queueSnapshot.Validate() == nil && queueSnapshot.ObservedAt.After(event.OccurredAt) {
+		return ""
+	}
+	return RoutineAttentionActive
+}
+
+func routineHandledAttentionAction(inspection RunInspection, event OperatorAttentionEvent) (RoutineOperatorActionSummary, bool) {
+	for index := len(inspection.OperatorActions) - 1; index >= 0; index-- {
+		action := inspection.OperatorActions[index]
+		if action.AttentionEventKey != event.EventKey || action.Status != OperatorActionStatusObserved || action.ResultStatus != OperatorActionResultSucceeded {
+			continue
+		}
+		projected := projectRoutineOperatorActions([]OperatorActionRecord{action}, 1)
+		if len(projected) == 1 {
+			return projected[0], true
+		}
+	}
+	return RoutineOperatorActionSummary{}, false
 }
 
 func routineAttentionOfferSummary(offer LegalActionOffer) RoutineAttentionOfferSummary {

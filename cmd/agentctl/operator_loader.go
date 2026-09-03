@@ -26,6 +26,7 @@ type operatorLoader interface {
 	LoadRepositories(context.Context, string, time.Time) (application.RoutineRepositoryPage, error)
 	LoadRepositoryDetail(context.Context, string, time.Time) (application.RoutineRepositoryDetail, error)
 	EnableRepository(context.Context, string, string) (application.RepositoryMutationResult, error)
+	AcceptDecision(context.Context, string, application.LegalDecisionInput) (application.OperationReceipt, error)
 }
 
 type operatorOverviewProjectionSource interface {
@@ -100,6 +101,29 @@ func (l *productionOperatorLoader) EnableRepository(ctx context.Context, reposit
 	}
 	expected := application.ConfigurationAdmissionAuthority{GenerationID: authority.Desired.GenerationID, Digest: authority.Desired.Digest, AuthorityVersion: authority.Version, ValidThrough: time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)}
 	return repositories.Enable(ctx, application.RepositoryMutationCommand{Requester: l.requester, Repository: repository, RequestID: requestID, ExpectedConfigurationAuthority: &expected})
+}
+
+func (l *productionOperatorLoader) AcceptDecision(ctx context.Context, offerID string, input application.LegalDecisionInput) (application.OperationReceipt, error) {
+	loaded, _, store, err := loadOperatorConfigurationCurrent(ctx, l.configPath)
+	if err != nil {
+		return application.OperationReceipt{}, &application.ServiceError{Category: application.ErrorUnavailable, Message: "decision authority is unavailable"}
+	}
+	defer store.Close()
+	operator := loaded.Controller.Operator
+	currentRequester := application.Requester{ID: operator.Login, Kind: "github_login", DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, ActorType: operator.ActorType}
+	if currentRequester != l.requester {
+		return application.OperationReceipt{}, &application.ServiceError{Category: application.ErrorConflict, Message: "decision authority changed"}
+	}
+	authorizer, err := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: loaded.Controller.Operator})
+	if err != nil {
+		return application.OperationReceipt{}, &application.ServiceError{Category: application.ErrorUnavailable, Message: "decision authority is unavailable"}
+	}
+	actions, err := application.NewLegalActionService(store, authorizer)
+	if err != nil {
+		return application.OperationReceipt{}, &application.ServiceError{Category: application.ErrorUnavailable, Message: "decision authority is unavailable"}
+	}
+	controller := newLocalController(store, loaded.Controller.CodexBinary, "")
+	return actions.ExecuteDecision(ctx, application.LegalActionExecutionCommand{Requester: l.requester, OfferID: offerID}, input, controller)
 }
 
 type operatorComposition struct {

@@ -241,28 +241,55 @@ func projectOverviewOnboarding(value application.Onboarding) application.Routine
 }
 
 func readRoutineOverviewAttention(ctx context.Context, tx *sql.Tx, limit int, result *application.RoutinePersistedOverviewSnapshot) error {
-	current, err := readCurrentOperatorAttentionFamilies(ctx, tx, currentOperatorAttentionFamilyRead{Limit: limit, SeverityOrder: true, Count: true})
+	current, err := readCurrentOperatorAttentionFamilies(ctx, tx, currentOperatorAttentionFamilyRead{Limit: 1001, SeverityOrder: true})
 	if err != nil {
 		return err
 	}
-	result.AttentionTotal = current.Total
-	result.AttentionTruncated = result.AttentionTotal > limit
-	result.ActionableTotal = result.AttentionTotal
-	result.ActionableTruncated = result.AttentionTruncated
+	if len(current.Events) > 1000 {
+		return errors.New("routine overview attention candidate bound exceeded")
+	}
+	var queueSnapshot application.QueueSnapshot
+	queueSnapshotFound := result.QueueSnapshot != nil
+	if queueSnapshotFound {
+		queueSnapshot = *result.QueueSnapshot
+	}
 	for _, event := range current.Events {
 		scope, target := application.ScopeController, "controller"
+		attentionState := application.RoutineAttentionActive
 		if event.RunID != "" {
 			scope, target = application.ScopeRun, event.RunID
-		} else if event.RepositoryProfileID != "" && event.RepositoryProfileID != "automation" {
-			var repository string
-			if err := tx.QueryRowContext(ctx, `SELECT repository FROM repository_lifecycles WHERE profile_id=? AND retired_at='' ORDER BY updated_at DESC LIMIT 1`, event.RepositoryProfileID).Scan(&repository); err == nil {
-				scope, target = application.ScopeRepository, repository
-			} else if !errors.Is(err, sql.ErrNoRows) {
-				return err
+			state, stateErr := readRoutineOverviewRunAttentionState(ctx, tx, event)
+			if stateErr != nil {
+				return stateErr
+			}
+			if state == "" {
+				continue
+			}
+			attentionState = state
+		} else {
+			if event.RepositoryProfileID != "" && event.RepositoryProfileID != "automation" {
+				var repository string
+				if err := tx.QueryRowContext(ctx, `SELECT repository FROM repository_lifecycles WHERE profile_id=? AND retired_at='' ORDER BY updated_at DESC LIMIT 1`, event.RepositoryProfileID).Scan(&repository); err == nil {
+					scope, target = application.ScopeRepository, repository
+				} else if !errors.Is(err, sql.ErrNoRows) {
+					return err
+				}
+			}
+			if application.ValidateOperatorAttentionEvent(event) != nil && application.ValidatePreviousOperatorAttentionEvent(event) != nil && application.ValidateLegacyOperatorAttentionEvent(event) != nil {
+				attentionState = application.RoutineAttentionConflict
+			} else {
+				attentionState = application.ClassifyRoutineControllerAttentionCurrent(event, queueSnapshot, queueSnapshotFound)
+				if attentionState == "" {
+					continue
+				}
 			}
 		}
-		result.Attention = append(result.Attention, application.RoutineAttentionSummary{EventID: event.EventKey, Scope: scope, TargetID: target, Severity: event.Severity, ReasonCode: event.ReasonCode, State: application.RoutineAttentionUnknown, OccurredAt: event.OccurredAt.UTC(), ObservedAt: event.ObservedAt.UTC()})
-		result.Actionable = append(result.Actionable, application.RoutineActionableItem{ItemID: event.EventKey, Scope: scope, TargetID: target, Severity: event.Severity, ReasonCode: event.ReasonCode, Navigation: "attention", ObservedAt: event.ObservedAt.UTC()})
+		result.AttentionTotal++
+		result.ActionableTotal++
+		if len(result.Attention) < limit {
+			result.Attention = append(result.Attention, application.RoutineAttentionSummary{EventID: event.EventKey, Scope: scope, TargetID: target, Severity: event.Severity, ReasonCode: event.ReasonCode, State: attentionState, OccurredAt: event.OccurredAt.UTC(), ObservedAt: event.ObservedAt.UTC()})
+			result.Actionable = append(result.Actionable, application.RoutineActionableItem{ItemID: event.EventKey, Scope: scope, TargetID: target, Severity: event.Severity, ReasonCode: event.ReasonCode, Navigation: "attention", ObservedAt: event.ObservedAt.UTC()})
+		}
 		if (event.EventType == application.OperatorAttentionCandidateScan || event.EventType == application.OperatorAttentionSchedulerLease) && (result.QueueAttention == nil || event.OccurredAt.After(result.QueueAttention.OccurredAt)) {
 			reason := "candidate_scan_attention"
 			if event.EventType == application.OperatorAttentionSchedulerLease {
@@ -271,7 +298,56 @@ func readRoutineOverviewAttention(ctx context.Context, tx *sql.Tx, limit int, re
 			result.QueueAttention = &application.RoutineQueueAttention{OccurredAt: event.OccurredAt.UTC(), Degraded: event.Severity == "critical" || event.Severity == "error", ReasonCode: reason}
 		}
 	}
+	result.AttentionTruncated = result.AttentionTotal > limit
+	result.ActionableTruncated = result.ActionableTotal > limit
 	return nil
+}
+
+func readRoutineOverviewRunAttentionState(ctx context.Context, tx *sql.Tx, event application.OperatorAttentionEvent) (application.RoutineAttentionState, error) {
+	var state string
+	if err := tx.QueryRowContext(ctx, `SELECT current_state FROM runs WHERE run_id=?`, event.RunID).Scan(&state); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return application.RoutineAttentionConflict, nil
+		}
+		return "", err
+	}
+	var schedules []application.RetrySchedule
+	if event.EventType == application.OperatorAttentionRetry {
+		rows, err := tx.QueryContext(ctx, `SELECT status,reason_code FROM automatic_retry_schedules WHERE run_id=? ORDER BY phase`, event.RunID)
+		if err != nil {
+			return "", err
+		}
+		for rows.Next() {
+			var status, reason string
+			if err := rows.Scan(&status, &reason); err != nil {
+				rows.Close()
+				return "", err
+			}
+			schedules = append(schedules, application.RetrySchedule{RunID: event.RunID, Status: application.RetryScheduleStatus(status), ReasonCode: reason})
+		}
+		if err := rows.Close(); err != nil {
+			return "", err
+		}
+	}
+	var cleanup []application.CleanupRecord
+	if event.EventType == application.OperatorAttentionCleanupResidue || event.EventType == application.OperatorAttentionSourceCheckoutSkipped {
+		rows, err := tx.QueryContext(ctx, `SELECT resource_kind,status FROM cleanup_results WHERE run_id=? ORDER BY cleanup_id`, event.RunID)
+		if err != nil {
+			return "", err
+		}
+		for rows.Next() {
+			var kind, status string
+			if err := rows.Scan(&kind, &status); err != nil {
+				rows.Close()
+				return "", err
+			}
+			cleanup = append(cleanup, application.CleanupRecord{RunID: event.RunID, Kind: kind, Status: status})
+		}
+		if err := rows.Close(); err != nil {
+			return "", err
+		}
+	}
+	return application.ClassifyRoutineAttentionCurrent(application.Run{ID: event.RunID, State: domain.State(state)}, event, schedules, cleanup), nil
 }
 
 func readRoutineOverviewConfiguration(ctx context.Context, tx *sql.Tx, requester domain.GitHubUserIdentity, observedAt time.Time, result *application.RoutinePersistedOverviewSnapshot) error {

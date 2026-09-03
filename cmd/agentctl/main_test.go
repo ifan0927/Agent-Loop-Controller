@@ -38,27 +38,52 @@ func TestLinearRegistryResolverMapsRepositoryLabelToCanonicalRepository(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	paths := []string{filepath.Join(root, "source"), filepath.Join(root, "runs"), filepath.Join(root, "worktrees")}
-	for _, path := range paths {
-		if err := os.MkdirAll(path, 0o700); err != nil {
-			t.Fatal(err)
+	repository := func(name, label string, identity int64) localregistry.Repository {
+		base := filepath.Join(root, name)
+		paths := []string{filepath.Join(base, "source"), filepath.Join(base, "runs"), filepath.Join(base, "worktrees")}
+		for _, path := range paths {
+			if err := os.MkdirAll(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return localregistry.Repository{
+			Owner: "IFAN0927", Name: name, LinearLabel: label, OriginURL: "git@github.com:ifan0927/" + name + ".git",
+			SourcePath: paths[0], RunRoot: paths[1], WorktreeRoot: paths[2], BaseBranch: "main",
+			VerifierRegistryRef: "builtin:v1", VerifierIDs: []string{"fixture-go-test"},
+			GitHubAppProfileRef: "github-app-profile:fixture", GitHubAppID: 1, GitHubInstallationID: identity, ExpectedRepositoryID: identity,
+			OperatorIdentityPolicy: localregistry.OperatorIdentityPolicy{AllowedLogins: []string{"ifan0927"}, TrustedActors: []localregistry.TrustedActorIdentity{{DatabaseID: 1, NodeID: "actor", Login: "ifan0927", Type: "User"}}},
 		}
 	}
-	registry, err := localregistry.New([]localregistry.Repository{{
-		Owner: "IFAN0927", Name: "LoopTest", LinearLabel: "looptest", OriginURL: "git@github.com:ifan0927/LoopTest.git",
-		SourcePath: paths[0], RunRoot: paths[1], WorktreeRoot: paths[2], BaseBranch: "main",
-		VerifierRegistryRef: "builtin:v1", VerifierIDs: []string{"fixture-go-test"},
-		GitHubAppProfileRef: "github-app-profile:fixture", GitHubAppID: 1, GitHubInstallationID: 2, ExpectedRepositoryID: 3,
-		OperatorIdentityPolicy: localregistry.OperatorIdentityPolicy{AllowedLogins: []string{"ifan0927"}, TrustedActors: []localregistry.TrustedActorIdentity{{DatabaseID: 1, NodeID: "actor", Login: "ifan0927", Type: "User"}}},
-	}})
+
+	for _, test := range []struct {
+		name            string
+		configuredLabel string
+	}{
+		{name: "legacy short label", configuredLabel: "looptest"},
+		{name: "complete onboarding label", configuredLabel: "repo:looptest"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registry, err := localregistry.New([]localregistry.Repository{repository(strings.ReplaceAll(test.name, " ", "-"), test.configuredLabel, 2)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			resolved, ok := (linearRegistryResolver{registry: registry}).ResolveLinearAdmissionRepository("repo:looptest")
+			if !ok || resolved.LinearLabel != test.configuredLabel {
+				t.Fatalf("repository=%+v ok=%t", resolved, ok)
+			}
+		})
+	}
+
+	registry, err := localregistry.New([]localregistry.Repository{
+		repository("legacy", "looptest", 3),
+		repository("current", "repo:looptest", 4),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	resolver := linearRegistryResolver{registry: registry}
-	repository, ok := resolver.ResolveLinearAdmissionRepository("repo:looptest")
-	if !ok || repository.CanonicalRepository != "ifan0927/looptest" {
-		t.Fatalf("repository=%+v ok=%t", repository, ok)
+	if _, ok := resolver.ResolveLinearAdmissionRepository("repo:looptest"); ok {
+		t.Fatal("ambiguous short and complete labels unexpectedly resolved")
 	}
 	for _, label := range []string{"ifan0927/looptest", "repo:", "repo:ifan0927/looptest", "repo:other"} {
 		if _, ok := resolver.ResolveLinearAdmissionRepository(label); ok {

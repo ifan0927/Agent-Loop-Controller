@@ -214,22 +214,31 @@ Runs provides stable local Controller-reader Active/Ended/All and canonical
 exact-repository filters across frozen binding generations, updated-time cursor
 pagination that is not invalidated by normal collection growth, and the compact R04 collection. Run detail
 provides the application-owned R05 progress/wait conclusion and R06 fixed
-delivery-gate result without mutation controls. The TUI uses bounded responsive
+delivery-gate result. It also completes R07 with the bounded untrusted decision
+request, fixed-option and optional-instruction flow, exact review and
+confirmation, settled receipt, and durable worker-resume observation. Decision
+acceptance returns before Codex execution and preserves worker-only heavy-work
+authority. The TUI uses bounded responsive
 layouts and preserves the last complete screen across sanitized refresh
 failures. Its
 observation header, projected health card, content-sized panels, explicit focus,
 and redundant status markers make the same bounded evidence easier to scan.
 Attention adds stable local Controller-reader
-severity/time/event pagination, item-bound safe summaries of current offers, explicit no-offer
-rows, and application-owned Run-detail navigation without completing the later
-R07 decision mutation. Repositories uses the stable local Controller reader,
+severity/time/event pagination, item-bound safe summaries of current offers,
+explicit no-offer and CLI-only rows, bounded recently-handled records, and
+direct `Enter` navigation into R07 decision-option selection. Overview and the
+inbox share the same current/resolved attention classification, including
+later-complete-queue-snapshot recovery of transient scan warnings. Run detail uses
+the Overview visual language for current status, operator context, cleanup and
+recent-action evidence, and selectable Controller-order delivery progress.
+Repositories uses the stable local Controller reader,
 opaque pagination, and target-authorized shared detail with an application-owned
 acceptance conclusion and eight readiness dimensions. R08 is complete: only a
 currently authorized ready-disabled repository exposes the first narrow TUI
 mutation, an explicitly confirmed receipt-backed enable operation. Disable,
-recheck, removal, onboarding, run, and Attention mutations remain planned or
-CLI-only. Onboarding application collections retain the same stable reader
-foundation. The remaining navigation surface is Queue, Onboarding, Settings,
+recheck, removal, onboarding, and other run or Attention mutations remain
+planned or CLI-only. Onboarding application collections retain the same stable
+reader foundation. The remaining navigation surface is Queue, Onboarding, Settings,
 and System/Audit, but stable Controller projections determine screen details.
 
 The fixed product metric remains ten complete operator-intent scenarios from

@@ -1117,8 +1117,8 @@ unsanitized transport payloads are not projected.
 
 **Purpose**
 
-Validate and persist one choice from a Codex decision request, then resume the
-same implementation contract.
+Validate and persist one choice from a Codex decision request, then hand the
+same implementation contract back to the existing worker.
 
 **Inputs**
 
@@ -1136,16 +1136,19 @@ path/hash.
 
 **External side effects**
 
-None until the local controller resumes Codex.
+None in the operator process. A later worker cycle reacquires scheduling and
+heavy-work authority before resuming Codex.
 
 **Failure and recovery behavior**
 
 Changed files, unoffered choices, stale state, or outcome conflicts fail closed;
-the persisted valid decision can be reused after restart.
+the persisted valid decision and settled operation receipt can be reused after
+restart. Exact replay cannot create a second acceptance or worker resume.
 
 **Key invariants**
 
-The controller never invents or auto-selects a human choice.
+The controller never invents or auto-selects a human choice, and the operator
+adapter never starts the heavy continuation it authorizes.
 
 ### Repair and fresh review
 
@@ -1829,9 +1832,14 @@ and reconciliation rather than shared in-memory authority.
 The implemented operator composition opens only an existing exact-inode,
 mode-0600, current-schema SQLite/configuration binding. It
 does not create, migrate, baseline, reconcile, adopt, rewrite, or repair that
-authority. Reads remain query-only application projections; the sole write path
-is the exact typed `RepositoryService.Enable` operation offered by Repository
-detail. The TUI model receives one complete Overview projection followed by
+authority. Reads remain query-only application projections; write paths are
+limited to the exact typed `RepositoryService.Enable` operation offered by
+Repository detail and the exact typed legal-action decision acceptance offered
+by Run detail. Decision acceptance reauthorizes the configured requester,
+recomputes the opaque offer, validates the persisted fixed option and normalized
+instructions, persists the private native decision evidence, transitions to
+`executing`, and settles the receipt before returning. It does not acquire a
+heavy-work permit or invoke Codex. The TUI model receives one complete Overview projection followed by
 one limit-100 repository page at the same observation time; a failed second
 read discards the batch. Presentation never reads SQLite, configuration,
 credentials, GitHub, Linear, worktrees, artifacts, raw logs, or arbitrary local
@@ -1856,6 +1864,18 @@ current unresolved operator-attention family, including retained legacy
 priority-tie evidence. The application projects one versioned typed item per
 candidate with safe event, scope, target, repository, Linear, Controller state,
 Attention state, severity, reason, time, and closed navigation conclusions.
+Overview and Attention apply the same current/resolved classification to the
+same persisted families, so a settled operator action cannot remain counted as
+active merely because its immutable source event remains durable. The inbox
+also projects a bounded, explanatory recently-handled list from successful
+observed operator-action records. That history proves what was handled but is
+not acknowledgement state or mutation authority. Cleanup `deleted` and
+intentional `retained` conclusions remain visible in Run detail but do not keep
+the inbox active; only unfinished, failed, or explicitly skipped cleanup
+evidence remains unresolved attention. Candidate-scan and scheduler-lease
+warnings remain active until a later valid complete queue snapshot proves that
+the admission scan path recovered; immutable warning history is not itself a
+current health conclusion.
 Only `run_detail` and `none` are navigation values. Current legal-action offers
 are sanitized and bound inside the exact item whose current persisted attention
 authority produced them; authority/evidence digests and page-level joins never
@@ -1868,9 +1888,16 @@ Run detail is the same projection whether opened from Overview, Runs, or an
 Attention item with an application-projected `run_detail` destination. The
 application owns current phase, exact wait kind, normal/abnormal/unknown/
 conflict/ended assessment, latest meaningful transition, active attention,
-pull-request summary, and the fixed eleven delivery gates. The TUI does not
-derive those conclusions or render legal-action offers or decision controls in
-this read-only slice. Controller aggregate readiness is
+pull-request summary, bounded recent operator-action and cleanup conclusions,
+and the fixed eleven delivery gates. The TUI renders those facts in the same
+Bubble Tea and Lip Gloss panel language as Overview: current status, operator
+context, and selectable Controller-order delivery progress. For
+`awaiting_human_decision`, the same projection also exposes only the bounded,
+sanitized, explicitly untrusted request, persisted fixed options, and current
+`decide` offer. After acceptance it projects whether durable evidence still
+awaits a worker resume attempt or a subsequent `resume` attempt has begun; it
+does not expose decision content, artifact paths, or process authority. The TUI
+does not derive those conclusions. Controller aggregate readiness is
 rendered exactly as projected; capacity, repository readiness, availability,
 and freshness remain separate evidence and are never recomputed into health by
 the adapter. Widths at or above 92 columns place repositories and runs on the
@@ -1881,6 +1908,27 @@ Anything below 80x24 renders only the size
 requirement and quit control. Panel height is content-driven within the
 available terminal budget; only the focused panel's current row is highlighted,
 and color is redundant presentation rather than authority.
+
+Selecting a decision-ready Attention row with `Enter` opens the decision flow
+directly; Run detail retains `d` as a secondary shortcut. The flow selects only
+an ID from the projected persisted options and uses the pinned Bubbles v2 editor
+for optional additional instructions.
+Surrounding whitespace is removed; a blank result becomes exactly `No
+additional instructions.` before the separate review and confirmation steps.
+Option IDs and the effective instruction payload are shown as exact escaped
+JSON strings, so terminal control bytes and repeated whitespace remain visible
+without becoming active terminal sequences.
+Cancellation before confirmation has no mutation capability. Submission binds
+the current opaque offer and exact normalized payload. Duplicate pending input,
+route changes, refreshes, retries, and late asynchronous results are fenced by
+run, offer, payload, detail generation, and operation generation. An uncertain
+response may replay only that exact payload. A successful receipt remains
+visible across subsequent stale detail refreshes while the TUI observes the
+worker-owned handoff. If the acceptance committed but the response was lost,
+an exact retry binds the original decision transition and private evidence even
+after the worker advances; it settles the original receipt without creating a
+second acceptance or resume. A prepared-only resume attempt is not sufficient
+handoff evidence.
 
 Repository detail is the same target-authorized projection whether opened from
 Overview or the stable Controller-reader Repositories collection. The

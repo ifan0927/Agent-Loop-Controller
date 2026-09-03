@@ -7,6 +7,7 @@ import (
 
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
 )
 
 func (m operatorModel) renderAttentionScreen() string {
@@ -40,12 +41,16 @@ func (m operatorModel) renderAttentionList(width, height int) string {
 	page := m.attention.page
 	innerWidth, innerHeight := max(width-2, 1), max(height-2, 1)
 	pageNumber := len(m.attention.request.previous) + 1
-	title := fmt.Sprintf("Inbox · page %d · %d of %d displayed", pageNumber, len(page.Items), page.Collection.Total)
+	title := fmt.Sprintf("Active Attention · page %d · %d of %d displayed", pageNumber, len(page.Items), page.Collection.Total)
 	lines := []string{ansi.Truncate(title, innerWidth, "…")}
 	if len(page.Items) == 0 {
-		lines = append(lines, "No unresolved Attention items")
+		lines = append(lines, "No active Attention items")
 	} else {
-		available := max(innerHeight-1, 1)
+		reserve := 0
+		if len(page.RecentlyHandled) != 0 {
+			reserve = min(len(page.RecentlyHandled)+1, 3)
+		}
+		available := max(innerHeight-1-reserve, 1)
 		selected := clamp(m.attention.index, 0, len(page.Items)-1)
 		start := clamp(selected-available+1, 0, max(len(page.Items)-available, 0))
 		end := min(start+available, len(page.Items))
@@ -57,7 +62,13 @@ func (m operatorModel) renderAttentionList(width, height int) string {
 			}
 			offer := "no action"
 			if len(item.Offers) != 0 {
-				offer = fmt.Sprintf("%d offered", len(item.Offers))
+				offer = "CLI action"
+				for _, current := range item.Offers {
+					if current.Action == "decide" && current.InputKind == "decision" {
+						offer = "decision ready"
+						break
+					}
+				}
 			}
 			identity = presentationLabel(string(item.Scope)) + " " + identity
 			row := operatorRow{
@@ -67,6 +78,15 @@ func (m operatorModel) renderAttentionList(width, height int) string {
 				tone:   severityTone(item.Severity),
 			}
 			lines = append(lines, m.renderRow(row, innerWidth, m.attention.focus == operatorAttentionListFocus && index == selected))
+		}
+	}
+	if len(page.RecentlyHandled) != 0 && len(lines) < innerHeight {
+		lines = append(lines, operatorAccentStyle.Render("Recently handled"))
+		for _, handled := range page.RecentlyHandled {
+			if len(lines) >= innerHeight {
+				break
+			}
+			lines = append(lines, ansi.Truncate(formatHandledAttention(handled, page.Metadata.ObservedAt), innerWidth, "…"))
 		}
 	}
 	style := lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(operatorBorderColor).Width(width).Height(height)
@@ -81,7 +101,7 @@ func (m operatorModel) renderAttentionSummary(width, height int) string {
 	lines := []string{"Selected item"}
 	item, ok := m.selectedAttentionItem()
 	if !ok {
-		lines = append(lines, "No Attention item selected", "No Controller action offered")
+		lines = append(lines, "No active Attention item selected", "No Controller action required")
 	} else {
 		lines = append(lines,
 			"Event "+item.EventID,
@@ -105,16 +125,35 @@ func (m operatorModel) renderAttentionSummary(width, height int) string {
 		)
 		if len(item.Offers) == 0 {
 			lines = append(lines, "No Controller action offered")
+			if item.EventType == "cleanup_residue_attention" {
+				lines = append(lines, "Inspect the run for deleted and retained cleanup results.")
+			}
 		} else {
-			lines = append(lines, "Current offered actions")
+			lines = append(lines, "Primary action")
 			for _, offer := range item.Offers {
-				lines = append(lines,
-					fmt.Sprintf("- %s · %s · %s/%s · %s", offer.Action, reasonPresentation(offer.Reason), offer.Confirmation, offer.InputKind, offer.Consequence),
-					"  offer "+offer.OfferID,
-				)
+				if offer.Action == "decide" && offer.InputKind == "decision" {
+					lines = append(lines,
+						operatorWarningStyle.Bold(true).Render("→ Enter handle human decision"),
+						"Read the bounded request, move to options, then use ↑/↓ and Enter.",
+					)
+				} else {
+					lines = append(lines,
+						fmt.Sprintf("- %s · %s", operatorActionPresentation(string(offer.Action)), reasonPresentation(offer.Reason)),
+						operatorMutedStyle.Render("  CLI only in this TUI release · Enter inspects the run"),
+					)
+				}
 			}
 		}
-		lines = append(lines, "Navigation "+presentationLabel(string(item.Navigation)))
+		if item.Navigation == "run_detail" && len(item.Offers) == 0 {
+			lines = append(lines, "Enter inspect run")
+		}
+	}
+	if len(m.attention.page.RecentlyHandled) != 0 {
+		handled := m.attention.page.RecentlyHandled[0]
+		lines = append(lines, "", operatorAccentStyle.Render("Recently handled"),
+			formatHandledAttention(handled, m.attention.page.Metadata.ObservedAt),
+			"Action record "+handled.Action.ActionID,
+		)
 	}
 	available := max(innerHeight, 1)
 	maxOffset := max(len(lines)-available, 0)
@@ -129,4 +168,12 @@ func (m operatorModel) renderAttentionSummary(width, height int) string {
 		style = style.BorderForeground(operatorFocusColor)
 	}
 	return style.Render(strings.Join(visible, "\n"))
+}
+
+func formatHandledAttention(item application.RoutineHandledAttentionItem, observedAt time.Time) string {
+	identity := item.RunID
+	if item.LinearIdentifier != "" {
+		identity = item.LinearIdentifier
+	}
+	return fmt.Sprintf("✓ %s · %s %s → %s · %s", identity, operatorActionPresentation(string(item.Action.Action)), presentationLabel(item.Action.ResultStatus), presentationLabel(item.Action.ResultingState), formatObservationAge(observedAt, item.Action.ObservedAt))
 }

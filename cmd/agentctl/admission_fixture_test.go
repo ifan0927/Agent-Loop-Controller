@@ -691,10 +691,14 @@ func (d *offlineAdmissionDriver) commands() []application.ProductionDriveCommand
 }
 
 func newOfflineAdmissionDispatcher(scanner application.LinearTodoCandidateScanner, reader application.LinearIssueReader, starter application.LinearReservedIssueStarter, store *sqlitestore.Store, controller application.LocalRunController, driver application.LinearTodoDispatchDriver, repository application.LocalRepository, owner string) (*application.LinearTodoDispatcher, error) {
-	return newOfflineAdmissionDispatcherWithResolver(scanner, reader, starter, store, controller, driver, offlineAdmissionResolver{repository: repository}, owner)
+	return newOfflineAdmissionDispatcherWithRequester(scanner, reader, starter, store, controller, driver, offlineAdmissionResolver{repository: repository}, owner, application.Requester{ID: "operator", Kind: "github_login"})
 }
 
 func newOfflineAdmissionDispatcherWithResolver(scanner application.LinearTodoCandidateScanner, reader application.LinearIssueReader, starter application.LinearReservedIssueStarter, store *sqlitestore.Store, controller application.LocalRunController, driver application.LinearTodoDispatchDriver, resolver application.LinearAdmissionRepositoryResolver, owner string) (*application.LinearTodoDispatcher, error) {
+	return newOfflineAdmissionDispatcherWithRequester(scanner, reader, starter, store, controller, driver, resolver, owner, application.Requester{ID: "operator", Kind: "github_login"})
+}
+
+func newOfflineAdmissionDispatcherWithRequester(scanner application.LinearTodoCandidateScanner, reader application.LinearIssueReader, starter application.LinearReservedIssueStarter, store *sqlitestore.Store, controller application.LocalRunController, driver application.LinearTodoDispatchDriver, resolver application.LinearAdmissionRepositoryResolver, owner string, requester application.Requester) (*application.LinearTodoDispatcher, error) {
 	var gate application.NewAdmissionGate = application.AllowNewAdmissionForTest()
 	if authority, found, err := store.ConfigurationAuthority(context.Background()); err != nil {
 		return nil, err
@@ -714,7 +718,7 @@ func newOfflineAdmissionDispatcherWithResolver(scanner application.LinearTodoCan
 		LeaseTTL:           time.Minute,
 		LeaseRenewal:       20 * time.Second,
 		OwnerNonce:         owner,
-		Requester:          application.Requester{ID: "operator", Kind: "github_login"},
+		Requester:          requester,
 		AttentionProfile:   application.OperatorAttentionProfile{ID: "offline", Name: "offline-fixture"},
 		AdmissionGate:      gate,
 	})

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -293,18 +294,55 @@ type RoutineDecisionRequest struct {
 	ContentTrust   string                  `json:"content_trust"`
 }
 
+type RoutineDecisionHandoffStatus string
+
+const (
+	RoutineDecisionAwaitingWorker RoutineDecisionHandoffStatus = "awaiting_worker"
+	RoutineDecisionWorkerResumed  RoutineDecisionHandoffStatus = "worker_resumed"
+)
+
+type RoutineDecisionHandoff struct {
+	Status           RoutineDecisionHandoffStatus `json:"status"`
+	AcceptedAt       time.Time                    `json:"accepted_at"`
+	ResumeObservedAt *time.Time                   `json:"resume_observed_at,omitempty"`
+}
+
+// RoutineOperatorActionSummary is bounded, presentation-safe proof of the
+// latest operator action for a run. It intentionally omits request payloads,
+// authority digests, and private evidence locations.
+type RoutineOperatorActionSummary struct {
+	ActionID       string             `json:"action_id"`
+	Action         OperatorActionType `json:"action"`
+	Status         string             `json:"status"`
+	ResultStatus   string             `json:"result_status"`
+	ResultingState string             `json:"resulting_state,omitempty"`
+	ReasonCode     string             `json:"reason_code"`
+	ObservedAt     time.Time          `json:"observed_at"`
+}
+
+// RoutineCleanupSummary exposes only the resource class and recorded cleanup
+// conclusion. Resource names and raw cleanup failures remain private.
+type RoutineCleanupSummary struct {
+	ResourceKind string    `json:"resource_kind"`
+	Status       string    `json:"status"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
 type RoutineRunDetail struct {
-	Metadata         RoutineProjectionMetadata  `json:"metadata"`
-	Run              RoutineRunSummary          `json:"run"`
-	LatestTransition *RoutineTransition         `json:"latest_transition,omitempty"`
-	Phase            RoutineRunPhase            `json:"phase"`
-	Wait             RoutineWaitClassification  `json:"wait"`
-	WaitAssessment   RoutineWaitAssessment      `json:"wait_assessment"`
-	PullRequest      *RoutinePullRequestSummary `json:"pull_request,omitempty"`
-	Gates            []RoutineDeliveryGate      `json:"gates"`
-	Attention        []RoutineAttentionSummary  `json:"active_attention"`
-	Offers           []LegalActionOffer         `json:"legal_action_offers"`
-	Decision         *RoutineDecisionRequest    `json:"decision_request,omitempty"`
+	Metadata         RoutineProjectionMetadata      `json:"metadata"`
+	Run              RoutineRunSummary              `json:"run"`
+	LatestTransition *RoutineTransition             `json:"latest_transition,omitempty"`
+	Phase            RoutineRunPhase                `json:"phase"`
+	Wait             RoutineWaitClassification      `json:"wait"`
+	WaitAssessment   RoutineWaitAssessment          `json:"wait_assessment"`
+	PullRequest      *RoutinePullRequestSummary     `json:"pull_request,omitempty"`
+	Gates            []RoutineDeliveryGate          `json:"gates"`
+	Attention        []RoutineAttentionSummary      `json:"active_attention"`
+	Offers           []LegalActionOffer             `json:"legal_action_offers"`
+	Decision         *RoutineDecisionRequest        `json:"decision_request,omitempty"`
+	DecisionHandoff  *RoutineDecisionHandoff        `json:"decision_handoff,omitempty"`
+	RecentActions    []RoutineOperatorActionSummary `json:"recent_actions"`
+	Cleanup          []RoutineCleanupSummary        `json:"cleanup"`
 }
 
 type RoutineRunQueryService struct {
@@ -364,9 +402,9 @@ func (s *RoutineRunQueryService) Detail(ctx context.Context, query RunDetailQuer
 	if err != nil {
 		return RoutineRunDetail{}, err
 	}
-	inspection, err := s.store.Inspect(ctx, run.ID)
+	inspection, _, err := s.queries.loadInspectionEvidence(ctx, run.ID)
 	if err != nil {
-		return RoutineRunDetail{}, classifyServiceError(err)
+		return RoutineRunDetail{}, err
 	}
 	if inspection.Run.ID != run.ID || inspection.Run.RepositoryBindingDigest != run.RepositoryBindingDigest {
 		return RoutineRunDetail{}, serviceError(ErrorInternal, "routine run evidence conflicts", nil)
@@ -375,7 +413,17 @@ func (s *RoutineRunQueryService) Detail(ctx context.Context, query RunDetailQuer
 	if err != nil {
 		return RoutineRunDetail{}, err
 	}
-	result := projectRoutineRunDetail(inspection, offers, observedAt.UTC())
+	confirmed, _, err := s.queries.loadInspectionEvidence(ctx, run.ID)
+	if err != nil {
+		return RoutineRunDetail{}, err
+	}
+	if routineProjectionDigest(inspection) != routineProjectionDigest(confirmed) {
+		return RoutineRunDetail{}, serviceError(ErrorConflict, "routine run changed during observation", nil)
+	}
+	if confirmed.Run.ID != run.ID || confirmed.Run.RepositoryBindingDigest != run.RepositoryBindingDigest {
+		return RoutineRunDetail{}, serviceError(ErrorInternal, "routine run evidence conflicts", nil)
+	}
+	result := projectRoutineRunDetail(confirmed, offers, observedAt.UTC())
 	result.Metadata.Digest = routineProjectionDigest(result)
 	return result, nil
 }
@@ -417,7 +465,47 @@ func projectRoutineRunDetail(inspection RunInspection, offers []LegalActionOffer
 	if run.State == domain.StateAwaitingHumanDecision && slices.ContainsFunc(offers, func(offer LegalActionOffer) bool { return offer.Action == OperationDecide }) {
 		result.Decision = projectRoutineDecisionRequest(inspection)
 	}
+	result.DecisionHandoff = projectRoutineDecisionHandoff(inspection)
+	result.RecentActions = projectRoutineOperatorActions(inspection.OperatorActions, 5)
+	for _, record := range inspection.Cleanup {
+		result.Cleanup = append(result.Cleanup, RoutineCleanupSummary{ResourceKind: record.Kind, Status: record.Status, UpdatedAt: record.UpdatedAt.UTC()})
+	}
 	return result
+}
+
+func projectRoutineOperatorActions(actions []OperatorActionRecord, limit int) []RoutineOperatorActionSummary {
+	if limit < 1 {
+		return nil
+	}
+	ordered := append([]OperatorActionRecord(nil), actions...)
+	sort.SliceStable(ordered, func(left, right int) bool {
+		leftAt, rightAt := routineOperatorActionObservedAt(ordered[left]), routineOperatorActionObservedAt(ordered[right])
+		if !leftAt.Equal(rightAt) {
+			return leftAt.After(rightAt)
+		}
+		return ordered[left].ActionID > ordered[right].ActionID
+	})
+	result := make([]RoutineOperatorActionSummary, 0, min(len(ordered), limit))
+	for index := 0; index < len(ordered) && len(result) < limit; index++ {
+		action := ordered[index]
+		observedAt := routineOperatorActionObservedAt(action)
+		result = append(result, RoutineOperatorActionSummary{
+			ActionID: action.ActionID, Action: action.ActionType, Status: action.Status,
+			ResultStatus: action.ResultStatus, ResultingState: string(action.ResultingState),
+			ReasonCode: action.ReasonCode, ObservedAt: observedAt.UTC(),
+		})
+	}
+	return result
+}
+
+func routineOperatorActionObservedAt(action OperatorActionRecord) time.Time {
+	if !action.ObservedAt.IsZero() {
+		return action.ObservedAt.UTC()
+	}
+	if !action.AppliedAt.IsZero() {
+		return action.AppliedAt.UTC()
+	}
+	return action.ReceivedAt.UTC()
 }
 
 func classifyRoutineWaitAssessment(wait RoutineWaitClassification, attention []RoutineAttentionSummary, gates []RoutineDeliveryGate) RoutineWaitAssessment {
@@ -506,11 +594,35 @@ func classifyRoutineAttention(inspection RunInspection, event OperatorAttentionE
 			}
 		}
 		return ""
+	case OperatorAttentionRetry:
+		if inspection.Run.State == domain.StateRejected || inspection.Run.State == domain.StateFailed || inspection.Run.State == domain.StateCompleted {
+			return ""
+		}
+		for index := len(inspection.RetrySchedules) - 1; index >= 0; index-- {
+			schedule := inspection.RetrySchedules[index]
+			if schedule.RunID != inspection.Run.ID {
+				continue
+			}
+			if schedule.Status == RetryScheduleAttention && schedule.ReasonCode == event.ReasonCode {
+				return RoutineAttentionActive
+			}
+			if schedule.Status == RetryScheduleScheduled && schedule.ReasonCode == RetryReasonOperatorRetry {
+				return ""
+			}
+		}
+		return RoutineAttentionUnknown
 	default:
 		// Scheduler and retry supersession depends on evidence outside a single
 		// run aggregate. Retain it conservatively and offer no authority here.
 		return RoutineAttentionUnknown
 	}
+}
+
+// ClassifyRoutineAttentionCurrent gives snapshot adapters the same
+// presentation-independent active/resolved conclusion used by Run detail and
+// the Attention inbox without exposing mutation authority.
+func ClassifyRoutineAttentionCurrent(run Run, event OperatorAttentionEvent, schedules []RetrySchedule, cleanup []CleanupRecord) RoutineAttentionState {
+	return classifyRoutineAttention(RunInspection{Run: run, RetrySchedules: schedules, Cleanup: cleanup}, event)
 }
 
 func projectRoutineDecisionRequest(inspection RunInspection) *RoutineDecisionRequest {
@@ -524,13 +636,49 @@ func projectRoutineDecisionRequest(inspection RunInspection) *RoutineDecisionReq
 			return nil
 		}
 		request := outcome.DecisionRequest
-		result := &RoutineDecisionRequest{Question: request.Question, Context: request.Context, Recommendation: request.Recommendation, BlockingReason: request.BlockingReason, ContentTrust: "untrusted"}
+		result := &RoutineDecisionRequest{Question: routineDecisionContent(request.Question), Context: routineDecisionContent(request.Context), Recommendation: request.Recommendation, BlockingReason: routineDecisionContent(request.BlockingReason), ContentTrust: "untrusted"}
 		for _, option := range request.Options {
-			result.Options = append(result.Options, RoutineDecisionOption{ID: option.ID, Description: option.Description})
+			result.Options = append(result.Options, RoutineDecisionOption{ID: option.ID, Description: routineDecisionContent(option.Description)})
 		}
 		return result
 	}
 	return nil
+}
+
+func routineDecisionContent(value string) string {
+	if sanitized := sanitizeUntrustedContent(value); sanitized != "" {
+		return sanitized
+	}
+	return "[untrusted content omitted]"
+}
+
+func projectRoutineDecisionHandoff(inspection RunInspection) *RoutineDecisionHandoff {
+	var acceptedAt time.Time
+	for index := len(inspection.Timeline) - 1; index >= 0; index-- {
+		transition := inspection.Timeline[index]
+		if transition.From == domain.StateAwaitingHumanDecision && transition.To == domain.StateExecuting && !transition.CreatedAt.IsZero() {
+			acceptedAt = transition.CreatedAt.UTC()
+			break
+		}
+		if transition.To == domain.StateAwaitingHumanDecision {
+			return nil
+		}
+	}
+	if acceptedAt.IsZero() {
+		return nil
+	}
+	result := &RoutineDecisionHandoff{Status: RoutineDecisionAwaitingWorker, AcceptedAt: acceptedAt}
+	for _, attempt := range inspection.Attempts {
+		if attempt.Kind != "resume" || (attempt.Status != "started" && attempt.Status != "succeeded") || attempt.StartedAt.IsZero() || attempt.StartedAt.Before(acceptedAt) {
+			continue
+		}
+		observed := attempt.StartedAt.UTC()
+		if result.ResumeObservedAt == nil || observed.Before(*result.ResumeObservedAt) {
+			result.Status = RoutineDecisionWorkerResumed
+			result.ResumeObservedAt = &observed
+		}
+	}
+	return result
 }
 
 func boundedRoutineDecision(request domain.DecisionRequest) bool {

@@ -408,7 +408,8 @@ fails closed if the locator, retained desired generation, exact database
 identity, mode, binding, or schema is unavailable or conflicting. It never
 initializes, migrates, reconciles, adopts, or writes configuration. SQLite
 writes are limited to the exact application-owned repository-enable receipt,
-lifecycle, and activity transaction after explicit confirmation.
+lifecycle, and activity transaction and the exact offered human-decision
+evidence, transition, and receipt after explicit confirmation.
 
 Overview, Runs, Attention, Repositories, Run detail, and Repository detail
 refresh every ten seconds. Use `1`, `2`, `3`, and `4` for Overview, Runs,
@@ -420,10 +421,31 @@ preserved. On Runs, `f` cycles Active,
 Ended, and All; `/` accepts an exact lowercase `owner/repository` filter; and
 `n`/`p` move through bounded cursor pages. Attention uses `Tab` between its list
 and selected-item summary, arrow keys to select or scroll, and the same `n`/`p`
-pagination. Items without a current offer explicitly show `No Controller action
-offered`; offers are informational and cannot be executed in this read-only
-route. Repositories uses the same `n`/`p` opaque pagination and defaults to 25
-rows. Repository detail displays lifecycle, readiness, availability,
+pagination. Active items are separated from a bounded `Recently handled`
+record of successful observed operator actions. A terminal cleanup conclusion
+such as `deleted` or intentional `retained` remains visible in Run detail but
+does not keep Overview or the inbox in active attention; `failed`, unfinished
+`intent`, and `skipped_attention` cleanup do. A candidate-scan or scheduler
+warning disappears from active attention only after a later complete queue
+snapshot proves recovery. Items without a current offer
+explicitly say whether `Enter` inspects the run; run actions not implemented in
+the TUI are labeled CLI-only instead of appearing selectable. Select a current
+human-decision item and press `Enter` to open the decision request directly.
+Read its bounded untrusted content, switch to the persisted options with `Tab`
+or `Enter`, select with the arrow keys, and press `Enter`. Run detail retains
+`d` as a secondary shortcut for the same current offer. Enter
+optional bounded clarification in the native editor, then use `Ctrl-S` to
+review. Blank or whitespace-only input becomes exactly `No additional
+instructions.`; other input loses only surrounding whitespace. Review the
+exact effective option and instructions, press `Enter` for the separate
+confirmation screen, and press `Enter` again to submit. `Escape` backs out
+without mutation before confirmation. An uncertain response retries the same
+opaque offer and exact normalized payload. A successful settled receipt remains
+visible while Run detail refreshes; the screen distinguishes waiting for the
+worker from a durable observed resume attempt. The TUI never starts Codex or
+acquires its heavy-work authority. Repositories uses the same `n`/`p` opaque
+pagination and defaults to 25 rows. Repository detail displays lifecycle,
+readiness, availability,
 configuration convergence, run/onboarding context, observation time, all eight
 readiness dimensions, and the application-owned acceptance conclusion. When
 `enable_repository` is offered, `e` opens an explicit confirmation and `Enter`
@@ -432,7 +454,7 @@ reopens current durable authority, re-resolves the configured operator and
 repository profile, and fails closed if their generation, digest, version, or
 binding changed after the screen was shown. Enabling does
 not enable global automatic admission, change a run, or control the worker.
-Disable, recheck, removal, onboarding, and run actions remain CLI-only or
+Disable, recheck, removal, onboarding, and other run actions remain CLI-only or
 planned. Use `r` to refresh, arrow keys or
 `j`/`k` to select or scroll, `?` for current help, and `q` or `Ctrl-C` to quit.
 Overview also uses `Tab` and `Shift+Tab` between non-empty panels. A refresh
@@ -458,8 +480,9 @@ evidence or recovery.
 
 ### Handle expected waits
 
-- `awaiting_human_decision`: select one offered choice with a decision JSON,
-  submit it through `controller continue`, then use `controller drive`.
+- `awaiting_human_decision`: normally resolve the current offered choice in
+  `agentctl operator`; the existing worker resumes it. The recovery CLI may
+  still submit a private decision JSON through `controller continue`.
 - `pr_open`, `reconciling_reviews`: CI or GitHub evidence is being read.
 - `awaiting_human_approval`: review/resolve/approve in GitHub; do not look for a
   controller approval command.
@@ -516,9 +539,12 @@ Controller Attention cursors remain usable as normal repositories and runs are
 added; upgrades that change their opaque cursor versions require returning to
 the first page once. The exact repository filter includes historical runs under
 older frozen binding generations of the same canonical repository. Run detail
-shows the application-owned phase and wait assessment, latest transition,
-compact pull request, active attention, and all eleven Controller-owned delivery
-gates. Repository detail shows all eight readiness dimensions and the
+uses Overview-style Bubble Tea/Lip Gloss panels for application-owned current
+status, wait assessment, latest transition, pull request, recent operator action
+and cleanup conclusions, active attention, and all eleven selectable
+Controller-owned delivery gates. Use `Tab` to switch focus between operator
+context and delivery progress, then the arrow keys to scroll the focused panel.
+Repository detail shows all eight readiness dimensions and the
 application-owned acceptance conclusion. Only a ready-disabled repository may
 offer one explicit, confirmed, receipt-backed enable control. Truncated collections always report
 displayed and total counts. Unknown future presentation codes remain visible
@@ -2977,14 +3003,22 @@ backup to `.plist` while the current service is loaded.
 
 ## 9. Human Decision Workflow
 
-1. Inspect `awaiting_human_decision` and locate the exact decision request and
-   offered option IDs.
-2. Discuss the choice outside the controller if necessary; do not edit task or
-   database evidence to encode the answer.
-3. Create a private bounded JSON decision with one offered `choice_id`.
-4. Submit it through the fully authorized `controller continue` command.
-5. Re-inspect; if the process stopped after the one local action, use
-   `controller drive`.
+1. Open the run in `agentctl operator`. Confirm that it is currently
+   `awaiting_human_decision` and shows the `d decide` action.
+2. Read the untrusted request, move focus to the persisted options, and select
+   exactly one displayed option ID. Discuss the choice outside the controller
+   if necessary; do not edit task or database evidence to encode the answer.
+3. Enter only optional bounded clarification. Blank input becomes exactly
+   `No additional instructions.`
+4. Review the exact JSON-string representation of the option ID and effective
+   instructions, enter the separate confirmation step, and submit once.
+5. Keep the TUI open to observe the durable receipt and the worker-resume
+   evidence. The TUI records and settles the decision only; the existing worker
+   owns the subsequent Codex resume.
+
+If the TUI is unavailable, the private decision JSON plus fully authorized
+`controller continue` command remains a recovery path. Do not invoke
+`controller drive` after a normal TUI decision merely to accelerate the worker.
 
 A changed Linear contract is a separate source-drift concern. Do not disguise a
 material task change as free-form decision instructions.
