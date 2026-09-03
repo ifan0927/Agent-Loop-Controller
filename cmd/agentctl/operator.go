@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -133,14 +134,17 @@ type operatorRunsState struct {
 }
 
 type operatorRunDetailState struct {
-	detail       *application.RoutineRunDetail
-	runID        string
-	returnRoute  operatorRoute
-	initialError *operatorSafeError
-	staleError   *operatorSafeError
-	refreshing   bool
-	generation   int64
-	gateIndex    int
+	detail              *application.RoutineRunDetail
+	runID               string
+	returnRoute         operatorRoute
+	startDecisionOnLoad bool
+	initialError        *operatorSafeError
+	staleError          *operatorSafeError
+	refreshing          bool
+	generation          int64
+	gateIndex           int
+	contextFocused      bool
+	contextOffset       int
 }
 
 type operatorRefreshTickMsg struct{}
@@ -381,7 +385,7 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case operatorRunDetailResultMsg:
-		if msg.generation != m.detail.generation || msg.runID != m.detail.runID {
+		if m.route != operatorRunDetailRoute || msg.generation != m.detail.generation || msg.runID != m.detail.runID {
 			return m, nil
 		}
 		m.detail.refreshing = false
@@ -397,6 +401,20 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.detail.detail = &detail
 		m.detail.initialError, m.detail.staleError = nil, nil
 		m.detail.gateIndex = clamp(m.detail.gateIndex, 0, max(len(detail.Gates)-1, 0))
+		m.detail.contextOffset = clamp(m.detail.contextOffset, 0, m.maximumRunDetailContextOffset(detail))
+		startDecision := m.detail.startDecisionOnLoad
+		m.detail.startDecisionOnLoad = false
+		if startDecision && m.decisionCanStart() {
+			started, command := m.startDecisionFlow()
+			m = started.(operatorModel)
+			m.decision.requestFocus = operatorDecisionRequestOptions
+			m.ensureSelectedDecisionOptionVisible()
+			if !m.tickerStarted {
+				m.tickerStarted = true
+				return m, tea.Batch(command, m.tickCommand())
+			}
+			return m, command
+		}
 		if !m.tickerStarted {
 			m.tickerStarted = true
 			return m, m.tickCommand()
@@ -575,6 +593,7 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.repositoryDetail.operationError = nil
 			return m, m.repositoryEnableCommand(m.repositoryDetail.operationGeneration, m.repositoryDetail.repository, m.repositoryDetail.requestID)
 		case key.Matches(msg, operatorKeys.overview):
+			m.invalidateRunDetailReadForRouteChange()
 			m.invalidateRepositoryReadsForRouteChange(operatorOverviewRoute)
 			m.route = operatorOverviewRoute
 			if !m.refreshing {
@@ -582,6 +601,7 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case key.Matches(msg, operatorKeys.runs):
+			m.invalidateRunDetailReadForRouteChange()
 			m.invalidateRepositoryReadsForRouteChange(operatorRunsRoute)
 			m.route = operatorRunsRoute
 			if !m.runs.refreshing {
@@ -589,6 +609,7 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case key.Matches(msg, operatorKeys.attention):
+			m.invalidateRunDetailReadForRouteChange()
 			m.invalidateRepositoryReadsForRouteChange(operatorAttentionRoute)
 			m.route = operatorAttentionRoute
 			if !m.attention.refreshing {
@@ -596,6 +617,7 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case key.Matches(msg, operatorKeys.repositories):
+			m.invalidateRunDetailReadForRouteChange()
 			m.invalidateRepositoryReadsForRouteChange(operatorRepositoriesRoute)
 			m.route = operatorRepositoriesRoute
 			if !m.repositories.refreshing {
@@ -603,6 +625,7 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case m.route == operatorRunDetailRoute && key.Matches(msg, operatorKeys.back):
+			m.invalidateRunDetailReadForRouteChange()
 			m.route = m.detail.returnRoute
 			return m, nil
 		case m.route == operatorRepositoryDetailRoute && key.Matches(msg, operatorKeys.back):
@@ -713,7 +736,7 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case m.route == operatorAttentionRoute && m.attention.page != nil && key.Matches(msg, operatorKeys.open):
 			item, ok := m.selectedAttentionItem()
 			if ok && item.Navigation == application.RoutineAttentionNavigationRunDetail {
-				return m.openRunDetail(item.RunID, operatorAttentionRoute)
+				return m.openAttentionItem(item)
 			}
 			return m, nil
 		case m.route == operatorAttentionRoute && m.attention.page != nil && key.Matches(msg, operatorKeys.nextPage):
@@ -771,10 +794,21 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.repositoryDetail.dimensionIndex = clamp(m.repositoryDetail.dimensionIndex+1, 0, max(len(m.repositoryDetail.detail.Dimensions)-1, 0))
 			return m, nil
 		case m.route == operatorRunDetailRoute && m.detail.detail != nil && key.Matches(msg, operatorKeys.up):
-			m.detail.gateIndex = clamp(m.detail.gateIndex-1, 0, max(len(m.detail.detail.Gates)-1, 0))
+			if m.detail.contextFocused {
+				m.detail.contextOffset = clamp(m.detail.contextOffset-1, 0, m.maximumRunDetailContextOffset(*m.detail.detail))
+			} else {
+				m.detail.gateIndex = clamp(m.detail.gateIndex-1, 0, max(len(m.detail.detail.Gates)-1, 0))
+			}
 			return m, nil
 		case m.route == operatorRunDetailRoute && m.detail.detail != nil && key.Matches(msg, operatorKeys.down):
-			m.detail.gateIndex = clamp(m.detail.gateIndex+1, 0, max(len(m.detail.detail.Gates)-1, 0))
+			if m.detail.contextFocused {
+				m.detail.contextOffset = clamp(m.detail.contextOffset+1, 0, m.maximumRunDetailContextOffset(*m.detail.detail))
+			} else {
+				m.detail.gateIndex = clamp(m.detail.gateIndex+1, 0, max(len(m.detail.detail.Gates)-1, 0))
+			}
+			return m, nil
+		case m.route == operatorRunDetailRoute && m.detail.detail != nil && key.Matches(msg, operatorKeys.next):
+			m.detail.contextFocused = !m.detail.contextFocused
 			return m, nil
 		case m.route == operatorRunDetailRoute && m.detail.detail != nil && msg.Code == 'd':
 			return m.startDecisionFlow()
@@ -841,6 +875,15 @@ func (m *operatorModel) startDetailRefresh() tea.Cmd {
 	return m.detailLoadCommand(m.detail.generation, m.detail.runID)
 }
 
+func (m *operatorModel) invalidateRunDetailReadForRouteChange() {
+	if m.route != operatorRunDetailRoute {
+		return
+	}
+	m.detail.generation++
+	m.detail.refreshing = false
+	m.detail.startDecisionOnLoad = false
+}
+
 func (m *operatorModel) startRepositoriesRefresh(request operatorRepositoriesRequest) tea.Cmd {
 	if m.repositories.refreshing {
 		return nil
@@ -876,6 +919,18 @@ func (m operatorModel) openRunDetail(runID string, returnRoute operatorRoute) (t
 	}
 	m.route = operatorRunDetailRoute
 	return m, m.startDetailRefresh()
+}
+
+func (m operatorModel) openAttentionItem(item application.RoutineAttentionItem) (tea.Model, tea.Cmd) {
+	opened, command := m.openRunDetail(item.RunID, operatorAttentionRoute)
+	next := opened.(operatorModel)
+	for _, offer := range item.Offers {
+		if offer.Action == application.OperationDecide && offer.InputKind == application.LegalActionInputDecision {
+			next.detail.startDecisionOnLoad = true
+			break
+		}
+	}
+	return next, command
 }
 
 func (m operatorModel) openRepositoryDetail(repository string, returnRoute operatorRoute) (tea.Model, tea.Cmd) {
@@ -1429,49 +1484,112 @@ func (m operatorModel) renderRunDetailScreen() string {
 	}
 	detail := m.detail.detail
 	header := m.renderRouteHeader("Run detail", detail.Metadata.ObservedAt, m.detail.refreshing, m.detail.staleError)
+	bodyHeight := max(m.height-lipgloss.Height(header)-lipgloss.Height(footer), 2)
+	statusLines := m.runDetailStatusLines(*detail)
+	contextLines := m.runDetailContextLines(*detail)
+	var body string
+	if m.width >= operatorWideWidth {
+		topHeight := clamp(bodyHeight*2/5, 8, 11)
+		statusWidth := m.width * 11 / 20
+		contextLines = visibleRunDetailContext(contextLines, m.detail.contextOffset, topHeight-3)
+		top := lipgloss.JoinHorizontal(lipgloss.Top,
+			m.renderRunDetailPanel("Current status", statusLines, statusWidth, topHeight, false),
+			m.renderRunDetailPanel("Operator context", contextLines, m.width-statusWidth-1, topHeight, m.detail.contextFocused),
+		)
+		body = lipgloss.JoinVertical(lipgloss.Left, top, m.renderRunDeliveryPanel(m.width, bodyHeight-topHeight))
+	} else {
+		statusHeight := clamp(bodyHeight/2, 10, 13)
+		title := "Current status & operator context"
+		if m.detail.contextFocused {
+			title = "Operator context"
+			statusLines = visibleRunDetailContext(contextLines, m.detail.contextOffset, statusHeight-3)
+		} else {
+			statusLines = append(statusLines, contextLines...)
+		}
+		body = lipgloss.JoinVertical(lipgloss.Left,
+			m.renderRunDetailPanel(title, statusLines, m.width, statusHeight, m.detail.contextFocused),
+			m.renderRunDeliveryPanel(m.width, bodyHeight-statusHeight),
+		)
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+}
+
+func visibleRunDetailContext(lines []string, offset, capacity int) []string {
+	capacity = max(capacity, 1)
+	start := clamp(offset, 0, max(len(lines)-capacity, 0))
+	return lines[start:min(start+capacity, len(lines))]
+}
+
+func (m operatorModel) maximumRunDetailContextOffset(detail application.RoutineRunDetail) int {
+	bodyHeight := max(m.height-lipgloss.Height(m.renderHelp())-1, 2)
+	panelHeight := clamp(bodyHeight/2, 10, 13)
+	if m.width >= operatorWideWidth {
+		panelHeight = clamp(bodyHeight*2/5, 8, 11)
+	}
+	return max(len(m.runDetailContextLines(detail))-max(panelHeight-3, 1), 0)
+}
+
+func (m operatorModel) runDetailStatusLines(detail application.RoutineRunDetail) []string {
 	identifier := detail.Run.LinearIdentifier
 	if identifier == "" {
 		identifier = detail.Run.RunID
 	} else {
 		identifier += " / " + detail.Run.RunID
 	}
-	head := detail.Run.CandidateHead
-	if head == "" {
-		head = "not established"
-	}
 	lines := []string{
 		fmt.Sprintf("%s · %s", detail.Run.Repository, identifier),
-		fmt.Sprintf("State %s · Phase %s", presentationLabel(string(detail.Run.State)), presentationLabel(string(detail.Phase))),
-		"Candidate exact head " + head,
-		fmt.Sprintf("Wait %s · Kind %s · updated %s", presentationLabel(string(detail.WaitAssessment)), presentationLabel(string(detail.Wait)), formatObservationAge(detail.Metadata.ObservedAt, detail.Run.UpdatedAt)),
+		fmt.Sprintf("State %s · Phase %s · Wait %s/%s · updated %s", presentationLabel(string(detail.Run.State)), presentationLabel(string(detail.Phase)), presentationLabel(string(detail.WaitAssessment)), presentationLabel(string(detail.Wait)), formatObservationAge(detail.Metadata.ObservedAt, detail.Run.UpdatedAt)),
 	}
+	lines = append(lines, m.runPrimaryActionLines(detail)...)
 	if len(detail.Attention) != 0 {
 		attention := detail.Attention[0]
-		lines = append(lines, fmt.Sprintf("ATTENTION %s · %s · %s · %s", presentationLabel(attention.Severity), presentationLabel(string(attention.State)), attention.ReasonCode, formatObservationAge(detail.Metadata.ObservedAt, attention.ObservedAt)))
+		lines = append(lines, fmt.Sprintf("Attention %s/%s · %s · %s", presentationLabel(attention.Severity), presentationLabel(string(attention.State)), reasonPresentation(attention.ReasonCode), formatObservationAge(detail.Metadata.ObservedAt, attention.ObservedAt)))
 	} else {
-		lines = append(lines, "Attention none")
+		lines = append(lines, "Attention none active")
 	}
 	if detail.LatestTransition != nil {
 		transition := detail.LatestTransition
 		lines = append(lines, fmt.Sprintf("Progress %s → %s · %s · %s", presentationLabel(string(transition.From)), presentationLabel(string(transition.To)), transition.ReasonCode, formatObservationAge(detail.Metadata.ObservedAt, transition.ObservedAt)))
-		if transition.BoundHead != "" {
-			lines = append(lines, "Transition bound head "+transition.BoundHead)
-		}
 	} else {
 		lines = append(lines, "Progress no meaningful transition recorded")
 	}
+	return lines
+}
+
+func (m operatorModel) runDetailContextLines(detail application.RoutineRunDetail) []string {
+	head := detail.Run.CandidateHead
+	if head == "" {
+		head = "not established"
+	}
+	var lines []string
 	if detail.PullRequest != nil {
 		pr := detail.PullRequest
-		lines = append(lines, fmt.Sprintf("Pull request #%d · %s · head %s · merged %t", pr.Number, presentationLabel(pr.State), pr.HeadSHA, pr.Merged))
+		lines = append(lines, fmt.Sprintf("Pull request #%d · %s · merged %t · exact head %s", pr.Number, presentationLabel(pr.State), pr.Merged, pr.HeadSHA))
 	} else {
-		lines = append(lines, "Pull request not established")
+		lines = append(lines, "Pull request not established · candidate exact head "+head)
+	}
+	if len(detail.RecentActions) != 0 {
+		action := detail.RecentActions[0]
+		lines = append(lines, fmt.Sprintf("Last action %s · %s/%s → %s · %s", operatorActionPresentation(string(action.Action)), presentationLabel(action.Status), presentationLabel(action.ResultStatus), presentationLabel(action.ResultingState), formatObservationAge(detail.Metadata.ObservedAt, action.ObservedAt)))
+	}
+	if len(detail.Cleanup) != 0 {
+		lines = append(lines, "Cleanup "+routineCleanupPresentation(detail.Cleanup))
 	}
 	lines = append(lines, m.decisionRunDetailLines()...)
-	lines = append(lines, "Delivery gates (Controller order)")
-	gateSlots := max(m.height-lipgloss.Height(header)-lipgloss.Height(footer)-len(lines)-2, 1)
+	return lines
+}
+
+func (m operatorModel) renderRunDeliveryPanel(width, height int) string {
+	detail := m.detail.detail
+	if detail == nil {
+		return m.renderRunDetailPanel("Delivery progress", []string{"Run detail unavailable"}, width, height, true)
+	}
+	innerHeight := max(height-2, 1)
+	gateSlots := max(innerHeight-4, 1)
 	selected := clamp(m.detail.gateIndex, 0, max(len(detail.Gates)-1, 0))
 	start := clamp(selected-gateSlots+1, 0, max(len(detail.Gates)-gateSlots, 0))
 	end := min(start+gateSlots, len(detail.Gates))
+	var lines []string
 	for index := start; index < end; index++ {
 		gate := detail.Gates[index]
 		marker, tone := gateMarker(gate.Status)
@@ -1479,9 +1597,9 @@ func (m operatorModel) renderRunDetailScreen() string {
 		if index != selected {
 			status = tone.Render(status)
 		}
-		line := fmt.Sprintf("  %-28s %s", presentationLabel(string(gate.Name)), status)
+		line := fmt.Sprintf("  %-24s %s", presentationLabel(string(gate.Name)), status)
 		if index == selected {
-			line = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("28")).Width(m.width).Render("> " + line[2:])
+			line = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("28")).Width(max(width-2, 1)).Render("> " + line[2:])
 		}
 		lines = append(lines, line)
 	}
@@ -1501,10 +1619,77 @@ func (m operatorModel) renderRunDetailScreen() string {
 		}
 		lines = append(lines, evidence, "Selected head "+bound+" · observed "+observation)
 	}
-	for index := range lines {
-		lines[index] = ansi.Truncate(lines[index], m.width, "…")
+	return m.renderRunDetailPanel("Delivery progress · Controller order", lines, width, height, !m.detail.contextFocused)
+}
+
+func (m operatorModel) renderRunDetailPanel(title string, content []string, width, height int, focused bool) string {
+	innerWidth, innerHeight := max(width-2, 1), max(height-2, 1)
+	lines := []string{operatorHeadingStyle.Render(title)}
+	for _, line := range content {
+		if len(lines) >= innerHeight {
+			break
+		}
+		lines = append(lines, ansi.Truncate(line, innerWidth, "…"))
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, header, strings.Join(lines, "\n"), footer)
+	border := operatorBorderColor
+	if focused {
+		border = operatorFocusColor
+	}
+	return lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(border).Width(width).Height(height).Render(strings.Join(lines, "\n"))
+}
+
+func (m operatorModel) runPrimaryActionLines(detail application.RoutineRunDetail) []string {
+	for _, offer := range detail.Offers {
+		if offer.Action == application.OperationDecide && offer.InputKind == application.LegalActionInputDecision {
+			if m.decisionCanStart() {
+				return []string{operatorWarningStyle.Bold(true).Render("ACTION REQUIRED · Human decision · open Attention and press Enter (or d here)")}
+			}
+			if m.decision.receipt != nil {
+				return []string{operatorAccentStyle.Bold(true).Render("DECISION ACCEPTED · awaiting current Controller observation")}
+			}
+			return nil
+		}
+	}
+	if len(detail.Offers) != 0 {
+		offer := detail.Offers[0]
+		return []string{operatorWarningStyle.Bold(true).Render("ACTION AVAILABLE · " + operatorActionPresentation(string(offer.Action)) + " · CLI only in this TUI release")}
+	}
+	if len(detail.Attention) != 0 {
+		return []string{operatorWarningStyle.Bold(true).Render("ATTENTION REQUIRES INSPECTION · no Controller action offered")}
+	}
+	if detail.WaitAssessment == application.RoutineAssessmentNormalWait {
+		return []string{operatorMutedStyle.Render("NO ACTION NEEDED · Controller is waiting on external authority")}
+	}
+	return nil
+}
+
+func operatorActionPresentation(value string) string {
+	return strings.ToUpper(presentationLabel(value))
+}
+
+func routineCleanupPresentation(cleanup []application.RoutineCleanupSummary) string {
+	counts := map[string]int{}
+	for _, record := range cleanup {
+		counts[record.Status]++
+	}
+	order := []string{"deleted", "retained", "failed", "intent", "skipped_attention"}
+	parts := make([]string, 0, len(counts))
+	for _, status := range order {
+		if counts[status] != 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", counts[status], strings.ToUpper(presentationLabel(status))))
+			delete(counts, status)
+		}
+	}
+	remaining := make([]string, 0, len(counts))
+	for status := range counts {
+		remaining = append(remaining, status)
+	}
+	sort.Strings(remaining)
+	for _, status := range remaining {
+		count := counts[status]
+		parts = append(parts, fmt.Sprintf("%d %s", count, strings.ToUpper(presentationLabel(status))))
+	}
+	return strings.Join(parts, " · ")
 }
 
 func (m operatorModel) renderRouteHeader(title string, observedAt time.Time, refreshing bool, stale *operatorSafeError) string {
@@ -1839,7 +2024,13 @@ func (m operatorModel) renderHelp() string {
 	case operatorAttentionRoute:
 		open := ""
 		if item, ok := m.selectedAttentionItem(); ok && item.Navigation == application.RoutineAttentionNavigationRunDetail {
-			open = " · enter open run"
+			open = " · enter inspect run"
+			for _, offer := range item.Offers {
+				if offer.Action == application.OperationDecide && offer.InputKind == application.LegalActionInputDecision {
+					open = " · enter handle decision"
+					break
+				}
+			}
 		}
 		if m.help.ShowAll {
 			value = "1 overview · 2 runs · 3 attention · 4 repositories · tab list/summary · ↑/↓ select or scroll" + open + " · n/p page · r refresh · ? help · q quit"
@@ -1847,9 +2038,9 @@ func (m operatorModel) renderHelp() string {
 			value = "1/2/3/4 navigate · tab region · ↑/↓ select/scroll" + open + " · n/p page · r refresh · ? · q"
 		}
 	case operatorRunDetailRoute:
-		value = "1/2/3/4 navigate · esc back · ↑/↓ delivery gates · r refresh · ? help · q quit"
+		value = "1/2/3/4 navigate · esc back · tab context/gates · ↑/↓ scroll · r refresh · ? · q"
 		if m.decisionCanStart() {
-			value = "1/2/3/4 navigate · esc back · ↑/↓ gates · d decide · r refresh · ? · q"
+			value = "1/2/3/4 navigate · esc back · tab context/gates · ↑/↓ scroll · d decide · r refresh · ? · q"
 		}
 	case operatorRepositoriesRoute:
 		value = "1/2/3/4 navigate · ↑/↓ select · enter open · n/p page · r refresh · ? · q"

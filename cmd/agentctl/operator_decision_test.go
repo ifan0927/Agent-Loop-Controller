@@ -213,9 +213,22 @@ func (d *decisionHandoffWorkerDriver) Drive(ctx context.Context, command applica
 func TestOperatorDecisionFlowNormalizesReviewsConfirmsRetriesAndObservesWorker(t *testing.T) {
 	model := decisionOperatorModel()
 	plain := ansi.Strip(model.render())
-	for _, phrase := range []string{"UNTRUSTED DECISION REQUEST", "Question Choose a release boundary?", `Options "inclusive"`, `"exclusive"`, "d decide"} {
+	for _, phrase := range []string{"UNTRUSTED HUMAN DECISION · 2 persisted options", "Question: Choose a release boundary?", "open Attention and press Enter", "d decide"} {
 		if !strings.Contains(plain, phrase) {
 			t.Fatalf("decision detail missing %q:\n%s", phrase, plain)
+		}
+	}
+	updated, _ := model.Update(keySpecial(tea.KeyTab, 0))
+	model = updated.(operatorModel)
+	contextViews := ansi.Strip(model.render())
+	for range 12 {
+		updated, _ = model.Update(keyMessage('j'))
+		model = updated.(operatorModel)
+		contextViews += "\n" + ansi.Strip(model.render())
+	}
+	for _, phrase := range []string{"Context:", "Blocking reason:", "Recommendation option ID", "Option \"inclusive\"", "Option \"exclusive\""} {
+		if !strings.Contains(contextViews, phrase) {
+			t.Fatalf("scrollable decision context missing %q:\n%s", phrase, contextViews)
 		}
 	}
 	if lipgloss.Width(model.render()) > 80 || lipgloss.Height(model.render()) > 24 {
@@ -329,6 +342,119 @@ func TestOperatorDecisionFlowNormalizesReviewsConfirmsRetriesAndObservesWorker(t
 	model = updated.(operatorModel)
 	if model.decision.stage != operatorDecisionSelecting || model.decision.offerID != next.Offers[0].OfferID || model.decision.receipt != nil {
 		t.Fatalf("new same-run decision did not replace the settled flow: %+v", model.decision)
+	}
+}
+
+func TestOperatorAttentionEnterOpensDecisionOptionsDirectly(t *testing.T) {
+	model := loadedOperatorModel(80, 24)
+	now := time.Date(2026, 9, 3, 5, 0, 0, 0, time.UTC)
+	model.route = operatorAttentionRoute
+	model.attention.page = &application.RoutineAttentionPage{
+		Metadata:   application.RoutineProjectionMetadata{SchemaVersion: application.RoutineAttentionSchemaVersion, ObservedAt: now},
+		Collection: application.RoutineCollectionMetadata{Total: 1},
+		Items: []application.RoutineAttentionItem{{
+			EventID: "attention-decision", EventType: application.OperatorAttentionHumanDecision,
+			Scope: application.ScopeRun, TargetID: "run-decision", RunID: "run-decision",
+			LinearIdentifier: "IFAN-206", Repository: "owner/repo",
+			ControllerState: string(domain.StateAwaitingHumanDecision), AttentionState: application.RoutineAttentionActive,
+			Severity: "warning", ReasonCode: "human_decision_required", OccurredAt: now.Add(-time.Minute), ObservedAt: now,
+			Offers:     []application.RoutineAttentionOfferSummary{{OfferID: "opaque-decision-offer", Action: application.OperationDecide, InputKind: application.LegalActionInputDecision}},
+			Navigation: application.RoutineAttentionNavigationRunDetail,
+		}},
+	}
+
+	updated, load := model.Update(keySpecial(tea.KeyEnter, 0))
+	model = updated.(operatorModel)
+	if load == nil || model.route != operatorRunDetailRoute || !model.detail.startDecisionOnLoad {
+		t.Fatalf("Attention did not start direct decision load: route=%q detail=%+v", model.route, model.detail)
+	}
+	detail := decisionFixtureRunDetail()
+	updated, _ = model.Update(operatorRunDetailResultMsg{generation: model.detail.generation, runID: model.detail.runID, detail: detail})
+	model = updated.(operatorModel)
+	if model.decision.stage != operatorDecisionSelecting || model.detail.startDecisionOnLoad || model.decision.requestFocus != operatorDecisionRequestOptions {
+		t.Fatalf("loaded Attention decision did not enter selection: %+v", model.decision)
+	}
+	if output := ansi.Strip(model.render()); !strings.Contains(output, "Attention / Human decision") || !strings.Contains(output, "Persisted options") {
+		t.Fatalf("direct decision screen did not use the shared TUI flow:\n%s", output)
+	}
+	updated, _ = model.Update(keyMessage('j'))
+	model = updated.(operatorModel)
+	updated, command := model.Update(keySpecial(tea.KeyEnter, 0))
+	model = updated.(operatorModel)
+	if command == nil || model.decision.stage != operatorDecisionEditing || model.decision.payload.ChoiceID != "exclusive" {
+		t.Fatalf("Attention option navigation failed: state=%+v command=%v", model.decision, command)
+	}
+}
+
+func TestOperatorAttentionDecisionLoadIsInvalidatedWhenRouteChanges(t *testing.T) {
+	model := loadedOperatorModel(80, 24)
+	now := time.Date(2026, 9, 3, 5, 15, 0, 0, time.UTC)
+	model.route = operatorAttentionRoute
+	model.attention.page = &application.RoutineAttentionPage{Items: []application.RoutineAttentionItem{{
+		EventID: "attention-decision", RunID: "run-decision", Navigation: application.RoutineAttentionNavigationRunDetail,
+		Offers: []application.RoutineAttentionOfferSummary{{Action: application.OperationDecide, InputKind: application.LegalActionInputDecision}},
+	}}, Metadata: application.RoutineProjectionMetadata{ObservedAt: now}}
+	updated, command := model.Update(keySpecial(tea.KeyEnter, 0))
+	model = updated.(operatorModel)
+	if command == nil || !model.detail.startDecisionOnLoad || !model.detail.refreshing {
+		t.Fatalf("decision load did not start: %+v", model.detail)
+	}
+	staleGeneration := model.detail.generation
+	updated, _ = model.Update(keyMessage('1'))
+	model = updated.(operatorModel)
+	if model.route != operatorOverviewRoute || model.detail.startDecisionOnLoad || model.detail.refreshing || model.detail.generation == staleGeneration {
+		t.Fatalf("route change did not invalidate direct decision load: route=%s detail=%+v", model.route, model.detail)
+	}
+	updated, _ = model.Update(operatorRunDetailResultMsg{generation: staleGeneration, runID: "run-decision", detail: decisionFixtureRunDetail()})
+	model = updated.(operatorModel)
+	if model.decision.stage != operatorDecisionIdle || model.detail.detail != nil {
+		t.Fatalf("stale detail result created a background decision: decision=%+v detail=%+v", model.decision, model.detail)
+	}
+}
+
+func TestOperatorDecisionDoesNotStartFromRefreshingOrStaleCachedDetail(t *testing.T) {
+	model := decisionOperatorModel()
+	opened, refresh := model.openRunDetail(model.detail.runID, operatorAttentionRoute)
+	model = opened.(operatorModel)
+	if refresh == nil || !model.detail.refreshing || model.decisionCanStart() {
+		t.Fatalf("cached detail remained actionable during refresh: %+v", model.detail)
+	}
+	generation := model.detail.generation
+	updated, command := model.Update(keyMessage('d'))
+	model = updated.(operatorModel)
+	if command != nil || model.decision.stage != operatorDecisionIdle || model.detail.generation != generation {
+		t.Fatalf("refreshing cached detail started decision: decision=%+v detail=%+v", model.decision, model.detail)
+	}
+	updated, _ = model.Update(operatorRunDetailResultMsg{generation: generation, runID: model.detail.runID, err: operatorSafeError{Category: application.ErrorUnavailable, Message: "refresh unavailable"}})
+	model = updated.(operatorModel)
+	if model.detail.staleError == nil || model.decisionCanStart() {
+		t.Fatalf("stale cached detail remained actionable: %+v", model.detail)
+	}
+	updated, command = model.Update(keyMessage('d'))
+	model = updated.(operatorModel)
+	if command != nil || model.decision.stage != operatorDecisionIdle {
+		t.Fatalf("stale cached detail started decision: %+v", model.decision)
+	}
+}
+
+func TestOperatorDecisionPinsTrustWarningWhileDirectOptionIsVisible(t *testing.T) {
+	model := decisionOperatorModel()
+	updated, _ := model.Update(keyMessage('d'))
+	model = updated.(operatorModel)
+	request := model.detail.detail.Decision
+	request.Question = strings.Repeat("Long untrusted question ", 20)
+	request.Context = strings.Repeat("Long untrusted context ", 20)
+	request.BlockingReason = strings.Repeat("Long untrusted blocking reason ", 20)
+	request.Options = append(request.Options, application.RoutineDecisionOption{ID: "final-option", Description: "Final persisted choice"})
+	model.decision.requestFocus = operatorDecisionRequestOptions
+	model.decision.optionIndex = len(request.Options) - 1
+	model.ensureSelectedDecisionOptionVisible()
+	output := ansi.Strip(model.render())
+	if !strings.Contains(output, "UNTRUSTED DECISION REQUEST") || !strings.Contains(output, "final-option") {
+		t.Fatalf("warning or selected option scrolled away:\n%s", output)
+	}
+	if lipgloss.Width(model.render()) > 80 || lipgloss.Height(model.render()) > 24 {
+		t.Fatalf("long direct decision exceeded viewport: %dx%d", lipgloss.Width(model.render()), lipgloss.Height(model.render()))
 	}
 }
 

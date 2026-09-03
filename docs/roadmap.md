@@ -224,8 +224,13 @@ failures. Its
 observation header, projected health card, content-sized panels, explicit focus,
 and redundant status markers make the same bounded evidence easier to scan.
 Attention adds stable local Controller-reader
-severity/time/event pagination, item-bound safe summaries of current offers, explicit no-offer
-rows, and application-owned Run-detail navigation into the R07 decision flow.
+severity/time/event pagination, item-bound safe summaries of current offers,
+explicit no-offer and CLI-only rows, bounded recently-handled records, and
+direct `Enter` navigation into R07 decision-option selection. Overview and the
+inbox share the same current/resolved attention classification, including
+later-complete-queue-snapshot recovery of transient scan warnings. Run detail uses
+the Overview visual language for current status, operator context, cleanup and
+recent-action evidence, and selectable Controller-order delivery progress.
 Repositories uses the stable local Controller reader,
 opaque pagination, and target-authorized shared detail with an application-owned
 acceptance conclusion and eight readiness dimensions. R08 is complete: only a

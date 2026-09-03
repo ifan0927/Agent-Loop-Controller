@@ -382,11 +382,12 @@ func TestOperatorAttentionRoutePagingNavigationRefreshAndRendering(t *testing.T)
 			{EventID: "event-controller", EventType: application.OperatorAttentionCandidateScan, Scope: application.ScopeController, TargetID: "local-controller", ControllerState: "scan", AttentionState: application.RoutineAttentionActive, Severity: "warning", ReasonCode: "truncated", OccurredAt: now.Add(-time.Hour), ObservedAt: now.Add(-time.Minute), Offers: []application.RoutineAttentionOfferSummary{}, Navigation: application.RoutineAttentionNavigationNone},
 			{EventID: "event-run", EventType: application.OperatorAttentionHumanDecision, Scope: application.ScopeRun, TargetID: "run-attention", RunID: "run-attention", LinearIdentifier: "IFAN-177", Repository: "owner/repo", ControllerState: string(domain.StateAwaitingHumanDecision), AttentionState: application.RoutineAttentionActive, Severity: "warning", ReasonCode: "human_decision_required", OccurredAt: now.Add(-30 * time.Minute), ObservedAt: now, Offers: []application.RoutineAttentionOfferSummary{{OfferID: "opaque", Action: application.OperationDecide, Reason: "human_decision_required", Confirmation: application.LegalActionConfirmationInput, InputKind: application.LegalActionInputDecision, Consequence: application.LegalActionConsequenceResumeExecution}}, Navigation: application.RoutineAttentionNavigationRunDetail},
 		},
+		RecentlyHandled: []application.RoutineHandledAttentionItem{{RunID: "run-handled", LinearIdentifier: "IFAN-176", Repository: "owner/repo", Action: application.RoutineOperatorActionSummary{ActionID: "operator-action-handled", Action: application.OperatorActionDecide, Status: application.OperatorActionStatusObserved, ResultStatus: application.OperatorActionResultSucceeded, ResultingState: string(domain.StateExecuting), ObservedAt: now.Add(-time.Minute)}}},
 	}
 	updated, _ = model.Update(operatorAttentionResultMsg{generation: model.attention.generation, request: *model.attention.pending, page: page})
 	model = updated.(operatorModel)
 	plain := ansi.Strip(model.render())
-	for _, phrase := range []string{"Agent Loop Controller / Attention", "Inbox · page 1 · 2 of 3 displayed", "No Controller action offered", "candidate_scan_incomplete", "WARNING/ACTIVE"} {
+	for _, phrase := range []string{"Agent Loop Controller / Attention", "Active Attention · page 1 · 2 of 3 displayed", "No Controller action offered", "candidate_scan_incomplete", "WARNING/ACTIVE", "Recently handled", "IFAN-176"} {
 		if !strings.Contains(plain, phrase) {
 			t.Fatalf("compact Attention missing %q:\n%s", phrase, plain)
 		}
@@ -396,13 +397,16 @@ func TestOperatorAttentionRoutePagingNavigationRefreshAndRendering(t *testing.T)
 	}
 	updated, _ = model.Update(keyMessage('j'))
 	model = updated.(operatorModel)
-	if model.attention.index != 1 || !strings.Contains(strings.ToLower(model.renderHelp()), "enter open run") {
+	if model.attention.index != 1 || !strings.Contains(strings.ToLower(model.renderHelp()), "enter handle decision") {
 		t.Fatalf("run selection/help state=%+v help=%q", model.attention, model.renderHelp())
 	}
 	updated, detailCommand := model.Update(keySpecial(tea.KeyEnter, 0))
 	model = updated.(operatorModel)
 	if detailCommand == nil || model.route != operatorRunDetailRoute || model.detail.runID != "run-attention" || model.detail.returnRoute != operatorAttentionRoute {
 		t.Fatalf("detail state=%+v", model.detail)
+	}
+	if !model.detail.startDecisionOnLoad {
+		t.Fatal("Attention decision did not retain direct-flow intent")
 	}
 	updated, _ = model.Update(keySpecial(tea.KeyEscape, 0))
 	model = updated.(operatorModel)
@@ -699,10 +703,17 @@ func TestOperatorExactRepositoryFilterAndSharedRunDetailRendering(t *testing.T) 
 	updated, _ = model.Update(operatorRunDetailResultMsg{generation: model.detail.generation, runID: "run-detail", detail: detail})
 	model = updated.(operatorModel)
 	plain := ansi.Strip(model.render())
-	for _, phrase := range []string{"Run detail", "Wait ABNORMAL WAIT", "ATTENTION", "Delivery gates", "VERIFICATION", "NOT APPLICABLE", "CONFLICT"} {
+	for _, phrase := range []string{"Run detail", "Wait ABNORMAL WAIT", "ATTENTION", "Delivery progress", "VERIFICATION", "CONFLICT"} {
 		if !strings.Contains(plain, phrase) {
 			t.Fatalf("missing %q in:\n%s", phrase, plain)
 		}
+	}
+	for range 5 {
+		updated, _ = model.Update(keyMessage('j'))
+		model = updated.(operatorModel)
+	}
+	if scrolled := ansi.Strip(model.render()); !strings.Contains(scrolled, "NOT APPLICABLE") {
+		t.Fatalf("delivery gate navigation did not reveal later evidence:\n%s", scrolled)
 	}
 	if strings.Contains(strings.ToLower(plain), "legal action") || strings.Contains(strings.ToLower(plain), "decision option") {
 		t.Fatalf("read-only detail exposed mutation affordances:\n%s", plain)
@@ -729,6 +740,39 @@ func operatorFixtureRunDetail(runID string) application.RoutineRunDetail {
 		PullRequest:      &application.RoutinePullRequestSummary{Number: 175, State: "open", HeadSHA: "candidate-head"},
 		Attention:        []application.RoutineAttentionSummary{{Severity: "warning", State: application.RoutineAttentionActive, ReasonCode: "human_approval_required", ObservedAt: now.Add(-time.Minute)}},
 		Gates:            gates,
+	}
+}
+
+func TestOperatorRunDetailExplainsCLIOnlyActionAndCleanupOutcome(t *testing.T) {
+	model := loadedOperatorModel(80, 24)
+	detail := operatorFixtureRunDetail("run-cleanup")
+	detail.Run.State = domain.StateFailed
+	detail.Phase = application.RoutinePhaseEnded
+	detail.Wait = application.RoutineWaitTerminal
+	detail.WaitAssessment = application.RoutineAssessmentEnded
+	detail.Offers = []application.LegalActionOffer{{Action: application.OperationAbandon, InputKind: application.LegalActionInputNone}}
+	detail.RecentActions = []application.RoutineOperatorActionSummary{{ActionID: "operator-action-abandon", Action: application.OperatorActionAbandon, Status: application.OperatorActionStatusObserved, ResultStatus: application.OperatorActionResultSucceeded, ResultingState: string(domain.StateFailed), ObservedAt: detail.Metadata.ObservedAt.Add(-time.Minute)}}
+	detail.Cleanup = []application.RoutineCleanupSummary{{ResourceKind: "worktree", Status: "deleted"}, {ResourceKind: "branch", Status: "deleted"}, {ResourceKind: "artifact_root", Status: "retained"}, {ResourceKind: "pull_request", Status: "retained"}}
+	model.route = operatorRunDetailRoute
+	model.detail = operatorRunDetailState{detail: &detail, runID: detail.Run.RunID, returnRoute: operatorAttentionRoute}
+	plain := ansi.Strip(model.render())
+	for _, phrase := range []string{"ACTION AVAILABLE · ABANDON · CLI only", "Last action ABANDON · OBSERVED/SUCCEEDED → FAILED", "Cleanup 2 DELETED · 2 RETAINED"} {
+		if !strings.Contains(plain, phrase) {
+			t.Fatalf("run cleanup detail missing %q:\n%s", phrase, plain)
+		}
+	}
+	if lipgloss.Width(model.render()) > 80 || lipgloss.Height(model.render()) > 24 {
+		t.Fatalf("cleanup detail exceeded 80x24:\n%s", plain)
+	}
+	model.width, model.height = 120, 32
+	wide := ansi.Strip(model.render())
+	for _, phrase := range []string{"Current status", "Operator context", "Delivery progress · Controller order", "Cleanup 2 DELETED · 2 RETAINED"} {
+		if !strings.Contains(wide, phrase) {
+			t.Fatalf("wide run detail missing %q:\n%s", phrase, wide)
+		}
+	}
+	if lipgloss.Width(model.render()) > model.width || lipgloss.Height(model.render()) > model.height {
+		t.Fatalf("wide cleanup detail exceeded bounds: %dx%d", lipgloss.Width(model.render()), lipgloss.Height(model.render()))
 	}
 }
 

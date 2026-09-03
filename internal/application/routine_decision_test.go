@@ -50,12 +50,36 @@ func TestRoutineRunDecisionProjectionSanitizesContentAndObservesWorkerHandoff(t 
 		t.Fatalf("prepared attempt claimed a worker resume=%+v", detail.DecisionHandoff)
 	}
 	inspection.Attempts = append(inspection.Attempts, Attempt{Kind: "resume", Status: "started", StartedAt: resumeAt, ArtifactDir: "/private/resume"})
+	inspection.OperatorActions = []OperatorActionRecord{{ActionID: "operator-action-safe", ActionType: OperatorActionDecide, Status: OperatorActionStatusObserved, ResultStatus: OperatorActionResultSucceeded, ResultingState: domain.StateExecuting, ReasonCode: "human_decision_required", RequestDigest: "private-request", ExpectedAuthorityDigest: "private-authority", ObservedAt: acceptedAt}}
+	inspection.Cleanup = []CleanupRecord{{RunID: run.ID, Kind: "worktree", Name: "/private/worktree", Status: "deleted", LastError: "private-error", UpdatedAt: resumeAt}}
 	detail = projectRoutineRunDetail(inspection, nil, resumeAt)
 	if detail.DecisionHandoff == nil || detail.DecisionHandoff.Status != RoutineDecisionWorkerResumed || detail.DecisionHandoff.ResumeObservedAt == nil || !detail.DecisionHandoff.ResumeObservedAt.Equal(resumeAt) {
 		t.Fatalf("resumed handoff=%+v", detail.DecisionHandoff)
 	}
+	if len(detail.RecentActions) != 1 || detail.RecentActions[0].ActionID != "operator-action-safe" || len(detail.Cleanup) != 1 || detail.Cleanup[0].ResourceKind != "worktree" || detail.Cleanup[0].Status != "deleted" {
+		t.Fatalf("run action/cleanup=%+v %+v", detail.RecentActions, detail.Cleanup)
+	}
 	handoff, _ := json.Marshal(detail.DecisionHandoff)
 	if strings.Contains(string(handoff), "private") {
 		t.Fatalf("handoff leaked private evidence: %s", handoff)
+	}
+	projection, _ := json.Marshal(detail)
+	for _, forbidden := range []string{"private-request", "private-authority", "/private/worktree", "private-error", "resource_name"} {
+		if strings.Contains(string(projection), forbidden) {
+			t.Fatalf("run projection leaked %q: %s", forbidden, projection)
+		}
+	}
+}
+
+func TestRoutineRunRecentActionsUseEffectiveObservationTime(t *testing.T) {
+	now := time.Date(2026, 9, 3, 9, 0, 0, 0, time.UTC)
+	actions := []OperatorActionRecord{
+		{ActionID: "operator-action-z", TransitionSequence: 7, ReceivedAt: now},
+		{ActionID: "operator-action-a", TransitionSequence: 7, ReceivedAt: now.Add(time.Minute)},
+		{ActionID: "operator-action-m", TransitionSequence: 7, ReceivedAt: now.Add(30 * time.Second), AppliedAt: now.Add(2 * time.Minute)},
+	}
+	projected := projectRoutineOperatorActions(actions, 2)
+	if len(projected) != 2 || projected[0].ActionID != "operator-action-m" || projected[1].ActionID != "operator-action-a" {
+		t.Fatalf("recent actions=%+v", projected)
 	}
 }

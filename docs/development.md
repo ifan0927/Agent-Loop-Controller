@@ -607,8 +607,11 @@ selection restoration by run ID, stale-screen preservation, and 80x24 gate
 scrolling without rendering mutation offers.
 Attention tests cover exact event selection restoration, list/summary focus and
 scrolling, next/previous cursor stacks, no-op Enter for `none`, shared Run detail
-return, item-bound sanitized offer summaries, stale-screen preservation, safe
-initial failures, and compact/wide bounded rendering.
+return, direct `Enter` entry into a current decision's option selection,
+item-bound sanitized offer summaries, active/resolved consistency with Overview,
+later-complete-queue-snapshot supersession of transient scan and scheduler
+warnings, bounded recently-handled action history, stale-screen preservation,
+safe initial failures, and compact/wide bounded rendering.
 Human-decision tests cover bounded untrusted request rendering, persisted-option
 selection, optional native input, deterministic blank normalization, exact
 review and confirmation, cancellation without mutation, duplicate-submit and
@@ -622,6 +625,9 @@ heavy-work acquisition and reauthorizes the configured operator against the
 current opaque offer. Response-loss coverage advances the worker before an
 exact acceptance retry and proves the original transition settles once;
 prepared-only resume attempts remain `awaiting_worker`.
+Run-detail tests cover its Overview-style status, operator-context, and delivery
+panels, recent action and cleanup summaries, Controller-order gate scrolling,
+and bounded 80x24 plus wide layouts.
 Repository tests cover Overview and Repositories entry, stable next/previous
 cursor stacks, selection and return-state restoration, every application-owned
 acceptance conclusion, all eight dimensions, explicit enable confirmation,

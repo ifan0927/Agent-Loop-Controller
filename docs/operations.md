@@ -421,12 +421,19 @@ preserved. On Runs, `f` cycles Active,
 Ended, and All; `/` accepts an exact lowercase `owner/repository` filter; and
 `n`/`p` move through bounded cursor pages. Attention uses `Tab` between its list
 and selected-item summary, arrow keys to select or scroll, and the same `n`/`p`
-pagination. Items without a current offer explicitly show `No Controller action
-offered`; Attention itself remains a read-only route. Open a human-decision item
-with `Enter`; shared Run detail marks the bounded question, context, options,
-recommendation, and blocking reason as untrusted. When the current application
-offer is `decide`, press `d`, read the request, switch to the persisted options
-with `Tab` or `Enter`, select with the arrow keys, and press `Enter`. Enter
+pagination. Active items are separated from a bounded `Recently handled`
+record of successful observed operator actions. A terminal cleanup conclusion
+such as `deleted` or intentional `retained` remains visible in Run detail but
+does not keep Overview or the inbox in active attention; `failed`, unfinished
+`intent`, and `skipped_attention` cleanup do. A candidate-scan or scheduler
+warning disappears from active attention only after a later complete queue
+snapshot proves recovery. Items without a current offer
+explicitly say whether `Enter` inspects the run; run actions not implemented in
+the TUI are labeled CLI-only instead of appearing selectable. Select a current
+human-decision item and press `Enter` to open the decision request directly.
+Read its bounded untrusted content, switch to the persisted options with `Tab`
+or `Enter`, select with the arrow keys, and press `Enter`. Run detail retains
+`d` as a secondary shortcut for the same current offer. Enter
 optional bounded clarification in the native editor, then use `Ctrl-S` to
 review. Blank or whitespace-only input becomes exactly `No additional
 instructions.`; other input loses only surrounding whitespace. Review the
@@ -532,9 +539,12 @@ Controller Attention cursors remain usable as normal repositories and runs are
 added; upgrades that change their opaque cursor versions require returning to
 the first page once. The exact repository filter includes historical runs under
 older frozen binding generations of the same canonical repository. Run detail
-shows the application-owned phase and wait assessment, latest transition,
-compact pull request, active attention, and all eleven Controller-owned delivery
-gates. Repository detail shows all eight readiness dimensions and the
+uses Overview-style Bubble Tea/Lip Gloss panels for application-owned current
+status, wait assessment, latest transition, pull request, recent operator action
+and cleanup conclusions, active attention, and all eleven selectable
+Controller-owned delivery gates. Use `Tab` to switch focus between operator
+context and delivery progress, then the arrow keys to scroll the focused panel.
+Repository detail shows all eight readiness dimensions and the
 application-owned acceptance conclusion. Only a ready-disabled repository may
 offer one explicit, confirmed, receipt-backed enable control. Truncated collections always report
 displayed and total counts. Unknown future presentation codes remain visible

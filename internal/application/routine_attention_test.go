@@ -16,6 +16,9 @@ type routineAttentionStoreFixture struct {
 	*legalActionStoreFixture
 	candidates      []OperatorAttentionEvent
 	controllerQuery ControllerAttentionCandidateQuery
+	queueSnapshot   QueueSnapshot
+	queueFound      bool
+	queueErr        error
 }
 
 var (
@@ -26,6 +29,10 @@ var (
 func (s *routineAttentionStoreFixture) ListControllerAttentionCandidates(_ context.Context, query ControllerAttentionCandidateQuery) ([]OperatorAttentionEvent, error) {
 	s.controllerQuery = query
 	return append([]OperatorAttentionEvent(nil), s.candidates...), nil
+}
+
+func (s *routineAttentionStoreFixture) LatestQueueSnapshot(context.Context) (QueueSnapshot, bool, error) {
+	return s.queueSnapshot, s.queueFound, s.queueErr
 }
 
 func (s *routineAttentionStoreFixture) ListControllerRuns(context.Context, ControllerRunQuery) (AuthorizedRunPage, error) {
@@ -47,6 +54,34 @@ func controllerReadAuthority(t *testing.T, authorizer *AuthorizationService, req
 		t.Fatal(err)
 	}
 	return authority
+}
+
+func TestRoutineAttentionResolvesTransientScanAfterLaterCompleteQueueSnapshot(t *testing.T) {
+	legal, authorizer, requester := legalActionDecisionFixture(t)
+	now := legal.event.ObservedAt.Add(time.Minute)
+	event, err := CandidateScanIncompleteAttentionEvent("scan-incomplete", OperatorAttentionProfile{ID: "automation", Name: "linear-todo-admission"}, "incomplete_authority", strings.Repeat("a", 64), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &routineAttentionStoreFixture{
+		legalActionStoreFixture: legal,
+		candidates:              []OperatorAttentionEvent{event},
+		queueSnapshot:           QueueSnapshot{Digest: strings.Repeat("b", 64), ObservedAt: now.Add(time.Minute), EffectiveCapacityIdentity: "capacity-v1"},
+		queueFound:              true,
+	}
+	service, err := NewRoutineAttentionQueryService(store, store, authorizer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := service.ListController(context.Background(), controllerReadAuthority(t, authorizer, requester), RoutineAttentionQuery{Requester: requester, Scope: ScopeController, Limit: 10}, now.Add(2*time.Minute))
+	if err != nil || page.Collection.Total != 0 || len(page.Items) != 0 {
+		t.Fatalf("recovered scan remained active: page=%+v err=%v", page, err)
+	}
+	store.queueSnapshot.ObservedAt = now.Add(-time.Second)
+	page, err = service.ListController(context.Background(), controllerReadAuthority(t, authorizer, requester), RoutineAttentionQuery{Requester: requester, Scope: ScopeController, Limit: 10}, now.Add(2*time.Minute))
+	if err != nil || page.Collection.Total != 1 || len(page.Items) != 1 || page.Items[0].EventID != routineAttentionEventID(event.EventKey) {
+		t.Fatalf("unrecovered scan was not active: page=%+v err=%v", page, err)
+	}
 }
 
 func TestRoutineAttentionBindsSanitizedOffersToExactTypedItem(t *testing.T) {
@@ -185,6 +220,82 @@ func TestRoutineAttentionPreservesConflictUnknownUnfamiliarAndResolvedConclusion
 	}
 	if states[current.EventType+":"+routineAttentionEventID(current.EventKey)] != RoutineAttentionActive || states[invalid.EventType+":"+routineAttentionEventID(invalid.EventKey)] != RoutineAttentionConflict || states[unfamiliar.EventType+":"+routineAttentionEventID(unfamiliar.EventKey)] != RoutineAttentionActive || unfamiliar.EventType != "unknown" {
 		t.Fatalf("states=%+v unfamiliar=%+v", states, unfamiliar)
+	}
+}
+
+func TestRoutineAttentionSeparatesHandledActionAndConcludedCleanupFromActiveItems(t *testing.T) {
+	legal, authorizer, requester := legalActionDecisionFixture(t)
+	now := legal.event.ObservedAt.Add(time.Minute)
+	retryRun := legal.run
+	retryRun.State = domain.StatePROpen
+	schedule := RetrySchedule{RunID: retryRun.ID, Phase: AutomaticRetryPhaseForRun(retryRun), ControllerState: string(retryRun.State), AttemptCount: 1, MaxAttempts: 3, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: RetryFailureTerminal, ReasonCode: RetryReasonTerminal, Status: RetryScheduleAttention, AttentionAt: now, CreatedAt: now, UpdatedAt: now}
+	resolvedRetry, err := AutomaticRetryAttentionEvent(retryRun, schedule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeInspection := legal.inspection
+	activeInspection.Run = retryRun
+	activeInspection.RetrySchedules = []RetrySchedule{schedule}
+	if state := classifyRoutineAttention(activeInspection, resolvedRetry); state != RoutineAttentionActive {
+		t.Fatalf("current retry attention state=%q", state)
+	}
+	action := newOperatorActionRecord(OperatorActionInput{
+		Requester: requester, RunID: legal.run.ID, Repository: legal.run.Repository,
+		ExpectedState: retryRun.State, RunIdempotencyKey: legal.run.IdempotencyKey,
+		TransitionSequence: 3, ActionType: OperatorActionAbandon,
+		ReasonCode: resolvedRetry.ReasonCode, AttentionEventKey: resolvedRetry.EventKey,
+		RequestDigest: strings.Repeat("a", 64), ExpectedAuthorityDigest: strings.Repeat("b", 64),
+	}, now)
+	action.Status, action.ResultStatus = OperatorActionStatusObserved, OperatorActionResultSucceeded
+	action.ResultingState, action.ObservedAt = domain.StateFailed, now.Add(time.Second)
+	legal.run.State = domain.StateFailed
+	legal.inspection.Run = legal.run
+	legal.inspection.OperatorActions = []OperatorActionRecord{action}
+	legal.inspection.Cleanup = []CleanupRecord{{RunID: legal.run.ID, Kind: "pull_request", Status: "retained", UpdatedAt: now}}
+	cleanup, err := CleanupResidueAttentionEvent(legal.run, 4, strings.Repeat("c", 64), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &routineAttentionStoreFixture{legalActionStoreFixture: legal, candidates: []OperatorAttentionEvent{resolvedRetry, cleanup}}
+	service, _ := NewRoutineAttentionQueryService(store, store, authorizer)
+	page, err := service.ListController(context.Background(), controllerReadAuthority(t, authorizer, requester), RoutineAttentionQuery{Requester: requester, Scope: ScopeController, Limit: 10}, now.Add(time.Minute))
+	if err != nil || len(page.Items) != 0 {
+		t.Fatalf("concluded cleanup remained active=%+v err=%v", page.Items, err)
+	}
+	if len(page.RecentlyHandled) != 1 || page.RecentlyHandled[0].Action.ActionID != action.ActionID || page.RecentlyHandled[0].Action.ResultStatus != OperatorActionResultSucceeded {
+		t.Fatalf("recently handled=%+v", page.RecentlyHandled)
+	}
+	raw, _ := json.Marshal(page)
+	for _, forbidden := range []string{action.RequestDigest, action.ExpectedAuthorityDigest, resolvedRetry.EventKey, "resource_name"} {
+		if strings.Contains(string(raw), forbidden) {
+			t.Fatalf("handled projection leaked %q: %s", forbidden, raw)
+		}
+	}
+}
+
+func TestRoutineRetryAttentionResolvesAfterOperatorRetrySchedulesWork(t *testing.T) {
+	legal, _, _ := legalActionDecisionFixture(t)
+	now := legal.event.ObservedAt.Add(time.Minute)
+	run := legal.run
+	run.State = domain.StatePROpen
+	attentionSchedule := RetrySchedule{RunID: run.ID, Phase: AutomaticRetryPhaseForRun(run), ControllerState: string(run.State), AttemptCount: 4, MaxAttempts: 3, InitialDelay: time.Second, MaximumDelay: 30 * time.Second, FailureClass: RetryFailureProcessStart, FailureEvidenceRef: "attempt:1", ReasonCode: RetryReasonBudgetExhausted, Status: RetryScheduleAttention, AttentionAt: now, CreatedAt: now.Add(-time.Minute), UpdatedAt: now}
+	event, err := AutomaticRetryAttentionEvent(run, attentionSchedule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspection := RunInspection{Run: run, RetrySchedules: []RetrySchedule{attentionSchedule}}
+	if state := classifyRoutineAttention(inspection, event); state != RoutineAttentionActive {
+		t.Fatalf("attention schedule state=%q", state)
+	}
+	operatorSchedule := attentionSchedule
+	operatorSchedule.Status = RetryScheduleScheduled
+	operatorSchedule.ReasonCode = RetryReasonOperatorRetry
+	operatorSchedule.NextEligibleAt = now.Add(time.Minute)
+	operatorSchedule.AttentionAt = time.Time{}
+	operatorSchedule.UpdatedAt = now.Add(time.Second)
+	inspection.RetrySchedules = []RetrySchedule{operatorSchedule}
+	if state := classifyRoutineAttention(inspection, event); state != "" {
+		t.Fatalf("successful operator retry remained active=%q", state)
 	}
 }
 

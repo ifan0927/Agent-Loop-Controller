@@ -503,18 +503,26 @@ func (s QueryService) Inspect(ctx context.Context, input QueryInput) (Inspection
 }
 
 func (s QueryService) inspectAuthorized(ctx context.Context, runID string) (InspectionResult, error) {
+	inspection, currentAttentionKey, err := s.loadInspectionEvidence(ctx, runID)
+	if err != nil {
+		return InspectionResult{}, err
+	}
+	return projectInspection(inspection, currentAttentionKey), nil
+}
+
+func (s QueryService) loadInspectionEvidence(ctx context.Context, runID string) (RunInspection, string, error) {
 	inspection, err := s.store.Inspect(ctx, runID)
 	if err != nil {
-		return InspectionResult{}, classifyServiceError(err)
+		return RunInspection{}, "", classifyServiceError(err)
 	}
 	attention, err := s.store.ListOperatorAttention(ctx, OperatorAttentionQueryInput{RunID: runID, Limit: maxOperatorAttentionProjection})
 	if err != nil {
-		return InspectionResult{}, classifyServiceError(err)
+		return RunInspection{}, "", classifyServiceError(err)
 	}
 	currentAttentionKey := ""
 	current, found, currentErr := s.store.CurrentOperatorAttention(ctx, runID)
 	if currentErr != nil {
-		return InspectionResult{}, classifyServiceError(currentErr)
+		return RunInspection{}, "", classifyServiceError(currentErr)
 	}
 	if found {
 		currentAttentionKey = current.EventKey
@@ -526,7 +534,7 @@ func (s QueryService) inspectAuthorized(ctx context.Context, runID string) (Insp
 		}
 	}
 	inspection.OperatorAttention = attention
-	return projectInspection(inspection, currentAttentionKey), nil
+	return inspection, currentAttentionKey, nil
 }
 
 // GetRunDetail reads and authorizes one run entirely through the application

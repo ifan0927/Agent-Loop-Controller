@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,41 @@ import (
 type routineOverviewStoreFixture struct {
 	snapshot RoutinePersistedOverviewSnapshot
 	calls    int
+}
+
+type routineRunAttentionStore struct {
+	serviceStore
+	attention []OperatorAttentionEvent
+}
+
+type changingRoutineRunStore struct {
+	routineRunAttentionStore
+	inspectCalls int
+}
+
+func (s *changingRoutineRunStore) Inspect(ctx context.Context, runID string) (RunInspection, error) {
+	s.inspectCalls++
+	inspection, err := s.routineRunAttentionStore.serviceStore.Inspect(ctx, runID)
+	if err == nil && s.inspectCalls >= 3 {
+		inspection.Run.UpdatedAt = inspection.Run.UpdatedAt.Add(time.Second)
+	}
+	return inspection, err
+}
+
+func (s routineRunAttentionStore) ListOperatorAttention(_ context.Context, input OperatorAttentionQueryInput) ([]OperatorAttentionEvent, error) {
+	if input.Limit < 1 || input.Limit > maxOperatorAttentionProjection {
+		return nil, errors.New("operator attention projection limit is out of bounds")
+	}
+	return append([]OperatorAttentionEvent(nil), s.attention...), nil
+}
+
+func (s routineRunAttentionStore) CurrentOperatorAttention(_ context.Context, runID string) (OperatorAttentionEvent, bool, error) {
+	for index := len(s.attention) - 1; index >= 0; index-- {
+		if s.attention[index].RunID == runID {
+			return s.attention[index], true, nil
+		}
+	}
+	return OperatorAttentionEvent{}, false, nil
 }
 
 func (f *routineOverviewStoreFixture) ReadRoutineOverviewSnapshot(context.Context, AuthorizedScopeSet, domain.GitHubUserIdentity, int) (RoutinePersistedOverviewSnapshot, error) {
@@ -136,6 +172,63 @@ func TestRoutineRunPhaseAndWaitAssessmentRemainApplicationOwned(t *testing.T) {
 				t.Fatalf("assessment=%q want=%q", got, test.assessment)
 			}
 		})
+	}
+}
+
+func TestRoutineRunDetailLoadsCurrentAttentionEvidenceFromStore(t *testing.T) {
+	now := time.Date(2026, 9, 3, 8, 0, 0, 0, time.UTC)
+	operator := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "U_7", ActorType: "User"}
+	binding := strings.Repeat("a", 64)
+	repository := LocalRepository{
+		CanonicalRepository: "owner/repo", RepositoryBindingDigest: binding,
+		AllowedOperatorLogins: []string{operator.Login},
+		TrustedOperatorActors: []TrustedActorIdentity{{Login: operator.Login, DatabaseID: operator.DatabaseID, NodeID: operator.NodeID, Type: operator.ActorType}},
+	}
+	raw, err := json.Marshal(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := Run{ID: "run-cleanup", IssueID: "IFAN-206", Repository: repository.CanonicalRepository, RepositoryConfigJSON: string(raw), RepositoryBindingDigest: binding, State: domain.StateFailed, UpdatedAt: now}
+	event, err := CleanupResidueAttentionEvent(run, 4, strings.Repeat("b", 64), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := routineRunAttentionStore{
+		serviceStore: serviceStore{run: run, inspection: RunInspection{Run: run, Cleanup: []CleanupRecord{{RunID: run.ID, Kind: "pull_request", Status: "failed", UpdatedAt: now}}}},
+		attention:    []OperatorAttentionEvent{event},
+	}
+	authorizer, err := NewAuthorizationService(ConfiguredOperatorIdentity{User: operator})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewRoutineRunQueryService(store, authorizer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	detail, err := service.Detail(context.Background(), RunDetailQuery{Requester: requesterForUser(operator), RunID: run.ID}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(detail.Attention) != 1 || detail.Attention[0].EventID != event.EventKey || detail.Attention[0].State != RoutineAttentionActive || !detail.Run.Attention {
+		t.Fatalf("run detail attention=%+v run=%+v", detail.Attention, detail.Run)
+	}
+}
+
+func TestRoutineRunDetailRejectsAuthorityMixedAcrossReads(t *testing.T) {
+	now := time.Date(2026, 9, 3, 8, 30, 0, 0, time.UTC)
+	legal, authorizer, requester := legalActionDecisionFixture(t)
+	legal.run.State = domain.StatePROpen
+	legal.run.UpdatedAt = now
+	legal.inspection = RunInspection{Run: legal.run}
+	store := &changingRoutineRunStore{routineRunAttentionStore: routineRunAttentionStore{serviceStore: serviceStore{run: legal.run, inspection: legal.inspection}}}
+	service, err := NewRoutineRunQueryService(store, authorizer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Detail(context.Background(), RunDetailQuery{Requester: requester, RunID: legal.run.ID}, now)
+	var safe *ServiceError
+	if !errors.As(err, &safe) || safe.Category != ErrorConflict || store.inspectCalls < 3 {
+		t.Fatalf("detail drift err=%v calls=%d", err, store.inspectCalls)
 	}
 }
 

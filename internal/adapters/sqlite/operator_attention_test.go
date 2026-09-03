@@ -293,23 +293,23 @@ func TestOperatorAttentionCurrentFamilyReaderPreservesWinnersAndExactCurrentAuth
 	if err := readRoutineOverviewAttention(ctx, tx, 100, &overview); err != nil {
 		t.Fatal(err)
 	}
-	if overview.AttentionTotal != len(wantController) || len(overview.Attention) != len(wantController) {
+	wantOverview := map[string]bool{newerRepository.EventKey: true, hiddenRepository.EventKey: true, distinctFamily.EventKey: true}
+	if overview.AttentionTotal != len(wantOverview) || len(overview.Attention) != len(wantOverview) {
 		t.Fatalf("overview attention=%+v total=%d", overview.Attention, overview.AttentionTotal)
 	}
 	overviewWinners := make(map[string]bool, len(overview.Attention))
 	for _, item := range overview.Attention {
 		overviewWinners[item.EventID] = true
 	}
-	for winner := range wantController {
+	for winner := range wantOverview {
 		if !overviewWinners[winner] {
-			t.Fatalf("overview and complete Attention disagree on winner %s", winner)
+			t.Fatalf("overview omitted active winner %s", winner)
 		}
 	}
 	wantTargets := map[string]struct {
 		scope  application.AuthorityScopeKind
 		target string
 	}{
-		newerRun.EventKey:         {scope: application.ScopeRun, target: run.ID},
 		newerRepository.EventKey:  {scope: application.ScopeRepository, target: run.Repository},
 		hiddenRepository.EventKey: {scope: application.ScopeRepository, target: "owner/two"},
 		distinctFamily.EventKey:   {scope: application.ScopeRepository, target: run.Repository},
@@ -324,11 +324,47 @@ func TestOperatorAttentionCurrentFamilyReaderPreservesWinnersAndExactCurrentAuth
 	if err := readRoutineOverviewAttention(ctx, tx, 2, &bounded); err != nil {
 		t.Fatal(err)
 	}
-	if bounded.AttentionTotal != len(wantController) || !bounded.AttentionTruncated || bounded.ActionableTotal != len(wantController) || !bounded.ActionableTruncated || len(bounded.Attention) != 2 || len(bounded.Actionable) != 2 || bounded.Attention[0].EventID != newerRun.EventKey || bounded.Attention[1].EventID != newerRepository.EventKey {
+	if bounded.AttentionTotal != len(wantOverview) || !bounded.AttentionTruncated || bounded.ActionableTotal != len(wantOverview) || !bounded.ActionableTruncated || len(bounded.Attention) != 2 || len(bounded.Actionable) != 2 || bounded.Attention[0].EventID != newerRepository.EventKey || bounded.Attention[1].EventID != hiddenRepository.EventKey {
 		t.Fatalf("bounded overview=%+v", bounded)
 	}
-	if bounded.QueueAttention == nil || bounded.QueueAttention.Degraded || bounded.QueueAttention.ReasonCode != "candidate_scan_attention" || bounded.QueueAttention.OccurredAt != newerRepository.OccurredAt {
+	if bounded.QueueAttention == nil || bounded.QueueAttention.Degraded || bounded.QueueAttention.ReasonCode != "scheduler_attention" || bounded.QueueAttention.OccurredAt != distinctFamily.OccurredAt {
 		t.Fatalf("bounded queue attention=%+v", bounded.QueueAttention)
+	}
+}
+
+func TestRoutineOverviewResolvesTransientScanAfterCompleteQueueSnapshot(t *testing.T) {
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 9, 3, 8, 8, 28, 0, time.UTC)
+	event, err := application.CandidateScanIncompleteAttentionEvent("scan-incomplete", application.OperatorAttentionProfile{ID: "automation", Name: "linear-todo-admission"}, "incomplete_authority", strings.Repeat("a", 64), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AppendOperatorAttention(ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveQueueSnapshot(ctx, application.QueueSnapshot{Digest: strings.Repeat("b", 64), ObservedAt: now.Add(time.Minute), EffectiveCapacityIdentity: "capacity-v1"}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, found, err := store.LatestQueueSnapshot(ctx)
+	if err != nil || !found {
+		t.Fatalf("queue snapshot found=%t err=%v", found, err)
+	}
+	tx, err := store.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	overview := application.RoutinePersistedOverviewSnapshot{QueueSnapshot: &snapshot}
+	if err := readRoutineOverviewAttention(ctx, tx, 10, &overview); err != nil {
+		t.Fatal(err)
+	}
+	if overview.AttentionTotal != 0 || len(overview.Attention) != 0 || overview.ActionableTotal != 0 || overview.QueueAttention != nil {
+		t.Fatalf("recovered scan remained active: %+v", overview)
 	}
 }
 

@@ -90,6 +90,9 @@ func (m operatorModel) currentDecisionOffer() (application.LegalActionOffer, boo
 }
 
 func (m operatorModel) decisionCanStart() bool {
+	if m.detail.refreshing || m.detail.staleError != nil {
+		return false
+	}
 	offer, offered := m.currentDecisionOffer()
 	if !offered {
 		return false
@@ -101,6 +104,9 @@ func (m operatorModel) decisionCanStart() bool {
 }
 
 func (m operatorModel) startDecisionFlow() (tea.Model, tea.Cmd) {
+	if !m.decisionCanStart() {
+		return m, nil
+	}
 	offer, ok := m.currentDecisionOffer()
 	if !ok {
 		return m, nil
@@ -314,7 +320,7 @@ func (m operatorModel) applyDecisionResult(msg operatorDecisionResultMsg) (tea.M
 
 func (m operatorModel) renderDecisionFlowScreen() string {
 	detail := m.detail.detail
-	header := m.renderRouteHeader("Human decision", detail.Metadata.ObservedAt, false, nil)
+	header := m.renderRouteHeader("Attention / Human decision", detail.Metadata.ObservedAt, false, nil)
 	request := detail.Decision
 	if request == nil {
 		return boundedLines(m.width, m.height, []string{header, "Decision request is no longer current.", "", "esc return"})
@@ -350,22 +356,21 @@ func (m operatorModel) renderDecisionFlowScreen() string {
 		}
 	}
 	contentHeight := max(m.height-lipgloss.Height(header)-1, 1)
-	body := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("214")).Padding(1, 2).Width(m.width).Height(contentHeight).Render(strings.Join(truncateStyledLines(lines, max(m.width-6, 1)), "\n"))
+	body := lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(operatorFocusColor).Padding(1, 2).Width(m.width).Height(contentHeight).Render(strings.Join(truncateStyledLines(lines, max(m.width-6, 1)), "\n"))
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, m.renderDecisionHelp())
 }
 
 func (m operatorModel) renderDecisionRequest(request *application.RoutineDecisionRequest) []string {
 	lines, _ := m.decisionRequestLines(request)
-	capacity := m.decisionBodyLineCapacity()
+	capacity := m.decisionRequestBodyLineCapacity()
 	start := clamp(m.decision.requestOffset, 0, max(len(lines)-capacity, 0))
-	return lines[start:min(start+capacity, len(lines))]
+	visible := []string{operatorWarningStyle.Bold(true).Render("UNTRUSTED DECISION REQUEST")}
+	return append(visible, lines[start:min(start+capacity, len(lines))]...)
 }
 
 func (m operatorModel) decisionRequestLines(request *application.RoutineDecisionRequest) ([]string, []int) {
 	width := max(m.width-8, 20)
-	lines := []string{
-		operatorWarningStyle.Bold(true).Render("UNTRUSTED DECISION REQUEST"),
-	}
+	var lines []string
 	lines = append(lines, wrappedDecisionLines("Question: ", request.Question, width)...)
 	lines = append(lines, wrappedDecisionLines("Context: ", request.Context, width)...)
 	lines = append(lines, wrappedDecisionLines("Blocking reason: ", request.BlockingReason, width)...)
@@ -425,12 +430,16 @@ func (m operatorModel) decisionBodyLineCapacity() int {
 	return max(m.height-7, 1)
 }
 
+func (m operatorModel) decisionRequestBodyLineCapacity() int {
+	return max(m.decisionBodyLineCapacity()-1, 1)
+}
+
 func (m operatorModel) maximumDecisionRequestOffset() int {
 	if m.detail.detail == nil || m.detail.detail.Decision == nil {
 		return 0
 	}
 	lines, _ := m.decisionRequestLines(m.detail.detail.Decision)
-	return max(len(lines)-m.decisionBodyLineCapacity(), 0)
+	return max(len(lines)-m.decisionRequestBodyLineCapacity(), 0)
 }
 
 func (m *operatorModel) ensureSelectedDecisionOptionVisible() {
@@ -442,7 +451,7 @@ func (m *operatorModel) ensureSelectedDecisionOptionVisible() {
 		return
 	}
 	selected := clamp(m.decision.optionIndex, 0, len(starts)-1)
-	start, capacity := starts[selected], m.decisionBodyLineCapacity()
+	start, capacity := starts[selected], m.decisionRequestBodyLineCapacity()
 	if start < m.decision.requestOffset {
 		m.decision.requestOffset = start
 	} else if start >= m.decision.requestOffset+capacity {
@@ -504,23 +513,6 @@ func (m operatorModel) decisionRunDetailLines() []string {
 	}
 	detail := m.detail.detail
 	var lines []string
-	if detail.Decision != nil {
-		lines = append(lines, operatorWarningStyle.Bold(true).Render("UNTRUSTED DECISION REQUEST · persisted options only"))
-		lines = append(lines,
-			"Question "+operatorDecisionText(detail.Decision.Question),
-			"Context "+operatorDecisionText(detail.Decision.Context),
-			"Blocking "+operatorDecisionText(detail.Decision.BlockingReason),
-			"Recommendation option ID "+operatorDecisionLiteral(detail.Decision.Recommendation),
-		)
-		optionIDs := make([]string, 0, len(detail.Decision.Options))
-		for _, option := range detail.Decision.Options {
-			optionIDs = append(optionIDs, operatorDecisionLiteral(option.ID))
-		}
-		lines = append(lines, "Options "+strings.Join(optionIDs, " · "))
-		if m.decisionCanStart() {
-			lines = append(lines, operatorWarningStyle.Bold(true).Render("→ Action available · d decide"))
-		}
-	}
 	if m.decision.receipt != nil {
 		lines = append(lines, operatorAccentStyle.Bold(true).Render("✓ Decision "+decisionReceiptLabel(*m.decision.receipt)))
 	}
@@ -530,6 +522,19 @@ func (m operatorModel) decisionRunDetailLines() []string {
 		} else {
 			lines = append(lines, operatorWarningStyle.Render("Decision accepted · waiting for worker resume observation"))
 		}
+	}
+	if detail.Decision != nil && m.decisionCanStart() {
+		lines = append(lines, operatorWarningStyle.Bold(true).Render(fmt.Sprintf("UNTRUSTED HUMAN DECISION · %d persisted options", len(detail.Decision.Options))))
+		lines = append(lines,
+			"Question: "+operatorDecisionText(detail.Decision.Question),
+			"Context: "+operatorDecisionText(detail.Decision.Context),
+			"Blocking reason: "+operatorDecisionText(detail.Decision.BlockingReason),
+			"Recommendation option ID (untrusted): "+operatorDecisionLiteral(detail.Decision.Recommendation),
+		)
+		for _, option := range detail.Decision.Options {
+			lines = append(lines, "Option "+operatorDecisionLiteral(option.ID)+" — "+operatorDecisionText(option.Description))
+		}
+		lines = append(lines, operatorWarningStyle.Bold(true).Render("→ Open Attention and press Enter · or d decide here"))
 	}
 	return lines
 }
