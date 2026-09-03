@@ -509,10 +509,13 @@ func TestOperatorRepositoriesPagingDetailConfirmationReplayAndSuccess(t *testing
 	updated, _ = model.Update(operatorRepositoryDetailResultMsg{generation: model.repositoryDetail.generation, repository: "owner/two", detail: detail})
 	model = updated.(operatorModel)
 	plain := ansi.Strip(model.render())
-	for _, phrase := range []string{"Repository detail", "READY DISABLED", "repository disabled", "PROFILE CONFIGURATION", "VERIFIER POLICY", "Action available"} {
+	for _, phrase := range []string{"Repository detail", "READY DISABLED", "repository disabled", "Readiness dimensions", "PROFILE CONFIGURATION", "VERIFIER POLICY", "Action available", "╭", "┌"} {
 		if !strings.Contains(plain, phrase) {
 			t.Fatalf("detail missing %q:\n%s", phrase, plain)
 		}
+	}
+	if lipgloss.Width(model.render()) > 80 || lipgloss.Height(model.render()) > 24 {
+		t.Fatalf("repository detail exceeded 80x24: %dx%d", lipgloss.Width(model.render()), lipgloss.Height(model.render()))
 	}
 	updated, _ = model.Update(keyMessage('e'))
 	model = updated.(operatorModel)
@@ -532,7 +535,7 @@ func TestOperatorRepositoriesPagingDetailConfirmationReplayAndSuccess(t *testing
 	}
 	updated, _ = model.Update(operatorRepositoryOperationResultMsg{generation: generation, repository: "owner/two", requestID: "operator-enable-stable", err: operatorSafeError{Category: application.ErrorUnavailable, Message: "result unavailable"}})
 	model = updated.(operatorModel)
-	if model.repositoryDetail.operationStage != operatorRepositoryOperationRetryable {
+	if model.repositoryDetail.operationStage != operatorRepositoryOperationRetryable || !strings.Contains(ansi.Strip(model.render()), "Enable uncertain") {
 		t.Fatalf("retryable state=%+v", model.repositoryDetail)
 	}
 	updated, retry := model.Update(keySpecial(tea.KeyEnter, 0))
@@ -548,7 +551,7 @@ func TestOperatorRepositoriesPagingDetailConfirmationReplayAndSuccess(t *testing
 	}
 	updated, _ = model.Update(operatorRepositoryDetailResultMsg{generation: model.repositoryDetail.generation, repository: "owner/two", err: operatorSafeError{Category: application.ErrorUnavailable, Message: "post-success refresh unavailable"}})
 	model = updated.(operatorModel)
-	if model.repositoryDetail.staleError == nil || model.repositoryDetail.receipt == nil || !strings.Contains(ansi.Strip(model.render()), "Enable result OBSERVED/SUCCEEDED") {
+	if model.repositoryDetail.staleError == nil || model.repositoryDetail.receipt == nil || !strings.Contains(ansi.Strip(model.render()), "Enable OBSERVED/SUCCEEDED") {
 		t.Fatalf("post-success stale state=%+v", model.repositoryDetail)
 	}
 	if help := model.renderHelp(); strings.Contains(help, "e enable") {
@@ -562,7 +565,7 @@ func TestOperatorRepositoriesPagingDetailConfirmationReplayAndSuccess(t *testing
 	enabled := operatorFixtureRepositoryDetail("owner/two", application.RepositoryEnabled, true)
 	updated, _ = model.Update(operatorRepositoryDetailResultMsg{generation: model.repositoryDetail.generation, repository: "owner/two", detail: enabled})
 	model = updated.(operatorModel)
-	if output := ansi.Strip(model.render()); !strings.Contains(output, "Enable result OBSERVED/SUCCEEDED · lifecycle ENABLED v2") || strings.Contains(output, "Action available") {
+	if output := ansi.Strip(model.render()); !strings.Contains(output, "Enable OBSERVED/SUCCEEDED · ENABLED v2") || strings.Contains(output, "Action available") {
 		t.Fatalf("settled detail:\n%s", output)
 	}
 	updated, _ = model.Update(keySpecial(tea.KeyEscape, 0))

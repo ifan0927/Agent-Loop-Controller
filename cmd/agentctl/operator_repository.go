@@ -147,7 +147,8 @@ func (m operatorModel) renderRepositoriesScreen() string {
 	pageNumber := len(m.repositories.request.previous) + 1
 	summary := fmt.Sprintf("Page %d · %d of %d displayed", pageNumber, len(page.Repositories), page.Collection.Total)
 	bodyHeight := max(m.height-lipgloss.Height(header)-lipgloss.Height(footer)-1, 1)
-	lines := []string{summary}
+	innerWidth := max(m.width-2, 1)
+	lines := []string{m.renderPanelHeader("Repository lifecycle", summary, innerWidth)}
 	if len(page.Repositories) == 0 {
 		lines = append(lines, "", "No authorized repositories")
 	} else {
@@ -162,10 +163,10 @@ func (m operatorModel) renderRepositoriesScreen() string {
 				availability = "available"
 			}
 			detail := fmt.Sprintf("%s · %s · %s · %s", presentationLabel(string(repository.LifecycleIntent)), availability, presentationLabel(string(repository.Acceptance.Conclusion)), formatObservationAge(page.Metadata.ObservedAt, repository.LastObservedAt))
-			lines = append(lines, m.renderRow(operatorRow{id: repository.Repository, name: repository.Repository, status: presentationLabel(string(repository.Readiness)), detail: detail, tone: repositoryRowTone(repository.Available, string(repository.Readiness))}, m.width, index == selected))
+			lines = append(lines, m.renderRow(operatorRow{id: repository.Repository, name: repository.Repository, status: presentationLabel(string(repository.Readiness)), detail: detail, tone: repositoryRowTone(repository.Available, string(repository.Readiness))}, innerWidth, index == selected))
 		}
 	}
-	body := lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(operatorBorderColor).Width(m.width).Height(bodyHeight).Render(strings.Join(lines, "\n"))
+	body := lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(operatorFocusColor).Width(m.width).Height(bodyHeight).Render(strings.Join(lines, "\n"))
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
 }
 
@@ -183,77 +184,227 @@ func (m operatorModel) renderRepositoryDetailScreen() string {
 	}
 	detail := state.detail
 	header := m.renderRouteHeader("Repository detail", detail.Metadata.ObservedAt, state.refreshing, state.staleError)
-	repository := detail.Repository
-	availability := "unavailable"
-	if repository.Available {
-		availability = "available"
-	}
-	lines := []string{
-		repository.Repository,
-		fmt.Sprintf("Conclusion %s · %s", presentationLabel(string(repository.Acceptance.Conclusion)), reasonPresentation(repository.Acceptance.ReasonCode)),
-		"Next direction " + presentationLabel(string(repository.Acceptance.NextDirection)),
-		fmt.Sprintf("Lifecycle %s · readiness %s (%s)", presentationLabel(string(repository.LifecycleIntent)), presentationLabel(string(repository.Readiness)), reasonPresentation(repository.ReadinessReasonCode)),
-		fmt.Sprintf("Availability %s (%s)", availability, reasonPresentation(repository.AvailabilityReasonCode)),
-		fmt.Sprintf("Configuration %s (%s)", presentationLabel(string(repository.ConfigurationConvergence)), reasonPresentation(repository.ConfigurationReasonCode)),
-	}
-	if repository.ActiveRunID != "" {
-		lines = append(lines, "Active run "+repository.ActiveRunID)
+	var overview string
+	if m.width >= operatorWideWidth {
+		leftWidth := (m.width - 1) * 3 / 5
+		rightWidth := m.width - leftWidth - 1
+		overview = lipgloss.JoinHorizontal(lipgloss.Top,
+			m.renderRepositoryStatusCard(detail, leftWidth),
+			" ",
+			m.renderRepositoryContextCard(detail, rightWidth),
+		)
 	} else {
-		lines = append(lines, "Active run none")
+		overview = m.renderRepositoryCompactCard(detail, m.width)
 	}
-	if repository.Onboarding != nil {
-		lines = append(lines, fmt.Sprintf("Onboarding %s · %s · %d steps · %s", repository.Onboarding.OnboardingID, presentationLabel(string(repository.Onboarding.Status)), repository.Onboarding.CompletedStepCount, reasonPresentation(repository.Onboarding.ReasonCode)))
-	} else {
-		lines = append(lines, "Current onboarding none")
-	}
-	lines = append(lines, "Last observation "+repository.LastObservedAt.Local().Format(time.RFC3339), "Readiness dimensions")
-	var tail []string
-	if state.receipt != nil {
-		tail = append(tail, fmt.Sprintf("Enable result %s/%s · lifecycle %s v%d", presentationLabel(string(state.receipt.Phase)), presentationLabel(string(state.receipt.Outcome)), presentationLabel(state.receipt.ResultingState), state.receipt.ResultingVersion))
-	}
-	if state.operationError != nil {
-		prefix := "Enable failed"
-		if state.operationStage == operatorRepositoryOperationRetryable {
-			prefix = "Enable result uncertain; Enter retries the same request"
-		}
-		tail = append(tail, prefix+" · "+state.operationError.String())
-	} else if m.repositoryActionOffered() && state.operationStage == operatorRepositoryOperationIdle {
-		tail = append(tail, "Action available: e enable repository")
-	}
-	dimensionSlots := max(m.height-lipgloss.Height(header)-lipgloss.Height(footer)-len(lines)-len(tail)-2, 1)
-	selected := clamp(state.dimensionIndex, 0, max(len(detail.Dimensions)-1, 0))
-	start := clamp(selected-dimensionSlots+1, 0, max(len(detail.Dimensions)-dimensionSlots, 0))
-	end := min(start+dimensionSlots, len(detail.Dimensions))
-	for index := start; index < end; index++ {
-		dimension := detail.Dimensions[index]
-		prefix := "  "
-		if index == selected {
-			prefix = "> "
-		}
-		line := fmt.Sprintf("%s%s · %s · %s · %s", prefix, presentationLabel(string(dimension.Dimension)), presentationLabel(string(dimension.Status)), reasonPresentation(dimension.ReasonCode), dimension.ObservedAt.Local().Format(time.RFC3339))
-		lines = append(lines, line)
-	}
-	lines = append(lines, tail...)
-	for index := range lines {
-		lines[index] = ansi.Truncate(lines[index], m.width, "…")
-	}
-	return lipgloss.JoinVertical(lipgloss.Left, header, strings.Join(lines, "\n"), footer)
+	dimensions := m.renderRepositoryDimensionsCard(detail, m.width)
+	return lipgloss.JoinVertical(lipgloss.Left, header, overview, dimensions, footer)
 }
 
 func (m operatorModel) renderRepositoryConfirmation() string {
-	repository := m.repositoryDetail.repository
+	detail := m.repositoryDetail.detail
+	header := m.renderRouteHeader("Confirm enablement", detail.Metadata.ObservedAt, false, nil)
+	title := operatorWarningStyle.Bold(true).Render("▲ CONFIRM REPOSITORY ENABLEMENT")
 	lines := []string{
-		"Agent Loop Controller / Confirm repository enablement",
+		renderStyledHeader(title, operatorMutedStyle.Render(m.repositoryDetail.repository), max(m.width-6, 1)),
 		"",
-		"Repository " + repository,
+		operatorHeadingStyle.Render("Effect"),
+		"Permit future admission for this repository.",
 		"",
-		"Enabling permits future admission for this repository.",
+		operatorHeadingStyle.Render("Unaffected"),
 		"It does not enable global automatic admission.",
 		"It does not start, cancel, or modify a run.",
 		"It does not start, stop, or restart the worker.",
-		"Stale authority may produce a safe conflict without changing lifecycle.",
 		"",
-		"Enter confirm · Esc cancel · q quit",
+		operatorMutedStyle.Render("Stale authority safely conflicts without changing lifecycle."),
 	}
-	return boundedLines(m.width, m.height, lines)
+	card := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("214")).Padding(1, 2).Width(m.width).Render(strings.Join(lines, "\n"))
+	return lipgloss.JoinVertical(lipgloss.Left, header, card, m.renderHelp())
+}
+
+func (m operatorModel) renderRepositoryCompactCard(detail *application.RoutineRepositoryDetail, width int) string {
+	repository := detail.Repository
+	innerWidth := max(width-4, 1)
+	lines := []string{
+		m.renderRepositoryTitle(repository, innerWidth),
+		fmt.Sprintf("Conclusion %s · %s", presentationLabel(string(repository.Acceptance.Conclusion)), reasonPresentation(repository.Acceptance.ReasonCode)),
+		"Next direction " + presentationLabel(string(repository.Acceptance.NextDirection)),
+		fmt.Sprintf("Lifecycle %s · Readiness %s (%s)", presentationLabel(string(repository.LifecycleIntent)), presentationLabel(string(repository.Readiness)), reasonPresentation(repository.ReadinessReasonCode)),
+		fmt.Sprintf("Availability %s (%s)", repositoryAvailabilityLabel(repository.Available), reasonPresentation(repository.AvailabilityReasonCode)),
+		fmt.Sprintf("Configuration %s (%s)", presentationLabel(string(repository.ConfigurationConvergence)), reasonPresentation(repository.ConfigurationReasonCode)),
+		"Last observed " + repository.LastObservedAt.Local().Format(time.RFC3339),
+		"Active run " + repositoryActiveRunLabel(repository) + " · Onboarding " + repositoryOnboardingLabel(repository),
+		m.repositoryOperationPresentation(),
+	}
+	return repositoryCardStyle(width, repositoryAcceptanceTone(string(repository.Acceptance.Conclusion))).Render(strings.Join(truncateStyledLines(lines, innerWidth), "\n"))
+}
+
+func (m operatorModel) renderRepositoryStatusCard(detail *application.RoutineRepositoryDetail, width int) string {
+	repository := detail.Repository
+	innerWidth := max(width-4, 1)
+	lines := []string{
+		m.renderRepositoryTitle(repository, innerWidth),
+		fmt.Sprintf("Conclusion %s · %s", presentationLabel(string(repository.Acceptance.Conclusion)), reasonPresentation(repository.Acceptance.ReasonCode)),
+		"Next direction " + presentationLabel(string(repository.Acceptance.NextDirection)),
+		fmt.Sprintf("Lifecycle %s · Readiness %s (%s)", presentationLabel(string(repository.LifecycleIntent)), presentationLabel(string(repository.Readiness)), reasonPresentation(repository.ReadinessReasonCode)),
+		fmt.Sprintf("Availability %s (%s)", repositoryAvailabilityLabel(repository.Available), reasonPresentation(repository.AvailabilityReasonCode)),
+		fmt.Sprintf("Configuration %s (%s)", presentationLabel(string(repository.ConfigurationConvergence)), reasonPresentation(repository.ConfigurationReasonCode)),
+		"Last observed " + repository.LastObservedAt.Local().Format(time.RFC3339),
+	}
+	return repositoryCardStyle(width, repositoryAcceptanceTone(string(repository.Acceptance.Conclusion))).Render(strings.Join(truncateStyledLines(lines, innerWidth), "\n"))
+}
+
+func (m operatorModel) renderRepositoryContextCard(detail *application.RoutineRepositoryDetail, width int) string {
+	repository := detail.Repository
+	innerWidth := max(width-4, 1)
+	lines := []string{
+		m.renderPanelHeader("Operational context", "LOCAL", innerWidth),
+		"Active run " + repositoryActiveRunLabel(repository),
+		"Onboarding " + repositoryOnboardingLabel(repository),
+		operatorMutedStyle.Render("Repository-local admission · run/worker unchanged"),
+		m.repositoryOperationPresentation(),
+	}
+	return repositoryCardStyle(width, "muted").Render(strings.Join(truncateStyledLines(lines, innerWidth), "\n"))
+}
+
+func (m operatorModel) renderRepositoryTitle(repository application.RoutineRepositorySummary, width int) string {
+	badge := repositoryStatusBadge(presentationLabel(string(repository.Acceptance.Conclusion)), repositoryAcceptanceTone(string(repository.Acceptance.Conclusion)))
+	return renderStyledHeader(operatorHeadingStyle.Render(repository.Repository), badge, width)
+}
+
+func (m operatorModel) renderRepositoryDimensionsCard(detail *application.RoutineRepositoryDetail, width int) string {
+	innerWidth := max(width-4, 1)
+	ready := 0
+	for _, dimension := range detail.Dimensions {
+		if string(dimension.Status) == "ready" {
+			ready++
+		}
+	}
+	lines := []string{m.renderPanelHeader("Readiness dimensions", fmt.Sprintf("%d/%d ready", ready, len(detail.Dimensions)), innerWidth)}
+	selected := clamp(m.repositoryDetail.dimensionIndex, 0, max(len(detail.Dimensions)-1, 0))
+	for index, dimension := range detail.Dimensions {
+		marker, tone := repositoryDimensionMarker(string(dimension.Status))
+		nameWidth := min(31, max(21, innerWidth/3))
+		name := lipgloss.NewStyle().Width(nameWidth).Render(presentationLabel(string(dimension.Dimension)))
+		content := fmt.Sprintf("%s %s  %s · %s · %s", marker, name, presentationLabel(string(dimension.Status)), reasonPresentation(dimension.ReasonCode), dimension.ObservedAt.Local().Format("15:04:05"))
+		content = ansi.Truncate(content, innerWidth-2, "…")
+		line := "  " + tone.Render(content)
+		if index == selected {
+			line = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("28")).Width(innerWidth).Render("> " + content)
+		}
+		lines = append(lines, line)
+	}
+	return lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(operatorFocusColor).Padding(0, 1).Width(width).Render(strings.Join(lines, "\n"))
+}
+
+func (m operatorModel) repositoryOperationPresentation() string {
+	state := m.repositoryDetail
+	if state.operationError != nil {
+		prefix := "Enable failed"
+		style := operatorDangerStyle
+		if state.operationStage == operatorRepositoryOperationRetryable {
+			prefix = "Enable uncertain · Enter retries same request"
+			style = operatorWarningStyle
+		}
+		return style.Bold(true).Render(prefix + " · " + state.operationError.String())
+	}
+	if state.receipt != nil {
+		return operatorAccentStyle.Bold(true).Render(fmt.Sprintf("✓ Enable %s/%s · %s v%d", presentationLabel(string(state.receipt.Phase)), presentationLabel(string(state.receipt.Outcome)), presentationLabel(state.receipt.ResultingState), state.receipt.ResultingVersion))
+	}
+	if m.repositoryEnableCanStart() {
+		return operatorWarningStyle.Bold(true).Render("→ Action available · e enable repository")
+	}
+	return operatorMutedStyle.Render("○ No Repository action offered")
+}
+
+func repositoryAvailabilityLabel(available bool) string {
+	if available {
+		return "AVAILABLE"
+	}
+	return "UNAVAILABLE"
+}
+
+func repositoryActiveRunLabel(repository application.RoutineRepositorySummary) string {
+	if repository.ActiveRunID == "" {
+		return "none"
+	}
+	return repository.ActiveRunID
+}
+
+func repositoryOnboardingLabel(repository application.RoutineRepositorySummary) string {
+	if repository.Onboarding == nil {
+		return "none"
+	}
+	return fmt.Sprintf("%s · %s · %d steps", repository.Onboarding.OnboardingID, presentationLabel(string(repository.Onboarding.Status)), repository.Onboarding.CompletedStepCount)
+}
+
+func repositoryAcceptanceTone(conclusion string) string {
+	switch conclusion {
+	case "accepting_new_work":
+		return "good"
+	case "ready_disabled", "not_ready", "unknown":
+		return "warning"
+	case "conflict", "unavailable":
+		return "danger"
+	default:
+		return "muted"
+	}
+}
+
+func repositoryCardStyle(width int, tone string) lipgloss.Style {
+	color := operatorBorderColor
+	switch tone {
+	case "good":
+		color = operatorFocusColor
+	case "warning":
+		color = lipgloss.Color("214")
+	case "danger":
+		color = lipgloss.Color("196")
+	}
+	return lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(color).Padding(0, 1).Width(width)
+}
+
+func repositoryStatusBadge(label, tone string) string {
+	style := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).Padding(0, 1)
+	switch tone {
+	case "good":
+		style = style.Background(lipgloss.Color("28"))
+	case "warning":
+		style = style.Foreground(lipgloss.Color("16")).Background(lipgloss.Color("214"))
+	case "danger":
+		style = style.Background(lipgloss.Color("124"))
+	default:
+		style = style.Background(lipgloss.Color("238"))
+	}
+	return style.Render(label)
+}
+
+func repositoryDimensionMarker(status string) (string, lipgloss.Style) {
+	switch status {
+	case "ready":
+		return "✓", operatorAccentStyle
+	case "not_ready", "unknown":
+		return "▲", operatorWarningStyle
+	case "conflict":
+		return "✕", operatorDangerStyle
+	default:
+		return "○", operatorMutedStyle
+	}
+}
+
+func truncateStyledLines(lines []string, width int) []string {
+	for index := range lines {
+		lines[index] = ansi.Truncate(lines[index], width, "…")
+	}
+	return lines
+}
+
+func renderStyledHeader(left, right string, width int) string {
+	left = ansi.Truncate(left, width, "…")
+	available := width - lipgloss.Width(left) - 1
+	if available <= 0 {
+		return left
+	}
+	right = ansi.Truncate(right, available, "…")
+	gap := max(width-lipgloss.Width(left)-lipgloss.Width(right), 1)
+	return left + strings.Repeat(" ", gap) + right
 }
