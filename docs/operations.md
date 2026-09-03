@@ -395,7 +395,7 @@ automatic Todo E2E trigger.
 
 ### Observe
 
-For the configured operator's routine read-only view, start the separate local
+For the configured operator's routine local view, start the separate local
 TUI:
 
 ```sh
@@ -406,18 +406,34 @@ The command accepts no requester flags. It derives the complete immutable
 operator identity from the already-bound current configuration authority and
 fails closed if the locator, retained desired generation, exact database
 identity, mode, binding, or schema is unavailable or conflicting. It never
-initializes, migrates, reconciles, adopts, or writes configuration or SQLite.
+initializes, migrates, reconciles, adopts, or writes configuration. SQLite
+writes are limited to the exact application-owned repository-enable receipt,
+lifecycle, and activity transaction after explicit confirmation.
 
-Overview, Runs, Attention, and Run detail refresh every ten seconds. Use `1`,
-`2`, and `3` for Overview, Runs, and Attention. `Enter` opens the shared Run
+Overview, Runs, Attention, Repositories, Run detail, and Repository detail
+refresh every ten seconds. Use `1`, `2`, `3`, and `4` for Overview, Runs,
+Attention, and Repositories. `Enter` opens the shared Run
 detail from a run or only from an Attention item whose projected navigation is
-Run detail; `Escape` returns with the previous screen state preserved. On Runs, `f` cycles Active,
+Run detail; it opens shared Repository detail from an Overview repository or
+Repositories row. `Escape` returns with the previous page, focus, and selection
+preserved. On Runs, `f` cycles Active,
 Ended, and All; `/` accepts an exact lowercase `owner/repository` filter; and
 `n`/`p` move through bounded cursor pages. Attention uses `Tab` between its list
 and selected-item summary, arrow keys to select or scroll, and the same `n`/`p`
 pagination. Items without a current offer explicitly show `No Controller action
 offered`; offers are informational and cannot be executed in this read-only
-route. Use `r` to refresh, arrow keys or
+route. Repositories uses the same `n`/`p` opaque pagination and defaults to 25
+rows. Repository detail displays lifecycle, readiness, availability,
+configuration convergence, run/onboarding context, observation time, all eight
+readiness dimensions, and the application-owned acceptance conclusion. When
+`enable_repository` is offered, `e` opens an explicit confirmation and `Enter`
+submits it; uncertain retry reuses the same in-process request ID. Submission
+reopens current durable authority, re-resolves the configured operator and
+repository profile, and fails closed if their generation, digest, version, or
+binding changed after the screen was shown. Enabling does
+not enable global automatic admission, change a run, or control the worker.
+Disable, recheck, removal, onboarding, and run actions remain CLI-only or
+planned. Use `r` to refresh, arrow keys or
 `j`/`k` to select or scroll, `?` for current help, and `q` or `Ctrl-C` to quit.
 Overview also uses `Tab` and `Shift+Tab` between non-empty panels. A refresh
 failure after a successful load leaves the last complete screen visible and
@@ -485,7 +501,7 @@ duration syntax such as `30s`, `15m`, and `24h`.
 agentctl operator [--config <controller.json>]
 ```
 
-Use this for the bounded read-only Controller Overview, Runs, and Attention
+Use this for the bounded Controller Overview, Runs, Attention, and Repositories
 journey. It
 shows the projected aggregate health, separate worker/capacity/repository
 evidence, repositories in projection order, active runs before recently ended
@@ -502,7 +518,9 @@ the first page once. The exact repository filter includes historical runs under
 older frozen binding generations of the same canonical repository. Run detail
 shows the application-owned phase and wait assessment, latest transition,
 compact pull request, active attention, and all eleven Controller-owned delivery
-gates. It exposes no mutation controls. Truncated collections always report
+gates. Repository detail shows all eight readiness dimensions and the
+application-owned acceptance conclusion. Only a ready-disabled repository may
+offer one explicit, confirmed, receipt-backed enable control. Truncated collections always report
 displayed and total counts. Unknown future presentation codes remain visible
 instead of being silently classified. Status markers and color improve scanning
 but never replace the projected status text.

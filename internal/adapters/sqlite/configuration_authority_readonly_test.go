@@ -69,6 +69,29 @@ func TestOpenConfigurationAuthorityReadOnlyRefusesMigration(t *testing.T) {
 	}
 }
 
+func TestOpenConfigurationAuthorityCurrentAllowsExplicitWritesButRefusesMigration(t *testing.T) {
+	path, configPath, identity := seedReadOnlyConfigurationAuthority(t, schemaVersion)
+	store, err := OpenConfigurationAuthorityCurrent(context.Background(), path, configPath, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(context.Background(), `UPDATE configuration_authority SET authority_version=authority_version WHERE authority_id=1`); err != nil {
+		store.Close()
+		t.Fatalf("current writable authority rejected explicit write: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	legacyPath, legacyConfigPath, legacyIdentity := seedReadOnlyConfigurationAuthority(t, schemaVersion-1)
+	if legacy, openErr := OpenConfigurationAuthorityCurrent(context.Background(), legacyPath, legacyConfigPath, legacyIdentity); openErr == nil || !strings.Contains(openErr.Error(), "schema is not current") {
+		if legacy != nil {
+			legacy.Close()
+		}
+		t.Fatalf("legacy schema open err=%v", openErr)
+	}
+}
+
 func seedReadOnlyConfigurationAuthority(t *testing.T, version int) (string, string, application.DatabaseFileIdentity) {
 	t.Helper()
 	root := t.TempDir()

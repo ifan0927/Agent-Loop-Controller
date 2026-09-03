@@ -20,6 +20,39 @@ type RoutineRepositorySummary struct {
 	ConfigurationReasonCode  string                           `json:"configuration_reason_code"`
 	Onboarding               *RoutineOnboardingSummary        `json:"onboarding,omitempty"`
 	LastObservedAt           time.Time                        `json:"last_observed_at"`
+	Acceptance               RoutineRepositoryAcceptance      `json:"acceptance"`
+}
+
+type RoutineRepositoryAcceptanceConclusion string
+
+const (
+	RoutineRepositoryAcceptingNewWork RoutineRepositoryAcceptanceConclusion = "accepting_new_work"
+	RoutineRepositoryReadyDisabled    RoutineRepositoryAcceptanceConclusion = "ready_disabled"
+	RoutineRepositoryNotReady         RoutineRepositoryAcceptanceConclusion = "not_ready"
+	RoutineRepositoryConflict         RoutineRepositoryAcceptanceConclusion = "conflict"
+	RoutineRepositoryUnknown          RoutineRepositoryAcceptanceConclusion = "unknown"
+	RoutineRepositoryUnavailable      RoutineRepositoryAcceptanceConclusion = "unavailable"
+)
+
+type RoutineRepositoryOperatorDirection string
+
+const (
+	RoutineRepositoryDirectionNone                  RoutineRepositoryOperatorDirection = "none"
+	RoutineRepositoryDirectionEnable                RoutineRepositoryOperatorDirection = "enable_repository"
+	RoutineRepositoryDirectionResolveReadiness      RoutineRepositoryOperatorDirection = "resolve_readiness"
+	RoutineRepositoryDirectionResolveConflict       RoutineRepositoryOperatorDirection = "resolve_conflict"
+	RoutineRepositoryDirectionRefreshAuthority      RoutineRepositoryOperatorDirection = "refresh_authority"
+	RoutineRepositoryDirectionInspectUnavailability RoutineRepositoryOperatorDirection = "inspect_unavailability"
+)
+
+type RoutineRepositoryAction string
+
+const RoutineRepositoryActionEnable RoutineRepositoryAction = "enable_repository"
+
+type RoutineRepositoryAcceptance struct {
+	Conclusion    RoutineRepositoryAcceptanceConclusion `json:"conclusion"`
+	ReasonCode    string                                `json:"reason_code"`
+	NextDirection RoutineRepositoryOperatorDirection    `json:"next_direction"`
 }
 
 type RoutineRepositoryDimension struct {
@@ -30,9 +63,10 @@ type RoutineRepositoryDimension struct {
 }
 
 type RoutineRepositoryDetail struct {
-	Metadata   RoutineProjectionMetadata    `json:"metadata"`
-	Repository RoutineRepositorySummary     `json:"repository"`
-	Dimensions []RoutineRepositoryDimension `json:"dimensions"`
+	Metadata         RoutineProjectionMetadata    `json:"metadata"`
+	Repository       RoutineRepositorySummary     `json:"repository"`
+	Dimensions       []RoutineRepositoryDimension `json:"dimensions"`
+	LegalNextActions []RoutineRepositoryAction    `json:"legal_next_actions"`
 }
 
 type RoutineRepositoryPage struct {
@@ -99,6 +133,7 @@ func (s *RoutineRepositoryQueryService) Detail(ctx context.Context, requester Re
 		return RoutineRepositoryDetail{}, err
 	}
 	result := RoutineRepositoryDetail{Metadata: RoutineProjectionMetadata{SchemaVersion: RoutineQuerySchemaVersion, ObservedAt: observedAt.UTC()}, Repository: summary}
+	result.LegalNextActions = routineRepositoryLegalNextActions(projection)
 	for _, dimension := range projection.Readiness.Dimensions {
 		result.Dimensions = append(result.Dimensions, RoutineRepositoryDimension{Dimension: dimension.Dimension, Status: dimension.Status, ReasonCode: dimension.ReasonCode, ObservedAt: dimension.ObservedAt.UTC()})
 	}
@@ -123,5 +158,35 @@ func (s *RoutineRepositoryQueryService) summary(ctx context.Context, projection 
 			result.Onboarding = &onboarding
 		}
 	}
+	result.Acceptance = routineRepositoryAcceptance(projection)
+	if result.Acceptance.Conclusion == RoutineRepositoryConflict || result.Acceptance.Conclusion == RoutineRepositoryUnknown {
+		result.Available = false
+	}
 	return result, nil
+}
+
+func routineRepositoryAcceptance(projection RepositoryProjection) RoutineRepositoryAcceptance {
+	readiness := projection.Readiness
+	switch readiness.Status {
+	case domain.RepositoryConflict:
+		return RoutineRepositoryAcceptance{Conclusion: RoutineRepositoryConflict, ReasonCode: readiness.ReasonCode, NextDirection: RoutineRepositoryDirectionResolveConflict}
+	case domain.RepositoryUnknown:
+		return RoutineRepositoryAcceptance{Conclusion: RoutineRepositoryUnknown, ReasonCode: readiness.ReasonCode, NextDirection: RoutineRepositoryDirectionRefreshAuthority}
+	case domain.RepositoryNotReady:
+		return RoutineRepositoryAcceptance{Conclusion: RoutineRepositoryNotReady, ReasonCode: readiness.ReasonCode, NextDirection: RoutineRepositoryDirectionResolveReadiness}
+	}
+	if projection.Lifecycle.Intent == RepositoryDisabled && projection.Recheck == nil && projection.Removal == nil && readiness.Status == domain.RepositoryReady {
+		return RoutineRepositoryAcceptance{Conclusion: RoutineRepositoryReadyDisabled, ReasonCode: "repository_disabled", NextDirection: RoutineRepositoryDirectionEnable}
+	}
+	if projection.Availability.Available {
+		return RoutineRepositoryAcceptance{Conclusion: RoutineRepositoryAcceptingNewWork, ReasonCode: projection.Availability.ReasonCode, NextDirection: RoutineRepositoryDirectionNone}
+	}
+	return RoutineRepositoryAcceptance{Conclusion: RoutineRepositoryUnavailable, ReasonCode: projection.Availability.ReasonCode, NextDirection: RoutineRepositoryDirectionInspectUnavailability}
+}
+
+func routineRepositoryLegalNextActions(projection RepositoryProjection) []RoutineRepositoryAction {
+	if projection.Lifecycle.Intent == RepositoryDisabled && projection.Readiness.Status == domain.RepositoryReady && projection.Recheck == nil && projection.Removal == nil {
+		return []RoutineRepositoryAction{RoutineRepositoryActionEnable}
+	}
+	return []RoutineRepositoryAction{}
 }

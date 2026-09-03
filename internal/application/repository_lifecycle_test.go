@@ -30,6 +30,7 @@ func (s *repositoryServiceProfileSource) ListRepositoryProfiles(context.Context)
 
 type repositoryServiceStore struct {
 	inspectErr       error
+	authority        RepositoryOperationAuthority
 	repositories     []RepositoryProjection
 	collectionInputs []ControllerRepositoryQuery
 }
@@ -46,11 +47,14 @@ func (*repositoryServiceStore) GetOperationReceiptTarget(context.Context, string
 func (*repositoryServiceStore) GetAuthorizedOperationReceipt(context.Context, string, AuthorizedScopeSet) (OperationReceipt, error) {
 	panic("not used")
 }
+func (*repositoryServiceStore) FindRepositoryOperationReceipt(context.Context, OperationType, string, domain.GitHubUserIdentity, string, string) (OperationReceipt, bool, error) {
+	panic("not used")
+}
 func (*repositoryServiceStore) AdoptRepositoryLifecycleBaseline(context.Context, RepositoryBaselineInput) error {
 	panic("not used")
 }
-func (*repositoryServiceStore) RepositoryOperationAuthority(context.Context, string) (RepositoryOperationAuthority, error) {
-	panic("not used")
+func (s *repositoryServiceStore) RepositoryOperationAuthority(context.Context, string) (RepositoryOperationAuthority, error) {
+	return s.authority, nil
 }
 func (s *repositoryServiceStore) ListControllerRepositories(_ context.Context, input ControllerRepositoryQuery) (RepositoryListPage, error) {
 	s.collectionInputs = append(s.collectionInputs, input)
@@ -146,6 +150,25 @@ func TestRepositoryInspectAuthorizesBeforeLookupAndHidesTargets(t *testing.T) {
 	var deniedService, missingService *ServiceError
 	if !errors.As(deniedErr, &deniedService) || !errors.As(missingErr, &missingService) || deniedService.Category != ErrorNotFound || missingService.Category != ErrorNotFound || deniedErr.Error() != missingErr.Error() {
 		t.Fatalf("denied=%v missing=%v", deniedErr, missingErr)
+	}
+}
+
+func TestRepositoryMutationFencesExpectedConfigurationAuthority(t *testing.T) {
+	identity := domain.GitHubUserIdentity{Login: "operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
+	authorizer, _ := NewAuthorizationService(ConfiguredOperatorIdentity{User: identity})
+	profileAuthority := RepositoryAuthority{Repository: "owner/repo", ProfileID: "repository-profile:owner/repo", BindingDigest: strings.Repeat("b", 64), AllowedLogins: []string{"operator"}, TrustedOperators: []domain.GitHubUserIdentity{identity}}
+	profiles := &repositoryServiceProfileSource{profile: RepositoryProfileAuthority{Authority: profileAuthority, Profile: LocalRepository{CanonicalRepository: profileAuthority.Repository}}, found: true}
+	current := ConfigurationAdmissionAuthority{GenerationID: 2, Digest: strings.Repeat("c", 64), AuthorityVersion: 2, ValidThrough: time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)}
+	store := &repositoryServiceStore{authority: RepositoryOperationAuthority{ConfigurationAuthority: current}}
+	service, err := NewRepositoryService(store, authorizer, profiles, RepositoryObservers{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := ConfigurationAdmissionAuthority{GenerationID: 1, Digest: strings.Repeat("d", 64), AuthorityVersion: 1, ValidThrough: current.ValidThrough}
+	_, err = service.Enable(context.Background(), RepositoryMutationCommand{Requester: requesterForUser(identity), Repository: profileAuthority.Repository, RequestID: "stale-authority", ExpectedConfigurationAuthority: &expected})
+	var safe *ServiceError
+	if !errors.As(err, &safe) || safe.Category != ErrorConflict {
+		t.Fatalf("stale configuration authority error=%v", err)
 	}
 }
 

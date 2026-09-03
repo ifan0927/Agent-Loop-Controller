@@ -1827,9 +1827,11 @@ state plus Controller-owned authorization, CAS, leases, idempotency, receipts,
 and reconciliation rather than shared in-memory authority.
 
 The implemented operator composition opens only an existing exact-inode,
-mode-0600, current-schema SQLite/configuration binding in query-only mode. It
+mode-0600, current-schema SQLite/configuration binding. It
 does not create, migrate, baseline, reconcile, adopt, rewrite, or repair that
-authority. The TUI model receives one complete Overview projection followed by
+authority. Reads remain query-only application projections; the sole write path
+is the exact typed `RepositoryService.Enable` operation offered by Repository
+detail. The TUI model receives one complete Overview projection followed by
 one limit-100 repository page at the same observation time; a failed second
 read discards the batch. Presentation never reads SQLite, configuration,
 credentials, GitHub, Linear, worktrees, artifacts, raw logs, or arbitrary local
@@ -1837,7 +1839,8 @@ paths to assemble workflow policy. It consumes bounded sanitized projections
 and only legal actions offered by Controller application services. It is not a
 database administration tool, orchestrator, or second state machine.
 
-Overview, Runs, Attention, and Run detail each refresh every ten seconds or on
+Overview, Runs, Attention, Repositories, Run detail, and Repository detail each
+refresh every ten seconds or on
 an explicit `r`, permit at most one visible active read per active route, and
 fence obsolete route and refresh generations. After one successful load, a later error preserves the last
 complete screen and marks it stale with only a sanitized service category and
@@ -1878,6 +1881,29 @@ Anything below 80x24 renders only the size
 requirement and quit control. Panel height is content-driven within the
 available terminal budget; only the focused panel's current row is highlighted,
 and color is redundant presentation rather than authority.
+
+Repository detail is the same target-authorized projection whether opened from
+Overview or the stable Controller-reader Repositories collection. The
+application owns the closed `accepting_new_work`, `ready_disabled`,
+`not_ready`, `conflict`, `unknown`, and `unavailable` conclusions, their safe
+reason and next direction, plus the closed `legal_next_actions` list. Only an
+exact ready-disabled authority with no active readiness recheck or removal may
+offer `enable_repository`; presentation never derives that policy. Detail also
+shows lifecycle, readiness, availability, configuration convergence, current
+run/onboarding context, last observation, and all eight dimensions.
+
+Enablement enters an explicit confirmation that identifies the repository and
+separates repository-local admission from global automatic admission, runs,
+and worker control. One in-memory caller request ID is retained across pending
+or uncertain retry, duplicate pending input is fenced, and execution freshly
+reopens durable current configuration, resolves the configured requester and
+profile again, and fences generation, digest, authority version, lifecycle,
+readiness, and binding authority through `RepositoryService.Enable`. A successful settled
+receipt remains visible while detail refreshes to the enabled lifecycle; a
+post-success refresh error preserves that outcome and marks the detail stale.
+Conflict or failure preserves the last complete detail and never claims
+success. Route, page, confirmation, and operation generations reject late
+collection, detail, and mutation results. TUI exit has no worker effect.
 
 Repository onboarding is a persisted Controller saga. Each step row owns a
 positive durable attempt number. Resume atomically re-arms the current failed

@@ -191,11 +191,13 @@ automatically.
 For the routine local operator, run `agentctl operator`. It authenticates as
 the configured Controller operator, opens only the already-bound current
 configuration authority, and provides Overview, filtered cursor-paginated Runs,
-a complete cursor-paginated read-only Attention inbox, and a shared compact run
-detail with Controller-owned progress, wait assessment, attention, pull-request
-summary, and all eleven delivery gates.
-It changes no Controller state, accepts no requester override flags, and does
-not start or supervise the worker.
+a complete cursor-paginated read-only Attention inbox, a shared compact Run
+detail, and a cursor-paginated Repositories destination with shared Repository
+detail. Repository detail shows the Controller-owned acceptance conclusion and
+all eight readiness dimensions; a currently authorized ready-disabled
+repository can be explicitly confirmed and enabled through the existing
+receipt-backed service. No other TUI mutation is implemented. The command
+accepts no requester override flags and does not start or supervise the worker.
 
 Low-level `continue`, `push`, `open-pr`, `reconcile`, `merge`,
 `reconcile-linear`, and `cleanup` commands are recovery interfaces, not the
@@ -233,13 +235,16 @@ reports explicit coverage limitations for history that was never persisted.
 Unsafe or ambiguous configuration repair remains out of scope. Controller-wide
 audit-integrity readiness and its explicit receipt-backed recheck are
 implemented, completing the presentation-independent operator foundation. The
-read-only `agentctl operator` Overview, Runs collection, complete Attention
-inbox, and shared Run detail are implemented with bounded responsive layouts,
+`agentctl operator` Overview, Runs collection, complete read-only Attention
+inbox, shared Run detail, Repositories collection, and shared Repository detail
+are implemented with bounded responsive layouts,
 visible selection, authorization-safe opaque pagination, background refresh,
 stale-result preservation, exact item-bound offer summaries, and
-configured-operator authorization. This completes the R04-R06 read journey and
-the read-only Attention prerequisite for R07; Attention mutations and the
-remaining TUI destinations remain planned. HTTP, a Web
+configured-operator authorization. Ready-disabled repositories alone expose a
+confirmed receipt-backed enable action; disable, recheck, onboarding, run, and
+Attention mutations remain outside this slice. This completes R08 in addition
+to the R04-R06 read journey and the read-only Attention prerequisite for R07;
+the remaining TUI destinations remain planned. HTTP, a Web
 UI, outbound notifications, Hermes runtime integration, public API/webhook
 admission, and cross-repository transactions remain deferred or exploratory.
 
