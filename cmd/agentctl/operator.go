@@ -34,10 +34,12 @@ const (
 type operatorRoute string
 
 const (
-	operatorOverviewRoute  operatorRoute = "overview"
-	operatorRunsRoute      operatorRoute = "runs"
-	operatorAttentionRoute operatorRoute = "attention"
-	operatorRunDetailRoute operatorRoute = "run_detail"
+	operatorOverviewRoute         operatorRoute = "overview"
+	operatorRunsRoute             operatorRoute = "runs"
+	operatorAttentionRoute        operatorRoute = "attention"
+	operatorRepositoriesRoute     operatorRoute = "repositories"
+	operatorRunDetailRoute        operatorRoute = "run_detail"
+	operatorRepositoryDetailRoute operatorRoute = "repository_detail"
 )
 
 type operatorPanelState struct {
@@ -144,16 +146,16 @@ type operatorRunDetailState struct {
 type operatorRefreshTickMsg struct{}
 
 type operatorKeyMap struct {
-	up, down, next, previous, refresh, help, quit                                        key.Binding
-	overview, runs, attention, open, back, lifecycle, repository, nextPage, previousPage key.Binding
+	up, down, next, previous, refresh, help, quit                                                              key.Binding
+	overview, runs, attention, repositories, open, back, lifecycle, repository, enable, nextPage, previousPage key.Binding
 }
 
 func (k operatorKeyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.overview, k.runs, k.attention, k.next, k.previous, k.up, k.down, k.refresh, k.help, k.quit}
+	return []key.Binding{k.overview, k.runs, k.attention, k.repositories, k.next, k.previous, k.up, k.down, k.refresh, k.help, k.quit}
 }
 
 func (k operatorKeyMap) FullHelp() [][]key.Binding {
-	return [][]key.Binding{{k.overview, k.runs, k.attention}, {k.next, k.previous}, {k.up, k.down}, {k.open, k.back}, {k.lifecycle, k.repository}, {k.nextPage, k.previousPage}, {k.refresh, k.help, k.quit}}
+	return [][]key.Binding{{k.overview, k.runs, k.attention, k.repositories}, {k.next, k.previous}, {k.up, k.down}, {k.open, k.back, k.enable}, {k.lifecycle, k.repository}, {k.nextPage, k.previousPage}, {k.refresh, k.help, k.quit}}
 }
 
 var operatorKeys = operatorKeyMap{
@@ -167,35 +169,40 @@ var operatorKeys = operatorKeyMap{
 	overview:     key.NewBinding(key.WithKeys("1"), key.WithHelp("1", "overview")),
 	runs:         key.NewBinding(key.WithKeys("2"), key.WithHelp("2", "runs")),
 	attention:    key.NewBinding(key.WithKeys("3"), key.WithHelp("3", "attention")),
+	repositories: key.NewBinding(key.WithKeys("4"), key.WithHelp("4", "repositories")),
 	open:         key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "open run")),
 	back:         key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "back")),
 	lifecycle:    key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "lifecycle filter")),
 	repository:   key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "repository filter")),
+	enable:       key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "enable repository")),
 	nextPage:     key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "next page")),
 	previousPage: key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "previous page")),
 }
 
 type operatorModel struct {
-	ctx             context.Context
-	cancel          context.CancelFunc
-	loader          operatorLoader
-	now             func() time.Time
-	refreshInterval time.Duration
-	width           int
-	height          int
-	batch           *operatorOverviewBatch
-	initialError    *operatorSafeError
-	staleError      *operatorSafeError
-	refreshing      bool
-	generation      int64
-	tickerStarted   bool
-	help            help.Model
-	focus           operatorPanel
-	panels          map[operatorPanel]operatorPanelState
-	route           operatorRoute
-	runs            operatorRunsState
-	attention       operatorAttentionState
-	detail          operatorRunDetailState
+	ctx              context.Context
+	cancel           context.CancelFunc
+	loader           operatorLoader
+	now              func() time.Time
+	newRequestID     func() string
+	refreshInterval  time.Duration
+	width            int
+	height           int
+	batch            *operatorOverviewBatch
+	initialError     *operatorSafeError
+	staleError       *operatorSafeError
+	refreshing       bool
+	generation       int64
+	tickerStarted    bool
+	help             help.Model
+	focus            operatorPanel
+	panels           map[operatorPanel]operatorPanelState
+	route            operatorRoute
+	runs             operatorRunsState
+	attention        operatorAttentionState
+	detail           operatorRunDetailState
+	repositories     operatorRepositoriesState
+	repositoryDetail operatorRepositoryDetailState
 }
 
 func newOperatorModel(parent context.Context, loader operatorLoader) operatorModel {
@@ -206,6 +213,7 @@ func newOperatorModel(parent context.Context, loader operatorLoader) operatorMod
 		cancel:          cancel,
 		loader:          loader,
 		now:             func() time.Time { return time.Now().UTC() },
+		newRequestID:    newOperatorRequestID,
 		refreshInterval: operatorRefreshInterval,
 		refreshing:      true,
 		generation:      1,
@@ -216,9 +224,10 @@ func newOperatorModel(parent context.Context, loader operatorLoader) operatorMod
 			operatorRunsPanel:         {},
 			operatorAttentionPanel:    {},
 		},
-		route:     operatorOverviewRoute,
-		runs:      operatorRunsState{request: operatorRunsRequest{lifecycle: application.RunLifecycleActive}},
-		attention: operatorAttentionState{focus: operatorAttentionListFocus},
+		route:            operatorOverviewRoute,
+		runs:             operatorRunsState{request: operatorRunsRequest{lifecycle: application.RunLifecycleActive}},
+		attention:        operatorAttentionState{focus: operatorAttentionListFocus},
+		repositoryDetail: operatorRepositoryDetailState{operationStage: operatorRepositoryOperationIdle},
 	}
 }
 
@@ -269,6 +278,40 @@ func (m operatorModel) attentionLoadCommand(generation int64, request operatorAt
 			return operatorAttentionResultMsg{generation: generation, request: request, err: safeOperatorError(err)}
 		}
 		return operatorAttentionResultMsg{generation: generation, request: request, page: page}
+	}
+}
+
+func (m operatorModel) repositoriesLoadCommand(generation int64, request operatorRepositoriesRequest) tea.Cmd {
+	ctx, loader, observedAt := m.ctx, m.loader, m.now().UTC()
+	request.previous = append([]string(nil), request.previous...)
+	return func() tea.Msg {
+		page, err := loader.LoadRepositories(ctx, request.cursor, observedAt)
+		if err != nil {
+			return operatorRepositoriesResultMsg{generation: generation, request: request, err: safeOperatorError(err)}
+		}
+		return operatorRepositoriesResultMsg{generation: generation, request: request, page: page}
+	}
+}
+
+func (m operatorModel) repositoryDetailLoadCommand(generation int64, repository string) tea.Cmd {
+	ctx, loader, observedAt := m.ctx, m.loader, m.now().UTC()
+	return func() tea.Msg {
+		detail, err := loader.LoadRepositoryDetail(ctx, repository, observedAt)
+		if err != nil {
+			return operatorRepositoryDetailResultMsg{generation: generation, repository: repository, err: safeOperatorError(err)}
+		}
+		return operatorRepositoryDetailResultMsg{generation: generation, repository: repository, detail: detail}
+	}
+}
+
+func (m operatorModel) repositoryEnableCommand(generation int64, repository, requestID string) tea.Cmd {
+	ctx, loader := m.ctx, m.loader
+	return func() tea.Msg {
+		result, err := loader.EnableRepository(ctx, repository, requestID)
+		if err != nil {
+			return operatorRepositoryOperationResultMsg{generation: generation, repository: repository, requestID: requestID, err: safeOperatorError(err)}
+		}
+		return operatorRepositoryOperationResultMsg{generation: generation, repository: repository, requestID: requestID, result: result}
 	}
 }
 
@@ -380,6 +423,80 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.tickCommand()
 		}
 		return m, nil
+	case operatorRepositoriesResultMsg:
+		if m.route != operatorRepositoriesRoute || msg.generation != m.repositories.generation {
+			return m, nil
+		}
+		m.repositories.refreshing, m.repositories.pending = false, nil
+		if msg.err.Message != "" {
+			if m.repositories.page == nil {
+				m.repositories.request = msg.request
+				m.repositories.initialError = &msg.err
+			} else {
+				m.repositories.staleError = &msg.err
+			}
+			return m, nil
+		}
+		selected := m.selectedRepository()
+		page := msg.page
+		m.repositories.page, m.repositories.request = &page, msg.request
+		m.repositories.initialError, m.repositories.staleError = nil, nil
+		m.restoreRepositorySelection(selected)
+		if !m.tickerStarted {
+			m.tickerStarted = true
+			return m, m.tickCommand()
+		}
+		return m, nil
+	case operatorRepositoryDetailResultMsg:
+		if m.route != operatorRepositoryDetailRoute || msg.generation != m.repositoryDetail.generation || msg.repository != m.repositoryDetail.repository {
+			return m, nil
+		}
+		m.repositoryDetail.refreshing = false
+		if msg.err.Message != "" {
+			if m.repositoryDetail.detail == nil {
+				m.repositoryDetail.initialError = &msg.err
+			} else {
+				m.repositoryDetail.staleError = &msg.err
+			}
+			return m, nil
+		}
+		detail := msg.detail
+		m.repositoryDetail.detail = &detail
+		m.repositoryDetail.initialError, m.repositoryDetail.staleError = nil, nil
+		m.repositoryDetail.dimensionIndex = clamp(m.repositoryDetail.dimensionIndex, 0, max(len(detail.Dimensions)-1, 0))
+		if !m.tickerStarted {
+			m.tickerStarted = true
+			return m, m.tickCommand()
+		}
+		return m, nil
+	case operatorRepositoryOperationResultMsg:
+		state := &m.repositoryDetail
+		if m.route != operatorRepositoryDetailRoute || state.operationStage != operatorRepositoryOperationPending || msg.generation != state.operationGeneration || msg.repository != state.repository || msg.requestID != state.requestID {
+			return m, nil
+		}
+		if msg.err.Message != "" {
+			state.operationError = &msg.err
+			if msg.err.Category == application.ErrorUnavailable || msg.err.Category == application.ErrorInternal {
+				state.operationStage = operatorRepositoryOperationRetryable
+			} else {
+				state.operationStage = operatorRepositoryOperationFailed
+			}
+			return m, nil
+		}
+		receipt := msg.result.Receipt
+		state.receipt, state.operationError = &receipt, nil
+		switch receipt.Outcome {
+		case application.OperationOutcomeSucceeded:
+			state.operationStage = operatorRepositoryOperationSucceeded
+			return m, m.startRepositoryDetailRefresh()
+		case application.OperationOutcomePending, application.OperationOutcomeAmbiguous:
+			state.operationStage = operatorRepositoryOperationRetryable
+			state.operationError = &operatorSafeError{Category: application.ErrorUnavailable, Message: "repository enablement outcome is uncertain"}
+		default:
+			state.operationStage = operatorRepositoryOperationFailed
+			state.operationError = &operatorSafeError{Category: application.ErrorConflict, Message: "repository enablement did not succeed"}
+		}
+		return m, nil
 	case operatorRefreshTickMsg:
 		next := m.tickCommand()
 		switch m.route {
@@ -399,6 +516,14 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.detail.detail != nil && !m.detail.refreshing {
 				return m, tea.Batch(next, m.startDetailRefresh())
 			}
+		case operatorRepositoriesRoute:
+			if m.repositories.page != nil && !m.repositories.refreshing {
+				return m, tea.Batch(next, m.startRepositoriesRefresh(m.repositories.request))
+			}
+		case operatorRepositoryDetailRoute:
+			if m.repositoryDetail.detail != nil && !m.repositoryDetail.refreshing && m.repositoryDetail.operationStage != operatorRepositoryOperationConfirming && m.repositoryDetail.operationStage != operatorRepositoryOperationPending {
+				return m, tea.Batch(next, m.startRepositoryDetailRefresh())
+			}
 		}
 		return m, next
 	case tea.KeyPressMsg:
@@ -413,26 +538,65 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, operatorKeys.quit):
 			m.cancel()
 			return m, tea.Quit
+		case m.route == operatorRepositoryDetailRoute && m.repositoryDetail.operationStage == operatorRepositoryOperationPending:
+			return m, nil
+		case m.route == operatorRepositoryDetailRoute && m.repositoryDetail.operationStage == operatorRepositoryOperationConfirming && key.Matches(msg, operatorKeys.open):
+			requestID := m.newRequestID()
+			if requestID == "" {
+				m.repositoryDetail.operationStage = operatorRepositoryOperationFailed
+				m.repositoryDetail.operationError = &operatorSafeError{Category: application.ErrorInternal, Message: "repository enablement request could not be created"}
+				return m, nil
+			}
+			m.repositoryDetail.requestID = requestID
+			m.repositoryDetail.operationGeneration++
+			m.repositoryDetail.operationStage = operatorRepositoryOperationPending
+			m.repositoryDetail.operationError, m.repositoryDetail.receipt = nil, nil
+			return m, m.repositoryEnableCommand(m.repositoryDetail.operationGeneration, m.repositoryDetail.repository, requestID)
+		case m.route == operatorRepositoryDetailRoute && m.repositoryDetail.operationStage == operatorRepositoryOperationConfirming && key.Matches(msg, operatorKeys.back):
+			m.repositoryDetail.operationStage = operatorRepositoryOperationIdle
+			return m, nil
+		case m.route == operatorRepositoryDetailRoute && m.repositoryDetail.operationStage == operatorRepositoryOperationConfirming:
+			return m, nil
+		case m.route == operatorRepositoryDetailRoute && m.repositoryDetail.operationStage == operatorRepositoryOperationRetryable && key.Matches(msg, operatorKeys.open):
+			m.repositoryDetail.operationGeneration++
+			m.repositoryDetail.operationStage = operatorRepositoryOperationPending
+			m.repositoryDetail.operationError = nil
+			return m, m.repositoryEnableCommand(m.repositoryDetail.operationGeneration, m.repositoryDetail.repository, m.repositoryDetail.requestID)
 		case key.Matches(msg, operatorKeys.overview):
+			m.invalidateRepositoryReadsForRouteChange(operatorOverviewRoute)
 			m.route = operatorOverviewRoute
 			if !m.refreshing {
 				return m, m.startOverviewRefresh()
 			}
 			return m, nil
 		case key.Matches(msg, operatorKeys.runs):
+			m.invalidateRepositoryReadsForRouteChange(operatorRunsRoute)
 			m.route = operatorRunsRoute
 			if !m.runs.refreshing {
 				return m, m.startRunsRefresh(m.runs.request)
 			}
 			return m, nil
 		case key.Matches(msg, operatorKeys.attention):
+			m.invalidateRepositoryReadsForRouteChange(operatorAttentionRoute)
 			m.route = operatorAttentionRoute
 			if !m.attention.refreshing {
 				return m, m.startAttentionRefresh(m.attention.request)
 			}
 			return m, nil
+		case key.Matches(msg, operatorKeys.repositories):
+			m.invalidateRepositoryReadsForRouteChange(operatorRepositoriesRoute)
+			m.route = operatorRepositoriesRoute
+			if !m.repositories.refreshing {
+				return m, m.startRepositoriesRefresh(m.repositories.request)
+			}
+			return m, nil
 		case m.route == operatorRunDetailRoute && key.Matches(msg, operatorKeys.back):
 			m.route = m.detail.returnRoute
+			return m, nil
+		case m.route == operatorRepositoryDetailRoute && key.Matches(msg, operatorKeys.back):
+			returnRoute := m.repositoryDetail.returnRoute
+			m.invalidateRepositoryReadsForRouteChange(returnRoute)
+			m.route = returnRoute
 			return m, nil
 		case key.Matches(msg, operatorKeys.refresh):
 			switch m.route {
@@ -451,6 +615,14 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case operatorRunDetailRoute:
 				if !m.detail.refreshing {
 					return m, m.startDetailRefresh()
+				}
+			case operatorRepositoriesRoute:
+				if !m.repositories.refreshing {
+					return m, m.startRepositoriesRefresh(m.repositories.request)
+				}
+			case operatorRepositoryDetailRoute:
+				if !m.repositoryDetail.refreshing && m.repositoryDetail.operationStage != operatorRepositoryOperationConfirming {
+					return m, m.startRepositoryDetailRefresh()
 				}
 			}
 			return m, nil
@@ -472,6 +644,13 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case m.route == operatorOverviewRoute && m.batch != nil && key.Matches(msg, operatorKeys.open):
 			if m.focus == operatorRunsPanel {
 				return m.openRunDetail(m.selectedOverviewRunID(), operatorOverviewRoute)
+			}
+			if m.focus == operatorRepositoriesPanel {
+				rows := m.panelRows(operatorRepositoriesPanel)
+				index := m.panels[operatorRepositoriesPanel].index
+				if index >= 0 && index < len(rows) {
+					return m.openRepositoryDetail(rows[index].id, operatorOverviewRoute)
+				}
 			}
 			return m, nil
 		case m.route == operatorRunsRoute && m.runs.page != nil && key.Matches(msg, operatorKeys.up):
@@ -541,6 +720,44 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.startAttentionRefresh(request)
 			}
 			return m, nil
+		case m.route == operatorRepositoriesRoute && m.repositories.page != nil && key.Matches(msg, operatorKeys.up):
+			m.moveRepositorySelection(-1)
+			return m, nil
+		case m.route == operatorRepositoriesRoute && m.repositories.page != nil && key.Matches(msg, operatorKeys.down):
+			m.moveRepositorySelection(1)
+			return m, nil
+		case m.route == operatorRepositoriesRoute && m.repositories.page != nil && key.Matches(msg, operatorKeys.open):
+			return m.openRepositoryDetail(m.selectedRepository(), operatorRepositoriesRoute)
+		case m.route == operatorRepositoriesRoute && m.repositories.page != nil && key.Matches(msg, operatorKeys.nextPage):
+			if m.repositories.page.Collection.NextCursor != "" {
+				request := m.repositories.request
+				request.previous = append(append([]string(nil), request.previous...), request.cursor)
+				request.cursor = m.repositories.page.Collection.NextCursor
+				return m, m.startRepositoriesRefresh(request)
+			}
+			return m, nil
+		case m.route == operatorRepositoriesRoute && m.repositories.page != nil && key.Matches(msg, operatorKeys.previousPage):
+			if len(m.repositories.request.previous) != 0 {
+				request := m.repositories.request
+				request.cursor = request.previous[len(request.previous)-1]
+				request.previous = append([]string(nil), request.previous[:len(request.previous)-1]...)
+				return m, m.startRepositoriesRefresh(request)
+			}
+			return m, nil
+		case m.route == operatorRepositoryDetailRoute && m.repositoryDetail.detail != nil && key.Matches(msg, operatorKeys.enable):
+			if m.repositoryEnableCanStart() {
+				m.repositoryDetail.generation++
+				m.repositoryDetail.refreshing = false
+				m.repositoryDetail.operationStage = operatorRepositoryOperationConfirming
+				m.repositoryDetail.operationError, m.repositoryDetail.receipt, m.repositoryDetail.requestID = nil, nil, ""
+			}
+			return m, nil
+		case m.route == operatorRepositoryDetailRoute && m.repositoryDetail.detail != nil && key.Matches(msg, operatorKeys.up):
+			m.repositoryDetail.dimensionIndex = clamp(m.repositoryDetail.dimensionIndex-1, 0, max(len(m.repositoryDetail.detail.Dimensions)-1, 0))
+			return m, nil
+		case m.route == operatorRepositoryDetailRoute && m.repositoryDetail.detail != nil && key.Matches(msg, operatorKeys.down):
+			m.repositoryDetail.dimensionIndex = clamp(m.repositoryDetail.dimensionIndex+1, 0, max(len(m.repositoryDetail.detail.Dimensions)-1, 0))
+			return m, nil
 		case m.route == operatorRunDetailRoute && m.detail.detail != nil && key.Matches(msg, operatorKeys.up):
 			m.detail.gateIndex = clamp(m.detail.gateIndex-1, 0, max(len(m.detail.detail.Gates)-1, 0))
 			return m, nil
@@ -557,6 +774,21 @@ func (m *operatorModel) startOverviewRefresh() tea.Cmd {
 	m.generation++
 	m.refreshing = true
 	return m.overviewLoadCommand(m.generation)
+}
+
+func (m *operatorModel) invalidateRepositoryReadsForRouteChange(target operatorRoute) {
+	if m.route == target {
+		return
+	}
+	if m.route == operatorRepositoriesRoute {
+		m.repositories.generation++
+		m.repositories.refreshing = false
+		m.repositories.pending = nil
+	}
+	if m.route == operatorRepositoryDetailRoute {
+		m.repositoryDetail.generation++
+		m.repositoryDetail.refreshing = false
+	}
 }
 
 func (m *operatorModel) startRunsRefresh(request operatorRunsRequest) tea.Cmd {
@@ -595,6 +827,29 @@ func (m *operatorModel) startDetailRefresh() tea.Cmd {
 	return m.detailLoadCommand(m.detail.generation, m.detail.runID)
 }
 
+func (m *operatorModel) startRepositoriesRefresh(request operatorRepositoriesRequest) tea.Cmd {
+	if m.repositories.refreshing {
+		return nil
+	}
+	m.repositories.initialError = nil
+	m.repositories.generation++
+	m.repositories.refreshing = true
+	copy := request
+	copy.previous = append([]string(nil), request.previous...)
+	m.repositories.pending = &copy
+	return m.repositoriesLoadCommand(m.repositories.generation, copy)
+}
+
+func (m *operatorModel) startRepositoryDetailRefresh() tea.Cmd {
+	if m.repositoryDetail.refreshing || m.repositoryDetail.repository == "" {
+		return nil
+	}
+	m.repositoryDetail.initialError = nil
+	m.repositoryDetail.generation++
+	m.repositoryDetail.refreshing = true
+	return m.repositoryDetailLoadCommand(m.repositoryDetail.generation, m.repositoryDetail.repository)
+}
+
 func (m operatorModel) openRunDetail(runID string, returnRoute operatorRoute) (tea.Model, tea.Cmd) {
 	if runID == "" {
 		return m, nil
@@ -606,6 +861,20 @@ func (m operatorModel) openRunDetail(runID string, returnRoute operatorRoute) (t
 	}
 	m.route = operatorRunDetailRoute
 	return m, m.startDetailRefresh()
+}
+
+func (m operatorModel) openRepositoryDetail(repository string, returnRoute operatorRoute) (tea.Model, tea.Cmd) {
+	if repository == "" {
+		return m, nil
+	}
+	m.invalidateRepositoryReadsForRouteChange(operatorRepositoryDetailRoute)
+	if m.repositoryDetail.repository != repository {
+		m.repositoryDetail = operatorRepositoryDetailState{repository: repository, returnRoute: returnRoute, operationStage: operatorRepositoryOperationIdle}
+	} else {
+		m.repositoryDetail.returnRoute = returnRoute
+	}
+	m.route = operatorRepositoryDetailRoute
+	return m, m.startRepositoryDetailRefresh()
 }
 
 func (m operatorModel) updateRepositoryEditor(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -998,16 +1267,20 @@ func (m operatorModel) attentionTargetLabel(targetID string) string {
 }
 
 var reasonPresentations = map[string]string{
-	"admission_authority_conflict": "admission authority conflict",
-	"cleanup_residue":              "cleanup residue",
-	"human_decision_required":      "human decision required",
-	"incomplete_authority":         "incomplete authority",
-	"lease_lost":                   "lease lost",
-	"legacy_ci_topology_drift":     "legacy CI topology drift",
-	"manual_intervention":          "manual intervention",
-	"manual_state":                 "manual state",
-	"terminal_failure":             "terminal failure",
-	"top_priority_tie":             "top priority tie",
+	"admission_authority_conflict":  "admission authority conflict",
+	"cleanup_residue":               "cleanup residue",
+	"human_decision_required":       "human decision required",
+	"incomplete_authority":          "incomplete authority",
+	"lease_lost":                    "lease lost",
+	"legacy_ci_topology_drift":      "legacy CI topology drift",
+	"manual_intervention":           "manual intervention",
+	"manual_state":                  "manual state",
+	"terminal_failure":              "terminal failure",
+	"top_priority_tie":              "top priority tie",
+	"repository_disabled":           "repository disabled",
+	"repository_busy":               "repository busy",
+	"readiness_recheck_in_progress": "readiness recheck in progress",
+	"available":                     "available",
 }
 
 func reasonPresentation(reason string) string {
@@ -1037,8 +1310,8 @@ func (m operatorModel) View() tea.View {
 
 func (m operatorModel) render() string {
 	if m.width < operatorMinimumWidth || m.height < operatorMinimumHeight {
-		navigation := "1 Overview  ·  2 Runs  ·  3 Attention"
-		if m.route == operatorRunDetailRoute {
+		navigation := "1 Overview  ·  2 Runs  ·  3 Attention  ·  4 Repositories"
+		if m.route == operatorRunDetailRoute || m.route == operatorRepositoryDetailRoute {
 			navigation += "  ·  Esc back"
 		}
 		return lipgloss.NewStyle().Padding(1, 2).Render(fmt.Sprintf("Terminal too small\n\nCurrent: %dx%d\nRequired: 80x24 minimum\n\n%s  ·  q / Ctrl-C quit", m.width, m.height, navigation))
@@ -1048,8 +1321,12 @@ func (m operatorModel) render() string {
 		return m.renderRunsScreen()
 	case operatorAttentionRoute:
 		return m.renderAttentionScreen()
+	case operatorRepositoriesRoute:
+		return m.renderRepositoriesScreen()
 	case operatorRunDetailRoute:
 		return m.renderRunDetailScreen()
+	case operatorRepositoryDetailRoute:
+		return m.renderRepositoryDetailScreen()
 	default:
 		return m.renderOverviewScreen()
 	}
@@ -1058,9 +1335,9 @@ func (m operatorModel) render() string {
 func (m operatorModel) renderOverviewScreen() string {
 	if m.batch == nil {
 		if m.initialError != nil {
-			return lipgloss.NewStyle().Padding(1, 2).Render("Operator Overview unavailable\n\n" + m.initialError.String() + "\n\nr retry · 2 Runs · 3 Attention · q / Ctrl-C quit")
+			return lipgloss.NewStyle().Padding(1, 2).Render("Operator Overview unavailable\n\n" + m.initialError.String() + "\n\nr retry · 2 Runs · 3 Attention · 4 Repositories · q / Ctrl-C quit")
 		}
-		return lipgloss.NewStyle().Padding(1, 2).Render("Agent Loop Controller\n\nLoading operator overview…\n\n2 Runs · 3 Attention · q / Ctrl-C quit")
+		return lipgloss.NewStyle().Padding(1, 2).Render("Agent Loop Controller\n\nLoading operator overview…\n\n2 Runs · 3 Attention · 4 Repositories · q / Ctrl-C quit")
 	}
 	header := lipgloss.JoinVertical(lipgloss.Left, m.renderHeader(), m.renderHealth())
 	footer := m.renderHelp()
@@ -1536,9 +1813,9 @@ func (m operatorModel) renderHelp() string {
 		if m.runs.repositoryEditing {
 			value = "type exact owner/repository · enter apply · esc cancel"
 		} else if m.help.ShowAll {
-			value = "1 overview · 2 runs · 3 attention · ↑/↓ select · enter open · f lifecycle · / repository · n/p page · r refresh · ? help · q quit"
+			value = "1 overview · 2 runs · 3 attention · 4 repositories · ↑/↓ select · enter open · f lifecycle · / repository · n/p page · r refresh · ? help · q quit"
 		} else {
-			value = "1/2/3 navigate · ↑/↓ select · enter open · f filter · / repository · n/p page · r refresh · ? · q"
+			value = "1/2/3/4 navigate · ↑/↓ select · enter open · f filter · / repository · n/p page · r refresh · ? · q"
 		}
 	case operatorAttentionRoute:
 		open := ""
@@ -1546,20 +1823,39 @@ func (m operatorModel) renderHelp() string {
 			open = " · enter open run"
 		}
 		if m.help.ShowAll {
-			value = "1 overview · 2 runs · 3 attention · tab list/summary · ↑/↓ select or scroll" + open + " · n/p page · r refresh · ? help · q quit"
+			value = "1 overview · 2 runs · 3 attention · 4 repositories · tab list/summary · ↑/↓ select or scroll" + open + " · n/p page · r refresh · ? help · q quit"
 		} else {
-			value = "1/2/3 navigate · tab region · ↑/↓ select/scroll" + open + " · n/p page · r refresh · ? · q"
+			value = "1/2/3/4 navigate · tab region · ↑/↓ select/scroll" + open + " · n/p page · r refresh · ? · q"
 		}
 	case operatorRunDetailRoute:
-		value = "1/2/3 navigate · esc back · ↑/↓ delivery gates · r refresh · ? help · q quit"
+		value = "1/2/3/4 navigate · esc back · ↑/↓ delivery gates · r refresh · ? help · q quit"
+	case operatorRepositoriesRoute:
+		value = "1/2/3/4 navigate · ↑/↓ select · enter open · n/p page · r refresh · ? · q"
+	case operatorRepositoryDetailRoute:
+		switch m.repositoryDetail.operationStage {
+		case operatorRepositoryOperationConfirming:
+			value = "enter confirm enable · esc cancel · q quit"
+		case operatorRepositoryOperationPending:
+			value = "enablement pending · q quit"
+		case operatorRepositoryOperationRetryable:
+			value = "enter retry same request · esc back · q quit"
+		default:
+			value = "1/2/3/4 navigate · esc back · ↑/↓ dimensions · r refresh · ? help · q quit"
+			if m.repositoryEnableCanStart() {
+				value = "1/2/3/4 navigate · esc back · ↑/↓ dimensions · e enable · r refresh · ? · q"
+			}
+		}
 	default:
 		if m.help.ShowAll {
-			value = "1 overview · 2 runs · 3 attention · tab/shift+tab panels · ↑/↓ or j/k select · r refresh · ? help · q quit"
+			value = "1 overview · 2 runs · 3 attention · 4 repositories · tab/shift+tab panels · ↑/↓ or j/k select · r refresh · ? help · q quit"
 		} else {
-			value = "1/2/3 navigate · tab panels · ↑/↓ select · r refresh · ? · q"
+			value = "1/2/3/4 navigate · tab panels · ↑/↓ select · r refresh · ? · q"
 		}
 		if m.focus == operatorRunsPanel && m.batch != nil && len(m.panelRows(operatorRunsPanel)) != 0 {
-			value = "1/2/3 navigate · tab panels · ↑/↓ select · enter open run · r refresh · ? · q"
+			value = "1/2/3/4 navigate · tab panels · ↑/↓ select · enter open run · r refresh · ? · q"
+		}
+		if m.focus == operatorRepositoriesPanel && m.batch != nil && len(m.panelRows(operatorRepositoriesPanel)) != 0 {
+			value = "1/2/3/4 navigate · tab panels · ↑/↓ select · enter open repository · r refresh · ? · q"
 		}
 	}
 	return " " + ansi.Truncate(value, max(m.width-2, 1), "…") + " "
@@ -1597,7 +1893,13 @@ var presentationLabels = map[string]string{
 	"approval": "APPROVAL", "merge": "MERGE", "cleanup": "CLEANUP", "independent_review": "INDEPENDENT REVIEW",
 	"branch_publication": "BRANCH PUBLICATION", "required_checks": "REQUIRED CHECKS", "review_conversations": "REVIEW CONVERSATIONS",
 	"source_checkout": "SOURCE CHECKOUT", "pending": "PENDING", "passed": "PASSED", "blocked": "BLOCKED",
-	"run_detail": "RUN DETAIL", "warning": "WARNING", "error": "ERROR",
+	"run_detail": "RUN DETAIL", "warning": "WARNING", "error": "ERROR", "observed": "OBSERVED", "succeeded": "SUCCEEDED",
+	"accepting_new_work": "ACCEPTING NEW WORK", "enable_repository": "ENABLE REPOSITORY",
+	"resolve_readiness": "RESOLVE READINESS", "resolve_conflict": "RESOLVE CONFLICT",
+	"refresh_authority": "REFRESH AUTHORITY", "inspect_unavailability": "INSPECT UNAVAILABILITY",
+	"profile_configuration": "PROFILE CONFIGURATION", "configuration_convergence": "CONFIGURATION CONVERGENCE",
+	"local_checkout": "LOCAL CHECKOUT", "base_branch": "BASE BRANCH", "github_repository": "GITHUB REPOSITORY",
+	"github_app": "GITHUB APP", "linear_label": "LINEAR LABEL", "verifier_policy": "VERIFIER POLICY",
 }
 
 func presentationLabel(value string) string {

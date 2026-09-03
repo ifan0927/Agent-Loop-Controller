@@ -151,8 +151,9 @@ completed controller, bounded-concurrency, and authorization foundation
 ```
 
 `agentctl` is the implemented canonical executable. The worker entrypoint is
-`agentctl controller worker`; the read-only Overview, Runs, complete Attention
-inbox, and shared Run detail are available through `agentctl operator`. New launchd installations use the
+`agentctl controller worker`; Overview, Runs, the complete read-only Attention
+inbox, shared Run detail, Repositories, and shared Repository detail with
+explicit enablement are available through `agentctl operator`. New launchd installations use the
 neutral service identity, and legacy installations have a bounded reversible
 migration rather than a second runtime path.
 
@@ -205,7 +206,8 @@ runs as a separate process from the worker, reads durable Controller state
 through typed application projections, and invokes only Controller-owned legal
 actions. Closing or crashing the TUI must not stop Controller execution.
 
-The read-only Overview, Runs, complete Attention inbox, and shared Run detail are implemented with Bubble
+Overview, Runs, the complete read-only Attention inbox, shared Run detail,
+Repositories, and shared Repository detail are implemented with Bubble
 Tea v2, Bubbles v2, and Lip Gloss v2. Overview presents projected health,
 repositories, active-before-recently-ended runs, and actionable attention.
 Runs provides stable local Controller-reader Active/Ended/All and canonical
@@ -216,15 +218,19 @@ delivery-gate result without mutation controls. The TUI uses bounded responsive
 layouts and preserves the last complete screen across sanitized refresh
 failures. Its
 observation header, projected health card, content-sized panels, explicit focus,
-and redundant status markers make the same bounded evidence easier to scan. It
-has no mutation actions. Attention adds stable local Controller-reader
+and redundant status markers make the same bounded evidence easier to scan.
+Attention adds stable local Controller-reader
 severity/time/event pagination, item-bound safe summaries of current offers, explicit no-offer
 rows, and application-owned Run-detail navigation without completing the later
-R07 decision mutation. Repository and Onboarding application collections now
-use the same stable local Controller reader with family-specific pagination,
-while detail and mutation authority remains target-specific. The remaining
-navigation surface is Queue, Repositories, Onboarding, Settings, and
-System/Audit, but stable Controller projections determine screen details.
+R07 decision mutation. Repositories uses the stable local Controller reader,
+opaque pagination, and target-authorized shared detail with an application-owned
+acceptance conclusion and eight readiness dimensions. R08 is complete: only a
+currently authorized ready-disabled repository exposes the first narrow TUI
+mutation, an explicitly confirmed receipt-backed enable operation. Disable,
+recheck, removal, onboarding, run, and Attention mutations remain planned or
+CLI-only. Onboarding application collections retain the same stable reader
+foundation. The remaining navigation surface is Queue, Onboarding, Settings,
+and System/Audit, but stable Controller projections determine screen details.
 
 The fixed product metric remains ten complete operator-intent scenarios from
 [#100](https://github.com/ifan0927/Agent-Loop-Controller/issues/100), worth ten

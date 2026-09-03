@@ -220,6 +220,7 @@ type RepositoryLifecycleFailure struct {
 type RepositoryLifecycleStore interface {
 	OperationReceiptStore
 	ControllerRepositoryCollectionStore
+	FindRepositoryOperationReceipt(context.Context, OperationType, string, domain.GitHubUserIdentity, string, string) (OperationReceipt, bool, error)
 	AdoptRepositoryLifecycleBaseline(context.Context, RepositoryBaselineInput) error
 	RepositoryOperationAuthority(context.Context, string) (RepositoryOperationAuthority, error)
 	GetAuthorizedRepository(context.Context, string, AuthorizedScopeSet) (RepositoryProjection, error)
@@ -379,9 +380,10 @@ func (s *RepositoryService) Inspect(ctx context.Context, requester Requester, re
 }
 
 type RepositoryMutationCommand struct {
-	Requester  Requester `json:"requester"`
-	Repository string    `json:"repository"`
-	RequestID  string    `json:"request_id"`
+	Requester                      Requester                        `json:"requester"`
+	Repository                     string                           `json:"repository"`
+	RequestID                      string                           `json:"request_id"`
+	ExpectedConfigurationAuthority *ConfigurationAdmissionAuthority `json:"-"`
 }
 
 type RepositoryMutationResult struct {
@@ -405,11 +407,43 @@ func (s *RepositoryService) changeLifecycle(ctx context.Context, command Reposit
 	if strings.TrimSpace(command.RequestID) == "" || len(command.RequestID) > 128 || strings.ContainsRune(command.RequestID, '\x00') {
 		return RepositoryMutationResult{}, serviceError(ErrorInvalidInput, "repository request ID is invalid", nil)
 	}
+	requestDigest := digestText("repository-lifecycle-request-v1\x00" + string(operationType) + "\x00" + profile.Authority.Repository + "\x00" + command.RequestID)
 	authority, err := s.store.RepositoryOperationAuthority(ctx, profile.Authority.Repository)
 	if err != nil {
 		return RepositoryMutationResult{}, classifyRepositoryError(err)
 	}
-	requestDigest := digestText("repository-lifecycle-request-v1\x00" + string(operationType) + "\x00" + profile.Authority.Repository + "\x00" + command.RequestID)
+	if expected := command.ExpectedConfigurationAuthority; expected != nil {
+		if !expected.Valid() {
+			return RepositoryMutationResult{}, serviceError(ErrorInvalidInput, "expected configuration authority is invalid", nil)
+		}
+		current := authority.ConfigurationAuthority
+		if expected.GenerationID != current.GenerationID || expected.Digest != current.Digest || expected.AuthorityVersion != current.AuthorityVersion {
+			return RepositoryMutationResult{}, serviceError(ErrorConflict, "repository configuration authority changed", ErrRepositoryLifecycleConflict)
+		}
+	}
+	prior, found, err := s.store.FindRepositoryOperationReceipt(ctx, operationType, profile.Authority.Repository, command.RequesterIdentity(), requestDigest, profile.Authority.BindingDigest)
+	if err != nil {
+		return RepositoryMutationResult{}, classifyRepositoryError(err)
+	}
+	if found {
+		projection, inspectErr := s.Inspect(ctx, command.Requester, command.Repository)
+		if inspectErr != nil {
+			return RepositoryMutationResult{}, inspectErr
+		}
+		if prior.Outcome != OperationOutcomePending {
+			return RepositoryMutationResult{Repository: projection, Receipt: prior}, nil
+		}
+		if repositoryOperationAuthorityDigest(authority) != prior.ExpectedAuthorityDigest {
+			_ = s.store.SettleRepositoryLifecycleFailure(ctx, RepositoryLifecycleFailure{OperationID: prior.OperationID, Outcome: OperationOutcomeConflict, ReasonCode: "lifecycle_authority_conflict", SettledAt: s.now().UTC()})
+			return RepositoryMutationResult{}, serviceError(ErrorConflict, "repository authority changed", ErrRepositoryLifecycleConflict)
+		}
+		projection, prior, err = s.store.ChangeRepositoryLifecycle(ctx, RepositoryLifecycleChange{OperationID: prior.OperationID, Expected: authority, Intent: intent, ChangedAt: s.now().UTC()})
+		if err != nil {
+			_ = s.store.SettleRepositoryLifecycleFailure(ctx, RepositoryLifecycleFailure{OperationID: prior.OperationID, Outcome: OperationOutcomeConflict, ReasonCode: "lifecycle_authority_conflict", SettledAt: s.now().UTC()})
+			return RepositoryMutationResult{}, classifyRepositoryError(err)
+		}
+		return RepositoryMutationResult{Repository: projection, Receipt: prior}, nil
+	}
 	authorityDigest := repositoryOperationAuthorityDigest(authority)
 	anchorPrefix := "repository-lifecycle-v1"
 	if authority.Lifecycle.Intent == intent {

@@ -23,6 +23,9 @@ type operatorLoader interface {
 	LoadRuns(context.Context, application.RunLifecycleFilter, string, string, time.Time) (application.RoutineRunPage, error)
 	LoadAttention(context.Context, string, time.Time) (application.RoutineAttentionPage, error)
 	LoadRunDetail(context.Context, string, time.Time) (application.RoutineRunDetail, error)
+	LoadRepositories(context.Context, string, time.Time) (application.RoutineRepositoryPage, error)
+	LoadRepositoryDetail(context.Context, string, time.Time) (application.RoutineRepositoryDetail, error)
+	EnableRepository(context.Context, string, string) (application.RepositoryMutationResult, error)
 }
 
 type operatorOverviewProjectionSource interface {
@@ -34,12 +37,14 @@ type operatorRepositoryProjectionSource interface {
 }
 
 type productionOperatorLoader struct {
-	overview     operatorOverviewProjectionSource
-	repositories operatorRepositoryProjectionSource
-	runs         *application.RoutineRunQueryService
-	attention    *application.RoutineAttentionQueryService
-	requester    application.Requester
-	reader       application.ControllerReadAuthority
+	overview          operatorOverviewProjectionSource
+	repositories      operatorRepositoryProjectionSource
+	repositoryQueries *application.RoutineRepositoryQueryService
+	runs              *application.RoutineRunQueryService
+	attention         *application.RoutineAttentionQueryService
+	requester         application.Requester
+	reader            application.ControllerReadAuthority
+	configPath        string
 }
 
 func (l *productionOperatorLoader) LoadOverview(ctx context.Context, observedAt time.Time) (operatorOverviewBatch, error) {
@@ -67,6 +72,36 @@ func (l *productionOperatorLoader) LoadAttention(ctx context.Context, cursor str
 	return l.attention.ListController(ctx, l.reader, application.RoutineAttentionQuery{Requester: l.requester, Scope: application.ScopeController, Limit: application.RoutineQueryDefaultLimit, Cursor: cursor}, observedAt.UTC())
 }
 
+func (l *productionOperatorLoader) LoadRepositories(ctx context.Context, cursor string, observedAt time.Time) (application.RoutineRepositoryPage, error) {
+	return l.repositoryQueries.ListController(ctx, l.reader, application.RoutineQueryDefaultLimit, cursor, observedAt.UTC())
+}
+
+func (l *productionOperatorLoader) LoadRepositoryDetail(ctx context.Context, repository string, observedAt time.Time) (application.RoutineRepositoryDetail, error) {
+	return l.repositoryQueries.Detail(ctx, l.requester, repository, observedAt.UTC())
+}
+
+func (l *productionOperatorLoader) EnableRepository(ctx context.Context, repository, requestID string) (application.RepositoryMutationResult, error) {
+	loaded, _, store, err := loadOperatorConfigurationCurrent(ctx, l.configPath)
+	if err != nil {
+		return application.RepositoryMutationResult{}, &application.ServiceError{Category: application.ErrorUnavailable, Message: "repository authority is unavailable"}
+	}
+	defer store.Close()
+	authority, present, err := store.ConfigurationAuthority(ctx)
+	if err != nil || !present || authority.Desired.GenerationID < 1 || authority.Version < 1 || loaded.Digest != authority.Desired.Digest {
+		return application.RepositoryMutationResult{}, &application.ServiceError{Category: application.ErrorConflict, Message: "repository authority changed"}
+	}
+	authorizer, err := application.NewAuthorizationService(application.ConfiguredOperatorIdentity{User: loaded.Controller.Operator})
+	if err != nil {
+		return application.RepositoryMutationResult{}, &application.ServiceError{Category: application.ErrorUnavailable, Message: "repository authority is unavailable"}
+	}
+	repositories, err := application.NewRepositoryService(store, authorizer, loaded.Registry, application.RepositoryObservers{})
+	if err != nil {
+		return application.RepositoryMutationResult{}, &application.ServiceError{Category: application.ErrorUnavailable, Message: "repository authority is unavailable"}
+	}
+	expected := application.ConfigurationAdmissionAuthority{GenerationID: authority.Desired.GenerationID, Digest: authority.Desired.Digest, AuthorityVersion: authority.Version, ValidThrough: time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)}
+	return repositories.Enable(ctx, application.RepositoryMutationCommand{Requester: l.requester, Repository: repository, RequestID: requestID, ExpectedConfigurationAuthority: &expected})
+}
+
 type operatorComposition struct {
 	loader operatorLoader
 	store  *sqlitestore.Store
@@ -79,10 +114,10 @@ func (c *operatorComposition) Close() error {
 	return c.store.Close()
 }
 
-// loadOperatorConfigurationReadOnly requires a completed current authority.
+// loadOperatorConfigurationCurrent requires a completed current authority.
 // It deliberately does not fall back to the live file, a baseline anchor, a
 // schema migration, or any managed composition helper that reconciles state.
-func loadOperatorConfigurationReadOnly(ctx context.Context, path string) (bootstrap.Bootstrap, *configurationadapter.Files, *sqlitestore.Store, error) {
+func loadOperatorConfigurationCurrent(ctx context.Context, path string) (bootstrap.Bootstrap, *configurationadapter.Files, *sqlitestore.Store, error) {
 	files, err := configurationadapter.NewFiles(path)
 	if err != nil {
 		return bootstrap.Bootstrap{}, nil, nil, errors.New("configuration authority is unavailable")
@@ -91,7 +126,7 @@ func loadOperatorConfigurationReadOnly(ctx context.Context, path string) (bootst
 	if err != nil || !found || locator.ConfigPath != path {
 		return bootstrap.Bootstrap{}, nil, nil, errors.New("configuration authority locator is unavailable")
 	}
-	store, err := sqlitestore.OpenConfigurationAuthorityReadOnly(ctx, locator.DatabasePath, path, locator.DatabaseIdentity)
+	store, err := sqlitestore.OpenConfigurationAuthorityCurrent(ctx, locator.DatabasePath, path, locator.DatabaseIdentity)
 	if err != nil {
 		return bootstrap.Bootstrap{}, nil, nil, errors.New("configuration authority store is unavailable")
 	}
@@ -122,7 +157,7 @@ func composeOperator(ctx context.Context, configOverride string) (*operatorCompo
 	if err != nil {
 		return nil, err
 	}
-	loaded, files, store, err := loadOperatorConfigurationReadOnly(ctx, path)
+	loaded, files, store, err := loadOperatorConfigurationCurrent(ctx, path)
 	if err != nil {
 		return nil, err
 	}
@@ -181,7 +216,7 @@ func composeOperator(ctx context.Context, configOverride string) (*operatorCompo
 		return closeWith(errors.New("attention projection service is unavailable"))
 	}
 	return &operatorComposition{
-		loader: &productionOperatorLoader{overview: overview, repositories: repositories, runs: runs, attention: attention, requester: requester, reader: reader},
+		loader: &productionOperatorLoader{overview: overview, repositories: repositories, repositoryQueries: repositories, runs: runs, attention: attention, requester: requester, reader: reader, configPath: path},
 		store:  store,
 	}, nil
 }

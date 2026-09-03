@@ -609,6 +609,17 @@ Attention tests cover exact event selection restoration, list/summary focus and
 scrolling, next/previous cursor stacks, no-op Enter for `none`, shared Run detail
 return, item-bound sanitized offer summaries, stale-screen preservation, safe
 initial failures, and compact/wide bounded rendering.
+Repository tests cover Overview and Repositories entry, stable next/previous
+cursor stacks, selection and return-state restoration, every application-owned
+acceptance conclusion, all eight dimensions, explicit enable confirmation,
+stable request replay, duplicate-submit fencing, settled receipt display,
+conflict and uncertain outcomes, post-success stale preservation, and late
+collection/detail/mutation generation fencing. Production-loader coverage uses
+a disposable current-schema store to prove ready-disabled-to-enabled lifecycle,
+receipt replay, admission availability, activity evidence, and unchanged worker
+observation without external calls. It also proves that a long-lived TUI cannot
+retain mutation authority after configured-operator rotation; application tests
+cover the configuration generation/digest/version CAS fence.
 
 ## Documentation Governance
 

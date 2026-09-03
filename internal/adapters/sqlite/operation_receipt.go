@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/ifan0927/Agent-Loop-Controller/internal/application"
@@ -12,6 +13,36 @@ import (
 )
 
 const operationReceiptSelect = `SELECT operation_id,authority_key,operation_anchor_digest,operation_type,scope_kind,target_id,requester_login,requester_database_id,requester_node_id,requester_actor_type,request_digest,expected_authority_digest,target_binding_digest,phase,outcome,resulting_authority_digest,resulting_state,resulting_version,evidence_digest,result_digest,accepted_at,applied_at,settled_at FROM operation_receipts`
+
+func (s *Store) FindRepositoryOperationReceipt(ctx context.Context, operationType application.OperationType, repository string, requester domain.GitHubUserIdentity, requestDigest, bindingDigest string) (application.OperationReceipt, bool, error) {
+	if operationType != application.OperationEnableRepository && operationType != application.OperationDisableRepository || strings.TrimSpace(repository) == "" || requester.Validate() != nil || len(requestDigest) != 64 || len(bindingDigest) != 64 {
+		return application.OperationReceipt{}, false, errors.New("repository operation receipt lookup is invalid")
+	}
+	requester.Login = strings.ToLower(strings.TrimSpace(requester.Login))
+	rows, err := s.db.QueryContext(ctx, operationReceiptSelect+` WHERE operation_type=? AND scope_kind='repository' AND target_id=? AND requester_login=? AND requester_database_id=? AND requester_node_id=? AND requester_actor_type=? AND request_digest=? AND target_binding_digest=? ORDER BY accepted_at,operation_id LIMIT 2`, string(operationType), repository, requester.Login, requester.DatabaseID, requester.NodeID, requester.ActorType, requestDigest, bindingDigest)
+	if err != nil {
+		return application.OperationReceipt{}, false, err
+	}
+	defer rows.Close()
+	var matches []application.OperationReceipt
+	for rows.Next() {
+		receipt, scanErr := scanOperationReceipt(rows)
+		if scanErr != nil {
+			return application.OperationReceipt{}, false, scanErr
+		}
+		matches = append(matches, receipt)
+	}
+	if err := rows.Err(); err != nil {
+		return application.OperationReceipt{}, false, err
+	}
+	if len(matches) == 0 {
+		return application.OperationReceipt{}, false, nil
+	}
+	if len(matches) != 1 {
+		return application.OperationReceipt{}, false, application.ErrOperationReceiptConflict
+	}
+	return matches[0], true, nil
+}
 
 func (s *Store) BeginOperationReceipt(ctx context.Context, receipt application.OperationReceipt) (application.OperationReceipt, bool, error) {
 	if retiredOperationReceiptType(receipt.OperationType) {

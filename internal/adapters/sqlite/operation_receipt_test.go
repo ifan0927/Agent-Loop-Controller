@@ -61,6 +61,35 @@ func TestOperationReceiptPersistsScopeNeutralLifecycleReplayAndConflict(t *testi
 	}
 }
 
+func TestFindRepositoryOperationReceiptNormalizesRequesterLogin(t *testing.T) {
+	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	requester := domain.GitHubUserIdentity{Login: "Operator", DatabaseID: 7, NodeID: "USER_7", ActorType: "User"}
+	requestDigest := strings.Repeat("a", 64)
+	bindingDigest := strings.Repeat("b", 64)
+	receipt := application.NewOperationReceipt(application.OperationReceiptInput{
+		OperationType:           application.OperationEnableRepository,
+		Scope:                   application.ScopeRepository,
+		TargetID:                "owner/repo",
+		Requester:               requester,
+		RequestDigest:           requestDigest,
+		ExpectedAuthorityDigest: strings.Repeat("c", 64),
+		OperationAnchorDigest:   strings.Repeat("d", 64),
+		TargetBindingDigest:     bindingDigest,
+		AcceptedAt:              time.Date(2026, 9, 3, 1, 0, 0, 0, time.UTC),
+	})
+	if _, created, err := store.BeginOperationReceipt(context.Background(), receipt); err != nil || !created {
+		t.Fatalf("created=%t err=%v", created, err)
+	}
+	found, ok, err := store.FindRepositoryOperationReceipt(context.Background(), application.OperationEnableRepository, "owner/repo", requester, requestDigest, bindingDigest)
+	if err != nil || !ok || found.OperationID != receipt.OperationID {
+		t.Fatalf("found=%+v ok=%t err=%v", found, ok, err)
+	}
+}
+
 func TestOperationReceiptServiceClassifiesAuthorityAndLifecycleDriftAsConflict(t *testing.T) {
 	store, err := openAdmissionTestStore(filepath.Join(t.TempDir(), "controller.db"))
 	if err != nil {
