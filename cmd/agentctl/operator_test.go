@@ -66,6 +66,9 @@ func (inertOperatorLoader) LoadRepositoryDetail(context.Context, string, time.Ti
 func (inertOperatorLoader) EnableRepository(context.Context, string, string) (application.RepositoryMutationResult, error) {
 	return application.RepositoryMutationResult{}, errors.New("not used")
 }
+func (inertOperatorLoader) AcceptDecision(context.Context, string, application.LegalDecisionInput) (application.OperationReceipt, error) {
+	return application.OperationReceipt{}, errors.New("not used")
+}
 
 func TestProductionOperatorOverviewLoaderUsesOneObservedTimeAndBoundedRepositoryPage(t *testing.T) {
 	observedAt := time.Date(2026, 9, 1, 2, 3, 4, 0, time.FixedZone("fixture", 8*60*60))

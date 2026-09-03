@@ -430,6 +430,24 @@ func TestCommandServiceManualDecisionCannotBypassHeavyPermit(t *testing.T) {
 	}
 }
 
+func TestCommandServiceAcceptDecisionStopsBeforeHeavyWork(t *testing.T) {
+	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateAwaitingHumanDecision, IdempotencyKey: "key"})
+	accepted := run
+	accepted.State = domain.StateExecuting
+	controller := &serviceController{run: accepted}
+	store := &serviceSchedulingStore{serviceStore: serviceStore{run: run}, enabled: true, held: true}
+	decision := &Decision{ChoiceID: "continue", Instructions: "No additional instructions."}
+	command := ContinueCommand{Requester: Requester{ID: "operator", Kind: "github_login"}, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey, Decision: decision}
+
+	result, err := NewCommandService(controller, store).AcceptDecision(context.Background(), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Run.State != domain.StateExecuting || controller.continued != 1 || store.acquireCalls != 0 || store.releaseCalls != 0 {
+		t.Fatalf("result=%+v continued=%d acquires=%d releases=%d", result, controller.continued, store.acquireCalls, store.releaseCalls)
+	}
+}
+
 func TestCommandServiceManualContinueReconcilesBeforePermitAdoption(t *testing.T) {
 	run := authorizeTestRun(Run{ID: "run", Repository: "owner/repo", State: domain.StateExecuting, IdempotencyKey: "key"})
 	controller := &serviceController{run: run}

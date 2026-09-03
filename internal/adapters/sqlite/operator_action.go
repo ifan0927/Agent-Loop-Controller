@@ -282,10 +282,17 @@ func (s *Store) advanceOperatorActionOnce(ctx context.Context, result applicatio
 		if err := tx.QueryRowContext(ctx, `SELECT current_state,(SELECT COALESCE(MAX(sequence),0) FROM transitions WHERE run_id=runs.run_id) FROM runs WHERE run_id=?`, record.RunID).Scan(&state, &sequence); err != nil {
 			return application.OperatorActionRecord{}, false, err
 		}
-		if state != string(result.ResultingState) || sequence != result.ResultingTransitionSequence || sequence < record.TransitionSequence {
+		currentResult := state == string(result.ResultingState) && sequence == result.ResultingTransitionSequence && sequence >= record.TransitionSequence
+		historicalDecisionResult := false
+		if !currentResult && record.ActionType == application.OperatorActionDecide && result.ResultingState == domain.StateExecuting && result.ResultingTransitionSequence == record.TransitionSequence+1 {
+			var from, to string
+			transitionErr := tx.QueryRowContext(ctx, `SELECT from_state,to_state FROM transitions WHERE run_id=? AND sequence=?`, record.RunID, result.ResultingTransitionSequence).Scan(&from, &to)
+			historicalDecisionResult = transitionErr == nil && from == string(domain.StateAwaitingHumanDecision) && to == string(domain.StateExecuting)
+		}
+		if !currentResult && !historicalDecisionResult {
 			return application.OperatorActionRecord{}, false, errors.New("operator action resulting authority conflicts")
 		}
-		update, err = tx.ExecContext(ctx, `UPDATE operator_actions SET status=?,result_status=?,resulting_state=?,resulting_transition_sequence=?,evidence_digest=?,applied_at=? WHERE action_id=? AND status=?`, nextStatus, result.ResultStatus, state, sequence, result.EvidenceDigest, formatTime(result.At), result.ActionID, result.ExpectedStatus)
+		update, err = tx.ExecContext(ctx, `UPDATE operator_actions SET status=?,result_status=?,resulting_state=?,resulting_transition_sequence=?,evidence_digest=?,applied_at=? WHERE action_id=? AND status=?`, nextStatus, result.ResultStatus, string(result.ResultingState), result.ResultingTransitionSequence, result.EvidenceDigest, formatTime(result.At), result.ActionID, result.ExpectedStatus)
 	}
 	if err != nil {
 		return application.OperatorActionRecord{}, false, err

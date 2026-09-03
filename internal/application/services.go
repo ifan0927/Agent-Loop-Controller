@@ -207,6 +207,20 @@ func effectiveLocalCISlowThreshold(value time.Duration) time.Duration {
 }
 
 func (s CommandService) Continue(ctx context.Context, command ContinueCommand) (CommandResult, error) {
+	return s.continueCommand(ctx, command, true)
+}
+
+// AcceptDecision applies one authorized human decision and returns after the
+// durable transition and receipt settlement. The worker remains the sole
+// owner of subsequent heavy execution.
+func (s CommandService) AcceptDecision(ctx context.Context, command ContinueCommand) (CommandResult, error) {
+	if command.ExpectedState != domain.StateAwaitingHumanDecision || command.Decision == nil {
+		return CommandResult{}, serviceError(ErrorInvalidInput, "an awaiting human decision and decision input are required", nil)
+	}
+	return s.continueCommand(ctx, command, false)
+}
+
+func (s CommandService) continueCommand(ctx context.Context, command ContinueCommand, resumeAfterDecision bool) (CommandResult, error) {
 	if command.RunID == "" || command.ExpectedState == "" || command.Repository == "" || command.IdempotencyKey == "" {
 		return CommandResult{}, serviceError(ErrorInvalidInput, "run, expected state, repository, and idempotency key are required", nil)
 	}
@@ -292,7 +306,7 @@ func (s CommandService) Continue(ctx context.Context, command ContinueCommand) (
 			}
 		}
 	}
-	if command.ExpectedState == domain.StateAwaitingHumanDecision && command.Decision != nil && HeavyWorkRequired(run.State) {
+	if resumeAfterDecision && command.ExpectedState == domain.StateAwaitingHumanDecision && command.Decision != nil && HeavyWorkRequired(run.State) {
 		resumeCtx, releaseResume, acquireErr := s.enterHeavyWork(ctx, run)
 		if acquireErr != nil {
 			return CommandResult{Run: projectRunResult(run)}, acquireErr

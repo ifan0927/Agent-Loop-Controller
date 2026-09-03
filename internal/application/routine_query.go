@@ -293,6 +293,19 @@ type RoutineDecisionRequest struct {
 	ContentTrust   string                  `json:"content_trust"`
 }
 
+type RoutineDecisionHandoffStatus string
+
+const (
+	RoutineDecisionAwaitingWorker RoutineDecisionHandoffStatus = "awaiting_worker"
+	RoutineDecisionWorkerResumed  RoutineDecisionHandoffStatus = "worker_resumed"
+)
+
+type RoutineDecisionHandoff struct {
+	Status           RoutineDecisionHandoffStatus `json:"status"`
+	AcceptedAt       time.Time                    `json:"accepted_at"`
+	ResumeObservedAt *time.Time                   `json:"resume_observed_at,omitempty"`
+}
+
 type RoutineRunDetail struct {
 	Metadata         RoutineProjectionMetadata  `json:"metadata"`
 	Run              RoutineRunSummary          `json:"run"`
@@ -305,6 +318,7 @@ type RoutineRunDetail struct {
 	Attention        []RoutineAttentionSummary  `json:"active_attention"`
 	Offers           []LegalActionOffer         `json:"legal_action_offers"`
 	Decision         *RoutineDecisionRequest    `json:"decision_request,omitempty"`
+	DecisionHandoff  *RoutineDecisionHandoff    `json:"decision_handoff,omitempty"`
 }
 
 type RoutineRunQueryService struct {
@@ -417,6 +431,7 @@ func projectRoutineRunDetail(inspection RunInspection, offers []LegalActionOffer
 	if run.State == domain.StateAwaitingHumanDecision && slices.ContainsFunc(offers, func(offer LegalActionOffer) bool { return offer.Action == OperationDecide }) {
 		result.Decision = projectRoutineDecisionRequest(inspection)
 	}
+	result.DecisionHandoff = projectRoutineDecisionHandoff(inspection)
 	return result
 }
 
@@ -524,13 +539,49 @@ func projectRoutineDecisionRequest(inspection RunInspection) *RoutineDecisionReq
 			return nil
 		}
 		request := outcome.DecisionRequest
-		result := &RoutineDecisionRequest{Question: request.Question, Context: request.Context, Recommendation: request.Recommendation, BlockingReason: request.BlockingReason, ContentTrust: "untrusted"}
+		result := &RoutineDecisionRequest{Question: routineDecisionContent(request.Question), Context: routineDecisionContent(request.Context), Recommendation: request.Recommendation, BlockingReason: routineDecisionContent(request.BlockingReason), ContentTrust: "untrusted"}
 		for _, option := range request.Options {
-			result.Options = append(result.Options, RoutineDecisionOption{ID: option.ID, Description: option.Description})
+			result.Options = append(result.Options, RoutineDecisionOption{ID: option.ID, Description: routineDecisionContent(option.Description)})
 		}
 		return result
 	}
 	return nil
+}
+
+func routineDecisionContent(value string) string {
+	if sanitized := sanitizeUntrustedContent(value); sanitized != "" {
+		return sanitized
+	}
+	return "[untrusted content omitted]"
+}
+
+func projectRoutineDecisionHandoff(inspection RunInspection) *RoutineDecisionHandoff {
+	var acceptedAt time.Time
+	for index := len(inspection.Timeline) - 1; index >= 0; index-- {
+		transition := inspection.Timeline[index]
+		if transition.From == domain.StateAwaitingHumanDecision && transition.To == domain.StateExecuting && !transition.CreatedAt.IsZero() {
+			acceptedAt = transition.CreatedAt.UTC()
+			break
+		}
+		if transition.To == domain.StateAwaitingHumanDecision {
+			return nil
+		}
+	}
+	if acceptedAt.IsZero() {
+		return nil
+	}
+	result := &RoutineDecisionHandoff{Status: RoutineDecisionAwaitingWorker, AcceptedAt: acceptedAt}
+	for _, attempt := range inspection.Attempts {
+		if attempt.Kind != "resume" || (attempt.Status != "started" && attempt.Status != "succeeded") || attempt.StartedAt.IsZero() || attempt.StartedAt.Before(acceptedAt) {
+			continue
+		}
+		observed := attempt.StartedAt.UTC()
+		if result.ResumeObservedAt == nil || observed.Before(*result.ResumeObservedAt) {
+			result.Status = RoutineDecisionWorkerResumed
+			result.ResumeObservedAt = &observed
+		}
+	}
+	return result
 }
 
 func boundedRoutineDecision(request domain.DecisionRequest) bool {

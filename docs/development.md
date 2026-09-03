@@ -609,6 +609,19 @@ Attention tests cover exact event selection restoration, list/summary focus and
 scrolling, next/previous cursor stacks, no-op Enter for `none`, shared Run detail
 return, item-bound sanitized offer summaries, stale-screen preservation, safe
 initial failures, and compact/wide bounded rendering.
+Human-decision tests cover bounded untrusted request rendering, persisted-option
+selection, optional native input, deterministic blank normalization, exact
+review and confirmation, cancellation without mutation, duplicate-submit and
+late-result fencing, exact response-loss replay, safe conflicts, settled receipt
+preservation across stale refreshes, and durable worker-resume observation at
+80x24. The deterministic production-loader journey covers Attention through
+TUI acceptance, the worker dispatcher's scheduling and permit handoff, exactly
+one persisted-session resume, and TUI observation of the durable handoff.
+It also proves decision acceptance returns before any Codex resume or
+heavy-work acquisition and reauthorizes the configured operator against the
+current opaque offer. Response-loss coverage advances the worker before an
+exact acceptance retry and proves the original transition settles once;
+prepared-only resume attempts remain `awaiting_worker`.
 Repository tests cover Overview and Repositories entry, stable next/previous
 cursor stacks, selection and return-state restoration, every application-owned
 acceptance conclusion, all eight dimensions, explicit enable confirmation,

@@ -708,7 +708,7 @@ func TestLegalDecisionOfferPersistsReceiptBeforeResumeAndReplaysAfterRestart(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	process := &durableFakeProcess{needsDecision: true}
+	process := &durableFakeProcess{needsDecision: true, decisionOnFirstResume: true}
 	controller := newController(t, store, lab, process, gitadapter.Workspace{})
 	run, err := controller.Start(context.Background(), startInput(t, lab))
 	if err != nil || run.State != domain.StateAwaitingHumanDecision {
@@ -746,13 +746,24 @@ func TestLegalDecisionOfferPersistsReceiptBeforeResumeAndReplaysAfterRestart(t *
 	if err != nil || len(before.OperatorActions) != 0 || process.resumeCalls != 0 {
 		t.Fatalf("invalid decision persisted authority: actions=%+v resume_calls=%d err=%v", before.OperatorActions, process.resumeCalls, err)
 	}
-	receipt, err := legal.ExecuteDecision(context.Background(), application.LegalActionExecutionCommand{Requester: requester, OfferID: offers[0].OfferID}, application.LegalDecisionInput{ChoiceID: "inclusive", Instructions: "Use inclusive min and max bounds."}, controller)
-	if err != nil || receipt.Phase != application.OperationPhaseObserved || receipt.Outcome != application.OperationOutcomeSucceeded || receipt.OperationType != application.OperationDecide || receipt.TargetID != run.ID {
-		t.Fatalf("receipt=%+v err=%v", receipt, err)
+	lossStore := &failOperatorActionApplyStore{Store: store, remaining: 1}
+	lossLegal, err := application.NewLegalActionService(lossStore, authorizer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = lossLegal.ExecuteDecision(context.Background(), application.LegalActionExecutionCommand{Requester: requester, OfferID: offers[0].OfferID}, application.LegalDecisionInput{ChoiceID: "inclusive", Instructions: "Use inclusive min and max bounds."}, newController(t, lossStore, lab, process, gitadapter.Workspace{})); err == nil {
+		t.Fatal("injected decision receipt response loss unexpectedly succeeded")
 	}
 	inspection, err := store.Inspect(context.Background(), run.ID)
-	if err != nil || len(inspection.OperatorActions) != 1 || inspection.OperatorActions[0].ExpectedAuthorityDigest != offers[0].AuthorityDigest || inspection.OperatorActions[0].Status != application.OperatorActionStatusObserved {
+	if err != nil || inspection.Run.State != domain.StateExecuting || len(inspection.OperatorActions) != 1 || inspection.OperatorActions[0].ExpectedAuthorityDigest != offers[0].AuthorityDigest || inspection.OperatorActions[0].Status != application.OperatorActionStatusValidated {
 		t.Fatalf("actions=%+v err=%v", inspection.OperatorActions, err)
+	}
+	if process.resumeCalls != 0 {
+		t.Fatalf("decision acceptance resumed Codex %d times", process.resumeCalls)
+	}
+	resumed, err := controller.Continue(context.Background(), run.ID, nil)
+	if err != nil || resumed.State != domain.StateAwaitingHumanDecision || process.resumeCalls != 1 {
+		t.Fatalf("worker handoff run=%+v resume_calls=%d err=%v", resumed, process.resumeCalls, err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -762,14 +773,6 @@ func TestLegalDecisionOfferPersistsReceiptBeforeResumeAndReplaysAfterRestart(t *
 		t.Fatal(err)
 	}
 	defer store.Close()
-	query, err := application.NewOperationReceiptQueryService(store, authorizer, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	persisted, err := query.Get(context.Background(), requester, receipt.OperationID)
-	if err != nil || persisted != receipt {
-		t.Fatalf("persisted=%+v receipt=%+v err=%v", persisted, receipt, err)
-	}
 	restartedLegal, _ := application.NewLegalActionService(store, authorizer)
 	for _, drift := range []application.LegalDecisionInput{
 		{ChoiceID: "exclusive", Instructions: "Use exclusive bounds."},
@@ -781,6 +784,19 @@ func TestLegalDecisionOfferPersistsReceiptBeforeResumeAndReplaysAfterRestart(t *
 		if !errors.As(driftErr, &serviceErr) || serviceErr.Category != application.ErrorConflict || process.resumeCalls != 1 {
 			t.Fatalf("drift=%+v resume_calls=%d err=%v", drift, process.resumeCalls, driftErr)
 		}
+	}
+	receipt, err := restartedLegal.ExecuteDecision(context.Background(), application.LegalActionExecutionCommand{Requester: requester, OfferID: offers[0].OfferID}, application.LegalDecisionInput{ChoiceID: "inclusive", Instructions: "Use inclusive min and max bounds."}, newController(t, store, lab, process, gitadapter.Workspace{}))
+	if err != nil || receipt.Phase != application.OperationPhaseObserved || receipt.Outcome != application.OperationOutcomeSucceeded || receipt.OperationType != application.OperationDecide || receipt.TargetID != run.ID || receipt.ResultingState != string(domain.StateExecuting) || process.resumeCalls != 1 {
+		failed, _ := store.Inspect(context.Background(), run.ID)
+		t.Fatalf("reconciled receipt=%+v resume_calls=%d actions=%+v err=%v", receipt, process.resumeCalls, failed.OperatorActions, err)
+	}
+	query, err := application.NewOperationReceiptQueryService(store, authorizer, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := query.Get(context.Background(), requester, receipt.OperationID)
+	if err != nil || persisted != receipt {
+		t.Fatalf("persisted=%+v receipt=%+v err=%v", persisted, receipt, err)
 	}
 	replayed, err := restartedLegal.ExecuteDecision(context.Background(), application.LegalActionExecutionCommand{Requester: requester, OfferID: offers[0].OfferID}, application.LegalDecisionInput{ChoiceID: "inclusive", Instructions: "Use inclusive min and max bounds."}, newController(t, store, lab, process, gitadapter.Workspace{}))
 	if err != nil || replayed != receipt || process.resumeCalls != 1 {
@@ -1387,6 +1403,19 @@ type failAfterTransitionStore struct {
 	application.RunStore
 	from, to  domain.State
 	remaining int
+}
+
+type failOperatorActionApplyStore struct {
+	*storeadapter.Store
+	remaining int
+}
+
+func (s *failOperatorActionApplyStore) ApplyOperatorActionResult(ctx context.Context, result application.OperatorActionMutationResult) (application.OperatorActionRecord, bool, error) {
+	if s.remaining > 0 {
+		s.remaining--
+		return application.OperatorActionRecord{}, false, errors.New("simulated response loss before decision receipt settlement")
+	}
+	return s.Store.ApplyOperatorActionResult(ctx, result)
 }
 
 func (s *failAfterTransitionStore) Transition(ctx context.Context, id string, from, to domain.State, reason, evidence, head string) error {

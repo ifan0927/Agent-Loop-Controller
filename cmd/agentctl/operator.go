@@ -203,6 +203,7 @@ type operatorModel struct {
 	detail           operatorRunDetailState
 	repositories     operatorRepositoriesState
 	repositoryDetail operatorRepositoryDetailState
+	decision         operatorDecisionState
 }
 
 func newOperatorModel(parent context.Context, loader operatorLoader) operatorModel {
@@ -228,6 +229,7 @@ func newOperatorModel(parent context.Context, loader operatorLoader) operatorMod
 		runs:             operatorRunsState{request: operatorRunsRequest{lifecycle: application.RunLifecycleActive}},
 		attention:        operatorAttentionState{focus: operatorAttentionListFocus},
 		repositoryDetail: operatorRepositoryDetailState{operationStage: operatorRepositoryOperationIdle},
+		decision:         newOperatorDecisionState(),
 	}
 }
 
@@ -324,6 +326,7 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		m.resizeDecisionEditor()
 		if msg.Width < operatorMinimumWidth || msg.Height < operatorMinimumHeight {
 			m.runs.repositoryEditing = false
 		}
@@ -497,6 +500,8 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			state.operationError = &operatorSafeError{Category: application.ErrorConflict, Message: "repository enablement did not succeed"}
 		}
 		return m, nil
+	case operatorDecisionResultMsg:
+		return m.applyDecisionResult(msg)
 	case operatorRefreshTickMsg:
 		next := m.tickCommand()
 		switch m.route {
@@ -513,7 +518,7 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(next, m.startAttentionRefresh(m.attention.request))
 			}
 		case operatorRunDetailRoute:
-			if m.detail.detail != nil && !m.detail.refreshing {
+			if m.detail.detail != nil && !m.detail.refreshing && !m.decision.blocksRefresh() {
 				return m, tea.Batch(next, m.startDetailRefresh())
 			}
 		case operatorRepositoriesRoute:
@@ -530,6 +535,13 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Code == 'c' && msg.Mod&tea.ModCtrl != 0 {
 			m.cancel()
 			return m, tea.Quit
+		}
+		if m.route == operatorRunDetailRoute && m.decision.interceptsKeys() {
+			updated, command, handled := m.updateDecisionFlow(msg)
+			m = updated
+			if handled {
+				return m, command
+			}
 		}
 		if m.route == operatorRunsRoute && m.runs.repositoryEditing {
 			return m.updateRepositoryEditor(msg)
@@ -764,6 +776,8 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case m.route == operatorRunDetailRoute && m.detail.detail != nil && key.Matches(msg, operatorKeys.down):
 			m.detail.gateIndex = clamp(m.detail.gateIndex+1, 0, max(len(m.detail.detail.Gates)-1, 0))
 			return m, nil
+		case m.route == operatorRunDetailRoute && m.detail.detail != nil && msg.Code == 'd':
+			return m.startDecisionFlow()
 		}
 	}
 	return m, nil
@@ -856,6 +870,7 @@ func (m operatorModel) openRunDetail(runID string, returnRoute operatorRoute) (t
 	}
 	if m.detail.runID != runID {
 		m.detail = operatorRunDetailState{runID: runID, returnRoute: returnRoute}
+		m.decision = newOperatorDecisionState()
 	} else {
 		m.detail.returnRoute = returnRoute
 	}
@@ -1409,6 +1424,9 @@ func (m operatorModel) renderRunDetailScreen() string {
 		}
 		return boundedLines(m.width, m.height, []string{"Agent Loop Controller / Run detail", "", "Loading run " + m.detail.runID + "…", "", "esc back · q quit"})
 	}
+	if m.decision.interceptsKeys() {
+		return m.renderDecisionFlowScreen()
+	}
 	detail := m.detail.detail
 	header := m.renderRouteHeader("Run detail", detail.Metadata.ObservedAt, m.detail.refreshing, m.detail.staleError)
 	identifier := detail.Run.LinearIdentifier
@@ -1448,6 +1466,7 @@ func (m operatorModel) renderRunDetailScreen() string {
 	} else {
 		lines = append(lines, "Pull request not established")
 	}
+	lines = append(lines, m.decisionRunDetailLines()...)
 	lines = append(lines, "Delivery gates (Controller order)")
 	gateSlots := max(m.height-lipgloss.Height(header)-lipgloss.Height(footer)-len(lines)-2, 1)
 	selected := clamp(m.detail.gateIndex, 0, max(len(detail.Gates)-1, 0))
@@ -1829,6 +1848,9 @@ func (m operatorModel) renderHelp() string {
 		}
 	case operatorRunDetailRoute:
 		value = "1/2/3/4 navigate · esc back · ↑/↓ delivery gates · r refresh · ? help · q quit"
+		if m.decisionCanStart() {
+			value = "1/2/3/4 navigate · esc back · ↑/↓ gates · d decide · r refresh · ? · q"
+		}
 	case operatorRepositoriesRoute:
 		value = "1/2/3/4 navigate · ↑/↓ select · enter open · n/p page · r refresh · ? · q"
 	case operatorRepositoryDetailRoute:

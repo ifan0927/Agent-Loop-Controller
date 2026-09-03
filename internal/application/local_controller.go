@@ -2604,55 +2604,71 @@ func findPersistedDecision(inspection RunInspection) (Decision, bool, error) {
 		if transition.From != domain.StateAwaitingHumanDecision || transition.To != domain.StateExecuting {
 			continue
 		}
-		var evidence persistedDecisionEvidence
-		if err := json.Unmarshal([]byte(transition.EvidenceReference), &evidence); err != nil {
-			return Decision{}, false, fmt.Errorf("decode persisted decision evidence: %w", err)
-		}
-		data, err := os.ReadFile(evidence.Path)
-		if err != nil {
-			return Decision{}, false, fmt.Errorf("read persisted decision: %w", err)
-		}
-		if bytesHash(data) != evidence.Hash {
-			return Decision{}, false, errors.New("persisted decision hash mismatch")
-		}
-		var decision Decision
-		decoder := json.NewDecoder(bytes.NewReader(data))
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&decision); err != nil {
-			return Decision{}, false, fmt.Errorf("decode persisted decision: %w", err)
-		}
-		if strings.TrimSpace(decision.ChoiceID) == "" || strings.TrimSpace(decision.Instructions) == "" {
-			return Decision{}, false, errors.New("persisted decision is incomplete")
-		}
-		if decision != evidence.Decision {
-			return Decision{}, false, errors.New("persisted decision does not match SQLite evidence")
-		}
-		attemptFound := false
-		var requestOutcome domain.AgentOutcome
-		for _, attempt := range inspection.Attempts {
-			if attempt.OutcomePath == evidence.RequestOutcomePath && attempt.OutcomeHash == evidence.RequestOutcomeHash && attempt.Status == "succeeded" {
-				requestOutcome, err = readOutcome[domain.AgentOutcome](attempt.OutcomePath, attempt.OutcomeHash)
-				if err != nil {
-					return Decision{}, false, err
-				}
-				attemptFound = true
-			}
-		}
-		if !attemptFound || requestOutcome.DecisionRequest == nil {
-			return Decision{}, false, errors.New("persisted decision request binding is missing")
-		}
-		choiceAllowed := false
-		for _, option := range requestOutcome.DecisionRequest.Options {
-			if option.ID == decision.ChoiceID {
-				choiceAllowed = true
-			}
-		}
-		if !choiceAllowed {
-			return Decision{}, false, errors.New("persisted decision choice is not in the bound request")
-		}
-		return decision, true, nil
+		return persistedDecisionForTransition(inspection, transition)
 	}
 	return Decision{}, false, nil
+}
+
+func findPersistedDecisionAtSequence(inspection RunInspection, sequence int64) (Decision, bool, error) {
+	if sequence < 1 {
+		return Decision{}, false, nil
+	}
+	for _, transition := range inspection.Timeline {
+		if transition.Sequence == sequence && transition.From == domain.StateAwaitingHumanDecision && transition.To == domain.StateExecuting {
+			return persistedDecisionForTransition(inspection, transition)
+		}
+	}
+	return Decision{}, false, nil
+}
+
+func persistedDecisionForTransition(inspection RunInspection, transition Transition) (Decision, bool, error) {
+	var evidence persistedDecisionEvidence
+	if err := json.Unmarshal([]byte(transition.EvidenceReference), &evidence); err != nil {
+		return Decision{}, false, fmt.Errorf("decode persisted decision evidence: %w", err)
+	}
+	data, err := os.ReadFile(evidence.Path)
+	if err != nil {
+		return Decision{}, false, fmt.Errorf("read persisted decision: %w", err)
+	}
+	if bytesHash(data) != evidence.Hash {
+		return Decision{}, false, errors.New("persisted decision hash mismatch")
+	}
+	var decision Decision
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decision); err != nil {
+		return Decision{}, false, fmt.Errorf("decode persisted decision: %w", err)
+	}
+	if strings.TrimSpace(decision.ChoiceID) == "" || strings.TrimSpace(decision.Instructions) == "" {
+		return Decision{}, false, errors.New("persisted decision is incomplete")
+	}
+	if decision != evidence.Decision {
+		return Decision{}, false, errors.New("persisted decision does not match SQLite evidence")
+	}
+	attemptFound := false
+	var requestOutcome domain.AgentOutcome
+	for _, attempt := range inspection.Attempts {
+		if attempt.OutcomePath == evidence.RequestOutcomePath && attempt.OutcomeHash == evidence.RequestOutcomeHash && attempt.Status == "succeeded" {
+			requestOutcome, err = readOutcome[domain.AgentOutcome](attempt.OutcomePath, attempt.OutcomeHash)
+			if err != nil {
+				return Decision{}, false, err
+			}
+			attemptFound = true
+		}
+	}
+	if !attemptFound || requestOutcome.DecisionRequest == nil {
+		return Decision{}, false, errors.New("persisted decision request binding is missing")
+	}
+	choiceAllowed := false
+	for _, option := range requestOutcome.DecisionRequest.Options {
+		if option.ID == decision.ChoiceID {
+			choiceAllowed = true
+		}
+	}
+	if !choiceAllowed {
+		return Decision{}, false, errors.New("persisted decision choice is not in the bound request")
+	}
+	return decision, true, nil
 }
 func successfulVerificationBatch(records []VerificationRecord, head string, ids []string) ([]VerificationRecord, bool) {
 	if len(ids) == 0 {

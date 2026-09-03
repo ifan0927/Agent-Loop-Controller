@@ -182,9 +182,10 @@ under the system LaunchDaemon for pre-login headless recovery.
 The normal worker runs until SIGINT/SIGTERM rather than expiring on a global
 timer; durable recovery and operation-specific timeouts remain authoritative.
 Observe a run with `controller status` or `controller inspect`. If the run stops
-at `awaiting_human_decision`, submit only one of the persisted offered choices
-through `controller continue --decision ...`; the running worker resumes it on
-the next cycle without a separate drive command. Human review resolution and
+at `awaiting_human_decision`, use `agentctl operator` for the normal local flow;
+it settles the decision locally and the running worker resumes it on the next
+cycle. The recovery-only `controller continue --decision ...` path instead
+owns and performs its resume before returning. Human review resolution and
 approval happen in GitHub; the driver observes them and continues
 automatically.
 
@@ -193,7 +194,10 @@ the configured Controller operator, opens only the already-bound current
 configuration authority, and provides Overview, filtered cursor-paginated Runs,
 a complete cursor-paginated read-only Attention inbox, a shared compact Run
 detail, and a cursor-paginated Repositories destination with shared Repository
-detail. Repository detail shows the Controller-owned acceptance conclusion and
+detail. Run detail provides the bounded human-decision request, fixed-option
+selection, optional bounded instructions, exact review, confirmation, settled
+receipt, and worker-resume observation for a current `decide` offer. Repository
+detail shows the Controller-owned acceptance conclusion and
 all eight readiness dimensions; a currently authorized ready-disabled
 repository can be explicitly confirmed and enabled through the existing
 receipt-backed service. No other TUI mutation is implemented. The command
@@ -240,10 +244,12 @@ inbox, shared Run detail, Repositories collection, and shared Repository detail
 are implemented with bounded responsive layouts,
 visible selection, authorization-safe opaque pagination, background refresh,
 stale-result preservation, exact item-bound offer summaries, and
-configured-operator authorization. Ready-disabled repositories alone expose a
-confirmed receipt-backed enable action; disable, recheck, onboarding, run, and
-Attention mutations remain outside this slice. This completes R08 in addition
-to the R04-R06 read journey and the read-only Attention prerequisite for R07;
+configured-operator authorization. Ready-disabled repositories expose a
+confirmed receipt-backed enable action, and a current human-decision gate
+exposes the receipt-backed R07 flow without giving the TUI worker authority.
+Disable, recheck, onboarding, and other run or Attention mutations remain
+outside this slice. This completes R07 and R08 in addition to the R04-R06 read
+journey;
 the remaining TUI destinations remain planned. HTTP, a Web
 UI, outbound notifications, Hermes runtime integration, public API/webhook
 admission, and cross-repository transactions remain deferred or exploratory.

@@ -177,18 +177,27 @@ func historicalActionReplayable(action OperatorActionRecord, run Run, inspection
 	if run.State == action.ExpectedState && sequence == action.TransitionSequence {
 		return true
 	}
-	if len(inspection.Timeline) == 0 {
-		return false
-	}
-	last := inspection.Timeline[len(inspection.Timeline)-1]
 	switch action.ActionType {
 	case OperatorActionDecide:
-		return last.From == domain.StateAwaitingHumanDecision && last.To == domain.StateExecuting
+		decision, found, err := findPersistedDecisionAtSequence(inspection, action.TransitionSequence+1)
+		return err == nil && found && DecisionOperationInputDigest(decision) == action.RequestDigest
 	case OperatorActionAbandon:
+		if len(inspection.Timeline) == 0 {
+			return false
+		}
+		last := inspection.Timeline[len(inspection.Timeline)-1]
 		return last.To == domain.StateFailed && last.Reason == AutomaticAdmissionAbandonTransition
 	case OperatorActionRecoverOwnedPush:
+		if len(inspection.Timeline) == 0 {
+			return false
+		}
+		last := inspection.Timeline[len(inspection.Timeline)-1]
 		return last.From == domain.StateManualIntervention && last.To == domain.StateApprovalReady && strings.HasPrefix(last.EvidenceReference, "recover_owned_push:") && last.BoundHead == run.CandidateHead
 	case OperatorActionAcceptExternalMerge:
+		if len(inspection.Timeline) == 0 {
+			return false
+		}
+		last := inspection.Timeline[len(inspection.Timeline)-1]
 		return last.From == domain.StateManualIntervention && last.To == domain.StateAwaitingLinearCompletion && strings.HasPrefix(last.EvidenceReference, "external_merge:") && inspection.Merge != nil && inspection.Merge.Method == "external"
 	default:
 		return false
@@ -212,32 +221,47 @@ func (s *LegalActionService) ExecuteDecision(ctx context.Context, command LegalA
 		return OperationReceipt{}, serviceError(ErrorConflict, "decision operation payload changed", nil)
 	} else if found && action.Status == OperatorActionStatusObserved {
 		return receipt, nil
-	} else if found && run.State != domain.StateAwaitingHumanDecision {
+	} else if found {
 		inspection, inspectErr := s.store.Inspect(ctx, run.ID)
 		if inspectErr != nil {
 			return OperationReceipt{}, classifyServiceError(inspectErr)
 		}
-		persisted, persistedFound, persistedErr := findPersistedDecision(inspection)
-		if persistedErr != nil || !persistedFound || DecisionOperationInputDigest(persisted) != action.RequestDigest {
+		acceptanceSequence := action.TransitionSequence + 1
+		persisted, persistedFound, persistedErr := findPersistedDecisionAtSequence(inspection, acceptanceSequence)
+		if persistedErr != nil || persistedFound && DecisionOperationInputDigest(persisted) != action.RequestDigest {
 			return OperationReceipt{}, serviceError(ErrorConflict, "accepted decision outcome cannot be reconciled", persistedErr)
 		}
-		actions, actionsErr := s.operatorActionService()
-		if actionsErr != nil {
-			return OperationReceipt{}, serviceError(ErrorInternal, "decision operation receipt is unavailable", actionsErr)
+		if persistedFound {
+			actions, actionsErr := s.operatorActionService()
+			if actionsErr != nil {
+				return OperationReceipt{}, serviceError(ErrorInternal, "decision operation receipt is unavailable", actionsErr)
+			}
+			acceptedRun := run
+			acceptedRun.State = domain.StateExecuting
+			if settleErr := settleLegalRecoveryAction(ctx, actions, action, acceptedRun, acceptanceSequence, "decision"); settleErr != nil {
+				return OperationReceipt{}, settleErr
+			}
+			return s.receiptForActionID(ctx, run, action.ActionID)
 		}
-		if settleErr := settleLegalRecoveryAction(ctx, actions, action, run, latestTransitionSequence(inspection.Timeline), "decision"); settleErr != nil {
-			return OperationReceipt{}, settleErr
+		if run.State != domain.StateAwaitingHumanDecision || latestTransitionSequence(inspection.Timeline) != action.TransitionSequence {
+			return OperationReceipt{}, serviceError(ErrorConflict, "accepted decision outcome cannot be reconciled", nil)
 		}
-		return s.receiptForRunAction(ctx, run.ID, OperatorActionDecide)
 	}
 	store, ok := s.store.(RunStore)
 	if !ok {
 		return OperationReceipt{}, serviceError(ErrorInternal, "decision execution store is unavailable", nil)
 	}
-	if _, err := NewCommandService(controller, store).Continue(ctx, ContinueCommand{Requester: command.Requester, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey, Decision: decision}); err != nil {
+	if _, err := NewCommandService(controller, store).AcceptDecision(ctx, ContinueCommand{Requester: command.Requester, RunID: run.ID, Repository: run.Repository, ExpectedState: run.State, IdempotencyKey: run.IdempotencyKey, Decision: decision}); err != nil {
 		return OperationReceipt{}, err
 	}
-	return s.receiptForRunAction(ctx, run.ID, OperatorActionDecide)
+	_, action, found, err := s.actionReceiptForOffer(ctx, run, offer)
+	if err != nil {
+		return OperationReceipt{}, err
+	}
+	if !found {
+		return OperationReceipt{}, serviceError(ErrorInternal, "decision operation receipt was not persisted", nil)
+	}
+	return s.receiptForActionID(ctx, run, action.ActionID)
 }
 
 func (s *LegalActionService) ExecuteRetry(ctx context.Context, command LegalActionExecutionCommand, revalidator OperatorRetryRevalidator) (OperationReceipt, error) {
@@ -378,6 +402,29 @@ func (s *LegalActionService) receiptForRunAction(ctx context.Context, runID stri
 		return receipt, nil
 	}
 	return OperationReceipt{}, serviceError(ErrorInternal, "operation receipt was not persisted", nil)
+}
+
+func (s *LegalActionService) receiptForActionID(ctx context.Context, run Run, actionID string) (OperationReceipt, error) {
+	store, ok := s.store.(OperatorActionStore)
+	if !ok {
+		return OperationReceipt{}, serviceError(ErrorInternal, "operation receipt store is unavailable", nil)
+	}
+	action, found, err := store.GetOperatorAction(ctx, actionID)
+	if err != nil {
+		return OperationReceipt{}, classifyServiceError(err)
+	}
+	if !found || action.RunID != run.ID {
+		return OperationReceipt{}, serviceError(ErrorInternal, "operation receipt was not persisted", nil)
+	}
+	binding := run.RepositoryBindingDigest
+	if !validAuthorityDigest(binding) {
+		binding = LegacyRunAuthorityDigest(run.Repository)
+	}
+	receipt, err := OperationReceiptForOperatorAction(action, binding)
+	if err != nil {
+		return OperationReceipt{}, serviceError(ErrorInternal, "operation receipt projection is invalid", err)
+	}
+	return receipt, nil
 }
 
 func (s *LegalActionService) actionReceiptForOffer(ctx context.Context, run Run, offer LegalActionOffer) (OperationReceipt, OperatorActionRecord, bool, error) {
