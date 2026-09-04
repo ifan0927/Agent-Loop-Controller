@@ -1,8 +1,13 @@
 # Roadmap
 
+> **Archived roadmap.** ALC v1 is frozen as a completed Phase 1 reference
+> implementation. Entries below document what was completed and what was
+> intentionally left unfinished; they are not an active feature backlog. See
+> [V1 Archive](V1_ARCHIVE.md).
+
 ## Product Vision
 
-Agent Loop Controller should make a local coding-delivery loop feel like one
+Agent Loop Controller v1 aimed to make a local coding-delivery loop feel like one
 coherent product across Hermes, Linear, Codex, and GitHub without making an LLM
 the workflow authority.
 
@@ -130,14 +135,15 @@ This milestone is recorded by the completed automatic-admission roadmap and its
 bounded remediation roadmap
 [#45](https://github.com/ifan0927/Agent-Loop-Controller/issues/45).
 
-## Current Product Focus
+## Archived Incomplete Direction
 
-### Planned: local operator product
+### Superseded: local operator product
 
-The active umbrella is
-[#99](https://github.com/ifan0927/Agent-Loop-Controller/issues/99). It replaces
-the retired read-only monitoring roadmap with a staged operator product intended
-to cover at least 90 percent of routine local work:
+The former active umbrella was
+[#99](https://github.com/ifan0927/Agent-Loop-Controller/issues/99). It proposed a
+staged operator product intended to cover at least 90 percent of routine local
+work. The direction is now superseded by the v1 archival decision; completed
+code remains reference evidence, and unfinished work is not a v1 backlog:
 
 ```text
 completed controller, bounded-concurrency, and authorization foundation
@@ -157,9 +163,8 @@ explicit enablement are available through `agentctl operator`. New launchd insta
 neutral service identity, and legacy installations have a bounded reversible
 migration rather than a second runtime path.
 
-Implementation work is created one dependency-ready issue at a time. Local
-operator identity, application authorization, operation receipts, and
-legal-action offers are complete. Activity-independent worker heartbeat,
+The completed implementation established local operator identity, application
+authorization, operation receipts, and legal-action offers. Activity-independent worker heartbeat,
 controller-authorized runtime observation, configuration generations/CAS,
 desired/effective convergence fencing, the first normal typed-change slice, and
 forward rollback, external-drift fail-stop for disposable runtimes, repository lifecycle,
@@ -199,7 +204,7 @@ These services own policy, authorization, idempotency, reconciliation, and
 sanitized evidence independently of presentation. GitHub repository creation,
 source templates, and UI secret provisioning are not part of this phase.
 
-### Phase 2: local TUI operator console
+### Intentionally incomplete: local TUI operator console
 
 The initial TUI is a presentation adapter in this repository and Go module. It
 runs as a separate process from the worker, reads durable Controller state
@@ -238,18 +243,21 @@ currently authorized ready-disabled repository exposes the first narrow TUI
 mutation, an explicitly confirmed receipt-backed enable operation. Disable,
 recheck, removal, onboarding, and other run or Attention mutations remain
 planned or CLI-only. Onboarding application collections retain the same stable
-reader foundation. The remaining navigation surface is Queue, Onboarding, Settings,
-and System/Audit, but stable Controller projections determine screen details.
+reader foundation. The remaining navigation surface was Queue, Onboarding,
+Settings, and System/Audit. Those destinations, plus disable, recheck, removal,
+onboarding, and other run or Attention mutations, are intentionally unfinished
+and are not scheduled for completion in v1.
 
-The fixed product metric remains ten complete operator-intent scenarios from
+The former product metric was ten complete operator-intent scenarios from
 [#100](https://github.com/ifan0927/Agent-Loop-Controller/issues/100), worth ten
-points each. At least 9/10 substantiates the 90-percent claim; v1 targets 10/10.
+points each. At least 9/10 would have substantiated the 90-percent claim; the
+target was not completed before archival.
 A scenario counts only when the complete human goal is supported without raw
 SQLite, config-file editing, artifacts, logs, filesystem inspection, or ad-hoc
 Controller internals. Manual admission may remain CLI-only and outside the
 denominator.
 
-TUI verification starts with Go model/update/application tests and deterministic
+TUI verification used Go model/update/application tests and deterministic
 View or golden tests, then adds a bounded set of VHS critical-flow acceptance
 tests. VHS is development tooling, not a runtime dependency.
 
@@ -265,9 +273,11 @@ GitHub approval and review resolution remain in GitHub. General Linear issue
 editing remains in Linear. Privileged installation/upgrade, secret management,
 and break-glass recovery remain explicit CLI/operator procedures.
 
-## Near-Term Goals
+## Archived Deferred Directions
 
-### Planned: outbound notification delivery
+The following ideas were not completed and are not active v1 commitments.
+
+### Not pursued in v1: outbound notification delivery
 
 The local operator product has no notification inbox, delivery history, read
 state, or inbound chat authority. After the Controller foundations and TUI are
@@ -275,22 +285,20 @@ usable, outbound notifications may be planned separately, with Discord as a
 possible adapter. Delivery and acknowledgement must remain subordinate to
 Controller state.
 
-### Planned: Hermes application integration
+### Not pursued in v1: Hermes application integration
 
 Hermes may later use the same authenticated application commands and sanitized
 queries for conversation, trigger, status, and notification workflows. It must
 not execute Mac shell commands, read worktrees, approve GitHub reviews, resolve
 human threads, or own controller state.
 
-### Current: multi-repository lifecycle and visibility
+### Completed foundation: multi-repository lifecycle and visibility
 
 Bounded multi-repository scheduling, durable lifecycle intent, readiness
 snapshots, and admission fencing are implemented while each run still selects
-exactly one repository. The remaining operator foundations and TUI should add
-onboarding and routine capacity/activity visibility without introducing
-cross-repository transactions or one issue spanning multiple PRs.
+exactly one repository. Additional TUI visibility was not completed.
 
-## Longer-Term Direction
+## Historical Exploratory Directions
 
 ### Exploratory: event-driven admission
 
@@ -333,8 +341,9 @@ Status words in this document are deliberate:
 - **Non-goal**: outside the current product boundary.
 
 Detailed implementation state, acceptance checklists, dependencies, and defect
-history belong in GitHub issues and pull requests. The current open umbrella is
-[#99](https://github.com/ifan0927/Agent-Loop-Controller/issues/99). The completed
+history belong in GitHub issues and pull requests. The superseded umbrella
+[#99](https://github.com/ifan0927/Agent-Loop-Controller/issues/99) retains its
+historical planning context. The completed
 trackers [#21](https://github.com/ifan0927/Agent-Loop-Controller/issues/21),
 [#42](https://github.com/ifan0927/Agent-Loop-Controller/issues/42), and
 [#45](https://github.com/ifan0927/Agent-Loop-Controller/issues/45) retain their
