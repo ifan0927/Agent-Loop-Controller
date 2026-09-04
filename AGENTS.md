@@ -4,6 +4,16 @@ All user-facing discussion is in Traditional Chinese. All code comments and
 committed technical documentation are in English unless a document explicitly
 requires Traditional Chinese.
 
+## Archive status
+
+This repository is the completed ALC v1 reference implementation. Active v1
+feature development is frozen. Preserve its architecture, ADRs, tests, fixtures,
+and verified implementation as historical engineering evidence. Changes are
+limited to security, buildability, archival accuracy, or similarly narrow
+reference-preservation work; do not resume the incomplete operator-platform
+roadmap or begin ALC v2 implementation here. See
+[V1 Archive](docs/V1_ARCHIVE.md).
+
 ## Request routing
 
 Every task starts here, then loads only the authorities triggered by the work.

@@ -1,5 +1,10 @@
 # Agent Loop Controller
 
+> **Archived v1 reference implementation.** ALC v1 completed its Phase 1
+> research and engineering objective and is no longer under active feature
+> development. The source, tests, evidence contracts, and operational history
+> remain available for study. See [V1 Archive](docs/V1_ARCHIVE.md).
+
 ## Overview
 
 Agent Loop Controller is a deterministic, human-gated software-delivery control
@@ -209,52 +214,24 @@ normal workflow.
 
 ## Project Status
 
-The production MVP and the automatic-admission, trusted-feedback, source-sync,
-recovery, headless supervision, bounded multi-repository scheduling, and second
-isolated live-E2E milestones are complete. The current product focus is the
-local TUI operator console in this repository under
-[roadmap #99](https://github.com/ifan0927/Agent-Loop-Controller/issues/99).
-Local operator identity, application authorization, operation receipts, and
-legal-action offers are implemented. Activity-independent worker heartbeat,
-controller-authorized runtime observation, configuration generation/CAS, and
-desired/effective convergence fencing are also implemented, together with the
-normal typed-change draft/preview/apply slice and Controller-owned forward
-rollback. External configuration drift now fails closed and requires replacing
-the complete disposable local runtime; no in-place restore command remains.
-Repository lifecycle, readiness, guarded retirement,
-zero-repository disabled-admission operation, admission fencing, and the
-restart-safe existing-checkout onboarding saga and restart-safe empty-repository
-initialization are also implemented. The latter derives a Controller-owned
-source checkout, creates one deterministic empty initial revision, and uses a
-guarded non-force host-SSH publication before reusing the shared
-`ready_disabled` tail. Versioned routine Controller application projections
-for Overview, runs and fixed delivery gates, queue, active attention,
-repositories, onboarding, and settings are also implemented; they are bounded,
-scope-authorized, sanitized, and side-effect free. Durable versioned activity
-list/detail projections and bounded operation-receipt history are implemented
-as presentation-independent application contracts. Meaningful current SQLite
-facts append their immutable sanitized activity snapshots transactionally;
-the worker performs bounded restart-safe reconstruction of legacy evidence and
-reports explicit coverage limitations for history that was never persisted.
-Unsafe or ambiguous configuration repair remains out of scope. Controller-wide
-audit-integrity readiness and its explicit receipt-backed recheck are
-implemented, completing the presentation-independent operator foundation. The
-`agentctl operator` Overview, Runs collection, complete read-only Attention
-inbox, shared Run detail, Repositories collection, and shared Repository detail
-are implemented with bounded responsive layouts,
-visible selection, authorization-safe opaque pagination, background refresh,
-stale-result preservation, exact item-bound offer summaries, and
-configured-operator authorization. Ready-disabled repositories expose a
-confirmed receipt-backed enable action, and a current human-decision gate
-exposes the receipt-backed R07 flow without giving the TUI worker authority.
-Disable, recheck, onboarding, and other run or Attention mutations remain
-outside this slice. This completes R07 and R08 in addition to the R04-R06 read
-journey;
-the remaining TUI destinations remain planned. HTTP, a Web
-UI, outbound notifications, Hermes runtime integration, public API/webhook
-admission, and cross-repository transactions remain deferred or exploratory.
+ALC v1 is a completed Phase 1 reference implementation. Its production MVP,
+automatic admission, exact-head evidence, independent review, bounded repair,
+human authority, restart recovery, configuration convergence, and isolated
+live-acceptance milestones are complete. Development stopped after the core
+coding-delivery loop and its operational vertical slice had been proven; this
+was a product-boundary decision, not a failed implementation.
 
-See [Roadmap](docs/roadmap.md) for status categories and current tracking.
+The partial local TUI remains in the repository as historical implementation
+evidence. Overview, Runs, Attention, shared Run detail, Repositories, shared
+Repository detail, the R07 decision flow, and R08 repository enablement were
+implemented. Queue, Onboarding, Settings, System/Audit, disable/recheck/removal,
+and other planned operator mutations were intentionally not completed. The
+former active umbrella
+[#99](https://github.com/ifan0927/Agent-Loop-Controller/issues/99) is retained as
+historical planning evidence and is superseded by the archival decision.
+
+See [Roadmap](docs/roadmap.md) for completed milestones and the archival
+disposition of former plans.
 
 ## Documentation
 
@@ -264,8 +241,10 @@ See [Roadmap](docs/roadmap.md) for status categories and current tracking.
   human-facing command, normal flow, recovery, supervision, and troubleshooting.
 - [Development](docs/development.md): repository layout, tests, fixtures, E2E,
   migrations, extension rules, and contribution checks.
-- [Roadmap](docs/roadmap.md): product direction, completed milestones, current
-  stabilization work, and longer-term goals.
+- [Roadmap](docs/roadmap.md): product direction, completed milestones, archival
+  disposition, and historical deferred directions.
+- [V1 Archive](docs/V1_ARCHIVE.md): final status, proven behavior, intentionally
+  unfinished areas, and the highest-value references for future work.
 - [GitHub App runbook](docs/runbooks/github-app.md) and
   [live-E2E runbook](docs/runbooks/live-e2e.md): high-risk credential/permission
   setup and destructive isolated acceptance procedures.
